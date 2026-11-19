@@ -669,6 +669,24 @@ pub fn worker_args() -> Vec<String> {
     ]
 }
 
+/// #3387 — set by a worker the host started with `--system-context-waiting`:
+/// SystemContext is on, SYSTEM can open no machine enrollment yet, and this
+/// worker runs the signed-in person's own enrollment as that person.
+static SYSTEM_CONTEXT_WAITING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #3387 — the worker's half of `--system-context-waiting`: remembered once,
+/// at start, for `roomler status` and the hello.
+pub fn note_system_context_waiting() {
+    SYSTEM_CONTEXT_WAITING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #3387 — whether this worker runs the person's own enrollment while
+/// SystemContext waits for a machine one ([`note_system_context_waiting`]).
+pub fn system_context_waiting() -> bool {
+    SYSTEM_CONTEXT_WAITING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The service host's once-per-start steps between `Running` and the worker
 /// supervisor. A trait so the ORDER can be asserted with a recorder: the
 /// firewall rule for the worker's path must exist before anything of ours

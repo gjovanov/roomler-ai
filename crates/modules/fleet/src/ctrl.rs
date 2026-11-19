@@ -13,12 +13,6 @@ use tracing::{debug, info};
 
 use crate::Hub;
 
-/// FR-90 P2g-3b — the most devices one `hive_purge` envelope is applied to:
-/// far above what a purge names (its session's location, members and the
-/// hosts it moved between), so a forged envelope cannot make a pod walk an
-/// unbounded list.
-pub const MAX_HIVE_PURGE_AGENTS: usize = 1024;
-
 /// C-2 — publish an rc control event on the global channel. Control
 /// events are IDEMPOTENT hub operations every pod applies locally (the
 /// one holding the session/agent acts; the rest no-op), which makes
@@ -122,6 +116,37 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(session = %sid, "rc ctrl: terminate applied from another pod");
             }
         }
+        // FR-138 P1b-2 — the controller's own end (its `rc:terminate`, or a
+        // redial's `replaces`) of a session the pod it reached did not hold:
+        // that pod wrote the end to the row, and the pod that holds the
+        // session ends it here. The tenant AND the controller are re-checked,
+        // so an envelope cannot end another person's session. The reason is
+        // the one the hub records for a controller (`host_disconnect` is the
+        // device's alone); an absent or unknown one reads `controller_hangup`.
+        Some("controller_terminate") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(sid), Some(tid), Some(uid)) =
+                (oid("session_id"), oid("tenant_id"), oid("user_id"))
+            else {
+                return;
+            };
+            use roomler_ai_remote_control::models::EndReason;
+            let reason = match ctrl
+                .get("reason")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<EndReason>(v).ok())
+            {
+                None | Some(EndReason::HostDisconnect) => EndReason::ControllerHangup,
+                Some(r) => r,
+            };
+            if hub.session_snapshot(sid) == Some((tid, uid)) && hub.terminate(sid, reason).is_ok() {
+                info!(session = %sid, "rc ctrl: a controller's end applied from another pod");
+            }
+        }
         // FR-52 P5 — an admin barred a person from a device on another pod,
         // and the session they are in may be here. `terminate_external_of`
         // holds the tenant check `terminate` makes above.
@@ -139,6 +164,37 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
             let ended = hub.terminate_external_of(aid, uid, tid);
             if ended > 0 {
                 info!(agent = %aid, principal = %uid, ended, "rc ctrl: revocation applied from another pod");
+            }
+        }
+        // FR-52 decision 16 — an admin cleared a device's approval, or turned the
+        // org's switch off, on another pod. Each scope has a name of its own, and
+        // none is `terminate_external` with a key left out: a key lost on the way
+        // must end nothing, never more.
+        Some("terminate_external_device") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(tid)) = (oid("agent_id"), oid("tenant_id")) else {
+                return;
+            };
+            let ended = hub.terminate_external_on(aid, tid);
+            if ended > 0 {
+                info!(agent = %aid, ended, "rc ctrl: a cleared approval applied from another pod");
+            }
+        }
+        Some("terminate_external_org") => {
+            let Some(tid) = ctrl
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| ObjectId::parse_str(s).ok())
+            else {
+                return;
+            };
+            let ended = hub.terminate_external_in(tid);
+            if ended > 0 {
+                info!(tenant = %tid, ended, "rc ctrl: an org switched off applied from another pod");
             }
         }
         // P2b — cycle an agent's WS so it re-establishes its overlay session
@@ -218,65 +274,23 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(agent = %aid, revision, "rc ctrl: desired config pushed from another pod");
             }
         }
-        // FR-90 P2g-3b — a Hive purge for devices whose sockets are on
-        // another pod: the purge was issued where the owner's DELETE, or the
-        // retention sweep, ran. `push_hive_purge` re-checks the tenant and
-        // the connection's `hive-purge`, so a mismatched envelope pushes
-        // nothing, and a device that gets one twice answers it once (the
-        // purge id).
-        Some("hive_purge") => {
-            let oid = |key: &str| {
-                ctrl.get(key)
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| ObjectId::parse_str(s).ok())
-            };
-            let (Some(tid), Some(pid), Some(sid), Some(aids)) = (
-                oid("tenant_id"),
-                oid("purge_id"),
-                oid("session_id"),
-                ctrl.get("agent_ids").and_then(|v| v.as_array()),
-            ) else {
-                return;
-            };
-            for aid in aids
-                .iter()
-                .take(MAX_HIVE_PURGE_AGENTS)
-                .filter_map(|v| v.as_str())
-                .filter_map(|s| ObjectId::parse_str(s).ok())
-            {
-                let msg = roomler_ai_remote_control::signaling::ServerMsg::HivePurge {
-                    purge_id: pid,
-                    session_id: sid,
-                    // FR-90 P2k-3 — a leaving member's copy alone; absent
-                    // from a pod before it, which sent a whole session's.
-                    leaving: ctrl
-                        .get("leaving")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                };
-                if hub.push_hive_purge(aid, tid, msg).is_ok() {
-                    info!(agent = %aid, purge = %pid, "rc ctrl: hive purge delivered from another pod");
-                }
-            }
-        }
-        // FR-90 P2g-4a — a removed device whose socket is on another pod is
-        // told to purge what it holds, before the kick published after it.
-        // The hub's own checks: its tenant, and `hive-purge-all`.
-        Some("hive_purge_all") => {
-            let oid = |key: &str| {
-                ctrl.get(key)
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| ObjectId::parse_str(s).ok())
-            };
-            let (Some(tid), Some(aid), Some(pid)) =
-                (oid("tenant_id"), oid("agent_id"), oid("purge_id"))
-            else {
-                return;
-            };
-            if hub.push_hive_purge_all(aid, tid, pid).is_ok() {
-                info!(agent = %aid, purge = %pid, "rc ctrl: a removed device's purge delivered from another pod");
-            }
-        }
+        // FR-138 P1b-2 — `resume_scope` is read from the store, which the hub
+        // does not reach: [`apply_rc_ctrl_on`] takes it.
         _ => {}
+    }
+}
+
+/// C-2 — [`apply_rc_ctrl`], with the module's state at hand for the events
+/// that need more than the hub. FR-138 P1b-2 (review 2, N2): a change to the
+/// resume scope made on another pod is only a nudge. This pod reads the store
+/// itself and tells its connections under its OWN window
+/// ([`crate::resume_scope::nudge`]), whatever the event carries: one that
+/// arrives late or twice applies the newest list, and a pod at window 0
+/// announces nothing.
+pub fn apply_rc_ctrl_on(state: &crate::FleetState, ctrl: &serde_json::Value) {
+    if ctrl.get("evt").and_then(|v| v.as_str()) == Some("resume_scope") {
+        crate::resume_scope::nudge(state);
+    } else {
+        apply_rc_ctrl(&state.rc_hub, ctrl);
     }
 }

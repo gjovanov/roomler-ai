@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod agent_carrier_rank_test;
+#[cfg(test)]
 mod agent_gather_test;
 #[cfg(test)]
 mod agent_test;

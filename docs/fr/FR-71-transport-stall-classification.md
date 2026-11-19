@@ -1,6 +1,6 @@
 # FR-71 — Transport stall classification: a transit stall is not an over-production signal
 
-**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches**; **2026-10-29**: the classifier documented (AC7) and a 15-day fleet read of 40,654 constrained windows against the gate — AC2 met; the hold's property holds where nothing is measured and **fails through FR-79 V5's `stall_is_ours` loop** (AC3–AC6 `[~]`, §Open decisions) ·
+**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). The classifier stays, as FR-79's gate generalised it. The field repeats of a transit stall (AC3, AC4, AC6) moved to FR-148 P1 and P3, and AC5's second half to its P5. FR-148 §12 maps each open criterion. At the close: proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches**; **2026-10-29**: the classifier documented (AC7) and a 15-day fleet read of 40,654 constrained windows against the gate — AC2 met; the hold's property holds where nothing is measured and **fails through FR-79 V5's `stall_is_ours` loop** (AC3–AC6 `[~]`, §Open decisions) ·
 **Parent:** split out of FR-70 (#1330) on its own open question; FR-70's M0 is this FR's instrument.
 
 ## Goal
@@ -429,7 +429,8 @@ The docs for the classifier live with the gate's, as the section it feeds:
 ## Open decisions
 
 - **The V5 loop — a stall is "ours" because the last stall said so
-  (2026-10-29).** `stall_is_ours` (`governor.rs:1154`) is the one rule that lets
+  (2026-10-29).** **DECIDED 2026-11-02 in [FR-79](FR-79-one-validity-gate.md): the
+  operator chose A, built as V5b.** `stall_is_ours` (`governor.rs:1154`) is the one rule that lets
   a rejected `TransitStalled` window cut, gated on `desired > 1.2 × pipe_bps`.
   `pipe_bps` (`:607`) falls through to the prior's stand-in (`:613`) when neither
   the blocked-send goodput nor the viewer's arrival rate is live, and the same
@@ -458,6 +459,9 @@ The docs for the classifier live with the gate's, as the section it feeds:
   at 555 ms; 13 such drops in 15 days, two of them to 0.20 M. The
   make-before-break answer T2 used fits: a congested report arms the clamp one
   window late, if the window after it is not stalled.
+  *2026-11-03: still open, and still this FR's. FR-79 V5b's rule (b) stops a
+  congested report the sender was not feeding. Here the sender really is
+  offering, so (b) leaves this case exactly as it was.*
 - **Whether T1b's hold should be deleted, and what replaces it (2026-09-08).** **DECIDED 2026-09-08: FR-79 V1 deleted it, T2 and T2b, and kept T1a's classifier as the gate's instrument.** The
   field's finding-4 shape on the corp-VPN host is not the simulated one (post-ack
   paint age with a tiny queue): it is a pump pass stalled in `other` by the overlay's

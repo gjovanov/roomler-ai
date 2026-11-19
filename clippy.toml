@@ -45,3 +45,23 @@ await-holding-invalid-types = [
     { path = "dashmap::iter::Iter", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
     { path = "dashmap::iter::IterMut", reason = "collect what the await needs and drop the iterator first (root clippy.toml)" },
 ]
+
+# A removed thing answers nothing (#3327, docs/security-baseline.md).
+#
+# Soft-deleted rows stay in their collection with a `deleted_at`, so a lookup
+# by id finds them unless it asks for live rows. `BaseDao::find_by_id_in_tenant`
+# answers live rows only. The tombstone-inclusive lookup is
+# `find_any_by_id_in_tenant`, and only a reader whose job is the tombstone may
+# use it: a refusal that must tell a removed device why (or it retries a bare
+# 401 forever), and an audit view of a removed thing. Each such reader is a
+# named DAO method (the `find_any_in_tenant`s) carrying
+# `#[expect(clippy::disallowed_methods, reason = "...")]` and a doc comment
+# saying why. A route that called it directly (through `base`) is how the
+# External access routes reopened the device hole after #1821 (#3322).
+#
+# ⚠️ This catches a call of that method, not every way to read a tombstone:
+# the tenant-less `BaseDao::find_by_id` and a hand-written `find_one` filter
+# are not covered.
+disallowed-methods = [
+    { path = "roomler_ai_services::dao::base::BaseDao::find_any_by_id_in_tenant", reason = "the tombstone-inclusive lookup: call it only from a named DAO reader that says why it must see a removed row, under #[expect] (root clippy.toml, #3327)" },
+]

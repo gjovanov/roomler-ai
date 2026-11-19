@@ -256,7 +256,7 @@
            has no spare width on phones; the resolution pill still carries the
            `relay-limited (native …)` cue. Shown once media is flowing. -->
       <div
-        v-if="rc.phase.value === 'connected' && rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value || rc.hevcActive.value)"
+        v-if="rc.phase.value === 'connected' && rc.hasMedia.value && (statsCodecLabel || rc.dcActive.value)"
         class="stats-readout d-none d-md-flex mr-2"
         role="status"
         aria-live="polite"
@@ -1118,13 +1118,13 @@
           This agent is currently offline. The session will fail until the agent
           reconnects.
         </p>
-        <!-- Not offered right after the person at the device ended the session:
-             their Disconnect is an explicit "stop", and the next step offered is
-             Reconnect, which asks them again. Break-glass stays available from a
-             fresh page, with its reason, audit and owner notice (operator,
-             2026-10-10). -->
+        <!-- Not offered right after the person at the device ended the session
+             (their Disconnect is an explicit "stop"; Reconnect asks them again),
+             nor ever to an outsider, who has no break-glass (#3258): see
+             `offersBreakGlass`. A member keeps it on a fresh page, with its
+             reason, audit and owner notice (operator, 2026-10-10). -->
         <v-btn
-          v-if="rc.endedBy.value !== 'host'"
+          v-if="offersBreakGlass({ external: isExternal, endedBy: rc.endedBy.value })"
           variant="text"
           size="small"
           color="warning"
@@ -1333,7 +1333,7 @@
              math hang off `rc.mediaIntrinsicW/H` which the composable
              keeps in sync either way. -->
         <video
-          v-show="!isWebCodecsRender && !isVp9_444Render && !isHevcRender"
+          v-show="!isWebCodecsRender && !isDcRender"
           ref="videoEl"
           autoplay
           playsinline
@@ -1366,33 +1366,20 @@
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
-        <!-- Phase Y.4 render path: canvas fed by the VP9-444 worker
+        <!-- Phase Y.4 render path: canvas fed by the data-channel worker
              over a `video-bytes` DataChannel (no WebRTC video track,
-             no RTCRtpScriptTransform). Mounts when the composable's
-             `vp9_444Active` flag flips true (DC opened + worker
-             initialised). The composable's watcher transfers control
-             of this canvas to the worker via `transferControlToOffscreen`,
-             replacing the synthetic OffscreenCanvas it started with.
-             Same scale classes + style as the video for layout
-             parity. -->
+             no RTCRtpScriptTransform), one for every codec there since
+             FR-135 R3 (rc.80 gave HEVC a canvas of its own). Mounts when
+             the composable's `dcActive` flag flips true (DC opened +
+             worker initialised). The composable's watcher transfers
+             control of this canvas to the worker via
+             `transferControlToOffscreen`, replacing the synthetic
+             OffscreenCanvas it started with. Same scale classes + style
+             as the video for layout parity. -->
         <canvas
-          v-if="isVp9_444Render"
-          :ref="bindVp9_444Canvas"
-          class="remote-video vp9-444-canvas"
-          :class="`scale-${rc.scaleMode.value}`"
-          :style="videoScaleStyle"
-        />
-        <!-- rc.80 render path: canvas fed by the HEVC worker over the
-             same `video-bytes` DataChannel (no WebRTC video track).
-             Mounts when the composable's `hevcActive` flag flips
-             true. Same `transferControlToOffscreen` wiring as the
-             VP9-444 path — the composable's watcher swaps the
-             synthetic OffscreenCanvas the worker started with for
-             this visible element. -->
-        <canvas
-          v-if="isHevcRender"
-          :ref="bindHevcCanvas"
-          class="remote-video hevc-canvas"
+          v-if="isDcRender"
+          :ref="bindDcCanvas"
+          class="remote-video dc-canvas"
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
@@ -1418,9 +1405,9 @@
             <code>{{ rc.mediaUnavailable.value.code }}</code>.
             <span v-if="rc.mediaUnavailable.value.detail">{{ rc.mediaUnavailable.value.detail }}</span>
           </p>
-          <p class="text-caption text-medium-emphasis mt-1">
-            Remote shell, file transfer and the other channels are unaffected.
-          </p>
+          <!-- #3786 — what still works without a picture is the agent's to say, in the hint above:
+               only it knows its OS and install. A fixed line here said file transfer was unaffected,
+               under a hint saying otherwise (a Linux system install, nobody at its screen: #3711). -->
         </div>
         <!-- FR-93 P2d-2 — the host is asking the person at its screen to share
              it. Before this the canvas stayed blank and the viewer re-created
@@ -2593,6 +2580,8 @@ import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import { peerAuthBadge } from '@/utils/peerAuth'
+import { claimRcResume, notifyRcReloadSurface, registerRcReloadSurface } from '@/utils/staleBuildWatch'
+import type { RcReloadSurface } from '@/utils/staleBuildPolicy'
 import {
   useRemoteControl,
   nextDirPath,
@@ -2616,8 +2605,10 @@ import {
   awaitingConsentLabel,
   drawerPasteFiles,
   uploadOutcomeMessage,
+  isTransferCancelled,
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
+import { offersBreakGlass } from '@/composables/breakGlass'
 import {
   PICKER_CHROMAS,
   PICKER_CODECS,
@@ -3451,7 +3442,9 @@ async function downloadEntry(entry: { name: string; is_dir: boolean }) {
       showSuccess(`Downloaded ${r.name} (${formatFileSize(r.bytes)})`)
     }
   } catch (e) {
-    showError(`Download failed: ${(e as Error).message}`)
+    // #3726 — the Transfers row's Cancel, which the person chose.
+    if (isTransferCancelled(e)) showSnackbar(`Download cancelled: ${entry.is_dir ? `${entry.name}.zip` : entry.name}`, 'info', 4000)
+    else showError(`Download failed: ${(e as Error).message}`)
   }
 }
 
@@ -3659,6 +3652,8 @@ async function uploadMany(
     const said = uploadOutcomeMessage(results, items.length, destPath)
     if (said.level === 'success') showSuccess(said.text)
     else if (said.level === 'warning') showSnackbar(said.text, 'warning', 10000)
+    // #3726 — a Cancel the person chose, said as one.
+    else if (said.level === 'info') showSnackbar(said.text, 'info', 4000)
     else showError(said.text)
   } finally {
     uploadsInFlight.value--
@@ -4290,27 +4285,21 @@ function bindWebcodecsCanvas(el: Element | unknown) {
 }
 
 // Phase Y.4 view-side render gate. Flips true when the composable
-// has opened the `video-bytes` DC AND spun up the VP9-444 worker
-// (Y.3 sets `vp9_444Active` in `startVp9_444Path()`). Drives the
-// template `<canvas>` swap below — the legacy `<video>` element
-// stays hidden in this mode because the agent doesn't ship a
-// WebRTC video track when the negotiated transport is
-// `data-channel-vp9-444`.
-const isVp9_444Render = computed<boolean>(() => rc.vp9_444Active.value)
-/** Bind callback for the VP9-444 canvas. The composable's watcher
- *  on `vp9_444CanvasEl` transfers OffscreenCanvas control to the
+// has opened the `video-bytes` DC AND spun up the data-channel worker
+// (`dcActive`, set in `startDcPath()`), on any codec that rides the
+// channel. Drives the template `<canvas>` swap below — the legacy
+// `<video>` element stays hidden in this mode because the agent
+// doesn't ship a WebRTC video track when the negotiated transport is
+// a data-channel one.
+const isDcRender = computed<boolean>(() => rc.dcActive.value)
+/** Bind callback for the data-channel canvas. The composable's watcher
+ *  on `dcCanvasEl` transfers OffscreenCanvas control to the
  *  worker as soon as we set the ref, replacing the synthetic
  *  OffscreenCanvas the worker started with so decoded frames land
  *  on the visible element. */
-function bindVp9_444Canvas(el: Element | unknown) {
-  rc.vp9_444CanvasEl.value = (el as HTMLCanvasElement | null) ?? null
+function bindDcCanvas(el: Element | unknown) {
+  rc.dcCanvasEl.value = (el as HTMLCanvasElement | null) ?? null
 }
-
-// rc.80 — HEVC over DataChannel render gate. Flips true when the
-// composable's `media_pump_hevc_dc` peer-side counterpart has opened
-// the DC + spun up the HEVC worker. Drives the template's HEVC
-// canvas mount.
-const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
 
 // P1 — per-hop diagnostics pill (opt-in localStorage roomler-rc-diag-hud=1).
 // Read once at mount: flipping the flag is a reload-scoped A/B, matching the
@@ -4341,12 +4330,6 @@ const diagLabel = computed(() => {
     + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}${render}`
   )
 })
-/** Bind callback for the HEVC canvas. Same `transferControlToOffscreen`
- *  pattern as the VP9-444 canvas — composable's `hevcCanvasEl`
- *  watcher fires once the ref lands. */
-function bindHevcCanvas(el: Element | unknown) {
-  rc.hevcCanvasEl.value = (el as HTMLCanvasElement | null) ?? null
-}
 
 // Fullscreen toggle. Drives the stage element into/out of the browser's
 // Fullscreen API. `isFullscreen` tracks the real DOM state via the
@@ -4513,22 +4496,16 @@ const resolutionButtonTitle = computed(() => {
 const nativeSourceW = computed<number>(() => {
   const vi = rc.videoInfo.value
   if ((vi?.native_w ?? 0) > 0) return vi!.native_w
-  if (rc.hevcActive.value && rc.hevcStats.value.width > 0) {
-    return rc.hevcStats.value.width
-  }
-  if (rc.vp9_444Active.value && rc.vp9_444Stats.value.width > 0) {
-    return rc.vp9_444Stats.value.width
+  if (rc.dcActive.value && rc.dcStats.value.width > 0) {
+    return rc.dcStats.value.width
   }
   return rc.mediaIntrinsicW.value || 0
 })
 const nativeSourceH = computed<number>(() => {
   const vi = rc.videoInfo.value
   if ((vi?.native_h ?? 0) > 0) return vi!.native_h
-  if (rc.hevcActive.value && rc.hevcStats.value.height > 0) {
-    return rc.hevcStats.value.height
-  }
-  if (rc.vp9_444Active.value && rc.vp9_444Stats.value.height > 0) {
-    return rc.vp9_444Stats.value.height
+  if (rc.dcActive.value && rc.dcStats.value.height > 0) {
+    return rc.dcStats.value.height
   }
   return rc.mediaIntrinsicH.value || 0
 })
@@ -4774,7 +4751,7 @@ const statsCodecLabel = computed(() => {
   // replaces the hardcoded "VP9 4:4:4 SW" that lied when the agent
   // actually ran vp9_qsv HW at 4:2:0.
   const vi = rc.videoInfo.value
-  if (vi && (rc.vp9_444Active.value || rc.hevcActive.value)) {
+  if (vi && rc.dcActive.value) {
     const codecName = vi.codec.toLowerCase() === 'h265'
       ? 'H.265'
       : vi.codec.toLowerCase() === 'h264'
@@ -4831,7 +4808,7 @@ const statsCodecLabel = computed(() => {
   // reported "VP9 4:4:4" and the operator went looking at the codec picker
   // instead of the capture failure (field, 2026-09-08). A pill must not name
   // a codec nobody told it.
-  if (rc.vp9_444Active.value || rc.hevcActive.value) {
+  if (rc.dcActive.value) {
     return codecLabelFromDecoderConfig(rc.dcDecoderCodec.value)
   }
   const raw = rc.stats.value.codec
@@ -4852,13 +4829,11 @@ const statsCodecLabel = computed(() => {
   return `${display} ${hasHw ? 'HW' : 'SW'}`
 })
 const statsBitrateLabel = computed(() => {
-  // VP9-444 + rc.80 HEVC read from the worker-emitted stats since
+  // A data-channel session reads the worker-emitted stats since
   // there's no RTP track means getStats() has nothing for video.
-  const bps = rc.hevcActive.value
-    ? rc.hevcStats.value.bitrateBps
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.bitrateBps
-      : rc.stats.value.bitrate_bps
+  const bps = rc.dcActive.value
+    ? rc.dcStats.value.bitrateBps
+    : rc.stats.value.bitrate_bps
   if (bps <= 0) return '— bps'
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
   return `${Math.round(bps / 1_000)} kbps`
@@ -4878,30 +4853,24 @@ const statsAgeLabel = computed(() => {
   return `~${Math.round(age.avgMs)} ms`
 })
 const statsFpsLabel = computed(() => {
-  const fps = rc.hevcActive.value
-    ? rc.hevcStats.value.fps
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.fps
-      : rc.stats.value.fps
+  const fps = rc.dcActive.value
+    ? rc.dcStats.value.fps
+    : rc.stats.value.fps
   if (fps <= 0) return '— fps'
   return `${Math.round(fps)} fps`
 })
 /** rc.35 — source resolution pill. Shown on every render path that
- *  exposes intrinsic dims (VP9-444 worker emits them in `stats`;
+ *  exposes intrinsic dims (the data-channel worker emits them in `stats`;
  *  WebRTC/WebCodecs paths set `mediaIntrinsicW/H` from `first-frame`
  *  or `<video>.onresize`). Useful when verifying that rc:resolution
  *  / auto-downscale / DPI flips landed at the dims you expect. */
 const statsResolutionLabel = computed(() => {
-  const w = rc.hevcActive.value
-    ? rc.hevcStats.value.width
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.width
-      : rc.mediaIntrinsicW.value
-  const h = rc.hevcActive.value
-    ? rc.hevcStats.value.height
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.height
-      : rc.mediaIntrinsicH.value
+  const w = rc.dcActive.value
+    ? rc.dcStats.value.width
+    : rc.mediaIntrinsicW.value
+  const h = rc.dcActive.value
+    ? rc.dcStats.value.height
+    : rc.mediaIntrinsicH.value
   if (!w || !h) return ''
   const base = `${w}×${h}`
   // rc.199 — the "why is Original blurry?" answer. The agent reports its
@@ -4920,16 +4889,12 @@ const statsResolutionLabel = computed(() => {
 /** FR-70 P1 — the decoded frame size, for the Resolution setting's
  *  override hint (same source as the pill above). */
 const decodedDims = computed(() => {
-  const w = rc.hevcActive.value
-    ? rc.hevcStats.value.width
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.width
-      : rc.mediaIntrinsicW.value
-  const h = rc.hevcActive.value
-    ? rc.hevcStats.value.height
-    : rc.vp9_444Active.value
-      ? rc.vp9_444Stats.value.height
-      : rc.mediaIntrinsicH.value
+  const w = rc.dcActive.value
+    ? rc.dcStats.value.width
+    : rc.mediaIntrinsicW.value
+  const h = rc.dcActive.value
+    ? rc.dcStats.value.height
+    : rc.mediaIntrinsicH.value
   return { w, h }
 })
 /** FR-74 P4 — screen pixels per remote pixel, from the decoded frame, the
@@ -5029,7 +4994,7 @@ function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: nu
   // `<video>` is hidden + unfed (videoWidth=0), so the agent's encode
   // resolution we cached from the worker's `first-frame` message is
   // the only ground truth for source pixel size.
-  const useIntrinsic = rc.vp9_444Active.value || rc.webcodecsActive.value || rc.hevcActive.value
+  const useIntrinsic = rc.dcActive.value || rc.webcodecsActive.value
   const srcW = useIntrinsic
     ? rc.mediaIntrinsicW.value
     : (video?.videoWidth ?? 0)
@@ -5501,6 +5466,60 @@ function startSession() {
   rc.connect(agent.value.id, undefined, false, tenantId.value)
 }
 
+// #3582 — the one time this page connects without a click. A reload for a new
+// build that took over a session's redial (its session already cut, its next
+// one about to be opened by the ladder) left the args that redial would have
+// used; this load resumes it once, through the redial's own ladder
+// (`resumeAfterReload`), so a device still restarting is retried as the redial
+// would have retried it, and the device decides consent as it would have for
+// the redial. `claimRcResume` refuses an intent older than a minute, one
+// recorded for another page or another person, and any page but the first
+// this load rendered; the intent is gone from storage either way. Never for
+// an external session: none is ever handed over (`utils/staleBuildWatch.ts`).
+let viewUnmounted = false
+watch(
+  () => rc.phase.value,
+  () => notifyRcReloadSurface(),
+)
+/** The signed-in person's id: the shell fetches it as this page loads its device. */
+function signedInUserId(timeoutMs: number): Promise<string | null> {
+  const now = authStore.user?.id
+  if (now) return Promise.resolve(now)
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const stop = watch(
+      () => authStore.user?.id,
+      (id) => {
+        if (!id) return
+        if (timer !== null) clearTimeout(timer)
+        stop()
+        resolve(id)
+      },
+    )
+    timer = setTimeout(() => {
+      stop()
+      resolve(null)
+    }, timeoutMs)
+  })
+}
+async function resumeAfterNewBuild() {
+  if (isExternal || viewUnmounted) return
+  const userId = await signedInUserId(10_000)
+  if (viewUnmounted) return
+  const args = claimRcResume({ agentId: agentId.value, tenantId: tenantId.value ?? null, path: location.pathname, userId })
+  if (!args || agent.value?.id !== args.agentId || rc.phase.value !== 'idle') return
+  rc.resumeAfterReload(args)
+}
+// What the page asks of a reload: the viewer's own reading, and the rating
+// prompt a session's end leaves on the page, which a reload would wipe.
+const reloadSurface: RcReloadSurface = {
+  ...rc.reloadSurface,
+  state: () => {
+    const s = rc.reloadSurface.state()
+    return { ...s, hold: s.hold || ratingPending.value !== null }
+  },
+}
+
 // FR-100 P2a — the toolbar's word on the device's identity key, and the one
 // way to accept a key that changed: the person's click, then a fresh attempt
 // that must prove it.
@@ -5564,11 +5583,14 @@ watch(
       }
       const rvfc = elWithRvfc.requestVideoFrameCallback
       if (typeof rvfc === 'function') {
-        const tick = () => {
+        const tick = (now: number) => {
           if (!videoEl.value) {
             rvfcHandle = null
             return
           }
+          // FR-138 — a frame presented: the `<video>` path's half of the
+          // picture's gap across a held session's cut (`rc.resume`).
+          rc.notePaint(now)
           if (videoEl.value.paused) {
             videoEl.value.play().catch(() => { /* autoplay gating — ignore */ })
           }
@@ -5697,8 +5719,12 @@ watch(
   },
 )
 
+let unregisterReloadSurface: (() => void) | null = null
 onMounted(() => {
-  void loadAgent()
+  // #3582 — a reload for a new build reads this viewer's session, and may take
+  // over its redial; the load after it may resume that session, once.
+  unregisterReloadSurface = registerRcReloadSurface(reloadSurface)
+  void loadAgent().then(resumeAfterNewBuild)
   void agentStore.fetchKeepBusyDefaultPattern(tenantId.value).then((p) => {
     orgKeepBusyDefault.value = p
   })
@@ -5717,6 +5743,9 @@ onMounted(() => {
   window.addEventListener('keydown', onWindowKeyDownForDrawer)
 })
 onBeforeUnmount(() => {
+  viewUnmounted = true
+  unregisterReloadSurface?.()
+  unregisterReloadSurface = null
   if (agentStatusTimer !== null) {
     clearInterval(agentStatusTimer)
     agentStatusTimer = null
@@ -6080,8 +6109,7 @@ onBeforeUnmount(() => {
  * browsers without the hint fall back silently to `auto` (bilinear).
  * For pixel-perfect 1:1 viewing, switch the scale mode to Original. */
 .remote-video.webcodecs-canvas,
-.remote-video.vp9-444-canvas,
-.remote-video.hevc-canvas {
+.remote-video.dc-canvas {
   image-rendering: high-quality;
 }
 .remote-video.scale-adaptive {

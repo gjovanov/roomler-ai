@@ -17,9 +17,111 @@
 #     closing the association and every stream on it. Upstream ended the
 #     loop on any send error, so one EHOSTUNREACH from a route that was
 #     absent for 3 ms killed a remote-desktop session outright. A transport
-#     that is really closed is still detected by the read loop.
+#     that is really closed is detected by the read loop once the ICE agent
+#     under it is closed, which the peer connection's close does (#3716).
 #   - src/association/association_test.rs: the regression test (a send
 #     that fails once; the message must arrive by retransmission).
+#   - src/queue/pending_queue.rs, src/stream/mod.rs and
+#     src/association/association_internal.rs (#3716): the association's
+#     close lets go every writer parked in flow control (the semaphore is
+#     closed; a write it lets go fails instead of waiting forever), and a
+#     stream's reset no longer queues behind such a writer. On a dead path
+#     the peer never acks, so a data channel's close waited forever behind
+#     the video writer, and with it the peer connection's close: its ICE
+#     agent, sockets and this association lived until the process exited.
+#     A write holds its stream's `write_turn` from its shutdown check until
+#     its chunks are queued, and the reset waits for that turn on its task,
+#     so it never goes ahead of a write the check let through.
+#   - src/stream/stream_test.rs: the regression test for that order (a
+#     reset taken while a write holds its turn queues behind the write).
+#   - src/queue/pending_queue.rs and src/stream/mod.rs (#3755): a write cut
+#     short (a timeout, a `select!` arm, a task abort) leaves its stream
+#     whole. Upstream spent the stream's sequence number and added to
+#     `buffered_amount` in `packetize`, before the waits for the queue's
+#     lock and room, so a write dropped in those waits left a gap: the
+#     receiver of an ordered stream waited for that number forever (RFC
+#     4960 §6.6), and every later message of the stream waited behind it.
+#     The queue now commits a write (`Stream::commit_write`) once its first
+#     chunk has room, with no await before that chunk's push. A large
+#     message cut after its first chunk queues its rest as it drops
+#     (`BegunMessage`), owing the rest's bytes before it reads the room
+#     (`PendingQueue::overdraft`, which the free room and then `pop` pay
+#     back). A `pop` that decided what it pays before the debt was recorded
+#     gives its chunk back after the drop read the room: one chunk of room
+#     free per racing drop while the rest is owed, one rest added per race
+#     (a large message that begins on it, cut while owed), so at most
+#     (1 + races) times the largest message owed; exact at rest. A
+#     write that must wait for room wakes the write loop first: on an
+#     association with nothing in flight nothing else woke it, and a
+#     message larger than the room left waited forever.
+#   - src/queue/queue_test.rs, src/stream/stream_test.rs,
+#     src/association/association_test.rs and test-only seams in
+#     src/association/association_internal.rs and src/queue/pending_queue.rs:
+#     the regression tests (a cut write, a cut large write, writers cut at
+#     random on one thread and on two, the queue's accounting at rest, pops
+#     during a cut message's drop and one split around it, a refused and an
+#     empty write).
+#   - src/association/delivery.rs (new), src/association/mod.rs,
+#     src/association/association_internal.rs and src/queue/pending_queue.rs
+#     (FR-148 P0): the association's acknowledgement clock, read without its
+#     lock (`Association::delivery_clock`). The SACK handler counts the user
+#     data the peer acknowledged, over every stream; the pending queue counts
+#     each time it fills and runs empty. The agent reads both to tell a
+#     delivery rate the path carried while bytes waited from one an idle
+#     sender set; the write call cannot, as it returns once SCTP has queued
+#     the bytes. Counting only: nothing the association does changes.
+#     src/queue/queue_test.rs holds its test (the fills, the empties and the
+#     acknowledged bytes, read through the clock).
+#   - src/association/association_internal.rs and src/association/delivery.rs
+#     (FR-148 P0): the clock counts the bytes the peer received. Under
+#     partial reliability a FORWARD TSN lets the cumulative point pass a
+#     chunk the peer never had, and `maxRetransmits: 0` marks every chunk
+#     abandoned at its first send, so the flag says nothing about loss. An
+#     abandoned chunk is left out when a SACK reported it missing or it was
+#     outstanding at a T3-rtx expiry (`DeliveryCounters::loss_mark`); the
+#     buffer release and the congestion window still use the full sum.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its tests (a skipped chunk, a gap-acked one counted once, a
+#     T3-rtx expiry, and an abandoned chunk with no evidence of loss).
+#   - src/association/gauges.rs (new), src/association/mod.rs,
+#     src/association/association_internal.rs and src/queue/pending_queue.rs
+#     (FR-148 P0 step 4a): the association's congestion gauges, read without
+#     its lock (`Association::gauges`): the congestion window, the slow start
+#     threshold, the peer's receive window, the bytes in flight and waiting,
+#     the fast retransmissions and T3-rtx expiries, and the acknowledgement
+#     delay of the newest chunk a SACK newly acknowledged that was sent once.
+#     The agent's open-time train reads them to tell the path's push-back
+#     from a window of SCTP's own. Each is a relaxed store, add or min where
+#     its value changes; nothing in the association reads one, so a reader
+#     changes nothing it sends.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its tests (one scripted exchange run with and without a reader,
+#     compared packet by packet; the acknowledgement delay; a clock gone
+#     backwards).
+#   - src/association/gauges.rs and src/association/mod.rs (FR-148 O10):
+#     `GaugeReader::peek`, the gauges read as `take` reads them but resetting
+#     nothing, so the agent's open-path line, which only looks, leaves the
+#     least acknowledgement delay to the reader that takes it.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its test (a peek between two SACKs, then a take).
+#   - src/association/association_internal.rs (#4033): `on_ack_timeout`
+#     stops the delayed acknowledgement timer that fired. Its task left
+#     `close_tx` set, and `AckTimer::start` arms nothing while it is, so
+#     after one delayed SACK the next lone DATA packet armed no timer: its
+#     SACK waited for another packet or for the sender's T3-rtx (this
+#     crate's at 1 s at the earliest), whose expiry also cuts the sender's
+#     congestion window to one packet (RFC 4960 §7.2.3). It reached every
+#     association this crate receives on: what a viewer sends the agent
+#     (input, clipboard, uploads) and tunnel bytes on webrtc-dc-v1. A late
+#     timeout (its timer stopped, and another armed, while it waited for the
+#     association's lock) stops that other timer too, and the SACK that one
+#     was for goes at once: none is lost, and the timer is never left
+#     unarmed for good. Upstream's timer is the same in 0.17.3, and its
+#     `on_ack_timeout` in 0.17.0.
+#     src/association/association_test.rs and
+#     src/association/association_internal/association_internal_test.rs
+#     hold its tests (two lone packets, each acknowledged within the
+#     interval; a late timeout delivered in the race's order).
 
 [package]
 edition = "2021"

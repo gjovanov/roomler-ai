@@ -47,10 +47,10 @@ CLIENT_PATHS=(
   agents/roomler-desktop
   agents/roomler-cli-shim
   agents/roomlerdw
+  agents/roomler-msi-ca
   agents/roomler-setup
   agents/roomler-cli
   crates/agent-core
-  crates/hive-node
   crates/roomler-setup-core
   crates/tunnel-core
   crates/remote_control
@@ -88,9 +88,6 @@ SERVER_CRATES=(
   roomler-ai-mod-fleet
   roomler-ai-mod-remote
   roomler-ai-mod-network
-  roomler-ai-mod-hive
-  roomler-ai-mod-vault
-  roomler-ai-mod-knowhow
   roomler-ai-services
   roomler-ai-db
   roomler-ai-config
@@ -103,10 +100,10 @@ CLIENT_CRATES=(
   roomler-desktop
   roomler-cli-shim
   roomlerdw
+  roomler-msi-ca
   roomler-setup
   roomler-cli
   roomler-node-core
-  roomler-hive-node
   roomler-setup-core
   roomler-ai-tunnel-core
   roomler-ai-remote-control
@@ -120,6 +117,7 @@ CLIENT_CRATES=(
 SHIPPED_AGENT_CRATES=(
   roomlerd
   roomlerdw
+  roomler-msi-ca
   roomler-cli
   roomler-cli-shim
   roomler-desktop

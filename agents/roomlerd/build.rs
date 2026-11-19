@@ -30,14 +30,10 @@
 //! surface.
 //!
 //! No-op on every non-Windows host.
-//!
-//! It also sets `cfg(hive_host)` ([`hive_host`], FR-90 P1h).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    hive_host();
-    worker_calls();
     windows_main_stack();
 
     #[cfg(windows)]
@@ -62,7 +58,7 @@ fn main() {
 /// both. It is a reserve, not a commit — pages are committed only as the stack
 /// grows. Threads created with an explicit size (std's, tokio's) are
 /// unaffected; any thread the OS creates at the image default gets the same
-/// reserve. Keyed on the TARGET, like [`hive_host`]: a build script runs on the
+/// reserve. Keyed on the TARGET: a build script runs on the
 /// host. `-bin=roomlerd` scopes it to this one binary, as the version resource
 /// below is.
 fn windows_main_stack() {
@@ -76,37 +72,6 @@ fn windows_main_stack() {
             println!("cargo:rustc-link-arg-bin=roomlerd=-Wl,--stack,{STACK_BYTES}")
         }
         _ => {}
-    }
-}
-
-/// FR-90 P1h — `cfg(hive_host)`: this build hosts agent sessions. That is the
-/// `hive` feature, on an operating system whose session launcher exists:
-/// Linux, macOS from P1h, and Windows from P1i-2, as the console user only.
-/// One name at the forty-odd sites that would each
-/// spell `all(feature = "hive", any(target_os = …))`, so the next system is
-/// one line here. Read from Cargo's environment, not `cfg!`: a build script
-/// runs on the HOST, and these describe the TARGET.
-fn hive_host() {
-    println!("cargo::rustc-check-cfg=cfg(hive_host)");
-    let hive = std::env::var_os("CARGO_FEATURE_HIVE").is_some();
-    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if hive && matches!(os.as_str(), "linux" | "macos" | "windows") {
-        println!("cargo::rustc-cfg=hive_host");
-    }
-}
-
-/// FR-90 P8-2b-1, P8-2b-3 — `cfg(worker_calls)`: a session's worker takes the
-/// daemon's calls (P8-2a-2's endpoints, P8-2a-4b's egress fronts). That is the
-/// `vault` feature, on every OS it builds for: a listener crosses as
-/// `SCM_RIGHTS` on the second channel on Unix (`worker/fds.rs`, gated
-/// `cfg(all(worker_calls, unix))` on top of this), and inside the call's own
-/// frame as `WSAPROTOCOL_INFOW` on Windows, since there is no second channel
-/// there (P8-2b-3). Read from Cargo's environment, as [`hive_host`] is.
-fn worker_calls() {
-    println!("cargo::rustc-check-cfg=cfg(worker_calls)");
-    let vault = std::env::var_os("CARGO_FEATURE_VAULT").is_some();
-    if vault {
-        println!("cargo::rustc-cfg=worker_calls");
     }
 }
 

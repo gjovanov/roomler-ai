@@ -1,162 +1,116 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
-//! Resolve the active-session user's profile directory from a
-//! SystemContext worker.
+//! The account signed in to this process's session, for the install
+//! clean-up's per-user arm (`install_cleanup.rs`).
 //!
 //! ## Why
 //!
-//! The SystemContext worker runs as `LocalSystem` (S-1-5-18) but
-//! lives in the user's interactive session (typically session 1).
-//! That means the worker's own `%APPDATA%` resolves to
-//! `C:\Windows\System32\config\systemprofile\AppData\Roaming\` —
-//! NOT the user's profile. The agent's config file (with the
-//! enrollment token, agent_id, server URL, etc.) was written into
-//! the user's profile by the user-context enrollment flow, so the
-//! SystemContext worker can't see it via the default
-//! `ProjectDirs::config_dir()` lookup.
+//! The clean-up removes a person's data trees from their profile when an
+//! install changes flavour. It runs elevated, often as an account other than
+//! the person signed in (an operator's `roomlerd cleanup-legacy-install`), so
+//! its own profile is not theirs, and a SystemContext worker's (`LocalSystem`)
+//! is `C:\Windows\System32\config\systemprofile\`.
 //!
-//! Field repro the field-test host 2026-05-06: every SystemContext spawn exited
-//! with `code=1` within ~500 ms, no log files written. Root cause:
-//! `config::load(default_path)` returned `not found` for the SYSTEM-
-//! profile path; `anyhow` propagated to main; process exited with
-//! code 1 BEFORE `logging::init()` had a chance to fire.
+//! A SystemContext worker never loads its CONFIG from here: it runs
+//! the machine's own enrollment and nothing else (#3387, `app.rs`
+//! `pick_config_path`). The person's own enrollment runs as that
+//! person, on the service host's user-context arm. Nor does it find the
+//! person's Downloads here: a received file is written as the person,
+//! into the Downloads their token names (#3048, `files::FsAs`).
 //!
-//! ## How
+//! ## How (FR-145)
 //!
-//! 1. `ProcessIdToSessionId(GetCurrentProcessId())` — discover the
-//!    worker's own session id. This works regardless of whether the
-//!    user is on the lock screen or actively interacting.
-//! 2. `WTSQuerySessionInformationW(NULL, sid, WTSUserName)` — look
-//!    up the username for that session. Returns "Administrator"
-//!    or whatever; empty string if no user is logged in.
-//! 3. Build `C:\Users\<username>\AppData\Roaming\roomler\
-//!    roomler\config\config.toml` (a host installed before the
-//!    rename keeps `roomler-agent` there, so both are tried — see
-//!    `config_candidates_under`). Uses the standard Win11
-//!    profile location; fails gracefully (returns `None`) if the
-//!    profile isn't there.
+//! 1. `ProcessIdToSessionId(GetCurrentProcessId())`: this process's
+//!    session, whether the person is at the lock screen or working.
+//! 2. `WTSQuerySessionInformationW` for `WTSUserName` and `WTSDomainName`:
+//!    the account signed in there; an empty name when nobody is.
+//! 3. `LookupAccountNameW("<domain>\<user>")`: that account's SID, a user
+//!    account only (`SidTypeUser`). The domain-qualified name names exactly
+//!    one account, so a local account and a domain account of the same name
+//!    are never confused. It needs no privilege beyond the elevated
+//!    operator's, where the session's own token (`WTSQueryUserToken`) would
+//!    need SYSTEM's.
 //!
-//!
-// RETIRED-NAME-ANCHOR-BEGIN
-// From here down, `roomler-agent` names the PRE-RENAME appdirs segment that
-// a host installed before P4b still has. The resolver returns both segments
-// and the tests pin the order; dropping the retired one is what removed the
-// user-config rung from every post-rename install in the first place.
-//! ## Limitations
-//!
-//! * Assumes the user's profile directory is at `C:\Users\<name>`.
-//!   On hosts with redirected profiles (drive D:, mapped network
-//!   home folders) this is wrong. We could read
-//!   `HKLM\Software\Microsoft\Windows NT\CurrentVersion\ProfileList`
-//!   for the SID-keyed profile path, but that's significantly more
-//!   FFI for a corner case. The operator can override with
-//!   `--config <explicit>` on the SCM service's ImagePath as the
-//!   workaround.
-//! * Returns `None` (caller falls back to default path) if any FFI
-//!   call fails. The worker will then exit with code 1, but at
-//!   least the supervisor's log line is honest about it.
+//! The clean-up then takes the profile the system records for that SID
+//! (`appdirs::profile_of_account`, `ProfileList\<sid>\ProfileImagePath`).
+//! Nothing here builds a profile path from a user name: `C:\Users\<name>` can
+//! be another account's folder (a local and a domain account of one name), or
+//! none (`<name>.000`, `<name>.<DOMAIN>`, a renamed account, a profile on
+//! another drive). `win_identity.rs` takes the file transfers' profile from
+//! the person's token for the same reason.
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
-use std::path::{Path, PathBuf};
-
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE, SidTypeUser};
 use windows_sys::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSQuerySessionInformationW,
-    WTSUserName,
+    ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory,
+    WTSQuerySessionInformationW, WTSUserName,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
-/// Resolve the active-session user's profile root (`C:\Users\<name>`).
-/// Returns `None` if any of the discovery steps fail (no logged-in
-/// user, FFI failure).
-///
-/// Used by the various `active_user_*_path()` helpers below; pulled
-/// out so each new feature with a profile-relative path doesn't
-/// re-implement the FFI dance. The lesson from rc.6 (config) and rc.7
-/// (file-DC Downloads): every SystemContext feature that touches a
-/// `%USERPROFILE%`-derived path needs an active-user fallback.
-pub fn active_user_profile_root() -> Option<PathBuf> {
-    let session_id = current_session_id()?;
-    let username = user_name_for_session(session_id)?;
-    Some(PathBuf::from(format!("C:\\Users\\{username}")))
+/// The user name of the account signed in to this process's session.
+/// `None` when nobody is signed in, or any of the discovery steps fail.
+pub fn session_user_name() -> Option<String> {
+    session_text(current_session_id()?, WTSUserName)
 }
 
-/// Per-user config candidates under `root`, most-current first.
-///
-/// The segment under `%APPDATA%\roomler\` is the appdirs *application*
-/// name, which P4b renamed `roomler-agent` -> `roomler`. A host installed
-/// before that rename still has the old tree, so both are candidates.
-///
-/// This cannot just call `appdirs`: a SystemContext worker runs as
-/// LocalSystem, so `ProjectDirs` would resolve the LocalSystem profile —
-/// the whole reason this module exists is to reach the INTERACTIVE user's
-/// profile instead. The segment list is therefore duplicated here on
-/// purpose, and `appdirs`'s own constants are the thing to keep it in step
-/// with.
-fn config_candidates_under(root: &Path) -> [PathBuf; 2] {
-    let base = root.join("AppData").join("Roaming").join("roomler");
-    [
-        base.join("roomler").join("config").join("config.toml"),
-        base.join("roomler-agent")
-            .join("config")
-            .join("config.toml"),
-    ]
+/// The SID of the account signed in to this process's session, as text
+/// (`S-1-5-21-…`): its domain-qualified name looked up with
+/// `LookupAccountNameW`, a user account only. `None` when nobody is signed
+/// in, or the account cannot be told.
+pub fn session_account_sid() -> Option<String> {
+    let session = current_session_id()?;
+    let user = session_text(session, WTSUserName)?;
+    let domain = session_text(session, WTSDomainName)?;
+    account_sid(&format!("{domain}\\{user}"))
 }
 
-/// Resolve the active-session user's config file path.
-/// Returns `None` if any of the discovery steps fail (no logged-in
-/// user, FFI failure, profile not at standard location).
-///
-/// Caller (typically main.rs's config_path resolution) uses this as
-/// a fallback when the default `ProjectDirs::config_dir()` lookup
-/// returns a path that doesn't exist. That caller then filters on
-/// `exists()`, so returning only ONE segment silently drops the rung
-/// whenever the host is on the other one — which is what happened to
-/// every post-rename install until FR-21: the hardcoded segment was the
-/// pre-rename one, so a freshly installed host had no user-config rung
-/// at all, with nothing logged.
-///
-/// Returns the first candidate that exists; if neither does, the current
-/// one, so the logged path names where the config SHOULD go.
-pub fn active_user_config_path() -> Option<PathBuf> {
-    let root = active_user_profile_root()?;
-    let candidates = config_candidates_under(&root);
-    Some(
-        candidates
-            .iter()
-            .find(|p| p.exists())
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone()),
-    )
+/// The SID of the user account `account` (`<domain>\<user>`), as text.
+fn account_sid(account: &str) -> Option<String> {
+    let name: Vec<u16> = account.encode_utf16().chain(Some(0)).collect();
+    let mut sid_len = 0u32;
+    let mut domain_len = 0u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a NUL-terminated name; null buffers with zero sizes ask for the
+    // sizes, which the call writes back.
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if sid_len == 0 {
+        return None;
+    }
+    let mut sid = vec![0u8; sid_len as usize];
+    let mut domain = vec![0u16; domain_len.max(1) as usize];
+    // SAFETY: buffers of the sizes the first call asked for, alive across
+    // the call.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok == 0 || kind != SidTypeUser {
+        return None;
+    }
+    Some(crate::win_token::sid_string(sid.as_mut_ptr().cast()))
 }
 
-/// Resolve the active-session user's Downloads folder path.
-///
-/// Used by the file-DC handler (`files::download_dir`) under
-/// SystemContext to land uploads in the user's actual Downloads
-/// folder, not the LocalSystem profile's
-/// `C:\Windows\System32\config\systemprofile\Downloads\` (which
-/// usually doesn't exist; field repro the field-test host rc.7: the file-DC
-/// `begin()` call hung because `tokio::fs::create_dir_all` failed
-/// silently on a path with no SYSTEM-profile parent ACL grant).
-///
-/// Returns `None` if the user has no logged-in session OR if the
-/// resolved path doesn't exist (don't optimistically point uploads
-/// at a phantom directory). The caller is expected to fall through
-/// to a non-SystemContext resolution (`directories::UserDirs`) or
-/// the temp-dir fallback.
-pub fn active_user_downloads_path() -> Option<PathBuf> {
-    let path = active_user_profile_root()?.join("Downloads");
-    if path.exists() { Some(path) } else { None }
-}
-
-/// `ProcessIdToSessionId(GetCurrentProcessId())`. Returns the session
-/// id this worker is attached to. The SystemContext spawn pipeline
-/// puts the worker in the active interactive session so this is the
-/// session where the user lives.
+/// `ProcessIdToSessionId(GetCurrentProcessId())`: the session this
+/// process is attached to.
 fn current_session_id() -> Option<u32> {
     // SAFETY: GetCurrentProcessId is a thread-safe Win32 call with
     // no preconditions, no ownership concerns.
@@ -168,24 +122,22 @@ fn current_session_id() -> Option<u32> {
     if ok == 0 { None } else { Some(sid) }
 }
 
-/// `WTSQuerySessionInformationW(NULL, sid, WTSUserName, ...)` →
-/// owned `String`. Returns `None` for failure or empty username
-/// (no logged-in user — typically the lock screen with no user
-/// session yet, e.g. fresh boot before first login).
-fn user_name_for_session(sid: u32) -> Option<String> {
+/// `WTSQuerySessionInformationW(NULL, session, class, ...)` → owned
+/// `String`. `None` for a failure or an empty answer (no signed-in user,
+/// typically a fresh boot before the first sign-in).
+fn session_text(session: u32, class: WTS_INFO_CLASS) -> Option<String> {
     let mut buffer: *mut u16 = std::ptr::null_mut();
     let mut bytes_returned: u32 = 0;
 
-    // SAFETY: WTS_CURRENT_SERVER_HANDLE is a documented sentinel
-    // that means "this server"; sid is a u32; WTSUserName is a
-    // documented enum value; `&mut buffer` is a stack ptr the API
-    // writes into; same for `&mut bytes_returned`. On success the
-    // buffer is OS-allocated and must be released via WTSFreeMemory.
+    // SAFETY: WTS_CURRENT_SERVER_HANDLE is a documented sentinel that means
+    // "this server"; `class` is a documented value; the out-params are stack
+    // pointers the API writes into. On success the buffer is OS-allocated
+    // and released via WTSFreeMemory below.
     let ok = unsafe {
         WTSQuerySessionInformationW(
             WTS_CURRENT_SERVER_HANDLE as HANDLE,
-            sid,
-            WTSUserName,
+            session,
+            class,
             &mut buffer,
             &mut bytes_returned,
         )
@@ -245,80 +197,28 @@ mod tests {
         );
     }
 
+    /// FR-145 — the session's account is told by its SID, and the system
+    /// records a profile for it: what the per-user clean-up removes from.
     #[test]
-    fn active_user_config_path_under_test_runner_resolves() {
-        // Under cargo test we're a logged-in user, so this resolves to OUR
-        // profile. Which SEGMENT it lands on depends on what exists on this
-        // box, so assert the shape, not one spelling — pinning a single
-        // segment is what let the pre-rename one survive here unnoticed.
-        let path = active_user_config_path();
-        assert!(path.is_some(), "should resolve under user context");
-        let p = path.unwrap();
-        let s = p.to_string_lossy().to_lowercase();
+    fn the_session_account_is_told_by_its_sid() {
+        let Some(name) = session_user_name() else {
+            eprintln!("NOTE: nobody is signed in to this session; nothing to tell");
+            return;
+        };
+        let sid = session_account_sid().expect("the signed-in account's SID");
+        assert!(sid.starts_with("S-1-"), "{name}: {sid}");
         assert!(
-            s.contains("\\users\\"),
-            "path should be under C:\\Users: {p:?}"
-        );
-        assert!(
-            s.ends_with("\\roomler\\config\\config.toml")
-                || s.ends_with("\\roomler-agent\\config\\config.toml"),
-            "path should end with a known config segment: {p:?}"
+            crate::appdirs::profile_of_account(&sid).is_some(),
+            "{name} ({sid}) has a profile the system records"
         );
     }
 
+    /// Only a user account is told: a group's name, or a name no account
+    /// has, is not.
     #[test]
-    fn config_candidates_put_the_current_segment_first() {
-        // The bug this replaced: only the PRE-RENAME segment was ever
-        // returned, so on a freshly installed host the caller's exists()
-        // filter dropped the user-config rung entirely — silently, because
-        // a missing candidate is indistinguishable from no logged-in user.
-        let root = Path::new("C:\\Users\\someone");
-        let got = config_candidates_under(root);
-        let a = got[0].to_string_lossy().to_lowercase();
-        let b = got[1].to_string_lossy().to_lowercase();
-        assert!(
-            a.ends_with("\\roomler\\roomler\\config\\config.toml"),
-            "current segment must come first: {a}"
-        );
-        assert!(
-            b.ends_with("\\roomler\\roomler-agent\\config\\config.toml"),
-            "pre-rename segment must still be offered: {b}"
-        );
-    }
-    #[test]
-    fn active_user_profile_root_under_test_runner_resolves() {
-        let root = active_user_profile_root();
-        assert!(root.is_some(), "should resolve under user context");
-        let p = root.unwrap();
-        let s = p.to_string_lossy().to_lowercase();
-        assert!(
-            s.starts_with("c:\\users\\"),
-            "path should be C:\\Users\\<name>: {p:?}"
-        );
-    }
-
-    #[test]
-    fn active_user_downloads_path_existence_gated() {
-        // Under cargo test runner, our user profile DOES exist and
-        // Downloads usually does too — but not guaranteed (e.g. CI
-        // runners with stripped profiles). The function returns
-        // None when the path doesn't exist; assert only the shape
-        // when Some, and accept None silently otherwise.
-        if let Some(p) = active_user_downloads_path() {
-            let s = p.to_string_lossy().to_lowercase();
-            assert!(
-                s.contains("\\users\\"),
-                "path should be under C:\\Users: {p:?}"
-            );
-            assert!(
-                s.ends_with("\\downloads"),
-                "path should end with \\Downloads: {p:?}"
-            );
-            assert!(
-                p.exists(),
-                "function returned Some(p) but p doesn't exist: {p:?}"
-            );
-        }
+    fn a_name_that_is_no_user_account_has_no_sid() {
+        assert_eq!(account_sid(r"NT AUTHORITY\NETWORK"), None, "a group");
+        assert_eq!(account_sid("no-such-account-fr145"), None);
     }
 
     #[test]
@@ -344,4 +244,3 @@ mod tests {
         assert!(result.is_none());
     }
 }
-// RETIRED-NAME-ANCHOR-END

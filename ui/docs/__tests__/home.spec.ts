@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearSignedIn, markSignedIn } from '../../src/api/session.ts'
-import { enrollCommands } from '../../src/utils/enrollCommands.ts'
+import { LINUX_WIZARD_NEEDS, enrollCommands } from '../../src/utils/enrollCommands.ts'
 import { CAPABILITIES, DOWNLOAD, FALLBACK_PLANS, HERO, PILLARS, annualLine } from '../../src/utils/landing.ts'
 import { MAX_DESCRIPTION_CHARS, MAX_TITLE_CHARS, SITE_ORIGIN } from '../site.ts'
 import { HOME_DESCRIPTION, HOME_TITLE, priceLabel, renderHome } from '../theme/home-layout.ts'
@@ -142,6 +142,29 @@ describe('the static homepage', () => {
     expect(html.match(/<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:<\/p>/g)).toHaveLength(2)
     // The lead ships the token wording and carries the pairing one.
     expect(html).toContain(`<p class="home-sub" data-download-lead data-pairing-lead="${DOWNLOAD.leadPairing}">${DOWNLOAD.lead}</p>`)
+  })
+
+  // #3202 — the Linux wizard needs WebKitGTK 4.1. The line rides inside the
+  // button's own hidden <p>, so home.js shows the two together and the count
+  // of gated elements above stays two.
+  it('says what the Linux wizard needs first, inside its hidden button', () => {
+    const html = render()
+    const gated = (os: string) => html.match(new RegExp(`<p data-wizard-unix="${os}" hidden>.*?</p>`, 's'))![0]
+    expect(gated('linux')).toContain(`<small class="home-hint">${LINUX_WIZARD_NEEDS}</small><small class="home-hint home-alt">`)
+    expect(gated('macos')).not.toContain('WebKitGTK')
+    expect(html.match(/WebKitGTK/g)).toHaveLength(1)
+  })
+
+  // #3247 item 13 — /api/setup/linux is the x86_64 wizard, so the Linux card
+  // also links the ARM64 one, in the same hidden <p> as its button.
+  it('links the ARM64 Linux wizard beside the Linux button, and nowhere else', () => {
+    const html = render()
+    const gated = (os: string) => html.match(new RegExp(`<p data-wizard-unix="${os}" hidden>.*?</p>`, 's'))![0]
+    expect(gated('linux')).toMatch(
+      /<small class="home-hint home-alt"><a href="[^"]*\/api\/setup\/linux-aarch64">For ARM64 \(aarch64\)<\/a><\/small><\/p>$/,
+    )
+    expect(gated('macos')).not.toContain('linux-aarch64')
+    expect(html.match(/linux-aarch64/g)).toHaveLength(1)
   })
 
   it('ships the fallback price table, marked up for the live refresh', () => {

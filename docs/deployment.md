@@ -45,7 +45,12 @@ One multi-stage `Dockerfile`:
    aggregate the api crate is built with) and `SAAS` (`1` adds the hosted service's
    billing + newsletter module). **The hosted build passes `PROFILE=full SAAS=1`** —
    also the defaults; the self-host publish workflow passes `SAAS=0` and asserts it.
-2. `oven/bun:1` — builds the Vue SPA
+2. `oven/bun:${BUN_VERSION}` — builds the Vue SPA. The build argument defaults to
+   [`.bun-version`](../.bun-version), bun's one record, which every workflow's `setup-bun`
+   step reads too, so the image builds with the bun CI tested and prints `bun --version` in
+   its build log. `scripts/bun-version-check.sh` (in the frontend checks) fails when the
+   default or a workflow drifts from the record (#3400). Until then the stage ran on
+   `oven/bun:1`, whatever 1.x was newest on the day of the build.
 3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
    `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,
    API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`, and the user
@@ -70,7 +75,7 @@ flowchart LR
         GE --> B --> L --> S --> P
     end
     G[("ghcr.io/gjovanov/roomler-ai<br/>public · no pull secret")]
-    PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>bump newTag in the deploy repo"]
+    PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>pre-pull on the nodes, wait 30 s<br/>bump newTag in the deploy repo"]
     D["deploy repo · k8s/overlays/prod<br/>newName: ghcr.io/gjovanov/roomler-ai<br/>newTag: hosted-…"]
     A["ArgoCD (webhook, automated + selfHeal)"]
     K["cluster: RollingUpdate<br/>maxSurge 0 / maxUnavailable 1<br/>pull ≈ 3 s per node (81 MB)"]
@@ -90,9 +95,51 @@ flowchart LR
 | roll | ArgoCD, one pod at a time | 20 s from the deploy-repo push to both pods on the new image; pulls 3.3 s / 2.7 s per node |
 | verify | from the fleet, after every roll | the workflow only proves the public `/health` kept answering |
 
+### The pre-pull: the image lands before the roll (FR-28)
+
+A replacement pod cannot exist until the old one is gone (`hostNetwork`, `maxSurge: 0`), so
+every second it takes to start is a second its tenants' sockets have no pod. The pull was the
+largest part of that: 3–4 s of each wave's 5.3–6.3 s on the roll read live on 2026-10-31
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md)). So a promote is two commits in the deploy repo,
+30 s apart (`.github/workflows/promote.yml:155-181`):
+
+```mermaid
+sequenceDiagram
+    participant P as promote.yml
+    participant D as deploy repo
+    participant A as ArgoCD
+    participant N as Both nodes
+    participant R as roomler2
+    P->>D: move the DaemonSet's image line
+    D->>A: webhook
+    A->>N: roomler2-prepull rolls and pulls the image
+    Note over R: no pod of the app is touched
+    P->>P: wait 30 s
+    P->>D: bump newTag
+    D->>A: webhook
+    A->>R: the roll, and each replacement finds the image on its node
+```
+
+| | |
+|---|---|
+| What holds the image | `roomler2-prepull` in the deploy repo's `k8s/overlays/prod`: a DaemonSet of `sleep`, on the nodes `roomler2` is pinned to, reading no config and no secret. `roomler2`'s `imagePullPolicy: IfNotPresent` does the rest |
+| The kill switch | Delete that file and its line in `kustomization.yaml`. The promote skips the step and pushes its one commit, and a roll pulls as it did before |
+| A pull that fails or outlasts the wait | Today's roll: the pod pulls for itself. The runner cannot see the cluster, so nothing waits on the pull |
+| A manual bump, or the break-glass path | Moves `newTag` only, so it rolls without a pre-pull |
+| Reading it | The replacement pod's events say `Container image already present on machine`, and the promote's summary says `pre-pull: pushed` |
+| What it bought | On its first roll (2026-11-07) each replacement started 2 s after its SIGTERM, and the roll took 25 s from the first SIGTERM to the second Ready, against 33.9 s. Five promotes to 2026-11-16 took 24–28 s ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull), AC4). A device's sockets now land on their backoff's +3 s dial instead of +7 s: back p50 3.5 s after the cut, against 7.8 s ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#the-field-read)) |
+
+⚠️ **It is not an ArgoCD sync wave, on purpose.** A wave would wait for the pull exactly, in
+one commit. But a DaemonSet that cannot get healthy, on a node that is down, would leave the
+sync running, with every later promote and self-heal stuck behind it until someone terminates
+the operation. The fixed wait can only ever fall back to today's roll.
+
+⚠️ During those 30 s the deploy repo's `newTag` still reads the old tag and nothing has rolled.
+
 Two things the lane never does: it never writes `latest` (that is the self-host `full` image
 without `saas`, owned by `publish-selfhost-image.yml`), and it never deploys — a roll re-homes
-every long-lived socket on the replaced pod (agents, RC sessions, tunnels, DERP), so which merge
+every long-lived socket on the replaced pod (agents, RC sessions, tunnels, DERP; a live RC session
+can [outlive it](#a-roll-and-a-live-remote-session-fr-138)), so which merge
 becomes prod, and when, stays a decision. Retention on GHCR is `ghcr-retention.yml` (Mondays):
 untagged BuildKit cache manifests and `hosted-*` tags beyond the newest 20 — never `latest`, `v*`,
 a per-arch or per-profile tag, `buildcache-*`, or an attestation (GHCR stores those untagged,
@@ -114,6 +161,87 @@ database and every country reads `unknown`. Do **not** fall back to dropping
 `GeoLite2-Country.mmdb` into `files/geoip/` by hand: MaxMind's EULA forbids handing GeoLite data
 to third parties, so it must never reach an image anyone else can pull, and the image no longer
 reads that path anyway.
+
+### A roll and a live remote session (FR-138)
+
+Before FR-138 a roll ended every live remote-control session on the pods it replaced. The pixels
+never crossed the server, but the device closed its peers when its control socket dropped, and the
+page opened a new session: 4.7 to 9.0 s without a picture, a new row, and on a device that asks, a
+new consent prompt. A session can now outlive the roll. The device keeps its peer, the page holds the
+session, and both claim it back on whichever pod they reach next
+([remote-control.md §11.19](remote-control.md#1119-a-session-outlives-its-control-socket-the-roll-old-meets-new-and-the-floor-fr-138),
+[FR-138](fr/FR-138-the-session-outlives-its-control-socket.md)). Three switches decide, and nothing
+is kept unless all three are on:
+
+| Switch | Where it lives | Default | Who sets it | Off, fast |
+|---|---|---|---|---|
+| **The window**, `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), in seconds | the server's config, read once at boot (`crates/config/src/settings.rs:1069`) | 0: off, and the scope is not read | whoever deploys the server | 0, for the whole fleet. It lands only with the roll that restarts the pods, so the scope is faster |
+| **The resume scope**, `GET` / `PUT /api/admin/rc-resume-scope`, entries of kind `all`, `org` or `device` ([api.md](api.md)) | the `rc_resume_scope` collection | empty | a platform admin. Anyone else gets the 404 every `/api/admin/*` route gives | a `PUT` without the entry, or with no entries at all. Every pod tells each device it no longer covers a window of 0 on its live connection, with no roll (`reannounce`, `crates/modules/fleet/src/resume_scope.rs:255`) |
+| **The device's switch**, `rc_sessions_survive_reattach` (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`) | the device's config, read when the daemon starts (`crates/agent-core/src/config_surface.rs:726`) | on, since FR-138 P4-1. Only `0`, `false`, `no` or `off` turns it off: an empty or unknown value is on. On with no window, a device behaves exactly as off (P4-0), so the resume scope decides which devices keep sessions | nobody, to have it on. Whoever administers the device turns it off, on the device. Remote config cannot set it: a push naming it is refused 403 `device_owned_switch`, by name ([remote-config.md](remote-config.md#6-shape)) | for one device: `roomler config set rc_sessions_survive_reattach off`, then `roomler restart`. Not `roomler config clear`: a cleared key is the default, on. `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH=0` in the service's environment wins over the key. For a class of devices, the scope is faster (the row above) |
+
+Production runs the window at 60 s, and its scope has read `all` since 2026-11-13, after FR-138's P4
+widened it class by class (D4). The staged entries stay beside `all`, so a `PUT` that drops `all`
+alone returns the scope to its last stage. From the agent release that carries FR-138 P4-1 every
+device's switch is on unless someone turned it off, so every device on such a release is told the window.
+Whatever the setting says, the server announces at most 120 s (`MAX_WINDOW_SECS`,
+`crates/modules/fleet/src/resume_scope.rs:377`), and the device keeps a peer no longer than that
+either (`WINDOW_CAP`, `agents/roomlerd/src/session_table.rs:70`).
+
+⚠️ **The `PUT` replaces the whole list.** Read the list first and send it back with your change: a
+list of one entry leaves exactly one device or org in the scope. An id that names no org or device
+is not refused, and matches nothing.
+
+```sh
+# The window this pod runs, and the list.
+curl -sS "$SERVER/api/admin/rc-resume-scope" -H "Authorization: Bearer $OPERATOR_TOKEN"
+# The whole list, replaced: an org and one device.
+curl -sS -X PUT "$SERVER/api/admin/rc-resume-scope" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"entries": [{"kind": "org", "id": "<org id>", "note": "why"}, {"kind": "device", "id": "<device id>"}]}'
+# Off for every device, at once, with no roll.
+curl -sS -X PUT "$SERVER/api/admin/rc-resume-scope" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{"entries": []}'
+```
+
+A withdrawn window stops new keeps only. A session its device kept before the withdrawal is
+refused at its next claim, or closes at its own deadline, whichever comes first.
+
+What a roll does to a live session now:
+
+| The session | All three switches on | Any one off |
+|---|---|---|
+| on `direct` or `turn` | kept: the same row, no redial, no prompt; on a supervised Mac, from agent 0.4.215. Eight sessions over seven field rolls read a pause in the picture of 13 to 262 ms | ends `agent_disconnect`, and the page redials into a new session |
+| on `derp` | kept, as on `direct`, when its DERP path is back before ICE gives up on the pair, as a Windows session's was on 2026-11-12, about 4 s after the cut. Otherwise it redials, since `/derp` is pod-local, and the new request ends the old row. Either way there is no `agent_busy`. `gap_ms` under-reads its stall ([remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c)) | ends as on `direct` |
+| external (FR-52), not yet live, or begun before its device entered the scope | ends as before | the same |
+
+**Before a roll**, read:
+
+| What | Why | Where |
+|---|---|---|
+| The open sessions | A roll ends every session it does not keep: an external one, any on a device outside the scope or without the switch, and one on `derp` whose DERP path is not back in time. Each is a person whose session drops | the `remote_sessions` rows in phase `active`, with their `carrier` and `external`, read bounded through `scripts/prod-mongo-read.sh`, never from a client inside the database pod ([production-mongo-reads.md](production-mongo-reads.md)) |
+| The window and the scope | which devices are told a window | `GET /api/admin/rc-resume-scope` |
+| Each such device's switch | a device says `rc-resume` only with its switch on | `capabilities.rpc` on its `agents` row, as its last hello reported it |
+
+**After a roll**, run `scripts/fr138-roll-read.sh --from <the promote's dispatch> --to <both pods
+Ready>`. It is read-only, and for each session live across the roll it prints the row's end or the
+same row kept, the page's `rc.connect` records with `after_drop` and its `rc.resume` record
+(`outcome`, `gap_ms`), any consent prompt, the device's detach, resume and close lines, and AC7's
+count of the sessions the roll ended. A kept session reads as the same row, live, its `attach_seq`
+one higher, with no `rc.connect` record after the cut and one `rc.resume` with `outcome=resumed`. An
+ended one reads `agent_disconnect`, seen at the loss or inferred (`end_source` `registration`,
+`sweep` or `redial`), or `controller_hangup` with `limit: hold_expired` on its `session_ended` audit
+when the device resumed it but its viewer never came back. Take `--from` at the dispatch: an
+inferred end is dated by the row's own last clock, which can come a stats interval before the cut.
+
+On each device the leak signature reads: every `rc session detached` line is followed by exactly one
+`rc session resumed` or `rc session closed` line for the same session, no `peer close overran its
+budget` line names a kept peer, and the daemon's UDP socket count is back at its baseline once the
+session has really ended.
+
+⚠️ **The rollback floor.** No server rollback goes to an image built before `79cf1019b` (P1a,
+#3607). Production has written the new audit kinds since 2026-11-10, and an older image cannot list
+the audit of a session that holds them. What a rollback above the floor still costs is in
+[remote-control.md §11.19](remote-control.md#1119-a-session-outlives-its-control-socket-the-roll-old-meets-new-and-the-floor-fr-138).
 
 ## The country database the image carries (#1896)
 
@@ -149,9 +277,9 @@ flowchart LR
 |---|---|---|
 | Fetch + verify | `scripts/fetch-geoip.sh:116` (`fetch`), `:162` (`stage`) | TLS from DB-IP's host; gzip CRC, 1–128 MiB, MaxMind metadata naming `DBIP-Country-Lite`. Writes the file 0644 and a provenance note with its SHA-256. **Every failure exits 0 with a warning**, and every wait is bounded: a host that accepts and then stalls costs 110 s (measured), not the job's timeout |
 | Both image lanes | `hosted-image.yml:128`, `publish-selfhost-image.yml:151` | Run the fetch before `docker build`, into the build context, as a step with `continue-on-error` and an 8-minute timeout, so nothing in it can fail a build. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
-| Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
+| Bake + default | `Dockerfile:155` (`COPY`), `Dockerfile:161` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
-| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:259` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
+| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
 | Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
@@ -197,10 +325,10 @@ docker compose up -d
 
 | Service | Port | Purpose |
 |---|---|---|
-| `mongo:7` | 27019→27017 | database (dev credentials in the compose file) |
-| `redis:7-alpine` | 6379 | pub/sub + presence |
+| `mongo:7.0.45`, pinned by digest | 27019→27017 | database (dev credentials in the compose file) |
+| `redis:7.4.12-alpine`, pinned by digest | 6379 | pub/sub + presence |
 | `ghcr.io/gjovanov/minio` | 9000 (API) / 9001 (console) | S3-compatible file storage: Chainguard's MinIO build, mirrored and pinned by digest, since `minio/minio` is gone from Docker Hub (#2034) |
-| `coturn/coturn` | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
+| `coturn/coturn:4.18.0-r0`, pinned by digest | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
 
 Then `cargo run --bin roomler-ai-api` (API :3000) and `cd ui && bun run dev`
 (SPA :5000, proxying `/api` + `/ws` to :5001).
@@ -221,6 +349,7 @@ nesting), loaded via the `config` crate. The ones that matter first:
 | `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` | `<node_ip>=<public_ip>,…` — per-pod announced IP resolution for multi-node clusters |
 | `ROOMLER__STRIPE__*` / `ROOMLER__CLAUDE__*` / `ROOMLER__S3__*` / SMTP / OAuth | Integrations |
 | `ROOMLER__STATS__GEOIP_MMDB` | The country database for the user analytics. **The image already sets it** to the DB-IP database it carries; set it only to use your own `.mmdb`, or to empty to turn lookups off. See [the country database](#the-country-database-the-image-carries-1896) |
+| `ROOMLER__RC__SESSION_RESUME_SECS` | How long a live remote session may outlive its device's control socket, in seconds: 0 (the default) is off, and at most 120 s is announced. Only devices in the resume scope are told it. See [a roll and a live remote session](#a-roll-and-a-live-remote-session-fr-138) |
 
 Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
 also settings — see `crates/config/src/settings.rs` for the full surface.
@@ -374,6 +503,9 @@ The multi-pod design is settled and documented in
 
 - WS sessions, the rc/tunnel hubs, DERP sockets, and mediasoup rooms are
   **pod-local**; chat/notifications/presence fan out via Redis.
+- A live remote session's state between pods is its `remote_sessions` row: the pod a
+  device's claim reaches rebuilds the session from it, so a session can outlive the pod
+  that held it ([above](#a-roll-and-a-live-remote-session-fr-138)).
 - The front LB keeps a tenant's users, agents, and rooms on one pod with a
   **consistent hash on the tenant id** (`/ws` and `/derp` accept a `tid=` hint);
   plain HTTP keeps per-request failover.
@@ -473,3 +605,15 @@ roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>^{}'`
 (the agent-v<V> commit), and `gh release view setup-v<V> --json assets`. The
 recipe, the re-run after a failure, and why the release no longer records a
 `targetCommitish` (#2013) are in the `ship-it` skill §6.
+
+## Reading production Mongo
+
+⚠️ **Never `kubectl exec -i mongodb-0 -- mongosh`.** A client started inside the
+database container counts against mongod's own 2 GiB limit. Run that way, an
+unbounded read OOM-killed production Mongo on 2026-10-26. Every read goes through
+`scripts/prod-mongo-read.sh`, which keeps the client in a throwaway container on
+the build host and reaches `mongodb-0` through a `kubectl port-forward`. It
+prints the pod's restart count and cgroup memory before and after, and proves its
+teardown. The method, why it was chosen over a client pod, the query bounds the
+server still needs, and every reader that uses it are in
+[production-mongo-reads.md](production-mongo-reads.md).

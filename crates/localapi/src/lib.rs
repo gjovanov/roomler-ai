@@ -23,10 +23,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-// FR-90 P1j — the adopt socket's protocol: a separate socket, open to every
-// account, whose peer the daemon identifies by the kernel's word alone.
-pub mod hive_adopt;
-
 // FR-84 D5b — the device's own view of its org (the Devices page's grid and
 // mesh), in its own file so the verbs' types don't sprawl through this one.
 mod devices;
@@ -238,6 +234,15 @@ pub struct NodeStatus {
     /// Additive; absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// #3387 — this daemon is the signed-in person's own worker, which a
+    /// machine-wide Windows service with SystemContext on runs as that person
+    /// while the machine has no enrollment SYSTEM can open. Until Setup or
+    /// `roomlerd enroll --machine-global` writes one, the lock and sign-in
+    /// screens cannot be controlled. Additive both ways: a daemon that is not
+    /// waiting, or predates the field, omits it (⇒ false); an older CLI
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_machine_enrollment: bool,
     /// S2 — MagicDNS status, copied verbatim from [`OverlayView::dns`].
     /// `None` when the overlay is off, MagicDNS is off for the tenant, or
     /// the daemon predates the field.
@@ -455,6 +460,78 @@ pub struct NodeStatus {
     /// with no GUI session (a Mac's root half), and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_grants: Option<MacosGrants>,
+    /// FR-67 P3 — what the most recent install attempt came to, as the
+    /// post-install watcher left it in `<log_dir>/last-install.json`
+    /// ([`LastInstallStatus`]). Read from disk on every answer, so a verdict
+    /// written after this daemon started (Windows: the new service starts
+    /// while the watcher still waits on msiexec) shows up without a restart.
+    ///
+    /// ⚠️ Three states must stay apart, and they do by construction: `None`
+    /// is a daemon that predates the field and cannot say; `Some` with
+    /// [`LastInstallStatus::ABSENT`] is a daemon with no record (its updater
+    /// has installed nothing); `Some` with [`LastInstallStatus::IN_PROGRESS`]
+    /// is a record whose verdict never came — the bug FR-67 exists for.
+    /// Collapsing any two of them recreates that bug one layer up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_install: Option<LastInstallStatus>,
+    /// FR-43 P3c — the GUI worker a Mac's root daemon supervises, as the
+    /// delegation channel sees it. What `roomlerd one-row` verifies after its
+    /// restart. `None` off macOS, from the worker itself, and from an older
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_worker: Option<GuiWorkerStatus>,
+    /// #3781 — the desktop companion (tray) beside this Windows daemon is too
+    /// old to connect to it. Since #3760 the pipe gives an interactive user
+    /// only the exact open a tray from [`CompanionTooOld::minimum`] on makes
+    /// (#3742), and a daemon that runs elevated or as SYSTEM owns its pipe, so
+    /// the person's tray reaches it through that entry alone.
+    ///
+    /// From a daemon that has the field, absent means fine or not applicable,
+    /// never unknown: the tray connects, there is none, this daemon runs as the
+    /// person (the pipe's owner, whose own tray still connects), or this is not
+    /// Windows. A tray whose version nobody can vouch for is reported, with
+    /// `installed` absent. A daemon that predates the field never sends it, and
+    /// an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_too_old: Option<CompanionTooOld>,
+}
+
+/// #3781 — what [`NodeStatus::companion_too_old`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CompanionTooOld {
+    /// The tray's version, as the marker the daemon writes beside it on every
+    /// refresh names it. `None` = no marker, or one that does not read as a
+    /// version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    /// The oldest tray this daemon accepts.
+    pub minimum: String,
+    /// The machine-wide `Roomler` service refreshes the tray, not this
+    /// process: its tries are in `roomler logs --source service`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_service: bool,
+    /// #3814 — `ROOMLERD_COMPANION_SYNC=0` is set where the refresh runs, so
+    /// the tray is replaced only at a start and never retried. `false` is
+    /// left out, so a status without the switch reads as before. A daemon
+    /// that predates the field never sends it, and an older CLI ignores it:
+    /// both print the retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_off: bool,
+}
+
+/// FR-43 P3c — what [`NodeStatus::gui_worker`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GuiWorkerStatus {
+    /// A worker holds the delegation channel.
+    pub attached: bool,
+    /// The permission words it announced (`screen-capture`, `input`), which
+    /// are the ones the device's row advertises (FR-43 P2c). `None` until it
+    /// has sent its caps, and again once it detaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<String>>,
+    /// The daemon runs with `macos_one_row`: its worker holds no enrollment.
+    #[serde(default)]
+    pub one_row: bool,
 }
 
 /// #3164 — what [`NodeStatus::macos_grants`] reports.
@@ -467,6 +544,92 @@ pub struct MacosGrants {
     /// Accessibility, read live: a grant shows here at once, and input works
     /// from the next event without a restart.
     pub accessibility: bool,
+}
+
+/// FR-67 P3 — the post-install watcher's record of the most recent install
+/// attempt (`<log_dir>/last-install.json`), as the daemon reads it back.
+///
+/// The watcher (`roomlerd post-install-watch`, spawned by the updater beside
+/// the installer) writes the record; until P3 nothing read it, on any
+/// platform. `status` is one of the words below, spelled exactly as the file
+/// and the watcher's own `post-install verdict:` log line spell them, so one
+/// grep finds all three surfaces:
+///
+/// | word | meaning |
+/// |---|---|
+/// | `Absent` | no record: this daemon's updater has installed nothing yet, or the record sits in another process role's log dir — `path` says where this one looked |
+/// | `InProgress` | the watcher wrote its opening line and no verdict. Younger than [`Self::STALE_AFTER_SECS`], a watcher still at work (on Windows the new service starts while it still waits on msiexec). Older, an install that never reported: the watcher was killed first |
+/// | `SucceededVerified` | the installer exited 0 and the new binary's `--version` answered `expected_version` |
+/// | `SucceededUnverified` | the installer exited 0 but the version probe did not confirm it; `note` says what it saw |
+/// | `InstallerFailed` | the installer exited non-zero (`installer_exit_code`) |
+/// | `Timeout` | the installer did not exit within the watcher's budget (on Windows, not after the kill-and-retry either) |
+/// | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) |
+/// | `Unreadable` | a file is there and does not parse; `note` carries the error |
+///
+/// Additive everywhere: a daemon that predates it sends no key, an older
+/// client ignores it. A word this client does not know is a newer daemon's
+/// and is shown as it is, never an error.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LastInstallStatus {
+    pub status: String,
+    /// The release the install was for (`agent-v0.4.172`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// What the new binary's `--version` printed, when the probe ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_binary_version: Option<String>,
+    /// When the watcher started, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<u64>,
+    /// When it wrote its verdict, unix seconds; unset while `InProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_exit_code: Option<i32>,
+    /// The watcher's own note on the verdict; for `Unreadable`, the error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The file this answer was read from, or looked for. `None` when the
+    /// daemon resolved no log dir at all (a checkout run with no home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl LastInstallStatus {
+    pub const ABSENT: &'static str = "Absent";
+    pub const IN_PROGRESS: &'static str = "InProgress";
+    pub const SUCCEEDED_VERIFIED: &'static str = "SucceededVerified";
+    pub const SUCCEEDED_UNVERIFIED: &'static str = "SucceededUnverified";
+    pub const INSTALLER_FAILED: &'static str = "InstallerFailed";
+    pub const TIMEOUT: &'static str = "Timeout";
+    pub const WATCHER_STOPPED: &'static str = "WatcherStopped";
+    pub const UNREADABLE: &'static str = "Unreadable";
+
+    /// An `InProgress` record older than this never got its verdict. The
+    /// watcher's whole life is bounded: 10 min on the installer (twice on a
+    /// Windows wedge retry), 2 min settling the Windows service. Nothing is
+    /// still writing a record this old.
+    pub const STALE_AFTER_SECS: u64 = 25 * 60;
+
+    /// A record with no verdict yet — fresh or stale alike.
+    pub fn in_progress(&self) -> bool {
+        self.status == Self::IN_PROGRESS
+    }
+
+    /// `InProgress`, and old enough that no watcher can still be at work on
+    /// it: the install never reported. A record with no start time cannot be
+    /// fresh, so it counts as never reported too.
+    pub fn never_reported(&self, now_unix: u64) -> bool {
+        self.in_progress()
+            && self
+                .started_unix
+                .is_none_or(|s| now_unix.saturating_sub(s) >= Self::STALE_AFTER_SECS)
+    }
+
+    /// The one outcome nobody needs to look at.
+    pub fn is_verified_success(&self) -> bool {
+        self.status == Self::SUCCEEDED_VERIFIED
+    }
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -1280,12 +1443,29 @@ pub enum Request {
     /// Remote-control sessions awaiting an operator consent decision.
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
+    /// Mutating, and the endpoint's ACL is NOT the whole boundary: an approval
+    /// lets someone see and control this screen, so it is the answer of the
+    /// person at that screen. On the daemon's own endpoint the dispatcher takes
+    /// it only from that person, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
+    /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
+    /// #3967 — a two-row Mac's per-user half tells its root half, over the
+    /// root half's person socket, that it lists the root half's consent
+    /// questions to its person's app and sends their answers back. Taken only
+    /// there, and only from that socket's own person, never root
+    /// ([`LocalApiState::consent_relaying`]). The root half keeps it for as
+    /// long as the connection stays open ([`HeldForTheConnection`]), and
+    /// counts that person's app as its questions' surface only meanwhile.
+    ConsentRelaying,
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
-    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
-    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    /// the Disconnect the "Being viewed by …" banner offers. Mutating, and
+    /// gated like [`Self::ConsentDecide`] on the daemon's own endpoint: the
+    /// person at the screen, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]). The person socket serves it to
+    /// the person it was made for.
     RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
@@ -1300,9 +1480,9 @@ pub enum Request {
     },
     /// Create a daemon-driven static forward: the daemon opens a tunnel to
     /// `node` (a hex agent id) over its own agent WS and listens on `local`,
-    /// dialing `remote` (`host:port`) from the target. Mutating — like
-    /// [`Request::ConsentDecide`], the pipe/socket ACL is the trust boundary
-    /// (P3b-2). Returns [`Response::FlowCreated`] with the assigned flow id.
+    /// dialing `remote` (`host:port`) from the target. Mutating — the
+    /// pipe/socket ACL is the trust boundary (P3b-2). Returns
+    /// [`Response::FlowCreated`] with the assigned flow id.
     CreateForward {
         node: String,
         local: u16,
@@ -1426,7 +1606,8 @@ pub enum Request {
     ExternalPasswordStatus,
     /// S2 — read the tail of one of the daemon's log files. `source` is
     /// `daemon` (this process's active rolling log), `service` (the
-    /// machine-global SCM host log), or `panic` (the newest panic dump).
+    /// machine-global SCM host log), `installer` (Windows: the per-Machine
+    /// MSI's own steps, #3230), or `panic` (the newest panic dump).
     /// `max_bytes` is clamped daemon-side (≤64 KiB) — bounded response,
     /// poll-based follow (no streaming). Returns [`Response::LogTail`].
     TailLog {
@@ -1484,8 +1665,9 @@ pub enum Request {
     /// FR-85 — start a LOCAL screen recording (the daemon spawns
     /// `roomlerd record`). Mutating, and the endpoint ACL is NOT the whole
     /// boundary: the caller must be the console user
-    /// ([`ClientPeer::is_console_user`]) — an RDP guest must not record the
-    /// console user's desktop. Returns [`Response::Recording`].
+    /// ([`ClientPeer::is_console_user`]), on Windows the person at the screen
+    /// this daemon shows — another signed-in account must not record that
+    /// person's desktop. Returns [`Response::Recording`].
     RecordStart {
         #[serde(default)]
         opts: RecordStartOpts,
@@ -1581,80 +1763,10 @@ pub enum Request {
     /// processes at the first server hello, and a control-surface poll must
     /// not be what launches vendor driver code. Before that first hello the
     /// answer is `not_probed`; a build without encoders answers
-    /// `unsupported`. Returns [`Response::EncoderCaps`].
+    /// `unsupported`. Returns [`Response::EncoderCaps`]. The person-at-the-device
+    /// socket serves it too (#3831, [`person_may`]); a daemon older than that
+    /// refuses it there.
     EncoderCaps,
-    /// FR-90 P1h-2 (AC7 on macOS) — the root update helper asks this daemon
-    /// to hold for its running agent turns before `installer(8)` restarts it
-    /// and, with it, every session's harness: what the in-process updater
-    /// does on Linux (P1d-1). Answered [`Response::HiveUpdateHeld`] once no
-    /// turn runs, or once the device's `hive_update_wait_secs` is spent; from
-    /// then on new prompts and starts are refused until THIS CONNECTION
-    /// closes. A successful install has restarted the daemon by then; a
-    /// failed one takes prompts and starts again. Root only. A daemon older
-    /// than the verb answers `Error("bad request: …")`, and the helper
-    /// installs without a hold, as before.
-    HiveUpdateHold,
-    /// FR-90 P3-9-2b — `roomler connect`: a local endpoint that signs in to a
-    /// secret's upstream as the secret's user, the value held by the daemon.
-    /// Its leases are asked for the device's OWNER (decision 23) and renewed
-    /// while it is held (decision 25), and it serves the account that asked,
-    /// as the listener read it from the OS ([`ClientPeer::asker`]). Answered
-    /// [`Response::Connected`]. It closes when THIS CONNECTION does. Only
-    /// root or SYSTEM, an elevated administrator, or the daemon's own account
-    /// may ask ([`peer_may_connect`]); never on the person socket. A daemon
-    /// older than the verb answers `Error("bad request: …")`.
-    Connect { args: ConnectArgs },
-    /// FR-90 P3-9-2b — where endpoint `id`, opened by a [`Request::Connect`]
-    /// on this same connection, stands: [`Response::ConnectState`]. Any other
-    /// id is refused.
-    ConnectStatus { id: u64 },
-}
-
-/// FR-90 P3-9-2b — what `roomler connect` asks for: the arguments a
-/// session's `vault_connect` takes, by the same names, and checked by the
-/// daemon as it checks a session's (`docs/vault.md` §19).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConnectArgs {
-    /// A structured secret, by its path or this organization's RRN, with no
-    /// `#field`.
-    pub handle: String,
-    /// `postgres`, `mongodb`, `http`, `kubernetes` or `ssh`.
-    pub engine: String,
-    /// The upstream, exactly as the secret's `audiences` names it.
-    pub upstream: String,
-    /// `http` and `kubernetes`: `basic`, `bearer` or `client-cert`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<String>,
-    /// A database's, named in the connection string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub database: Option<String>,
-    /// A secret whose value is the upstream's CA (PEM).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca: Option<String>,
-    /// MongoDB's: the database the secret's user is defined in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_source: Option<String>,
-    /// How long each lease is asked for, in seconds (30 to 900, default
-    /// 300); renewed before it ends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_s: Option<u32>,
-}
-
-/// FR-90 P3-9-2b — where a person's endpoint stands
-/// ([`Request::ConnectStatus`]).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct EndpointState {
-    /// How long its leases have left, in seconds, as the daemon holds them.
-    pub left_s: u64,
-    /// How many times its leases were renewed.
-    pub renewals: u32,
-    /// The vault refused a renewal, saying this: the endpoint serves to its
-    /// leases' end, then closes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refused: Option<String>,
-    /// Why it closed, once it has.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed: Option<String>,
 }
 
 /// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
@@ -1760,7 +1872,20 @@ pub struct ConfigEntry {
     /// once `group` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// #2871 — why a `ConfigSet` of this key would be refused on the
+    /// connection that served this listing, when it would: the one code is
+    /// `root_only` — the key is a root daemon's to set, and this listing came
+    /// over its person-at-the-device socket, which serves the key read-only
+    /// ([`person_view`]). Absent = settable here, and from a daemon older
+    /// than this field, whose person socket served no listing at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<String>,
 }
+
+/// #2871 — the one [`ConfigEntry::read_only`] code: the key is the root
+/// daemon's to set (`sudo roomler config set <key> <value>`), and the person
+/// socket serves it read-only.
+pub const READ_ONLY_ROOT_ONLY: &str = "root_only";
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
 /// (`Status`) or a sequence (`Peers` / `Flows`).
@@ -1780,6 +1905,11 @@ pub enum Response {
     ConsentDecided {
         ok: bool,
     },
+    /// #3967 — a [`Request::ConsentRelaying`] was taken, for as long as the
+    /// connection that said it stays open. A daemon that does not take it
+    /// answers [`Response::Error`]; one older than the verb answers "unknown
+    /// variant" ([`is_unknown_verb`]) and keeps the connection open.
+    ConsentRelayingTaken,
     /// FR-27 — live remote-control sessions.
     RcSessions(Vec<RcSessionInfo>),
     /// FR-27 — result of [`Request::RcDisconnect`]; `ok` = a session with that
@@ -1958,25 +2088,6 @@ pub enum Response {
     Devices(Box<DevicesPage>),
     /// FR-84 D5b — the mesh graph ([`Request::Mesh`]).
     Mesh(Box<MeshView>),
-    /// FR-90 P1h-2 — the daemon holds for the update ([`Request::HiveUpdateHold`]):
-    /// install now. It waited `waited_secs` for agent turns; `cut` turns were
-    /// still running when the device's `hive_update_wait_secs` ran out, and the
-    /// install cuts them. New prompts and starts are refused until the
-    /// connection that asked closes.
-    HiveUpdateHeld {
-        waited_secs: u64,
-        cut: u32,
-    },
-    /// FR-90 P3-9-2b — the endpoint a [`Request::Connect`] opened: what a
-    /// session's `vault_connect` answers (where it is, a connection string
-    /// that holds no credential, what to set, how long its leases have), and
-    /// its `id` for [`Request::ConnectStatus`] on the same connection.
-    Connected {
-        id: u64,
-        endpoint: serde_json::Value,
-    },
-    /// FR-90 P3-9-2b — [`Request::ConnectStatus`]'s answer.
-    ConnectState(EndpointState),
     /// FR-84 D5b — the daemon answered FOR THE SERVER and the server did not
     /// give it the list. `code` names the cause so a client can choose what
     /// to show without reading prose: `server_unreachable` (connect / TLS /
@@ -2239,10 +2350,12 @@ pub struct RecordingsListing {
 ///
 /// The pipe ACL admits every Interactive User — RDP sessions included — and
 /// the unix socket every process of its uid. That is the right boundary for
-/// reading status, and the wrong one for starting a screen recording: a guest
-/// in an RDP session must not be able to record the CONSOLE user's desktop.
-/// The recording verbs, and a `ConfigSet` of any `record_*` key, therefore
-/// require [`ClientPeer::is_console_user`].
+/// reading status, and the wrong one for starting a screen recording: another
+/// signed-in account must not be able to record the desktop this daemon
+/// shows. The recording verbs, and a `ConfigSet` of any `record_*` key,
+/// therefore require [`ClientPeer::is_console_user`]; a consent answer and a
+/// Disconnect require [`ClientPeer::may_decide_for_the_screen`]. On Windows
+/// both take the session whose screen this daemon shows ([`screen_session`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientPeer {
     /// Windows: the client process's session id.
@@ -2275,89 +2388,65 @@ impl ClientPeer {
         elevated: None,
     };
 
-    /// Is this peer the person at the console? Windows: its session is the
-    /// active CONSOLE session. Unix: it is this daemon's own uid (a per-user
-    /// daemon, whose socket is 0600 anyway), or root.
+    /// Is this peer the console person, the person at the screen this daemon
+    /// shows? Windows: its session is that screen's session
+    /// ([`screen_session`]): the daemon's own, or the active console session
+    /// for a daemon in session 0. Unix: it is this daemon's own uid (a
+    /// per-user daemon, whose socket is 0600 anyway), or root.
     pub fn is_console_user(&self) -> bool {
-        peer_is_console_user(self, console_session_id(), own_uid())
+        peer_is_console_user(self, console_session_id(), own_session_id(), own_uid())
     }
 
-    /// FR-90 P1h-2 — is this peer root (Unix)? What may hold the daemon for
-    /// an update: a hold refuses every new agent prompt and start until it
-    /// ends, so no other local account may place one. Unknown is not root.
+    /// #2871 — may this peer set a key that is the console person's call
+    /// ([`CONSOLE_PERSON_KEYS`]), on `scope`'s endpoint?
+    /// [`peer_may_set_console_key`].
+    pub fn may_set_console_key(&self, scope: Scope) -> bool {
+        peer_may_set_console_key(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
+    }
+
+    /// Is this peer root (Unix)? Root is root on every endpoint, so the
+    /// person socket's fresh seat check before a console person's key is
+    /// written (#2871) passes it by. Unknown is not root.
     pub fn is_root(&self) -> bool {
         self.uid == Some(0)
     }
 
-    /// FR-92 P10 — may this peer turn keep busy ON? Only the person at the
-    /// console, on `scope`'s endpoint ([`peer_may_start_keep_busy`]).
+    /// FR-92 P10 — may this peer turn keep busy ON? Only the console person,
+    /// at the screen this daemon shows, on `scope`'s endpoint
+    /// ([`peer_may_start_keep_busy`]).
     pub fn may_start_keep_busy(&self, scope: Scope) -> bool {
-        peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
+        peer_may_start_keep_busy(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
     }
 
     /// FR-85 P2e — may this peer start, stop or delete a recording, on
     /// `scope`'s endpoint? [`peer_may_record`].
     pub fn may_record(&self, scope: Scope) -> bool {
-        peer_may_record(self, scope, console_session_id(), own_uid())
+        peer_may_record(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
     }
 
-    /// FR-90 P3-9-2b — may this peer run `roomler connect` here (decision
-    /// 26)? [`peer_may_connect`].
-    pub fn may_connect(&self) -> bool {
-        peer_may_connect(self, own_uid(), own_sid())
+    /// May this peer answer a consent prompt or end a live session over the
+    /// daemon's own endpoint? [`peer_may_decide_for_the_screen`].
+    pub fn may_decide_for_the_screen(&self) -> bool {
+        peer_may_decide_for_the_screen(self, console_session_id(), own_session_id(), own_uid())
     }
-
-    /// FR-90 P3-9-2b — the account a [`Request::Connect`] from this peer
-    /// serves its endpoint to: its own, as the OS said at accept time. `None`
-    /// when the OS did not say.
-    pub fn asker(&self) -> Option<Asker> {
-        match (self.uid, self.gid, &self.sid) {
-            (Some(uid), Some(gid), _) => Some(Asker::Unix { uid, gid }),
-            (None, _, Some(sid)) => Some(Asker::Windows { sid: sid.clone() }),
-            _ => None,
-        }
-    }
-}
-
-/// FR-90 P3-9-2b — the account a person's endpoint ([`Request::Connect`])
-/// is served to: the one that asked, read by the listener from the OS before
-/// a byte of the request, never from anything the client says.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Asker {
-    /// Its uid and gid.
-    Unix { uid: u32, gid: u32 },
-    /// Its account, by SID (`S-1-5-…`).
-    Windows { sid: String },
-}
-
-/// FR-90 P3-9-2b — the pure decision behind [`ClientPeer::may_connect`]
-/// (decision 26, its recommendation, pending the operator's word).
-///
-/// `roomler connect` lends the device's OWNER's vault grants (decision 23),
-/// whoever runs it, so it is held to who may already act for the whole
-/// device:
-/// - **Unix**: root, or the daemon's own uid. On a system install the daemon's
-///   socket is root's anyway, and the person socket refuses the verb
-///   ([`person_may`]).
-/// - **Windows**: SYSTEM (and the other service accounts, as
-///   [`ClientPeer::system_account`] reads them), an elevated administrator,
-///   or the account the daemon itself runs as (an attended install's
-///   person). ⚠️ The pipe's ACL is wider than that: it admits every
-///   interactive user, an RDP session's included (`LOCALAPI_SDDL`'s `IU`), so
-///   without this gate anyone signed in would reach the owner's grants.
-/// - Anything unknown: no.
-///
-/// The endpoint serves the account that asked ([`ClientPeer::asker`]), read
-/// from the same token this decides on, so the account that passes is the
-/// account that is served.
-pub fn peer_may_connect(peer: &ClientPeer, own_uid: Option<u32>, own_sid: Option<&str>) -> bool {
-    if let Some(uid) = peer.uid {
-        return uid == 0 || Some(uid) == own_uid;
-    }
-    if peer.system_account == Some(true) || peer.elevated == Some(true) {
-        return true;
-    }
-    matches!((peer.sid.as_deref(), own_sid), (Some(p), Some(o)) if p == o)
 }
 
 /// FR-92 P10 — the pure decision behind [`ClientPeer::may_start_keep_busy`].
@@ -2367,13 +2456,17 @@ pub fn peer_may_connect(peer: &ClientPeer, own_uid: Option<u32>, own_sid: Option
 /// `roomler exec` arrives there — so with it, a plain
 /// `roomler exec <host> -- roomler keep-busy on` would start synthetic input
 /// under the person's name.
-/// - **Windows**: the active console session, never session 0 (services),
-///   and (P10b) **never a service account** — SYSTEM, LocalService or
-///   NetworkService — nor a peer whose account could not be read.
+/// - **Windows**: the session whose screen this daemon shows
+///   ([`screen_session`]: its own, or the active console session for a
+///   daemon in session 0), never session 0 (services), and (P10b) **never a
+///   service account** — SYSTEM, LocalService or NetworkService — nor a peer
+///   whose account could not be read. With no screen's session known, no
+///   Windows peer.
 /// - **A per-user daemon's own socket** (macOS GUI worker, Linux user
 ///   daemon): its owner, who is the person.
 /// - **The person socket of a Linux system install** ([`Scope::Person`]):
-///   its ACL admits only the person it was made for.
+///   the person it was made for, by the uid the kernel read
+///   ([`person_peer_ok`], root being refused above).
 /// - Anything unknown: no.
 ///
 /// **SYSTEM is Windows' root** (P10b). A SystemContext-mode worker runs as
@@ -2404,18 +2497,22 @@ pub fn peer_may_start_keep_busy(
     peer: &ClientPeer,
     scope: Scope,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
     if peer.uid == Some(0) {
         return false;
     }
-    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
+    if let (Some(p), Some(s)) = (
+        peer.session_id,
+        screen_session(own_session, console_session),
+    ) {
         // P10b — `Some(false)` only: SYSTEM and its kin never, and an
         // account that could not be read never either (fail closed).
-        return p == c && p != 0 && peer.system_account == Some(false);
+        return p == s && p != 0 && peer.system_account == Some(false);
     }
     match scope {
-        Scope::Person => peer.uid.is_some(),
+        Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
         Scope::Full => matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o),
     }
 }
@@ -2426,29 +2523,43 @@ pub fn peer_may_start_keep_busy(
 /// socket of a system install that gate cannot pass: it compares the peer with
 /// this daemon, which is root, and the person at the seat is not. There the
 /// listener has already taken the kernel's word that the peer is that person
-/// or root ([`person_peer_ok`]), so all that is left to ask is whether the
-/// peer was identified at all.
+/// or root ([`person_peer_ok`]), and the same check is made again here, as for
+/// every per-peer gate on that socket (#2871's review), so the decision does
+/// not rest on the listener's one call site.
 pub fn peer_may_record(
     peer: &ClientPeer,
     scope: Scope,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
     match scope {
-        Scope::Person => peer.uid.is_some(),
-        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
+        Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
+        Scope::Full => peer_is_console_user(peer, console_session, own_session, own_uid),
     }
 }
 
 /// The pure decision behind [`ClientPeer::is_console_user`], testable
 /// without an OS.
+///
+/// On Windows the console person is the person at the screen this daemon
+/// shows, as for a consent answer: a peer in [`screen_session`]'s session,
+/// the daemon's own non-zero session or, for a daemon in session 0, the
+/// console session. With neither known, no Windows peer passes. A worker,
+/// which the service host starts in the console session, takes the console
+/// session's person. On Unix no session is read: the daemon's own uid, or
+/// root.
 pub fn peer_is_console_user(
     peer: &ClientPeer,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
-    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
-        return p == c;
+    if let (Some(p), Some(s)) = (
+        peer.session_id,
+        screen_session(own_session, console_session),
+    ) {
+        return p == s;
     }
     match (peer.uid, own_uid) {
         (Some(p), Some(o)) => p == o || p == 0,
@@ -2456,9 +2567,143 @@ pub fn peer_is_console_user(
     }
 }
 
+/// #2871 — the pure decision behind [`ClientPeer::may_set_console_key`]: who
+/// may set a key that is the console person's call ([`CONSOLE_PERSON_KEYS`]),
+/// by the endpoint the request came in on.
+///
+/// - **The daemon's own endpoint** ([`Scope::Full`]): the console person as
+///   [`peer_is_console_user`] reads them — on Windows the session whose screen
+///   this daemon shows ([`screen_session`]; the pipe admits every interactive
+///   user, RDP sessions included), the daemon's own uid or root on Unix.
+/// - **The person-at-the-device socket** ([`Scope::Person`]): its person. On a
+///   root daemon `peer_is_console_user` reduces to "root" (the daemon's own uid
+///   IS 0), so through that gate alone the person at the seat of a Linux system
+///   install or a Mac's root half could set none of these — keys the code
+///   itself calls theirs. Here the connection's uid, which the kernel read
+///   (`SO_PEERCRED`, `getpeereid`), must be the person the socket was made for,
+///   or root ([`person_peer_ok`]) — the check the listener already made before
+///   a byte was read, made again where the decision is (#2871's review: with it
+///   in the listener alone, no test could tell it was there). An unknown peer
+///   is refused, as everywhere. On top of this the dispatcher asks the daemon
+///   whether that person is STILL at the seat before it applies the change
+///   ([`LocalApiState::at_the_seat_now`]).
+///
+/// What this does NOT widen: the person socket still refuses every key that is
+/// not the console person's ([`person_may`] → [`person_socket_admits_key`]),
+/// and the device-owned gates (`exec_enabled`, `ssh_enabled`,
+/// `remote_config_enabled`) are not in [`CONSOLE_PERSON_KEYS`].
+pub fn peer_may_set_console_key(
+    peer: &ClientPeer,
+    scope: Scope,
+    console_session: Option<u32>,
+    own_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    match scope {
+        Scope::Full => peer_is_console_user(peer, console_session, own_session, own_uid),
+        Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
+    }
+}
+
+/// The session whose screen this daemon shows, on Windows: the one whose
+/// person a consent prompt asks, and whose session a Disconnect ends. Its
+/// person is also the console person whose gates the daemon's own endpoint
+/// keeps: a console person's keys, the recording verbs, keep busy on and the
+/// external-access password ([`peer_is_console_user`],
+/// [`peer_may_start_keep_busy`]).
+///
+/// - **Its own session**, when that is not session 0: a worker, which the
+///   service host starts in the active console session, or a per-user
+///   daemon, which runs where its person signed in, over RDP too. The person
+///   at the console is someone else then, and is not the one asked.
+/// - **The console session** (`WTSGetActiveConsoleSessionId`) for a daemon
+///   in session 0, the service host.
+/// - **None** when its own session cannot be read, or it runs in session 0
+///   and there is no console session: no person's screen, so only SYSTEM
+///   and an elevated administrator decide ([`peer_may_decide_for_the_screen`]),
+///   and no Windows peer passes a console person's gate.
+///
+/// Never session 0: no person sits there.
+pub fn screen_session(own_session: Option<u32>, console_session: Option<u32>) -> Option<u32> {
+    match own_session? {
+        0 => console_session.filter(|&s| s != 0),
+        own => Some(own),
+    }
+}
+
+/// Who may answer a consent prompt (approve or deny) or end a live session
+/// (a Disconnect) over the daemon's own endpoint ([`Scope::Full`]).
+///
+/// Both decide what happens to a screen, and an approval lets someone see
+/// and control it, so they are the answer of the person at that screen, as
+/// on the person socket, where the seat is asked (#3845). The Windows pipe
+/// admits every interactive user (its `IU` ace), so here the peer the OS
+/// read at accept decides, never anything the client says:
+/// - **SYSTEM** (`S-1-5-18`, read from the client's token; LocalService and
+///   NetworkService are not SYSTEM) and **an administrator who elevated**:
+///   either can change the daemon itself.
+/// - **Windows**: a peer in the session whose screen this daemon shows
+///   ([`screen_session`]).
+/// - **Unix**: this daemon's own account, or root: who its owner-only socket
+///   admits, so nothing changes there.
+/// - Anything unknown: no. A peer the endpoint could not read is refused.
+///
+/// [`ClientPeer::is_root`] reads a uid, which a pipe client never has: on
+/// Windows it is false for every peer, SYSTEM's included, so SYSTEM is
+/// named here by its SID.
+pub fn peer_may_decide_for_the_screen(
+    peer: &ClientPeer,
+    console_session: Option<u32>,
+    own_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    if peer.sid.as_deref() == Some(SYSTEM_SID) || peer.elevated == Some(true) {
+        return true;
+    }
+    if let Some(session) = peer.session_id {
+        return screen_session(own_session, console_session) == Some(session);
+    }
+    matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o || p == 0)
+}
+
+/// The session this process runs in (Windows), `None` when it cannot be read
+/// or on other platforms.
+fn own_session_id() -> Option<u32> {
+    #[cfg(test)]
+    {
+        if let Some((own, _)) = PINNED_SESSIONS.get() {
+            return own;
+        }
+    }
+    #[cfg(windows)]
+    {
+        process_session(std::process::id())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: what this thread reads as the daemon's own session and the
+    /// console session ([`own_session_id`], [`console_session_id`]), on every
+    /// OS, while a test holds them pinned. A dispatch test can then stand
+    /// where a daemon in another session stands, an RDP session or session 0.
+    static PINNED_SESSIONS: std::cell::Cell<Option<(Option<u32>, Option<u32>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The active console session (Windows), `None` when there is none or on
 /// other platforms.
 fn console_session_id() -> Option<u32> {
+    #[cfg(test)]
+    {
+        if let Some((_, console)) = PINNED_SESSIONS.get() {
+            return console;
+        }
+    }
     #[cfg(windows)]
     {
         // SAFETY: no arguments, no preconditions.
@@ -2519,35 +2764,6 @@ struct TokenFacts {
     /// FR-90 P3-9-2b — whether it is elevated; `None` when that could not be
     /// read.
     elevated: Option<bool>,
-}
-
-/// FR-90 P3-9-2b — the account this process runs as, by SID (Windows), read
-/// once; `None` elsewhere, or when it could not be read.
-fn own_sid() -> Option<&'static str> {
-    #[cfg(windows)]
-    {
-        static OWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        OWN.get_or_init(|| {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::Security::TOKEN_QUERY;
-            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-            let mut token = std::ptr::null_mut();
-            // SAFETY: our own process's pseudo-handle; `token` is a valid
-            // out-param, closed below once.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-                return None;
-            }
-            let facts = token_facts(token);
-            // SAFETY: closes the token opened above, exactly once.
-            unsafe { CloseHandle(token) };
-            facts.and_then(|f| f.sid)
-        })
-        .as_deref()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
 }
 
 /// The session process `pid` runs in.
@@ -2731,6 +2947,59 @@ pub struct OverlayView {
     pub derp_inbound_drops: Option<(u64, u64)>,
 }
 
+/// #3967 — how a connection that holds something ([`HeldForTheConnection`])
+/// ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    /// Its far end closed it, or reading or writing it failed: the process
+    /// that dialled is gone, or let it go.
+    ClosedByThePeer,
+    /// The daemon stopped serving it: the person socket's listener stopped
+    /// (the person at the seat changed, or the daemon is stopping).
+    Dropped,
+}
+
+/// #3967 — what a daemon keeps for one connection, for as long as that
+/// connection is open ([`LocalApiState::consent_relaying`]). The connection's
+/// loop holds it, and `on_end` runs once when the connection ends, saying how
+/// ([`ConnectionEnd`]).
+pub struct HeldForTheConnection {
+    on_end: Option<Box<dyn FnOnce(ConnectionEnd) + Send>>,
+}
+
+impl HeldForTheConnection {
+    /// Held until the connection ends; `on_end` is told how.
+    pub fn new(on_end: impl FnOnce(ConnectionEnd) + Send + 'static) -> Self {
+        Self {
+            on_end: Some(Box::new(on_end)),
+        }
+    }
+
+    /// The connection ended `how`.
+    fn end(mut self, how: ConnectionEnd) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(how);
+        }
+    }
+}
+
+impl Drop for HeldForTheConnection {
+    /// Dropped without [`Self::end`]: the loop that held it was cut short.
+    fn drop(&mut self) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(ConnectionEnd::Dropped);
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldForTheConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldForTheConnection")
+            .field("held", &self.on_end.is_some())
+            .finish()
+    }
+}
+
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
 /// gathers this from its live overlay / tunnel / forward state; the trait keeps
 /// the protocol unit-testable with a mock and free of daemon internals.
@@ -2751,6 +3020,18 @@ pub trait LocalApiState: Send + Sync {
     async fn peers_view(&self) -> Vec<PeerInfo> {
         self.peers()
     }
+    /// #2871 (review) — is `uid` the person at this device's seat RIGHT NOW:
+    /// on Linux the person signed in at seat0, on a Mac the console user?
+    /// Asked fresh by the person-at-the-device socket before it applies a
+    /// `ConfigSet` ([`Scope::Person`]), and since #3845 before it takes a
+    /// `ConsentDecide`: its listener follows the seat on a poll, so a
+    /// connection can outlive its person's turn at the seat.
+    /// #3796 — or not known yet ([`AtTheSeat::NotKnownYet`]): a daemon that
+    /// asks other processes, which may not answer, waits a bounded time.
+    /// Default: no — a daemon that cannot say changes nothing there.
+    async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+        AtTheSeat::No
+    }
     /// Remote-control sessions awaiting an operator consent decision (P2b).
     /// Default: none — so existing impls / mocks and the read-only contract are
     /// undisturbed; the agent daemon overrides this.
@@ -2760,6 +3041,38 @@ pub trait LocalApiState: Send + Sync {
     /// Apply an operator consent decision to `session_id` (P2b). Returns whether
     /// it was recorded. Default: no-op `false`.
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+        false
+    }
+    /// #3864 — what a `ConsentPending` request answers. Default:
+    /// [`Self::consent_pending`]. A one-row Mac's worker overrides it: the
+    /// root half asks that Mac's questions, on a broker of its own, so the
+    /// worker lists those too, asked over the root half's person socket.
+    async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+        self.consent_pending()
+    }
+    /// #3864 — what a `ConsentDecide` request answers once the endpoint's
+    /// gates have passed. Default: [`Self::consent_decide`]'s verdict. A
+    /// one-row Mac's worker overrides it to send an answer to a question its
+    /// own broker is not asking to the root half, and passes on the root
+    /// half's refusal in its own words.
+    async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+        Response::ConsentDecided {
+            ok: self.consent_decide(session_id, allow),
+        }
+    }
+    /// #3967 — a [`Request::ConsentRelaying`] from `uid`, the person socket's
+    /// own person (the dispatcher admits nobody else, root included): that
+    /// person's per-user half lists this daemon's consent questions to their
+    /// app. `Some` takes it, kept until the connection ends; `None` refuses
+    /// it. Default: refused. A two-row Mac's root half takes it.
+    fn consent_relaying(&self, _uid: u32) -> Option<HeldForTheConnection> {
+        None
+    }
+    /// #3967 — whether this daemon is a two-row Mac's per-user half, which
+    /// lists its root half's questions to its person's app and so tells the
+    /// root half ([`Request::ConsentRelaying`]) for as long as it runs.
+    /// Default: no.
+    fn announces_consent_relay(&self) -> bool {
         false
     }
     /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
@@ -3010,42 +3323,6 @@ pub trait LocalApiState: Send + Sync {
     /// connection die before it learns the restart was accepted. Default:
     /// no-op.
     fn restart_commit(&self) {}
-    /// FR-90 P1h-2 — hold this daemon for an update the root helper is about
-    /// to install: wait for running agent turns (at most the device's
-    /// `hive_update_wait_secs`), refuse new prompts and starts, and answer
-    /// [`Response::HiveUpdateHeld`]. The hold lasts until the asking
-    /// connection closes ([`Self::hive_update_release`]). Default: this node
-    /// runs no agent sessions, so there is nothing to hold for.
-    async fn hive_update_hold(&self) -> Response {
-        Response::Error {
-            message: "this node runs no agent sessions".into(),
-        }
-    }
-    /// FR-90 P1h-2 — the connection that held the daemon closed. An install
-    /// that worked restarted the daemon long before, so this is one that did
-    /// not: take prompts and starts again. Default: no-op.
-    fn hive_update_release(&self) {}
-    /// FR-90 P3-9-2b — open a person's endpoint (`roomler connect`) served to
-    /// `asker`, the account that asked, and answer [`Response::Connected`].
-    /// The peer has passed [`peer_may_connect`] by now. Default: a daemon
-    /// built without the vault lends nothing.
-    async fn connect(&self, _asker: &Asker, _args: &ConnectArgs) -> Response {
-        Response::Error {
-            message: "this device's daemon was built without the vault, so it opens no \
-                      endpoint"
-                .into(),
-        }
-    }
-    /// FR-90 P3-9-2b — where endpoint `id` stands: [`Response::ConnectState`].
-    /// Asked only for an id this connection opened.
-    fn connect_status(&self, _id: u64) -> Response {
-        Response::Error {
-            message: "this daemon holds no endpoint".into(),
-        }
-    }
-    /// FR-90 P3-9-2b — the connection that opened endpoint `id` closed: close
-    /// it, with its connections, and let its leases go. Default: no-op.
-    fn connect_release(&self, _id: u64) {}
     /// FR-84 D4 — what this device can encode, from the probe's CACHED
     /// result only (never a probe). `None` = this node does not report
     /// encoder capabilities at all (mocks, non-daemon impls); the daemon
@@ -3055,49 +3332,33 @@ pub trait LocalApiState: Send + Sync {
     }
 }
 
-/// FR-85 — the refusal a non-console caller gets for a recording verb.
+/// FR-85 — a recording verb's refusal, which names the screen's person (#3907).
 fn not_the_console_user() -> Response {
     Response::Error {
-        message: "only the person at this device's console can start, stop or delete a \
+        message: "only the person at this device's screen can start, stop or delete a \
                   recording, or change where recordings are saved"
             .into(),
     }
 }
 
-/// FR-52 — the answer to anyone but the person at the console who tries to
-/// open this device to people outside its organization, or change how.
+/// FR-52 — the answer to anyone but the person at this device's screen who
+/// tries to open it to people outside its organization, or change how.
 fn not_the_console_user_for_external_access() -> Response {
     Response::Error {
-        message: "only the person at this device's console can open it to people outside \
+        message: "only the person at this device's screen can open it to people outside \
                   the organization, or change how"
             .into(),
     }
 }
 
 /// FR-92 P10 — the answer to a keep-busy start from anyone but the person at
-/// the console.
+/// this device's screen.
 fn not_the_person_for_keep_busy() -> Response {
     Response::Error {
-        message: "only the person at this device's console can turn keep busy on here — \
+        message: "only the person at this device's screen can turn keep busy on here — \
                   not root or SYSTEM, not a background service, not another session \
                   (anyone may stop it)"
             .into(),
-    }
-}
-
-/// FR-90 P3-9-2b (decision 26) — the answer to a `roomler connect` from
-/// anyone [`peer_may_connect`] refuses.
-fn not_one_who_may_connect() -> Response {
-    Response::Error {
-        message: if cfg!(windows) {
-            "roomler connect lends this device's owner's vault grants, so here only SYSTEM, an \
-             elevated administrator, or the account Roomler's service runs as may run it: run \
-             it from an elevated prompt"
-        } else {
-            "roomler connect lends this device's owner's vault grants, so here only root, or \
-             the account the daemon runs as, may run it: `sudo roomler connect …`"
-        }
-        .into(),
     }
 }
 
@@ -3110,9 +3371,264 @@ pub enum Scope {
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
     /// to see who is viewing their screen, end it, answer a consent prompt,
-    /// record it, and see the devices the machine's private network lets it
-    /// see.
-    Person,
+    /// record it, see the devices the machine's private network lets it see
+    /// and what the device can encode (#3831), and set the keys that are that
+    /// person's own call (#2871).
+    ///
+    /// `owner_uid` is the person it was made for (#2871's review): the
+    /// listener drops any connection whose kernel-read uid is neither theirs
+    /// nor root's ([`person_peer_ok`]), and the per-peer gates check the same
+    /// thing again here, so what a peer may set does not rest on that one
+    /// call site.
+    Person { owner_uid: u32 },
+}
+
+impl Scope {
+    /// Is this the person-at-the-device socket?
+    pub const fn is_person(self) -> bool {
+        matches!(self, Scope::Person { .. })
+    }
+}
+
+/// #2871 — how a [`ConsoleKey`] names the config keys the console gate
+/// RESTRICTS on the daemon's own endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMatch {
+    /// The key itself, by equality. `files_dir` is not `files_dir_x`.
+    Exact(&'static str),
+    /// Every key with this prefix: a whole surface that is one decision
+    /// (`record_`, `external_`). Fail-safe as a restriction — a new
+    /// `record_*` key is console-gated before anyone thinks about it — and
+    /// for that reason never what the person socket ADMITS: there it would
+    /// fail open (`ConsoleKey::person_socket`).
+    Prefix(&'static str),
+}
+
+impl KeyMatch {
+    /// Does `key` fall under this entry?
+    pub fn matches(self, key: &str) -> bool {
+        match self {
+            KeyMatch::Exact(k) => key == k,
+            KeyMatch::Prefix(p) => key.starts_with(p),
+        }
+    }
+}
+
+/// #2871 — one entry of [`CONSOLE_PERSON_KEYS`]: a config key (or a prefix
+/// of them) that is the console person's call, and what that means on each
+/// endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsoleKey {
+    pub keys: KeyMatch,
+    /// The FR that made it the console person's.
+    pub fr: &'static str,
+    /// On the daemon's own endpoint, where the ACL may admit more than that
+    /// person (Windows' pipe admits every interactive user, RDP guests
+    /// included), a `ConfigSet` from anyone else is refused with these words.
+    pub refusal: &'static str,
+    /// The keys under this entry that the person-at-the-device socket of a
+    /// root daemon serves a `ConfigSet` of to the person at the seat (design A
+    /// on #2871), each by EQUALITY — under a prefix entry too (#2871's
+    /// review): a prefix that is a fail-safe restriction on the daemon's own
+    /// endpoint would be a fail-OPEN allowlist here, admitting every future
+    /// `record_*` / `external_*` key without anyone deciding it is the seat
+    /// person's on a root install. A key of the entry left out stays root's
+    /// on a root-mode install, with `why_not_person_socket` saying why.
+    pub person_socket: &'static [&'static str],
+    /// Why a key of this entry is left out of `person_socket`; empty when
+    /// none is.
+    pub why_not_person_socket: &'static str,
+}
+
+/// #2871 — the config keys that are the person at the console's call, as
+/// one table.
+///
+/// Each was gated to the console person by its own FR, in its own `match`
+/// arm of the dispatcher, because the daemon's own endpoint may admit more
+/// than that person: Windows' pipe admits every interactive user (an RDP
+/// guest must not steer where another person's files land, or switch off the
+/// check on the browsers that connect to their screen). This table is those
+/// arms, and its entries' `person_socket` lists are the person-at-the-device
+/// socket's allowlist for `ConfigSet` ([`person_socket_admits_key`]), exact
+/// keys only: on a root daemon the console gate alone reduces to "root", so
+/// until design A these keys — the code's own words call them the console
+/// person's — were unsettable from the seat of every root-mode Unix install.
+///
+/// Every key here is one the console person can already set on Windows and
+/// on a per-user install. ⚠️ What is NOT here, by decision: the device-owned
+/// gates `exec_enabled`, `ssh_enabled` and `remote_config_enabled` — whether
+/// the person at the seat may switch them is a policy call the operator has
+/// not made (#2871), so on a root daemon they stay root's. Locked by
+/// `the_console_person_key_table_is_the_person_sockets_allowlist`.
+pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
+    // FR-85 — where recordings of this console's screen are written, and
+    // whether a remote controller may record it, with its audio. The
+    // recorder writes as the console user, never as root. A prefix: on the
+    // daemon's own endpoint the whole surface is one decision. On the person
+    // socket the two remote switches are the person's, and `record_dir` is
+    // not (#2871): on a root-mode install it is the whole device's folder.
+    ConsoleKey {
+        keys: KeyMatch::Prefix("record_"),
+        fr: "FR-85",
+        refusal: "only the person at this device's screen can start, stop or delete a \
+                  recording, or change where recordings are saved",
+        person_socket: &["record_remote_enabled", "record_remote_audio"],
+        why_not_person_socket: "`record_dir` is where every recording on the device is saved: on \
+                                a root-mode install it stays root's, pending a check of the \
+                                folder each time a recording starts",
+    },
+    // FR-84 D4 — where files dropped into the console user's session land:
+    // one must not steer another person's incoming files (say, into their
+    // Startup folder). Equality, not a prefix match. A root writer stays
+    // inside the active user's profile (`files::validate_files_dir_setting`,
+    // run with the daemon's own identity before the save).
+    ConsoleKey {
+        keys: KeyMatch::Exact("files_dir"),
+        fr: "FR-84 D4",
+        refusal: "only the person at this device's screen can change where incoming files \
+                  land",
+        person_socket: &["files_dir"],
+        why_not_person_socket: "",
+    },
+    // FR-92 — whether a controller may keep this console's pointer moving:
+    // it is the console person's mouse.
+    ConsoleKey {
+        keys: KeyMatch::Exact("keep_busy_enabled"),
+        fr: "FR-92",
+        refusal: "only the person at this device's screen can change whether keep busy is \
+                  allowed here",
+        person_socket: &["keep_busy_enabled"],
+        why_not_person_socket: "",
+    },
+    // FR-99 — whether a controller may cover this console's screen: it is
+    // the console person who would sit in front of the curtain.
+    ConsoleKey {
+        keys: KeyMatch::Exact("privacy_mode_allowed"),
+        fr: "FR-99",
+        refusal: "only the person at this device's screen can change whether privacy mode \
+                  is allowed here",
+        person_socket: &["privacy_mode_allowed"],
+        why_not_person_socket: "",
+    },
+    // FR-99 P3 — whether this console's screen is locked when a remote
+    // session ends: it is the console person who would have to sign in again.
+    ConsoleKey {
+        keys: KeyMatch::Exact("lock_on_end"),
+        fr: "FR-99 P3",
+        refusal: "only the person at this device's screen can change whether this computer \
+                  locks when a remote session ends",
+        person_socket: &["lock_on_end"],
+        why_not_person_socket: "",
+    },
+    // FR-108 — whether a controller's display match may switch this
+    // console's display mode: it is the console person whose screen would
+    // change.
+    ConsoleKey {
+        keys: KeyMatch::Exact("display_match"),
+        fr: "FR-108",
+        refusal: "only the person at this device's screen can change whether a remote \
+                  session may switch this display",
+        person_socket: &["display_match"],
+        why_not_person_socket: "",
+    },
+    // FR-100 P1c — whether this device checks the browsers that connect to
+    // it: switching the check off weakens the console person's OWN remote
+    // access, and the pipe admits RDP guests and non-admins too.
+    ConsoleKey {
+        keys: KeyMatch::Exact("peer_auth"),
+        fr: "FR-100 P1c",
+        refusal: "only the person at this device's screen can change whether this device \
+                  checks the browsers that connect to it",
+        person_socket: &["peer_auth"],
+        why_not_person_socket: "",
+    },
+    // FR-101 P2b — what a remote session may take from this console: its
+    // clipboard, its files, its audio. Three exact keys, one decision.
+    ConsoleKey {
+        keys: KeyMatch::Exact("rc_clipboard"),
+        fr: "FR-101 P2b",
+        refusal: "only the person at this device's screen can change what a remote session \
+                  may use here (clipboard, files, audio)",
+        person_socket: &["rc_clipboard"],
+        why_not_person_socket: "",
+    },
+    ConsoleKey {
+        keys: KeyMatch::Exact("rc_files"),
+        fr: "FR-101 P2b",
+        refusal: "only the person at this device's screen can change what a remote session \
+                  may use here (clipboard, files, audio)",
+        person_socket: &["rc_files"],
+        why_not_person_socket: "",
+    },
+    ConsoleKey {
+        keys: KeyMatch::Exact("rc_audio"),
+        fr: "FR-101 P2b",
+        refusal: "only the person at this device's screen can change what a remote session \
+                  may use here (clipboard, files, audio)",
+        person_socket: &["rc_audio"],
+        why_not_person_socket: "",
+    },
+    // FR-101 P1b — whether this device may reach its server without TLS.
+    // Console-gated on the daemon's own endpoint so that an RDP guest cannot
+    // downgrade the device's link — an upper bound on who may touch it, not a
+    // statement that the person at the seat owns it: it is about the device's
+    // server link, not their screen or session. On a root-mode install it
+    // stays root's.
+    ConsoleKey {
+        keys: KeyMatch::Exact("allow_plaintext_server"),
+        fr: "FR-101 P1b",
+        refusal: "only the person at this device's screen can let it reach its server \
+                  without TLS",
+        person_socket: &[],
+        why_not_person_socket: "the device's server link, not the person's screen or session: \
+                                a root daemon's TLS posture is its administrator's",
+    },
+    // FR-52 — whether someone OUTSIDE the organization may take this
+    // console's screen at all: gates 3–5 are the console person's to give. A
+    // prefix, like `record_`: the whole surface is one decision. (The
+    // password behind gate 4, `ExternalPasswordSet` / `Clear`, is a verb, not
+    // a key, and is NOT admitted on the person socket here: `sudo roomler rc
+    // password …` on a system install.)
+    ConsoleKey {
+        keys: KeyMatch::Prefix("external_"),
+        fr: "FR-52",
+        refusal: "only the person at this device's screen can open it to people outside \
+                  the organization, or change how",
+        person_socket: &[
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+        ],
+        why_not_person_socket: "",
+    },
+];
+
+/// #2871 — the [`CONSOLE_PERSON_KEYS`] entry `key` falls under, if any. First
+/// match wins; the table has no overlapping entries (locked by its test).
+pub fn console_person_key(key: &str) -> Option<&'static ConsoleKey> {
+    CONSOLE_PERSON_KEYS.iter().find(|k| k.keys.matches(key))
+}
+
+/// #2871 — does the person-at-the-device socket serve `ConfigSet` of `key`
+/// to the person at the seat? Exactly the keys a [`CONSOLE_PERSON_KEYS`] entry
+/// lists in `person_socket`, by EQUALITY, never by its prefix (#2871's review:
+/// `record_anything_new` is console-gated and still refused here); every other
+/// key — the device-owned gates, the overlay, SSH, the updater, an unknown
+/// key — is refused there ([`not_on_the_person_socket_for_key`]).
+pub fn person_socket_admits_key(key: &str) -> bool {
+    console_person_key(key).is_some_and(|k| k.person_socket.contains(&key))
+}
+
+/// #2871 — the console gate's refusal for `key`, in that key's own words. For
+/// a key outside the table (unreachable under the dispatcher's guard) the
+/// recording gate's words, which are the oldest.
+fn console_key_refusal(key: &str) -> Response {
+    match console_person_key(key) {
+        Some(k) => Response::Error {
+            message: k.refusal.into(),
+        },
+        None => not_the_console_user(),
+    }
 }
 
 /// FR-27 P11 — may the person-at-the-device socket serve this request?
@@ -3125,7 +3641,11 @@ pub enum Scope {
 /// Disconnect, the consent prompt and its answer, and whether a recording is
 /// running (the tray turns red). FR-97 P2g adds the companion's Devices page,
 /// and P2h the live links its Connection column and Overview read. FR-85 P2e
-/// adds recording that person's own screen.
+/// adds recording that person's own screen, and #2871 (design A) the
+/// configuration: the listing, read-only but for the keys that are the
+/// console person's call, and `ConfigSet` of exactly those
+/// ([`person_socket_admits_key`]). #3831 adds what this device can encode,
+/// the Overview's card, from the probe's cached summary.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -3160,13 +3680,52 @@ pub fn person_may(req: &Request) -> bool {
         // The recorder runs as them and the daemon lists and deletes as them
         // (`RecordingManager`), so this reaches nothing they could not reach
         // themselves. The Recordings view needs the list to show anything,
-        // and the start is gated again, on the peer, in the dispatcher. Where
-        // recordings go and whether a controller may make one stay
-        // `ConfigSet`, below.
+        // and the start is gated again, on the peer, in the dispatcher. Whether
+        // a controller may make one is the console person's key, set below by
+        // name (#2871); where recordings go stays root's on a root-mode install.
         | Request::RecordStart { .. }
         | Request::RecordStop
         | Request::RecordingsList
-        | Request::RecordingDelete { .. } => true,
+        | Request::RecordingDelete { .. }
+        // #2871 (design A) — the configuration listing. Secrets are never on
+        // this surface (`config_surface`), Windows serves it to every
+        // interactive user, and the companion needs it to show the root
+        // daemon's switches — the device-owned gates read-only, with the
+        // administrator's command — instead of another daemon's file. Every
+        // key the person socket does not serve a `ConfigSet` of is marked
+        // `read_only` on the way out (`person_view`).
+        | Request::ConfigGet
+        // #3831 — what this device can encode: the Overview's "Hardware video
+        // encoding" card, which read Error on every Linux system install
+        // while this socket refused it. It can go here because the answer is
+        // read-only and cached: `handle` asks `LocalApiState::encoder_caps`,
+        // which the daemon answers with `caps::summarize_cached`, a
+        // `OnceLock::get` and lock reads of what the probe already found plus
+        // the denylist from its env and config. That never starts a probe or
+        // runs vendor driver code (`not_probed_never_triggers_a_probe` pins
+        // it), and it changes nothing on the host. The denylist and the
+        // preference it reports are on the configuration listing above
+        // already, and Windows serves the verb to every interactive user.
+        | Request::EncoderCaps
+        // #3967 — a two-row Mac's per-user half says it lists the root
+        // half's consent questions to its person's app. It reads nothing and
+        // grants nothing: it decides only whether the root half counts that
+        // person's app as its questions' surface, which nobody but that
+        // person can reach anyway. The dispatcher takes it only from the
+        // socket's own person, never root, and only for as long as the
+        // connection stays open.
+        | Request::ConsentRelaying => true,
+        // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
+        // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
+        // files land, whether a controller may record their screen, what a
+        // remote session may use on it, privacy, lock on end, display match,
+        // the browser check, external access. Not where recordings are saved,
+        // not the device-owned gates, not the overlay, SSH or the
+        // updater, and not an unknown key — each refused with the key's name
+        // and the `sudo` command (`not_on_the_person_socket_for_key`). The
+        // dispatcher gates the peer again (`may_set_console_key`), and the
+        // listener checked its uid against the seat's person before that.
+        Request::ConfigSet { key, .. } => person_socket_admits_key(key),
         Request::Flows
         | Request::Ping { .. }
         | Request::CreateForward { .. }
@@ -3179,24 +3738,18 @@ pub fn person_may(req: &Request) -> bool {
         | Request::RouteUpdate { .. }
         | Request::SetDeviceName { .. }
         | Request::ConfigCleanupStale
-        | Request::ConfigGet
-        | Request::ConfigSet { .. }
-        // FR-52 — the device-held external-access password: administrative,
-        // like every config verb (`sudo roomler rc password …` on a system
-        // install).
+        // FR-52 — the device-held external-access password: a verb, not a
+        // key, and administrative here (`sudo roomler rc password …` on a
+        // system install) even now that the `external_*` keys are the
+        // person's (#2871): admitting it is the follow-up that decision
+        // left open.
         | Request::ExternalPasswordSet { .. }
         | Request::ExternalPasswordClear
         | Request::ExternalPasswordStatus
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RestartDaemon { .. }
-        | Request::EncoderCaps
-        | Request::HiveUpdateHold
-        // FR-90 P3-9-2b — `roomler connect` lends the device OWNER's vault
-        // grants: whoever sits at the screen need not be the owner.
-        | Request::Connect { .. }
-        | Request::ConnectStatus { .. } => false,
+        | Request::RestartDaemon { .. } => false,
     }
 }
 
@@ -3207,6 +3760,13 @@ pub fn person_may(req: &Request) -> bool {
 /// `relay_dst`, `relay_server`), the carrier's forensic snapshot (`debug`), the
 /// path decision (`why`) and the prober's measurements (`probes`). Those name
 /// other devices' public and LAN addresses. Everything else passes as it is.
+///
+/// #2871 — a `ConfigEntries` listing is served whole (no secret is on the
+/// surface), with every key this socket does NOT serve a `ConfigSet` of
+/// marked [`READ_ONLY_ROOT_ONLY`]: the companion renders those rows without
+/// a control and with the administrator's command, and the CLI's `config ls`
+/// marks them. The marks are the daemon's own truth about THIS connection,
+/// so no client keeps a list of its own.
 pub fn person_view(resp: Response) -> Response {
     match resp {
         Response::Peers(mut peers) => {
@@ -3220,6 +3780,14 @@ pub fn person_view(resp: Response) -> Response {
             }
             Response::Peers(peers)
         }
+        Response::ConfigEntries(mut entries) => {
+            for e in &mut entries {
+                if !person_socket_admits_key(&e.key) {
+                    e.read_only = Some(READ_ONLY_ROOT_ONLY.into());
+                }
+            }
+            Response::ConfigEntries(entries)
+        }
         other => other,
     }
 }
@@ -3229,9 +3797,118 @@ fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
                   viewing this screen, ends it, answers consent prompts, records this screen, \
-                  and lists the devices this machine's private network reaches and its links \
-                  to them. Everything else goes to the daemon's own socket — run `sudo roomler …`"
+                  lists the devices this machine's private network reaches, its links to them \
+                  and what this device can encode, and shows this device's settings, changing \
+                  only the ones that are the person at the device's own call. Everything else \
+                  goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
+    }
+}
+
+/// #2871 — the answer to a `ConfigSet` on the person-at-the-device socket of
+/// a key it does not serve: the device-owned gates, the overlay, SSH, the
+/// updater, an unknown key. Names the key and the administrator's command, and
+/// keeps the phrase every client already recognises a person-socket refusal by
+/// ("person-at-the-device socket"); the listing says the same per key as
+/// [`ConfigEntry::read_only`] = [`READ_ONLY_ROOT_ONLY`].
+fn not_on_the_person_socket_for_key(key: &str) -> Response {
+    Response::Error {
+        message: format!(
+            "`{key}` is an administrator's on this device: this is the person-at-the-device \
+             socket of a system install, which serves that key read-only. Only the settings \
+             that are the person at the device's own call change here (where incoming files \
+             land, whether a controller may record, what a remote session may use, privacy, \
+             external access). Run `sudo roomler config set {key} <value>`"
+        ),
+    }
+}
+
+/// #3796 — whether a uid is the person at this device's seat right now, as
+/// the daemon could tell it in time ([`LocalApiState::at_the_seat_now`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtTheSeat {
+    /// That uid is the person at the seat.
+    Yes,
+    /// Someone else, nobody, or a daemon that cannot say.
+    No,
+    /// Who is at the seat gave no answer within the daemon's wait (logind
+    /// stopped, say), or the daemon's lookup failed (#3845): not known yet.
+    /// A `ConfigSet` or a `ConsentDecide` is refused with
+    /// [`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`], which asks for a retry, never
+    /// as if the person had left.
+    NotKnownYet,
+}
+
+/// #3711, #3796, #3830 — the answer when who is signed in at this computer's
+/// screen is not known in time on a Linux system install: a read, a received
+/// file, a files folder's set (`files::CANNOT_TELL`), a recording's start
+/// (`Refusal::NotKnownYet`), and a `ConfigSet` or (#3845) a `ConsentDecide`
+/// over the person socket. A retry asks again.
+pub const CANNOT_TELL_WHO_IS_AT_THE_SCREEN: &str =
+    "Could not tell who is signed in at this computer's screen. Try again.";
+
+/// #2871 (review) — is the peer of a person-socket connection the person at
+/// the seat RIGHT NOW ([`LocalApiState::at_the_seat_now`])? A peer the kernel
+/// said nothing about never is.
+async fn still_at_the_seat(state: &dyn LocalApiState, peer: &ClientPeer) -> AtTheSeat {
+    match peer.uid {
+        Some(uid) => state.at_the_seat_now(uid).await,
+        None => AtTheSeat::No,
+    }
+}
+
+/// #2871 (review) — the answer to a `ConfigSet` on the person-at-the-device
+/// socket from an account that is no longer the person at the seat: the seat
+/// changed while this connection stayed open (the listener moves within a few
+/// seconds), or the daemon cannot tell who is there.
+fn not_at_the_seat_now(key: &str) -> Response {
+    Response::Error {
+        message: format!(
+            "`{key}` was not changed: the person-at-the-device socket changes a setting only for \
+             the person signed in at this device's own screen, and that is not this account right \
+             now (the seat changed since this connection opened). Change it from the device's \
+             screen, or as an administrator: `sudo roomler config set {key} <value>`"
+        ),
+    }
+}
+
+/// #3845 — the answer to a consent answer on the person-at-the-device socket
+/// from an account that is not the person at the seat now: the seat changed
+/// while this connection stayed open, or nobody is signed in there.
+fn not_at_the_seat_to_answer() -> Response {
+    Response::Error {
+        message: "The answer was not taken: only the person signed in at this device's own \
+                  screen answers a request to see or control it, and that is not this account \
+                  right now (the seat changed since this connection opened)."
+            .into(),
+    }
+}
+
+/// The answer to a consent answer (`ending` false) or a Disconnect (`ending`
+/// true) on the daemon's own endpoint from a peer
+/// [`peer_may_decide_for_the_screen`] does not admit. Nothing is decided,
+/// and the refusal is on the record.
+fn not_the_screens_person(peer: &ClientPeer, ending: bool) -> Response {
+    tracing::warn!(
+        peer_session = ?peer.session_id,
+        peer_uid = ?peer.uid,
+        peer_elevated = ?peer.elevated,
+        screen_session = ?screen_session(own_session_id(), console_session_id()),
+        verb = if ending { "rc_disconnect" } else { "consent_decide" },
+        "localapi: refused, from a caller that is not the person at this device's screen, \
+         SYSTEM or an elevated administrator"
+    );
+    let message = if ending {
+        "The session was not ended: only the person signed in at this device's screen ends a \
+         session on it from here, or SYSTEM, or an administrator from an elevated prompt. This \
+         caller is none of those."
+    } else {
+        "The answer was not taken: only the person signed in at this device's screen answers a \
+         request to see or control it, or SYSTEM, or an administrator from an elevated prompt. \
+         This caller is none of those."
+    };
+    Response::Error {
+        message: message.into(),
     }
 }
 
@@ -3292,10 +3969,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
         | Request::Mesh { .. }
-        | Request::RestartDaemon { .. }
-        | Request::HiveUpdateHold
-        | Request::Connect { .. }
-        | Request::ConnectStatus { .. } => Response::Error {
+        | Request::ConsentRelaying
+        | Request::RestartDaemon { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -3319,7 +3994,8 @@ where
 
 /// [`serve_connection`] with the peer the listener identified at accept time.
 /// FR-85: the recording verbs and a `ConfigSet` of any `record_*` key require
-/// [`ClientPeer::is_console_user`]; an unknown peer fails that check.
+/// [`ClientPeer::is_console_user`]; a consent answer and a Disconnect require
+/// [`ClientPeer::may_decide_for_the_screen`]. An unknown peer fails both.
 pub async fn serve_connection_as<S>(
     stream: S,
     state: &dyn LocalApiState,
@@ -3345,29 +4021,62 @@ where
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
-    // FR-90 P1h-2 — a hold this connection placed ends with it, however it
-    // ends: EOF, a read error, a write error.
-    let mut held = false;
-    // FR-90 P3-9-2b — and so does every endpoint it opened (decision 25:
-    // `roomler connect` in the foreground).
-    let mut opened: Vec<u64> = Vec::new();
+    // #3967 — what this connection holds for as long as it stays open: a
+    // per-user half's `ConsentRelaying`. Ended below when the loop ends
+    // (the peer closed it, or it failed); dropped with this future when the
+    // listener stops serving it.
+    let mut held: Option<HeldForTheConnection> = None;
     let served: std::io::Result<()> = async {
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
+                // #2871 — on the person-at-the-device socket, a `ConfigSet` of a
+                // key that is not the console person's is refused by name, with
+                // the administrator's command.
+                Ok(Request::ConfigSet { ref key, .. })
+                    if scope.is_person() && !person_socket_admits_key(key) =>
+                {
+                    not_on_the_person_socket_for_key(key)
+                }
                 // FR-27 P11 — on the person-at-the-device socket, anything but the
                 // safety surface is refused before any handler runs.
-                Ok(ref req) if scope == Scope::Person && !person_may(req) => {
-                    not_on_the_person_socket()
-                }
+                Ok(ref req) if scope.is_person() && !person_may(req) => not_on_the_person_socket(),
                 // The async verbs — await them here; everything else is a pure sync
                 // dispatch through `handle`.
                 // FR-97 P2h — the network view, which a daemon may take from
                 // another process (a two-half Mac's root half).
                 Ok(Request::Status) => Response::Status(Box::new(state.status_view().await)),
                 Ok(Request::Peers) => Response::Peers(state.peers_view().await),
+                // #3864 — and the consent questions, which a one-row Mac's
+                // worker lists from the root half too.
+                Ok(Request::ConsentPending) => {
+                    Response::ConsentPending(state.consent_pending_view().await)
+                }
+                // #3967 — a two-row Mac's per-user half says it lists them,
+                // over the root half's person socket: taken only from that
+                // socket's own person, never root, and held on this
+                // connection.
+                Ok(Request::ConsentRelaying) => match scope {
+                    Scope::Person { owner_uid }
+                        if owner_uid != 0 && peer.uid == Some(owner_uid) =>
+                    {
+                        if held.is_none() {
+                            held = state.consent_relaying(owner_uid);
+                        }
+                        if held.is_some() {
+                            Response::ConsentRelayingTaken
+                        } else {
+                            Response::Error {
+                                message: CONSENT_RELAYING_NOT_TAKEN.into(),
+                            }
+                        }
+                    }
+                    _ => Response::Error {
+                        message: CONSENT_RELAYING_NOT_HERE.into(),
+                    },
+                },
                 Ok(Request::Ping {
                     target,
                     timeout_ms,
@@ -3398,119 +4107,75 @@ where
                 Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
                 Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
                 Ok(Request::ConfigGet) => state.config_entries().await,
-                // FR-85 — where recordings are written is the console user's call.
+                // The keys that are the console person's call — where their
+                // recordings and incoming files land (FR-85, FR-84 D4), keep
+                // busy (FR-92), privacy mode and lock on end (FR-99), display
+                // match (FR-108), the browser check (FR-100 P1c), what a
+                // session may use (FR-101 P2b), the TLS escape (FR-101 P1b),
+                // external access (FR-52) — are ONE table, `CONSOLE_PERSON_KEYS`
+                // (#2871), each refused in its own words to anyone but that
+                // person: on the daemon's own endpoint the session whose screen
+                // the daemon shows (`screen_session`) or the daemon's uid (the
+                // pipe admits every interactive user), on the person socket its
+                // person (`may_set_console_key`).
                 Ok(Request::ConfigSet { key, .. })
-                    if key.starts_with("record_") && !peer.is_console_user() =>
+                    if console_person_key(&key).is_some() && !peer.may_set_console_key(scope) =>
                 {
-                    not_the_console_user()
+                    console_key_refusal(&key)
                 }
-                // FR-84 D4 — and so is where files dropped into the console
-                // user's session land: the pipe admits RDP guests too, and one
-                // must not steer another person's incoming files (say, into
-                // their Startup folder). Equality, not a prefix match.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "files_dir" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change where \
-                              incoming files land"
-                            .into(),
+                // #2871 (review) — and on the person socket the seat is asked
+                // again, fresh, before anything is written: the listener follows
+                // the seat on a poll, so a connection can outlive its person's
+                // turn there, and these settings are the person AT the seat's.
+                // Root is root on every endpoint.
+                Ok(Request::ConfigSet { key, value }) if scope.is_person() && !peer.is_root() => {
+                    match still_at_the_seat(state, &peer).await {
+                        AtTheSeat::Yes => state.config_set(&key, value.as_deref()).await,
+                        AtTheSeat::No => not_at_the_seat_now(&key),
+                        // #3796 — not known in time: a retry asks again
+                        // (#3711: a timeout refuses), never "the seat changed".
+                        AtTheSeat::NotKnownYet => Response::Error {
+                            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+                        },
                     }
-                }
-                // FR-92 — and whether a controller may keep this console's
-                // pointer moving: it is the console person's mouse. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "keep_busy_enabled" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change \
-                              whether keep busy is allowed here"
-                            .into(),
-                    }
-                }
-                // FR-99 — and whether a controller may cover this console's
-                // screen: it is the console person who would sit in front of
-                // the curtain. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "privacy_mode_allowed" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change \
-                              whether privacy mode is allowed here"
-                            .into(),
-                    }
-                }
-                // FR-99 P3 — and whether this console's screen is locked when a
-                // remote session ends: it is the console person who would
-                // have to sign in again. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "lock_on_end" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change \
-                              whether this computer locks when a remote session ends"
-                            .into(),
-                    }
-                }
-                // FR-108 — and whether a controller's display match may switch
-                // this console's display mode: it is the console person whose
-                // screen would change. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "display_match" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change \
-                              whether a remote session may switch this display"
-                            .into(),
-                    }
-                }
-                // FR-100 P1c — and whether this device checks the browsers that
-                // connect to it: switching the check off weakens the console
-                // person's own remote access, and the pipe admits RDP guests
-                // and non-admins too. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "peer_auth" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change \
-                              whether this device checks the browsers that connect to it"
-                            .into(),
-                    }
-                }
-                // FR-101 P2b — and what a remote session may take from this
-                // console: its clipboard, its files, its audio. Equality.
-                Ok(Request::ConfigSet { key, .. })
-                    if matches!(key.as_str(), "rc_clipboard" | "rc_files" | "rc_audio")
-                        && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can change what \
-                              a remote session may use here (clipboard, files, audio)"
-                            .into(),
-                    }
-                }
-                // FR-101 P1b — and whether this device may reach its server
-                // without TLS. Equality, like the arm above.
-                Ok(Request::ConfigSet { key, .. })
-                    if key == "allow_plaintext_server" && !peer.is_console_user() =>
-                {
-                    Response::Error {
-                        message: "only the person at this device's console can let it reach \
-                              its server without TLS"
-                            .into(),
-                    }
-                }
-                // FR-52 — and whether someone OUTSIDE the organization may
-                // take this console's screen at all: gates 3–5 and the
-                // password behind gate 4 are the console person's to give.
-                // A prefix, like `record_`: the whole surface is one decision.
-                Ok(Request::ConfigSet { key, .. })
-                    if key.starts_with("external_") && !peer.is_console_user() =>
-                {
-                    not_the_console_user_for_external_access()
                 }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
+                }
+                // #3845 — and so is a consent answer, an approval or a denial:
+                // it lets someone see and control this screen, so it must come
+                // from whoever is at the seat NOW, never over a connection that
+                // outlived its person's turn there. Root is root everywhere.
+                Ok(Request::ConsentDecide { session_id, allow })
+                    if scope.is_person() && !peer.is_root() =>
+                {
+                    match still_at_the_seat(state, &peer).await {
+                        AtTheSeat::Yes => state.consent_decide_view(&session_id, allow).await,
+                        AtTheSeat::No => not_at_the_seat_to_answer(),
+                        AtTheSeat::NotKnownYet => Response::Error {
+                            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+                        },
+                    }
+                }
+                // And on the daemon's own endpoint a consent answer and a
+                // Disconnect come from the person at the screen this daemon
+                // shows, SYSTEM or an elevated administrator, as the OS read
+                // the peer at accept: the Windows pipe admits every interactive
+                // user. A peer it could not read is refused. Any scope but the
+                // person socket's, so a new one starts refused.
+                Ok(Request::ConsentDecide { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, false)
+                }
+                // #3864 — an answer past its gates: the daemon's view of it.
+                Ok(Request::ConsentDecide { session_id, allow }) => {
+                    state.consent_decide_view(&session_id, allow).await
+                }
+                Ok(Request::RcDisconnect { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, true)
                 }
                 Ok(Request::ExternalPasswordSet { .. } | Request::ExternalPasswordClear)
                     if !peer.is_console_user() =>
@@ -3585,31 +4250,6 @@ where
                 // FR-84 D3 — the daemon decides (and records) here; it leaves only
                 // after the answer below is on the wire.
                 Ok(Request::RestartDaemon { reason }) => state.restart_daemon(&reason).await,
-                // FR-90 P1h-2 — root alone holds the daemon for an update: the
-                // hold refuses every new agent prompt and start until it ends.
-                Ok(Request::HiveUpdateHold) if !peer.is_root() => Response::Error {
-                    message: "only root may hold this daemon for an update".into(),
-                },
-                Ok(Request::HiveUpdateHold) => state.hive_update_hold().await,
-                // FR-90 P3-9-2b (decision 26) — `roomler connect` lends the
-                // device owner's grants: root or SYSTEM, an elevated
-                // administrator, or the daemon's own account. The endpoint
-                // serves the account that asked, as the OS read it.
-                Ok(Request::Connect { .. }) if !peer.may_connect() => not_one_who_may_connect(),
-                Ok(Request::Connect { args }) => match peer.asker() {
-                    Some(asker) => state.connect(&asker, &args).await,
-                    None => Response::Error {
-                        message: "this device could not read which account asked, so it \
-                                  serves none"
-                            .into(),
-                    },
-                },
-                // Only an endpoint this connection opened: another
-                // connection's may be another account's.
-                Ok(Request::ConnectStatus { id }) if !opened.contains(&id) => Response::Error {
-                    message: format!("no endpoint {id} was opened on this connection"),
-                },
-                Ok(Request::ConnectStatus { id }) => state.connect_status(id),
                 Ok(req) => handle(&req, state),
                 Err(e) => Response::Error {
                     message: format!("bad request: {e}"),
@@ -3617,18 +4257,25 @@ where
             };
             // FR-97 P2h — what the person socket serves leaves out what only
             // an administrator needs (see `person_view`).
-            let resp = if scope == Scope::Person {
+            let resp = if scope.is_person() {
                 person_view(resp)
             } else {
                 resp
             };
-            let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
-            held |= matches!(resp, Response::HiveUpdateHeld { .. });
-            // Kept before the answer is written: a client gone by then still
-            // has its endpoint closed below.
-            if let Response::Connected { id, .. } = &resp {
-                opened.push(*id);
+            // #2871 — a change the person at the seat made over the person
+            // socket is on the record with who made it, beside the daemon's
+            // own line for the key (`localapi: config key updated`), which
+            // carries the value and whether it is live.
+            if scope.is_person()
+                && let Response::ConfigUpdated { entry } = &resp
+            {
+                tracing::info!(
+                    key = %entry.key, peer_uid = ?peer.uid,
+                    "localapi: config key set by the person at the device over the \
+                     person-at-the-device socket (#2871)"
+                );
             }
+            let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
             // A Response always serialises; fall back to an Error line if a
             // custom serializer ever failed, so we never break the frame.
             let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
@@ -3654,14 +4301,25 @@ where
         Ok(())
     }
     .await;
-    if held {
-        state.hive_update_release();
-    }
-    for id in opened {
-        state.connect_release(id);
+    // #3967 — the peer closed the connection (EOF), or reading or writing it
+    // failed: whatever it held ends with it.
+    if let Some(held) = held.take() {
+        held.end(ConnectionEnd::ClosedByThePeer);
     }
     served
 }
+
+/// #3967 — a `ConsentRelaying` the daemon does not take: it is no Mac's root
+/// half.
+const CONSENT_RELAYING_NOT_TAKEN: &str = "consent_relaying was not taken: only a two-row Mac's \
+                                          root daemon takes it, from the per-user half of the \
+                                          person at its screen";
+
+/// #3967 — a `ConsentRelaying` anywhere but the person socket, or from anyone
+/// but that socket's own person.
+const CONSENT_RELAYING_NOT_HERE: &str = "consent_relaying is taken only over the person-at-the-\
+                                         device socket, from the person it serves, never from \
+                                         root";
 
 // ---------------------------------------------------------------------------
 // Platform listener (unification P1-cont)
@@ -3745,11 +4403,20 @@ pub fn effective_pipe_pool(configured: Option<u32>) -> u32 {
 const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 
 /// SDDL for the pipe. DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
-/// `B`uiltin `A`dministrators, and `I`nteractive `U`sers — and, by omission,
-/// deny everyone else. IU covers the desktop app / CLI running in the operator's
-/// interactive session (including a non-elevated admin, whose Administrators SID
-/// is deny-only but who still matches IU). No OWNER is set — a user-mode daemon
+/// `B`uiltin `A`dministrators and the pipe's owner (`OW`, OWNER RIGHTS: the
+/// daemon's own account, which a worker running as the person is); allow
+/// `I`nteractive `U`sers `0x12008b` only — and, by omission, deny everyone
+/// else. IU covers the desktop app / CLI running in the operator's interactive
+/// session (including a non-elevated admin, whose Administrators SID is
+/// deny-only but who still matches IU). No OWNER is set — a user-mode daemon
 /// can't assign one it doesn't hold, and the creator is a valid owner anyway.
+///
+/// #3736 — `0x12008b` is reading and writing data plus reading the owner
+/// (`FILE_GENERIC_READ | FILE_WRITE_DATA`), exactly what a client opens with
+/// (`PIPE_CLIENT_ACCESS`). Never `GENERIC_WRITE`, whose `FILE_APPEND_DATA` is
+/// `FILE_CREATE_PIPE_INSTANCE`: only SYSTEM, the Administrators and the
+/// daemon's own account add an instance of this pipe, and every instance
+/// carries the first one's owner, which is what a client checks.
 ///
 /// SACL `S:(ML;;NW;;;ME)` — a mandatory-integrity label at **Medium** with
 /// No-Write-Up: a process **below** medium integrity (an AppContainer / sandboxed
@@ -3759,7 +4426,8 @@ const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 /// medium IL and SYSTEM above it, so both are unaffected. Setting a label at or
 /// below the creator's own IL needs no privilege.
 #[cfg(windows)]
-const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
+const LOCALAPI_SDDL: &str =
+    "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;IU)S:(ML;;NW;;;ME)";
 
 /// `SDDL_REVISION_1` — the only defined SDDL revision.
 #[cfg(windows)]
@@ -4046,7 +4714,7 @@ async fn accept_pipe(
 // ---- Unix: socket in the per-user runtime dir, chmod 0600 -----------------
 
 /// The LocalAPI socket file name (under the per-user runtime dir).
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const LOCALAPI_SOCKET_NAME: &str = "roomler.sock";
 
 /// Well-known home for a SYSTEM (root) daemon's control socket.
@@ -4061,33 +4729,168 @@ const LOCALAPI_SOCKET_NAME: &str = "roomler.sock";
 #[cfg(unix)]
 const LOCALAPI_SYSTEM_DIR: &str = "/var/run/roomler";
 
-/// The PER-USER socket path — `$XDG_RUNTIME_DIR/roomler.sock` when the
-/// runtime dir is set (systemd guarantees it's 0700 + user-owned — the right
-/// home for a control socket), else a `roomler/` subdir under the temp dir
-/// (locked to 0700 by the listener). The socket itself is chmod 0600.
+/// The PER-USER socket path of this process's account
+/// ([`per_user_socket_path_for`]): `$XDG_RUNTIME_DIR/roomler.sock` off
+/// macOS, `<per-user temp folder>/roomler/roomler.sock` on macOS, each only
+/// when that directory is private to this account. `None` otherwise, and
+/// always for root on macOS. The socket itself is chmod 0600.
 #[cfg(unix)]
-pub(crate) fn user_socket_path() -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(dir).join(LOCALAPI_SOCKET_NAME);
-    }
-    // No runtime dir (common on macOS, where temp_dir() is already per-user).
-    std::env::temp_dir()
-        .join("roomler")
-        .join(LOCALAPI_SOCKET_NAME)
+pub(crate) fn per_user_socket_path() -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    per_user_socket_path_for(
+        euid,
+        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
+        std::env::temp_dir(),
+        &dir_facts,
+    )
 }
 
-/// The SYSTEM socket path, used by a daemon privileged enough to bind it,
-/// and by the root update helper (FR-90 P1h-2), which holds THAT daemon.
+/// The SYSTEM socket path, used by a daemon privileged enough to bind it.
 #[cfg(unix)]
 pub fn system_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(LOCALAPI_SYSTEM_DIR).join(LOCALAPI_SOCKET_NAME)
 }
 
-/// Where a CLIENT looks, in order: a per-user daemon first (unchanged fast
-/// path for every existing install), then the system daemon.
+/// Where a CLIENT looks, in order: its own account's per-user daemon first,
+/// when it has a private directory for one, then the system daemon.
 #[cfg(unix)]
-pub(crate) fn unix_socket_candidates() -> [std::path::PathBuf; 2] {
-    [user_socket_path(), system_socket_path()]
+pub(crate) fn unix_socket_candidates() -> Vec<std::path::PathBuf> {
+    per_user_socket_path()
+        .into_iter()
+        .chain(std::iter::once(system_socket_path()))
+        .collect()
+}
+
+/// What `lstat` says about a directory an endpoint could live in, as plain
+/// facts, so the rule that reads them is tested on every platform.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirFacts {
+    pub(crate) is_dir: bool,
+    pub(crate) is_symlink: bool,
+    pub(crate) uid: u32,
+    pub(crate) mode: u32,
+}
+
+/// `lstat` of `dir`: its last component is never followed.
+#[cfg(unix)]
+fn dir_facts(dir: &std::path::Path) -> Option<DirFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir).ok()?;
+    Some(DirFacts {
+        is_dir: m.is_dir(),
+        is_symlink: m.file_type().is_symlink(),
+        uid: m.uid(),
+        mode: m.mode(),
+    })
+}
+
+/// #3736 — a directory where only `euid` (and root) can create an entry: a
+/// real directory, not a link to one, owned by `euid`, and writable by
+/// neither its group nor anyone else.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn private_dir(facts: &DirFacts, euid: u32) -> bool {
+    facts.is_dir && !facts.is_symlink && facts.uid == euid && facts.mode & 0o022 == 0
+}
+
+/// #3736 — the per-user endpoint of the account `euid`, or `None` when it has
+/// no private directory for one. Never a shared directory such as `/tmp`: a
+/// per-user endpoint lives where only its own account can create it.
+///
+/// - Off macOS: `runtime_dir` (`$XDG_RUNTIME_DIR`, which logind makes 0700
+///   and the account's) and nothing else. Root under `sudo`, cron or a system
+///   service has none, so it goes straight to the system socket.
+/// - On macOS: the per-user temp folder (`/var/folders/…/T`, what launchd sets
+///   `TMPDIR` to and what `temp_dir()` reads without it), and never for root,
+///   whose daemon serves the system socket.
+///
+/// Either directory counts only when [`private_dir`] holds for `euid`,
+/// as `facts` (`lstat`) reads it. A trailing slash is dropped first, because
+/// `lstat("dir/")` follows a link named `dir`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn per_user_socket_path_for(
+    euid: u32,
+    runtime_dir: Option<std::path::PathBuf>,
+    temp_dir: std::path::PathBuf,
+    facts: &dyn Fn(&std::path::Path) -> Option<DirFacts>,
+) -> Option<std::path::PathBuf> {
+    let private = |dir: std::path::PathBuf| {
+        let dir: std::path::PathBuf = dir.components().collect();
+        facts(&dir)
+            .is_some_and(|f| private_dir(&f, euid))
+            .then_some(dir)
+    };
+    if cfg!(target_os = "macos") {
+        if euid == 0 {
+            return None;
+        }
+        private(temp_dir).map(|dir| dir.join("roomler").join(LOCALAPI_SOCKET_NAME))
+    } else {
+        private(runtime_dir?).map(|dir| dir.join(LOCALAPI_SOCKET_NAME))
+    }
+}
+
+/// #3736 — whether a client running as `caller` keeps a socket whose server
+/// runs as `server`: its own account, or root, the two accounts a LocalAPI
+/// daemon it may talk to runs as.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn server_uid_trusted(server: u32, caller: u32) -> bool {
+    server == caller || server == 0
+}
+
+/// #3736 — the endpoints a daemon serves: the system socket alone when it
+/// could bind it, else its own per-user one, when it has a private directory
+/// for it, else none.
+///
+/// A system daemon serves no per-user path beside its own (it once did, for
+/// CLIs that predate the system socket, 2026-08). Nothing still supported
+/// needs one: the CLI on a daemon host re-execs `roomlerd cli`, the
+/// standalone CLI knows the system socket since tunnel-v0.4.149, and the
+/// companion runs as the person, whom that root-only path never admitted.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn unix_endpoints(
+    system: &std::path::Path,
+    system_bound: bool,
+    per_user: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    if system_bound {
+        vec![system.to_path_buf()]
+    } else {
+        per_user.into_iter().collect()
+    }
+}
+
+/// #3736 — why this account has no per-user socket to try, for a "not
+/// running" message: `None` for root, who reaches the system socket, and
+/// whenever there is one.
+#[cfg(unix)]
+pub fn no_per_user_socket_note() -> Option<String> {
+    // SAFETY: geteuid never fails.
+    if unsafe { libc::geteuid() } == 0 || per_user_socket_path().is_some() {
+        return None;
+    }
+    Some(if cfg!(target_os = "macos") {
+        "this account's temp folder is not private to it, so there is no per-user socket to try"
+            .to_string()
+    } else {
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            None => "XDG_RUNTIME_DIR is not set (a login session sets it), so there is no \
+                     per-user socket to try"
+                .to_string(),
+            Some(dir) => format!(
+                "XDG_RUNTIME_DIR ({}) is not a directory private to this account, so there \
+                 is no per-user socket to try",
+                std::path::Path::new(&dir).display()
+            ),
+        }
+    })
+}
+
+/// Windows has no per-user socket: the pipe is one name for every account.
+#[cfg(windows)]
+pub fn no_per_user_socket_note() -> Option<String> {
+    None
 }
 
 /// Bind the daemon's control socket, preferring the SYSTEM path.
@@ -4097,35 +4900,26 @@ pub(crate) fn unix_socket_candidates() -> [std::path::PathBuf; 2] {
 /// and a uid is only a PROXY for the thing we actually need) this TESTS the
 /// capability: if `/var/run/roomler` can be created and bound, we are the
 /// system daemon and belong there. An unprivileged daemon fails that and
-/// keeps exactly its current per-user path.
+/// serves its own per-user path, which lives only in a directory private to
+/// its account ([`per_user_socket_path_for`]).
 ///
-/// A system daemon ALSO binds the per-user path, best-effort. That is
-/// forward-compat for one release, the same shape as the P2a rollout: a
-/// `roomler` CLI that predates this change only knows the per-user path, and
-/// packaging does not guarantee the CLI and the daemon step forward in the
-/// same instant. Drop the second bind once the fleet is past it.
+/// #3736 — a system daemon serves the system socket alone, and a per-user
+/// daemon with no private directory serves nothing and logs why
+/// ([`unix_endpoints`]): never a socket in a shared temp dir.
 #[cfg(unix)]
 async fn serve_unix(
     state: Arc<dyn LocalApiState>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let system = system_socket_path();
-    match prepare_unix_listener(&system) {
+    let bound = prepare_unix_listener(&system);
+    let plan = unix_endpoints(&system, bound.is_ok(), per_user_socket_path());
+    match bound {
         Ok(listener) => {
             tracing::info!(
                 path = %system.display(),
                 "localapi: system-daemon socket (privileged); a user session reaches it here"
             );
-            let legacy = user_socket_path();
-            if let Ok(l) = prepare_unix_listener(&legacy) {
-                let st = state.clone();
-                let sd = shutdown.clone();
-                tracing::info!(
-                    path = %legacy.display(),
-                    "localapi: also serving the legacy per-user path (pre-split CLIs)"
-                );
-                tokio::spawn(async move { accept_unix(l, legacy, st, sd).await });
-            }
             accept_unix(listener, system, state, shutdown).await
         }
         Err(e) => {
@@ -4133,7 +4927,20 @@ async fn serve_unix(
                 path = %system.display(), error = %e,
                 "localapi: not privileged for the system socket; using the per-user path"
             );
-            serve_unix_at(user_socket_path(), state, shutdown).await
+            match plan.into_iter().next() {
+                Some(path) => serve_unix_at(path, state, shutdown).await,
+                None => {
+                    let why = no_per_user_socket_note()
+                        .unwrap_or_else(|| "there is no per-user socket for it".to_string());
+                    tracing::warn!(
+                        "localapi: not served: this account cannot bind the system socket, and {why}"
+                    );
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("localapi: not served: {why}"),
+                    ))
+                }
+            }
         }
     }
 }
@@ -4164,9 +4971,10 @@ fn prepare_unix_listener(path: &std::path::Path) -> std::io::Result<tokio::net::
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        // Lock the parent to owner-only when we own it (the temp-subdir case);
-        // for $XDG_RUNTIME_DIR this is already true and the chmod is harmless
-        // (ignored if we don't own it).
+        // Lock the parent to owner-only: the `roomler/` subdir of a Mac's
+        // per-user temp folder, or `/var/run/roomler`. A per-user parent is
+        // in a directory private to this account, and for $XDG_RUNTIME_DIR
+        // this is already true (#3736).
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     // A stale socket from an unclean exit makes bind fail with EADDRINUSE.
@@ -4247,8 +5055,10 @@ pub fn person_socket_path(uid: u32) -> std::path::PathBuf {
 
 /// FR-27 P11 — the caller check on the person socket, per connection, from
 /// the kernel (`SO_PEERCRED`): the person it belongs to, or root. Unknown is
-/// neither.
-#[cfg(unix)]
+/// neither. A pure decision, built on every platform so the Windows lane
+/// tests it too. The listener drops every other caller with it, and #2871's
+/// per-peer gates on a [`Scope::Person`] connection decide by it again
+/// (`peer_may_set_console_key`, `peer_may_start_keep_busy`, `peer_may_record`).
 pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
     matches!(peer.uid, Some(u) if u == owner_uid || u == 0)
 }
@@ -4298,6 +5108,27 @@ pub async fn serve_person_socket(
         path = %path.display(), uid = owner_uid,
         "localapi: person-at-the-device socket up (FR-27 P11)"
     );
+    let served = serve_person_listener(listener, owner_uid, state, &mut stop).await;
+    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
+        let _ = std::fs::remove_file(&path);
+    }
+    tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
+    served
+}
+
+/// FR-27 P11 — [`serve_person_socket`]'s accept loop, on a listener already
+/// bound: a connection whose kernel-read uid is neither `owner_uid` nor root
+/// is dropped before a byte of it is read ([`person_peer_ok`]), and every
+/// other one is served as [`Scope::Person`] until `stop`. Kept apart from the
+/// bind so a test can hand it a listener of its own and connect as an account
+/// that is not the socket's person (#2871).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn serve_person_listener(
+    listener: tokio::net::UnixListener,
+    owner_uid: u32,
+    state: Arc<dyn LocalApiState>,
+    stop: &mut watch::Receiver<bool>,
+) -> std::io::Result<()> {
     // ⚠️ Connections are held HERE, not detached: when the person at the seat
     // changes this listener is stopped, and a connection the previous person
     // still holds open must not keep answering consent for the new person's
@@ -4329,7 +5160,7 @@ pub async fn serve_person_socket(
                     }
                     let st = state.clone();
                     conns.spawn(async move {
-                        if let Err(e) = serve_connection_scoped(stream, &*st, peer, Scope::Person).await {
+                        if let Err(e) = serve_connection_scoped(stream, &*st, peer, Scope::Person { owner_uid }).await {
                             tracing::debug!(error = %e, "localapi: person-socket client ended");
                         }
                     });
@@ -4342,10 +5173,6 @@ pub async fn serve_person_socket(
         }
     };
     conns.shutdown().await;
-    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
-        let _ = std::fs::remove_file(&path);
-    }
-    tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
     served
 }
 
@@ -4568,6 +5395,14 @@ pub struct Client {
 /// `\\.\pipe\roomler` / `$XDG_RUNTIME_DIR/roomler.sock`). "Daemon not running"
 /// surfaces as [`std::io::ErrorKind::NotFound`] — callers should render that as
 /// "device service not running", not a hard failure.
+///
+/// #3736 — an endpoint is kept only when the account serving it is this
+/// process's own or the system's: on Unix the server's uid, from the kernel,
+/// is this process's or root's ([`server_uid_trusted`]); on Windows the pipe's
+/// owner is SYSTEM, the Administrators group or this account
+/// ([`pipe_owner_trusted`]). Any other is refused with
+/// [`std::io::ErrorKind::PermissionDenied`], naming the endpoint and the
+/// account, and on Unix the next candidate is tried.
 pub async fn connect() -> std::io::Result<Client> {
     #[cfg(windows)]
     {
@@ -4575,22 +5410,71 @@ pub async fn connect() -> std::io::Result<Client> {
     }
     #[cfg(not(windows))]
     {
-        // Try a per-user daemon first (unchanged, and the common case), then
-        // the system daemon. Without the second candidate a root daemon is
-        // invisible to a user session on macOS, where the per-user path lives
-        // under ROOT's `/var/folders/…` — the CLI would report "not running"
-        // for a daemon that is running perfectly well.
-        let mut last: Option<std::io::Error> = None;
-        for path in unix_socket_candidates() {
-            match connect_unix_at(path).await {
-                Ok(client) => return Ok(client),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")
-        }))
+        // Try this account's per-user daemon first, then the system daemon.
+        // Without the second candidate a root daemon is invisible to a user
+        // session on macOS, where the per-user path lives under the person's
+        // own `/var/folders/…`: the CLI would report "not running" for a
+        // daemon that is running perfectly well.
+        // SAFETY: geteuid never fails.
+        let caller = unsafe { libc::geteuid() };
+        connect_first_trusted(unix_socket_candidates(), caller, |_, stream| {
+            Ok(stream.peer_cred()?.uid())
+        })
+        .await
     }
+}
+
+/// [`connect`]'s Unix loop: the first of `paths` that answers AND is served
+/// by an account [`server_uid_trusted`] keeps for `caller`. `server_uid`
+/// reads the serving account off a connected stream (the kernel's peer
+/// credentials in production; tests may report another).
+#[cfg(unix)]
+pub(crate) async fn connect_first_trusted<F>(
+    paths: Vec<std::path::PathBuf>,
+    caller: u32,
+    server_uid: F,
+) -> std::io::Result<Client>
+where
+    F: Fn(&std::path::Path, &tokio::net::UnixStream) -> std::io::Result<u32>,
+{
+    let mut last: Option<std::io::Error> = None;
+    let mut refused: Option<std::io::Error> = None;
+    for path in paths {
+        let stream = match tokio::net::UnixStream::connect(&path).await {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        match server_uid(&path, &stream) {
+            Ok(server) if server_uid_trusted(server, caller) => {
+                return Ok(Client::new(Box::new(stream)));
+            }
+            Ok(server) => {
+                let e = untrusted_socket(&path, server, caller);
+                tracing::warn!(error = %e, "localapi: a socket served by another account was not used");
+                refused.get_or_insert(e);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(refused
+        .or(last)
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")))
+}
+
+/// The refusal for a socket whose server runs as `server`.
+#[cfg(unix)]
+fn untrusted_socket(path: &std::path::Path, server: u32, caller: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is served by uid {server}, which is neither this account (uid {caller}) nor root, \
+             so it was not used; to talk to that daemon, run this as uid {server}",
+            path.display()
+        ),
+    )
 }
 
 /// The OTHER daemon's socket, when this host runs two and [`connect`] would
@@ -4607,13 +5491,15 @@ pub async fn connect() -> std::io::Result<Client> {
 /// Returns `Some(path)` only when BOTH exist AND different processes answer
 /// them, i.e. exactly when a caller could be looking at the wrong one.
 ///
-/// #2511 — both existing is not two daemons. A system daemon ALSO binds the
-/// legacy per-user path (`serve_unix`), so a root CLI on a host with one root
-/// daemon found both, and told its reader a second daemon ran and to use the
-/// sudo they already had: on every `roomler exec <linux host> -- roomler
-/// status`. Each socket is now asked who answers it, by the peer's PID. A PID
-/// that cannot be read keeps the note, because staying silent would hide a
-/// real second daemon.
+/// #2511 — both existing is not two daemons. A system daemon older than #3736
+/// also binds a per-user path, so a root CLI on a host with one root daemon
+/// found both, and told its reader a second daemon ran and to use the sudo
+/// they already had: on every `roomler exec <linux host> -- roomler status`.
+/// Each socket is asked who answers it, by the peer's PID. A PID that cannot
+/// be read keeps the note, because staying silent would hide a real second
+/// daemon. Since #3736 root has no per-user candidate on its own (no private
+/// runtime dir under `sudo`, cron or a system service; never on a Mac), and
+/// with no per-user candidate there is nothing to compare.
 ///
 /// #2871 — `exists()` on the system socket answers **false to the very caller
 /// this note is for**: its directory is `0700 root` ([`prepare_unix_listener`]),
@@ -4625,7 +5511,8 @@ pub async fn connect() -> std::io::Result<Client> {
 /// FR-97 P2g), so that is read as the root half's evidence too.
 #[cfg(unix)]
 pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
-    let [user, system] = unix_socket_candidates();
+    let user = per_user_socket_path()?;
+    let system = system_socket_path();
     let user_exists = user.exists();
     let system_exists = system.exists() || macos_root_half_serves_me().await;
     let same_process = if user_exists && system_exists {
@@ -4663,7 +5550,9 @@ pub fn own_person_socket_path() -> Option<std::path::PathBuf> {
 
 /// #2891 — does this process run as root? A companion that does reaches a
 /// root daemon's own socket; one that does not reaches, at most, that
-/// daemon's person socket ([`person_may`]), where no config verb is served.
+/// daemon's person socket ([`person_may`]), which sets only the console
+/// person's own keys (#2871, design A) and, on a daemon older than that,
+/// serves no config verb at all.
 /// That is how its Device configuration page tells a refusal it must explain
 /// (a Linux system install) from a daemon that is down.
 #[cfg(unix)]
@@ -4742,37 +5631,245 @@ pub(crate) fn pipe_busy_backoff(attempt: u32) -> Option<std::time::Duration> {
 }
 
 /// Named-pipe connect, parameterised on the pipe name so tests can target a
-/// private one. Retries `ERROR_PIPE_BUSY` (every listening instance taken)
-/// on the bounded [`pipe_busy_backoff`] ladder; any other error (notably
-/// `ERROR_FILE_NOT_FOUND` = daemon not running) propagates immediately.
+/// private one, for this process's own account ([`connect_windows_checked`]).
 #[cfg(windows)]
 pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Client> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    const ERROR_PIPE_BUSY: i32 = 231;
-    let mut attempt = 0u32;
-    let pipe = loop {
-        match ClientOptions::new().open(pipe_name) {
-            Ok(p) => break p,
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => match pipe_busy_backoff(attempt)
-            {
-                Some(delay) => {
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                None => return Err(e),
-            },
-            Err(e) => return Err(e),
-        }
-    };
-    Ok(Client::new(Box::new(pipe)))
+    let caller = own_account_sid().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "localapi: this process's own account cannot be read",
+        )
+    })?;
+    connect_windows_checked(pipe_name, &caller).await
 }
 
 /// Unix-socket connect, parameterised on the path so tests can target a private
-/// one, and the root update helper the system daemon (FR-90 P1h-2).
+/// one. #3736 — kept only when this process's own account or root serves it
+/// ([`server_uid_trusted`]).
 #[cfg(unix)]
 pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
-    let stream = tokio::net::UnixStream::connect(path).await?;
-    Ok(Client::new(Box::new(stream)))
+    // SAFETY: geteuid never fails.
+    connect_unix_checked(path, unsafe { libc::geteuid() }).await
+}
+
+/// [`connect_unix_at`] for a client running as `caller`.
+#[cfg(unix)]
+pub(crate) async fn connect_unix_checked(
+    path: std::path::PathBuf,
+    caller: u32,
+) -> std::io::Result<Client> {
+    connect_first_trusted(vec![path], caller, |_, stream| {
+        Ok(stream.peer_cred()?.uid())
+    })
+    .await
+}
+
+/// SYSTEM's SID.
+const SYSTEM_SID: &str = "S-1-5-18";
+/// The Administrators group's SID: the owner of what an elevated
+/// administrator creates, unless policy makes it the person.
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// #3736 — whether a client running as the account `caller_sid` keeps a pipe
+/// whose owner is `owner_sid` (both as `S-1-…` text): SYSTEM, the
+/// Administrators group, or the caller's own account. These are the owners
+/// the daemon's pipe has (a SYSTEM worker's, an elevated one's, or a worker
+/// that runs as the person), and no other account can make SYSTEM or the
+/// Administrators group the owner of a pipe it creates. An owner that could
+/// not be read is no account at all.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn pipe_owner_trusted(owner_sid: &str, caller_sid: &str) -> bool {
+    owner_sid == SYSTEM_SID
+        || owner_sid == ADMINISTRATORS_SID
+        || (!owner_sid.is_empty() && owner_sid == caller_sid)
+}
+
+/// #3736 — the access a pipe client asks for: reading and writing data, and
+/// nothing else. Never `GENERIC_WRITE`, whose `FILE_APPEND_DATA` is the
+/// right to create an instance of the pipe, and nothing that changes the
+/// pipe itself (`FILE_WRITE_ATTRIBUTES`: no client sets a pipe's state).
+/// `GENERIC_READ` carries `READ_CONTROL`, which reading the owner needs.
+#[cfg(windows)]
+const PIPE_CLIENT_ACCESS: u32 = windows_sys::Win32::Foundation::GENERIC_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+
+/// #3736 — overlapped, for tokio, and at identification level: the server
+/// may learn who the client is, and may never act as it.
+#[cfg(windows)]
+const PIPE_CLIENT_FLAGS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+    | windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
+    | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+/// #3736 — [`connect_windows_at`] for a client running as the account
+/// `caller_sid`: the pipe is opened with [`PIPE_CLIENT_ACCESS`] and
+/// [`PIPE_CLIENT_FLAGS`], retrying `ERROR_PIPE_BUSY` (every listening
+/// instance taken) on the bounded [`pipe_busy_backoff`] ladder, and any other
+/// open error (notably `ERROR_FILE_NOT_FOUND` = daemon not running)
+/// propagates immediately. Then it is kept only when [`pipe_owner_trusted`]
+/// holds for its owner, read through the client's own handle. Not the server
+/// process's token: a person may not open a SYSTEM process's token, so that
+/// check would refuse the real daemon.
+#[cfg(windows)]
+pub(crate) async fn connect_windows_checked(
+    pipe_name: &str,
+    caller_sid: &str,
+) -> std::io::Result<Client> {
+    let pipe = open_pipe_client(pipe_name).await?;
+    let (owner, name) = pipe_owner(&pipe)?;
+    if !pipe_owner_trusted(&owner, caller_sid) {
+        let who = match &name {
+            Some(n) => format!("{n} ({owner})"),
+            None => owner.clone(),
+        };
+        let account = name.as_deref().unwrap_or(&owner);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{pipe_name} is owned by {who}, which is neither SYSTEM, the Administrators \
+                 group nor this account ({caller_sid}), so it was not used. Where the device \
+                 service runs as {account} (an attended install), run this as {account}"
+            ),
+        ));
+    }
+    Ok(Client::new(Box::new(pipe)))
+}
+
+/// [`connect_windows_checked`]'s open: the exact access and flags, on the
+/// busy ladder.
+#[cfg(windows)]
+async fn open_pipe_client(
+    pipe_name: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut attempt = 0u32;
+    loop {
+        // SAFETY: a NUL-terminated name; the handle is handed to tokio below,
+        // which owns it from then on, or no handle was made.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                PIPE_CLIENT_ACCESS,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                PIPE_CLIENT_FLAGS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            // SAFETY: a live pipe handle opened overlapped, owned by nothing
+            // else; tokio takes it (and closes it on failure).
+            return unsafe {
+                tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(handle as _)
+            };
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(e);
+        }
+        match pipe_busy_backoff(attempt) {
+            Some(delay) => {
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            None => return Err(e),
+        }
+    }
+}
+
+/// The owner of the pipe `pipe` is a client of, as `S-1-…` text, and its
+/// account name when it resolves. Read through the client's own handle
+/// (its `READ_CONTROL`). An owner that cannot be read is an error.
+#[cfg(windows)]
+fn pipe_owner(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
+) -> std::io::Result<(String, Option<String>)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a live pipe handle opened with READ_CONTROL; `owner` points into
+    // `sd`, which the call allocates and is freed below, once.
+    let rc = unsafe {
+        GetSecurityInfo(
+            pipe.as_raw_handle() as _,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    let read = (rc == 0 && !owner.is_null()).then(|| (sid_text(owner), account_name(owner)));
+    if !sd.is_null() {
+        // SAFETY: the one descriptor GetSecurityInfo allocated, freed once.
+        unsafe { LocalFree(sd as _) };
+    }
+    match read {
+        Some((Some(sid), name)) => Ok((sid, name)),
+        _ if rc != 0 => Err(std::io::Error::from_raw_os_error(rc as i32)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "localapi: the pipe's owner cannot be read",
+        )),
+    }
+}
+
+/// `DOMAIN\name` of `sid`, when it resolves.
+#[cfg(windows)]
+fn account_name(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain_len = domain.len() as u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: `sid` is valid for this call; the buffers are writable for the
+    // lengths passed, which the call updates to the characters written.
+    let ok = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    } != 0;
+    if !ok {
+        return None;
+    }
+    let name = String::from_utf16(&name[..name_len as usize]).ok()?;
+    let domain = String::from_utf16(&domain[..domain_len as usize]).ok()?;
+    Some(if domain.is_empty() {
+        name
+    } else {
+        format!("{domain}\\{name}")
+    })
+}
+
+/// This process's own account, as `S-1-…` text: its token's user.
+#[cfg(windows)]
+fn own_account_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: this process's own token; closed below, once.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let facts = token_facts(token);
+    // SAFETY: the token opened above, closed once.
+    unsafe { CloseHandle(token) };
+    facts.and_then(|f| f.sid)
 }
 
 /// FR-97 P2g — [`connect_unix_at`], kept only when the process serving the
@@ -4783,6 +5880,18 @@ pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client
 /// a socket served by anyone else is refused, not believed.
 #[cfg(unix)]
 pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::Result<Client> {
+    let stream = connect_unix_stream_served_by_root(path).await?;
+    Ok(Client::new(Box::new(stream)))
+}
+
+/// #3967 — [`connect_unix_served_by_root`]'s stream itself, for a caller that
+/// holds the connection open after its request: a two-row Mac's per-user
+/// half, telling its root half that it lists the root half's questions
+/// ([`Request::ConsentRelaying`]).
+#[cfg(unix)]
+pub async fn connect_unix_stream_served_by_root(
+    path: std::path::PathBuf,
+) -> std::io::Result<tokio::net::UnixStream> {
     let stream = tokio::net::UnixStream::connect(&path).await?;
     let server = stream.peer_cred()?.uid();
     if server != 0 {
@@ -4791,7 +5900,7 @@ pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::R
             format!("{} is served by uid {server}, not root", path.display()),
         ));
     }
-    Ok(Client::new(Box::new(stream)))
+    Ok(stream)
 }
 
 impl Client {
@@ -5585,16 +6694,65 @@ pub struct LanCaptureStatus {
     pub via_name: Option<String>,
 }
 
+/// #3998 — whether this account's OWN endpoint is gone: the first one
+/// [`connect`] tries, the per-user socket, is not there or nothing listens on
+/// it. On a Linux system install that socket is the person socket its root
+/// daemon serves the person at the seat; on a Mac it is the per-user half's,
+/// or a one-row Mac's screen worker's. Each goes with its daemon.
+///
+/// With it gone, no device service is there for this account, whatever a
+/// later endpoint answered. `connect` returns its LAST endpoint's error, and
+/// on a Linux system install or a Mac that is the system socket, in a folder
+/// only root may enter: a stopped daemon reads there as `PermissionDenied`,
+/// exactly as a running one does. `false` with no own endpoint to look at.
+#[cfg(unix)]
+pub async fn own_endpoint_gone() -> bool {
+    match per_user_socket_path() {
+        Some(path) => endpoint_gone(&path).await,
+        None => false,
+    }
+}
+
+/// #3998 — on Windows the pipe is [`connect`]'s only endpoint, and its own
+/// `NotFound` already says that no service is there.
+#[cfg(windows)]
+pub async fn own_endpoint_gone() -> bool {
+    false
+}
+
+/// #3998 — how long [`endpoint_gone`] waits for a connect: a unix socket
+/// answers at once, or is there and busy.
+#[cfg(unix)]
+const ENDPOINT_GONE_WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// #3998 — whether nothing a client could reach is at `path`: no socket, or
+/// one that nothing listens on (a daemon that stopped and left it behind).
+/// A socket that a service listens on is not gone, however busy or silent.
+#[cfg(unix)]
+pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
+    match tokio::time::timeout(ENDPOINT_GONE_WITHIN, tokio::net::UnixStream::connect(path)).await {
+        Ok(Err(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        Ok(Ok(_)) | Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// #2511 — one process behind both sockets is one daemon (the system
-    /// daemon's legacy per-user bind), and only that case goes quiet.
+    /// #2511 — one process behind both sockets is one daemon (a system daemon
+    /// older than #3736 also binds a per-user path), and only that case goes
+    /// quiet.
     #[cfg(unix)]
     #[test]
     fn one_daemon_behind_both_sockets_is_not_a_second_daemon() {
-        assert!(!second_daemon(true, true, Some(true)), "the legacy bind");
+        assert!(
+            !second_daemon(true, true, Some(true)),
+            "an older system daemon's per-user bind"
+        );
         assert!(second_daemon(true, true, Some(false)), "macOS's two halves");
         assert!(second_daemon(true, true, None), "unknowable: keep the note");
         assert!(
@@ -5747,6 +6905,7 @@ mod tests {
                 route_offer_withheld: None,
                 host_firewall: None,
                 config_path: None,
+                waiting_for_machine_enrollment: false,
                 dns: None,
                 srflx: None,
                 warm_relay: None,
@@ -5766,11 +6925,14 @@ mod tests {
                 legacy_env_uses: Some(Vec::new()),
                 retired_env_present: Some(Vec::new()),
                 files_dir: None,
+                last_install: None,
                 derp_inbound_drops: None,
                 netcheck: None,
                 pid: None,
                 started_at_ms: None,
                 macos_grants: None,
+                gui_worker: None,
+                companion_too_old: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -5833,6 +6995,12 @@ mod tests {
                 bytes_in: 4096,
                 bytes_out: 8192,
             }]
+        }
+        /// Whoever asks is at the seat here: the tests that use this mock are
+        /// about other gates. The seat check has its own states (`SeatAt`,
+        /// `NoSeat`).
+        async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+            AtTheSeat::Yes
         }
         fn consent_pending(&self) -> Vec<ConsentRequest> {
             vec![ConsentRequest {
@@ -6635,6 +7803,7 @@ mod tests {
             group_label: String::new(),
             tier: String::new(),
             default: None,
+            read_only: None,
         };
         // The pre-D2 shape: the four FR-84 D2 fields are omitted while
         // empty, so an entry a D2 daemon has not classified is byte-for-byte
@@ -6695,6 +7864,7 @@ mod tests {
             group_label: "Access & consent".into(),
             tier: "essential".into(),
             default: Some("false".into()),
+            read_only: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(
@@ -6703,6 +7873,16 @@ mod tests {
         );
         let back: ConfigEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back, full);
+        // #2871 — `read_only` is additive: absent while unset (the line above
+        // is byte-for-byte the pre-#2871 shape), carried when the person
+        // socket marks a key, and tolerated by a reader that predates it.
+        let marked = ConfigEntry {
+            read_only: Some(READ_ONLY_ROOT_ONLY.into()),
+            ..full.clone()
+        };
+        let json = serde_json::to_string(&marked).unwrap();
+        assert!(json.ends_with(r#","read_only":"root_only"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<ConfigEntry>(&json).unwrap(), marked);
 
         // A classified key whose built-in default is UNSET (a tribool) omits
         // `default` rather than sending `null`, so "unset by default" and
@@ -6832,6 +8012,94 @@ mod tests {
         );
         let back: NodeStatus = serde_json::from_str(&with).unwrap();
         assert_eq!(back.macos_grants, st.macos_grants);
+    }
+
+    /// FR-67 P3 — `NodeStatus.last_install` is additive, and the three states
+    /// it must keep apart survive the wire: no key (a daemon that predates it)
+    /// parses to `None`; `Absent` and `InProgress` are two different words
+    /// that round-trip as themselves.
+    #[test]
+    fn node_status_last_install_is_additive_and_keeps_absent_from_in_progress() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("last_install"), "{without}");
+        let back: NodeStatus = serde_json::from_str(&without).unwrap();
+        assert_eq!(back.last_install, None, "no key = a daemon that cannot say");
+
+        let absent = LastInstallStatus {
+            status: LastInstallStatus::ABSENT.into(),
+            expected_version: None,
+            new_binary_version: None,
+            started_unix: None,
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+        };
+        st.last_install = Some(absent.clone());
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""last_install":{"status":"Absent""#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.last_install.as_ref(), Some(&absent));
+        assert!(!absent.in_progress());
+        assert!(
+            !absent.never_reported(u64::MAX),
+            "absent is not a record that never reported"
+        );
+
+        let frozen = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.16".into()),
+            started_unix: Some(1_756_475_398),
+            ..absent.clone()
+        };
+        let back: LastInstallStatus =
+            serde_json::from_str(&serde_json::to_string(&frozen).unwrap()).unwrap();
+        assert_eq!(back, frozen);
+        assert_ne!(back.status, absent.status, "the two words never collapse");
+    }
+
+    /// FR-67 P3 — `InProgress` is a verdict still being written only while
+    /// the watcher can still be alive; past its whole budget it is an install
+    /// that never reported, and a record with no start time cannot be fresh.
+    #[test]
+    fn last_install_in_progress_is_never_reported_only_once_stale() {
+        let started = 1_792_967_937u64;
+        let mut li = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: None,
+            started_unix: Some(started),
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: None,
+        };
+        assert!(li.in_progress());
+        assert!(
+            !li.never_reported(started + 17),
+            "17 s in, the Windows watcher is still waiting on msiexec"
+        );
+        assert!(
+            !li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS - 1),
+            "inside the budget it is still a watcher at work"
+        );
+        assert!(li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS));
+        assert!(li.never_reported(started + 86_400 * 7));
+        li.started_unix = None;
+        assert!(
+            li.never_reported(started),
+            "no start time = no claim to freshness"
+        );
+        li.status = LastInstallStatus::SUCCEEDED_VERIFIED.into();
+        assert!(
+            !li.never_reported(u64::MAX),
+            "a verdict is never 'never reported'"
+        );
+        assert!(li.is_verified_success());
     }
 
     #[tokio::test]
@@ -7154,6 +8422,149 @@ mod tests {
     /// no account rather than guessing one. `None` is never written. Both
     /// values round-trip with `mode` untouched, because a per-user daemon is
     /// still a `Service` node.
+    /// #3387 — `waiting_for_machine_enrollment` is additive: absent from an
+    /// older daemon and from one that is not waiting (its JSON is unchanged),
+    /// and round-tripped when a machine-wide service runs the person's own
+    /// enrollment as the person.
+    #[test]
+    fn waiting_for_machine_enrollment_is_additive() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(!st.waiting_for_machine_enrollment);
+        assert!(
+            !serde_json::to_string(&st)
+                .unwrap()
+                .contains("waiting_for_machine_enrollment")
+        );
+        let waiting = NodeStatus {
+            privileged: Some(false),
+            waiting_for_machine_enrollment: true,
+            ..st
+        };
+        let wire = serde_json::to_string(&waiting).unwrap();
+        assert!(
+            wire.contains(r#""waiting_for_machine_enrollment":true"#),
+            "{wire}"
+        );
+        let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+        assert!(back.waiting_for_machine_enrollment);
+    }
+
+    /// #3781 — `companion_too_old` is additive both ways: absent from an older
+    /// daemon and from one whose tray connects (its JSON is unchanged), a tray
+    /// of unknown version round-trips with no `installed`, and a status that
+    /// carries the field still parses for a reader that predates it.
+    #[test]
+    fn companion_too_old_is_additive_both_ways() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.companion_too_old, None);
+        let fine = serde_json::to_string(&st).unwrap();
+        assert!(!fine.contains("companion_too_old"), "{fine}");
+
+        let too_old = NodeStatus {
+            companion_too_old: Some(CompanionTooOld {
+                installed: Some("0.4.212".into()),
+                minimum: "0.4.216".into(),
+                by_service: true,
+                retry_off: false,
+            }),
+            ..st.clone()
+        };
+        let wire = serde_json::to_string(&too_old).unwrap();
+        assert!(
+            wire.contains(
+                r#""companion_too_old":{"installed":"0.4.212","minimum":"0.4.216","by_service":true}"#
+            ),
+            "{wire}"
+        );
+        let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.companion_too_old, too_old.companion_too_old);
+
+        let unknown = CompanionTooOld {
+            installed: None,
+            minimum: "0.4.216".into(),
+            by_service: false,
+            retry_off: false,
+        };
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert_eq!(json, r#"{"minimum":"0.4.216"}"#);
+        assert_eq!(
+            serde_json::from_str::<CompanionTooOld>(&json).unwrap(),
+            unknown
+        );
+
+        /// `NodeStatus` as a CLI from before the field reads it.
+        #[derive(Deserialize)]
+        struct OlderReader {
+            name: String,
+            connected: bool,
+        }
+        let older: OlderReader = serde_json::from_str(&wire).unwrap();
+        assert_eq!((older.name.as_str(), older.connected), ("h", true));
+    }
+
+    /// #3814 — `retry_off` is additive both ways. `false` is left out, so a
+    /// status without the switch is what 0.4.218 sends; absent reads as
+    /// `false`; `true` round-trips; and a reader from before the field (a
+    /// 0.4.218 CLI's `CompanionTooOld`, or a `NodeStatus` from before
+    /// `companion_too_old`, as tunnel-v0.4.215's) parses a status that
+    /// carries it.
+    #[test]
+    fn companion_too_old_retry_off_is_additive_both_ways() {
+        let before = r#"{"installed":"0.4.212","minimum":"0.4.216","by_service":true}"#;
+        let read: CompanionTooOld = serde_json::from_str(before).unwrap();
+        assert!(!read.retry_off, "absent reads as the retry on");
+        assert_eq!(serde_json::to_string(&read).unwrap(), before);
+
+        let off = CompanionTooOld {
+            retry_off: true,
+            ..read
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(
+            json,
+            r#"{"installed":"0.4.212","minimum":"0.4.216","by_service":true,"retry_off":true}"#
+        );
+        assert_eq!(serde_json::from_str::<CompanionTooOld>(&json).unwrap(), off);
+
+        /// `CompanionTooOld` as a 0.4.218 CLI reads it.
+        #[derive(Deserialize)]
+        struct Before3814 {
+            installed: Option<String>,
+            minimum: String,
+            #[serde(default)]
+            by_service: bool,
+        }
+        let b: Before3814 = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (b.installed.as_deref(), b.minimum.as_str(), b.by_service),
+            (Some("0.4.212"), "0.4.216", true)
+        );
+
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let status = NodeStatus {
+            companion_too_old: Some(off.clone()),
+            ..serde_json::from_str::<NodeStatus>(old).unwrap()
+        };
+        let wire = serde_json::to_string(&status).unwrap();
+        assert!(wire.contains(r#""retry_off":true"#), "{wire}");
+        assert_eq!(
+            serde_json::from_str::<NodeStatus>(&wire)
+                .unwrap()
+                .companion_too_old,
+            Some(off)
+        );
+        /// `NodeStatus` as a CLI from before `companion_too_old` reads it.
+        #[derive(Deserialize)]
+        struct Before3781 {
+            name: String,
+            connected: bool,
+        }
+        let older: Before3781 = serde_json::from_str(&wire).unwrap();
+        assert_eq!((older.name.as_str(), older.connected), ("h", true));
+    }
+
     #[test]
     fn privileged_is_additive_and_independent_of_mode() {
         let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
@@ -7308,27 +8719,677 @@ mod tests {
             system_account: None,
             ..ClientPeer::UNKNOWN
         };
-        // Windows: the peer's session must be the active console session.
-        assert!(peer_is_console_user(&win(1), Some(1), None));
+        // Windows, a worker in the console session (1): the peer's session
+        // must be that session.
+        assert!(peer_is_console_user(&win(1), Some(1), Some(1), None));
         assert!(
-            !peer_is_console_user(&win(2), Some(1), None),
+            !peer_is_console_user(&win(2), Some(1), Some(1), None),
             "an RDP session"
         );
         assert!(
-            !peer_is_console_user(&win(1), None, None),
+            !peer_is_console_user(&win(1), None, Some(0), None),
             "no console session at all"
         );
         // Unix: the daemon's own uid, or root.
-        assert!(peer_is_console_user(&unix(1000), None, Some(1000)));
-        assert!(peer_is_console_user(&unix(0), None, Some(1000)));
-        assert!(!peer_is_console_user(&unix(1001), None, Some(1000)));
+        assert!(peer_is_console_user(&unix(1000), None, None, Some(1000)));
+        assert!(peer_is_console_user(&unix(0), None, None, Some(1000)));
+        assert!(!peer_is_console_user(&unix(1001), None, None, Some(1000)));
         // Fail-closed on anything unknown.
         assert!(!peer_is_console_user(
             &ClientPeer::UNKNOWN,
             Some(1),
+            Some(1),
             Some(1000)
         ));
         assert!(!ClientPeer::UNKNOWN.is_console_user());
+    }
+
+    /// A Windows person's process, as the pipe reads it at accept: its
+    /// session, and from its token a person's account, not elevated.
+    fn person_in_session(s: u32) -> ClientPeer {
+        ClientPeer {
+            session_id: Some(s),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        }
+    }
+
+    /// One console person's gate on the daemon's own endpoint, as a function
+    /// of the peer, the console session and the daemon's own session.
+    type ScreenGate = fn(&ClientPeer, Option<u32>, Option<u32>) -> bool;
+
+    /// The console person's gates on the daemon's own endpoint: a console
+    /// person's `ConfigSet` key, the recording verbs, keep busy on, and
+    /// `is_console_user`, the external-access password's gate.
+    const CONSOLE_PERSON_GATES: [(&str, ScreenGate); 4] = [
+        (
+            "is_console_user (the external-access password)",
+            |p, c, o| peer_is_console_user(p, c, o, None),
+        ),
+        ("a console person's key", |p, c, o| {
+            peer_may_set_console_key(p, Scope::Full, c, o, None)
+        }),
+        ("the recording verbs", |p, c, o| {
+            peer_may_record(p, Scope::Full, c, o, None)
+        }),
+        ("keep busy on", |p, c, o| {
+            peer_may_start_keep_busy(p, Scope::Full, c, o, None)
+        }),
+    ];
+
+    /// On Windows the console person's gates take the person at the screen
+    /// this daemon shows ([`screen_session`]), as a consent answer does: a
+    /// per-user daemon in an RDP session takes that session's person and
+    /// refuses the console's; a worker in the console session and a daemon in
+    /// session 0 take the console's; with neither session known nobody passes
+    /// by session. A table per gate; every wrong row is named.
+    #[test]
+    fn the_console_persons_gates_follow_the_screens_session() {
+        // (the daemon, the console session, its own session, the one taken)
+        let rows = [
+            (
+                "a per-user daemon in RDP session 3",
+                Some(1),
+                Some(3),
+                Some(3),
+            ),
+            (
+                "a per-user daemon in RDP session 3, no console session",
+                None,
+                Some(3),
+                Some(3),
+            ),
+            ("a worker in the console session", Some(1), Some(1), Some(1)),
+            ("a worker in console session 2", Some(2), Some(2), Some(2)),
+            ("a daemon in session 0", Some(1), Some(0), Some(1)),
+            (
+                "a daemon in session 0, no console session",
+                None,
+                Some(0),
+                None,
+            ),
+            (
+                "a daemon whose own session is unreadable",
+                Some(1),
+                None,
+                None,
+            ),
+            ("no session known", None, None, None),
+        ];
+        let mut wrong = Vec::new();
+        for (gate, may) in CONSOLE_PERSON_GATES {
+            for (daemon, console, own, taken) in rows {
+                for s in 0..=4 {
+                    let want = Some(s) == taken;
+                    if may(&person_in_session(s), console, own) != want {
+                        wrong.push(format!(
+                            "{gate}: {daemon}: the person in session {s} must be {}",
+                            if want { "taken" } else { "refused" }
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} rows wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+
+        // Each gate's other conditions stay as they were, in the screen's
+        // session too: keep busy on takes a person's account only, never
+        // SYSTEM nor an account that could not be read, and elevation is no
+        // pass to any of these gates.
+        let (console, own) = (Some(1), Some(3));
+        let system = ClientPeer {
+            system_account: Some(true),
+            sid: Some(SYSTEM_SID.into()),
+            elevated: Some(true),
+            ..person_in_session(3)
+        };
+        let unread = ClientPeer {
+            system_account: None,
+            sid: None,
+            elevated: None,
+            ..person_in_session(3)
+        };
+        assert!(!peer_may_start_keep_busy(
+            &system,
+            Scope::Full,
+            console,
+            own,
+            None
+        ));
+        assert!(!peer_may_start_keep_busy(
+            &unread,
+            Scope::Full,
+            console,
+            own,
+            None
+        ));
+        assert!(
+            peer_is_console_user(&system, console, own, None),
+            "the gate keep busy tightens"
+        );
+        let elevated_at_the_console = ClientPeer {
+            sid: Some("S-1-5-21-1-2-3-500".into()),
+            elevated: Some(true),
+            ..person_in_session(1)
+        };
+        for (gate, may) in CONSOLE_PERSON_GATES {
+            assert!(!may(&elevated_at_the_console, console, own), "{gate}");
+        }
+
+        // Unix reads no session (both `None`), so each gate decides by the
+        // uid, as it always has: a per-user daemon's own uid or root, and
+        // keep busy never root.
+        for (uid, console_person, keep_busy) in
+            [(501, true, true), (0, true, false), (502, false, false)]
+        {
+            let peer = ClientPeer {
+                uid: Some(uid),
+                gid: Some(uid),
+                ..ClientPeer::UNKNOWN
+            };
+            let full = Scope::Full;
+            assert_eq!(
+                peer_is_console_user(&peer, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_set_console_key(&peer, full, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_record(&peer, full, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_start_keep_busy(&peer, full, None, None, Some(501)),
+                keep_busy,
+                "{uid}"
+            );
+        }
+    }
+
+    /// A machine-wide install: the service host starts its worker in the
+    /// active console session, so the screen's session is the console
+    /// session, and a daemon in session 0 goes by the console session. There
+    /// every console person's gate decides exactly as the console-session
+    /// rule did, for every peer, on both scopes. That rule is written out
+    /// here.
+    #[test]
+    fn on_a_machine_wide_install_the_console_persons_gates_decide_as_before() {
+        let console_user_was = |p: &ClientPeer, console: Option<u32>, uid: Option<u32>| match (
+            p.session_id,
+            console,
+        ) {
+            (Some(s), Some(c)) => s == c,
+            _ => matches!((p.uid, uid), (Some(a), Some(o)) if a == o || a == 0),
+        };
+        let keep_busy_was =
+            |p: &ClientPeer, scope: Scope, console: Option<u32>, uid: Option<u32>| {
+                if p.uid == Some(0) {
+                    return false;
+                }
+                match (p.session_id, console) {
+                    (Some(s), Some(c)) => s == c && s != 0 && p.system_account == Some(false),
+                    _ => match scope {
+                        Scope::Person { owner_uid } => person_peer_ok(p, owner_uid),
+                        Scope::Full => matches!((p.uid, uid), (Some(a), Some(o)) if a == o),
+                    },
+                }
+            };
+        let mut peers = vec![ClientPeer::UNKNOWN];
+        for s in 0..=3 {
+            for system_account in [None, Some(false), Some(true)] {
+                for elevated in [None, Some(false), Some(true)] {
+                    peers.push(ClientPeer {
+                        session_id: Some(s),
+                        system_account,
+                        elevated,
+                        ..ClientPeer::UNKNOWN
+                    });
+                }
+            }
+        }
+        for u in [0, 501, 502] {
+            peers.push(ClientPeer {
+                uid: Some(u),
+                gid: Some(u),
+                ..ClientPeer::UNKNOWN
+            });
+        }
+        let mut checked = 0;
+        for console in [1, 2] {
+            let c = Some(console);
+            // The worker in the console session, and a daemon in session 0.
+            for own in [c, Some(0)] {
+                for uid in [None, Some(0), Some(501)] {
+                    for scope in [Scope::Full, Scope::Person { owner_uid: 501 }] {
+                        for p in &peers {
+                            let was = console_user_was(p, c, uid);
+                            let key_or_record_was = match scope {
+                                Scope::Full => was,
+                                Scope::Person { owner_uid } => person_peer_ok(p, owner_uid),
+                            };
+                            let at = format!(
+                                "{p:?}, console {c:?}, own {own:?}, uid {uid:?}, {scope:?}"
+                            );
+                            assert_eq!(peer_is_console_user(p, c, own, uid), was, "{at}");
+                            assert_eq!(
+                                peer_may_set_console_key(p, scope, c, own, uid),
+                                key_or_record_was,
+                                "{at}"
+                            );
+                            assert_eq!(
+                                peer_may_record(p, scope, c, own, uid),
+                                key_or_record_was,
+                                "{at}"
+                            );
+                            assert_eq!(
+                                peer_may_start_keep_busy(p, scope, c, own, uid),
+                                keep_busy_was(p, scope, c, uid),
+                                "{at}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 2 * 3 * 2 * peers.len());
+    }
+
+    /// Pins what this thread reads as the daemon's own session and the
+    /// console session (`PINNED_SESSIONS`) until it drops.
+    struct PinnedSessions;
+
+    impl PinnedSessions {
+        fn own_and_console(own: Option<u32>, console: Option<u32>) -> Self {
+            PINNED_SESSIONS.set(Some((own, console)));
+            PinnedSessions
+        }
+    }
+
+    impl Drop for PinnedSessions {
+        fn drop(&mut self) {
+            PINNED_SESSIONS.set(None);
+        }
+    }
+
+    /// A daemon that takes every console person's verb and counts the ones
+    /// that reach it.
+    #[derive(Clone, Default)]
+    struct TakesTheVerbs(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl TakesTheVerbs {
+        fn reached(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn take(&self) -> Response {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Response::KeepBusy(KeepBusyInfo::unavailable())
+        }
+    }
+
+    #[async_trait]
+    impl LocalApiState for TakesTheVerbs {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn config_set(&self, _key: &str, _value: Option<&str>) -> Response {
+            self.take()
+        }
+        async fn external_password_set(&self, _password: &Secret) -> Response {
+            self.take()
+        }
+        async fn external_password_clear(&self) -> Response {
+            self.take()
+        }
+        async fn record_start(&self, _opts: RecordStartOpts) -> Response {
+            self.take()
+        }
+        async fn record_stop(&self) -> Response {
+            self.take()
+        }
+        async fn recording_delete(&self, _name: &str) -> Response {
+            self.take()
+        }
+        async fn keep_busy_on(&self, _opts: KeepBusyStartOpts) -> Response {
+            self.take()
+        }
+        async fn keep_busy_off(&self) -> Response {
+            self.take()
+        }
+    }
+
+    /// Through the dispatcher, with this thread reading the sessions each
+    /// kind of daemon reads: the person at the screen it shows sets a console
+    /// person's key, turns keep busy on, records, and sets and clears the
+    /// external-access password; anyone in another session is refused each
+    /// in the gate's own words, and nothing reaches the daemon. Stopping keep
+    /// busy stays open to every peer.
+    #[tokio::test]
+    async fn the_console_persons_verbs_follow_the_screen_the_daemon_shows() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let password_set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        let verbs = [
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
+            r#"{"t":"keep_busy_on","d":{}}"#,
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+            password_set.as_str(),
+            r#"{"t":"external_password_clear"}"#,
+        ];
+        /// A kind of daemon: the two sessions it reads, and the sessions
+        /// whose person it takes and refuses.
+        struct Daemon {
+            what: &'static str,
+            own: Option<u32>,
+            console: Option<u32>,
+            taken: &'static [u32],
+            refused: &'static [u32],
+        }
+        let daemons = [
+            Daemon {
+                what: "a per-user daemon in RDP session 3",
+                own: Some(3),
+                console: Some(1),
+                taken: &[3],
+                refused: &[1, 2, 0],
+            },
+            Daemon {
+                what: "a worker in the console session",
+                own: Some(1),
+                console: Some(1),
+                taken: &[1],
+                refused: &[3, 0],
+            },
+            Daemon {
+                what: "a daemon in session 0",
+                own: Some(0),
+                console: Some(1),
+                taken: &[1],
+                refused: &[3, 0],
+            },
+            Daemon {
+                what: "a daemon whose own session is unreadable",
+                own: None,
+                console: Some(1),
+                taken: &[],
+                refused: &[1, 3],
+            },
+            Daemon {
+                what: "a daemon in session 0, no console session",
+                own: Some(0),
+                console: None,
+                taken: &[],
+                refused: &[1, 3, 0],
+            },
+        ];
+        let mut wrong = Vec::new();
+        for Daemon {
+            what: daemon,
+            own,
+            console,
+            taken,
+            refused,
+        } in daemons
+        {
+            let _pinned = PinnedSessions::own_and_console(own, console);
+            for &s in taken {
+                if !person_in_session(s).is_console_user() {
+                    wrong.push(format!("{daemon}: session {s}: not is_console_user"));
+                }
+                for line in verbs {
+                    let state = TakesTheVerbs::default();
+                    let r =
+                        ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), line)
+                            .await;
+                    if state.reached() != 1 {
+                        wrong.push(format!("{daemon}: session {s} refused {line} → {r:?}"));
+                    }
+                }
+            }
+            for &s in refused {
+                if person_in_session(s).is_console_user() {
+                    wrong.push(format!("{daemon}: session {s}: is_console_user"));
+                }
+                for line in verbs {
+                    let state = TakesTheVerbs::default();
+                    let r =
+                        ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), line)
+                            .await;
+                    if state.reached() != 0 || !is_console_refusal(&r) {
+                        wrong.push(format!("{daemon}: session {s} taken {line} → {r:?}"));
+                    }
+                }
+                let state = TakesTheVerbs::default();
+                let off = r#"{"t":"keep_busy_off"}"#;
+                ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), off).await;
+                if state.reached() != 1 {
+                    wrong.push(format!("{daemon}: session {s} could not stop keep busy"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// #3907 — `line` from the person at the CONSOLE of a per-user daemon in
+    /// RDP session 3: since #3903 the console person's gates take the person
+    /// at the screen the daemon shows, session 3's, and refuse this one. The
+    /// refusal, which must not reach the daemon.
+    async fn refused_at_the_console_of_an_rdp_daemon(line: &str) -> String {
+        let _pinned = PinnedSessions::own_and_console(Some(3), Some(1));
+        let state = TakesTheVerbs::default();
+        let r = ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(1), line).await;
+        assert_eq!(state.reached(), 0, "{line} reached the daemon: {r:?}");
+        match r {
+            Response::Error { message } => message,
+            other => panic!("{line} was not refused: {other:?}"),
+        }
+    }
+
+    /// #3907 — the recording verbs' refusal names the person at this device's
+    /// screen, whom the gate takes, and never the console, whose person it
+    /// refuses here.
+    #[tokio::test]
+    async fn a_recording_verbs_refusal_names_the_person_at_the_screen() {
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can start, stop or delete a recording, \
+                 or change where recordings are saved",
+                "{line}"
+            );
+        }
+    }
+
+    /// #3907 — keep busy on: its refusal names the person at this device's
+    /// screen.
+    #[tokio::test]
+    async fn a_keep_busy_starts_refusal_names_the_person_at_the_screen() {
+        assert_eq!(
+            refused_at_the_console_of_an_rdp_daemon(r#"{"t":"keep_busy_on","d":{}}"#).await,
+            "only the person at this device's screen can turn keep busy on here — not root or \
+             SYSTEM, not a background service, not another session (anyone may stop it)"
+        );
+    }
+
+    /// #3907 — the external-access password, set and clear: its refusal names
+    /// the person at this device's screen.
+    #[tokio::test]
+    async fn the_external_access_passwords_refusal_names_the_person_at_the_screen() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        for (verb, line) in [
+            ("external_password_set", set.as_str()),
+            (
+                "external_password_clear",
+                r#"{"t":"external_password_clear"}"#,
+            ),
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can open it to people outside the \
+                 organization, or change how",
+                "{verb}"
+            );
+        }
+    }
+
+    /// #3907 — a console person's `ConfigSet` key: every entry of
+    /// [`CONSOLE_PERSON_KEYS`] refuses in its own words, which name the person
+    /// at this device's screen.
+    #[tokio::test]
+    async fn a_console_persons_keys_refusal_names_the_person_at_the_screen() {
+        const RECORDING: &str = "only the person at this device's screen can start, stop or \
+                                 delete a recording, or change where recordings are saved";
+        const OUTSIDERS: &str = "only the person at this device's screen can open it to people \
+                                 outside the organization, or change how";
+        const SESSION_USE: &str = "only the person at this device's screen can change what a \
+                                   remote session may use here (clipboard, files, audio)";
+        let expected = [
+            ("record_dir", RECORDING),
+            ("record_remote_enabled", RECORDING),
+            ("record_remote_audio", RECORDING),
+            (
+                "files_dir",
+                "only the person at this device's screen can change where incoming files land",
+            ),
+            (
+                "keep_busy_enabled",
+                "only the person at this device's screen can change whether keep busy is \
+                 allowed here",
+            ),
+            (
+                "privacy_mode_allowed",
+                "only the person at this device's screen can change whether privacy mode is \
+                 allowed here",
+            ),
+            (
+                "lock_on_end",
+                "only the person at this device's screen can change whether this computer locks \
+                 when a remote session ends",
+            ),
+            (
+                "display_match",
+                "only the person at this device's screen can change whether a remote session \
+                 may switch this display",
+            ),
+            (
+                "peer_auth",
+                "only the person at this device's screen can change whether this device checks \
+                 the browsers that connect to it",
+            ),
+            ("rc_clipboard", SESSION_USE),
+            ("rc_files", SESSION_USE),
+            ("rc_audio", SESSION_USE),
+            (
+                "allow_plaintext_server",
+                "only the person at this device's screen can let it reach its server without TLS",
+            ),
+            ("external_access_enabled", OUTSIDERS),
+            ("external_consent_mode", OUTSIDERS),
+            ("external_max_permissions", OUTSIDERS),
+        ];
+        // Every entry of the table is asked, a new one included.
+        for k in CONSOLE_PERSON_KEYS {
+            assert!(
+                expected.iter().any(|(key, _)| k.keys.matches(key)),
+                "{k:?}: no key of it is asked here"
+            );
+        }
+        for (key, words) in expected {
+            let line = format!(r#"{{"t":"config_set","d":{{"key":"{key}","value":"false"}}}}"#);
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(&line).await,
+                words,
+                "{key}"
+            );
+        }
+    }
+
+    /// The tray and the CLI as the pipe reads them: a client of this process,
+    /// read from the OS at accept (its session, its account from its token),
+    /// sets a console person's key, turns keep busy on and starts a recording
+    /// over a real pipe, as the person at the screen this process shows. A
+    /// process in session 0, or one running as a service account, shows no
+    /// person's screen, and the test says it skipped.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_at_the_screen_sets_a_console_persons_key_over_a_real_pipe() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(
+            r"\\.\pipe\roomler-test-console-person-{}",
+            std::process::id()
+        );
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        if own_session_id().is_none_or(|s| s == 0) || peer.system_account != Some(false) {
+            eprintln!("skipped: session 0 or a service account: {peer:?}");
+            return;
+        }
+        assert_eq!(
+            peer.session_id,
+            screen_session(own_session_id(), console_session_id()),
+            "{peer:?}"
+        );
+        let state = TakesTheVerbs::default();
+        let st = state.clone();
+        let served = tokio::spawn(async move { serve_connection_as(server, &st, peer).await });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        for line in [
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"keep_busy_on","d":{}}"#,
+            r#"{"t":"record_start","d":{}}"#,
+        ] {
+            wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let got = lines.next_line().await.unwrap().unwrap();
+            let r = serde_json::from_str::<Response>(&got).unwrap();
+            assert!(!is_console_refusal(&r), "{line}: {got}");
+        }
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!(state.reached(), 3);
     }
 
     /// FR-92 P10 — who may turn keep busy ON. Root never: it is how
@@ -7357,61 +9418,100 @@ mod tests {
             ..ClientPeer::UNKNOWN
         };
         let full = Scope::Full;
-        let person = Scope::Person;
-        // Windows: the active console session only; session 0 never.
-        assert!(peer_may_start_keep_busy(&win(1), full, Some(1), None));
+        let person = Scope::Person { owner_uid: 1000 };
+        // Windows, a worker in the console session (1): that session only;
+        // session 0 never.
+        assert!(peer_may_start_keep_busy(
+            &win(1),
+            full,
+            Some(1),
+            Some(1),
+            None
+        ));
         // P10b — SYSTEM (and LocalService / NetworkService) never, even inside
         // the console session: that is how `roomler exec` arrives on a host in
         // SystemContext mode. The console-user gate would let it through.
         assert!(
-            !peer_may_start_keep_busy(&win_as(1, Some(true)), full, Some(1), None),
+            !peer_may_start_keep_busy(&win_as(1, Some(true)), full, Some(1), Some(1), None),
             "SYSTEM in the console session"
         );
         assert!(
-            peer_is_console_user(&win_as(1, Some(true)), Some(1), None),
+            peer_is_console_user(&win_as(1, Some(true)), Some(1), Some(1), None),
             "the gate this one tightens"
         );
         // P10b — an account the listener could not read is a refusal.
         assert!(
-            !peer_may_start_keep_busy(&win_as(1, None), full, Some(1), None),
+            !peer_may_start_keep_busy(&win_as(1, None), full, Some(1), Some(1), None),
             "an unreadable account"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(2), full, Some(1), None),
+            !peer_may_start_keep_busy(&win(2), full, Some(1), Some(1), None),
             "an RDP session"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(0), full, Some(0), None),
+            !peer_may_start_keep_busy(&win(0), full, Some(0), Some(0), None),
             "session 0"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(1), full, None, None),
+            !peer_may_start_keep_busy(&win(1), full, None, Some(0), None),
             "no console"
         );
         // A per-user daemon: its owner — and NOT root, unlike the console gate.
-        assert!(peer_may_start_keep_busy(&unix(501), full, None, Some(501)));
+        assert!(peer_may_start_keep_busy(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
         assert!(
-            !peer_may_start_keep_busy(&unix(0), full, None, Some(501)),
+            !peer_may_start_keep_busy(&unix(0), full, None, None, Some(501)),
             "root"
         );
         assert!(
-            peer_is_console_user(&unix(0), None, Some(501)),
+            peer_is_console_user(&unix(0), None, None, Some(501)),
             "the gate this one tightens"
         );
         assert!(
-            !peer_may_start_keep_busy(&unix(502), full, None, Some(501)),
+            !peer_may_start_keep_busy(&unix(502), full, None, None, Some(501)),
             "another user"
         );
         // A root daemon's own socket: only root reaches it, and root may not.
-        assert!(!peer_may_start_keep_busy(&unix(0), full, None, Some(0)));
+        assert!(!peer_may_start_keep_busy(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
         // The person socket of a system install: its person; root never.
-        assert!(peer_may_start_keep_busy(&unix(1000), person, None, Some(0)));
-        assert!(!peer_may_start_keep_busy(&unix(0), person, None, Some(0)));
+        assert!(peer_may_start_keep_busy(
+            &unix(1000),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(!peer_may_start_keep_busy(
+            &unix(0),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        // #2871 (review) — and nobody else, decided HERE as well as by the
+        // listener that would have dropped them: another account's uid on
+        // that socket is not its person.
+        assert!(
+            !peer_may_start_keep_busy(&unix(1001), person, None, None, Some(0)),
+            "another account on the person socket"
+        );
         // Fail closed.
         for scope in [full, person] {
             assert!(!peer_may_start_keep_busy(
                 &ClientPeer::UNKNOWN,
                 scope,
+                Some(1),
                 Some(1),
                 Some(501)
             ));
@@ -7556,19 +9656,12 @@ mod tests {
             Some(false),
             "a person's token, read: {peer:?}"
         );
-        // FR-90 P3-9-2b — and its account, by SID, from the same token: this
-        // process's own, so the daemon's own account may connect.
+        // FR-90 P3-9-2b — and its account, by SID, from the same token.
         assert!(
             peer.sid.as_deref().is_some_and(|s| s.starts_with("S-1-5-")),
             "{peer:?}"
         );
-        assert_eq!(peer.sid.as_deref(), own_sid(), "the client is this process");
         assert!(peer.elevated.is_some(), "its elevation, read: {peer:?}");
-        assert!(peer.may_connect(), "{peer:?}");
-        assert_eq!(
-            peer.asker(),
-            peer.sid.clone().map(|sid| Asker::Windows { sid })
-        );
     }
 
     #[test]
@@ -7627,24 +9720,42 @@ mod tests {
         serde_json::from_str(&r).unwrap()
     }
 
+    /// How every console person's gate refuses: it names the person at this
+    /// device's screen, whom the gate takes (#3907).
+    const AT_THE_SCREEN: &str = "only the person at this device's screen can ";
+
     fn is_console_refusal(r: &Response) -> bool {
-        matches!(r, Response::Error { message } if message.contains("console"))
+        matches!(r, Response::Error { message } if message.starts_with(AT_THE_SCREEN))
     }
 
     fn is_person_refusal(r: &Response) -> bool {
         matches!(r, Response::Error { message } if message.contains("person-at-the-device socket"))
     }
 
+    /// The person socket of a root daemon, made for uid 501 (a Mac's first
+    /// account), as the tests' person at the seat.
+    const SEAT: Scope = Scope::Person { owner_uid: 501 };
+
     async fn ask_scoped(scope: Scope, line: &str) -> Response {
-        ask_scoped_as(ClientPeer::UNKNOWN, scope, line).await
+        ask_scoped_as(scope, ClientPeer::UNKNOWN, line).await
     }
 
-    async fn ask_scoped_as(peer: ClientPeer, scope: Scope, line: &str) -> Response {
+    /// `ask_scoped`, as a known peer: what the person socket's listener hands
+    /// the dispatcher once `person_peer_ok` has passed the connection.
+    async fn ask_scoped_as(scope: Scope, peer: ClientPeer, line: &str) -> Response {
+        ask_state_scoped_as(Mock, scope, peer, line).await
+    }
+
+    /// `ask_scoped_as`, against `state` instead of [`Mock`].
+    async fn ask_state_scoped_as<S: LocalApiState + 'static>(
+        state: S,
+        scope: Scope,
+        peer: ClientPeer,
+        line: &str,
+    ) -> Response {
         let (client, server) = tokio::io::duplex(4096);
-        let srv = tokio::spawn(async move {
-            let state = Mock;
-            serve_connection_scoped(server, &state, peer, scope).await
-        });
+        let srv =
+            tokio::spawn(async move { serve_connection_scoped(server, &state, peer, scope).await });
         let (crd, mut cwr) = tokio::io::split(client);
         let mut clines = tokio::io::BufReader::new(crd).lines();
         cwr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
@@ -7658,6 +9769,8 @@ mod tests {
     /// FR-27 P11 — the person socket serves the safety surface and nothing
     /// else. The match in [`person_may`] is exhaustive, so a NEW verb cannot
     /// slip onto it by default; this pins which side today's verbs are on.
+    /// #2871 (design A) — and the configuration: the listing, and `ConfigSet`
+    /// of exactly the keys that are the console person's call.
     #[test]
     fn person_may_is_exactly_the_safety_surface() {
         let allowed = [
@@ -7683,6 +9796,28 @@ mod tests {
             r#"{"t":"record_stop"}"#,
             r#"{"t":"recordings_list"}"#,
             r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
+            // #2871 — the configuration listing (marked read-only per key on
+            // the way out), and the keys that are the console person's call.
+            r#"{"t":"config_get"}"#,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"files_dir"}}"#,
+            r#"{"t":"config_set","d":{"key":"keep_busy_enabled","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"privacy_mode_allowed","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"lock_on_end","value":"always"}}"#,
+            r#"{"t":"config_set","d":{"key":"display_match","value":"never"}}"#,
+            r#"{"t":"config_set","d":{"key":"peer_auth","value":"enforce"}}"#,
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"rc_files","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"rc_audio","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"external_access_enabled","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"external_consent_mode","value":"ask"}}"#,
+            // #3831 — what this device can encode, the Overview's card: the
+            // probe's cached summary, read-only, never a probe.
+            r#"{"t":"encoder_caps"}"#,
+            // #3967 — a two-row Mac's per-user half says it lists the root
+            // half's consent questions; taken from the socket's own person
+            // only, on the dispatcher's own check.
+            r#"{"t":"consent_relaying"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -7691,14 +9826,13 @@ mod tests {
         let refused = [
             Request::Flows,
             Request::RouteList,
-            Request::ConfigGet,
-            // #2871 — the companion's "two halves" banner reads the root
-            // half's `Status` over this socket and NOTHING else: on a
-            // root-mode Mac the device-owned gates (`exec_enabled`,
-            // `ssh_enabled`, `remote_config_enabled`) stay root's to set
-            // (`sudo roomler config set …`). Admitting a config verb here
-            // would hand them to whoever sits at the seat, and is a design
-            // decision (#2871), not a bug fix.
+            // #2871 — the device-owned gates (`exec_enabled`, `ssh_enabled`,
+            // `remote_config_enabled`) stay root's to set on a root-mode
+            // install (`sudo roomler config set …`): whether the person at
+            // the seat may switch them is a policy call the operator has not
+            // made. Design A admits the console person's OWN keys above and
+            // nothing else — not these, not the overlay, SSH or the updater,
+            // not the TLS escape, not an unknown key.
             Request::ConfigSet {
                 key: "exec_enabled".into(),
                 value: Some("true".into()),
@@ -7711,17 +9845,45 @@ mod tests {
                 key: "remote_config_enabled".into(),
                 value: Some("true".into()),
             },
+            Request::ConfigSet {
+                key: "overlay_enabled".into(),
+                value: Some("true".into()),
+            },
+            Request::ConfigSet {
+                key: "ssh_authorized_keys".into(),
+                value: Some("ssh-ed25519 AAAA".into()),
+            },
+            Request::ConfigSet {
+                key: "auto_update".into(),
+                value: Some("false".into()),
+            },
+            Request::ConfigSet {
+                key: "auto_grant_session".into(),
+                value: Some("true".into()),
+            },
+            Request::ConfigSet {
+                key: "allow_plaintext_server".into(),
+                value: Some("true".into()),
+            },
+            // Where every recording on the device is saved: root's on a
+            // root-mode install, though the remote switches beside it are the
+            // person's.
+            Request::ConfigSet {
+                key: "record_dir".into(),
+                value: Some("/home/a/Videos".into()),
+            },
+            Request::ConfigSet {
+                key: "files_dir_x".into(),
+                value: Some("1".into()),
+            },
+            Request::ConfigSet {
+                key: "no_such_key".into(),
+                value: None,
+            },
             Request::ConfigCleanupStale,
-            Request::EncoderCaps,
-            Request::HiveUpdateHold,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
-            // FR-90 P3-9-2b — the owner's grants, never the seat's.
-            Request::Connect {
-                args: ConnectArgs::default(),
-            },
-            Request::ConnectStatus { id: 1 },
         ];
         for req in refused {
             assert!(!person_may(&req), "the person socket must refuse {req:?}");
@@ -7773,23 +9935,30 @@ mod tests {
     #[tokio::test]
     async fn a_person_connection_serves_the_safety_surface_and_refuses_the_rest() {
         assert!(matches!(
-            ask_scoped(Scope::Person, r#"{"t":"status"}"#).await,
+            ask_scoped(SEAT, r#"{"t":"status"}"#).await,
             Response::Status(_)
         ));
-        let r = ask_scoped(Scope::Person, r#"{"t":"config_get"}"#).await;
+        let r = ask_scoped(SEAT, r#"{"t":"route_list"}"#).await;
         assert!(is_person_refusal(&r), "{r:?}");
         assert!(
             matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
             "the refusal says where to go instead: {r:?}"
         );
-        let r = ask_scoped(Scope::Person, r#"{"t":"flows"}"#).await;
+        let r = ask_scoped(SEAT, r#"{"t":"flows"}"#).await;
         assert!(is_person_refusal(&r), "{r:?}");
-        // The banner's Disconnect and the consent answer reach the state.
+        // #2871 — the listing passes through to the state (the mock has no
+        // config surface: a DIFFERENT error, so the pre-filter demonstrably
+        // let it by).
+        let r = ask_scoped(SEAT, r#"{"t":"config_get"}"#).await;
+        assert!(!is_person_refusal(&r), "{r:?}");
+        assert!(matches!(&r, Response::Error { message } if message.contains("not supported")));
+        // The banner's Disconnect and the consent answer pass the allowlist
+        // (a consent answer then asks the seat, #3845: its own test).
         for j in [
             r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
             r#"{"t":"consent_decide","d":{"session_id":"6ac95ff543d358ac1a427048","allow":false}}"#,
         ] {
-            let r = ask_scoped(Scope::Person, j).await;
+            let r = ask_scoped(SEAT, j).await;
             assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
         }
         // FR-97 P2g — so do the Devices page and the mesh, read-only.
@@ -7797,12 +9966,12 @@ mod tests {
             r#"{"t":"devices","d":{"org":"primary"}}"#,
             r#"{"t":"mesh","d":{"org":"primary"}}"#,
         ] {
-            let r = ask_scoped(Scope::Person, j).await;
+            let r = ask_scoped(SEAT, j).await;
             assert!(!is_person_refusal(&r), "{j} must pass through: {r:?}");
         }
         // FR-97 P2h — the peers pass too, without the relay endpoints the
         // Mock's first peer carries; the daemon's own socket keeps them.
-        match ask_scoped(Scope::Person, r#"{"t":"peers"}"#).await {
+        match ask_scoped(SEAT, r#"{"t":"peers"}"#).await {
             Response::Peers(p) => {
                 assert_eq!(p.len(), 2, "every peer, as the daemon knows them");
                 assert_eq!(p[0].rtt_ms, Some(52), "the link itself is served");
@@ -7820,6 +9989,1390 @@ mod tests {
         }
     }
 
+    /// #3831 — a daemon whose probe has answered: [`Mock`]'s answers, with the
+    /// summary its cache holds.
+    struct Encodes;
+    #[async_trait]
+    impl LocalApiState for Encodes {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
+            Some(EncoderCapsSummary {
+                state: "ready".into(),
+                cells: vec![EncoderCell {
+                    codec: "h264".into(),
+                    backend: "vaapi".into(),
+                    chroma: vec!["yuv420".into()],
+                    hardware: true,
+                }],
+                hw_encoders: vec!["ffmpeg-h264_vaapi".into()],
+                codecs: vec!["h264".into()],
+                probe_ms: Some(640),
+                probe_cached: true,
+                denied: vec!["hevc_vaapi:yuv444".into()],
+                encoder_preference: Some("auto".into()),
+            })
+        }
+    }
+
+    /// #3831 — on a Linux system install the companion runs as the person and
+    /// reaches the root daemon over its person socket, where its encoding card
+    /// read `Error`: the socket refused `encoder_caps`. The answer is the
+    /// probe's cached summary and nothing else, so the person socket now
+    /// serves it whole, to its person and to root, exactly as the daemon's own
+    /// socket does; a verb outside the list is still refused with the `sudo`
+    /// text.
+    #[tokio::test]
+    async fn the_person_socket_serves_the_cached_encoder_summary() {
+        let want = Response::EncoderCaps(Encodes.encoder_caps().unwrap());
+        let person = ClientPeer {
+            uid: Some(501),
+            ..ClientPeer::UNKNOWN
+        };
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        for peer in [person.clone(), root] {
+            let r =
+                ask_state_scoped_as(Encodes, SEAT, peer.clone(), r#"{"t":"encoder_caps"}"#).await;
+            assert!(
+                !is_person_refusal(&r),
+                "refused on the person socket: {r:?}"
+            );
+            assert_eq!(r, want, "the cached summary, whole, as {peer:?}");
+        }
+        let full = ask_state_scoped_as(
+            Encodes,
+            Scope::Full,
+            ClientPeer::UNKNOWN,
+            r#"{"t":"encoder_caps"}"#,
+        )
+        .await;
+        assert_eq!(full, want, "the daemon's own socket answers the same");
+        let r = ask_state_scoped_as(Encodes, SEAT, person, r#"{"t":"route_list"}"#).await;
+        assert!(is_person_refusal(&r), "{r:?}");
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
+            "{r:?}"
+        );
+    }
+
+    /// #2871 — the console person's keys are ONE table, and that table is the
+    /// person socket's `ConfigSet` allowlist: every entry the dispatcher
+    /// gates to the console person, exactly which of them the person socket
+    /// serves, no overlap, and the device-owned gates in neither.
+    #[test]
+    fn the_console_person_key_table_is_the_person_sockets_allowlist() {
+        // The classification, key by key, with the FR that made it so.
+        let expected: &[(&str, &str, bool)] = &[
+            // Console-gated on the daemon's own endpoint, and NOT the
+            // person's on a root-mode install: there it is where every
+            // recording on the device is saved.
+            ("record_dir", "FR-85", false),
+            ("record_remote_enabled", "FR-85", true),
+            ("record_remote_audio", "FR-85", true),
+            ("files_dir", "FR-84 D4", true),
+            ("keep_busy_enabled", "FR-92", true),
+            ("privacy_mode_allowed", "FR-99", true),
+            ("lock_on_end", "FR-99 P3", true),
+            ("display_match", "FR-108", true),
+            ("peer_auth", "FR-100 P1c", true),
+            ("rc_clipboard", "FR-101 P2b", true),
+            ("rc_files", "FR-101 P2b", true),
+            ("rc_audio", "FR-101 P2b", true),
+            // Console-gated on the daemon's own endpoint (an RDP guest must
+            // not downgrade the device's link), and NOT the person's on a
+            // root-mode install: the device's server link is not their
+            // screen or session.
+            ("allow_plaintext_server", "FR-101 P1b", false),
+            ("external_access_enabled", "FR-52", true),
+            ("external_consent_mode", "FR-52", true),
+            ("external_max_permissions", "FR-52", true),
+        ];
+        for (key, fr, on_person_socket) in expected {
+            let k = console_person_key(key).unwrap_or_else(|| panic!("{key} is console-gated"));
+            assert_eq!(k.fr, *fr, "{key}");
+            assert_eq!(k.person_socket.contains(key), *on_person_socket, "{key}");
+            assert_eq!(person_socket_admits_key(key), *on_person_socket, "{key}");
+            assert!(
+                k.refusal.starts_with(AT_THE_SCREEN),
+                "{key}'s refusal names the person at this device's screen: {}",
+                k.refusal
+            );
+            // A key kept off the person socket has its entry say why.
+            if !on_person_socket {
+                assert!(!k.why_not_person_socket.is_empty(), "{key}: say why");
+            }
+        }
+        // ...and an entry says why only when it does keep a key off.
+        for k in CONSOLE_PERSON_KEYS {
+            let kept_off = expected
+                .iter()
+                .any(|(key, _, on)| !on && k.keys.matches(key));
+            assert_eq!(!k.why_not_person_socket.is_empty(), kept_off, "{k:?}");
+        }
+        // #2871 (review) — what the person socket admits is a LIST of exact
+        // keys, each under the entry that console-gates it, and it is exactly
+        // this one. A new key here is a security decision: is it the person
+        // at the seat's own call on a ROOT install, where the setting is the
+        // whole device's? Where their incoming files land and what a session
+        // may take from their screen are; where every recording is saved and
+        // the device's server link are not.
+        let admitted: Vec<&str> = CONSOLE_PERSON_KEYS
+            .iter()
+            .flat_map(|k| {
+                for name in k.person_socket {
+                    assert!(k.keys.matches(name), "{name} is listed under its own entry");
+                }
+                k.person_socket.iter().copied()
+            })
+            .collect();
+        assert_eq!(
+            admitted,
+            [
+                "record_remote_enabled",
+                "record_remote_audio",
+                "files_dir",
+                "keep_busy_enabled",
+                "privacy_mode_allowed",
+                "lock_on_end",
+                "display_match",
+                "peer_auth",
+                "rc_clipboard",
+                "rc_files",
+                "rc_audio",
+                "external_access_enabled",
+                "external_consent_mode",
+                "external_max_permissions",
+            ],
+            "the person-at-the-device socket's ConfigSet allowlist changed. Does the new key \
+             belong to the person at the SEAT of a root-mode install (a Linux system install, \
+             a Mac's root half), where it sets the whole device's value for everyone who sits \
+             there after them? If not, leave it out of `person_socket`: the console gate alone \
+             still keeps it the console person's on Windows and on a per-user install"
+        );
+        // The entries do not overlap: one decision per key.
+        for key in expected.iter().map(|(k, _, _)| *k) {
+            let hits = CONSOLE_PERSON_KEYS
+                .iter()
+                .filter(|k| k.keys.matches(key))
+                .count();
+            assert_eq!(hits, 1, "{key} falls under exactly one entry");
+        }
+        // Equality is equality (`files_dir_x` is not `files_dir`), a prefix
+        // is a prefix (`record_` covers every recording key).
+        assert!(console_person_key("files_dir_x").is_none());
+        assert!(console_person_key("peer_auth_x").is_none());
+        assert!(console_person_key("record_anything_new").is_some());
+        assert!(console_person_key("external_anything_new").is_some());
+        // #2871 (review) — but a prefix only RESTRICTS: a key nobody has
+        // classified yet is console-gated on the daemon's own endpoint and
+        // refused on the person socket (fail closed both ways), and the
+        // admitted names are matched whole, as `ssh` is not `ssh-consent`.
+        for key in [
+            "record_anything_new",
+            "external_anything_new",
+            "record_",
+            "external_",
+            "record_dir_x",
+            "external_access_enabled_x",
+            "rc_files_x",
+        ] {
+            assert!(
+                !person_socket_admits_key(key),
+                "{key} must not reach the person socket by a prefix"
+            );
+        }
+        // ⚠️ The device-owned gates are in NEITHER set: not console-gated
+        // (any interactive user may set them on Windows, as before), and not
+        // served by the person socket (root's on a root-mode install, pending
+        // the operator's policy call on #2871). Nor is anything else.
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "ssh_authorized_keys",
+            "ssh_account_mode",
+            "auto_update",
+            "auto_grant_session",
+            "relay_server_enabled",
+            "hive_enabled",
+            "vault_enabled",
+            "macos_supervise_gui_worker",
+            "no_such_key",
+        ] {
+            assert!(
+                console_person_key(key).is_none(),
+                "{key} is not console-gated"
+            );
+            assert!(
+                !person_socket_admits_key(key),
+                "{key} must stay root's on the person socket"
+            );
+        }
+    }
+
+    /// #2871 — who may set a console person's key, by the endpoint the
+    /// request came in on: the console gate's own answer on the daemon's
+    /// endpoint, the socket's person (or root) on the person socket — decided
+    /// here by the uid, not left to the listener (#2871's review) — and never
+    /// an unknown peer.
+    #[test]
+    fn who_may_set_a_console_persons_key_by_endpoint() {
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            uid: None,
+            system_account: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let unix = |u| ClientPeer {
+            session_id: None,
+            uid: Some(u),
+            system_account: None,
+            ..ClientPeer::UNKNOWN
+        };
+        let full = Scope::Full;
+        let person = Scope::Person { owner_uid: 501 };
+        // The daemon's own endpoint: as the console gate always decided (a
+        // worker in the console session, 1, on Windows).
+        assert!(peer_may_set_console_key(
+            &win(1),
+            full,
+            Some(1),
+            Some(1),
+            None
+        ));
+        assert!(
+            !peer_may_set_console_key(&win(2), full, Some(1), Some(1), None),
+            "an RDP session"
+        );
+        assert!(peer_may_set_console_key(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
+        assert!(
+            !peer_may_set_console_key(&unix(502), full, None, None, Some(501)),
+            "another user"
+        );
+        // A root daemon's own endpoint: only root reaches it, and only root
+        // passes — which is why the person at the seat of a root-mode install
+        // had no path to their own keys before design A.
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(!peer_may_set_console_key(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
+        // The person socket of that root daemon: its person and root; never a
+        // peer the OS said nothing about.
+        assert!(peer_may_set_console_key(
+            &unix(501),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(!peer_may_set_console_key(
+            &ClientPeer::UNKNOWN,
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        // #2871 (review) — and never ANOTHER account, decided here by the uid
+        // the kernel read, whatever the listener did first. Before this, any
+        // known uid passed on that socket: drop the listener's check and
+        // another account's `ConfigSet` would have been applied.
+        assert!(
+            !peer_may_set_console_key(&unix(502), person, None, None, Some(0)),
+            "another account on the person socket"
+        );
+        assert!(
+            !peer_may_set_console_key(
+                &unix(501),
+                Scope::Person { owner_uid: 502 },
+                None,
+                None,
+                Some(0)
+            ),
+            "the person a socket was made for, on another person's socket"
+        );
+        assert!(!peer_may_set_console_key(
+            &ClientPeer::UNKNOWN,
+            full,
+            Some(1),
+            Some(1),
+            Some(0)
+        ));
+        // The listener's own check, for the record: the seat's person or root,
+        // nobody else — so a `Some(uid)` reaching the dispatcher IS one of them.
+        assert!(person_peer_ok(&unix(501), 501));
+        assert!(person_peer_ok(&unix(0), 501));
+        assert!(!person_peer_ok(&unix(502), 501));
+        assert!(!person_peer_ok(&ClientPeer::UNKNOWN, 501));
+    }
+
+    /// #2871 — over the person socket, the person at the seat reaches the
+    /// state for their own keys and is refused everything else BY NAME, with
+    /// the administrator's command; an unidentified peer on that socket is
+    /// refused their own keys too (fail closed); and the device-owned gates
+    /// are refused whoever asks.
+    #[tokio::test]
+    async fn the_person_at_the_seat_sets_their_own_keys_over_the_person_socket_and_nothing_else() {
+        let seat = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        // Their own keys reach the state (the mock has no config surface: a
+        // DIFFERENT error, so both gates demonstrably passed).
+        for line in [
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"files_dir"}}"#,
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"privacy_mode_allowed","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"external_access_enabled","value":"false"}}"#,
+        ] {
+            let r = ask_scoped_as(SEAT, seat.clone(), line).await;
+            assert!(!is_person_refusal(&r), "{line} → {r:?}");
+            assert!(!is_console_refusal(&r), "{line} → {r:?}");
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("not supported")),
+                "{line} → {r:?}"
+            );
+        }
+        // Everything else is refused by name, before any handler runs.
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "allow_plaintext_server",
+            "record_dir",
+            "auto_grant_session",
+            "no_such_key",
+        ] {
+            let line = format!(r#"{{"t":"config_set","d":{{"key":"{key}","value":"true"}}}}"#);
+            let r = ask_scoped_as(SEAT, seat.clone(), &line).await;
+            assert!(is_person_refusal(&r), "{key} → {r:?}");
+            let Response::Error { message } = &r else {
+                unreachable!()
+            };
+            assert!(
+                message.contains(&format!("`{key}`")),
+                "names the key: {message}"
+            );
+            assert!(
+                message.contains(&format!("sudo roomler config set {key} <value>")),
+                "gives the administrator's command: {message}"
+            );
+        }
+        // A peer the OS said nothing about never passes, on this socket either.
+        let r = ask_scoped(
+            SEAT,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
+        )
+        .await;
+        assert!(is_console_refusal(&r), "{r:?}");
+        // #2871 (review) — nor does ANOTHER account, by the dispatcher's own
+        // check of the uid: this connection's peer is not the person the
+        // socket was made for. (The listener drops such a connection before a
+        // byte is read; this holds without it.)
+        let other = ClientPeer {
+            uid: Some(502),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        for line in [
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"external_access_enabled","value":"true"}}"#,
+            r#"{"t":"config_set","d":{"key":"peer_auth","value":"off"}}"#,
+        ] {
+            let r = ask_scoped_as(SEAT, other.clone(), line).await;
+            assert!(is_console_refusal(&r), "{line} → {r:?}");
+            assert!(
+                !matches!(&r, Response::Error { message } if message.contains("not supported")),
+                "{line} must not reach the state: {r:?}"
+            );
+        }
+        // The daemon's own endpoint is unchanged: the console gate's words for
+        // an unidentified peer, and no console gate on the device-owned gates.
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"record_dir","value":"/tmp/x"}}"#,
+        )
+        .await;
+        assert!(is_console_refusal(&r) && !is_person_refusal(&r), "{r:?}");
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"exec_enabled","value":"true"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r) && !is_person_refusal(&r), "{r:?}");
+    }
+
+    /// #2871 (review) — [`Mock`]'s answers, with a seat that says who is at it
+    /// now.
+    struct SeatAt(Option<u32>);
+    #[async_trait]
+    impl LocalApiState for SeatAt {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Mock.peers()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Mock.flows()
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            if self.0 == Some(uid) {
+                AtTheSeat::Yes
+            } else {
+                AtTheSeat::No
+            }
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
+        }
+    }
+
+    /// #3796 — a daemon that could not tell in time who is at the seat: its
+    /// lookup gave no answer within its wait.
+    struct SeatNotKnownYet;
+    #[async_trait]
+    impl LocalApiState for SeatNotKnownYet {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+            AtTheSeat::NotKnownYet
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
+        }
+    }
+
+    /// A daemon that does not say who is at the seat: the trait's default.
+    struct NoSeat;
+    #[async_trait]
+    impl LocalApiState for NoSeat {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+    }
+
+    /// #2871 (review) — the person socket follows the seat on a poll, so a
+    /// connection can outlive its person's turn there: before a `ConfigSet`
+    /// is applied, the seat is asked again. Someone else at the seat now (a
+    /// user switch), nobody, or a daemon that cannot say: refused, by name and
+    /// with what to do instead. Root is root. The safety surface is not asked
+    /// (the poll still closes the socket within seconds).
+    #[tokio::test]
+    async fn a_person_who_left_the_seat_changes_nothing_over_the_person_socket() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let line = r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"true"}}"#;
+        // Still at the seat: the change reaches the state (the state has no
+        // config surface: its own error, so the seat check passed).
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), line).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("not supported")),
+            "{r:?}"
+        );
+        // bob switched in, the login screen is up, or the daemon cannot say.
+        for (state_seat, what) in [(Some(502), "another person"), (None, "nobody")] {
+            let r = ask_state_scoped_as(SeatAt(state_seat), SEAT, ana.clone(), line).await;
+            let Response::Error { message } = &r else {
+                panic!("{what} at the seat: {r:?}")
+            };
+            assert!(
+                message.contains("`rc_clipboard` was not changed"),
+                "{what}: {message}"
+            );
+            assert!(message.contains("person-at-the-device socket"), "{message}");
+            assert!(
+                message.contains("sudo roomler config set rc_clipboard <value>"),
+                "{message}"
+            );
+        }
+        let r = ask_state_scoped_as(NoSeat, SEAT, ana.clone(), line).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("was not changed")),
+            "the trait's default is no: {r:?}"
+        );
+        // Root on the person socket is not asked: root sets these anywhere.
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatAt(None), SEAT, root, line).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("not supported")),
+            "{r:?}"
+        );
+        // The daemon's own endpoint never asks the seat.
+        let r = ask_state_scoped_as(SeatAt(None), Scope::Full, ana.clone(), line).await;
+        assert!(!matches!(&r, Response::Error { message } if message.contains("was not changed")));
+        // And the safety surface is served without asking.
+        let r = ask_state_scoped_as(SeatAt(None), SEAT, ana, r#"{"t":"status"}"#).await;
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+    }
+
+    /// #3796 — a daemon that cannot tell in time who is at the seat (its
+    /// lookup of logind gave no answer within its wait) refuses a `ConfigSet`
+    /// over the person socket with the try-again text, in the words a read or
+    /// a received file gets then (#3711: a timeout refuses). Never "the seat
+    /// changed": the person may well still be there. Root, the daemon's own
+    /// endpoint and the safety surface are not asked.
+    #[tokio::test]
+    async fn a_seat_not_known_in_time_refuses_a_person_socket_set_with_try_again() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let line = r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"off"}}"#;
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana.clone(), line).await;
+        let Response::Error { message } = &r else {
+            panic!("a set with no answer in time: {r:?}")
+        };
+        assert_eq!(
+            message,
+            "Could not tell who is signed in at this computer's screen. Try again."
+        );
+        assert_eq!(message, CANNOT_TELL_WHO_IS_AT_THE_SCREEN);
+        // Root on the person socket is not asked: the change reaches the state
+        // (which has no config surface: its own error).
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, line).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("not supported")),
+            "{r:?}"
+        );
+        // The daemon's own endpoint never asks the seat.
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana.clone(), line).await;
+        assert!(
+            !matches!(&r, Response::Error { message } if message == CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+            "{r:?}"
+        );
+        // And the safety surface is served without asking.
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana, r#"{"t":"status"}"#).await;
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+    }
+
+    /// #3845 — a consent answer over the person socket lets its sender see
+    /// and control this screen, so the seat is asked again first, as before a
+    /// `ConfigSet`: from the person at the seat it is taken; from someone who
+    /// left, or with nobody there, it is refused in words; with no answer in
+    /// time, with the try-again text, a deny as much as an approval. Root and
+    /// the daemon's own endpoint are not asked.
+    #[tokio::test]
+    async fn a_consent_answer_over_the_person_socket_comes_from_whoever_is_at_the_seat_now() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(
+            r,
+            Response::ConsentDecided { ok: true },
+            "the person at the seat"
+        );
+        for (at_seat, what) in [(Some(502), "another person"), (None, "nobody")] {
+            let r = ask_state_scoped_as(SeatAt(at_seat), SEAT, ana.clone(), approve).await;
+            let Response::Error { message } = &r else {
+                panic!("{what} at the seat: {r:?}")
+            };
+            assert!(message.contains("was not taken"), "{what}: {message}");
+            assert!(
+                message.contains("not this account right now"),
+                "{what}: {message}"
+            );
+        }
+        let try_again = Response::Error {
+            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+        };
+        for line in [approve, deny] {
+            let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana.clone(), line).await;
+            assert_eq!(r, try_again, "{line}");
+        }
+        // Root on the person socket is not asked.
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        // The daemon's own endpoint never asks the seat. It takes a consent
+        // answer only from the person at the screen it shows, SYSTEM or an
+        // elevated administrator (`peer_may_decide_for_the_screen`), so `ana`
+        // asks there as an elevated administrator: a peer it identifies on
+        // every OS.
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana_elevated, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+    }
+
+    /// #3864 — a daemon whose consent questions are another process's, as a
+    /// one-row Mac's worker's are the root half's: its own list is empty and
+    /// it takes no answer itself, while its views list the question and pass
+    /// the other process's verdict on, a refusal in its own words.
+    struct Relaying;
+    #[async_trait]
+    impl LocalApiState for Relaying {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            if uid == 501 {
+                AtTheSeat::Yes
+            } else {
+                AtTheSeat::No
+            }
+        }
+        fn consent_pending(&self) -> Vec<ConsentRequest> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            false
+        }
+        async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+            vec![ConsentRequest {
+                session_id: "c3".into(),
+                controller_name: "Alice".into(),
+                permissions: "VIEW".into(),
+                timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
+                surface: "companion".into(),
+                org: String::new(),
+            }]
+        }
+        async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+            if session_id == "c3" && allow {
+                Response::ConsentDecided { ok: true }
+            } else {
+                Response::Error {
+                    message: "refused by the process that asked".into(),
+                }
+            }
+        }
+    }
+
+    /// #3864 — a list and an answer are the daemon's views
+    /// ([`LocalApiState::consent_pending_view`],
+    /// [`LocalApiState::consent_decide_view`]) on the daemon's own endpoint
+    /// and on the person socket alike, so a one-row Mac's worker can serve
+    /// the root half's questions on the socket its person's app dials. The
+    /// gates still come first: a peer the endpoint does not admit, or someone
+    /// who is not at the seat now, is refused before the view is asked.
+    ///
+    /// Red before #3864: both verbs were the sync dispatch's (`handle`), which
+    /// read the daemon's own lists, so the question was never listed and its
+    /// answer never taken.
+    #[tokio::test]
+    async fn the_consent_verbs_are_answered_by_the_daemons_views() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        // The daemon's own endpoint admits an answer from an elevated
+        // administrator on every OS (`peer_may_decide_for_the_screen`).
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        let list = r#"{"t":"consent_pending"}"#;
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":false}}"#;
+        for (scope, peer, what) in [
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+            (SEAT, ana.clone(), "the person socket"),
+        ] {
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), list).await;
+            assert!(
+                matches!(&r, Response::ConsentPending(v) if v.len() == 1 && v[0].session_id == "c3"),
+                "{what}: {r:?}"
+            );
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), approve).await;
+            assert_eq!(r, Response::ConsentDecided { ok: true }, "{what}");
+            let r = ask_state_scoped_as(Relaying, scope, peer, deny).await;
+            assert_eq!(
+                r,
+                Response::Error {
+                    message: "refused by the process that asked".into()
+                },
+                "{what}: a refusal passes through in its own words"
+            );
+        }
+        // The gates come first. On the person socket, someone who is not at
+        // the seat now; on the daemon's own endpoint, a peer it cannot read.
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let r = ask_state_scoped_as(Relaying, SEAT, bob, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("was not taken")),
+            "{r:?}"
+        );
+        let r = ask_state_scoped_as(Relaying, Scope::Full, ClientPeer::UNKNOWN, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("This caller is none of those")),
+            "{r:?}"
+        );
+    }
+
+    /// #3967 — a daemon that takes a relay announcement, as a two-row Mac's
+    /// root half does, and writes down each one it takes and how it ends.
+    #[derive(Clone, Default)]
+    struct TakesRelays {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl LocalApiState for TakesRelays {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_relaying(&self, uid: u32) -> Option<HeldForTheConnection> {
+            self.log.lock().unwrap().push(format!("taken {uid}"));
+            let log = self.log.clone();
+            Some(HeldForTheConnection::new(move |how| {
+                log.lock().unwrap().push(format!("ended {uid} {how:?}"));
+            }))
+        }
+    }
+
+    /// One connection `state` serves for `peer` under `scope`, asked line by
+    /// line, as a client that keeps it open between its requests.
+    struct HeldOpen {
+        wr: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        served: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl HeldOpen {
+        fn open<S: LocalApiState + 'static>(state: S, scope: Scope, peer: ClientPeer) -> Self {
+            let (client, server) = tokio::io::duplex(4096);
+            let served =
+                tokio::spawn(
+                    async move { serve_connection_scoped(server, &state, peer, scope).await },
+                );
+            let (rd, wr) = tokio::io::split(client);
+            Self {
+                wr,
+                lines: tokio::io::BufReader::new(rd).lines(),
+                served,
+            }
+        }
+
+        async fn ask(&mut self, line: &str) -> Response {
+            self.wr
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let answer = self.lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&answer).unwrap()
+        }
+
+        /// The client closes its end, and the daemon's loop finishes.
+        async fn close(self) {
+            drop(self.wr);
+            drop(self.lines);
+            self.served.await.unwrap().unwrap();
+        }
+    }
+
+    /// #3967 — a two-row Mac's per-user half says `consent_relaying` over the
+    /// root half's person socket, and the root half takes it from that
+    /// socket's own person for exactly as long as the connection stays open:
+    /// until the per-user half closes it (it stopped, or restarted), or until
+    /// the listener stops serving it (the seat changed: `serve_person_listener`
+    /// aborts every connection it holds). One connection holds one, however
+    /// often it says so. Nobody else is taken: not root, not another account,
+    /// not a caller on the daemon's own endpoint. A daemon that does not take
+    /// it refuses it, and keeps the connection open for the next request, as
+    /// an older daemon does with a verb it does not know.
+    ///
+    /// Red before #3967: the person socket refused the verb.
+    #[tokio::test]
+    async fn a_relay_announcement_is_held_for_its_connections_life() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let say = r#"{"t":"consent_relaying"}"#;
+        let list = r#"{"t":"consent_pending"}"#;
+
+        // Taken, and the per-user half closes the connection.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        assert_eq!(
+            conn.ask(say).await,
+            Response::ConsentRelayingTaken,
+            "said again"
+        );
+        assert!(
+            matches!(conn.ask(list).await, Response::ConsentPending(_)),
+            "the connection serves its next request"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501"],
+            "one held, while it is open"
+        );
+        conn.close().await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501", "ended 501 ClosedByThePeer"]
+        );
+
+        // Taken, and the listener stops serving it.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        conn.served.abort();
+        let _ = (&mut conn.served).await;
+        assert_eq!(*log.lock().unwrap(), ["taken 501", "ended 501 Dropped"]);
+
+        // Refused, and nothing is held: root and another account on the
+        // person socket, and a caller on the daemon's own endpoint.
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ana.clone()
+        };
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        for (scope, peer, what) in [
+            (SEAT, root, "root on the person socket"),
+            (SEAT, bob, "another account on the person socket"),
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+        ] {
+            let state = TakesRelays::default();
+            let log = state.log.clone();
+            let r = ask_state_scoped_as(state, scope, peer, say).await;
+            assert!(matches!(r, Response::Error { .. }), "{what}: {r:?}");
+            assert!(log.lock().unwrap().is_empty(), "{what}: nothing is held");
+        }
+
+        // A daemon that does not take it refuses it, and the connection
+        // serves its next request.
+        let mut conn = HeldOpen::open(Mock, SEAT, ana);
+        assert!(matches!(conn.ask(say).await, Response::Error { .. }));
+        assert!(matches!(conn.ask(list).await, Response::ConsentPending(_)));
+        conn.close().await;
+    }
+
+    /// A daemon that counts the consent answers and the Disconnects that
+    /// reach it, and takes every one.
+    #[derive(Clone, Default)]
+    struct Counting {
+        decided: Arc<std::sync::atomic::AtomicUsize>,
+        ended: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LocalApiState for Counting {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            self.decided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        fn rc_disconnect(&self, _session_id: &str) -> bool {
+            self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    impl Counting {
+        fn decided(&self) -> usize {
+            self.decided.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn ended(&self) -> usize {
+            self.ended.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Who may answer a consent prompt or end a live session over the
+    /// daemon's own endpoint: the person at the screen the daemon shows,
+    /// SYSTEM, or an administrator who elevated. On Windows that screen is the
+    /// daemon's own session, and only a daemon in session 0 (the service host)
+    /// takes the console's; with neither known, only SYSTEM and an elevated
+    /// administrator. On Unix it is the daemon's own account or root, as its
+    /// owner-only socket admits.
+    #[test]
+    fn the_screen_decision_table() {
+        let decide = peer_may_decide_for_the_screen;
+        // A Windows person's process, read from its token.
+        let win = |s: u32| ClientPeer {
+            session_id: Some(s),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let elevated = |s: u32| ClientPeer {
+            sid: Some("S-1-5-21-1-2-3-500".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let system = |s: u32| ClientPeer {
+            system_account: Some(true),
+            sid: Some("S-1-5-18".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let unix = |u: u32| ClientPeer {
+            uid: Some(u),
+            gid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+
+        // A machine-wide install: the worker runs in the console session (1).
+        assert!(
+            decide(&win(1), Some(1), Some(1), None),
+            "the console person"
+        );
+        assert!(
+            !decide(&win(2), Some(1), Some(1), None),
+            "another signed-in account: a switched-away user, an RDP session"
+        );
+        assert!(
+            decide(&elevated(2), Some(1), Some(1), None),
+            "an elevated administrator, from any session"
+        );
+        assert!(decide(&system(0), Some(1), Some(1), None), "SYSTEM");
+        assert!(
+            decide(&system(1), Some(1), Some(1), None),
+            "SYSTEM in the console session"
+        );
+
+        // A per-user install whose person works over RDP: the daemon runs in
+        // that RDP session (3), and its screen is the one it shows.
+        assert!(
+            decide(&win(3), Some(1), Some(3), None),
+            "the person in the RDP session the daemon shows"
+        );
+        assert!(
+            !decide(&win(1), Some(1), Some(3), None),
+            "the person at the console is someone else"
+        );
+        assert!(
+            decide(&elevated(1), Some(1), Some(3), None),
+            "an elevated administrator"
+        );
+        assert!(decide(&system(0), Some(1), Some(3), None), "SYSTEM");
+
+        // A daemon in session 0, the service host: the console session.
+        assert!(decide(&win(1), Some(1), Some(0), None));
+        assert!(
+            !decide(&win(0), Some(1), Some(0), None),
+            "session 0 is never a person's"
+        );
+        assert!(!decide(&win(2), Some(1), Some(0), None));
+
+        // No console session, or a daemon whose own session could not be
+        // read: nobody but SYSTEM and an elevated administrator.
+        for (console, own) in [(None, Some(0)), (Some(1), None), (None, None)] {
+            for s in [0, 1, 2] {
+                assert!(
+                    !decide(&win(s), console, own, None),
+                    "{console:?} {own:?} {s}"
+                );
+            }
+            assert!(
+                decide(&system(0), console, own, None),
+                "{console:?} {own:?}"
+            );
+            assert!(
+                decide(&elevated(1), console, own, None),
+                "{console:?} {own:?}"
+            );
+        }
+
+        // SYSTEM by its own account: LocalService and NetworkService are
+        // service accounts, not SYSTEM.
+        for sid in ["S-1-5-19", "S-1-5-20"] {
+            let service = ClientPeer {
+                sid: Some(sid.into()),
+                elevated: Some(false),
+                ..system(0)
+            };
+            assert!(!decide(&service, Some(1), Some(1), None), "{sid}");
+        }
+        // A Windows peer whose session or account could not be read.
+        let no_session = ClientPeer {
+            session_id: None,
+            ..win(1)
+        };
+        assert!(!decide(&no_session, Some(1), Some(1), None));
+        let no_account = ClientPeer {
+            session_id: Some(2),
+            ..ClientPeer::UNKNOWN
+        };
+        assert!(!decide(&no_account, Some(1), Some(1), None));
+
+        // Unix: the daemon's own account, or root.
+        assert!(decide(&unix(1000), None, None, Some(1000)));
+        assert!(decide(&unix(0), None, None, Some(1000)), "root");
+        assert!(!decide(&unix(1001), None, None, Some(1000)));
+        assert!(!decide(&unix(1000), None, None, None));
+
+        // Unknown: never.
+        for (console, own, uid) in [
+            (Some(1), Some(1), None),
+            (None, None, Some(1000)),
+            (None, None, None),
+        ] {
+            assert!(!decide(&ClientPeer::UNKNOWN, console, own, uid));
+        }
+
+        // The screen's session alone.
+        assert_eq!(screen_session(Some(3), Some(1)), Some(3), "its own");
+        assert_eq!(screen_session(Some(0), Some(1)), Some(1), "the console's");
+        assert_eq!(screen_session(Some(0), None), None);
+        assert_eq!(screen_session(Some(0), Some(0)), None);
+        assert_eq!(screen_session(None, Some(1)), None, "fails closed");
+    }
+
+    /// Over the daemon's own endpoint a consent answer, an approval or a
+    /// denial, and a Disconnect come from the person at the screen it shows,
+    /// SYSTEM or an elevated administrator. Another signed-in account, and a
+    /// peer the endpoint could not identify, are refused in words, and nothing
+    /// reaches the daemon. The person socket keeps its own rule (#3845).
+    #[tokio::test]
+    async fn a_consent_answer_or_a_disconnect_on_the_daemons_own_endpoint_comes_from_the_screens_person()
+     {
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let end = r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#;
+        // A session that is neither this process's nor the console's.
+        let other = [own_session_id(), console_session_id()]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let another_session = ClientPeer {
+            session_id: Some(other),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1002".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let stranger = if own_uid() == Some(4242) { 4243 } else { 4242 };
+        let another_account = ClientPeer {
+            uid: Some(stranger),
+            gid: Some(stranger),
+            ..ClientPeer::UNKNOWN
+        };
+        for (who, peer) in [
+            ("another session", another_session.clone()),
+            ("another account", another_account),
+            ("a peer nobody could identify", ClientPeer::UNKNOWN),
+        ] {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert!(
+                    matches!(&r, Response::Error { message } if message.starts_with("The answer was not taken")),
+                    "{who}: {line} → {r:?}"
+                );
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.starts_with("The session was not ended")),
+                "{who}: {r:?}"
+            );
+            assert_eq!(state.decided(), 0, "{who}: nothing was decided");
+            assert_eq!(state.ended(), 0, "{who}: nothing was ended");
+        }
+
+        let mut admitted = vec![
+            (
+                "SYSTEM",
+                ClientPeer {
+                    session_id: Some(0),
+                    system_account: Some(true),
+                    sid: Some(SYSTEM_SID.into()),
+                    elevated: Some(true),
+                    ..ClientPeer::UNKNOWN
+                },
+            ),
+            (
+                "an elevated administrator in another session",
+                ClientPeer {
+                    sid: Some("S-1-5-21-1-2-3-500".into()),
+                    elevated: Some(true),
+                    ..another_session
+                },
+            ),
+        ];
+        // The person at the screen this daemon shows, as the OS reads this
+        // process: on Windows the screen's session (its own, or the
+        // console's from session 0); on Unix this account.
+        let screen = screen_session(own_session_id(), console_session_id());
+        if cfg!(unix) || screen.is_some() {
+            admitted.push((
+                "the person at the screen",
+                ClientPeer {
+                    session_id: screen,
+                    uid: own_uid(),
+                    system_account: Some(false),
+                    elevated: Some(false),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        if cfg!(unix) {
+            admitted.push((
+                "root",
+                ClientPeer {
+                    uid: Some(0),
+                    gid: Some(0),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        for (who, peer) in admitted {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert_eq!(r, Response::ConsentDecided { ok: true }, "{who}: {line}");
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert_eq!(r, Response::RcDisconnected { ok: true }, "{who}");
+            assert_eq!((state.decided(), state.ended()), (2, 1), "{who}");
+        }
+
+        // The person socket keeps #3845's rule: the person at the seat answers
+        // there and ends a session there, with no Windows identity at all.
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        let state = Counting::default();
+        let r = ask_state_scoped_as(state.clone(), SEAT, ana, end).await;
+        assert_eq!(r, Response::RcDisconnected { ok: true });
+        assert_eq!(state.ended(), 1);
+    }
+
+    /// The tray and the CLI as the pipe reads them: a client of this process,
+    /// read from the OS at accept (its session, and its account from its
+    /// token), answers a consent prompt and ends a session over a real pipe.
+    /// It is admitted wherever this test runs as a person runs a tray or a
+    /// CLI: in an interactive session, which is this daemon's own screen
+    /// here, or elevated (a CI runner).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_at_the_screen_answers_and_ends_a_session_over_a_real_pipe() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(r"\\.\pipe\roomler-test-screen-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        let interactive = own_session_id().is_some_and(|s| s != 0);
+        if !interactive && peer.elevated != Some(true) {
+            eprintln!("skipped: this process runs in session 0, not elevated: {peer:?}");
+            return;
+        }
+        assert_eq!(peer.session_id, own_session_id(), "{peer:?}");
+        let state = Counting::default();
+        let st = state.clone();
+        let served = tokio::spawn(async move { serve_connection_as(server, &st, peer).await });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        for (line, want) in [
+            (
+                r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#,
+                Response::ConsentDecided { ok: true },
+            ),
+            (
+                r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
+                Response::RcDisconnected { ok: true },
+            ),
+        ] {
+            wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let got = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Response>(&got).unwrap(),
+                want,
+                "{line}"
+            );
+        }
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!((state.decided(), state.ended()), (1, 1));
+    }
+
+    /// #2871 — the person's view of a configuration listing marks every key
+    /// the person socket will not set `root_only` and leaves the console
+    /// person's own keys unmarked; the daemon's own endpoint marks nothing.
+    #[test]
+    fn the_person_view_marks_every_key_the_person_socket_will_not_set() {
+        let entry = |key: &str| ConfigEntry {
+            key: key.into(),
+            value: Some("x".into()),
+            kind: "string".into(),
+            restart_required: true,
+            description: String::new(),
+            group: "access".into(),
+            group_label: String::new(),
+            tier: "standard".into(),
+            default: None,
+            read_only: None,
+        };
+        let listing = vec![
+            entry("exec_enabled"),
+            entry("record_dir"),
+            entry("record_remote_enabled"),
+            entry("overlay_enabled"),
+            entry("files_dir"),
+            entry("allow_plaintext_server"),
+            entry("external_access_enabled"),
+            entry("ssh_enabled"),
+        ];
+        let Response::ConfigEntries(seen) = person_view(Response::ConfigEntries(listing.clone()))
+        else {
+            panic!("a listing stays a listing");
+        };
+        let marked: Vec<&str> = seen
+            .iter()
+            .filter(|e| e.read_only.as_deref() == Some(READ_ONLY_ROOT_ONLY))
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                "exec_enabled",
+                "record_dir",
+                "overlay_enabled",
+                "allow_plaintext_server",
+                "ssh_enabled"
+            ]
+        );
+        assert!(
+            seen.iter()
+                .filter(|e| e.read_only.is_none())
+                .all(|e| person_socket_admits_key(&e.key)),
+            "an unmarked key is one the person socket sets"
+        );
+        // Values stay: the surface carries no secret, and the companion shows
+        // the gates' state read-only.
+        assert!(seen.iter().all(|e| e.value.as_deref() == Some("x")));
+        // The marks are the person view's alone: `handle` on the daemon's own
+        // endpoint never adds one (the listing above is what it would serve).
+        assert!(listing.iter().all(|e| e.read_only.is_none()));
+        // Any other answer passes untouched.
+        let updated = Response::ConfigUpdated {
+            entry: entry("record_dir"),
+        };
+        assert_eq!(person_view(updated.clone()), updated);
+    }
+
     /// FR-85 P2e — who may start, stop or delete a recording. The daemon's own
     /// endpoints keep the console gate. On a system install's person socket
     /// that gate can never pass: it compares the peer with the daemon, which
@@ -7835,29 +11388,34 @@ mod tests {
             ..ClientPeer::UNKNOWN
         };
         let full = Scope::Full;
-        let person = Scope::Person;
+        let person = Scope::Person { owner_uid: 1000 };
         // The person at the seat of a system install, on their own socket.
-        assert!(peer_may_record(&unix(1000), person, None, Some(0)));
+        assert!(peer_may_record(&unix(1000), person, None, None, Some(0)));
         assert!(
-            !peer_is_console_user(&unix(1000), None, Some(0)),
+            !peer_is_console_user(&unix(1000), None, None, Some(0)),
             "the gate this one widens"
         );
+        // Another account is not the seat's person, even on the socket made
+        // for one (#2871's review: the uid is checked here, not only by the
+        // listener).
+        assert!(!peer_may_record(&unix(1001), person, None, None, Some(0)));
         // Root passes there as it does on its own socket.
-        assert!(peer_may_record(&unix(0), person, None, Some(0)));
+        assert!(peer_may_record(&unix(0), person, None, None, Some(0)));
         // The daemon's own endpoints: nothing moved. A root daemon's socket
         // refuses anyone else, and a per-user daemon's serves its owner.
-        assert!(peer_may_record(&unix(0), full, None, Some(0)));
-        assert!(!peer_may_record(&unix(1000), full, None, Some(0)));
-        assert!(peer_may_record(&unix(501), full, None, Some(501)));
-        assert!(!peer_may_record(&unix(502), full, None, Some(501)));
-        // Windows: the console session, RDP refused.
-        assert!(peer_may_record(&win(1), full, Some(1), None));
-        assert!(!peer_may_record(&win(2), full, Some(1), None));
+        assert!(peer_may_record(&unix(0), full, None, None, Some(0)));
+        assert!(!peer_may_record(&unix(1000), full, None, None, Some(0)));
+        assert!(peer_may_record(&unix(501), full, None, None, Some(501)));
+        assert!(!peer_may_record(&unix(502), full, None, None, Some(501)));
+        // Windows, a worker in the console session: that session, RDP refused.
+        assert!(peer_may_record(&win(1), full, Some(1), Some(1), None));
+        assert!(!peer_may_record(&win(2), full, Some(1), Some(1), None));
         // Fail closed.
         for scope in [full, person] {
             assert!(!peer_may_record(
                 &ClientPeer::UNKNOWN,
                 scope,
+                Some(1),
                 Some(1),
                 Some(0)
             ));
@@ -7873,18 +11431,19 @@ mod tests {
             uid: Some(1000),
             ..ClientPeer::UNKNOWN
         };
+        let seat = Scope::Person { owner_uid: 1000 };
         for line in [
             r#"{"t":"record_start","d":{}}"#,
             r#"{"t":"record_stop"}"#,
             r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
         ] {
-            let r = ask_scoped_as(person(), Scope::Person, line).await;
+            let r = ask_scoped_as(seat, person(), line).await;
             assert!(!is_person_refusal(&r), "{line} → {r:?}");
             assert!(!is_console_refusal(&r), "{line} → {r:?}");
-            let r = ask_scoped_as(ClientPeer::UNKNOWN, Scope::Person, line).await;
+            let r = ask_scoped_as(seat, ClientPeer::UNKNOWN, line).await;
             assert!(is_console_refusal(&r), "{line} → {r:?}");
         }
-        let r = ask_scoped_as(person(), Scope::Person, r#"{"t":"recordings_list"}"#).await;
+        let r = ask_scoped_as(seat, person(), r#"{"t":"recordings_list"}"#).await;
         assert!(!is_person_refusal(&r), "{r:?}");
     }
 
@@ -8052,11 +11611,34 @@ mod tests {
         wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
         let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert!(matches!(r, Response::Status(_)), "{r:?}");
-        wr.write_all(b"{\"t\":\"config_get\"}\n").await.unwrap();
+        wr.write_all(b"{\"t\":\"route_list\"}\n").await.unwrap();
         let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert!(is_person_refusal(&r), "{r:?}");
+        // #2871 — over the REAL socket the peer's uid comes from `SO_PEERCRED`
+        // and is this process's: the person. Their own key passes both gates
+        // to the state (the mock has no config surface: a different error);
+        // a device-owned gate is refused by name, before any handler.
+        wr.write_all(
+            b"{\"t\":\"config_set\",\"d\":{\"key\":\"record_remote_enabled\",\"value\":\"true\"}}\n",
+        )
+        .await
+        .unwrap();
+        let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(!is_person_refusal(&r) && !is_console_refusal(&r), "{r:?}");
+        assert!(matches!(&r, Response::Error { message } if message.contains("not supported")));
+        wr.write_all(
+            b"{\"t\":\"config_set\",\"d\":{\"key\":\"exec_enabled\",\"value\":\"true\"}}\n",
+        )
+        .await
+        .unwrap();
+        let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(is_person_refusal(&r), "{r:?}");
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("`exec_enabled`")),
+            "{r:?}"
+        );
         // This connection stays OPEN across the stop below, having just been
-        // served twice: the stop must cut it.
+        // served several times: the stop must cut it.
 
         // A second server at the same path must not take the live one over.
         let (_tx2, rx2) = watch::channel(false);
@@ -8091,404 +11673,160 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
-    #[derive(Default)]
-    struct HoldMock {
-        holds: std::sync::atomic::AtomicUsize,
-        releases: std::sync::atomic::AtomicUsize,
-    }
-    #[async_trait]
-    impl LocalApiState for HoldMock {
-        fn status(&self) -> NodeStatus {
-            Mock.status()
-        }
-        fn peers(&self) -> Vec<PeerInfo> {
-            Mock.peers()
-        }
-        fn flows(&self) -> Vec<FlowInfo> {
-            Mock.flows()
-        }
-        async fn hive_update_hold(&self) -> Response {
-            self.holds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Response::HiveUpdateHeld {
-                waited_secs: 7,
-                cut: 0,
-            }
-        }
-        fn hive_update_release(&self) {
-            self.releases
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// FR-90 P1h-2 — root alone holds the daemon for an update (a hold
-    /// refuses every new agent prompt and start), and the hold ends with the
-    /// connection that placed it; a refusal places none. The wire is pinned:
-    /// the helper and the daemon are different processes, often of different
-    /// builds.
+    /// #2871 — the person socket's own accept loop, over a real unix socket:
+    /// a connection from an account that is neither the socket's person nor
+    /// root is dropped before a byte of it is read. It is closed although it
+    /// sent nothing, where its person's idle connection waits for a request;
+    /// a request it sends anyway is never answered; and nothing it sent
+    /// reaches the state. The test process plays both: the person, on a
+    /// listener made for its own uid, and another account, on one made for a
+    /// uid it is not. Root passes every person socket, so as root only the
+    /// first half runs.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn only_root_holds_the_daemon_and_the_hold_ends_with_its_connection() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let root = ClientPeer {
-            session_id: None,
-            uid: Some(0),
-            system_account: None,
-            ..ClientPeer::UNKNOWN
-        };
-        let someone = ClientPeer {
-            session_id: None,
-            uid: Some(1000),
-            system_account: None,
-            ..ClientPeer::UNKNOWN
-        };
-        for (peer, holds) in [(root, true), (someone, false), (ClientPeer::UNKNOWN, false)] {
-            let state = std::sync::Arc::new(HoldMock::default());
-            let (client, server) = tokio::io::duplex(4096);
-            let st = std::sync::Arc::clone(&state);
-            let served = peer.clone();
-            let srv = tokio::spawn(async move { serve_connection_as(server, &*st, served).await });
-            let (crd, mut cwr) = tokio::io::split(client);
-            let mut clines = tokio::io::BufReader::new(crd).lines();
-            cwr.write_all(b"{\"t\":\"hive_update_hold\"}\n")
-                .await
-                .unwrap();
-            let line = clines.next_line().await.unwrap().unwrap();
-            if holds {
-                assert_eq!(
-                    line,
-                    r#"{"t":"hive_update_held","d":{"waited_secs":7,"cut":0}}"#
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                assert_eq!(
-                    state.releases.load(SeqCst),
-                    0,
-                    "held while the helper installs"
-                );
-            } else {
-                let r: Response = serde_json::from_str(&line).unwrap();
-                assert!(
-                    matches!(&r, Response::Error { message } if message.contains("only root")),
-                    "{peer:?} → {r:?}"
-                );
-            }
-            drop(cwr);
-            drop(clines);
-            srv.await.unwrap().unwrap();
-            assert_eq!(state.holds.load(SeqCst), usize::from(holds), "{peer:?}");
-            assert_eq!(
-                state.releases.load(SeqCst),
-                usize::from(holds),
-                "released once its connection closed: {peer:?}"
-            );
-        }
-    }
+    async fn another_accounts_connection_is_dropped_before_a_byte_is_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    /// FR-90 P3-9-2b — a daemon whose `connect` opens at once, keeping whom
-    /// it served and which endpoints were let go.
-    #[derive(Default)]
-    struct ConnectMock {
-        asked: std::sync::Mutex<Vec<Asker>>,
-        released: std::sync::Mutex<Vec<u64>>,
-        opened: std::sync::atomic::AtomicU64,
-    }
-    #[async_trait]
-    impl LocalApiState for ConnectMock {
-        fn status(&self) -> NodeStatus {
-            Mock.status()
-        }
-        fn peers(&self) -> Vec<PeerInfo> {
-            Mock.peers()
-        }
-        fn flows(&self) -> Vec<FlowInfo> {
-            Mock.flows()
-        }
-        async fn connect(&self, asker: &Asker, args: &ConnectArgs) -> Response {
-            self.asked.lock().unwrap().push(asker.clone());
-            let id = self
-                .opened
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            Response::Connected {
-                id,
-                endpoint: serde_json::json!({ "upstream": args.upstream }),
+        /// Counts every request that reaches it.
+        #[derive(Default)]
+        struct Counted(AtomicUsize);
+        #[async_trait]
+        impl LocalApiState for Counted {
+            fn status(&self) -> NodeStatus {
+                self.0.fetch_add(1, SeqCst);
+                Mock.status()
+            }
+            fn peers(&self) -> Vec<PeerInfo> {
+                self.0.fetch_add(1, SeqCst);
+                Vec::new()
+            }
+            fn flows(&self) -> Vec<FlowInfo> {
+                self.0.fetch_add(1, SeqCst);
+                Vec::new()
+            }
+            async fn config_entries(&self) -> Response {
+                self.0.fetch_add(1, SeqCst);
+                Response::ConfigEntries(Vec::new())
+            }
+            async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+                self.0.fetch_add(1, SeqCst);
+                AtTheSeat::Yes
             }
         }
-        fn connect_status(&self, id: u64) -> Response {
-            Response::ConnectState(EndpointState {
-                left_s: 100 + id,
-                ..EndpointState::default()
-            })
-        }
-        fn connect_release(&self, id: u64) {
-            self.released.lock().unwrap().push(id);
-        }
-    }
 
-    /// One connection's conversation with a [`ConnectMock`]: each line sent
-    /// and its answer, then the connection closed and served to its end.
-    async fn converse(
-        state: &std::sync::Arc<ConnectMock>,
-        peer: ClientPeer,
-        scope: Scope,
-        lines: &[&str],
-    ) -> Vec<Response> {
-        let (client, server) = tokio::io::duplex(4096);
-        let st = std::sync::Arc::clone(state);
-        let srv =
-            tokio::spawn(async move { serve_connection_scoped(server, &*st, peer, scope).await });
-        let (crd, mut cwr) = tokio::io::split(client);
-        let mut clines = tokio::io::BufReader::new(crd).lines();
-        let mut answers = Vec::new();
-        for line in lines {
-            cwr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
-            let answer = clines.next_line().await.unwrap().unwrap();
-            answers.push(serde_json::from_str(&answer).unwrap());
+        /// What one connection heard back.
+        #[derive(Debug, PartialEq)]
+        enum Heard {
+            Answer(String),
+            /// The far end closed (or reset) it.
+            Closed,
+            /// Still open, and nothing came within the wait.
+            Silence,
         }
-        drop(cwr);
-        drop(clines);
-        srv.await.unwrap().unwrap();
-        answers
-    }
 
-    const CONNECT: &str = r#"{"t":"connect","d":{"args":{"handle":"db/orders","engine":"postgres","upstream":"db.internal:5432"}}}"#;
+        /// `owner_uid`'s person socket, served on a listener this test binds
+        /// at `path`.
+        fn serve(
+            path: &std::path::Path,
+            owner_uid: u32,
+        ) -> (
+            Arc<Counted>,
+            watch::Sender<bool>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let listener = tokio::net::UnixListener::bind(path).unwrap();
+            let counted = Arc::new(Counted::default());
+            let state: Arc<dyn LocalApiState> = counted.clone();
+            let (tx, mut rx) = watch::channel(false);
+            let srv = tokio::spawn(async move {
+                serve_person_listener(listener, owner_uid, state, &mut rx).await
+            });
+            (counted, tx, srv)
+        }
 
-    /// FR-90 P3-9-2b — an endpoint lives as long as the connection that
-    /// opened it (decision 25: `roomler connect` in the foreground): it is
-    /// served to the account that asked, read by the listener, and its state
-    /// is that connection's to read, no other's.
-    #[tokio::test]
-    async fn an_endpoint_serves_the_account_that_asked_and_ends_with_its_connection() {
-        let state = std::sync::Arc::new(ConnectMock::default());
-        let root = ClientPeer {
-            uid: Some(0),
-            gid: Some(0),
-            ..ClientPeer::UNKNOWN
-        };
-        let answers = converse(
-            &state,
-            root,
-            Scope::Full,
-            &[
-                CONNECT,
-                r#"{"t":"connect_status","d":{"id":1}}"#,
-                // Not this connection's: refused, and its state never read.
-                r#"{"t":"connect_status","d":{"id":2}}"#,
-            ],
-        )
-        .await;
-        assert_eq!(
-            answers[0],
-            Response::Connected {
-                id: 1,
-                endpoint: serde_json::json!({ "upstream": "db.internal:5432" }),
+        /// Connect to `path`, send `line` (nothing when it is empty), and
+        /// wait up to `wait` for a line back.
+        async fn exchange(path: &std::path::Path, line: &str, wait: Duration) -> Heard {
+            let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            if !line.is_empty() {
+                // To a connection already dropped a write may fail (EPIPE) or
+                // land in the kernel's buffer first: either way, no answer.
+                let _ = wr.write_all(format!("{line}\n").as_bytes()).await;
             }
-        );
-        assert_eq!(
-            answers[1],
-            Response::ConnectState(EndpointState {
-                left_s: 101,
-                ..EndpointState::default()
-            })
-        );
-        assert!(
-            matches!(&answers[2], Response::Error { message } if message.contains("no endpoint 2")),
-            "{:?}",
-            answers[2]
-        );
-        assert_eq!(
-            *state.asked.lock().unwrap(),
-            [Asker::Unix { uid: 0, gid: 0 }],
-            "served to the account the listener read"
-        );
-        assert_eq!(
-            *state.released.lock().unwrap(),
-            [1],
-            "let go once its connection closed"
-        );
-    }
-
-    /// FR-90 P3-9-2b (decision 26) — `roomler connect` lends the device
-    /// owner's grants: anyone the gate refuses, a peer whose account the OS
-    /// did not name, and the person socket all get a refusal, and the daemon
-    /// is never asked.
-    #[tokio::test]
-    async fn a_connect_is_refused_before_the_daemon_is_asked() {
-        // A uid no runner signs in as, and not root.
-        let someone = ClientPeer {
-            uid: Some(4_000_000_001),
-            gid: Some(4_000_000_001),
-            ..ClientPeer::UNKNOWN
-        };
-        // SYSTEM, whose SID could not be read: the gate passes, and still no
-        // account is served.
-        let unnamed = ClientPeer {
-            session_id: Some(1),
-            system_account: Some(true),
-            elevated: Some(true),
-            ..ClientPeer::UNKNOWN
-        };
-        let root = ClientPeer {
-            uid: Some(0),
-            gid: Some(0),
-            ..ClientPeer::UNKNOWN
-        };
-        for (peer, scope, says) in [
-            (someone, Scope::Full, "owner's vault grants"),
-            (ClientPeer::UNKNOWN, Scope::Full, "owner's vault grants"),
-            (unnamed, Scope::Full, "could not read which account asked"),
-            (root, Scope::Person, "person-at-the-device socket"),
-        ] {
-            let state = std::sync::Arc::new(ConnectMock::default());
-            let answers = converse(&state, peer.clone(), scope, &[CONNECT]).await;
-            assert!(
-                matches!(&answers[0], Response::Error { message } if message.contains(says)),
-                "{peer:?} on {scope:?} → {:?}",
-                answers[0]
-            );
-            assert!(state.asked.lock().unwrap().is_empty(), "{peer:?}");
-            assert!(state.released.lock().unwrap().is_empty(), "{peer:?}");
+            match tokio::time::timeout(wait, lines.next_line()).await {
+                Err(_) => Heard::Silence,
+                Ok(Ok(Some(l))) => Heard::Answer(l),
+                Ok(Ok(None) | Err(_)) => Heard::Closed,
+            }
         }
-    }
 
-    /// FR-90 P3-9-2b (decision 26) — who may run `roomler connect`: root or
-    /// the daemon's own uid on Unix; SYSTEM, an elevated administrator or the
-    /// daemon's own account on Windows. Never another interactive user (the
-    /// pipe admits them all), and never a peer nothing is known about.
-    #[test]
-    fn only_root_system_an_elevated_administrator_or_the_daemons_own_account_may_connect() {
-        let unix = |uid| ClientPeer {
-            uid: Some(uid),
-            gid: Some(uid),
-            ..ClientPeer::UNKNOWN
-        };
-        assert!(peer_may_connect(&unix(0), Some(1000), None), "root");
-        assert!(
-            peer_may_connect(&unix(1000), Some(1000), None),
-            "the daemon's own uid"
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-p11d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The control: the same client and the same loop, on a socket made
+        // for this process. An idle connection is held open for its request,
+        // and the request is answered by the state.
+        let mine = dir.join("mine.sock");
+        let (counted, tx, srv) = serve(&mine, me);
+        assert_eq!(
+            exchange(&mine, "", Duration::from_millis(300)).await,
+            Heard::Silence,
+            "the person's idle connection waits for its request"
         );
-        assert!(
-            !peer_may_connect(&unix(1001), Some(1000), None),
-            "another uid"
-        );
-        assert!(
-            !peer_may_connect(&unix(1001), None, None),
-            "no own uid read"
-        );
-        let me = "S-1-5-21-10-20-30-1001";
-        let win = |sid: &str, system: bool, elevated: Option<bool>| ClientPeer {
-            session_id: Some(2),
-            system_account: Some(system),
-            sid: Some(sid.into()),
-            elevated,
-            ..ClientPeer::UNKNOWN
-        };
-        assert!(
-            peer_may_connect(&win("S-1-5-18", true, Some(true)), None, Some(me)),
-            "SYSTEM"
-        );
-        assert!(
-            peer_may_connect(
-                &win("S-1-5-21-10-20-30-500", false, Some(true)),
-                None,
-                Some(me)
+        match exchange(&mine, r#"{"t":"status"}"#, Duration::from_secs(5)).await {
+            Heard::Answer(l) => assert!(
+                matches!(
+                    serde_json::from_str::<Response>(&l),
+                    Ok(Response::Status(_))
+                ),
+                "{l}"
             ),
-            "an elevated administrator"
-        );
-        assert!(
-            peer_may_connect(&win(me, false, Some(false)), None, Some(me)),
-            "the daemon's own account, not elevated"
-        );
-        let guest = win("S-1-5-21-10-20-30-1002", false, Some(false));
-        assert!(
-            !peer_may_connect(&guest, None, Some(me)),
-            "another interactive user, an RDP guest"
-        );
-        assert!(!peer_may_connect(&guest, None, None), "no own account read");
-        assert!(
-            !peer_may_connect(&win("S-1-5-21-10-20-30-1002", false, None), None, Some(me)),
-            "an elevation that could not be read is no elevation"
-        );
-        assert!(
-            !peer_may_connect(&ClientPeer::UNKNOWN, Some(0), Some(me)),
-            "a peer nothing is known about"
-        );
+            other => panic!("the socket's person is answered: {other:?}"),
+        }
+        assert_eq!(counted.0.load(SeqCst), 1, "its request reached the state");
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+
+        if me != 0 {
+            // Another account: this process, on a socket made for a uid it
+            // is not.
+            let other = if me == 4242 { 4243 } else { 4242 };
+            let theirs = dir.join("theirs.sock");
+            let (counted, tx, srv) = serve(&theirs, other);
+            assert_eq!(
+                exchange(&theirs, "", Duration::from_secs(5)).await,
+                Heard::Closed,
+                "closed at accept, without waiting for a byte"
+            );
+            for line in [
+                r#"{"t":"status"}"#,
+                r#"{"t":"config_get"}"#,
+                r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"true"}}"#,
+            ] {
+                assert_eq!(
+                    exchange(&theirs, line, Duration::from_secs(5)).await,
+                    Heard::Closed,
+                    "{line} from another account"
+                );
+            }
+            assert_eq!(
+                counted.0.load(SeqCst),
+                0,
+                "nothing another account sent reached the state"
+            );
+            tx.send(true).unwrap();
+            srv.await.unwrap().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FR-90 P3-9-2b — the account an endpoint is served to is the one the
-    /// OS named, whole: a uid with its gid, or a SID; else none.
-    #[test]
-    fn the_account_served_is_the_one_the_os_named() {
-        let unix = ClientPeer {
-            uid: Some(1000),
-            gid: Some(100),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(
-            unix.asker(),
-            Some(Asker::Unix {
-                uid: 1000,
-                gid: 100
-            })
-        );
-        let win = ClientPeer {
-            session_id: Some(2),
-            sid: Some("S-1-5-18".into()),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(
-            win.asker(),
-            Some(Asker::Windows {
-                sid: "S-1-5-18".into()
-            })
-        );
-        assert_eq!(ClientPeer::UNKNOWN.asker(), None);
-        let half = ClientPeer {
-            uid: Some(1000),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(half.asker(), None, "a uid without its gid");
-    }
-
-    /// FR-90 P3-9-2b — the connect verbs on the wire: the CLI and the daemon
-    /// are often different builds.
-    #[test]
-    fn the_connect_verbs_wire_is_locked() {
-        let req = Request::Connect {
-            args: ConnectArgs {
-                handle: "db/orders".into(),
-                engine: "postgres".into(),
-                upstream: "db.internal:5432".into(),
-                ttl_s: Some(120),
-                ..ConnectArgs::default()
-            },
-        };
-        let wire = r#"{"t":"connect","d":{"args":{"handle":"db/orders","engine":"postgres","upstream":"db.internal:5432","ttl_s":120}}}"#;
-        assert_eq!(serde_json::to_string(&req).unwrap(), wire);
-        assert_eq!(serde_json::from_str::<Request>(wire).unwrap(), req);
-        assert_eq!(
-            serde_json::to_string(&Request::ConnectStatus { id: 7 }).unwrap(),
-            r#"{"t":"connect_status","d":{"id":7}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Response::Connected {
-                id: 7,
-                endpoint: serde_json::json!({ "uri": "postgresql:///" }),
-            })
-            .unwrap(),
-            r#"{"t":"connected","d":{"id":7,"endpoint":{"uri":"postgresql:///"}}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Response::ConnectState(EndpointState {
-                left_s: 200,
-                renewals: 1,
-                refused: None,
-                closed: None,
-            }))
-            .unwrap(),
-            r#"{"t":"connect_state","d":{"left_s":200,"renewals":1}}"#
-        );
-    }
-
+    /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
     #[tokio::test]
     async fn an_unidentified_peer_cannot_start_stop_delete_or_move_recordings() {
         for line in [
@@ -8527,7 +11865,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("incoming files")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("incoming files")),
                 "{line} → {r:?}"
             );
         }
@@ -8539,7 +11877,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -8566,7 +11904,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("without TLS")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("without TLS")),
                 "{line} → {r:?}"
             );
         }
@@ -8577,7 +11915,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -8603,7 +11941,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("locks")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("locks")),
                 "{line} → {r:?}"
             );
         }
@@ -8614,7 +11952,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -8640,7 +11978,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("display")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("display")),
                 "{line} → {r:?}"
             );
         }
@@ -8651,7 +11989,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -8677,7 +12015,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("browsers")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("browsers")),
                 "{line} → {r:?}"
             );
         }
@@ -8688,7 +12026,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -8724,7 +12062,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("outside")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("outside")),
                 "{line} → {r:?}"
             );
         }
@@ -8792,14 +12130,15 @@ mod tests {
     #[tokio::test]
     async fn the_console_user_passes_the_gate() {
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
         };
         if !me.is_console_user() {
-            // A Windows host with no active console session (some CI runners):
-            // the refusal half above is the part that must hold everywhere.
+            // A Windows process with no screen's session (session 0 with no
+            // active console session, as on some CI runners): the refusal half
+            // above is the part that must hold everywhere.
             return;
         }
         // The gate lets the console user through to the state, which in this
@@ -8979,18 +12318,23 @@ mod tests {
     /// system candidate at all, a root daemon is invisible from a user
     /// session on macOS — `temp_dir()` is per-user there, so the CLI would
     /// search its own `/var/folders/…`, find nothing, and report "not
-    /// running" for a daemon that is running.
+    /// running" for a daemon that is running. #3736: the per-user candidate
+    /// is there only when this account has a private directory for it.
     #[cfg(unix)]
     #[test]
     fn socket_candidates_prefer_the_per_user_daemon() {
         let cands = super::unix_socket_candidates();
-        assert_eq!(cands[0], super::user_socket_path(), "per-user first");
-        assert_eq!(cands[1], super::system_socket_path(), "system second");
-        assert_ne!(cands[0], cands[1], "the two must be distinct paths");
+        let system = super::system_socket_path();
+        match super::per_user_socket_path() {
+            Some(per_user) => {
+                assert_eq!(cands, vec![per_user, system.clone()], "per-user first");
+            }
+            None => assert_eq!(cands, vec![system.clone()], "the system socket alone"),
+        }
+        assert_eq!(cands.last(), Some(&system), "system last");
         assert!(
-            cands[1].starts_with("/var/run/roomler"),
-            "the system path must be well-known, not per-user: {:?}",
-            cands[1]
+            system.starts_with("/var/run/roomler"),
+            "the system path must be well-known, not per-user: {system:?}"
         );
         // Every candidate is the same socket FILE name — only the directory
         // (and therefore the privilege domain) differs.
@@ -9032,6 +12376,597 @@ mod tests {
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── who may serve a LocalAPI endpoint (#3736) ───────────────────
+
+    /// A client keeps a socket only when its own account or root serves it.
+    #[test]
+    fn a_socket_another_account_serves_is_not_trusted() {
+        assert!(!server_uid_trusted(1001, 1000), "another person's socket");
+        assert!(!server_uid_trusted(65534, 1000), "nobody's socket");
+        assert!(
+            !server_uid_trusted(1000, 0),
+            "root never keeps a person's socket"
+        );
+    }
+
+    /// Controls: the caller's own per-user daemon and the root daemon.
+    #[test]
+    fn the_callers_own_account_and_root_are_trusted() {
+        assert!(server_uid_trusted(1000, 1000), "the caller's own daemon");
+        assert!(server_uid_trusted(0, 1000), "the system daemon");
+        assert!(server_uid_trusted(0, 0), "root reaching the system daemon");
+    }
+
+    /// A directory only `uid` owns and writes.
+    fn private_dir_facts(uid: u32) -> DirFacts {
+        DirFacts {
+            is_dir: true,
+            is_symlink: false,
+            uid,
+            mode: 0o040700,
+        }
+    }
+
+    /// `/tmp`: root's, and every account may write it.
+    const SHARED_TEMP: DirFacts = DirFacts {
+        is_dir: true,
+        is_symlink: false,
+        uid: 0,
+        mode: 0o041777,
+    };
+
+    /// The per-user candidate of `euid` whose own directory is `dir`, read
+    /// from the field this OS takes it from: the runtime dir off macOS, the
+    /// per-user temp folder on macOS.
+    fn per_user_candidate(euid: u32, dir: &str, facts: DirFacts) -> Option<std::path::PathBuf> {
+        let lstat = move |_: &std::path::Path| Some(facts);
+        if cfg!(target_os = "macos") {
+            per_user_socket_path_for(euid, None, dir.into(), &lstat)
+        } else {
+            per_user_socket_path_for(euid, Some(dir.into()), "/tmp".into(), &lstat)
+        }
+    }
+
+    #[test]
+    fn a_root_caller_with_no_runtime_dir_has_no_per_user_candidate() {
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        assert_eq!(
+            per_user_socket_path_for(0, None, "/tmp".into(), &shared),
+            None,
+            "never a path under the shared temp dir"
+        );
+        let own = |_: &std::path::Path| Some(private_dir_facts(0));
+        assert_eq!(
+            per_user_socket_path_for(0, None, "/var/folders/zz/T".into(), &own),
+            None,
+            "root goes straight to the system socket"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_per_user_candidate_is_the_runtime_dir_only() {
+        let own = |_: &std::path::Path| Some(private_dir_facts(1000));
+        assert_eq!(
+            per_user_socket_path_for(1000, None, "/tmp".into(), &own),
+            None,
+            "no runtime dir: no temp-dir fallback"
+        );
+        assert_eq!(
+            per_user_socket_path_for(1000, Some("/run/user/1000".into()), "/tmp".into(), &own),
+            Some("/run/user/1000/roomler.sock".into())
+        );
+    }
+
+    #[test]
+    fn the_per_user_dir_is_the_callers_own_and_private() {
+        let (dir, expected) = if cfg!(target_os = "macos") {
+            (
+                "/var/folders/ab/cd/T",
+                "/var/folders/ab/cd/T/roomler/roomler.sock",
+            )
+        } else {
+            ("/run/user/1000", "/run/user/1000/roomler.sock")
+        };
+        assert_eq!(
+            per_user_candidate(1000, dir, private_dir_facts(1000)),
+            Some(expected.into()),
+            "its own, 0700"
+        );
+        for (facts, why) in [
+            (private_dir_facts(1001), "another account's directory"),
+            (
+                private_dir_facts(0),
+                "root's directory is not this account's",
+            ),
+            (
+                DirFacts {
+                    mode: 0o040770,
+                    ..private_dir_facts(1000)
+                },
+                "group-writable",
+            ),
+            (
+                DirFacts {
+                    mode: 0o040702,
+                    ..private_dir_facts(1000)
+                },
+                "world-writable",
+            ),
+            (SHARED_TEMP, "a shared temp dir"),
+            (
+                DirFacts {
+                    is_dir: false,
+                    is_symlink: true,
+                    ..private_dir_facts(1000)
+                },
+                "a link",
+            ),
+            (
+                DirFacts {
+                    is_dir: false,
+                    ..private_dir_facts(1000)
+                },
+                "not a directory",
+            ),
+        ] {
+            assert_eq!(per_user_candidate(1000, dir, facts), None, "{why}");
+        }
+        let missing = |_: &std::path::Path| None;
+        let gone = if cfg!(target_os = "macos") {
+            per_user_socket_path_for(1000, None, dir.into(), &missing)
+        } else {
+            per_user_socket_path_for(1000, Some(dir.into()), "/tmp".into(), &missing)
+        };
+        assert_eq!(gone, None, "a directory that is not there");
+    }
+
+    #[test]
+    fn the_system_daemon_serves_no_endpoint_under_the_temp_dir() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        let root_per_user = per_user_socket_path_for(0, None, "/tmp".into(), &shared);
+        assert_eq!(
+            unix_endpoints(system, true, root_per_user),
+            vec![system.to_path_buf()],
+            "the system socket alone"
+        );
+        assert_eq!(
+            unix_endpoints(system, true, Some("/run/user/0/roomler.sock".into())),
+            vec![system.to_path_buf()],
+            "no second, per-user endpoint beside it"
+        );
+    }
+
+    #[test]
+    fn a_daemon_with_no_private_dir_serves_no_endpoint() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        // No runtime dir off macOS; a shared temp folder on macOS.
+        let per_user = per_user_socket_path_for(1000, None, "/tmp".into(), &shared);
+        assert!(
+            unix_endpoints(system, false, per_user).is_empty(),
+            "nothing in a shared temp dir"
+        );
+        // Control: a per-user daemon with its own runtime dir serves there.
+        let own: std::path::PathBuf = "/run/user/1000/roomler.sock".into();
+        assert_eq!(unix_endpoints(system, false, Some(own.clone())), vec![own]);
+    }
+
+    /// A directory for one test's sockets: this account's, 0700.
+    #[cfg(unix)]
+    fn test_socket_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("roomler-3736-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Serve the mock daemon on `path` until the sender flips.
+    #[cfg(unix)]
+    async fn serve_mock_at(
+        path: std::path::PathBuf,
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (tx, rx) = watch::channel(false);
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let p = path.clone();
+        let srv = tokio::spawn(async move { serve_unix_at(p, state, rx).await });
+        for _ in 0..200 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (tx, srv)
+    }
+
+    /// A listener that accepts and never answers, as a socket that is not
+    /// the daemon's might.
+    #[cfg(unix)]
+    fn hold_silently(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    /// #3998 — an endpoint is gone when nothing is at its path, or nothing
+    /// listens on what is there: a daemon that stopped and left its socket
+    /// behind. One that a service listens on is not, busy or silent. On a
+    /// Linux system install and a Mac this is what tells a stopped daemon
+    /// from a refusal: `connect` returns its last endpoint's error, the
+    /// system socket's `PermissionDenied`, whether or not the daemon runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endpoint_missing_or_left_behind_is_gone_and_a_served_one_is_not() {
+        let dir = test_socket_dir("3998-gone");
+        let missing = dir.join("missing.sock");
+        assert!(endpoint_gone(&missing).await, "nothing at the path");
+        let left = dir.join("left.sock");
+        drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+        assert!(left.exists(), "the socket stays behind its listener");
+        assert!(endpoint_gone(&left).await, "nothing listens on it");
+        let served = dir.join("served.sock");
+        let held = hold_silently(tokio::net::UnixListener::bind(&served).unwrap());
+        assert!(
+            !endpoint_gone(&served).await,
+            "a service listens on it, silent or not"
+        );
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real kernel credentials, for a caller that is NOT the account
+    /// serving the socket. (As root the server would be root, which every
+    /// caller keeps: the root-only test below covers a real other uid.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_refuses_a_socket_another_account_serves() {
+        // SAFETY: geteuid never fails.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            return;
+        }
+        let dir = test_socket_dir("refuse");
+        let path = dir.join("roomler.sock");
+        let (tx, srv) = serve_mock_at(path.clone()).await;
+        let caller = me.wrapping_add(4242).max(1);
+        let refused = connect_unix_checked(path.clone(), caller).await;
+        let e = refused
+            .err()
+            .expect("a socket another account serves is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        let text = e.to_string();
+        assert!(
+            text.contains(&path.display().to_string()) && text.contains(&format!("uid {me}")),
+            "names the path and the serving uid: {text}"
+        );
+        // Control: the account that serves it keeps it.
+        let mut client = connect_unix_checked(path.clone(), me)
+            .await
+            .expect("its own account's socket");
+        assert_eq!(client.status().await.unwrap().name, "devbox");
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loop: a socket served by another account is skipped, and the
+    /// client goes on to the next candidate, the system socket in
+    /// production. The serving uid of the first is reported as another
+    /// account's (that read is the seam); the second is read from the kernel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_socket_falls_through_to_the_next_candidate() {
+        // SAFETY: geteuid never fails.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(4242).max(1);
+        let dir = test_socket_dir("fallthrough");
+        let first = dir.join("first.sock");
+        let second = dir.join("second.sock");
+        let silent = hold_silently(tokio::net::UnixListener::bind(&first).unwrap());
+        let (tx, srv) = serve_mock_at(second.clone()).await;
+        let reported = |p: &std::path::Path, s: &tokio::net::UnixStream| {
+            if p == first {
+                Ok(other)
+            } else {
+                Ok(s.peer_cred()?.uid())
+            }
+        };
+        let mut client = connect_first_trusted(vec![first.clone(), second.clone()], me, &reported)
+            .await
+            .expect("the next candidate is reached");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), client.status())
+            .await
+            .expect("answered by the second socket, not the silent first")
+            .unwrap();
+        assert_eq!(status.name, "devbox");
+        // With nothing else to try, the refusal is what the caller hears.
+        let e = connect_first_trusted(vec![first.clone()], me, &reported)
+            .await
+            .err()
+            .expect("only a refused socket: an error");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains(&format!("uid {other}")), "{e}");
+        silent.abort();
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bind and listen on `path` with THIS thread's effective uid switched to
+    /// `uid`, then switch back. A raw `setresuid` changes only the calling
+    /// thread, and the real and saved uids stay root's, so the way back is
+    /// allowed. The kernel records the listener's credentials at `listen()`.
+    #[cfg(target_os = "linux")]
+    fn listen_as(
+        path: &std::path::Path,
+        uid: u32,
+    ) -> std::io::Result<std::os::unix::net::UnixListener> {
+        const KEEP: libc::c_long = -1;
+        // SAFETY: the raw syscall changes only this thread's ids.
+        if unsafe { libc::syscall(libc::SYS_setresuid, KEEP, uid as libc::c_long, KEEP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let bound = std::os::unix::net::UnixListener::bind(path);
+        // SAFETY: as above; the saved uid is root's.
+        let back = unsafe { libc::syscall(libc::SYS_setresuid, KEEP, 0 as libc::c_long, KEEP) };
+        assert_eq!(back, 0, "this thread is root again");
+        bound
+    }
+
+    /// Root only (CI's sudo step; skipped otherwise, unless
+    /// `ROOMLERD_TEST_REQUIRE_ROOT` says it must run): a socket a real other
+    /// uid serves is refused by the kernel's credentials, and the client
+    /// still reaches root's socket after it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn as_root_a_socket_another_uid_serves_is_refused_and_roots_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid never fails.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_none(),
+                "ROOMLERD_TEST_REQUIRE_ROOT is set: this test must run as root"
+            );
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = std::env::temp_dir().join(format!("roomler-3736-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.join("other"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let other = dir.join("other").join("roomler.sock");
+        let system = dir.join("roomler.sock");
+        let o = other.clone();
+        let std_listener = std::thread::spawn(move || listen_as(&o, NOBODY))
+            .join()
+            .unwrap()
+            .expect("listen as another uid");
+        std_listener.set_nonblocking(true).unwrap();
+        let silent = hold_silently(tokio::net::UnixListener::from_std(std_listener).unwrap());
+        let (tx, srv) = serve_mock_at(system.clone()).await;
+
+        let e = connect_unix_checked(other.clone(), 0)
+            .await
+            .err()
+            .expect("another uid's socket is refused");
+        assert!(e.to_string().contains(&format!("uid {NOBODY}")), "{e}");
+        let mut client = connect_first_trusted(vec![other.clone(), system.clone()], 0, |_, s| {
+            Ok(s.peer_cred()?.uid())
+        })
+        .await
+        .expect("root's socket is reached");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), client.status())
+            .await
+            .expect("answered by root's socket")
+            .unwrap();
+        assert_eq!(status.name, "devbox");
+        silent.abort();
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client keeps a pipe only when SYSTEM, the Administrators group or
+    /// its own account owns it.
+    #[test]
+    fn a_pipe_another_account_owns_is_not_trusted() {
+        let person = "S-1-5-21-1-2-3-1000";
+        assert!(
+            !pipe_owner_trusted("S-1-5-21-1-2-3-1001", person),
+            "another person's pipe"
+        );
+        assert!(!pipe_owner_trusted("S-1-5-19", person), "LocalService");
+        assert!(
+            !pipe_owner_trusted(person, "S-1-5-18"),
+            "SYSTEM never keeps a person's pipe"
+        );
+        assert!(
+            !pipe_owner_trusted("", person),
+            "an owner that could not be read"
+        );
+        assert!(
+            !pipe_owner_trusted("", ""),
+            "two unknowns are not one account"
+        );
+    }
+
+    /// Controls: SYSTEM's, the Administrators group's and the caller's own.
+    #[test]
+    fn system_administrators_and_the_callers_own_pipe_are_trusted() {
+        let person = "S-1-5-21-1-2-3-1000";
+        assert!(pipe_owner_trusted("S-1-5-18", person), "SYSTEM");
+        assert!(pipe_owner_trusted("S-1-5-32-544", person), "Administrators");
+        assert!(pipe_owner_trusted(person, person), "the caller's own");
+        assert!(pipe_owner_trusted("S-1-5-18", "S-1-5-18"), "SYSTEM's own");
+    }
+
+    /// This process's own account, as `S-1-…` text.
+    #[cfg(windows)]
+    fn own_sid() -> String {
+        process_token(std::process::id())
+            .and_then(|t| t.sid)
+            .expect("this process's SID")
+    }
+
+    /// Serve the mock daemon once on a pipe that `owner_sid` owns.
+    #[cfg(windows)]
+    fn serve_pipe_owned_by(pipe: &str, owner_sid: &str) -> tokio::task::JoinHandle<()> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let mut sec = PipeSecurity::new(&format!("O:{owner_sid}D:(A;;GA;;;WD)")).unwrap();
+        // SAFETY: `sec` outlives the create, and the kernel copies the descriptor.
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(pipe, sec.as_ptr())
+        }
+        .unwrap();
+        tokio::spawn(async move {
+            let _sec = sec;
+            if server.connect().await.is_ok() {
+                let _ = serve_connection(server, &Mock).await;
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn connect_refuses_a_pipe_another_account_owns() {
+        let me = own_sid();
+        let pipe = format!(r"\\.\pipe\roomler-test-3736-other-{}", std::process::id());
+        let _srv = serve_pipe_owned_by(&pipe, &me);
+        let e = connect_windows_checked(&pipe, "S-1-5-21-1-2-3-4242")
+            .await
+            .err()
+            .expect("a pipe another account owns is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        let text = e.to_string();
+        assert!(
+            text.contains(&pipe) && text.contains(&me),
+            "names the pipe and its owner: {text}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn connect_keeps_a_pipe_its_own_account_owns() {
+        let me = own_sid();
+        let pipe = format!(r"\\.\pipe\roomler-test-3736-own-{}", std::process::id());
+        let _srv = serve_pipe_owned_by(&pipe, &me);
+        let mut client = connect_windows_checked(&pipe, &me)
+            .await
+            .expect("its own account's pipe");
+        assert_eq!(client.status().await.unwrap().name, "devbox");
+    }
+
+    /// #3736 — who may add an instance of the LocalAPI pipe: SYSTEM, the
+    /// Administrators group and the pipe's owner (OWNER RIGHTS, the daemon's
+    /// own account), never an interactive user, who reads and writes data and
+    /// reads the owner: exactly what a client opens with.
+    #[cfg(windows)]
+    #[test]
+    fn interactive_users_read_and_write_the_pipe_and_never_add_an_instance() {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, GENERIC_MAPPING, GetAce, GetSecurityDescriptorDacl,
+            IsWellKnownSid, MapGenericMask, PSID, WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid, WinInteractiveSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE,
+        };
+        // FILE_APPEND_DATA is FILE_CREATE_PIPE_INSTANCE on a pipe.
+        const CREATE_INSTANCE: u32 = FILE_APPEND_DATA;
+        let sec = PipeSecurity::new(LOCALAPI_SDDL).expect("the SDDL parses");
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the descriptor PipeSecurity owns, alive for this test; valid
+        // out-params.
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(sec.psd, &mut present, &mut dacl, &mut defaulted) };
+        assert!(ok != 0 && present != 0 && !dacl.is_null(), "a DACL");
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut masks = std::collections::HashMap::new();
+        // SAFETY: `dacl` is valid while `sec` lives.
+        let count = u32::from(unsafe { (*dacl).AceCount });
+        for i in 0..count {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: an index below the ACL's own count.
+            assert_ne!(unsafe { GetAce(dacl, i, &mut ace) }, 0);
+            let ace = ace as *const ACCESS_ALLOWED_ACE;
+            // SAFETY: the SDDL holds only allow (`A`) entries, so each ACE is an
+            // ACCESS_ALLOWED_ACE whose SID starts at `SidStart`.
+            let (sid, mut mask) = unsafe { ((&raw const (*ace).SidStart) as PSID, (*ace).Mask) };
+            // SAFETY: a valid mask and mapping.
+            unsafe { MapGenericMask(&mut mask, &mapping) };
+            for (kind, name) in [
+                (WinLocalSystemSid, "SY"),
+                (WinBuiltinAdministratorsSid, "BA"),
+                (WinCreatorOwnerRightsSid, "OW"),
+                (WinInteractiveSid, "IU"),
+            ] {
+                // SAFETY: `sid` points into the ACE, alive with `sec`.
+                if unsafe { IsWellKnownSid(sid, kind) } != 0 {
+                    masks.insert(name, mask);
+                }
+            }
+        }
+        let iu = masks["IU"];
+        assert_eq!(
+            iu & CREATE_INSTANCE,
+            0,
+            "an interactive user never adds an instance: {iu:#x}"
+        );
+        assert_eq!(
+            iu,
+            (PIPE_CLIENT_ACCESS & !windows_sys::Win32::Foundation::GENERIC_READ)
+                | FILE_GENERIC_READ,
+            "an interactive user gets exactly what a client opens with: {iu:#x}"
+        );
+        for name in ["SY", "BA", "OW"] {
+            assert_ne!(masks[name] & CREATE_INSTANCE, 0, "{name} adds instances");
+        }
+    }
+
+    /// The pipe client asks for reading and writing data, nothing that
+    /// creates an instance or changes the pipe, at identification level, so
+    /// the server can tell who it is and never act as it.
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_client_opens_with_read_and_write_data_at_identification_level() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_APPEND_DATA, FILE_FLAG_OVERLAPPED, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+            FILE_WRITE_EA, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        };
+        assert_eq!(PIPE_CLIENT_ACCESS, GENERIC_READ | FILE_WRITE_DATA);
+        assert_eq!(
+            PIPE_CLIENT_ACCESS
+                & (GENERIC_WRITE | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA),
+            0,
+            "never the create-instance right, nor a right to change the pipe"
+        );
+        assert_eq!(
+            PIPE_CLIENT_FLAGS,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+        );
     }
 
     // ─── srflx health ────────────────────────────────────────────────

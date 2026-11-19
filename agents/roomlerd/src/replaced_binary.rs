@@ -459,20 +459,6 @@ async fn watch(
                         "replaced-binary watch: still busy at the ceiling — restarting anyway, which cuts it"
                     );
                 }
-                // Agent turns are a person's work in progress: waited for as
-                // an install waits for them, and new ones held meanwhile.
-                if !crate::updater::wait_for_agent_turns(&mut shutdown, "replaced-binary").await {
-                    return;
-                }
-                // That wait can be long: look again before leaving.
-                let busy = busy_now(&rc_sessions);
-                if !matches!(
-                    decide(Some(&*p), Instant::now(), &busy),
-                    Step::Restart { .. }
-                ) {
-                    crate::updater::hold_agent_prompts(false);
-                    continue;
-                }
                 let reason = format!(
                     "FR-96 P2b: {} was replaced ({running_version} -> {new})",
                     path.display()
@@ -488,7 +474,6 @@ async fn watch(
                         return;
                     }
                     Err(why) => {
-                        crate::updater::hold_agent_prompts(false);
                         warn!(
                             %why,
                             retry_in_secs = RETRY_AFTER.as_secs(),

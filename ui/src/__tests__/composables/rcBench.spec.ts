@@ -374,6 +374,57 @@ describe('rcBench — the rc.l4 record', () => {
     })
   })
 
+  it('FR-135 R0 (N2) — carries what the batch measured, so it reads without a join', () => {
+    const body = buildL4Upload(
+      { rtts: [40], lost: 0, paths: ['hevc'] },
+      {
+        ...ctx,
+        join: {
+          targetFps: 60,
+          width: 2560,
+          height: 1600,
+          codec: 'h265',
+          chroma: 'yuv420',
+          carrier: 'relay',
+          render: 'fsr',
+          decoderHw: true,
+        },
+      },
+    )
+    expect(body!.lines[0].fields).toMatchObject({
+      v: 1,
+      target_fps: 60,
+      width: 2560,
+      height: 1600,
+      codec: 'h265',
+      chroma: 'yuv420',
+      carrier: 'relay',
+      render: 'fsr',
+      decoder_hw: true,
+    })
+  })
+
+  it('FR-135 R0 (N2) — leaves out what the page did not know, and anything that is not a short name or a size', () => {
+    const fields = (join: Record<string, unknown> | null) =>
+      buildL4Upload({ rtts: [40], lost: 0, paths: ['video'] }, { ...ctx, join: join as never })!.lines[0]
+        .fields as unknown as Record<string, unknown>
+    const JOIN_KEYS = ['target_fps', 'width', 'height', 'codec', 'chroma', 'carrier', 'render', 'decoder_hw']
+    for (const join of [null, {}, { targetFps: null, codec: null, decoderHw: null }]) {
+      const f = fields(join)
+      for (const k of JOIN_KEYS) expect(k in f, k).toBe(false)
+    }
+    const odd = fields({
+      targetFps: 0,
+      width: 1920, // a width with no height is no size
+      codec: 'H265 <b>',
+      chroma: '',
+      carrier: 'x'.repeat(33),
+      render: 42,
+      decoderHw: 'yes',
+    })
+    for (const k of JOIN_KEYS) expect(k in odd, k).toBe(false)
+  })
+
   it('files nothing without a tenant, and names the device org only when it differs', () => {
     expect(buildL4Upload({ rtts: [1], lost: 0, paths: ['hevc'] }, { ...ctx, tenantId: null })).toBeNull()
     const same = buildL4Upload({ rtts: [1], lost: 0, paths: ['hevc'] }, { ...ctx, agentOrgId: ctx.tenantId })

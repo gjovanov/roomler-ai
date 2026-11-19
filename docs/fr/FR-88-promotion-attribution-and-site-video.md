@@ -344,7 +344,7 @@ Decisions 1–3 shipped with their defaults in P1. Decision 4 is open.
   amended to the `:::video` container as built. A post can already use the container, and its embed
   adds no `VideoObject`. Giving a post one is a change of its own.
 - **Conference-call recording.** `ui/docs/content/collaboration/video-conferencing.md:21` claims
-  "Record a call", but `crates/modules/conference/src/recording.rs:84-107` only inserts a metadata
+  "Record a call", but `crates/modules/conference/src/recording.rs:91-108` only inserts a metadata
   row (`url` empty, `size` 0). The doc is corrected in a separate PR.
 
 ## 8. Field-verification log

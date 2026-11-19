@@ -36,10 +36,18 @@
 //!
 //! The spellings are a wire and storage vocabulary: the server stores what
 //! it is sent, the growth freeze groups by it. Never rename one.
+//!
+//! FR-148 P0 adds one field to the carrier line, `relay_transport`
+//! ([`relay_transport_of`]): what carries the agent's own TURN allocation
+//! for the nominated pair (`udp`, `tcp`, `tls`), `none` when the agent's
+//! local candidate is no relay, and `unknown` when the agent cannot say.
+//! It is a log field only: no wire carries it and the server stores
+//! nothing of it.
 
 use std::time::Duration;
 
 use tracing::{debug, info};
+use webrtc::ice::url::{ProtoType, SchemeType};
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// How long to wait for the first nomination after `Connected` (ICE has
@@ -186,8 +194,89 @@ pub fn carrier_of(pair: &PairView, overlay: Option<&OverlayPath>) -> SessionCarr
     SessionCarrier::Direct
 }
 
-/// The nominated pair, polled every 100 ms for up to `wait`.
-async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<PairView> {
+/// FR-148 P0 — what carries the agent's own TURN allocation for the
+/// nominated pair, which the carrier line names beside the carrier
+/// (`relay_transport`). A relay candidate names its relayed address, which
+/// is UDP whatever carries the allocation to the TURN server, so the pair's
+/// candidates cannot tell TURN over UDP from TURN over TCP or TLS. The
+/// vendored webrtc-ice stamps each relay candidate it gathers with its TURN
+/// URL's transport and scheme (`Candidate::relay_transport`), and the
+/// vendored webrtc hands it over with the pair
+/// (`RTCIceCandidatePair::local_relay_transport`).
+///
+/// | The nominated pair's local candidate | Recorded |
+/// |---|---|
+/// | a relay allocated over `turn:…?transport=udp` | `udp` |
+/// | a relay allocated over `turn:…?transport=tcp` (the fork does not gather one today) | `tcp` |
+/// | a relay allocated over `turns:…?transport=tcp` (TLS over TCP, `tcp_turn_conn`) | `tls` |
+/// | host · srflx · prflx: no allocation of the agent's carries the pair, though the far end's relay may | `none` |
+/// | a relay without a stamp, a URL pair the fork does not gather (TURN over DTLS), or a type webrtc-rs could not name | `unknown`, never a guess |
+///
+/// The browser's own transport to its TURN server never reaches the agent:
+/// a pair whose relay is the browser's reads `none`. The spellings are a
+/// field read's vocabulary: never rename one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelayTransport {
+    /// TURN over UDP.
+    Udp,
+    /// TURN over TCP.
+    Tcp,
+    /// TURN over TLS over TCP.
+    Tls,
+    /// The agent's local candidate is no relay.
+    NoRelay,
+    /// The agent could not say.
+    Unknown,
+}
+
+impl RelayTransport {
+    /// Every value, for a test that must cover each.
+    pub const ALL: [RelayTransport; 5] = [
+        RelayTransport::Udp,
+        RelayTransport::Tcp,
+        RelayTransport::Tls,
+        RelayTransport::NoRelay,
+        RelayTransport::Unknown,
+    ];
+
+    /// The carrier line's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayTransport::Udp => "udp",
+            RelayTransport::Tcp => "tcp",
+            RelayTransport::Tls => "tls",
+            RelayTransport::NoRelay => "none",
+            RelayTransport::Unknown => "unknown",
+        }
+    }
+}
+
+/// The relay transport's rule: the local candidate's type, and the stamp
+/// its gather left (`None` when there is none).
+pub fn relay_transport_of(
+    local: CandidateKind,
+    stamp: Option<(ProtoType, SchemeType)>,
+) -> RelayTransport {
+    match local {
+        CandidateKind::Host | CandidateKind::Srflx | CandidateKind::Prflx => {
+            RelayTransport::NoRelay
+        }
+        CandidateKind::Unspecified => RelayTransport::Unknown,
+        CandidateKind::Relay => match stamp {
+            Some((ProtoType::Udp, SchemeType::Turn)) => RelayTransport::Udp,
+            Some((ProtoType::Tcp, SchemeType::Turn)) => RelayTransport::Tcp,
+            Some((ProtoType::Tcp, SchemeType::Turns)) => RelayTransport::Tls,
+            _ => RelayTransport::Unknown,
+        },
+    }
+}
+
+/// The nominated pair, polled every 100 ms for up to `wait`, and what
+/// carries the agent's relay for it.
+async fn nominated_pair(
+    pc: &RTCPeerConnection,
+    wait: Duration,
+) -> Option<(PairView, RelayTransport)> {
     let sctp = pc.sctp();
     let dtls = sctp.transport();
     let ice = dtls.ice_transport();
@@ -195,12 +284,14 @@ async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<PairVi
     loop {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
             let (local, remote) = (pair.local(), pair.remote());
-            return Some(PairView {
+            let view = PairView {
                 local_kind: local.typ.into(),
                 remote_kind: remote.typ.into(),
                 local_addr: local.address.clone(),
                 remote_addr: remote.address.clone(),
-            });
+            };
+            let relay = relay_transport_of(view.local_kind, pair.local_relay_transport());
+            return Some((view, relay));
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -240,7 +331,7 @@ pub async fn observe(pc: &RTCPeerConnection, session_id: bson::oid::ObjectId) ->
         return SessionCarrier::Unknown;
     };
     tokio::time::sleep(SETTLE).await;
-    let pair = nominated_pair(pc, Duration::from_millis(500))
+    let (pair, relay) = nominated_pair(pc, Duration::from_millis(500))
         .await
         .unwrap_or(first);
     let overlay = if crate::peer::addr_is_overlay_range(&pair.remote_addr) {
@@ -249,9 +340,23 @@ pub async fn observe(pc: &RTCPeerConnection, session_id: bson::oid::ObjectId) ->
         None
     };
     let carrier = carrier_of(&pair, overlay.as_ref());
+    emit(session_id, carrier, &pair, relay, overlay.as_ref());
+    carrier
+}
+
+/// The carrier line. Its field names and their order are pinned by a test,
+/// since a field read greps for them.
+fn emit(
+    session_id: bson::oid::ObjectId,
+    carrier: SessionCarrier,
+    pair: &PairView,
+    relay: RelayTransport,
+    overlay: Option<&OverlayPath>,
+) {
     info!(
         %session_id,
         carrier = carrier.as_str(),
+        relay_transport = relay.as_str(),
         local_typ = ?pair.local_kind,
         local_addr = %pair.local_addr,
         remote_typ = ?pair.remote_kind,
@@ -259,7 +364,6 @@ pub async fn observe(pc: &RTCPeerConnection, session_id: bson::oid::ObjectId) ->
         overlay = ?overlay,
         "session carrier recorded (FR-102 P9c)"
     );
-    carrier
 }
 
 #[cfg(test)]
@@ -472,5 +576,239 @@ mod tests {
             CandidateKind::from(T::Unspecified),
             CandidateKind::Unspecified
         );
+    }
+
+    /// FR-148 P0 — the relay transport's spellings: locked, one per value,
+    /// all distinct.
+    #[test]
+    fn the_relay_transport_spellings_are_locked_and_distinct() {
+        let spellings: Vec<&str> = RelayTransport::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(spellings, ["udp", "tcp", "tls", "none", "unknown"]);
+        let distinct: std::collections::HashSet<&str> = spellings.iter().copied().collect();
+        assert_eq!(distinct.len(), RelayTransport::ALL.len());
+    }
+
+    /// FR-148 P0 — every answer of the relay transport's rule: a relay of the
+    /// agent's names its stamp's transport, any other local candidate names
+    /// none, and what the agent cannot say is `unknown`, never a guess.
+    #[test]
+    fn the_relay_transport_reads_the_local_relays_stamp_and_never_guesses() {
+        use ProtoType::{Tcp, Udp};
+        use SchemeType::{Stun, Turn, Turns};
+        let relay = CandidateKind::Relay;
+        assert_eq!(
+            relay_transport_of(relay, Some((Udp, Turn))),
+            RelayTransport::Udp
+        );
+        assert_eq!(
+            relay_transport_of(relay, Some((Tcp, Turn))),
+            RelayTransport::Tcp
+        );
+        assert_eq!(
+            relay_transport_of(relay, Some((Tcp, Turns))),
+            RelayTransport::Tls
+        );
+        // No allocation of the agent's carries the pair, whatever the far
+        // end's candidate is, and whatever a stamp says.
+        for kind in [
+            CandidateKind::Host,
+            CandidateKind::Srflx,
+            CandidateKind::Prflx,
+        ] {
+            for stamp in [None, Some((Udp, Turn)), Some((Tcp, Turns))] {
+                assert_eq!(
+                    relay_transport_of(kind, stamp),
+                    RelayTransport::NoRelay,
+                    "{kind:?} {stamp:?}"
+                );
+            }
+        }
+        // A relay without a stamp, a pair the fork gathers no relay over
+        // (TURN over DTLS, a STUN URL, a part it could not parse), and a
+        // type webrtc-rs could not name.
+        for stamp in [
+            None,
+            Some((Udp, Turns)),
+            Some((Udp, Stun)),
+            Some((ProtoType::Unknown, Turn)),
+            Some((Tcp, SchemeType::Unknown)),
+        ] {
+            assert_eq!(
+                relay_transport_of(relay, stamp),
+                RelayTransport::Unknown,
+                "{stamp:?}"
+            );
+        }
+        for stamp in [None, Some((Udp, Turn))] {
+            assert_eq!(
+                relay_transport_of(CandidateKind::Unspecified, stamp),
+                RelayTransport::Unknown,
+                "{stamp:?}"
+            );
+        }
+    }
+
+    /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
+    /// logging::init`'s file layer: time, level, message, fields; no target).
+    fn logged(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is taken
+        // once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// FR-148 P0 — the carrier line's field names and their order, which a
+    /// field read greps for (`scripts/rc-path-report.cjs`): the relay
+    /// transport follows the carrier.
+    #[test]
+    fn the_carrier_line_names_its_fields() {
+        let sid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        let p = pair(
+            CandidateKind::Relay,
+            "203.0.113.9",
+            CandidateKind::Srflx,
+            "198.51.100.5",
+        );
+        let out = logged(|| emit(sid, SessionCarrier::Turn, &p, RelayTransport::Tls, None));
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            "session carrier recorded (FR-102 P9c)",
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "carrier=\"turn\"",
+            "relay_transport=\"tls\"",
+            "local_typ=Relay",
+            "local_addr=203.0.113.9",
+            "remote_typ=Srflx",
+            "remote_addr=198.51.100.5",
+            "overlay=None",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    /// The credentials the loopback TURN server takes.
+    struct Auth;
+
+    impl webrtc::turn::auth::AuthHandler for Auth {
+        fn auth_handle(
+            &self,
+            _username: &str,
+            _realm: &str,
+            _src_addr: std::net::SocketAddr,
+        ) -> Result<Vec<u8>, webrtc::turn::Error> {
+            Ok(webrtc::turn::auth::generate_auth_key(
+                "user",
+                "roomler.test",
+                "pass",
+            ))
+        }
+    }
+
+    /// A peer that gathers relay candidates only, from the TURN server at
+    /// `port` on loopback, over UDP.
+    async fn relayed_peer(port: u16) -> std::sync::Arc<RTCPeerConnection> {
+        use webrtc::ice_transport::ice_server::RTCIceServer;
+        use webrtc::peer_connection::configuration::RTCConfiguration;
+        use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec![format!("turn:127.0.0.1:{port}?transport=udp")],
+                username: "user".to_owned(),
+                credential: "pass".to_owned(),
+            }],
+            ice_transport_policy: RTCIceTransportPolicy::Relay,
+            ..Default::default()
+        };
+        let api = webrtc::api::APIBuilder::new().build();
+        std::sync::Arc::new(api.new_peer_connection(config).await.unwrap())
+    }
+
+    /// FR-148 P0 — through the vendored webrtc-ice and webrtc: a session on
+    /// the agent's own TURN allocation over UDP reads `udp`, from the pair
+    /// the carrier line reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pair_on_the_agents_udp_relay_names_its_transport() {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        use webrtc::turn;
+        let listener =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let server = turn::server::Server::new(turn::server::config::ServerConfig {
+            realm: "roomler.test".to_owned(),
+            auth_handler: std::sync::Arc::new(Auth),
+            conn_configs: vec![turn::server::config::ConnConfig {
+                conn: listener,
+                relay_addr_generator: Box::new(
+                    turn::relay::relay_none::RelayAddressGeneratorNone {
+                        address: "127.0.0.1".to_owned(),
+                        net: std::sync::Arc::new(webrtc::util::vnet::net::Net::new(None)),
+                    },
+                ),
+            }],
+            channel_bind_timeout: Duration::from_secs(0),
+            alloc_close_notify: None,
+        })
+        .await
+        .unwrap();
+        let viewer = relayed_peer(port).await;
+        let agent = relayed_peer(port).await;
+        let (tx, mut connected) = tokio::sync::mpsc::channel::<()>(1);
+        agent.on_peer_connection_state_change(Box::new(move |s| {
+            if s == RTCPeerConnectionState::Connected {
+                let _ = tx.try_send(());
+            }
+            Box::pin(async {})
+        }));
+        // The viewer offers with a data channel, as the browser does, and
+        // the agent answers; each with every candidate gathered.
+        let _channel = viewer.create_data_channel("video", None).await.unwrap();
+        let offer = viewer.create_offer(None).await.unwrap();
+        let mut gathered = viewer.gathering_complete_promise().await;
+        viewer.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer = viewer.local_description().await.unwrap();
+        agent.set_remote_description(offer).await.unwrap();
+        let answer = agent.create_answer(None).await.unwrap();
+        let mut gathered = agent.gathering_complete_promise().await;
+        agent.set_local_description(answer).await.unwrap();
+        let _ = gathered.recv().await;
+        let answer = agent.local_description().await.unwrap();
+        viewer.set_remote_description(answer).await.unwrap();
+        let up = tokio::time::timeout(Duration::from_secs(15), connected.recv()).await;
+        let read = nominated_pair(&agent, Duration::from_secs(5)).await;
+        // A peer must be closed: dropping one frees none of its sockets.
+        for pc in [&agent, &viewer] {
+            let _ = pc.close().await;
+        }
+        let _ = server.close().await;
+        assert!(up.is_ok(), "the relayed pair did not connect in 15 s");
+        let (view, relay) = read.expect("no nominated pair");
+        assert_eq!(view.local_kind, CandidateKind::Relay, "{view:?}");
+        assert_eq!(relay, RelayTransport::Udp, "{view:?}");
     }
 }

@@ -140,33 +140,30 @@ pub struct DerpConn {
     self_tx: mpsc::Sender<Vec<u8>>,
 }
 
-/// #32 — which of a peer's inbound routes a [`DerpConn`] owns.
+/// #32 — which of a peer's two inbound routes a [`DerpConn`] owns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RouteKind {
     /// The WG/carrier consumer ([`DerpMux::conn_for`]).
     Wg,
     /// R4's tunnel consumer ([`DerpMux::tunnel_conn_for`]).
     Tunnel,
-    /// FR-90 P2d-2c — one Hive replica stream, by its tag
-    /// ([`DerpMux::hive_conn_for`]).
-    Hive(HiveStreamTag),
 }
 
-/// FR-90 P2d-2c — the prefix of a Hive replica stream's payload on the DERP
-/// leg, ahead of its [`HiveStreamTag`] and the QUIC packet. Eight bytes, like
-/// the disco magic: WireGuard's header never opens on it, disco's magic is
-/// another, and a QUIC packet that does is a 2^-64 event.
+/// FR-137 S-B1 — the prefix FR-90's Hive replica streams put on a DERP
+/// payload: `[src || RMHIVE01 || 12-byte tag || QUIC packet]`. Eight bytes,
+/// like the disco magic: WireGuard's header never opens on it, disco's magic
+/// is another, and a QUIC packet that does is a 2^-64 event.
+///
+/// Hive is parked and no build sends one now, but a 0.4.199 peer still does,
+/// whatever carrier its WireGuard pair rides. [`DerpMux::deliver`] drops and
+/// counts such a frame FIRST: left to the tunnel/WG split below it, it would
+/// reach a tunnel's QUIC endpoint, boringtun, or `MuxEvent::Unrouted`, and
+/// `Unrouted` makes the overlay follow a healthy DIRECT pair onto the relay
+/// (`demote_follow`), with a hold-down that grows to 15 minutes.
+///
+/// ⚠️ Removable only once no deployed agent can send it: past the rollback
+/// reach of the last release that compiled Hive.
 pub const HIVE_MAGIC: &[u8; 8] = b"RMHIVE01";
-
-/// FR-90 P2d-2c — which Hive stream a payload belongs to: its grant's id, 12
-/// bytes. A peer pair carries any number of streams at once (two sessions,
-/// a renewal beside the grant it replaces), where the tunnel's route is one
-/// per peer.
-pub type HiveStreamTag = [u8; 12];
-
-/// The bytes a Hive frame carries ahead of its packet.
-const HIVE_HEADER_LEN: usize = HIVE_MAGIC.len() + std::mem::size_of::<HiveStreamTag>();
-
 /// #32 — a route must not outlive the conn that consumes it.
 ///
 /// The table was written and never cleaned: the vend methods insert, "last one
@@ -191,31 +188,17 @@ impl Drop for DerpConn {
         // silent drop into a guaranteed one. And the two slots are independent
         // consumers: a WG carrier going away must not take R4's tunnel route
         // with it.
-        match self.route {
-            RouteKind::Hive(tag) => {
-                if routes
-                    .hive
-                    .get(&tag)
-                    .is_some_and(|tx| tx.same_channel(&self.self_tx))
-                {
-                    routes.hive.remove(&tag);
-                }
-            }
-            RouteKind::Wg | RouteKind::Tunnel => {
-                let slot = if self.route == RouteKind::Wg {
-                    &mut routes.wg
-                } else {
-                    &mut routes.tunnel
-                };
-                if slot
-                    .as_ref()
-                    .is_some_and(|tx| tx.same_channel(&self.self_tx))
-                {
-                    *slot = None;
-                }
-            }
+        let slot = match self.route {
+            RouteKind::Wg => &mut routes.wg,
+            RouteKind::Tunnel => &mut routes.tunnel,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|tx| tx.same_channel(&self.self_tx))
+        {
+            *slot = None;
         }
-        if routes.wg.is_none() && routes.tunnel.is_none() && routes.hive.is_empty() {
+        if routes.wg.is_none() && routes.tunnel.is_none() {
             peers.remove(&self.peer_pubkey);
         }
     }
@@ -235,9 +218,6 @@ type PeerTable = Arc<Mutex<HashMap<DerpPubKey, PeerRoutes>>>;
 struct PeerRoutes {
     wg: Option<mpsc::Sender<Vec<u8>>>,
     tunnel: Option<mpsc::Sender<Vec<u8>>>,
-    /// FR-90 P2d-2c — Hive replica streams to this peer, by tag; split from
-    /// the rest by [`HIVE_MAGIC`] before anything else is read.
-    hive: HashMap<HiveStreamTag, mpsc::Sender<Vec<u8>>>,
 }
 
 /// Which consumer an inbound DERP payload belongs to: WireGuard and disco to
@@ -309,12 +289,8 @@ impl RelayConn for DerpConn {
                 "derp ws down",
             ));
         }
-        let mut frame = Vec::with_capacity(32 + HIVE_HEADER_LEN + buf.len());
+        let mut frame = Vec::with_capacity(32 + buf.len());
         frame.extend_from_slice(&self.peer_pubkey);
-        if let RouteKind::Hive(tag) = &self.route {
-            frame.extend_from_slice(HIVE_MAGIC);
-            frame.extend_from_slice(tag);
-        }
         frame.extend_from_slice(buf);
         match self.ws_out.try_send((Instant::now(), frame)) {
             Ok(()) => Ok(buf.len()),
@@ -383,10 +359,10 @@ pub struct DerpMux {
     /// the carrier shedding load correctly, which reads nothing like a drop
     /// caused by a full queue or a missing route.
     dropped_stale: Arc<std::sync::atomic::AtomicU64>,
-    /// FR-90 P2d-2c — Hive frames dropped: no stream by that tag (it ended
-    /// here first), a full queue, or a frame cut short. A counter of its own,
-    /// since none of these says anything about the carrier the overlay reads
-    /// `dropped_unrouted` for.
+    /// FR-137 S-B1 — frames that opened on [`HIVE_MAGIC`] (a 0.4.199 peer's
+    /// Hive replica stream), dropped before anything else read them. A
+    /// counter of its own, since none says anything about the carrier the
+    /// overlay reads `dropped_unrouted` for.
     dropped_hive: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -484,27 +460,7 @@ impl DerpMux {
         self.build_conn(peer_pubkey, in_rx, RouteKind::Tunnel, in_tx)
     }
 
-    /// FR-90 P2d-2c — vend a [`DerpConn`] for one Hive replica stream toward
-    /// `peer_pubkey`, tagged `tag` (its grant's id), on this mux's established
-    /// `/derp` WS. Its payloads travel as `[HIVE_MAGIC || tag || packet]`, and
-    /// [`Self::deliver`] routes them by `(src, tag)` before anything else, so
-    /// any number of streams share a pair, and none of them touches the
-    /// peer's WG or tunnel route. ⚠️ Not [`Self::tunnel_conn_for`]: that
-    /// route is one per peer, last one wins, so a stream on it would take a
-    /// `quic-derp-v1` tunnel's route between the same two devices.
-    pub fn hive_conn_for(&self, peer_pubkey: DerpPubKey, tag: HiveStreamTag) -> DerpConn {
-        let (in_tx, in_rx) = mpsc::channel(INBOUND_QUEUE);
-        self.peers
-            .lock()
-            .unwrap()
-            .entry(peer_pubkey)
-            .or_default()
-            .hive
-            .insert(tag, in_tx.clone());
-        self.build_conn(peer_pubkey, in_rx, RouteKind::Hive(tag), in_tx)
-    }
-
-    /// FR-90 P2d-2c — Hive frames this mux dropped, cumulative.
+    /// FR-137 S-B1 — [`HIVE_MAGIC`] frames this mux dropped, cumulative.
     pub fn hive_drops(&self) -> u64 {
         self.dropped_hive.load(Ordering::Relaxed)
     }
@@ -563,25 +519,13 @@ impl DerpMux {
         let mut src = [0u8; 32];
         src.copy_from_slice(&frame[..32]);
         let payload = &frame[32..];
-        // FR-90 P2d-2c — a Hive stream's frame goes to the route its tag
-        // names, and nowhere else. A miss is counted, never `Unrouted`: that
-        // event means a WG peer to follow onto DERP, and a Hive stream that
-        // ended here first is nothing of the kind.
-        if let Some(rest) = payload.strip_prefix(HIVE_MAGIC.as_slice()) {
-            let tag: Option<HiveStreamTag> = rest
-                .get(..std::mem::size_of::<HiveStreamTag>())
-                .and_then(|t| t.try_into().ok());
-            let tx = tag.and_then(|tag| {
-                let peers = self.peers.lock().unwrap();
-                peers.get(&src).and_then(|r| r.hive.get(&tag).cloned())
-            });
-            let delivered = tx.is_some_and(|tx| {
-                tx.try_send(rest[std::mem::size_of::<HiveStreamTag>()..].to_vec())
-                    .is_ok()
-            });
-            if !delivered {
-                self.dropped_hive.fetch_add(1, Ordering::Relaxed);
-            }
+        // FR-137 S-B1 — a 0.4.199 peer's Hive replica frame, FIRST and before
+        // the tunnel/WG split: dropped and counted, never handed to a tunnel
+        // consumer or boringtun, and never `Unrouted` — that event means a WG
+        // peer to follow onto DERP, and would pin a healthy direct pair to the
+        // relay ([`HIVE_MAGIC`]).
+        if payload.starts_with(HIVE_MAGIC.as_slice()) {
+            self.dropped_hive.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // R4 split: a non-WG/non-disco payload goes to the peer's TUNNEL
@@ -706,7 +650,7 @@ mod tests {
         let carrier: Arc<DerpConn> = Arc::new(mux.conn_for(pk(0x02)));
         let survivor = Arc::clone(&carrier);
 
-        // A WG frame (first byte 1..=4 ⇒ the WG/disco consumer).
+        // A WG frame (its whole header [1, 0, 0, 0] ⇒ the WG/disco consumer).
         let mut frame = pk(0x02).to_vec();
         frame.extend_from_slice(&[1, 0, 0, 0]);
         mux.deliver(&frame);
@@ -787,9 +731,9 @@ mod tests {
         assert_eq!(DISCO_MAGIC, crate::overlay::disco::MAGIC);
     }
 
-    /// R4 — per-frame demux: WG (first byte 1..=4) and disco (8-byte magic)
-    /// reach the WG consumer; QUIC-shaped payloads (short header 0x40+, long
-    /// header 0xC0+) reach the TUNNEL consumer when registered. A QUIC short
+    /// R4 — per-frame demux: WG (its whole 4-byte header, `[1..=4, 0, 0, 0]`,
+    /// #2002) and disco (8-byte magic) reach the WG consumer; every other
+    /// payload, QUIC, reaches the TUNNEL consumer when registered. A QUIC short
     /// header may start with 0x52 ('R'), so the disco test is the full magic.
     #[tokio::test]
     async fn deliver_splits_wg_disco_and_tunnel_per_frame() {
@@ -863,25 +807,6 @@ mod tests {
         assert!(payload_is_wg_or_disco(&disco), "disco");
     }
 
-    /// FR-90 P2d-2c — a Hive stream's payload, as it travels: the magic, its
-    /// tag, then the packet.
-    fn hive(tag: &HiveStreamTag, packet: &[u8]) -> Vec<u8> {
-        let mut v = HIVE_MAGIC.to_vec();
-        v.extend_from_slice(tag);
-        v.extend_from_slice(packet);
-        v
-    }
-
-    /// The next payload `conn` receives, within 2 s.
-    async fn next(conn: &DerpConn) -> Vec<u8> {
-        let mut buf = [0u8; 256];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), conn.recv_from(&mut buf))
-            .await
-            .expect("a payload within 2 s")
-            .unwrap();
-        buf[..n].to_vec()
-    }
-
     /// Whether `conn` receives anything within 100 ms.
     async fn hears_anything(conn: &DerpConn) -> bool {
         let mut buf = [0u8; 256];
@@ -890,103 +815,45 @@ mod tests {
             .is_ok()
     }
 
-    /// FR-90 P2d-2c — a Hive conn frames each payload as
-    /// `[peer || HIVE_MAGIC || tag || packet]`.
+    /// FR-137 S-B1 — a 0.4.199 peer's Hive replica frame
+    /// (`[RMHIVE01 || tag || QUIC]`), with Hive parked: dropped and counted
+    /// first, whatever routes the peer holds. It reaches neither the WG nor
+    /// the tunnel consumer, and it reports no `Unrouted`, which would send
+    /// the overlay after a healthy DIRECT pair (a peer on a direct carrier
+    /// holds no DERP route at all). The plain frame after it, from that same
+    /// route-less peer, is the positive control: it does report `Unrouted`.
     #[tokio::test]
-    async fn a_hive_conn_frames_its_magic_and_its_tag() {
-        let (mux, mut out_rx) = DerpMux::new(pk(0x01));
-        let h = mux.hive_conn_for(pk(0x02), [9; 12]);
-        h.send_to(&[0x41, 1, 2], h.synth_peer()).await.unwrap();
-        let (_, f) = out_rx.recv().await.unwrap();
-        let mut want = pk(0x02).to_vec();
-        want.extend_from_slice(&hive(&[9; 12], &[0x41, 1, 2]));
-        assert_eq!(f, want);
-    }
-
-    /// FR-90 P2d-2c — Hive streams to one peer carry by their tags, each its
-    /// own packets with the header stripped; neither the WG nor the tunnel
-    /// consumer sees a Hive frame, nor a Hive route the tunnel's; a frame for a
-    /// tag nobody holds, or cut short, is dropped and counted, and reports no
-    /// `Unrouted` (that event sends the overlay after a WG peer).
-    #[tokio::test]
-    async fn hive_streams_to_one_peer_carry_by_tag_and_apart() {
+    async fn a_parked_hive_frame_is_dropped_and_never_unrouted() {
         let (mux, _out_rx) = DerpMux::new(pk(0x01));
         let (ev_tx, mut ev_rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
         mux.set_event_sink(ev_tx);
-        let peer = pk(0x02);
-        let wg_conn = mux.conn_for(peer);
-        let tun_conn = mux.tunnel_conn_for(peer);
-        let (t1, t2) = ([1u8; 12], [2u8; 12]);
-        let h1 = mux.hive_conn_for(peer, t1);
-        let h2 = mux.hive_conn_for(peer, t2);
         let quic = [0xC3u8, 0, 0, 0, 1];
+        let mut hive = HIVE_MAGIC.to_vec();
+        hive.extend_from_slice(&[9; 12]);
+        hive.extend_from_slice(&quic);
 
-        mux.deliver(&frame(peer, &hive(&t2, &quic)));
-        mux.deliver(&frame(peer, &hive(&t1, &[0x41, 7, 7])));
-        mux.deliver(&frame(peer, &quic));
-        mux.deliver(&frame(peer, &hive(&[3; 12], &quic)));
-        mux.deliver(&frame(peer, HIVE_MAGIC));
-
-        assert_eq!(
-            next(&h1).await,
-            [0x41, 7, 7],
-            "t1's packet, header stripped"
-        );
-        assert_eq!(next(&h2).await, quic, "t2's");
-        assert_eq!(next(&tun_conn).await, quic, "the tunnel's own packet");
-        assert!(!hears_anything(&tun_conn).await, "and no Hive frame");
+        // A peer holding both of its routes.
+        let routed = pk(0x02);
+        let wg_conn = mux.conn_for(routed);
+        let tun_conn = mux.tunnel_conn_for(routed);
+        mux.deliver(&frame(routed, &hive));
+        mux.deliver(&frame(routed, HIVE_MAGIC));
         assert!(!hears_anything(&wg_conn).await, "the WG consumer sees none");
-        assert!(!hears_anything(&h1).await && !hears_anything(&h2).await);
-        assert_eq!(
-            mux.hive_drops(),
-            2,
-            "a tag nobody holds, and a frame cut short"
-        );
-        assert!(ev_rx.try_recv().is_err(), "no Unrouted for a Hive miss");
-    }
+        assert!(!hears_anything(&tun_conn).await, "nor the tunnel's");
 
-    /// FR-90 P2d-2c — a dropped Hive conn retires its own tag's route only: a
-    /// newer conn for the same tag, the peer's other streams and its tunnel
-    /// route stay, and the peer's entry goes with its last route.
-    #[tokio::test]
-    async fn a_hive_route_retires_alone() {
-        let (mux, _out_rx) = DerpMux::new(pk(0x01));
-        let peer = pk(0x02);
-        let tun_conn = mux.tunnel_conn_for(peer);
-        let old = mux.hive_conn_for(peer, [1; 12]);
-        let renewed = mux.hive_conn_for(peer, [1; 12]);
-        let other = mux.hive_conn_for(peer, [2; 12]);
-        drop(old);
-        mux.deliver(&frame(peer, &hive(&[1; 12], &[0x41])));
-        assert_eq!(next(&renewed).await, [0x41], "the newer conn for the tag");
-        drop(renewed);
-        mux.deliver(&frame(peer, &hive(&[1; 12], &[0x42])));
-        mux.deliver(&frame(peer, &hive(&[2; 12], &[0x43])));
-        mux.deliver(&frame(peer, &[0xC3, 1]));
-        assert_eq!(mux.hive_drops(), 1, "the retired tag");
-        assert_eq!(next(&other).await, [0x43], "the other stream");
-        assert_eq!(next(&tun_conn).await, [0xC3, 1], "the tunnel route");
-        drop(other);
-        assert!(
-            mux.peers.lock().unwrap().contains_key(&peer),
-            "the tunnel's still"
-        );
-        drop(tun_conn);
-        assert!(
-            !mux.peers.lock().unwrap().contains_key(&peer),
-            "the peer's entry goes with its last route"
-        );
+        // A peer on a direct carrier: no DERP route of any kind.
+        let direct = pk(0x03);
+        mux.deliver(&frame(direct, &hive));
+        assert_eq!(mux.hive_drops(), 3, "every Hive frame counted, once");
+        assert!(ev_rx.try_recv().is_err(), "no Unrouted for a Hive frame");
 
-        // A peer with Hive routes only: one going leaves the other's.
-        let first = mux.hive_conn_for(peer, [4; 12]);
-        let last = mux.hive_conn_for(peer, [5; 12]);
-        drop(first);
-        mux.deliver(&frame(peer, &hive(&[5; 12], &[0x44])));
-        assert_eq!(
-            next(&last).await,
-            [0x44],
-            "a peer's last Hive route outlives the other"
+        // The positive control: that peer's plain frame IS reported.
+        mux.deliver(&frame(direct, &quic));
+        assert!(
+            matches!(ev_rx.try_recv(), Ok(MuxEvent::Unrouted(src)) if src == direct),
+            "a route-less peer's own frame reports Unrouted"
         );
+        assert_eq!(mux.hive_drops(), 3, "and is no Hive frame");
     }
 
     /// R4 — with NO tunnel consumer registered the mux behaves exactly as

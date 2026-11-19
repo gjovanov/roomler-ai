@@ -1,3 +1,9 @@
+# bun for the UI stage (#3400). Its one record is `.bun-version`, which CI's
+# setup-bun steps read too; this default must equal it, and the frontend checks
+# (scripts/bun-version-check.sh) fail when it does not. A FROM can only use an
+# argument declared before the first stage.
+ARG BUN_VERSION=1.3.12
+
 # --- Stage 1: Rust build ---
 #
 # FR-73 P1b — three layers instead of one, so a registry-backed cache is worth
@@ -97,10 +103,10 @@ RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features 
       --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
 
 # --- Stage 2: Vue SPA build ---
-FROM oven/bun:1 AS ui-builder
+FROM oven/bun:${BUN_VERSION} AS ui-builder
 WORKDIR /app/ui
 COPY ui/package.json ui/bun.lock ./
-RUN bun install --frozen-lockfile
+RUN bun --version && bun install --frozen-lockfile
 COPY ui/ .
 RUN bun run build
 

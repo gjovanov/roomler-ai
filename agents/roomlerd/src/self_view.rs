@@ -486,7 +486,7 @@ impl SelfView {
                 },
                 true,
             ) => tracing::info!(
-                verb, org, code = %code, status = ?status, %message, elapsed_ms,
+                verb, org, code = %code, status = ?status, reason = %message, elapsed_ms,
                 "localapi self-view: the server did not give the list"
             ),
             (_, true) if matches!(previous, Some(Some(_))) => tracing::info!(
@@ -607,16 +607,7 @@ fn transport_error(server: &str, e: reqwest::Error) -> Upstream {
     // The URL carries only the path and the search text, but the chain below
     // is the useful part; strip the URL so the line stays short.
     let e = e.without_url();
-    let mut chain = e.to_string();
-    let mut source = std::error::Error::source(&e);
-    while let Some(s) = source {
-        let text = s.to_string();
-        if !chain.contains(&text) {
-            chain.push_str(": ");
-            chain.push_str(&text);
-        }
-        source = s.source();
-    }
+    let chain = crate::error_chain::error_chain(&e);
     Upstream::new("server_unreachable", format!("{what} ({chain})"))
 }
 

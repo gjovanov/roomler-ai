@@ -15,6 +15,35 @@
 #     silently un-do the patch.
 #   - this Cargo.toml: header rewritten with patch notes (was the
 #     cargo-normalized header for the registry upload).
+#   - src/data_channel/mod.rs (#3716): `send`/`send_text` no longer hold the
+#     channel's slot lock across the SCTP write, so a write parked in flow
+#     control on a dead path cannot hold the channel's (and the peer
+#     connection's) close behind it. They take turns on a `send_lock` of
+#     their own instead, which `close()` and `buffered_amount()` never take:
+#     the slot lock was the only thing ordering a channel's writes.
+#   - src/sctp_transport/mod.rs (FR-148 P0): `delivery_clock()`, the
+#     association's acknowledgement clock (`Association::delivery_clock`, a
+#     patch of the vendored webrtc-sctp) for a caller outside this crate,
+#     since `association()` is crate-private. It never waits for the slot:
+#     `stop()` holds it across the association's close, so a held slot
+#     answers `None`.
+#   - src/sctp_transport/mod.rs (FR-148 O10): `gauges()`, the association's
+#     congestion gauges (`Association::gauges`, a patch of the vendored
+#     webrtc-sctp), beside `delivery_clock()` and in its way: it never waits
+#     for the slot, and a held slot answers `None`.
+#   - src/api/setting_engine/mod.rs + src/ice_transport/ice_gatherer.rs
+#     (FR-148 P4): `SettingEngine::set_ice_carrier_rank`, carried into the
+#     ICE agent's `AgentConfig::carrier_rank` the way the IP filter is (a
+#     patch of the vendored webrtc-ice). Unset, the agent is unchanged.
+#     And src/ice_transport/mod.rs: `RTCIceTransport::local_candidates()`,
+#     the gathered candidates for a caller outside this crate (the gatherer
+#     is crate-private), read without ever creating an agent.
+#   - src/ice_transport/ice_candidate_pair.rs + src/ice_transport/mod.rs
+#     (FR-148 P0): `RTCIceCandidatePair::local_relay_transport()`, what
+#     carries the local candidate's TURN allocation (`Candidate::
+#     relay_transport`, a patch of the vendored webrtc-ice), on the pairs the
+#     selection reads and its change handler hands over. Read only by the
+#     agent's carrier line.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only

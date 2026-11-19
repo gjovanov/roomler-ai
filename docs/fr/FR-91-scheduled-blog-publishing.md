@@ -37,7 +37,7 @@ lane, and it is out of scope here, as FR-39 requires for campaign material.
 | `ui/dist` is copied into the runtime image, which serves it from the pod nginx | `Dockerfile:132-133`; `files/nginx-pod.conf:134-137` (`/blog/`), `:142-146` (feed) | a post is a property of the image |
 | `hosted-image.yml` builds on any `ui/**` change | `.github/workflows/hosted-image.yml:31` | every post is an image |
 | Only `promote.yml` puts an image live; it rolls `roomler2` (2 replicas, hostNetwork, maxSurge 0) | `promote.yml`; `docs/deployment.md` | every post is a roll |
-| IndexNow runs only inside a promote | `promote.yml:90-101`, `:179-190` | a post published any other way is never announced |
+| IndexNow runs only inside a promote | `promote.yml:94-105`, `:210-221` | a post published any other way is never announced |
 | A future `date` is a build error, by design | `ui/docs/theme/posts.ts:169` | there is no scheduling inside this repo, and this FR keeps it that way |
 | `draft` is refused: a file here IS published | `ui/docs/theme/posts.ts:92-94` | unpublished copy lives elsewhere (FR-39/FR-87) |
 | Assets are content-hashed into `/docs/assets/` by one emitter | `ui/docs/build.ts:179`; `site.ts:38` (`LEGACY_UNHASHED_ASSETS = false`) | a separately built page cannot rely on the image's asset names |

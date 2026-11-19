@@ -192,6 +192,12 @@ impl AssociationInternal {
             ack_state: AckState::default(),
             ack_mode: AckMode::default(),
         };
+        // roomler (FR-148 P0): what one DATA chunk carries, fixed for the
+        // association's life, so a writer can size its messages to one packet.
+        ret.pending_queue
+            .gauges()
+            .set_max_payload(ret.max_payload_size);
+        ret.store_gauges(); // roomler (FR-148 P0): the initial window
 
         log::trace!(
             "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
@@ -259,6 +265,10 @@ impl AssociationInternal {
             // awake read/write_loop to exit
             self.close_loop_ch_tx.take();
 
+            // roomler (#3716): and every writer parked in flow control. Nothing
+            // else ever lets one go once the peer stops acknowledging.
+            self.pending_queue.close();
+
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
                 self.unregister_stream(si);
             }
@@ -324,6 +334,29 @@ impl AssociationInternal {
     fn awake_write_loop(&self) {
         //log::debug!("[{}] awake_write_loop_ch.notify_one", self.name);
         let _ = self.awake_write_loop_ch.try_send(());
+    }
+
+    /// roomler (FR-148): the acknowledgement clock, which `Association` keeps
+    /// to read without this struct's lock.
+    pub(crate) fn delivery_clock(&self) -> super::delivery::DeliveryClock {
+        self.pending_queue.delivery_clock()
+    }
+
+    /// roomler (FR-148 P0): the gauges, which `Association` keeps to read
+    /// without this struct's lock.
+    pub(crate) fn gauge_reader(&self) -> super::gauges::GaugeReader {
+        self.pending_queue.gauge_reader()
+    }
+
+    /// roomler (FR-148 P0): the windows and the bytes in flight into the
+    /// gauges, where they changed: four relaxed stores, read by nothing here.
+    fn store_gauges(&self) {
+        self.pending_queue.gauges().store_windows(
+            self.cwnd,
+            self.ssthresh,
+            self.rwnd,
+            self.inflight_queue.get_num_bytes(),
+        );
     }
 
     /// unregister_stream un-registers a stream from the association
@@ -476,6 +509,7 @@ impl AssociationInternal {
 
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
+                    self.pending_queue.gauges().on_fast_retransmit(); // roomler (FR-148 P0)
                     c.nsent += 1;
                 } else {
                     break; // end of pending data
@@ -778,6 +812,7 @@ impl AssociationInternal {
         //     example, implementations MAY use the size of the receiver
         //     advertised window).
         self.ssthresh = self.rwnd;
+        self.store_gauges(); // roomler (FR-148 P0)
         log::trace!(
             "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
             self.name,
@@ -1104,8 +1139,16 @@ impl AssociationInternal {
     async fn process_selective_ack(
         &mut self,
         d: &ChunkSelectiveAck,
-    ) -> Result<(HashMap<u16, i64>, u32)> {
+    ) -> Result<(HashMap<u16, i64>, u32, u64)> {
         let mut bytes_acked_per_stream = HashMap::new();
+        // roomler (FR-148): the bytes the peer received, for the
+        // acknowledgement clock. `bytes_acked_per_stream` releases the
+        // streams' buffers and moves the congestion window, as it did.
+        let mut delivered: u64 = 0;
+        let loss_mark = self.pending_queue.delivery().loss_mark();
+        // roomler (FR-148 P0): the newest chunk this SACK newly acknowledges
+        // of those sent once (Karn), for the gauges' acknowledgement delay.
+        let mut newest_sent_once: Option<(u32, SystemTime)> = None;
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1134,6 +1177,22 @@ impl AssociationInternal {
                         *amount += n_bytes_acked;
                     } else {
                         bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
+                    }
+
+                    // roomler (FR-148): only an abandoned chunk can be passed
+                    // by a FORWARD TSN that the peer never had, and the clock
+                    // leaves one out when a SACK reported it missing or T3-rtx
+                    // expired while it was out (`DeliveryCounters::loss_mark`).
+                    // One lost with no such evidence still counts: a
+                    // cumulative point cannot say which skipped chunks arrived.
+                    if !(c.abandoned() && loss_mark.is_some_and(|m| sna32lt(c.tsn, m))) {
+                        delivered += c.user_data.len() as u64;
+                    }
+
+                    // roomler (FR-148 P0): the cumulative point goes up in
+                    // TSN order, so the last one sent once is the newest.
+                    if c.nsent == 1 {
+                        newest_sent_once = Some((c.tsn, c.since));
                     }
 
                     // RFC 4960 sec 6.3.1.  RTO Calculation
@@ -1199,6 +1258,16 @@ impl AssociationInternal {
                         } else {
                             bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
                         }
+                        // roomler (FR-148): a gap block says the peer holds it.
+                        delivered += u64::try_from(n_bytes_acked).unwrap_or(0);
+
+                        // roomler (FR-148 P0): gap blocks lie above the
+                        // cumulative point; the newest of them wins.
+                        if c.nsent == 1
+                            && newest_sent_once.is_none_or(|(newest, _)| sna32gt(tsn, newest))
+                        {
+                            newest_sent_once = Some((tsn, c.since));
+                        }
 
                         log::trace!("[{}] tsn={} has been sacked", self.name, c.tsn);
 
@@ -1228,7 +1297,29 @@ impl AssociationInternal {
             }
         }
 
-        Ok((bytes_acked_per_stream, htna))
+        // roomler (FR-148): what this SACK reports missing, for the SACKs after
+        // it: every chunk still outstanding below its highest newly acknowledged
+        // TSN is in a gap. A mark the cumulative point has reached covers
+        // nothing that is still outstanding.
+        let next = d.cumulative_tsn_ack.wrapping_add(1);
+        let mark = loss_mark.filter(|m| sna32gt(*m, next));
+        self.pending_queue
+            .delivery()
+            .set_loss_mark(if sna32gt(htna, next) {
+                Some(mark.filter(|m| sna32gt(*m, htna)).unwrap_or(htna))
+            } else {
+                mark
+            });
+
+        // roomler (FR-148 P0): the gauges' acknowledgement delay. A clock that
+        // went backwards stores nothing, and the SACK goes on as it would.
+        if let Some((_, since)) = newest_sent_once {
+            if let Ok(delay) = SystemTime::now().duration_since(since) {
+                self.pending_queue.gauges().on_ack_delay(delay);
+            }
+        }
+
+        Ok((bytes_acked_per_stream, htna, delivered))
     }
 
     async fn on_cumulative_tsn_ack_point_advanced(&mut self, total_bytes_acked: i64) {
@@ -1415,12 +1506,16 @@ impl AssociationInternal {
         }
 
         // Process selective ack
-        let (bytes_acked_per_stream, htna) = self.process_selective_ack(d).await?;
+        let (bytes_acked_per_stream, htna, delivered) = self.process_selective_ack(d).await?;
 
         let mut total_bytes_acked = 0;
         for n_bytes_acked in bytes_acked_per_stream.values() {
             total_bytes_acked += *n_bytes_acked;
         }
+        // roomler (FR-148): the acknowledgement clock, for a reader beside the
+        // association (`Association::delivery_clock`): the bytes the peer
+        // received, which `process_selective_ack` counts beside the sum above.
+        self.pending_queue.delivery().on_acked(delivered);
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
@@ -1495,6 +1590,10 @@ impl AssociationInternal {
             }
             self.awake_write_loop();
         }
+
+        // roomler (FR-148 P0): the windows this SACK moved, and what it left
+        // in flight.
+        self.store_gauges();
 
         self.postprocess_sack(state, cum_tsn_ack_point_advanced)
             .await;
@@ -1969,6 +2068,10 @@ impl AssociationInternal {
             }
         }
 
+        // roomler (FR-148 P0): the window this send spent, and what it put in
+        // flight.
+        self.store_gauges();
+
         (chunks, sis_to_reset)
     }
 
@@ -2281,6 +2384,14 @@ impl AckTimerObserver for AssociationInternal {
             self.ack_state
         );
         self.stats.inc_ack_timeouts();
+        // roomler (#4033): the timer that fired is spent, but its task leaves
+        // `close_tx` set, and `AckTimer::start` arms nothing while it is, so
+        // the next lone packet would arm none. A late timeout, whose timer was
+        // stopped while it waited for this lock, stops any armed since; the
+        // SACK that one was for goes now, as `Immediate` sends it.
+        if let Some(ack_timer) = &mut self.ack_timer {
+            ack_timer.stop();
+        }
         self.ack_state = AckState::Immediate;
         self.awake_write_loop();
     }
@@ -2334,6 +2445,12 @@ impl RtxTimerObserver for AssociationInternal {
 
             RtxTimerId::T3RTX => {
                 self.stats.inc_t3timeouts();
+                // roomler (FR-148): every chunk out now may be lost, so the
+                // acknowledgement clock leaves out an abandoned one that the
+                // cumulative point passes later (`DeliveryCounters::loss_mark`).
+                self.pending_queue
+                    .delivery()
+                    .set_loss_mark(Some(self.my_next_tsn));
 
                 // RFC 4960 sec 6.3.3
                 //  E1)  For the destination address for which the timer expires, adjust
@@ -2347,6 +2464,9 @@ impl RtxTimerObserver for AssociationInternal {
 
                 self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
+                // roomler (FR-148 P0): the expiry, and the windows it cut.
+                self.pending_queue.gauges().on_t3_expiry();
+                self.store_gauges();
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,
@@ -2435,5 +2555,19 @@ impl RtxTimerObserver for AssociationInternal {
             }
             _ => {}
         }
+    }
+}
+
+/// roomler (#3755): for the tests that need the pending queue full.
+#[cfg(test)]
+impl AssociationInternal {
+    /// Gives this association a pending queue of `bytes`. Before any stream is
+    /// opened: a stream writes to the queue it was opened with.
+    pub(crate) fn use_pending_queue_of(&mut self, bytes: usize) {
+        assert!(
+            self.streams.is_empty(),
+            "the pending queue is swapped before any stream is opened"
+        );
+        self.pending_queue = Arc::new(PendingQueue::with_limit(bytes));
     }
 }

@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::NetworkState;
 use crate::derp_types::{DerpKey, DerpPubKey};
-use roomler_core::cluster::directory::{OwnerRecord, derp_key, derpnet_key};
+use roomler_core::cluster::directory::{DIRECTORY_TTL_SECS, OwnerRecord, derp_key, derpnet_key};
 use roomler_core::cluster::metrics::DERP_REHOME_STUCK_TOTAL;
 
 const REHOME_COOLDOWN: Duration = Duration::from_secs(60);
@@ -82,19 +82,33 @@ pub async fn on_derp_register(
     let member = pk_hex(pk);
     let token = dir.owner_token(&agent_id.to_hex());
     let key = derp_key(&net_hex, &member);
-    if let Err(e) = dir.claim_lww(&key, &token).await {
-        debug!(%network_id, %e, "derp directory claim failed");
-        return;
-    }
-    state.derp_presence_tokens.insert((network_id, *pk), token);
-    if let Err(e) = dir.set_add(&derpnet_key(&net_hex), &member).await {
-        debug!(%network_id, %e, "derp net-index add failed");
-    }
+    // #3840: the token is kept whatever the claim answered (a reply lost to a
+    // timeout may hide a write that landed), and `finish_registration` writes
+    // what a Redis error left owed. This path waits on Redis no longer than
+    // before: the claim, and the index add only after a claim that answered.
+    let claimed = dir.claim_lww(&key, &token).await;
+    state
+        .derp_presence_tokens
+        .insert((network_id, *pk), token.clone());
+    let owed = match claimed {
+        Ok(()) => match dir.set_add(&derpnet_key(&net_hex), &member).await {
+            Ok(()) => false,
+            Err(e) => {
+                debug!(%network_id, %e, "derp net-index add failed");
+                true
+            }
+        },
+        Err(e) => {
+            debug!(%network_id, %e, "derp directory claim failed");
+            true
+        }
+    };
     // Sweep off the registration path: a dead peer pod costs an RPC
     // deadline and must not delay this socket's frame pumping.
     let st = state.clone();
+    let pk = *pk;
     tokio::spawn(async move {
-        converge_network(&st, network_id).await;
+        finish_registration(st, network_id, pk, token, owed).await;
     });
 }
 
@@ -123,18 +137,19 @@ pub async fn on_derp_teardown(state: &NetworkState, network_id: ObjectId, pk: &D
 /// One convergence sweep over a network's live registrations. Target =
 /// the pod of the newest record; every other pod gets a rehome for its
 /// members (locally short-circuited for ourselves).
-pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
+pub async fn converge_network(state: &NetworkState, network_id: ObjectId) -> Sweep {
     let Some(dir) = state.cluster_directory.clone() else {
-        return;
+        return Sweep::Done;
     };
     let net_hex = network_id.to_hex();
     let members = match dir.set_members(&derpnet_key(&net_hex)).await {
         Ok(m) if m.len() > 1 => m,
-        _ => return,
+        Ok(_) => return Sweep::Done,
+        Err(_) => return Sweep::Again,
     };
     let keys: Vec<String> = members.iter().map(|m| derp_key(&net_hex, m)).collect();
     let Ok(records) = dir.get_many(&keys).await else {
-        return;
+        return Sweep::Again;
     };
 
     let mut by_pod: std::collections::HashMap<String, Vec<String>> =
@@ -156,10 +171,10 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
         }
     }
     if by_pod.len() < 2 {
-        return;
+        return Sweep::Done;
     }
     let Some((_, target_pod)) = newest else {
-        return;
+        return Sweep::Done;
     };
     info!(
         %network_id,
@@ -167,6 +182,7 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
         pods = by_pod.len(),
         "derp network split across pods — rehoming toward newest registration"
     );
+    let mut sweep = Sweep::Done;
     for (pod, pks) in by_pod {
         if pod == target_pod {
             continue;
@@ -182,9 +198,13 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
                 // Presumed-dead pod: its records TTL out within 90 s and
                 // the next registration converges cleanly.
                 debug!(%network_id, %pod, %e, "derp.rehome RPC failed");
+                if sweep_again_after(&e) {
+                    sweep = Sweep::Again;
+                }
             }
         }
     }
+    sweep
 }
 
 /// Close local DERP sockets for the given pubkeys (cooldown-paced).
@@ -289,9 +309,173 @@ pub fn remove_cancel_if_ours(
         .remove_if(key, |_, c| std::sync::Arc::ptr_eq(c, ours));
 }
 
+/// #3840 — what one convergence sweep came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Converged, nothing to converge, or every other pod was asked to close
+    /// its sockets (a pod that did not answer within the bus deadline is
+    /// presumed dead: its records end by TTL within 90 s).
+    Done,
+    /// A Redis error stopped it before every pod was asked: run it again.
+    Again,
+}
+
+/// Whether a `derp.rehome` request that failed leaves the sweep to be run
+/// again. A deadline (the pod is presumed dead) or a NACK (it answered) does
+/// not.
+fn sweep_again_after(e: &roomler_core::cluster::bus::BusError) -> bool {
+    matches!(e, roomler_core::cluster::bus::BusError::Redis(_))
+}
+
+/// #3840 — the wait before a registration's second round; it doubles up to
+/// [`FINISH_WAIT_MAX`].
+const FINISH_WAIT_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between two rounds: the heartbeat's period.
+const FINISH_WAIT_MAX: Duration = Duration::from_secs(30);
+
+/// The wait after a round that waited `wait`.
+fn finish_wait_after(wait: Duration) -> Duration {
+    (wait * 2).min(FINISH_WAIT_MAX)
+}
+
+/// #3840 — what a registration owes after its claim, done off the
+/// registration path: when a Redis error stopped the claim or the index add
+/// (`owed`), the record and the member; then one convergence sweep. A round
+/// that a Redis error stops runs again after a wait of 1 s doubling to 30 s,
+/// while this registration's token is still the one this pod holds for the
+/// node (teardown, a newer registration here, or the heartbeat's prune of a
+/// closed socket ends it).
+///
+/// The record is written again with `claim_if_newer`, never a plain claim: a
+/// registration made after this one, on any pod, keeps the record, and that
+/// registration's own sweep converges the network.
+async fn finish_registration(
+    state: NetworkState,
+    network_id: ObjectId,
+    pk: DerpPubKey,
+    token: String,
+    mut owed: bool,
+) {
+    let Some(dir) = state.cluster_directory.clone() else {
+        return;
+    };
+    let net_hex = network_id.to_hex();
+    let member = pk_hex(&pk);
+    let key = derp_key(&net_hex, &member);
+    let mut wait = FINISH_WAIT_FIRST;
+    // Nothing owed: the sweep runs at once, as it always did.
+    let mut at_once = !owed;
+    loop {
+        if !at_once {
+            tokio::time::sleep(wait).await;
+            wait = finish_wait_after(wait);
+            let ours = state
+                .derp_presence_tokens
+                .get(&(network_id, pk))
+                .is_some_and(|held| *held == token);
+            if !ours {
+                return;
+            }
+        }
+        at_once = false;
+        if owed {
+            match dir.claim_if_newer(&key, &token, DIRECTORY_TTL_SECS).await {
+                Ok(true) => {}
+                // A registration made after this one holds the record.
+                Ok(false) => return,
+                Err(e) => {
+                    debug!(%network_id, %e, "derp directory claim failed again");
+                    continue;
+                }
+            }
+            // A teardown while the claim was in flight released nothing.
+            if !keep_late_claim(&state, network_id, &pk, &token).await {
+                return;
+            }
+            if let Err(e) = dir.set_add(&derpnet_key(&net_hex), &member).await {
+                debug!(%network_id, %e, "derp net-index add failed again");
+                continue;
+            }
+            owed = false;
+            debug!(%network_id, "derp registration written after a Redis error");
+        }
+        if converge_network(&state, network_id).await == Sweep::Done {
+            return;
+        }
+    }
+}
+
+/// #3840 — the step after a late claim that wrote the record: whether the
+/// registration still holds its token, so that its finisher goes on to the
+/// index and the sweep. A teardown that ran while the claim was in flight
+/// found no record to release, because the claim had not written it yet; the
+/// record the claim wrote is released here, by its token, so it cannot
+/// outlive its socket. The index member is left to the next sweep, which
+/// prunes a member with no record: removing it here could race a newer
+/// registration's add on the other pod.
+pub async fn keep_late_claim(
+    state: &NetworkState,
+    network_id: ObjectId,
+    pk: &DerpPubKey,
+    token: &str,
+) -> bool {
+    let held = state
+        .derp_presence_tokens
+        .get(&(network_id, *pk))
+        .is_some_and(|held| *held == token);
+    if held {
+        return true;
+    }
+    if let Some(dir) = &state.cluster_directory {
+        let key = derp_key(&network_id.to_hex(), &pk_hex(pk));
+        if let Err(e) = dir.release(&key, token).await {
+            debug!(%network_id, %e, "derp late claim release failed (TTL backstop)");
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3840 — a rehome request the bus could not publish (a Redis error)
+    /// says nothing of the pod it was for, so the sweep runs again. A
+    /// deadline or a NACK ends it, as before.
+    #[test]
+    fn only_a_redis_error_on_a_rehome_runs_the_sweep_again() {
+        use roomler_core::cluster::bus::BusError;
+        let redis = BusError::Redis(redis::RedisError::from(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )));
+        let deadline = BusError::Deadline(Duration::from_secs(2));
+        let nack = BusError::Nack("unknown class".into());
+        let got = [
+            sweep_again_after(&redis),
+            sweep_again_after(&deadline),
+            sweep_again_after(&nack),
+        ];
+        eprintln!("W14-RESULT sweep again after [redis, deadline, nack]: {got:?}");
+        assert_eq!(
+            got,
+            [true, false, false],
+            "W14-RED a rehome Redis did not publish must leave the sweep to run again, \
+             and only that one"
+        );
+    }
+
+    /// #3840 — a registration's rounds wait 1 s, then twice as long each
+    /// time, up to the heartbeat's 30 s.
+    #[test]
+    fn a_registrations_rounds_wait_1_s_doubling_to_30_s() {
+        let mut wait = FINISH_WAIT_FIRST;
+        let mut waits = vec![wait];
+        for _ in 0..6 {
+            wait = finish_wait_after(wait);
+            waits.push(wait);
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
+    }
 
     #[test]
     fn pk_hex_roundtrip() {

@@ -94,8 +94,9 @@
 
   async function loadEntries() {
     try {
-      const list = await invoke('cmd_config_entries');
-      entries = new Map(list.map((e) => [e.key, e]));
+      // #2871 — `{ entries, machine_merged }`; the Welcome flow reads values.
+      const listing = await invoke('cmd_config_entries');
+      entries = new Map(listing.entries.map((e) => [e.key, e]));
     } catch (e) {
       console.warn('welcome: config entries unavailable', e);
     }
@@ -162,8 +163,12 @@
     const s = get('status');
     const dv = get('deviceView');
     const enrolled = !!(s && s.enrolled);
+    // #4020 — an enrollment the device service holds and this app cannot
+    // read: neither line, and no offer to enroll.
+    const unknown = !enrolled && !!(s && s.enrollment_unknown);
     el('wl-dev-enrolled').hidden = !enrolled;
-    el('wl-dev-unenrolled').hidden = enrolled || !s;
+    el('wl-dev-unenrolled').hidden = enrolled || unknown || !s;
+    el('wl-dev-unknown').hidden = !unknown;
     if (enrolled) {
       const liveName = dv && dv.available && dv.status && dv.status.name;
       setText('wl-dev-name', liveName || s.device_name || '—');

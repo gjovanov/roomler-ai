@@ -1,6 +1,6 @@
 # FR-59 — Slow-link latency priority: make delay the controlled variable
 
-**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1–AC5 open (they need a relay-locked CORPLAP pair); **AC6 unit-verified 2026-10-29** ·
+**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). P1 to P4 and P7 (the viewer's reorder buffer) stay live. P5, P6 and P8 go in FR-148: the slow-link profile becomes a live plan field in its P2. AC2 and AC5 are read in its P3. FR-148 §12 maps each open criterion. At the close: P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1 and AC3 met on the 2026-11-02 read, AC2 and AC5 partial, AC4 moved to FR-63; **AC6 unit-verified 2026-10-29** ·
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
@@ -40,14 +40,14 @@ therefore **increased**.
 ### The six mechanisms
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
-   (`agents/roomlerd/src/encode/mod.rs:219`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
+   (`agents/roomlerd/src/encode/mod.rs:229`); on a constrained path `area_min_bitrate_bps()`
+   (`:215`) returns exactly it, and `governor.rs:353` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:324` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps
@@ -61,7 +61,7 @@ therefore **increased**.
 
 4. **The queue budget is denominated in the nominal ceiling.**
    `constrained_queue_budget_bytes(relay_max_bps())` (`rate_profile.rs:360`, called once at
-   `peer.rs:4949`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
+   `peer.rs:5056`) = 3,000,000 × 450 ms / 8000 = **168,750 bytes**. At 395 kbps that "450 ms"
    budget is **3.4 seconds** of standing queue. The gate never fired.
 
 5. **The only true latency signal is silent, rejected, or toothless.** `viewer_age_ms=None` in
@@ -71,12 +71,12 @@ therefore **increased**.
    `age_over` cuts **fps** and issues an AIMD MD — which stops at the 1.5 Mbps floor.
 
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
-   viewer `localStorage` opt-in (`useRemoteControl.ts:3237`). On a lossy mobile link every lost
+   viewer `localStorage` opt-in (`useRemoteControl.ts:3362`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
-   is already stale. `peer.rs:2947` still records "a gap cannot occur".
+   is already stale. `peer.rs:2989` still records "a gap cannot occur".
 
 Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip`
-(`peer.rs:1552`) — on a TURN relay that is the **relay's** address, so a fast office day writes
+(`peer.rs:1563`) — on a TURN relay that is the **relay's** address, so a fast office day writes
 `5_069_353` into a key a slow airport session inherits for `TTL` (7 days).
 
 ## Key design
@@ -146,16 +146,34 @@ evidence is why both are already in the stats).
 
 ## Acceptance criteria
 
-- [ ] **AC1** — On a link measured below 1 Mbps, `target_bps` converges **below** the old
-      1.5 Mbps floor and within 2× of `goodput_bps`.
-- [ ] **AC2** — `constrained` queue budget in bytes tracks the measured rate: on a 400 kbps
+- [x] **AC1** — On a link measured below 1 Mbps, `target_bps` converges **below** the old
+      1.5 Mbps floor and within 2× of `goodput_bps`. *Met on CORPLAP-2, 2026-10-30 12:19Z,
+      carrier `turn`: goodput 180 kbps, target 1.84 M → 1.5 M → 200 kbps, then 200-253 kbps
+      for 29 windows, ratio at most 1.40. The other session that week took longer: carrier
+      `derp`, 11:48Z, target 2.4-3.0 M for about 55 s above a held goodput of 224 kbps with
+      age steady at 60-95 ms, then 1.29 M at 11:49:30Z and under 1 M. Fleet, week to
+      2026-11-02: 89 sub-1 M windows, 2 sessions, 1 host, 53 of them under 1.5 M and within 2×.*
+- [~] **AC2** — `constrained` queue budget in bytes tracks the measured rate: on a 400 kbps
       pipe the byte gate engages (`frames_skipped_backpressure` climbs) instead of standing at 0.
-- [ ] **AC3** — A session opening with an FR-35 seed ≥2× above the first measured window logs
-      the abandonment and does not run at the seeded ceiling.
-- [ ] **AC4** — Field: viewer paint age on the airport-class link falls from the measured
+      *Partly read. In that `derp` session the counter climbs 1 → 25 while target is
+      355-838 kbps. The `turn` session at 200 kbps skips 0. No window of the week has goodput
+      in 250-600 kbps, and the budget itself is not in the heartbeat. Owed: a real relayed
+      session near 400 kbps, because netem cannot push back on the sender.*
+- [x] **AC3** — A session opening with an FR-35 seed ≥2× above the first measured window logs
+      the abandonment and does not run at the seeded ceiling. *Met on 2026-10-30 11:48Z: 3 s
+      in, seed 3.18 M against a measured 224 kbps, 14×. The line is logged, `learned_ceiling`
+      goes to 0 and the target drops to 2.4 M, the nominal, which it then climbs to 3.0 M.
+      Three more lines that week, all mid-session: 3.19 M → 523 kbps, 6.21 M → 200 kbps,
+      3.0 M → 200 kbps.*
+- **AC4** moved: FR-63 AC4 carries it, "closes here" (`docs/fr/FR-63-one-delay-based-rate-controller.md:393`).
+      Field: viewer paint age on the airport-class link falls from the measured
       2,284–7,095 ms band to **under 600 ms sustained**, with the before/after heartbeats recorded.
-- [ ] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
-      path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise.
+- [~] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
+      path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise. *Week to
+      2026-11-02. Direct: CORPLAP-3 on the LAN, 52 sessions, 6 468 windows, age p50 11, p90 31,
+      max 560 ms, beside the p50 4-8 and p90 16-42 of 2026-09-01. Relay, per host: target median
+      3.0-38.9 M, age median 10-71 ms, skips 0-29. No same-instrument "before" exists any more,
+      so "unchanged within noise" can't be shown. Whether this is enough is the operator's call.*
 - [x] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
       **Unit-verified 2026-10-29** — every switch in the Phases table traced from its config
       key to the line that consumes it, each with a unit test that drives it OFF and asserts the
@@ -176,6 +194,10 @@ evidence is why both are already in the stats).
       **Field-verified 2026-09-02 on 0.4.50**: 0 in the AFTER session at 25 mouse events/s,
       against 24 in 2 minutes at 1.7 events/s on 0.4.49 the same hour, same path.
 
+- [x] **AC9** — Docs: `docs/rate-control.md` holds what this FR built, the floor relief, the
+      arrival clamp, the queue budget and the seed contradiction, with its diagram and switch
+      table, and it is linked from `docs/README.md`'s index.
+
 ## AC6 — the kill-switch audit (2026-10-29)
 
 Every switch in the Phases table, traced from its config key to the line that consumes it,
@@ -185,8 +207,8 @@ The plumbing is one shape for all of them:
 
 ```mermaid
 flowchart LR
-  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3156–3161 → ROOMLERD_*"]
-  bridge --> rd["readers<br/>encode/mod.rs:317–448<br/>on unless the value is \"0\""]
+  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3165–3170 → ROOMLERD_*"]
+  bridge --> rd["readers<br/>encode/mod.rs:319–450<br/>on unless the value is \"0\""]
   rd --> gf["GovernorFlags::from_env<br/>governor.rs:171"]
   rd --> pk["PlanKnobs::from_env<br/>plan.rs:187 (P2)"]
   rd --> pump["pump, resolved once<br/>peer.rs:6362 (P5) · :6745 (P2)"]
@@ -205,7 +227,7 @@ flowchart LR
 | **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`170d18473^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
 | **T1** | none — a parse fix | `crates/vendored/webrtc-sctp` | not a switch; the vendored parser's own tests plus the CI drift gate (`ci.yml:273`, `scripts/revendor-webrtc-sctp.sh --check`) |
 
-`config_surface.rs:4315` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
+`config_surface.rs:4334` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
 editable through the config surface, not only by env.
 
 **Fail-first.** A unit test is evidence only if it fails without the thing it protects, so each
@@ -349,3 +371,4 @@ it was the one configuration the A/B never ran on.
 | 2026-09-02 14:09 | **0.4.50** | **AFTER arm, same procedure**: CORPLAP-1 → neo16, same pair type, `hevc_qsv`, 25 synthetic mouse events/s (Worker-driven), 33 windows (session `6a982e0f`) | **Opened at 200 kbps** from the remembered rate (no burst). Bytes-per-frame ratio **p50 0.90, p90 1.01, max 2.09**, 2/32 over 1.5× — the encoder follows the target (**AC7 ✓**). Targets 200 k → 320 k by the relative additive step, MD back to 200 k on a path stall. No gate skips, no send stalls. Age p50 86 / **p90 851** / max 3,938 ms — the two spikes are DERP-path stalls (one per drain), not a standing queue. **0 `chunk too short`** with 15× the mouse traffic (**AC8 ✓** on this session). ⚠️ The session ended at 66 s because the laptop hard-rebooted (see below), not by the pump. |
 | 2026-09-02 14:11 | 0.4.50 | CORPLAP-1, first 60 s after an unclean reboot | **Latent boot-window panic** (pre-existing, not P8): `Instant::now() - 60 s` at the pump's `last_motion_at` seed underflows on a host up for < 60 s — three sessions started 34–52 s after boot by the viewer's auto-reconnect all died with `overflow when subtracting duration from instant`; the one at +66 s ran. The crash recorder counted them with four 0.4.49 worker aborts and attempted a rollback (GitHub unreachable from the laptop, so it did not run); at +5 min 0.4.50 was promoted to last-known-good. Fixed by `clock::instant_before` at all six seed sites. |
 | 2026-09-02 14:13–14:17 | 0.4.50 | CORPLAP-1 → neo16 on a LAN **direct** pair (the overlay latched LAN after the reboot), `hevc_qsv` 1920×1200@60 | Operator's own session: 114 windows, age p50 44 / p90 159 / max 886 ms, bytes-per-frame ratio p50 0.92 — 0.4.50 healthy on the direct path. |
+| 2026-11-02 | 0.4.177-0.4.197 | prod `agent_logs`, read-only, the week: CORPLAP-2 on `turn` and on `derp`, every relay and direct host | **AC1 and AC3 met, AC2 and AC5 partial**, each in its criterion above. Natural traffic, no set drag. |

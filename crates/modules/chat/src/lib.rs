@@ -35,12 +35,12 @@ use roomler_ai_services::{
 };
 use roomler_core::{Capabilities, Core, Module, Role, TenantCtx, WsHandlerSpec, WsRegistration};
 
-pub mod bound;
 pub mod export;
 pub mod file;
 pub mod giphy;
 pub mod guards;
 pub mod media_type;
+pub mod membership;
 pub mod message;
 pub mod reaction;
 pub mod room;
@@ -176,7 +176,15 @@ impl Module for ChatState {
             // it counts messages. A static segment, so it wins over the host's
             // `/user/{user_id}` capture.
             .route("/user/unread-summary", get(user_unread::unread_summary))
+            // Platform operators: end the room memberships that outlived an
+            // org membership (a dry run unless asked).
+            .route("/admin/room-members/prune", post(membership::prune))
             .with_state(self.clone())
+    }
+
+    /// A room membership ends with the org membership under it.
+    fn hooks(&self) -> roomler_core::Hooks {
+        membership::hooks(self)
     }
 
     /// `typing:start` / `typing:stop` on the user socket.

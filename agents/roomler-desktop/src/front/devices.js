@@ -773,10 +773,16 @@
         '. Showing the devices this one reaches directly' +
         retryText();
     }
+    // #4019 — the two lines share a slot of fixed height (`.dv-notes`), so
+    // showing or hiding either moves no row. A line cut short in it reads
+    // whole on hover.
     setText(status, note || '');
+    status.title = note || '';
     status.hidden = !note;
     setText(error, warn || '');
+    error.title = warn || '';
     error.hidden = !warn;
+    $('dv-notes').classList.toggle('both', !!note && !!warn);
   }
 
   function retryText() {

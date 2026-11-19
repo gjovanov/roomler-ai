@@ -9,6 +9,13 @@ use roomler_ai_config::JwtSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod single_use;
+
+pub use single_use::{
+    AgentEnrollment, ClaimedKeyUse, EnrollmentCredential, SingleUse, SpendPurpose, SpendRefusal,
+    Spent, Unspent,
+};
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("Invalid credentials")]
@@ -63,18 +70,9 @@ pub enum TokenType {
     /// on an attended install: a user who could swap one for the other could
     /// tell SYSTEM what to run (FR-94 §4).
     AgentService,
-    /// FR-90 P3-7-1b — the vault's grant of one agent session's own egress
-    /// (`rc:vault.net`), which the network module verifies when the device
-    /// opens the tunnel. Its own audience, so no other gate accepts it and it
-    /// accepts no other credential: it acts for a session, never for the
-    /// device or a person.
-    NetGrant,
-    /// FR-90 P3-8-1a — the vault's ticket for one agent session's command on
-    /// another device over Roomler SSH (`rc:vault.ssh`), which the network
-    /// module verifies at `rc:ssh.request` (P3-8-1b). Its own audience, so no
-    /// other gate accepts it and it accepts no other credential, a net grant
-    /// included: it acts for a session, never for the device or a person.
-    SshTicket,
+    // FR-137 — FR-90's `net_grant` and `ssh_ticket` audiences are retired with
+    // the vault that minted them. A token of either kind no longer decodes, so
+    // every verifier refuses it. Never reuse either spelling for a new kind.
 }
 
 /// Claims carried by a remote-control enrollment token (aud = enroll).
@@ -86,7 +84,9 @@ pub struct EnrollmentClaims {
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
-    pub jti: String, // unique id — caller may persist for single-use checks
+    /// Unique id: the used-token ledger keys the token's one use on it
+    /// ([`single_use`]). For an ephemeral key it names the key's row instead.
+    pub jti: String,
     /// FR-104 — the admin minted this token to also ANCHOR the device it
     /// enrolls: `POST /api/agent/anchor` accepts it a second time, for that
     /// one device, once. Absent from every older token (and from every token
@@ -158,128 +158,23 @@ pub struct TunnelClientClaims {
     pub generation: u32,
 }
 
-/// FR-90 P3-7-1b — claims carried by a session's egress grant (`net_grant`).
-/// It names one session at one fence, running on one device, and the one
-/// exit its flows leave through: for a forward one destination, for SOCKS
-/// none. It lives at most a lease's ceiling.
-///
-/// ⚠️ The network module believes a flow under it only from the device it
-/// names as the origin: a grant copied to another device opens nothing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NetGrantClaims {
-    /// The session's id, hex.
-    pub sub: String,
-    pub tenant_id: String,
-    /// The session's fence when the vault decided.
-    pub fence: u64,
-    /// The person the session acts for, hex.
-    pub owner_user_id: String,
-    /// The device the session runs on, hex: the only one that may use it.
-    pub origin_agent_id: String,
-    /// The device the flows exit through, hex.
-    pub exit_agent_id: String,
-    /// A `roomler_ai_remote_control::vault::NetKind` word.
-    pub net: String,
-    /// A forward's one destination, as `canonical_net_host` spells it;
-    /// empty for SOCKS.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub dst_host: String,
-    #[serde(default, skip_serializing_if = "is_zero_port")]
-    pub dst_port: u16,
-    /// The grant's id, as the vault records its allow (`grant:<jti>`).
-    pub jti: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub iss: String,
-    pub token_type: TokenType,
-}
-
-fn is_zero_port(port: &u16) -> bool {
-    *port == 0
-}
-
-/// FR-90 P3-7-1b — what the vault grants: every claim but the issuer, the
-/// audience and the start, which the auth service fills.
-#[derive(Debug, Clone, Copy)]
-pub struct NetGrant<'a> {
-    pub session_id: ObjectId,
-    pub tenant_id: ObjectId,
-    pub fence: u64,
-    pub owner_user_id: ObjectId,
-    pub origin_agent_id: ObjectId,
-    pub exit_agent_id: ObjectId,
-    pub net: roomler_ai_remote_control::vault::NetKind,
-    /// A forward's destination, its host canonical; `None` for SOCKS.
-    pub dst: Option<(&'a str, u16)>,
-    pub grant_id: ObjectId,
-    /// When it ends, in seconds since the epoch: at most
-    /// `lease_limits::MAX_TTL_SECS` from now.
-    pub exp: i64,
-}
-
-/// FR-90 P3-8-1a — claims carried by a session's SSH ticket (`ssh_ticket`).
-/// It names one session at one fence, running on one device, the one other
-/// device its command runs on, and the account that device's SSH policy
-/// mapped when the vault decided. It lives at most a lease's ceiling.
-///
-/// ⚠️ Never the device it runs on: a session already runs there, as its own
-/// account, and SSH would run it as whatever that device maps, the daemon's
-/// among them. No such ticket is signed, and none is believed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SshTicketClaims {
-    /// The session's id, hex.
-    pub sub: String,
-    pub tenant_id: String,
-    /// The session's fence when the vault decided.
-    pub fence: u64,
-    /// The person the session acts for, hex.
-    pub owner_user_id: String,
-    /// The device the session runs on, hex: the only one that may use it.
-    pub origin_agent_id: String,
-    /// The device the command runs on, hex: never the origin.
-    pub target_agent_id: String,
-    /// The account the target's SSH policy mapped when the vault decided, a
-    /// `roomler_ai_remote_control::models::SshAccountMode` word.
-    pub account: String,
-    /// The ticket's id, as the vault records its allow (`ticket:<jti>`).
-    pub jti: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub iss: String,
-    pub token_type: TokenType,
-}
-
-/// FR-90 P3-8-1a — what the vault tickets: every claim but the issuer, the
-/// audience and the start, which the auth service fills.
-#[derive(Debug, Clone, Copy)]
-pub struct SshTicket {
-    pub session_id: ObjectId,
-    pub tenant_id: ObjectId,
-    pub fence: u64,
-    pub owner_user_id: ObjectId,
-    pub origin_agent_id: ObjectId,
-    pub target_agent_id: ObjectId,
-    pub account: roomler_ai_remote_control::models::SshAccountMode,
-    pub ticket_id: ObjectId,
-    /// When it ends, in seconds since the epoch: at most
-    /// `lease_limits::MAX_TTL_SECS` from now.
-    pub exp: i64,
-}
-
 /// Claims carried by a tunnel-enrollment token. Mirrors
 /// [`EnrollmentClaims`] (single-use via `jti`, short TTL) but its
 /// own audience so a leaked agent-enrollment can't bootstrap a
 /// tunnel client and vice-versa.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelEnrollmentClaims {
-    /// Admin user id (issuer) as hex.
+    /// The user who minted the token, hex: the person the enrollment acts
+    /// for, the owner of a new tunnel client and the one whose right to
+    /// re-enroll a known machine id the enroll route checks (#3328).
     pub sub: String,
     pub tenant_id: String,
     pub iat: i64,
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
-    /// Unique id — caller may persist for single-use checks.
+    /// Unique id: the used-token ledger keys the token's one use on it
+    /// ([`single_use`]).
     pub jti: String,
 }
 
@@ -525,8 +420,9 @@ impl AuthService {
 
     // ─── Remote-control tokens ────────────────────────────────────────
 
-    /// Mint a single-use enrollment token. The returned `jti` is unique and
-    /// may be persisted by the caller for replay protection.
+    /// Mint a single-use enrollment token. The returned `jti` is unique; the
+    /// door that redeems the token spends it on the used-token ledger
+    /// ([`single_use`]).
     pub fn issue_enrollment_token(
         &self,
         admin_user_id: ObjectId,
@@ -562,14 +458,19 @@ impl AuthService {
         Ok((token, jti))
     }
 
-    pub fn verify_enrollment_token(&self, token: &str) -> Result<EnrollmentClaims, AuthError> {
+    /// Verify a single-use enrollment token. It comes back [`Unspent`]: the
+    /// caller reads its claims, and spends it before it mints anything.
+    pub fn verify_enrollment_token(
+        &self,
+        token: &str,
+    ) -> Result<Unspent<EnrollmentClaims>, AuthError> {
         let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::Enrollment {
             return Err(AuthError::InvalidToken(
                 "Not an enrollment token".to_string(),
             ));
         }
-        Ok(claims)
+        Ok(Unspent::new(claims))
     }
 
     /// FR-51 P2 — mint the JWT half of an ephemeral enrollment key. `exp` is
@@ -599,28 +500,58 @@ impl AuthService {
     }
 
     /// Accept EITHER enrollment credential on the public enroll route and say
-    /// which arrived (`true` = the FR-51 ephemeral key). Everything else —
-    /// agent, user, tunnel audiences — is refused exactly as before; the two
-    /// enrollment kinds stay separate audiences everywhere else.
+    /// which arrived. Everything else — agent, user, tunnel audiences — is
+    /// refused exactly as before; the two enrollment kinds stay separate
+    /// audiences everywhere else. Only the single-use kind comes back
+    /// [`Unspent`]: an FR-51 ephemeral key is reusable, and its row decides
+    /// each use (`EnrollmentKeyDao::claim_use`).
     pub fn verify_enrollment_token_any(
         &self,
         token: &str,
-    ) -> Result<(EnrollmentClaims, bool), AuthError> {
+    ) -> Result<EnrollmentCredential, AuthError> {
         let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
         match claims.token_type {
-            TokenType::Enrollment => Ok((claims, false)),
-            TokenType::EphemeralEnrollment => Ok((claims, true)),
+            TokenType::Enrollment => Ok(EnrollmentCredential::SingleUse(Unspent::new(claims))),
+            TokenType::EphemeralEnrollment => Ok(EnrollmentCredential::EphemeralKey(claims)),
             _ => Err(AuthError::InvalidToken(
                 "Not an enrollment token".to_string(),
             )),
         }
     }
 
-    /// Mint a long-lived agent token at the device row's token generation
-    /// `gen` (FR-103). The TTL is one year unless `override_ttl_secs` is
-    /// given; the server passes `rc.agent_token_ttl_secs`. A device renews its
-    /// token well before then (`POST /api/agent/self/renew`).
+    /// Mint the long-lived agent token an ENROLLMENT earns, at the device
+    /// row's token generation `generation` (FR-103), for the org the
+    /// enrollment was minted for. It takes the redemption itself — a
+    /// single-use token already spent on the ledger, or an ephemeral key's
+    /// claimed use — so a door that skips the spend cannot mint (#3328). The
+    /// TTL is one year unless `override_ttl_secs` is given; the server passes
+    /// `rc.agent_token_ttl_secs`.
     pub fn issue_agent_token(
+        &self,
+        enrollment: AgentEnrollment,
+        agent_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        self.mint_agent_token(agent_id, tenant_id, generation, override_ttl_secs)
+    }
+
+    /// FR-103 — a fresh agent token for a device that renews the one it holds
+    /// (`POST /api/agent/self/renew`), at the row's generation. Renewal only:
+    /// an enrollment mints through [`Self::issue_agent_token`].
+    pub fn renew_agent_token(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        self.mint_agent_token(agent_id, tenant_id, generation, override_ttl_secs)
+    }
+
+    /// The agent token itself, for the two entries above.
+    fn mint_agent_token(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
@@ -682,13 +613,37 @@ impl AuthService {
         Ok(())
     }
 
-    /// FR-94 — mint the credential of a device's SYSTEM service: `sub` = the
-    /// agent id, `anchor_id` = the anchor it belongs to, its own audience,
-    /// and the agent token's one-year lifetime. The service renews it
-    /// (`POST /api/agent/service/renew`) under the same anchor, so the year
-    /// is a renewal interval, not the anchor's life; the anchor binding is
-    /// what revokes it.
+    /// FR-94 — mint the credential of a device's SYSTEM service when it is
+    /// ANCHORED: `sub` = the agent id, `anchor_id` = the anchor it belongs to,
+    /// its own audience, and the agent token's one-year lifetime, for the org
+    /// the enrollment token was minted for. It takes that token spent on the
+    /// ledger (#3328). The service renews it (`POST /api/agent/service/renew`)
+    /// under the same anchor, so the year is a renewal interval, not the
+    /// anchor's life; the anchor binding is what revokes it.
     pub fn issue_agent_service_token(
+        &self,
+        enrollment: Spent<EnrollmentClaims>,
+        agent_id: ObjectId,
+        anchor_id: &str,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        self.mint_agent_service_token(agent_id, tenant_id, anchor_id)
+    }
+
+    /// FR-94 — a fresh service credential under the SAME anchor, for a
+    /// service whose credential is still live (`POST /api/agent/service/renew`).
+    /// Renewal only: an anchor mints through [`Self::issue_agent_service_token`].
+    pub fn renew_agent_service_token(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        anchor_id: &str,
+    ) -> Result<String, AuthError> {
+        self.mint_agent_service_token(agent_id, tenant_id, anchor_id)
+    }
+
+    /// The service credential itself, for the two entries above.
+    fn mint_agent_service_token(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
@@ -726,8 +681,9 @@ impl AuthService {
     // ─── tunnel client tokens ─────────────────────────────────
 
     /// Mint a single-use tunnel-enrollment token. Returned `jti` is
-    /// unique; caller may persist for replay protection. Mirrors
-    /// [`issue_enrollment_token`] but with a distinct audience.
+    /// unique; `POST /api/tunnel-client/enroll` spends it on the used-token
+    /// ledger ([`single_use`]). Mirrors [`Self::issue_enrollment_token`] but
+    /// with a distinct audience.
     pub fn issue_tunnel_enrollment_token(
         &self,
         admin_user_id: ObjectId,
@@ -750,23 +706,67 @@ impl AuthService {
         Ok((token, jti))
     }
 
+    /// Verify a tunnel-enrollment token. It comes back [`Unspent`]: the enroll
+    /// route reads its claims, and spends it before it writes anything.
     pub fn verify_tunnel_enrollment_token(
         &self,
         token: &str,
-    ) -> Result<TunnelEnrollmentClaims, AuthError> {
+    ) -> Result<Unspent<TunnelEnrollmentClaims>, AuthError> {
         let claims = self.decode_any::<TunnelEnrollmentClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::TunnelEnrollment {
             return Err(AuthError::InvalidToken(
                 "Not a tunnel-enrollment token".to_string(),
             ));
         }
-        Ok(claims)
+        Ok(Unspent::new(claims))
     }
 
-    /// Mint a long-lived tunnel-client token at the client row's token
-    /// generation `gen` (FR-103). Default TTL one year, override via
-    /// `override_ttl_secs`. Mirrors [`Self::issue_agent_token`].
+    /// Mint the long-lived tunnel-client token an ENROLLMENT earns, at the
+    /// client row's token generation `generation` (FR-103). It takes the
+    /// enrollment token spent on the ledger (#3328), and the credential is
+    /// for the org that token was minted for and owned by the person it was
+    /// minted for. Default TTL one year, override via `override_ttl_secs`.
     pub fn issue_tunnel_client_token(
+        &self,
+        enrollment: Spent<TunnelEnrollmentClaims>,
+        tunnel_client_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        let owner_user_id = enrollment.subject()?;
+        self.mint_tunnel_client_token(
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+            generation,
+            override_ttl_secs,
+        )
+    }
+
+    /// FR-103 — a fresh tunnel-client token for a client that renews the one
+    /// it holds (`POST /api/tunnel-client/renew`), with the same owner.
+    /// Renewal only: an enrollment mints through
+    /// [`Self::issue_tunnel_client_token`].
+    pub fn renew_tunnel_client_token(
+        &self,
+        tunnel_client_id: ObjectId,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        self.mint_tunnel_client_token(
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+            generation,
+            override_ttl_secs,
+        )
+    }
+
+    /// The tunnel-client token itself, for the two entries above.
+    fn mint_tunnel_client_token(
         &self,
         tunnel_client_id: ObjectId,
         tenant_id: ObjectId,
@@ -816,173 +816,6 @@ impl AuthService {
         }
         Ok(claims)
     }
-
-    // ─── FR-90 P3-7-1b: a session's egress grant ──────────────────────
-
-    /// Sign the vault's grant of a session's egress. Refuses a grant that
-    /// does not hold together, before signing anything: a forward with no
-    /// destination, or a host not in its canonical spelling, would otherwise
-    /// be read as a grant wider than the one decided; SOCKS names no
-    /// destination; and none ends past the lease ceiling.
-    pub fn issue_net_grant(&self, g: &NetGrant<'_>) -> Result<String, AuthError> {
-        let now = Utc::now().timestamp();
-        let (dst_host, dst_port) = match g.dst {
-            Some((host, port)) => (host.to_string(), port),
-            None => (String::new(), 0),
-        };
-        let claims = NetGrantClaims {
-            sub: g.session_id.to_hex(),
-            tenant_id: g.tenant_id.to_hex(),
-            fence: g.fence,
-            owner_user_id: g.owner_user_id.to_hex(),
-            origin_agent_id: g.origin_agent_id.to_hex(),
-            exit_agent_id: g.exit_agent_id.to_hex(),
-            net: g.net.wire().to_string(),
-            dst_host,
-            dst_port,
-            jti: g.grant_id.to_hex(),
-            iat: now,
-            exp: g.exp,
-            iss: self.jwt_settings.issuer.clone(),
-            token_type: TokenType::NetGrant,
-        };
-        net_grant_holds(&claims)?;
-        encode(&self.header(), &claims, &self.signing.encoding)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))
-    }
-
-    /// Verify a session's egress grant. Refuses every other audience, and
-    /// every other verifier refuses this one. Checked as it was issued: its
-    /// kind, its destination, its ids and its life.
-    ///
-    /// ⚠️ No leeway past `exp`: a grant's end is a decision's, at most the
-    /// lease ceiling, never the minute of clock skew a year-long token is
-    /// given. The tokens are made and checked by the same servers.
-    pub fn verify_net_grant(&self, token: &str) -> Result<NetGrantClaims, AuthError> {
-        let mut validation = self.validation();
-        validation.leeway = 0;
-        let claims = self.decode_any::<NetGrantClaims>(token, &validation)?;
-        if claims.token_type != TokenType::NetGrant {
-            return Err(AuthError::InvalidToken("Not a net grant".to_string()));
-        }
-        net_grant_holds(&claims)?;
-        Ok(claims)
-    }
-
-    // ─── FR-90 P3-8-1a: a session's SSH ticket ────────────────────────
-
-    /// Sign the vault's ticket for a session's command on another device.
-    /// Refuses a ticket that does not hold together, before signing anything:
-    /// one naming the device it runs on as its target would let a session
-    /// run as whatever that device maps instead of as itself, and none ends
-    /// past the lease ceiling.
-    pub fn issue_ssh_ticket(&self, t: &SshTicket) -> Result<String, AuthError> {
-        let claims = SshTicketClaims {
-            sub: t.session_id.to_hex(),
-            tenant_id: t.tenant_id.to_hex(),
-            fence: t.fence,
-            owner_user_id: t.owner_user_id.to_hex(),
-            origin_agent_id: t.origin_agent_id.to_hex(),
-            target_agent_id: t.target_agent_id.to_hex(),
-            account: t.account.wire().to_string(),
-            jti: t.ticket_id.to_hex(),
-            iat: Utc::now().timestamp(),
-            exp: t.exp,
-            iss: self.jwt_settings.issuer.clone(),
-            token_type: TokenType::SshTicket,
-        };
-        ssh_ticket_holds(&claims)?;
-        encode(&self.header(), &claims, &self.signing.encoding)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))
-    }
-
-    /// Verify a session's SSH ticket. Refuses every other audience, a net
-    /// grant's included, and every other verifier refuses this one. Checked
-    /// as it was issued: its ids, its two devices, its account and its life.
-    ///
-    /// ⚠️ No leeway past `exp`, as for a net grant: a ticket's end is a
-    /// decision's.
-    pub fn verify_ssh_ticket(&self, token: &str) -> Result<SshTicketClaims, AuthError> {
-        let mut validation = self.validation();
-        validation.leeway = 0;
-        let claims = self.decode_any::<SshTicketClaims>(token, &validation)?;
-        if claims.token_type != TokenType::SshTicket {
-            return Err(AuthError::InvalidToken("Not an SSH ticket".to_string()));
-        }
-        ssh_ticket_holds(&claims)?;
-        Ok(claims)
-    }
-}
-
-/// FR-90 P3-8-1a — whether a ticket's claims hold together, at its signing
-/// and at every check: every id an id; a target that is not the device it
-/// runs on; an account this build names; and a life no longer than a lease's
-/// ceiling.
-fn ssh_ticket_holds(c: &SshTicketClaims) -> Result<(), AuthError> {
-    use roomler_ai_remote_control::{models::SshAccountMode, vault::lease_limits};
-    let bad = |why: &str| Err(AuthError::InvalidToken(format!("ssh ticket: {why}")));
-    let id = |hex: &str| ObjectId::parse_str(hex).ok();
-    let ids = [
-        &c.sub,
-        &c.tenant_id,
-        &c.owner_user_id,
-        &c.origin_agent_id,
-        &c.target_agent_id,
-        &c.jti,
-    ];
-    if ids.iter().any(|hex| id(hex).is_none()) {
-        return bad("an id that is not one");
-    }
-    // Compared as ids, so no two spellings of one device read as two.
-    if id(&c.origin_agent_id) == id(&c.target_agent_id) {
-        return bad("a target that is the device it runs on");
-    }
-    if SshAccountMode::from_wire(&c.account).is_none() {
-        return bad("an account this build cannot name");
-    }
-    if c.exp <= c.iat || c.exp - c.iat > i64::from(lease_limits::MAX_TTL_SECS) {
-        return bad("a life past the lease ceiling");
-    }
-    Ok(())
-}
-
-/// FR-90 P3-7-1b — whether a grant's claims hold together, at its signing
-/// and at every check: a kind this build names; a forward's destination
-/// canonical and whole, and SOCKS naming none; every id an id; and a life no
-/// longer than a lease's ceiling.
-fn net_grant_holds(c: &NetGrantClaims) -> Result<(), AuthError> {
-    use roomler_ai_remote_control::vault::{NetKind, canonical_net_host, lease_limits};
-    let bad = |why: &str| Err(AuthError::InvalidToken(format!("net grant: {why}")));
-    match NetKind::from_wire(&c.net) {
-        None => return bad("a kind this build cannot name"),
-        Some(NetKind::Forward) => {
-            if c.dst_port == 0
-                || canonical_net_host(&c.dst_host).as_deref() != Some(c.dst_host.as_str())
-            {
-                return bad("a forward names one destination, its host canonical");
-            }
-        }
-        Some(NetKind::Socks) => {
-            if !c.dst_host.is_empty() || c.dst_port != 0 {
-                return bad("SOCKS names no destination");
-            }
-        }
-    }
-    let ids = [
-        &c.sub,
-        &c.tenant_id,
-        &c.owner_user_id,
-        &c.origin_agent_id,
-        &c.exit_agent_id,
-        &c.jti,
-    ];
-    if ids.iter().any(|id| ObjectId::parse_str(id).is_err()) {
-        return bad("an id that is not one");
-    }
-    if c.exp <= c.iat || c.exp - c.iat > i64::from(lease_limits::MAX_TTL_SECS) {
-        return bad("a life past the lease ceiling");
-    }
-    Ok(())
 }
 
 fn uuid_v4_hex() -> String {
@@ -1020,7 +853,7 @@ mod tests {
         let agent_id = ObjectId::new();
         let tenant_id = ObjectId::new();
         let token = s
-            .issue_agent_token(agent_id, tenant_id, 0, Some(60))
+            .mint_agent_token(agent_id, tenant_id, 0, Some(60))
             .unwrap();
         let claims = s.verify_agent_token(&token).unwrap();
         assert_eq!(claims.sub, agent_id.to_hex());
@@ -1034,7 +867,8 @@ mod tests {
         let admin = ObjectId::new();
         let tenant = ObjectId::new();
         let (token, jti) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        let claims = s.verify_enrollment_token(&token).unwrap();
+        let unspent = s.verify_enrollment_token(&token).unwrap();
+        let claims = unspent.claims();
         assert_eq!(claims.sub, admin.to_hex());
         assert_eq!(claims.tenant_id, tenant.to_hex());
         assert_eq!(claims.jti, jti);
@@ -1055,7 +889,7 @@ mod tests {
         let s = svc();
         let agent_id = ObjectId::new();
         let tenant = ObjectId::new();
-        let token = s.issue_agent_token(agent_id, tenant, 0, Some(60)).unwrap();
+        let token = s.mint_agent_token(agent_id, tenant, 0, Some(60)).unwrap();
         let err = s.verify_enrollment_token(&token).unwrap_err();
         matches!(err, AuthError::InvalidToken(_));
     }
@@ -1075,23 +909,29 @@ mod tests {
             .unwrap();
 
         // _any accepts it and says which kind arrived.
-        let (claims, is_ephemeral) = s.verify_enrollment_token_any(&token).unwrap();
-        assert!(is_ephemeral);
+        let EnrollmentCredential::EphemeralKey(claims) =
+            s.verify_enrollment_token_any(&token).unwrap()
+        else {
+            panic!("an ephemeral key must read as one");
+        };
         assert_eq!(claims.jti, "jti-eph-1");
         assert_eq!(claims.token_type, TokenType::EphemeralEnrollment);
 
         // The single-use verifier refuses it (it is not that kind).
         assert!(s.verify_enrollment_token(&token).is_err());
 
-        // A standard enrollment token through _any reads as NOT ephemeral.
+        // A standard enrollment token through _any reads as the single-use
+        // kind, unspent (#3328).
         let (std_token, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        let (_, is_ephemeral) = s.verify_enrollment_token_any(&std_token).unwrap();
-        assert!(!is_ephemeral);
+        assert!(matches!(
+            s.verify_enrollment_token_any(&std_token).unwrap(),
+            EnrollmentCredential::SingleUse(_)
+        ));
 
         // And _any refuses every other audience — an agent token here would
         // mean any enrolled device could mint sibling devices.
         let agent_token = s
-            .issue_agent_token(ObjectId::new(), tenant, 0, Some(60))
+            .mint_agent_token(ObjectId::new(), tenant, 0, Some(60))
             .unwrap();
         assert!(s.verify_enrollment_token_any(&agent_token).is_err());
     }
@@ -1111,12 +951,12 @@ mod tests {
         let (anchoring, jti) = s
             .issue_enrollment_token_with(admin, tenant, 600, true)
             .unwrap();
-        let claims = s.verify_enrollment_token(&anchoring).unwrap();
-        assert!(claims.anchor);
-        assert_eq!(claims.jti, jti);
+        let unspent = s.verify_enrollment_token(&anchoring).unwrap();
+        assert!(unspent.claims().anchor);
+        assert_eq!(unspent.claims().jti, jti);
 
         let (plain, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        assert!(!s.verify_enrollment_token(&plain).unwrap().anchor);
+        assert!(!s.verify_enrollment_token(&plain).unwrap().claims().anchor);
         // Not even written into a plain token's payload: byte-for-byte the
         // tokens minted before FR-104.
         let payload = plain.split('.').nth(1).unwrap();
@@ -1133,7 +973,7 @@ mod tests {
         let agent = ObjectId::new();
         let tenant = ObjectId::new();
         let service = s
-            .issue_agent_service_token(agent, tenant, "anchor-1")
+            .mint_agent_service_token(agent, tenant, "anchor-1")
             .unwrap();
 
         let claims = s.verify_agent_service_token(&service).unwrap();
@@ -1152,7 +992,7 @@ mod tests {
 
         // And the agent token, the one the user can read, is not a service
         // credential.
-        let agent_token = s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap();
+        let agent_token = s.mint_agent_token(agent, tenant, 0, Some(60)).unwrap();
         assert!(s.verify_agent_service_token(&agent_token).is_err());
         let (enroll, _) = s
             .issue_enrollment_token(ObjectId::new(), tenant, 600)
@@ -1186,7 +1026,7 @@ mod tests {
         let tid = ObjectId::new();
         let uid = ObjectId::new();
         let token = s
-            .issue_tunnel_client_token(cid, tid, uid, 0, Some(60))
+            .mint_tunnel_client_token(cid, tid, uid, 0, Some(60))
             .unwrap();
         let claims = s.verify_tunnel_client_token(&token).unwrap();
         assert_eq!(claims.sub, cid.to_hex());
@@ -1201,7 +1041,8 @@ mod tests {
         let admin = ObjectId::new();
         let tenant = ObjectId::new();
         let (token, jti) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
-        let claims = s.verify_tunnel_enrollment_token(&token).unwrap();
+        let unspent = s.verify_tunnel_enrollment_token(&token).unwrap();
+        let claims = unspent.claims();
         assert_eq!(claims.sub, admin.to_hex());
         assert_eq!(claims.tenant_id, tenant.to_hex());
         assert_eq!(claims.jti, jti);
@@ -1216,6 +1057,87 @@ mod tests {
         let (_, jti1) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
         let (_, jti2) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
         assert_ne!(jti1, jti2);
+    }
+
+    /// #3328 — an enrollment mint takes the redemption itself, and reads the
+    /// org from it: the credential is for the org the token (or the
+    /// ephemeral key) was minted for, and a tunnel client's is owned by the
+    /// person the token was minted for. Nothing a door passes can point it
+    /// anywhere else.
+    #[test]
+    fn an_enrollment_mints_for_the_org_and_the_person_its_token_names() {
+        let s = svc();
+        let (admin, tenant) = (ObjectId::new(), ObjectId::new());
+        // What `UsedTokenDao::spend` hands back once the ledger took the use.
+        let spend = |unspent: Unspent<EnrollmentClaims>| Spent::new(unspent.into_claims());
+
+        let (token, _) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
+        let spent = Spent::new(
+            s.verify_tunnel_enrollment_token(&token)
+                .unwrap()
+                .into_claims(),
+        );
+        let client = ObjectId::new();
+        let minted = s
+            .issue_tunnel_client_token(spent, client, 3, Some(60))
+            .unwrap();
+        let claims = s.verify_tunnel_client_token(&minted).unwrap();
+        assert_eq!(claims.sub, client.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.owner_user_id, admin.to_hex());
+        assert_eq!(claims.generation, 3);
+
+        let agent = ObjectId::new();
+        let (token, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
+        let spent = spend(s.verify_enrollment_token(&token).unwrap());
+        let minted = s
+            .issue_agent_token(AgentEnrollment::Token(spent), agent, 1, Some(60))
+            .unwrap();
+        let claims = s.verify_agent_token(&minted).unwrap();
+        assert_eq!(claims.sub, agent.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.generation, 1);
+
+        let now = bson::DateTime::now();
+        let key = roomler_ai_remote_control::models::EnrollmentKey {
+            id: Some(ObjectId::new()),
+            tenant_id: tenant,
+            jti: "jti-eph-2".to_string(),
+            label: "ci".to_string(),
+            created_by: admin,
+            max_uses: 5,
+            uses: 1,
+            expires_at: now,
+            revoked_at: None,
+            ephemeral_ttl_secs: None,
+            last_used_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let minted = s
+            .issue_agent_token(
+                AgentEnrollment::EphemeralKey(ClaimedKeyUse::new(key)),
+                agent,
+                0,
+                Some(60),
+            )
+            .unwrap();
+        assert_eq!(
+            s.verify_agent_token(&minted).unwrap().tenant_id,
+            tenant.to_hex()
+        );
+
+        let (token, _) = s
+            .issue_enrollment_token_with(admin, tenant, 600, true)
+            .unwrap();
+        let spent = spend(s.verify_enrollment_token(&token).unwrap());
+        let minted = s
+            .issue_agent_service_token(spent, agent, "anchor-9")
+            .unwrap();
+        let claims = s.verify_agent_service_token(&minted).unwrap();
+        assert_eq!(claims.sub, agent.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.anchor_id, "anchor-9");
     }
 
     // verify_tunnel_client_token rejects every other audience
@@ -1243,7 +1165,7 @@ mod tests {
     fn tunnel_client_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_client_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -1294,7 +1216,7 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -1314,7 +1236,7 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1332,7 +1254,7 @@ mod tests {
     fn agent_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1358,7 +1280,7 @@ mod tests {
     fn access_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1420,7 +1342,7 @@ mod tests {
         let a = svc_with(SECRET_A, "");
         let b = svc_with(SECRET_B, "");
         let t = a
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let kid = jsonwebtoken::decode_header(&t).unwrap().kid.expect("kid");
 
@@ -1445,7 +1367,7 @@ mod tests {
     fn rotation_keeps_tokens_minted_under_the_previous_secret() {
         let old = svc_with(SECRET_A, "");
         let old_token = old
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // The flag day, for contrast: swap the secret and carry nothing over.
@@ -1462,7 +1384,7 @@ mod tests {
 
         // …and it signs with the NEW key, not the retired one.
         let fresh = rotated
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         assert_eq!(
             jsonwebtoken::decode_header(&fresh).unwrap().kid.unwrap(),
@@ -1482,7 +1404,7 @@ mod tests {
     fn a_forged_kid_buys_nothing() {
         let s = svc_with(SECRET_A, "");
         let foreign = svc_with(SECRET_B, "")
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // Signed with B, but re-labelled to name A's key.
@@ -1595,7 +1517,7 @@ mod tests {
 
         // The renewal verifier is still an AGENT verifier: no other audience.
         let tunnel = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1665,404 +1587,5 @@ mod tests {
             b64(claims.to_string()),
         );
         assert!(s.verify_agent_token(&forged).is_err());
-    }
-
-    // ─── FR-90 P3-7-1b: a session's egress grant ──────────────────────
-
-    use roomler_ai_remote_control::vault::NetKind;
-
-    fn a_grant<'a>(net: NetKind, dst: Option<(&'a str, u16)>, exp: i64) -> NetGrant<'a> {
-        NetGrant {
-            session_id: ObjectId::new(),
-            tenant_id: ObjectId::new(),
-            fence: 7,
-            owner_user_id: ObjectId::new(),
-            origin_agent_id: ObjectId::new(),
-            exit_agent_id: ObjectId::new(),
-            net,
-            dst,
-            grant_id: ObjectId::new(),
-            exp,
-        }
-    }
-
-    fn in_secs(s: i64) -> i64 {
-        Utc::now().timestamp() + s
-    }
-
-    /// A grant names what was decided, and only its own verifier takes it:
-    /// no other gate accepts it, and it accepts no other credential.
-    #[test]
-    fn net_grant_roundtrip_and_audiences() {
-        let s = svc();
-        let g = a_grant(NetKind::Forward, Some(("db.internal", 5432)), in_secs(300));
-        let token = s.issue_net_grant(&g).unwrap();
-        let c = s.verify_net_grant(&token).unwrap();
-        assert_eq!(
-            (c.sub.as_str(), c.tenant_id.as_str(), c.fence),
-            (
-                g.session_id.to_hex().as_str(),
-                g.tenant_id.to_hex().as_str(),
-                7
-            )
-        );
-        assert_eq!(c.owner_user_id, g.owner_user_id.to_hex());
-        assert_eq!(c.origin_agent_id, g.origin_agent_id.to_hex());
-        assert_eq!(c.exit_agent_id, g.exit_agent_id.to_hex());
-        assert_eq!(
-            (c.net.as_str(), c.dst_host.as_str(), c.dst_port),
-            ("forward", "db.internal", 5432)
-        );
-        assert_eq!(c.jti, g.grant_id.to_hex());
-        assert_eq!((c.exp, c.token_type.clone()), (g.exp, TokenType::NetGrant));
-
-        let socks = s
-            .issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(60)))
-            .unwrap();
-        let c = s.verify_net_grant(&socks).unwrap();
-        assert_eq!(
-            (c.net.as_str(), c.dst_host.as_str(), c.dst_port),
-            ("socks", "", 0)
-        );
-
-        // No other gate accepts a grant.
-        for t in [&token, &socks] {
-            assert!(s.verify_token(t).is_err());
-            assert!(s.verify_access_token(t).is_err());
-            assert!(s.verify_refresh_token(t).is_err());
-            assert!(s.verify_enrollment_token(t).is_err());
-            assert!(s.verify_enrollment_token_any(t).is_err());
-            assert!(s.verify_agent_token(t).is_err());
-            assert!(s.verify_agent_token_for_renewal(t).is_err());
-            assert!(s.verify_agent_service_token(t).is_err());
-            assert!(s.verify_tunnel_enrollment_token(t).is_err());
-            assert!(s.verify_tunnel_client_token(t).is_err());
-            assert!(s.verify_tunnel_client_token_for_renewal(t).is_err());
-        }
-        // And a grant is no other credential.
-        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
-        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
-        let others = [
-            pair.access_token,
-            pair.refresh_token,
-            s.issue_enrollment_token(ObjectId::new(), tenant, 600)
-                .unwrap()
-                .0,
-            s.issue_ephemeral_enroll_key_token(ObjectId::new(), tenant, "j", in_secs(600))
-                .unwrap(),
-            s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap(),
-            s.issue_agent_service_token(agent, tenant, "anchor-1")
-                .unwrap(),
-            s.issue_tunnel_enrollment_token(ObjectId::new(), tenant, 600)
-                .unwrap()
-                .0,
-            s.issue_tunnel_client_token(ObjectId::new(), tenant, ObjectId::new(), 0, Some(60))
-                .unwrap(),
-        ];
-        for t in &others {
-            assert!(s.verify_net_grant(t).is_err());
-        }
-    }
-
-    /// The issuer refuses a grant that does not hold together, so no caller's
-    /// slip can sign one wider than the vault decided.
-    #[test]
-    fn a_net_grant_that_does_not_hold_together_is_never_signed() {
-        let s = svc();
-        for g in [
-            a_grant(NetKind::Forward, None, in_secs(60)),
-            a_grant(NetKind::Forward, Some(("db.internal", 0)), in_secs(60)),
-            a_grant(NetKind::Forward, Some(("", 5432)), in_secs(60)),
-            a_grant(NetKind::Forward, Some(("DB.internal", 5432)), in_secs(60)),
-            a_grant(NetKind::Forward, Some(("db.internal.", 5432)), in_secs(60)),
-            a_grant(NetKind::Socks, Some(("db.internal", 5432)), in_secs(60)),
-            // Past the ceiling by more than a second's tick between the two
-            // clocks reads, so never at it by chance.
-            a_grant(NetKind::Socks, None, in_secs(905)),
-            a_grant(NetKind::Socks, None, in_secs(0)),
-            a_grant(NetKind::Socks, None, in_secs(-10)),
-        ] {
-            assert!(s.issue_net_grant(&g).is_err(), "{g:?}");
-        }
-        assert!(
-            s.issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(900)))
-                .is_ok(),
-            "the ceiling itself"
-        );
-    }
-
-    /// A token signed with the server's own key but naming a grant that does
-    /// not hold together is refused at the check too, whoever signed it.
-    #[test]
-    fn a_net_grant_signed_wider_than_it_holds_is_refused() {
-        let s = svc();
-        let now = Utc::now().timestamp();
-        let good = NetGrantClaims {
-            sub: ObjectId::new().to_hex(),
-            tenant_id: ObjectId::new().to_hex(),
-            fence: 1,
-            owner_user_id: ObjectId::new().to_hex(),
-            origin_agent_id: ObjectId::new().to_hex(),
-            exit_agent_id: ObjectId::new().to_hex(),
-            net: "forward".into(),
-            dst_host: "db.internal".into(),
-            dst_port: 5432,
-            jti: ObjectId::new().to_hex(),
-            iat: now,
-            exp: now + 60,
-            iss: "roomler-ai-test".into(),
-            token_type: TokenType::NetGrant,
-        };
-        let signed = |c: &NetGrantClaims| encode(&s.header(), c, &s.signing.encoding).unwrap();
-        assert!(s.verify_net_grant(&signed(&good)).is_ok());
-        let mut wider = Vec::new();
-        let mut c = good.clone();
-        c.dst_host = String::new();
-        c.dst_port = 0;
-        wider.push(("a forward with no destination", c));
-        let mut c = good.clone();
-        c.dst_host = "DB.INTERNAL".into();
-        wider.push(("a host not canonical", c));
-        let mut c = good.clone();
-        c.net = "socks".into();
-        wider.push(("SOCKS naming a destination", c));
-        let mut c = good.clone();
-        c.net = "udp".into();
-        wider.push(("a kind this build cannot name", c));
-        let mut c = good.clone();
-        c.origin_agent_id = "any-device".into();
-        wider.push(("an origin that is no id", c));
-        let mut c = good.clone();
-        c.exp = now + 901;
-        wider.push(("a life past the ceiling", c));
-        // A grant's every claim, under another audience: no grant at all.
-        let mut c = good.clone();
-        c.token_type = TokenType::Agent;
-        wider.push(("another audience", c));
-        for (why, c) in &wider {
-            assert!(s.verify_net_grant(&signed(c)).is_err(), "{why}");
-        }
-    }
-
-    /// A grant ends at its end: none of the leeway every other verifier
-    /// gives, which would let a grant decided for 900 s open a flow at 959.
-    #[test]
-    fn a_net_grant_has_no_leeway_past_its_end() {
-        let s = svc();
-        let now = Utc::now().timestamp();
-        let lapsed = NetGrantClaims {
-            sub: ObjectId::new().to_hex(),
-            tenant_id: ObjectId::new().to_hex(),
-            fence: 1,
-            owner_user_id: ObjectId::new().to_hex(),
-            origin_agent_id: ObjectId::new().to_hex(),
-            exit_agent_id: ObjectId::new().to_hex(),
-            net: "socks".into(),
-            dst_host: String::new(),
-            dst_port: 0,
-            jti: ObjectId::new().to_hex(),
-            iat: now - 65,
-            exp: now - 5,
-            iss: "roomler-ai-test".into(),
-            token_type: TokenType::NetGrant,
-        };
-        let t = encode(&s.header(), &lapsed, &s.signing.encoding).unwrap();
-        assert!(
-            s.decode_any::<NetGrantClaims>(&t, &s.validation()).is_ok(),
-            "the default validation's minute of leeway would take it"
-        );
-        assert!(matches!(
-            s.verify_net_grant(&t),
-            Err(AuthError::TokenExpired)
-        ));
-    }
-
-    // ─── FR-90 P3-8-1a: a session's SSH ticket ────────────────────────
-
-    use roomler_ai_remote_control::models::SshAccountMode;
-
-    fn a_ticket(account: SshAccountMode, exp: i64) -> SshTicket {
-        SshTicket {
-            session_id: ObjectId::new(),
-            tenant_id: ObjectId::new(),
-            fence: 7,
-            owner_user_id: ObjectId::new(),
-            origin_agent_id: ObjectId::new(),
-            target_agent_id: ObjectId::new(),
-            account,
-            ticket_id: ObjectId::new(),
-            exp,
-        }
-    }
-
-    /// A ticket names what was decided, and only its own verifier takes it:
-    /// no other gate accepts it, a net grant's included, and it accepts no
-    /// other credential.
-    #[test]
-    fn ssh_ticket_roundtrip_and_audiences() {
-        let s = svc();
-        let t = a_ticket(SshAccountMode::ConsoleUser, in_secs(120));
-        let token = s.issue_ssh_ticket(&t).unwrap();
-        let c = s.verify_ssh_ticket(&token).unwrap();
-        assert_eq!(
-            (c.sub.as_str(), c.tenant_id.as_str(), c.fence),
-            (
-                t.session_id.to_hex().as_str(),
-                t.tenant_id.to_hex().as_str(),
-                7
-            )
-        );
-        assert_eq!(c.owner_user_id, t.owner_user_id.to_hex());
-        assert_eq!(c.origin_agent_id, t.origin_agent_id.to_hex());
-        assert_eq!(c.target_agent_id, t.target_agent_id.to_hex());
-        assert_eq!(c.account, "console_user");
-        assert_eq!(c.jti, t.ticket_id.to_hex());
-        assert_eq!((c.exp, c.token_type.clone()), (t.exp, TokenType::SshTicket));
-
-        // No other gate accepts a ticket, a net grant's verifier among them.
-        assert!(s.verify_net_grant(&token).is_err());
-        assert!(s.verify_token(&token).is_err());
-        assert!(s.verify_access_token(&token).is_err());
-        assert!(s.verify_refresh_token(&token).is_err());
-        assert!(s.verify_enrollment_token(&token).is_err());
-        assert!(s.verify_enrollment_token_any(&token).is_err());
-        assert!(s.verify_agent_token(&token).is_err());
-        assert!(s.verify_agent_token_for_renewal(&token).is_err());
-        assert!(s.verify_agent_service_token(&token).is_err());
-        assert!(s.verify_tunnel_enrollment_token(&token).is_err());
-        assert!(s.verify_tunnel_client_token(&token).is_err());
-        assert!(s.verify_tunnel_client_token_for_renewal(&token).is_err());
-
-        // And a ticket is no other credential, a net grant least of all.
-        let (agent, tenant) = (ObjectId::new(), ObjectId::new());
-        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
-        let others = [
-            pair.access_token,
-            pair.refresh_token,
-            s.issue_enrollment_token(ObjectId::new(), tenant, 600)
-                .unwrap()
-                .0,
-            s.issue_ephemeral_enroll_key_token(ObjectId::new(), tenant, "j", in_secs(600))
-                .unwrap(),
-            s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap(),
-            s.issue_agent_service_token(agent, tenant, "anchor-1")
-                .unwrap(),
-            s.issue_tunnel_enrollment_token(ObjectId::new(), tenant, 600)
-                .unwrap()
-                .0,
-            s.issue_tunnel_client_token(ObjectId::new(), tenant, ObjectId::new(), 0, Some(60))
-                .unwrap(),
-            s.issue_net_grant(&a_grant(NetKind::Socks, None, in_secs(60)))
-                .unwrap(),
-        ];
-        for t in &others {
-            assert!(s.verify_ssh_ticket(t).is_err());
-        }
-    }
-
-    /// The issuer refuses a ticket that does not hold together, so no caller's
-    /// slip can sign one for the device the session runs on.
-    #[test]
-    fn an_ssh_ticket_that_does_not_hold_together_is_never_signed() {
-        let s = svc();
-        let mut own = a_ticket(SshAccountMode::Daemon, in_secs(60));
-        own.target_agent_id = own.origin_agent_id;
-        for t in [
-            own,
-            // Past the ceiling by more than a second's tick between the two
-            // clocks reads, so never at it by chance.
-            a_ticket(SshAccountMode::Daemon, in_secs(905)),
-            a_ticket(SshAccountMode::Daemon, in_secs(0)),
-            a_ticket(SshAccountMode::Daemon, in_secs(-10)),
-        ] {
-            assert!(s.issue_ssh_ticket(&t).is_err(), "{t:?}");
-        }
-        for account in SshAccountMode::ALL {
-            assert!(
-                s.issue_ssh_ticket(&a_ticket(account, in_secs(900))).is_ok(),
-                "the ceiling itself, as {account:?}"
-            );
-        }
-    }
-
-    /// A token signed with the server's own key but naming a ticket that does
-    /// not hold together is refused at the check too, whoever signed it.
-    #[test]
-    fn an_ssh_ticket_signed_wider_than_it_holds_is_refused() {
-        let s = svc();
-        let now = Utc::now().timestamp();
-        let good = SshTicketClaims {
-            sub: ObjectId::new().to_hex(),
-            tenant_id: ObjectId::new().to_hex(),
-            fence: 1,
-            owner_user_id: ObjectId::new().to_hex(),
-            origin_agent_id: ObjectId::new().to_hex(),
-            target_agent_id: ObjectId::new().to_hex(),
-            account: "console_user".into(),
-            jti: ObjectId::new().to_hex(),
-            iat: now,
-            exp: now + 60,
-            iss: "roomler-ai-test".into(),
-            token_type: TokenType::SshTicket,
-        };
-        let signed = |c: &SshTicketClaims| encode(&s.header(), c, &s.signing.encoding).unwrap();
-        assert!(s.verify_ssh_ticket(&signed(&good)).is_ok());
-        let mut wider = Vec::new();
-        let mut c = good.clone();
-        c.target_agent_id = c.origin_agent_id.clone();
-        wider.push(("the device it runs on", c));
-        let mut c = good.clone();
-        c.target_agent_id = c.origin_agent_id.to_uppercase();
-        wider.push(("the device it runs on, spelled another way", c));
-        let mut c = good.clone();
-        c.target_agent_id = "any-device".into();
-        wider.push(("a target that is no id", c));
-        let mut c = good.clone();
-        c.account = "root".into();
-        wider.push(("an account this build cannot name", c));
-        let mut c = good.clone();
-        c.account = "Daemon".into();
-        wider.push(("an account not in its one spelling", c));
-        let mut c = good.clone();
-        c.exp = now + 901;
-        wider.push(("a life past the ceiling", c));
-        // A ticket's every claim, under another audience: no ticket at all.
-        let mut c = good.clone();
-        c.token_type = TokenType::NetGrant;
-        wider.push(("a net grant's audience", c));
-        for (why, c) in &wider {
-            assert!(s.verify_ssh_ticket(&signed(c)).is_err(), "{why}");
-        }
-    }
-
-    /// A ticket ends at its end: none of the leeway every other verifier
-    /// gives, which would let a ticket decided for 900 s ask at 959.
-    #[test]
-    fn an_ssh_ticket_has_no_leeway_past_its_end() {
-        let s = svc();
-        let now = Utc::now().timestamp();
-        let lapsed = SshTicketClaims {
-            sub: ObjectId::new().to_hex(),
-            tenant_id: ObjectId::new().to_hex(),
-            fence: 1,
-            owner_user_id: ObjectId::new().to_hex(),
-            origin_agent_id: ObjectId::new().to_hex(),
-            target_agent_id: ObjectId::new().to_hex(),
-            account: "daemon".into(),
-            jti: ObjectId::new().to_hex(),
-            iat: now - 65,
-            exp: now - 5,
-            iss: "roomler-ai-test".into(),
-            token_type: TokenType::SshTicket,
-        };
-        let t = encode(&s.header(), &lapsed, &s.signing.encoding).unwrap();
-        assert!(
-            s.decode_any::<SshTicketClaims>(&t, &s.validation()).is_ok(),
-            "the default validation's minute of leeway would take it"
-        );
-        assert!(matches!(
-            s.verify_ssh_ticket(&t),
-            Err(AuthError::TokenExpired)
-        ));
     }
 }

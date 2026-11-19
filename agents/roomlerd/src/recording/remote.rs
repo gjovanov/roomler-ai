@@ -46,6 +46,13 @@
 //! no-op on the cache before this was so. A LOCAL recording still needs
 //! someone at the device.
 //!
+//! #3830 — each waits for that answer `launch::unix::CONSOLE_LOOKUP_WAIT` at
+//! most, off the async runtime, and an answer not had in that time is NOT
+//! CONFIRMED (`Refusal::NotKnownYet`): the start is refused, and the
+//! unattended recording is stopped, as for a sign-in. An ATTENDED recording
+//! is never asked: its person is at the screen with its banner up, and a hung
+//! logind cannot change who that is.
+//!
 //! The microphone is not a remote option: [`RecordingManager::start_remote`]
 //! has no parameter for it.
 //!
@@ -78,7 +85,10 @@
 //! Exactly one party speaks for a recording's ending, and every hand-off
 //! names the recording (its file): the follower that last claimed it
 //! ([`Speakers`]), or the grace while it waits ([`Slot`]). The grace acts on
-//! its own recording only, and claims it before stopping it.
+//! its own recording only, and claims it before stopping it. A detached
+//! recording is the grace's to report only once its follower has handed it
+//! on (#3447): a session's end can detach it while the follower still
+//! follows it, and the follower then reports it.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,6 +158,12 @@ struct Detached {
     /// The grace is stopping it. From here nobody picks it up or detaches it
     /// again, or its ending would be reported twice.
     stopping: bool,
+    /// #3447 — the session's follower has handed it on and stopped following
+    /// it. Until then that follower still speaks for its ending: the session
+    /// may have asked it to end as it ended, or it may end before the
+    /// follower looks again, and the follower reports it either way. Whoever
+    /// takes it out of the slot meanwhile says nothing ([`finish_detached`]).
+    handed_on: bool,
     /// The dropped session's surfaces: its banner comes down, and the ending
     /// is reported on its queue, if nobody picks it up.
     indicator: crate::indicator::ViewerIndicator,
@@ -164,22 +180,56 @@ enum Detach {
     Evicted(Detached),
     /// That session's recording was already there.
     Already,
+    /// #3451 — that session's recorder is still launching: nothing is
+    /// detached, and the start decides once the recorder runs.
+    Launching,
 }
 
 /// The one detached recording, and every way it changes hands. Each change
 /// is one call under one lock, so two parties can never both win it.
 #[derive(Default)]
-struct Slot(Option<Detached>);
+struct Slot {
+    held: Option<Detached>,
+    /// #3451 — the sessions whose recorder is launching, one entry per start
+    /// (a second start that finds the recorder busy adds and takes back its
+    /// own). A recording of theirs is not detached meanwhile: once the
+    /// recorder runs, the start looks at its session and either stops the
+    /// recording or leaves its follower to hand it on, as for any drop.
+    /// Detached during the launch, it could be picked up before the start had
+    /// looked, and the start's own decision then came too late.
+    launching: Vec<ObjectId>,
+}
 
 impl Slot {
-    /// Put `d` into the grace.
+    /// Put `d` into the grace. A follower's hand-on of a recording already
+    /// there marks that entry (#3447), and nothing unmarks it.
     fn detach(&mut self, d: Detached) -> Detach {
-        match &self.0 {
-            Some(cur) if cur.session_id == d.session_id => Detach::Already,
-            _ => match self.0.replace(d) {
-                Some(old) => Detach::Evicted(old),
-                None => Detach::Done,
-            },
+        if self.launching.contains(&d.session_id) {
+            return Detach::Launching;
+        }
+        if let Some(cur) = self
+            .held
+            .as_mut()
+            .filter(|cur| cur.session_id == d.session_id)
+        {
+            cur.handed_on |= d.handed_on;
+            return Detach::Already;
+        }
+        match self.held.replace(d) {
+            Some(old) => Detach::Evicted(old),
+            None => Detach::Done,
+        }
+    }
+
+    /// #3451 — `session`'s recorder is launching.
+    fn launching(&mut self, session: ObjectId) {
+        self.launching.push(session);
+    }
+
+    /// #3451 — that launch is over: one entry comes off.
+    fn launched(&mut self, session: ObjectId) {
+        if let Some(i) = self.launching.iter().position(|s| *s == session) {
+            self.launching.swap_remove(i);
         }
     }
 
@@ -187,11 +237,11 @@ impl Slot {
     /// recording the grace is already stopping.
     fn pick_up(&mut self, user: ObjectId) -> Option<Detached> {
         if self
-            .0
+            .held
             .as_ref()
             .is_some_and(|d| d.controller_user_id == user && !d.stopping)
         {
-            self.0.take()
+            self.held.take()
         } else {
             None
         }
@@ -200,7 +250,7 @@ impl Slot {
     /// The grace claims `session`'s recording for a stop. `false` = it is not
     /// there to claim (picked up, or claimed already).
     fn claim_stop(&mut self, session: ObjectId) -> bool {
-        match self.0.as_mut() {
+        match self.held.as_mut() {
             Some(d) if d.session_id == session && !d.stopping => {
                 d.stopping = true;
                 true
@@ -212,7 +262,7 @@ impl Slot {
     /// Take `session`'s recording out: the grace is done with it.
     fn take(&mut self, session: ObjectId) -> Option<Detached> {
         if self.holds(session) {
-            self.0.take()
+            self.held.take()
         } else {
             None
         }
@@ -221,22 +271,43 @@ impl Slot {
     /// `session`'s recording, while it waits (not being stopped): whether it
     /// runs unattended.
     fn waiting(&self, session: ObjectId) -> Option<bool> {
-        self.0
+        self.held
             .as_ref()
             .filter(|d| d.session_id == session && !d.stopping)
             .map(|d| d.unattended)
     }
 
     fn holds(&self, session: ObjectId) -> bool {
-        self.0.as_ref().is_some_and(|d| d.session_id == session)
+        self.held.as_ref().is_some_and(|d| d.session_id == session)
     }
 }
 
-static DETACHED: StdMutex<Slot> = StdMutex::new(Slot(None));
+static DETACHED: StdMutex<Slot> = StdMutex::new(Slot {
+    held: None,
+    launching: Vec::new(),
+});
 
 /// Run `f` on the slot, under its lock.
 fn slot<T>(f: impl FnOnce(&mut Slot) -> T) -> Option<T> {
     DETACHED.lock().ok().map(|mut s| f(&mut s))
+}
+
+/// #3451 — a start's mark in the slot while its recorder launches
+/// ([`Slot::launching`]). It comes off when the start has looked at its
+/// session, when the launch failed, or when the start went away.
+struct Launch(ObjectId);
+
+impl Launch {
+    fn begin(session: ObjectId) -> Self {
+        slot(|s| s.launching(session));
+        Self(session)
+    }
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        slot(|s| s.launched(self.0));
+    }
 }
 
 /// P3b-3 — the handler whose session holds the remote recording in progress.
@@ -296,7 +367,14 @@ fn superseded(file: &str, id: u64) -> bool {
 
 /// Report how a detached recording ended, on its own session, and take its
 /// banner down. `last` describes it only if it is its file.
+///
+/// #3447 — nothing, for one its follower never handed on: that follower
+/// still follows it and reports the ending itself. Both speaking was two
+/// `stopped` for one recording, and its banner taken down twice.
 fn finish_detached(m: &RecordingManager, d: Detached) {
+    if !d.handed_on {
+        return;
+    }
     let last = m.state().last.unwrap_or_default();
     let this = d.file.is_some() && file_name(last.path.as_deref()) == d.file;
     let msg = ClientMsg::RecordingActivity {
@@ -347,6 +425,8 @@ async fn grace_watch(session_id: ObjectId) {
             None
         } else if !gates().enabled {
             Some("gate_revoked")
+        // P1f — only an unattended recording is asked, and an answer not had
+        // in time stops it, as a sign-in does (#3830).
         } else if unattended && fresh_remote_identity(m).await != Ok(Identity::Unattended) {
             Some("session_changed")
         } else if Instant::now() >= deadline {
@@ -376,20 +456,18 @@ async fn grace_watch(session_id: ObjectId) {
 /// closes a peer within a budget, and a close that overruns it is dropped
 /// before it ever reaches the channel, which then stays `Open` for good.
 /// The loop knows every end (the server's terminate, the control connection
-/// lost, the host's Disconnect) and says so here. An entry goes when its
-/// session ends.
+/// lost, the host's Disconnect) and says so here, and it says when a re-offer
+/// replaces the session's peer (#3451).
+///
+/// ⚠️ An entry stays while its handler lives, after its channel's end too
+/// (#3451). A start still launching there must hear its session's end, or its
+/// peer's replacement, and its channel may have gone first.
 static HANDLERS: StdMutex<Vec<(ObjectId, std::sync::Weak<Handler>)>> = StdMutex::new(Vec::new());
 
 fn register(session_id: ObjectId, h: &Arc<Handler>) {
     if let Ok(mut all) = HANDLERS.lock() {
         all.retain(|(_, w)| w.strong_count() > 0);
         all.push((session_id, Arc::downgrade(h)));
-    }
-}
-
-fn unregister(h: &Handler) {
-    if let Ok(mut all) = HANDLERS.lock() {
-        all.retain(|(_, w)| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), h));
     }
 }
 
@@ -411,7 +489,28 @@ fn handlers_of(session_id: ObjectId) -> Vec<Arc<Handler>> {
 /// or not its channel ever closes.
 pub fn session_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
+        h.over.store(true, Ordering::Release);
         h.end_session();
+    }
+}
+
+/// #3451 — the signalling loop is replacing `session_id`'s peer with one that
+/// carries the recording (a re-offer whose grant holds RECORD and whose record
+/// context is set). Said BEFORE the old peer closes: that peer's `record`
+/// channel ending is then not the session's end. The session goes on under
+/// the new peer, and a recorder launching for it carries on, for the new
+/// peer's channel to pick up.
+///
+/// ⚠️ Never for a peer without the recording (#3468, from review). The hub
+/// forwards one offer per session, and a peer built from a second one gets
+/// the default grant and no record context: nothing on it picks the recording
+/// up, so the old channel's end IS the recording's end. Said for it, a
+/// recording launching there waited in the grace past the host's Disconnect.
+/// The loop's check is `signaling::reoffer_carries_record`, always `false`
+/// today.
+pub fn peer_replaced(session_id: ObjectId) {
+    for h in handlers_of(session_id) {
+        h.replaced.store(true, Ordering::Release);
     }
 }
 
@@ -420,10 +519,41 @@ pub fn session_ended(session_id: ObjectId) {
 /// it does not wait for the controller to come back. Detaching it would
 /// keep recording someone who just sent the controller away, and a
 /// controller whose device auto-grants would reconnect straight into it.
+///
+/// ⚠️ That includes a recording the re-attach grace holds for the session
+/// (#3474): `stop_held` stops it here, then and there, and reports it once.
+/// Left to the grace, the controller's next session would pick it up. Another
+/// session's recording is never stopped by it.
 pub fn host_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
+        h.over.store(true, Ordering::Release);
         h.host_ended();
     }
+    stop_held(session_id, "host_stopped");
+}
+
+/// Stop the recording the grace holds for `session_id`, `reason`, and report
+/// how it ended. Claimed under the slot's lock BEFORE the stop, as the grace
+/// does: while its file finalizes, the controller's next session can neither
+/// pick it up nor detach it again. ⚠️ ITS recording only: one that ended by
+/// itself (another may have begun since) is not stopped, only reported. Its
+/// follower, if it has not handed it on yet, reports it instead (#3447).
+fn stop_held(session_id: ObjectId, reason: &'static str) {
+    let Some(m) = manager() else { return };
+    if slot(|s| s.claim_stop(session_id)) != Some(true) {
+        return;
+    }
+    info!(session = %session_id, reason, "stopping a detached remote recording");
+    tokio::spawn(async move {
+        if m.active_remote()
+            .is_some_and(|r| r.session_id == session_id)
+        {
+            m.stop_with(Some(reason)).await;
+        }
+        if let Some(d) = slot(|s| s.take(session_id)).flatten() {
+            finish_detached(m, d);
+        }
+    });
 }
 
 // ── The device owner's gates ────────────────────────────────────────────────
@@ -486,14 +616,15 @@ fn manager() -> Option<&'static Arc<RecordingManager>> {
     MANAGER.get()
 }
 
-/// P1f — [`RecordingManager::identity_remote_fresh`] off the async runtime:
-/// asking afresh who is signed in runs `loginctl` on Linux. An answer that
-/// cannot be had reads as "nobody to record as" at a start (refused) and as
-/// "someone" in the watch (stopped): closed both ways.
+/// P1f — [`RecordingManager::identity_remote_fresh`]: who is signed in,
+/// asked afresh. #3830 — never on an async worker: on Linux, through the
+/// console lookup's one lookup in flight, `launch::unix::CONSOLE_LOOKUP_WAIT`
+/// at most (a blocking thread elsewhere). An answer that cannot be had in
+/// time is NOT CONFIRMED ([`Refusal::NotKnownYet`]): a start refuses it, and
+/// the watch over an unattended recording reads it as a possible sign-in and
+/// stops the recording. Closed both ways, never "nobody".
 async fn fresh_remote_identity(m: &'static Arc<RecordingManager>) -> Result<Identity, Refusal> {
-    tokio::task::spawn_blocking(move || m.identity_remote_fresh())
-        .await
-        .unwrap_or(Err(Refusal::NoConsoleUser))
+    m.identity_remote_fresh().await
 }
 
 /// The wire code and words for a remote start the identity rule refuses. A
@@ -502,16 +633,25 @@ async fn fresh_remote_identity(m: &'static Arc<RecordingManager>) -> Result<Iden
 fn identity_refusal(r: Refusal) -> (&'static str, Option<String>) {
     let code = match r {
         Refusal::LoginScreen => "login_screen",
-        Refusal::NoConsoleUser | Refusal::RootDaemon | Refusal::SwitchedOff => "unavailable",
+        Refusal::NoConsoleUser
+        | Refusal::RootDaemon
+        | Refusal::SwitchedOff
+        | Refusal::NotKnownYet => "unavailable",
     };
     (code, Some(r.message().into()))
 }
 
 /// What this device advertises in `AgentCaps.record` right now.
 pub fn advertised() -> Vec<String> {
+    advertised_by(manager().map(Arc::as_ref))
+}
+
+/// [`advertised`], for `m` as the recorder that serves a remote session: the
+/// daemon's own ([`install`]), or a test's.
+pub(crate) fn advertised_by(m: Option<&RecordingManager>) -> Vec<String> {
     advertise(
         gates(),
-        manager().is_some_and(|m| m.available_remote()),
+        m.is_some_and(|m| m.available_remote()),
         super::system_audio_supported(),
     )
 }
@@ -706,39 +846,18 @@ const BANNER_POLL: Duration = Duration::from_millis(1100);
 /// the companion is already running.
 const BANNER_READ_CEILING: Duration = Duration::from_secs(5);
 
-/// Whether the desktop companion can show this session's prompt and banner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Companion {
-    /// Ask the system: start the companion if it is installed and not
-    /// running (`companion::ensure_running`, bounded).
-    System,
-    /// A fixed answer — for tests, which must never launch the real app.
-    Fixed(bool),
-    /// Up, and waited for as [`Self::System`] is, on a test's own clock.
-    Timed { poll: Duration, ceiling: Duration },
-}
+// Whether the desktop companion can show this session's prompt and banner. The
+// type lives with the companion (#3442): an SSH question asks through it too.
+pub use crate::companion::Companion;
 
 impl Companion {
-    async fn up(self) -> bool {
-        match self {
-            Self::System => tokio::time::timeout(
-                crate::signaling::COMPANION_START_BUDGET,
-                crate::companion::ensure_running(),
-            )
-            .await
-            .unwrap_or(false),
-            Self::Fixed(up) => up,
-            Self::Timed { .. } => true,
-        }
-    }
-
     /// The wait before a recorder may start, if this one has any.
     fn banner_wait(self) -> Option<(Duration, Duration)> {
         match self {
             // `ROOMLERD_RECORD_WAITS_FOR_BANNER=0` — start at once, as before P3d.
             Self::System => tunnel_core::env::flag("RECORD_WAITS_FOR_BANNER", true)
                 .then_some((BANNER_POLL, BANNER_READ_CEILING)),
-            Self::Fixed(_) => None,
+            Self::Fixed(_) | Self::Starting(_) => None,
             Self::Timed { poll, ceiling } => Some((poll, ceiling)),
         }
     }
@@ -809,12 +928,20 @@ struct Handler {
     /// P3b-3 — THIS session asked the recording to end (the controller's
     /// Stop, or the follower's own gate / sign-in stop). A drop while it
     /// finalizes then neither detaches it nor silences its report: this
-    /// session's follower still reports the ending, once.
+    /// session's follower still reports the ending, once. So does a drop
+    /// that detached it a moment before (#3447): the follower never hands it
+    /// on, and the grace says nothing.
     ending: AtomicBool,
     /// The session's end has been handled ([`Handler::end_session`] runs
     /// once: from the signalling loop, `on_close`, or the channel watch that
     /// sees an end `on_close` never reports).
     gone: AtomicBool,
+    /// #3451 — the signalling loop ended this session ([`session_ended`],
+    /// [`host_ended`]), whichever end of it this handler saw first.
+    over: AtomicBool,
+    /// #3451 — the signalling loop replaced this session's peer
+    /// ([`peer_replaced`]): this channel's end is not the session's.
+    replaced: AtomicBool,
     /// P3b-2 — the transfer in progress (`id`, its cancel flag): one at a
     /// time per session.
     transfer: StdMutex<Option<(String, Arc<AtomicBool>)>>,
@@ -834,6 +961,8 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
         unattended: AtomicBool::new(false),
         ending: AtomicBool::new(false),
         gone: AtomicBool::new(false),
+        over: AtomicBool::new(false),
+        replaced: AtomicBool::new(false),
         transfer: StdMutex::new(None),
     });
     // The session's end, three ways: the signalling loop says so
@@ -886,7 +1015,7 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
                     tokio::spawn(h.get(id, name, offset));
                 }
                 Ok(Incoming::Cancel { id }) => h.cancel(&id),
-                Err(e) => warn!(session = %h.ctx.session_id, %e, "record DC: unparseable message"),
+                Err(e) => warn!(session = %h.ctx.session_id, e = ?e.to_string(), "record DC: unparseable message"),
             }
         })
     }));
@@ -1130,10 +1259,13 @@ impl Handler {
 
         // FR-85 decision 6 — a device at its login screen is refused before
         // anyone is asked: whoever stands at a sign-in screen must not be
-        // asked to approve what could never run there. The answer after the
-        // question is decided afresh below, whatever this one said.
+        // asked to approve what could never run there. #3830 — nor is anyone
+        // asked while who is at the screen cannot be told: that start could
+        // only be refused after the question. The answer after the question
+        // is decided afresh below, whatever this one said.
         if self.ctx.prompt_window.is_some()
-            && let Err(r @ Refusal::LoginScreen) = fresh_remote_identity(m).await
+            && let Err(r @ (Refusal::LoginScreen | Refusal::NotKnownYet)) =
+                fresh_remote_identity(m).await
         {
             return Some(identity_refusal(r));
         }
@@ -1152,6 +1284,12 @@ impl Handler {
             let (decision, have_surface) = self.ask_host(window, audio).await;
             use crate::consent::Decision;
             match decision {
+                // ⚠️ An Allow taken after the session ended is not one
+                // (#3433): `end_session` marks the session over before it
+                // withdraws the question, and an Allow can land in between.
+                // Nothing is owed to a session that is over, as for a
+                // withdrawn question.
+                Decision::Granted if self.gone.load(Ordering::Acquire) => return None,
                 Decision::Granted => {
                     self.report(RecordingActivityKind::PromptGranted, None, None, None, None);
                 }
@@ -1242,8 +1380,12 @@ impl Handler {
         }
 
         // The session may have gone while the host was asked, or the banner
-        // raised: nobody is left to record for, or to answer.
-        if channel_gone(&self.dc) {
+        // raised: nobody is left to record for, or to answer. ⚠️ Its end, not
+        // only its channel (#3433): the signalling loop can end a session
+        // whose channel stays open (a peer whose close overran its budget),
+        // and an Allow given just before was then recorded for a session that
+        // was over.
+        if self.gone.load(Ordering::Acquire) || channel_gone(&self.dc) {
             if !unattended {
                 self.ctx.indicator.end_recording(sid);
             }
@@ -1255,6 +1397,9 @@ impl Handler {
             controller_user_id: self.ctx.controller_user_id,
             controller_name: self.ctx.controller_name.clone(),
         };
+        // #3451 — from here until the look below, nothing detaches this
+        // session's recording.
+        let launch = Launch::begin(sid);
         match m.start_remote(initiator, audio, identity).await {
             Ok(state) => {
                 let name = file_name(state.path.as_deref());
@@ -1262,15 +1407,40 @@ impl Handler {
                 // before anything awaits.
                 let speaker = claim_speaker(name.as_deref().unwrap_or_default());
                 info!(session = %sid, ?name, audio, "remote recording started");
+                // ⚠️ The session may have ended while the recorder launched
+                // (#3433). Detached then, the recording waited in the grace,
+                // and the controller's next session picked up a recording made
+                // for a session that was over. Nothing detached it meanwhile
+                // (the launch's mark, #3451), so it is this start's to decide:
+                // on the session's end it stops now, `session_ended`, and this
+                // session's follower reports it like any stop it asked for.
+                //
+                // ⚠️ The SESSION's end, not its channel's (#3451): the loop's
+                // word, or the channel gone with no replacement behind it. Only
+                // a re-offer whose new peer carries the recording replaces the
+                // channel (`peer_replaced`): the recording then carries on under
+                // the new one, its follower handing it on as for any drop. The
+                // hub forwards one offer per session, and a peer built from a
+                // second one carries no RECORD, so today every channel end here
+                // is the session's end (#3468, from review).
+                //
+                // `ending` is set before the mark comes off, and a detach reads
+                // both under the slot's lock: it came before and was refused,
+                // or it sees `ending` and leaves the recording to this stop.
+                // An ending something else asked for first (the controller's
+                // Stop, the host's Disconnect) stands.
+                let over = self.over.load(Ordering::Acquire)
+                    || (channel_gone(&self.dc) && !self.replaced.load(Ordering::Acquire));
+                let stop = over && !self.ending.swap(true, Ordering::AcqRel);
+                // Also before the mark comes off (#3468, from review): what a
+                // detach builds the grace's record from, and the start's report.
+                // A detach right after the mark read an empty id and a stale
+                // `unattended: false`, and the grace then never stopped an
+                // unattended recording when someone signed in.
                 if let Ok(mut c) = self.current.lock() {
                     *c = Some(id.to_string());
                 }
                 self.unattended.store(unattended, Ordering::Release);
-                let mut s = StateMsg::new(id, "recording");
-                s.name = name.clone();
-                s.audio = state.system_audio;
-                s.unattended = unattended;
-                send(&self.dc, &s).await;
                 self.report(
                     RecordingActivityKind::Started,
                     name.clone(),
@@ -1279,6 +1449,20 @@ impl Handler {
                     None,
                 );
                 hold(&self);
+                drop(launch);
+                if stop {
+                    info!(session = %sid, "the session ended while its recorder launched — stopping it");
+                    tokio::spawn(async move {
+                        if let Some(m) = manager() {
+                            m.stop_with(Some("session_ended")).await;
+                        }
+                    });
+                }
+                let mut s = StateMsg::new(id, "recording");
+                s.name = name.clone();
+                s.audio = state.system_audio;
+                s.unattended = unattended;
+                send(&self.dc, &s).await;
                 tokio::spawn(
                     self.clone()
                         .follow(id.to_string(), unattended, name, speaker),
@@ -1286,6 +1470,7 @@ impl Handler {
                 None
             }
             Err(e) => {
+                drop(launch);
                 self.ctx.indicator.end_recording(sid);
                 Some(match e {
                     StartError::Busy => ("busy", None),
@@ -1306,6 +1491,46 @@ impl Handler {
         // already has an answered prompt, and a decision recorded against its
         // id must not be able to answer this one (the ssh / ssh-consent lesson).
         let prompt_id = ObjectId::new().to_hex();
+        // ⚠️ Armed, and registered with this session, BEFORE anything shows
+        // it: registered under the lock `end_session` reads, and only while
+        // the session is still on (#3433). Shown first, as it was, the
+        // question could not be answered yet: the device may still be
+        // starting a companion (up to its 3 s budget) or posting a
+        // notification, and a click then was refused. Nor could it be
+        // withdrawn: a session that ended in that time found no question to
+        // cancel, and a session ends once, so the question stood for its whole
+        // window and an Allow in it was taken.
+        //
+        // The window still runs from the show: the prompt starts its clock at
+        // its first poll, below, once every surface is up, and each surface
+        // counts down from when it went up, so the host is never shown more
+        // time than it has.
+        //
+        // Armed before that lock is taken, not under it: arming clears old
+        // answers off the disk, and `end_session` waits on the lock from the
+        // signalling loop. It holds as tight: `end_session` marks the session
+        // over before it reads the lock, so either the question is registered
+        // and that end withdraws it, or the end is seen here and the question
+        // dropped. Nothing can answer a fresh id before it is shown.
+        let asking = self
+            .ctx
+            .consent
+            .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window });
+        let registered = match self.prompt.lock() {
+            Ok(mut p) if !self.gone.load(Ordering::Acquire) => {
+                *p = Some(prompt_id.clone());
+                true
+            }
+            _ => false,
+        };
+        if !registered {
+            // The session is over, so nobody is asked. A poisoned lock is
+            // treated the same: what could not be withdrawn is not asked.
+            // Dropped outside the lock: it takes the question off the books
+            // and its files off the disk.
+            drop(asking);
+            return (crate::consent::Decision::Cancelled, false);
+        }
         let what = if audio {
             "record this screen and what the computer plays"
         } else {
@@ -1350,11 +1575,16 @@ impl Handler {
         let mut have_surface = native || (marker && self.ctx.companion.up().await);
         // FR-93 P6f — the last on-screen surface: a desktop notification where
         // neither the panel nor the companion can show the question.
+        //
+        // ⚠️ Not for a session that ended meanwhile (#3433): starting the
+        // companion can take its whole budget, and its question is withdrawn
+        // by then. Nothing more goes up for it, and its marker is not written
+        // again: the wait below ends at once, and takes what is up down.
         let mut notified = false;
-        if !have_surface {
+        if !have_surface && !self.gone.load(Ordering::Acquire) {
             notified = self.ctx.indicator.show_notification_prompt(view).await;
             have_surface = notified;
-            if notified && marker {
+            if notified && marker && !self.gone.load(Ordering::Acquire) {
                 prompt.surface = crate::consent::PromptSurface::Notification;
                 if let Err(e) = self.ctx.consent.write_prompt(&prompt_id, &prompt) {
                     warn!(%e, "record: could not mark the consent prompt as shown by a notification");
@@ -1362,14 +1592,7 @@ impl Handler {
             }
         }
         info!(session = %self.ctx.session_id, native, notified, have_surface, "consent prompt surface (record)");
-        if let Ok(mut p) = self.prompt.lock() {
-            *p = Some(prompt_id.clone());
-        }
-        let decision = self
-            .ctx
-            .consent
-            .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window })
-            .await;
+        let decision = asking.await;
         self.ctx.indicator.hide_prompt(&prompt_id);
         if let Ok(mut p) = self.prompt.lock() {
             *p = None;
@@ -1412,7 +1635,7 @@ impl Handler {
             && h.ctx.controller_user_id == me
             && channel_gone(&h.dc)
         {
-            h.detach_recording();
+            h.detach_recording(false);
         }
         if let Some(d) = slot(|s| s.pick_up(me)).flatten()
             && self.clone().reattach(d).await
@@ -1459,7 +1682,8 @@ impl Handler {
             m.retarget_remote(d.session_id, sid)
         };
         if !moved {
-            // It ended between the drop and now: nobody else will report it.
+            // It ended between the drop and now: reported here, or by its
+            // follower if that never handed it on (#3447).
             finish_detached(m, d);
             return false;
         }
@@ -1613,7 +1837,7 @@ impl Handler {
         }
         match outcome {
             Ok(sent) => {
-                info!(session = %self.ctx.session_id, %name, offset, sent, "record: download sent");
+                info!(session = %self.ctx.session_id, ?name, offset, sent, "record: download sent");
                 self.report(
                     RecordingActivityKind::Downloaded,
                     Some(name),
@@ -1729,7 +1953,10 @@ impl Handler {
         if self.gone.swap(true, Ordering::AcqRel) {
             return;
         }
-        unregister(self);
+        // ⚠️ Read only after `gone` is set (#3433). `ask_host` registers its
+        // question under this lock, and only while `gone` is clear: either it
+        // sees this end and asks nobody, or this sees its question, armed,
+        // and withdraws it.
         let prompt = self.prompt.lock().ok().and_then(|p| p.clone());
         if let Some(p) = prompt {
             self.ctx.consent.cancel(&p);
@@ -1737,7 +1964,7 @@ impl Handler {
         // A transfer has nowhere left to go (the controller resumes it from
         // its offset on the next session).
         self.cancel("");
-        self.detach_recording();
+        self.detach_recording(false);
         // The channel's callbacks hold this handler, and it holds the
         // channel: without letting go here neither is ever freed, nor the
         // session's queue the handler keeps. A follower still reporting keeps
@@ -1772,11 +1999,19 @@ impl Handler {
     /// A recording this session already asked to end is left to finish: its
     /// follower reports the ending. One that moved to another session (picked
     /// up) is not this session's any more.
-    fn detach_recording(&self) {
+    ///
+    /// #3447 — `follower`: the session's follower hands the recording on, and
+    /// the entry says so (under the slot's lock, as it goes in or onto the
+    /// one there). `true` = the grace holds it now, put there here or before:
+    /// only then does the follower stop following it. Otherwise (asked to end
+    /// since the follower looked, its recorder still launching, not this
+    /// session's) the follower looks again. It used to leave on a detach that
+    /// did nothing, and that ending then had nobody to report it.
+    fn detach_recording(&self, follower: bool) -> bool {
         if !self.owns_active() || self.ending.load(Ordering::Acquire) {
-            return;
+            return false;
         }
-        let Some(m) = manager() else { return };
+        let Some(m) = manager() else { return false };
         let sid = self.ctx.session_id;
         let d = Detached {
             session_id: sid,
@@ -1790,15 +2025,25 @@ impl Handler {
             unattended: self.unattended.load(Ordering::Acquire),
             file: file_name(m.state().path.as_deref()),
             stopping: false,
+            handed_on: follower,
             indicator: self.ctx.indicator.clone(),
             outbound: self.ctx.outbound.clone(),
         };
-        match slot(|s| s.detach(d)) {
+        // ⚠️ `ending` read again under the slot's lock (#3433): a start that
+        // finds its session ended once its recorder runs sets it, then takes
+        // back under that lock whatever is here, so the recording is that
+        // start's to stop or the grace's to hold, never both.
+        let detached = slot(|s| (!self.ending.load(Ordering::Acquire)).then(|| s.detach(d)));
+        match detached.flatten() {
             Some(Detach::Done) => {}
             // Another session's recording, over, whose grace had not looked
             // since: finished here, or its banner stays up for good.
             Some(Detach::Evicted(old)) => finish_detached(m, old),
-            Some(Detach::Already) | None => return,
+            // In the grace already (a follower's hand-on marked on it).
+            Some(Detach::Already) => return true,
+            // Its recorder still launching, where the start decides (#3451);
+            // or asked to end since the first look.
+            Some(Detach::Launching) | None => return false,
         }
         info!(
             session = %sid,
@@ -1806,6 +2051,7 @@ impl Handler {
             "session ended while recording — waiting for its controller to come back"
         );
         tokio::spawn(grace_watch(sid));
+        true
     }
 
     /// Follow a recording this session started (or picked up, P3b-3) until
@@ -1862,14 +2108,22 @@ impl Handler {
                         || slot(|s| s.holds(sid)) == Some(true)
                         || channel_gone(&self.dc))
                 {
-                    self.detach_recording();
-                    return;
+                    // #3447 — it stops following only once the grace holds
+                    // the recording, its hand-on marked; else it looks again.
+                    if self.detach_recording(true) {
+                        return;
+                    }
+                    continue;
                 }
                 let off = !gates().enabled;
                 // P1f — an UNATTENDED recording ends the moment someone signs
                 // in: they never saw it start, and nothing on their screen
                 // says it runs. Asked fresh every tick, never from a cache;
-                // an answer that cannot be had counts as "someone" (closed).
+                // an answer that cannot be had counts as "someone" (closed),
+                // and so does one not had in time (#3830, `NotKnownYet`).
+                // ⚠️ Asked ONLY while unattended: an attended recording's
+                // person is at the screen with its banner up, and a hung
+                // logind must not end it.
                 let signed_in = unattended
                     && !stopping
                     && fresh_remote_identity(m).await != Ok(Identity::Unattended);
@@ -1961,6 +2215,7 @@ mod tests {
             unattended: false,
             file: Some("a.mp4".into()),
             stopping: false,
+            handed_on: false,
             indicator: crate::indicator::ViewerIndicator::disabled(),
             outbound: mpsc::channel::<ClientMsg>(1).0,
         }
@@ -1984,6 +2239,7 @@ mod tests {
             Refusal::NoConsoleUser,
             Refusal::RootDaemon,
             Refusal::SwitchedOff,
+            Refusal::NotKnownYet,
         ] {
             assert_eq!(
                 identity_refusal(r),
@@ -2039,6 +2295,103 @@ mod tests {
             _ => panic!("the other session's recording was not handed back"),
         }
         assert!(s.holds(b) && !s.holds(a));
+    }
+
+    /// #3451 — nothing detaches a recording whose recorder is still
+    /// launching: its start decides once the recorder runs. So nothing can
+    /// pick it up first and leave that decision too late. Another session's
+    /// detach is not held up, and a second start's mark (one that found the
+    /// recorder busy) comes off without taking the launching start's.
+    #[test]
+    fn a_launching_recording_is_never_detached() {
+        let (a, b, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let mut s = Slot::default();
+        s.launching(a);
+        assert!(matches!(s.detach(detached(a, user)), Detach::Launching));
+        assert!(s.pick_up(user).is_none(), "picked up while it launched");
+        assert!(matches!(s.detach(detached(b, user)), Detach::Done));
+
+        s.launching(a);
+        s.launched(a);
+        assert!(
+            matches!(s.detach(detached(a, user)), Detach::Launching),
+            "a busy start's mark took the launching start's with it"
+        );
+        s.launched(a);
+        match s.detach(detached(a, user)) {
+            Detach::Evicted(old) => assert_eq!(old.session_id, b),
+            _ => panic!("once launched, the recording is detached as any other"),
+        }
+        assert!(s.holds(a));
+    }
+
+    /// #3447 — a follower hands its recording on by marking the entry, under
+    /// the slot's lock, whoever put the entry there: the session's end first
+    /// (its follower still follows it), or the follower's own detach. A later
+    /// detach that is not the follower's never takes the mark off.
+    #[test]
+    fn a_followers_hand_on_is_marked_on_the_entry() {
+        let (a, user) = (ObjectId::new(), ObjectId::new());
+        let handing_on = || Detached {
+            handed_on: true,
+            ..detached(a, user)
+        };
+        let mut s = Slot::default();
+        assert!(matches!(s.detach(detached(a, user)), Detach::Done));
+        assert!(s.held.as_ref().is_some_and(|d| !d.handed_on));
+        assert!(matches!(s.detach(handing_on()), Detach::Already));
+        assert!(
+            s.held.as_ref().is_some_and(|d| d.handed_on),
+            "the follower left and the entry does not say so"
+        );
+        assert!(matches!(s.detach(detached(a, user)), Detach::Already));
+        assert!(
+            s.held.as_ref().is_some_and(|d| d.handed_on),
+            "a session end's detach took the follower's mark off"
+        );
+        assert!(s.take(a).is_some());
+        assert!(matches!(s.detach(handing_on()), Detach::Done));
+        assert!(s.held.as_ref().is_some_and(|d| d.handed_on));
+    }
+
+    /// #3447 — whoever takes a detached recording out of the slot (the grace,
+    /// a detach over it, a pick-up whose recording ended) reports its ending
+    /// only once its follower has handed it on. Before that the follower
+    /// still follows it and reports it: both speaking was two `stopped` for
+    /// one recording, and its banner taken down twice.
+    #[test]
+    fn a_recording_its_follower_still_follows_is_not_reported_by_its_taker() {
+        let m = RecordingManager::new("roomlerd".into(), "config.toml".into());
+        let (a, user) = (ObjectId::new(), ObjectId::new());
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(4);
+        finish_detached(
+            &m,
+            Detached {
+                outbound: tx.clone(),
+                ..detached(a, user)
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "reported while its follower still follows it"
+        );
+        finish_detached(
+            &m,
+            Detached {
+                handed_on: true,
+                outbound: tx,
+                ..detached(a, user)
+            },
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::RecordingActivity {
+                kind: RecordingActivityKind::Stopped,
+                session_id,
+                ..
+            }) if session_id == a
+        ));
+        assert!(rx.try_recv().is_err(), "reported twice");
     }
 
     /// P3b-3 — a recording's ending has one speaker. A pick-up's claim for
@@ -2402,5 +2755,356 @@ mod tests {
             "an OFF must reach a recording in progress"
         );
         assert_eq!(gates(), Gates::default());
+    }
+}
+
+/// #3830 — the console lookup held up: what the daemon shows, decides and
+/// watches while logind does not answer. The `loginctl` walk is stood in
+/// (`launch::unix::StandIn`) and the manager decides as a Linux root daemon;
+/// everything above the walk is the daemon's own. Each probe runs as a task on
+/// a multi-thread runtime like the daemon's and is waited for from the test's
+/// own thread, so a probe that holds a worker cannot also hold up its verdict.
+#[cfg(all(test, target_os = "linux"))]
+mod console_lookup_tests {
+    use super::*;
+    use crate::recording::launch::unix::{Seat, StandIn};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, PoisonError};
+    use tunnel_core::localapi::{RecordStartOpts, Response};
+
+    /// How long a caller that must have an answer waits for the stood-in
+    /// lookup, as the daemon's callers wait for logind.
+    const WAIT: Duration = Duration::from_millis(300);
+    /// What "at once" may take on a busy CI runner: the bar #3830 sets for
+    /// `roomler status` while logind is paused.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+
+    /// Lookups, counted as they begin. The first `quick` answer at once; every
+    /// later one holds until the gate opens, as a stopped logind holds
+    /// `loginctl`.
+    #[derive(Clone, Default)]
+    struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        fn lookup(
+            &self,
+            quick: usize,
+            first: Seat,
+            then: Seat,
+        ) -> impl Fn() -> Seat + Send + Sync + 'static {
+            let held = self.clone();
+            move || {
+                if held.0.began.fetch_add(1, Ordering::SeqCst) < quick {
+                    return first;
+                }
+                let open = held.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    held.0
+                        .opened
+                        .wait_while(open, |open| !*open)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                then
+            }
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and the runtime declared before it can shut down.
+    struct OpenedAtTheEnd(Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// A manager that decides as a Linux root daemon whose console lookup is
+    /// `lookup`, for the rest of the test binary's life: the remote path takes
+    /// a `'static` one.
+    fn manager_over(
+        lookup: impl Fn() -> Seat + Send + Sync + 'static,
+    ) -> &'static Arc<RecordingManager> {
+        Box::leak(Box::new(Arc::new(
+            RecordingManager::new(
+                PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+                PathBuf::from("does-not-exist.toml"),
+            )
+            .with_console_stand_in(StandIn::new(lookup, WAIT)),
+        )))
+    }
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// `probe`, run as a task on `rt`: its answer and how long it took,
+    /// waited for `within` at most from THIS thread.
+    fn on_a_worker<T: Send + 'static>(
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+        probe: impl Future<Output = T> + Send + 'static,
+    ) -> Result<(T, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(async move {
+            let answer = probe.await;
+            let _ = tx.send((answer, asked.elapsed()));
+        });
+        rx.recv_timeout(within)
+            .map_err(|_| format!("no answer within {within:?}"))
+    }
+
+    fn initiator() -> RemoteInitiator {
+        RemoteInitiator {
+            session_id: ObjectId::new(),
+            controller_user_id: ObjectId::new(),
+            controller_name: "Tester".into(),
+        }
+    }
+
+    /// #3830 — a console lookup that never answers holds up no worker. While
+    /// it hangs, the status the tray polls (`record_status`), the caps the
+    /// heartbeat sends (`record_caps()`), a listing and a local start (what is
+    /// decided) and P1f's fresh check (what the watch over an unattended
+    /// recording asks every second) all ask, again and again, from tasks on a
+    /// two-worker runtime, and a 10 ms timer beside them still wakes on time:
+    /// the runtime canary's own measure (`runtime_canary.rs`). And the hang
+    /// holds one lookup, however many ask.
+    ///
+    /// Red before #3830: the first caller held the console cache's mutex
+    /// across the lookup on its worker, the next blocked on that mutex on the
+    /// other, and no worker was left to drive the timer.
+    #[test]
+    fn a_console_lookup_that_never_answers_delays_no_timer() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(0, Seat::Empty, Seat::Person(1000)));
+        // What is shown: one reader per worker, and one more.
+        for _ in 0..3 {
+            rt.spawn(async move {
+                for _ in 0..1_000 {
+                    let _ = m.status();
+                    let _ = advertised_by(Some(Arc::as_ref(m)));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+        // What is decided.
+        rt.spawn(async move {
+            for _ in 0..1_000 {
+                let _ = m.list().await;
+                let _ = m.start(RecordStartOpts::default()).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        // What P1f's watch asks.
+        rt.spawn(async move {
+            for _ in 0..1_000 {
+                let _ = fresh_remote_identity(m).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let tick = Duration::from_millis(10);
+        let late = on_a_worker(&rt, Duration::from_secs(10), async move {
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            worst
+        });
+        let began = held.began();
+        let (worst, _) = late.expect("a 10 ms timer kept waking while the console lookup hung");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while the console lookup hung"
+        );
+        assert_eq!(began, 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3830 — the status the tray polls (`record_status`) and the caps the
+    /// heartbeat sends (`record_caps()`, which is `advertised()`) answer at
+    /// once while the console lookup hangs, asked from a worker. With no
+    /// answer had yet, the status says who is signed in cannot be told, and
+    /// the caps still say `available`: a capability, not who is at the screen
+    /// (as at a login screen, decision 6), so the viewer's Record control does
+    /// not come and go with logind.
+    ///
+    /// Red before #3830: both waited on the lookup for as long as logind did
+    /// not answer.
+    #[test]
+    fn the_status_and_the_caps_answer_while_the_console_lookup_hangs() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(0, Seat::Empty, Seat::Person(1000)));
+        let available = RecordCap::Available.wire().to_string();
+        // The first asks start the lookup; the later ones find it hanging.
+        for _ in 0..3 {
+            let (status, took) = on_a_worker(&rt, AT_ONCE * 4, async move { m.status() })
+                .expect("the status answers while the console lookup hangs");
+            assert!(took < AT_ONCE, "the status took {took:?}");
+            match status {
+                Response::Recording(st) => {
+                    assert!(!st.available, "{st:?}");
+                    assert_eq!(
+                        st.unavailable_reason.as_deref(),
+                        Some(Refusal::NotKnownYet.message()),
+                        "{st:?}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            let (caps, took) = on_a_worker(&rt, AT_ONCE * 4, async move {
+                advertised_by(Some(Arc::as_ref(m)))
+            })
+            .expect("the caps answer while the console lookup hangs");
+            assert!(took < AT_ONCE, "the caps took {took:?}");
+            assert!(caps.contains(&available), "{caps:?}");
+        }
+        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3830 — FR-85 P1f's guards ask who is signed in afresh, and a fresh
+    /// check with no answer in time is NOT CONFIRMED: never the answer had
+    /// before it, never "nobody". The last answer here was "no session, and no
+    /// screen the recorder could reach" (an unattended recording could start),
+    /// and then logind stops answering.
+    /// - The check a remote start decides on before it skips the indicator,
+    ///   which is also what the watch over an unattended recording asks every
+    ///   tick (`fresh_remote_identity`), answers `NotKnownYet` within its wait:
+    ///   the start is refused `unavailable`, and the watch reads it as it reads
+    ///   a sign-in, so it stops the recording.
+    /// - The launch re-check refuses the start, by that name.
+    ///
+    /// Red before #3830: a fresh check waited on the lookup for as long as
+    /// logind did not answer, and the launch re-check did so on a worker.
+    #[test]
+    fn a_fresh_check_with_no_answer_in_time_is_not_confirmed() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(1, Seat::Empty, Seat::Empty));
+        let bound = WAIT + Duration::from_secs(1);
+        let (first, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(m)).expect("a check logind answers");
+        assert_eq!(
+            first,
+            Ok(Identity::Unattended),
+            "nobody, and no screen: unattended"
+        );
+
+        let (fresh, took) = on_a_worker(&rt, bound, fresh_remote_identity(m))
+            .expect("a fresh check answers within its wait while the console lookup hangs");
+        assert_eq!(
+            fresh,
+            Err(Refusal::NotKnownYet),
+            "not confirmed: never the cached nobody"
+        );
+        assert!(took >= WAIT, "it answered in {took:?}, before its wait");
+        // A start refuses it on the wire; the watch (`follow`, `grace_watch`)
+        // stops on anything but `Ok(Unattended)`.
+        assert_eq!(identity_refusal(Refusal::NotKnownYet).0, "unavailable");
+
+        let (started, _) = on_a_worker(&rt, bound, async move {
+            m.start_remote(initiator(), false, Identity::Unattended)
+                .await
+        })
+        .expect("the launch re-check answers within its wait while the console lookup hangs");
+        assert!(
+            matches!(started, Err(StartError::Unavailable(Refusal::NotKnownYet))),
+            "{started:?}"
+        );
+        assert_eq!(
+            held.began(),
+            2,
+            "the held lookup, and only it, since the first"
+        );
+    }
+
+    /// #3830 — with a console lookup that answers, every decision stands as
+    /// before: the recorder runs as the person signed in, a login screen
+    /// refuses (a local start, and a remote one at the launch re-check, by its
+    /// own name) while the device still advertises `available`, and with no
+    /// session and no screen a remote recording runs unattended while a local
+    /// one is refused. The control for the tests above: green before #3830 and
+    /// after.
+    #[test]
+    fn with_a_console_lookup_that_answers_every_decision_stands() {
+        let rt = runtime();
+        let bound = WAIT + Duration::from_secs(1);
+        let start_locally = |m: &'static Arc<RecordingManager>| async move {
+            match m.start(RecordStartOpts::default()).await {
+                Response::Error { message } => message,
+                other => panic!("a local start went ahead: {other:?}"),
+            }
+        };
+
+        let person = manager_over(|| Seat::Person(1000));
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(person)).expect("a person: answered");
+        assert_eq!(who, Ok(Identity::SessionUser { uid: 1000 }));
+        let (status, _) =
+            on_a_worker(&rt, bound, async move { person.status() }).expect("a status: answered");
+        assert!(
+            matches!(status, Response::Recording(ref st) if st.available),
+            "{status:?}"
+        );
+
+        let greeter = manager_over(|| Seat::NoPerson);
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(greeter)).expect("a greeter: answered");
+        assert_eq!(who, Err(Refusal::LoginScreen));
+        let (refused, _) =
+            on_a_worker(&rt, bound, start_locally(greeter)).expect("a local start: answered");
+        assert_eq!(refused, Refusal::LoginScreen.message());
+        let (started, _) = on_a_worker(&rt, bound, async move {
+            greeter
+                .start_remote(initiator(), false, Identity::Unattended)
+                .await
+        })
+        .expect("a remote start: answered");
+        assert!(
+            matches!(started, Err(StartError::Unavailable(Refusal::LoginScreen))),
+            "{started:?}"
+        );
+        assert!(
+            advertised_by(Some(Arc::as_ref(greeter)))
+                .contains(&RecordCap::Available.wire().to_string()),
+            "a login screen still advertises `available`"
+        );
+
+        let nobody = manager_over(|| Seat::Empty);
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(nobody)).expect("nobody: answered");
+        assert_eq!(who, Ok(Identity::Unattended));
+        let (refused, _) =
+            on_a_worker(&rt, bound, start_locally(nobody)).expect("a local start: answered");
+        assert_eq!(refused, Refusal::NoConsoleUser.message());
     }
 }

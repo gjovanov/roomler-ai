@@ -17,12 +17,13 @@ pub struct Message {
     #[serde(default)]
     pub author_type: AuthorType,
     /// FR-90 — the name to show for an author that is not a user (an agent
-    /// session's turns: "Claude · mars"). `None` for a user, whose name comes
-    /// from `users` as it always has.
+    /// session's turns: "Claude · <device>"). FR-90 is parked (FR-137), and
+    /// its stored turn stubs still list and export by this name. `None` for a
+    /// user, whose name comes from `users` as it always has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_display: Option<String>,
-    /// FR-90 — the module that owns this message's meaning, if any (a turn's
-    /// stub). Chat stores it and never interprets it.
+    /// FR-90 — the module that owns this message's meaning, if any (a parked
+    /// session's turn stub). Chat stores it and never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<super::Binding>,
     pub content: String,

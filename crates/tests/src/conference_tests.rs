@@ -2080,3 +2080,308 @@ async fn ws_disconnect_finalizes_http_only_call_session() {
     }
     assert!(cleaned, "HTTP-only session must be reaped on WS disconnect");
 }
+
+// ── #3416: a call joined before the page's socket has its id ────────
+
+/// `call/join` or `call/leave` naming `connection_id`, or with no body at all
+/// (`None`): what a page sends before its socket has been given an id.
+async fn call_post(
+    app: &TestApp,
+    tenant_id: &str,
+    room_id: &str,
+    token: &str,
+    action: &str,
+    connection_id: Option<&str>,
+) {
+    let req = app.auth_post(
+        &format!("/api/tenant/{}/room/{}/call/{}", tenant_id, room_id, action),
+        token,
+    );
+    let req = match connection_id {
+        Some(cid) => req.json(&serde_json::json!({ "connection_id": cid })),
+        None => req,
+    };
+    let resp = req.send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "call/{action}");
+}
+
+/// The user ids the server lists in a room's call.
+async fn call_user_ids(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) -> Vec<String> {
+    let items: Vec<Value> = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/room/{}/call/participant",
+                tenant_id, room_id
+            ),
+            token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    items
+        .iter()
+        .filter_map(|p| p["user_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// #3416 — a page that sends `call/join` before its socket has been given an
+/// id opens a session with no connection id, and its leave names the
+/// connection the socket has by then. That leave must close the session: the
+/// person is no longer listed, the count drops, and a call they were alone in
+/// ends.
+#[tokio::test]
+async fn a_scoped_leave_closes_the_session_its_page_joined_without_an_id() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin1").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Fast Join").await;
+
+    // Join is clicked before the socket's `connected` frame: no body.
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    // The frame arrives, so the page's leave names that connection.
+    let (ws, conn) = ws_connect_with_conn_id(&app.addr, token).await;
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()]
+    );
+
+    call_post(&app, tid, &room_id, token, "leave", Some(&conn)).await;
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        Vec::<String>::new(),
+        "the person is still listed after their page left the call"
+    );
+    let room = get_room(&app, tid, &room_id, token).await;
+    assert_eq!(room["participant_count"], 0, "the count still counts them");
+    assert_eq!(
+        room["conference_status"], "ended",
+        "a call they were alone in must end"
+    );
+    drop(ws);
+}
+
+/// #3416 — the same session, closed by its page's socket closing. The
+/// disconnect cleanup knows the room from the socket's `media:join` and
+/// leaves with the socket's id, which the session never carried.
+#[tokio::test]
+async fn a_socket_close_closes_the_session_its_page_joined_without_an_id() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin2").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Fast Join Drop").await;
+
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    let (mut ws, _conn) = ws_connect_with_conn_id(&app.addr, token).await;
+    let _t = media_join(&mut ws, &room_id).await;
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()]
+    );
+
+    // The tab closes; no HTTP leave ever arrives.
+    drop(ws);
+
+    let mut cleaned = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let room = get_room(&app, tid, &room_id, token).await;
+        if room["participant_count"] == 0
+            && room["conference_status"] == "ended"
+            && call_user_ids(&app, tid, &room_id, token).await.is_empty()
+        {
+            cleaned = true;
+            break;
+        }
+    }
+    assert!(
+        cleaned,
+        "the socket closed, and the session its page joined without an id is still open"
+    );
+}
+
+/// #3416 — the heal closes only sessions no connection owns, and only the
+/// leaver's own. One of a person's two devices leaving keeps the other one
+/// listed, and another person's session with no connection id is untouched.
+#[tokio::test]
+async fn a_scoped_leave_leaves_other_devices_and_other_people_alone() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin3").await;
+    let tid = &tenant.tenant_id;
+    let (admin, member) = (&tenant.admin, &tenant.member);
+    let (tok, other) = (&admin.access_token, &member.access_token);
+    let room_id = create_room_and_start_call(&app, tid, tok, "Two Devices").await;
+
+    let (ws_a, conn_a) = ws_connect_with_conn_id(&app.addr, tok).await;
+    let (ws_b, conn_b) = ws_connect_with_conn_id(&app.addr, tok).await;
+    for conn in [&conn_a, &conn_b] {
+        call_post(&app, tid, &room_id, tok, "join", Some(conn)).await;
+    }
+    // Another person, who joined before their socket had an id.
+    call_post(&app, tid, &room_id, other, "join", None).await;
+    let room = get_room(&app, tid, &room_id, tok).await;
+    assert_eq!(room["participant_count"], 2);
+
+    // Device B leaves. Device A is still in the call.
+    call_post(&app, tid, &room_id, tok, "leave", Some(&conn_b)).await;
+    let ids = call_user_ids(&app, tid, &room_id, tok).await;
+    assert!(
+        ids.contains(&admin.id),
+        "one device's leave closed the person's other device"
+    );
+    assert!(
+        ids.contains(&member.id),
+        "a leave closed another person's session"
+    );
+    let room = get_room(&app, tid, &room_id, tok).await;
+    assert_eq!(room["participant_count"], 2);
+    assert_eq!(room["conference_status"], "in_progress");
+
+    // Device A leaves too: the person is gone, the other person is not.
+    call_post(&app, tid, &room_id, tok, "leave", Some(&conn_a)).await;
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, tok).await,
+        vec![member.id.clone()],
+        "a leave closed another person's session with no connection id"
+    );
+    let room = get_room(&app, tid, &room_id, tok).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(room["conference_status"], "in_progress");
+
+    drop(ws_a);
+    drop(ws_b);
+}
+
+/// #3416 — a device that joined with its id closes only its own session when
+/// it leaves. The person's session with no connection id may be their other
+/// device, on an older client whose join raced its socket, still in the call:
+/// it stays open, and the call does not end under it.
+#[tokio::test]
+async fn a_device_that_joined_with_its_id_leaves_an_unscoped_session_alone() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin6").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Older Client").await;
+
+    // Device A, an older client: its join raced its socket.
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    // Device B joins with its id, and leaves.
+    let (ws_b, conn_b) = ws_connect_with_conn_id(&app.addr, token).await;
+    call_post(&app, tid, &room_id, token, "join", Some(&conn_b)).await;
+    call_post(&app, tid, &room_id, token, "leave", Some(&conn_b)).await;
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()],
+        "device B's leave closed device A's session"
+    );
+    let room = get_room(&app, tid, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(
+        room["conference_status"], "in_progress",
+        "the call ended under device A"
+    );
+    drop(ws_b);
+}
+
+/// #3416 — a device that joined with its id and left finds nothing open when
+/// it leaves again: a repeated leave, a leave racing its socket's close, or a
+/// leave after the call ended under it. It still held a session of its own,
+/// so a session with no connection id is not its own, and it must stay open:
+/// it may be the person's other device, on an older client, still in the call.
+#[tokio::test]
+async fn a_device_that_already_left_leaves_an_unscoped_session_alone() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin7").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Leave Again").await;
+
+    // Device A, an older client: its join raced its socket.
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    // Device B joins with its id, leaves, and leaves again.
+    let (ws_b, conn_b) = ws_connect_with_conn_id(&app.addr, token).await;
+    call_post(&app, tid, &room_id, token, "join", Some(&conn_b)).await;
+    for _ in 0..2 {
+        call_post(&app, tid, &room_id, token, "leave", Some(&conn_b)).await;
+    }
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()],
+        "device B's second leave closed device A's session"
+    );
+    let room = get_room(&app, tid, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(
+        room["conference_status"], "in_progress",
+        "the call ended under device A"
+    );
+    drop(ws_b);
+}
+
+/// #3416 — the heal keeps the leave's one decrement per person. A second leave
+/// from the same page finds nothing open, so the count does not drop under the
+/// person still in the call.
+#[tokio::test]
+async fn a_repeated_scoped_leave_after_the_heal_closes_nothing_more() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin4").await;
+    let tid = &tenant.tenant_id;
+    let (admin, member) = (&tenant.admin, &tenant.member);
+    let (tok, other) = (&admin.access_token, &member.access_token);
+    let room_id = create_room_and_start_call(&app, tid, tok, "Leave Twice").await;
+
+    call_post(&app, tid, &room_id, other, "join", None).await;
+    let (ws_m, conn_m) = ws_connect_with_conn_id(&app.addr, other).await;
+    let (ws_a, conn_a) = ws_connect_with_conn_id(&app.addr, tok).await;
+    call_post(&app, tid, &room_id, tok, "join", Some(&conn_a)).await;
+
+    for _ in 0..2 {
+        call_post(&app, tid, &room_id, other, "leave", Some(&conn_m)).await;
+    }
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, tok).await,
+        vec![admin.id.clone()]
+    );
+    let room = get_room(&app, tid, &room_id, tok).await;
+    assert_eq!(
+        room["participant_count"], 1,
+        "a repeated leave dropped the count under the person still in the call"
+    );
+    assert_eq!(room["conference_status"], "in_progress");
+
+    drop(ws_m);
+    drop(ws_a);
+}
+
+/// #3416 — the socket-close heal needs the socket to have been in this call
+/// (its `media:join`). A socket that never was, such as another tab of the
+/// same person, must not close a session it cannot tell is its own: a session
+/// with no connection id may be that person's other device, still in the call.
+#[tokio::test]
+async fn closing_a_socket_that_never_joined_the_call_leaves_an_unscoped_session_alone() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin5").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Other Tab").await;
+
+    // A device joins before its socket has an id.
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    // Another tab of the same person opens a socket and closes it.
+    let (ws_tab, _conn_tab) = ws_connect_with_conn_id(&app.addr, token).await;
+    drop(ws_tab);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()],
+        "a socket that was never in the call closed a session"
+    );
+    let room = get_room(&app, tid, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(room["conference_status"], "in_progress");
+}

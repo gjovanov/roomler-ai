@@ -3,7 +3,7 @@
 > **CLOSED 2026-08-30** — issue #917 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
 **Issue:** [#917](https://github.com/gjovanov/roomler-ai/issues/917)
-**Status:** design
+**Status:** closed 2026-08-30 (#917): every phase shipped and field-verified on agent 0.4.35. P1 stuck-capture recovery on 0.4.24; P2 first-frame guarantee in #1027; P3/P3b the locked-host indication on 0.4.24, again on 0.4.35; P4 the 5-minute attended window
 
 ## Goal
 
@@ -34,7 +34,7 @@ host cannot show the prompt at all. The operator had to unlock first, which is
 what set up defect 2. (The M3 lock-screen work put the video *capture* on the
 secure desktop; this newer window is not there.)
 
-### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:570`
+### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:949`
 
 The black session's own log (session `6a930b60`) is unambiguous:
 

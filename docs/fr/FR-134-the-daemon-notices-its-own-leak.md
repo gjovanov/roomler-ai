@@ -1,6 +1,6 @@
 # FR-134: The daemon notices its own leak, and a peer probe starts no process
 
-**Issue:** [#3262](https://github.com/gjovanov/roomler-ai/issues/3262) · **Status:** P1 and P2 shipped in 0.4.194, 2026-11-01. AC3 reads on 2026-11-08
+**Issue:** [#3262](https://github.com/gjovanov/roomler-ai/issues/3262) · **Status:** closed 2026-11-08, every criterion met. P1 and P2 shipped in 0.4.194, 2026-11-01; AC3 read seven days of the fleet with no false alarm on 2026-11-08
 **Related:** #3252 (the leak that prompted this), FR-65 ([#1255](https://github.com/gjovanov/roomler-ai/issues/1255), the stall watch), FR-92 (keep-busy, the leak's constant caller)
 
 ## Goal
@@ -79,13 +79,13 @@ would need privileges a per-user install lacks.
 
 - [x] **AC1**: all three OSes log the handle count hourly, read from `agent_logs` on real devices.
 - [x] **AC2**: a real climb reaches `agent_logs` as a warning, on a lab device with the bar lowered.
-- [ ] **AC3**: no false alarm on a healthy device across the fleet for 7 days.
+- [x] **AC3**: no false alarm on a healthy device across the fleet for 7 days.
 - [x] **AC4**: a Windows host starts no `PING.EXE` from the daemon over 10 minutes, and `roomler peers` still fills its RTT column, within 5 ms of a hand `ping`.
 - [x] **AC5**: docs: the self-report and both kill switches in the operator docs, with a `docs/README.md` row if a page is added.
 
 ## Open decisions
 
-None blocking. AC3 is what would change the thresholds.
+None. AC3 was what would change the thresholds, and it read no false alarm in seven days, so they stand.
 
 ## Out of scope
 
@@ -105,3 +105,4 @@ None blocking. AC3 is what would change the thresholds.
 | 2026-11-01 | AC1 from `agent_logs`, read with `scripts/resource-watch-read.cjs` | 15 devices in the grox org, each with two lines **60.0 minutes** apart: 9 Windows (485 to 800 handles), 4 Linux (36 to 39, the lab device aside), 2 macOS rows (20 to 33) |
 | 2026-11-01 | AC2 on NEO16-WSL, `ROOMLERD_RESOURCE_WATCH_MIN_RISE=30`, 6 held LocalAPI connections every 5 minutes, each one real descriptor in the daemon | 43 at the first sample, then `WARN handles=115 rise=72 per_second=0` at 17:59:11Z on the 13th: the fleet's only warning, read from `agent_logs`. The rig was removed afterwards |
 | 2026-11-01 | Wrong turns | The script reformatted for this repo returned `lines 1`: mongosh reads stdin as a REPL, so a bare `coll` ran alone and `.aggregate(` errored. `roomler logs --grep` found no hourly line, because it filters only the last 64 KiB. Both are in `docs/resource-watch.md`. |
+| 2026-11-08 | AC3: seven days of `agent_logs`, 11-01 16:45Z to 11-08 16:45Z, read with `scripts/resource-watch-read.cjs` as published, after a per-day count of the batches it matches (2,914, under its cap of 5,000) | **2,914 lines: 2,913 `INFO` and one `WARN`, AC2's lab climb above at 11-01 17:59:11Z. No other device warned.** The 15 devices online all week logged 121 to 176 lines each across 11 to 13 releases, 0.4.194 to 0.4.206, so every update restart is inside the window: 9 at 396 to 1,776 handles (the Windows workers) and 6 at 20 to 115 descriptors (Linux and macOS, the lab device included). 90 shorter-lived installs logged the rest. `mongodb-0` restarts unchanged |

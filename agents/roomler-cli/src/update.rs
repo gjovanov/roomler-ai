@@ -32,7 +32,7 @@
 //! |---|---|---|
 //! | Windows | the `.zip` | its `roomler.exe` replaces the running exe |
 //! | macOS, and Linux where no package owns this binary | the `.tar.gz` | its `roomler` is written beside the running binary and renamed over it, so the swap is atomic |
-//! | Linux where dpkg owns this binary (`install.sh`'s Debian path) | the `.deb` | `dpkg -i`, so dpkg's database keeps naming the version on disk |
+//! | Linux where dpkg owns this binary (`install.sh`'s Debian path) | the `.deb` | `dpkg --force-confold -i`, so dpkg's database keeps naming the version on disk, and a configuration file the person edited stays (#3932) |
 //!
 //! A binary in a root-owned directory needs root to replace, and `dpkg -i`
 //! always does: the command says to re-run under `sudo`.
@@ -552,14 +552,27 @@ fn install_deb(deb: &[u8], offered: &str) -> Result<()> {
         );
     }
     let st = std::process::Command::new("dpkg")
-        .arg("-i")
-        .arg(&path)
+        .args(dpkg_install_args(&path))
         .status()
         .context("run dpkg -i")?;
     if !st.success() {
         bail!("dpkg -i exited {:?}", st.code());
     }
     Ok(())
+}
+
+/// `dpkg`'s arguments to install the verified `.deb` at `path`: dpkg's
+/// [`tunnel_core::dpkg::OPTIONS`] before its action (#3932), so a
+/// configuration file the person edited stays and dpkg asks nothing, in their
+/// terminal either. The CLI's package ships none today; every package install
+/// of ours takes the options.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn dpkg_install_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> =
+        tunnel_core::dpkg::dpkg_args().map(Into::into).collect();
+    args.push("-i".into());
+    args.push(path.into());
+    args
 }
 
 #[cfg(not(unix))]
@@ -853,6 +866,26 @@ mod tests {
         assert!(!deb_version_is("0.4.148-1", "0.4.149"));
         assert!(!deb_version_is("0.4.1490-1", "0.4.149"));
         assert!(!deb_version_is("", "0.4.149"));
+    }
+
+    /// #3932 — dpkg gets `tunnel_core::dpkg::OPTIONS` before its action (it
+    /// stops reading options at the first argument that is not one): the argv
+    /// the real-dpkg cell ran, which kept an edited configuration file and read
+    /// nothing from stdin, so nothing is asked on the person's terminal either.
+    #[test]
+    fn dpkg_keeps_an_edited_configuration_file_and_asks_nothing() {
+        let deb = std::path::Path::new("/tmp/roomler-update-x/roomler-cli.deb");
+        assert_eq!(
+            dpkg_install_args(deb),
+            [
+                "--force-confold",
+                "-i",
+                "/tmp/roomler-update-x/roomler-cli.deb"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        // The vector above is the whole set: a new option is a new cell run.
+        assert_eq!(tunnel_core::dpkg::OPTIONS, ["--force-confold"]);
     }
 
     /// A gzipped tar of `(path, bytes)` files, as `release-tunnel.yml` makes one.

@@ -57,6 +57,10 @@ pub struct CandidateBase {
     pub(crate) network: String,
     //CandidateRelay
     pub(crate) relay_client: Option<Arc<turn::client::Client>>,
+    /// roomler (FR-148 P0): what carries a relay's TURN allocation
+    /// ([`Candidate::relay_transport`]); stamped where `gather_candidates_relay`
+    /// makes the candidate, `None` everywhere else.
+    pub(crate) relay_transport: Option<(ProtoType, SchemeType)>,
 }
 
 impl Default for CandidateBase {
@@ -84,6 +88,7 @@ impl Default for CandidateBase {
             priority_override: 0,
             network: String::new(),
             relay_client: None,
+            relay_transport: None,
         }
     }
 }
@@ -307,6 +312,10 @@ impl Candidate for CandidateBase {
 
     fn get_closed_ch(&self) -> Arc<Mutex<Option<broadcast::Sender<()>>>> {
         self.closed_ch.clone()
+    }
+
+    fn relay_transport(&self) -> Option<(ProtoType, SchemeType)> {
+        self.relay_transport
     }
 }
 

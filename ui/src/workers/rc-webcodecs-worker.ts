@@ -32,14 +32,30 @@
 import { epochNowMs } from './rc-hop-stats'
 import { createBenchSampler } from './rc-bench-sampler'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
+import {
+  clockCalPong,
+  normalizeSkewMs,
+  toPageEpochMs,
+  type ClockCalMessage,
+  type ClockCalPing,
+} from './rc-clock-cal'
+import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from './rc-paint-gap'
 
 /** `bench` — FR-16 L4 bench mode, set only when the knob is on AND the
  *  agent advertised `bench`: sample the probe marker while a probe is armed. */
 type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas; bench?: boolean }
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
+/** FR-138 — the page started to hold its session (`rc-paint-gap.ts`). */
+type PaintGapMarkMessage = { type: typeof PAINT_GAP_MARK }
 type CloseMessage = { type: 'close' }
-type IncomingMessage = InitCanvasMessage | BenchArmMessage | CloseMessage
+type IncomingMessage =
+  | InitCanvasMessage
+  | BenchArmMessage
+  | ClockCalPing
+  | ClockCalMessage
+  | PaintGapMarkMessage
+  | CloseMessage
 
 interface RTCTransformerLike {
   readable: ReadableStream<unknown>
@@ -71,6 +87,14 @@ const workerScope = self as unknown as {
 
 /** FR-16 L4 — reads the bench probe off painted frames, only while armed. */
 const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now: epochNowMs })
+/** #3566 — this worker's clock less the page's, ms, as the page measured it when
+ *  it started the worker (`clock-cal`, `rc-clock-cal.ts`). The page times a bench
+ *  probe from its own clock, so a paint stamp goes back through it. 0 until it
+ *  arrives, and for a session that measures none: the stamp of before. */
+let pageSkewMs = 0
+/** FR-138 — the gap in the painted frames across a held session's cut. Says
+ *  nothing unless the page marks a cut. */
+const paintGap = createPaintGapMark()
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -100,7 +124,7 @@ let awaitingKeyAfterRebuild = false
 let lastKeyframeReqMs = 0
 
 /** Ask the agent (the composable → `rc:keyframe` on the control channel) for
- *  a key frame; debounced like the data-channel workers' resync request.
+ *  a key frame; debounced like the data-channel worker's resync request.
  *  `now` skips the debounce, for the once-a-session rebuild: early in a
  *  worker's life the debounce would swallow it (the clock starts at the
  *  worker's creation). */
@@ -114,12 +138,21 @@ function requestKeyframe(opts: { now?: boolean } = {}): void {
 workerScope.onmessage = (e) => {
   const msg = e.data
   if (!msg) return
-  if (msg.type === 'init-canvas') {
+  if (msg.type === 'clock-cal-ping') {
+    // #3566 — answered first, and stamped on arrival.
+    workerScope.postMessage(clockCalPong(msg.seq, epochNowMs()))
+  } else if (msg.type === 'init-canvas') {
     canvas = msg.canvas
     ctx = canvas.getContext('2d')
     if (typeof msg.bench === 'boolean') bench.setEnabled(msg.bench)
   } else if (msg.type === 'bench-arm') {
     bench.arm(msg.seq)
+  } else if (msg.type === 'clock-cal') {
+    pageSkewMs = normalizeSkewMs(msg.skewMs)
+  } else if (msg.type === PAINT_GAP_MARK) {
+    // FR-138 — the page holds its session from here: when this worker last
+    // painted, and the gap at the first frame it paints next.
+    workerScope.postMessage({ type: PAINT_GAP_MARKED, sinceMs: paintGap.mark(performance.now()) })
   } else if (msg.type === 'close') {
     try {
       decoder?.close()
@@ -132,6 +165,8 @@ workerScope.onmessage = (e) => {
     configured = false
     framesDecoded = 0
     awaitingKeyAfterRebuild = false
+    pageSkewMs = 0
+    paintGap.reset()
   }
 }
 
@@ -156,8 +191,12 @@ workerScope.onrtctransform = async (event) => {
         const colorSpace = firstDims ? frameColorSpace(frame) : null
         // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
         const benchClone = bench.take(frame)
-        paintFrame(frame)
-        if (benchClone) bench.settle(benchClone, epochNowMs())
+        const drew = paintFrame(frame)
+        // FR-138 — the first frame painted after a held session's cut.
+        const gapClosed = drew ? paintGap.painted(performance.now()) : null
+        if (gapClosed) workerScope.postMessage({ type: PAINT_GAP_CLOSED, gapMs: gapClosed.gapMs })
+        // #3566 — on the page's clock, which times the probe.
+        if (benchClone) bench.settle(benchClone, toPageEpochMs(epochNowMs(), pageSkewMs))
         if (firstDims) {
           workerScope.postMessage({
             type: 'first-frame',
@@ -391,17 +430,20 @@ workerScope.onrtctransform = async (event) => {
   })
 }
 
-function paintFrame(frame: VideoFrame): void {
+/** Paint `frame` and close it; `true` when it reached the canvas. */
+function paintFrame(frame: VideoFrame): boolean {
   if (!canvas || !ctx) {
     frame.close()
-    return
+    return false
   }
   try {
     if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth
     if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight
     ctx.drawImage(frame, 0, 0)
+    return true
   } catch {
     /* canvas vanished mid-teardown */
+    return false
   } finally {
     frame.close()
   }
@@ -431,8 +473,9 @@ export function codecMimeForShort(short: string): string {
       // rc.94 — Level 5.1 (`L153`), not L3.1 (`L93`). L3.1 maxes at
       // ~1280×720; desktops at 1920×1200 / 1440p / 4K exceed it and the
       // HW HEVC decoder renders black. L5.1 (up to 4K@64) is a declared
-      // MAX, so smaller streams still decode. Matches rc-hevc-worker's
-      // DEFAULT_HEVC_CODEC + the isHevcDecodeSupported probe.
+      // MAX, so smaller streams still decode. Matches the composable's
+      // HEVC_MAIN_CODEC_STRING, which the data-channel worker is given and
+      // the isHevcDecodeSupported probe asks about.
       return 'hev1.1.6.L153.B0'
     case 'av1':
       return 'av01.0.08M.08'

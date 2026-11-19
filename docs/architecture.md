@@ -196,8 +196,8 @@ The rules that keep it a monolith rather than a pile of crates:
   namespaces, index specs, jobs, lifecycle hooks, capabilities — and the host composes the
   concrete types under `#[cfg(feature)]`. No dynamic loading, no runtime registry.
 - **A DAG, not peers.** Any module may call core; `conference → chat`, `remote → fleet`,
-  `network → fleet`, `hive → fleet`, `hive → chat`. Core never calls a module: the inverse flows (tenant
-  archive, agent removal, member removal) are hooks that core invokes in a fixed order.
+  `network → fleet`. Core never calls a module: the inverse flows (tenant archive, agent removal)
+  are hooks that core invokes in a fixed order.
 - **Core membership.** Something lives in core only if at least two modules need it **and** it is
   identity, tenancy or infrastructure. Everything else belongs to a module.
 - **Profiles, not switches.** Cargo features select the pillars a build links (`full`, `collab`,
@@ -228,12 +228,17 @@ The **LocalAPI** (named pipe `\\.\pipe\roomler` on Windows, `$XDG_RUNTIME_DIR/ro
 elsewhere) is the on-host control surface all three clients share — status, peers,
 flows, routes, consent decisions. Protocol reference: [tunnels.md](tunnels.md).
 
-A **system** daemon listens at `/var/run/roomler/roomler.sock`, and also at the legacy
-per-user path, for CLIs that predate the split. On macOS a per-user half answers a socket
-of its own. So two existing paths are not two daemons. When both exist, the CLI asks each
-for its peer's PID, and adds "a second roomler daemon is running" only when two processes
-answer (#2511). One process behind both is the system daemon's legacy bind, which every
-root `roomler status` used to report as a second daemon.
+A **system** daemon listens at `/var/run/roomler/roomler.sock` alone (#3736; before it,
+also at a per-user path, for CLIs that predate the split). A per-user endpoint lives only
+in a directory private to its account: `$XDG_RUNTIME_DIR` off macOS, the per-user temp
+folder on macOS. A client keeps an endpoint only when its own account or the system
+serves it, and otherwise goes on to the next candidate
+([security-baseline.md](security-baseline.md), the LocalAPI paragraph). On macOS a
+per-user half answers a socket of its own. So two existing paths are not two daemons.
+When both exist, the CLI asks each for its peer's PID, and adds "a second roomler daemon
+is running" only when two processes answer (#2511). One process behind both is an older
+system daemon's per-user bind, which every root `roomler status` used to report as a
+second daemon.
 
 ## Request flow & auth
 
@@ -268,7 +273,7 @@ usage, relay stats) renders with d3. i18n is wired but ships English only today.
 
 ## Deployment shape
 
-- **One Docker image** — `rust:1.88-bookworm` builds the API, `oven/bun` builds the
+- **One Docker image** — `rust:1.95-bookworm` builds the API, `oven/bun` builds the
   SPA, `debian:trixie-slim` runs nginx + the binary ([deployment.md](deployment.md)).
 - **Dev stack** — `docker compose up -d`: MongoDB (:27019), Redis, MinIO, coturn.
 - **Native artifacts** — MSI / `.deb` / `.pkg` / tarballs built by tag-triggered

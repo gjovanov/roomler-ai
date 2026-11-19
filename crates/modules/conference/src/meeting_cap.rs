@@ -207,7 +207,12 @@ async fn end_call(state: &ConferenceState, call: &LiveCall, tenant: &Tenant) -> 
         debug!(room = %call.room_id, %e, "call session close failed (plan_limit)");
     }
     // C-4 — the media island may live on another pod.
-    crate::media_cluster::close_room_everywhere(state, &call.room_id).await;
+    crate::media_cluster::close_room_everywhere(
+        state,
+        &call.room_id,
+        crate::media_cluster::CloseReason::Ended,
+    )
+    .await;
     let max = tenant.limits().meeting_max_minutes;
     let event = serde_json::json!({
         "type": "room:call_ended",

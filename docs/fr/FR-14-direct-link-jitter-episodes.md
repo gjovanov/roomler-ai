@@ -62,9 +62,11 @@ the lump), and they compose.
 
 ## Acceptance criteria
 
-- [ ] On a VPN-churning direct pair (CORPLAP-1-class), `target_bps` never crashes
+- [~] On a VPN-churning direct pair (CORPLAP-1-class), `target_bps` never crashes
       to the area floor during a 30-min drag session (no min=floor heartbeat
-      windows like 12:00Z above).
+      windows like 12:00Z above). **Partial (2026-11-03):** none of 7 855 direct
+      windows on the three corporate laptops reached the floor, with 626 network
+      changes inside those sessions. No drag is on record (field log).
 - [ ] `bytes_inflight` p99 < 80 KB on that pair (was: max 164 KB).
 - [ ] Field: dragging on CORPLAP-1-from-neo16 *during* VPN churn shows no
       multi-hundred-ms lumps.
@@ -76,3 +78,4 @@ the lump), and they compose.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.5 | Baseline evidence above; FR filed. |
+| 2026-11-03 | 0.4.177 to 0.4.197, natural traffic | **AC1 `[~]`.** `agent_logs`, the week, every `constrained=false` window with `target_bps` at or under the 1.5 M area floor, beside the *overlay: network change* lines that fall inside those sessions. CORPLAP-1: 10 direct sessions, 1 052 windows, none at the floor, lowest target 6.72 M, 44 lines in 5 of the sessions, longest session 31 min. CORPLAP-3: 53 sessions, 6 588 windows, none at the floor, lowest 3.63 M, 562 lines in 46 of the sessions, longest 49 min. CORPLAP-2: 11 sessions, 215 windows, none at the floor, lowest 12.3 M, 20 lines in 8 of the sessions. So the crash this FR was filed for didn't show on the three hosts it describes, in a week of network churn. A drag isn't logged, so this doesn't show a 30-minute drag. Other hosts still reach the floor on direct: 158 windows in 3 sessions on 2 hosts. Nothing was built under this FR (`episode_ceiling` isn't in the tree); FR-74 P1 and P1b replaced the direct gate. |

@@ -126,6 +126,10 @@ pub(crate) fn pick_asset<'a>(
 ///   has real dependencies (webkit2gtk, GTK, the tray library), and dpkg with
 ///   one unmet leaves it half-configured, which breaks apt for the whole host,
 ///   the daemon's own next update included. A refusal costs one tick instead.
+///   dpkg gets [`tunnel_core::dpkg::OPTIONS`] as `-o Dpkg::Options::=…`
+///   (#3932): this package ships a configuration file, its login start, and
+///   a person who edited or deleted it keeps it so, where dpkg would ask on
+///   stdin, read end of file and leave the package not configured.
 /// - rpm: the first of `dnf`, `zypper` and `yum`, `install.sh`'s order
 ///   (`desktop_rpm_tool`). None of them removes a package to install one
 ///   unless told to (dnf's `--allowerasing`; zypper non-interactive cancels a
@@ -138,20 +142,21 @@ pub(crate) fn install_commands(
 ) -> Vec<(&'static str, Vec<String>)> {
     let own = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     match db {
-        PkgDb::Dpkg => [(
-            "apt-get",
-            own(&[
+        PkgDb::Dpkg => {
+            let mut args = own(&[
                 "install",
                 "-y",
                 "--no-remove",
                 "-o",
                 "DPkg::Lock::Timeout=60",
-                path,
-            ]),
-        )]
-        .into_iter()
-        .filter(|(tool, _)| has(tool))
-        .collect(),
+            ]);
+            args.extend(tunnel_core::dpkg::apt_get_args());
+            args.push(path.to_string());
+            [("apt-get", args)]
+                .into_iter()
+                .filter(|(tool, _)| has(tool))
+                .collect()
+        }
         PkgDb::Rpm => [
             ("dnf", own(&["install", "-y", path])),
             (
@@ -637,6 +642,31 @@ mod tests {
         assert_eq!(args.last().map(String::as_str), Some(p));
         // No apt-get: nothing, rather than bare dpkg.
         assert!(install_commands(PkgDb::Dpkg, p, |t| t == "dpkg").is_empty());
+    }
+
+    /// #3932 — this package ships a configuration file (its autostart entry).
+    /// apt-get hands dpkg `tunnel_core::dpkg::OPTIONS` as
+    /// `-o Dpkg::Options::=<option>`: the argv the real-dpkg cell ran, which
+    /// kept an edited or deleted file, exited 0 and read nothing from stdin.
+    #[test]
+    fn a_deb_keeps_an_edited_configuration_file_and_asks_nothing() {
+        let p = "/tmp/roomler-update.x/c.deb";
+        let c = install_commands(PkgDb::Dpkg, p, |_| true);
+        assert_eq!(
+            c[0].1,
+            [
+                "install",
+                "-y",
+                "--no-remove",
+                "-o",
+                "DPkg::Lock::Timeout=60",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+                p,
+            ]
+        );
+        // The vector above is the whole set: a new option is a new cell run.
+        assert_eq!(tunnel_core::dpkg::OPTIONS, ["--force-confold"]);
     }
 
     #[test]

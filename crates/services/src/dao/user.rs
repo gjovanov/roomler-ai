@@ -27,6 +27,14 @@ const UNPROVEN_EMAIL_DOMAIN: &str = "unverified.invalid";
 /// nothing until minute 15, so the first resend is always immediate, at any TTL.
 const ACTIVATION_RESEND_COOLDOWN_SECS: i64 = 15 * 60;
 
+/// The address an account has PROVEN, for someone deciding whether to trust it.
+/// `None` when it has none: an unverified account's `email` can hold a sign-up's
+/// claim or a placeholder, and neither says anything about who is asking.
+pub fn proven_address(email: &str, is_verified: bool) -> Option<&str> {
+    (is_verified && email.contains('@') && !email.to_ascii_lowercase().ends_with(".invalid"))
+        .then_some(email)
+}
+
 /// Placeholder `email` for an account created from an OAuth identity whose
 /// address the provider did not verify.
 ///
@@ -712,6 +720,25 @@ impl UserDao {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sign-up's claim is not proof, and neither placeholder is an address.
+    #[test]
+    fn only_a_verified_real_address_is_proven() {
+        assert_eq!(
+            proven_address("a@corp.example", true),
+            Some("a@corp.example")
+        );
+        assert_eq!(proven_address("a@corp.example", false), None);
+        for placeholder in [
+            unverified_placeholder_email("microsoft", "oid-1"),
+            evicted_placeholder_email(&ObjectId::new()),
+        ] {
+            assert_eq!(proven_address(&placeholder, true), None, "{placeholder}");
+            assert_eq!(proven_address(&placeholder, false), None, "{placeholder}");
+        }
+        assert_eq!(proven_address("A@SOME.INVALID", true), None);
+        assert_eq!(proven_address("no-at-sign", true), None);
+    }
 
     /// The whole point of the placeholder: it satisfies the unique index
     /// without reserving anything a real person could ever hold.

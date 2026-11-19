@@ -137,11 +137,12 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | Jobs | Cap | Set at |
 |---|---|---|
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
-| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2638` |
-| The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:401` |
+| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2744` |
+| The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:404` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
-| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1368`, `:1617` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1947`, `:2127`, `:2620` |
+| The integration shards and `ci.yml`'s macOS overlay check | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1572` |
+| `ci.yml`'s Windows clippy lane (#3940) | 11,000 MB | `ci.yml:1917` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:507`, `:237`, `:658`; `:1204`, `:2321`, `:2501`, `:3026` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -150,15 +151,26 @@ run builds cold, and each master run publishes the same size again, so the GC ne
 ~8 (FR-6 wave 33). A master run that publishes a CI cache over its cap now warns
 `CI cache over its cap` on the run page (`ci-seed-save/action.yml:99`).
 
+The same lane crossed its 6,000 MB cap on 2026-11-03, and the warning fired on every master
+run from then on: each cold build pruned to 6,248–6,510 MB, and every run took 20–32 min,
+against 9 and 13 for the last two warm runs on 2026-11-02. #3940 raised the cap to 11,000 MB
+when it added the desktop companion's step to that lane. The companion's own cold clippy and
+test build prunes to 2,686 MB, part of it the setup wizard's Tauri tree that the lane already
+holds, so the lane's cold build prunes to at most 9,196 MB. At the lane's 4.1:1 packing
+(6,509 MB to a 1,582 MiB archive), that target is over the 1.9 GiB asset margin and goes up in
+two parts (`ci-seed-save/action.yml:140-152`), as the unit lane's 9,536 MB target already does.
+
 **A cold build also has to fit its job's ceiling, publish included.** A run cut off before
 it publishes leaves the next run cold as well, and that one is cut off the same way. Wave 34's
 first master run built the unit lane cold (1,795 crates) and hit the 30-minute ceiling at
 30 min 15 s, with the second part of its 2.6 GB archive still uploading. That part landed two
-seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:474`,
+seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:477`,
 `:159`), about 1.5 times their measured cold runs (FR-6 wave 36). The macOS overlay check
-allows 35 (`ci.yml:1340`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
-its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). Every other `ci.yml` lane with a
-cold run on record allows about 1.5 times it or more. A forced cold run on 2026-11-01 gave
+allows 35 (`ci.yml:1538`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
+its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). The Windows clippy lane allows 55
+(`ci.yml:1876`) since #3940: its cold runs took up to 32 min against 40 before the companion's
+step joined them. Every other `ci.yml` lane with a cold run on record allows about 1.5 times it
+or more. A forced cold run on 2026-11-01 gave
 Windows sessions and the FR-85 recorder their first: 11.1 min against 40 and 8.9 against 30.
 It also put unit at 27.3 min against 45 and lint at 18.0 against 40, prune and pack included.
 Unit's upload adds about 90 s.
@@ -231,8 +243,8 @@ grep -oE 'target is [0-9]+ MB.*' job.log                          # GC line, non
 | `::warning title=Seed publish did not land::` | the save's own check failed; the next run may build cold |
 | `tag run — skipping accretion GC` | expected on every tag run |
 
-A failed rehearsal opens a GitHub issue (`release-agent.yml:3742`), and the next green one
-closes it (`:3742`).
+A failed rehearsal opens a GitHub issue (`release-agent.yml:3848`), and the next green one
+closes it (`:3912`).
 
 ## 6. The waves that built this
 
@@ -249,6 +261,7 @@ closes it (`:3742`).
 | 36 (#3170) | the unit and lint lanes' job ceilings rise from 30 to 45 and 40 min | a cold run of either lane finishes its publish (wave 34's first cold unit run was cut off mid-upload at 30 min 15 s) |
 | 37 (#3192) | the macOS overlay check's ceiling rises from 25 to 35 min | its cold run (22 min 33 s, measured) finishes its publish |
 | 38 (#3251) | the prune removes local crates' macOS object files, which the last-dash name match missed | the macOS overlay cache stops growing 525–552 MB a version, and a cold prune lands at 4,039 MB, not 4,664 |
+| — (#3940) | the Windows clippy lane's cap rises to 11,000 MB and its ceiling to 55 min, with the desktop companion's step | ends a cold build of that lane on every CI run since 2026-11-03 (20–32 min, against 9–13 warm) |
 
 What is left is runner queueing, not compiling. On 0.4.182 and 0.4.183 the `.pkg` waited
 about 8 minutes for a macOS runner, and tag to publish took 13–16 minutes. On 0.4.184 and

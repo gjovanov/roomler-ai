@@ -18,7 +18,6 @@ use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 
 use crate::agent_presence_tests::{connect_agent, enroll};
 use crate::fixtures::test_app::TestApp;
-use crate::knowhow_scan_tests::recv_t;
 
 const GB: i64 = 1_000_000_000;
 
@@ -548,6 +547,30 @@ async fn exempt_and_enterprise_orgs_are_never_throttled() {
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next frame of type `want`, or `None` once `wait` passes.
+async fn recv_t(ws: &mut Ws, want: &str, wait: std::time::Duration) -> Option<serde_json::Value> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(Message::Text(txt)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+                    && v["t"] == want
+                {
+                    return Some(v);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => return None,
+        }
+    }
+}
 
 /// Join the overlay as a node that rides DERP, with a server-reflexive
 /// address (so its capability verdict is single-relay, not DERP).

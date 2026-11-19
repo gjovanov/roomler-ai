@@ -16,7 +16,7 @@ ignores it as a candidate, and keeps aiming at the (wrong) advertised
 address.
 
 Field case (2026-08-15, corplap-3 / Cisco AnyConnect full tunnel): the
-CORP3 corporate egress `192.164.201.1` maps one fresh socket to ports
+CORP3 corporate egress `<its public address>` maps one fresh socket to ports
 8467 / 8646 / 8614 across three coturn destinations — per-destination, no
 usable stride, so port prediction is off the table. Observed-src completion
 is the only viable path. The MBB cadence measurement (#435) already showed

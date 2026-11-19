@@ -16,8 +16,11 @@
   let routesActive = null; // painted by tunnels.js via the shared event below
 
   function paintStatus(s) {
+    // #4020 — the device service holds an enrollment this app cannot read,
+    // and no service named it: not known, so no "Not enrolled" and no set-up.
+    const unknown = !s.enrolled && !!s.enrollment_unknown;
     // Banners.
-    if (s.enrolled) hide($('ov-not-enrolled'));
+    if (s.enrolled || unknown) hide($('ov-not-enrolled'));
     else show($('ov-not-enrolled'));
     if (s.attention) {
       show($('ov-attention'));
@@ -34,8 +37,18 @@
 
     const chip = $('ov-enrolled-chip');
     if (chip) {
-      chip.textContent = s.enrolled ? 'Enrolled' : 'Not enrolled';
-      chip.className = 'chip ' + (s.enrolled ? 'chip-ok' : 'chip-warn');
+      chip.textContent = unknown ? 'Offline' : s.enrolled ? 'Enrolled' : 'Not enrolled';
+      chip.className = 'chip ' + (unknown ? 'chip-muted' : s.enrolled ? 'chip-ok' : 'chip-warn');
+    }
+    // The encoders and files cards' words for a stopped service (#4020).
+    const note = $('ov-enrolled-note');
+    if (note) {
+      note.textContent = !unknown
+        ? ''
+        : s.service_running
+          ? 'The device service did not answer.'
+          : 'The device service is not running.';
+      note.hidden = !unknown;
     }
 
     setText('ov-server', s.server_url || '—');
@@ -372,6 +385,12 @@
       if (view.reason === 'old_daemon') {
         encChip('Unavailable', 'chip-muted');
         encNote('The device service predates this view — update the service to see this.');
+      } else if (view.reason === 'root_only') {
+        // #3831 — a Linux system install whose service predates #3831 refuses
+        // this over the person socket the app reaches it by: an answer, not a
+        // failure.
+        encChip('Unavailable', 'chip-muted');
+        encNote("The encoders are shown to this device's administrator.");
       } else if (view.reason === 'daemon_unreachable') {
         encChip('Offline', 'chip-muted');
         encNote('The device service is not running.');

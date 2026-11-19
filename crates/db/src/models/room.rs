@@ -126,7 +126,8 @@ pub struct Room {
     pub actual_start_time: Option<DateTime>,
     pub actual_end_time: Option<DateTime>,
     /// FR-90 — the module that owns this room's meaning, if any (an agent
-    /// session's room). Chat stores it and never interprets it.
+    /// session's room). Chat stores it and never interprets it. FR-90 is
+    /// parked (FR-137): such a room now opens as a plain Secret room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<super::Binding>,
     pub created_at: DateTime,

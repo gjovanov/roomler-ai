@@ -1,0 +1,47 @@
+# #2034 — the self-host quickstart, as a stranger runs it, on amd64 and arm64.
+#
+# ⚠️ On a schedule as well as on a path filter. A removed image changes nothing in
+# this repository, so a push trigger alone would have stayed green through #2034.
+name: Self-host pull
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.selfhost.yml
+      - docker-compose.yml
+      - .env.selfhost.example
+      - scripts/selfhost-pull-check.sh
+      - ui/e2e/selfhost-collab.spec.ts
+      - ui/e2e/selfhost-turn-relay.spec.ts
+      - ui/e2e/fixtures/call-media.ts
+      - .github/workflows/selfhost-pull.yml
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quickstart:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      # One architecture's failure must not hide the other's result.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/selfhost-pull-check.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: selfhost-${{ matrix.arch }}
+          path: selfhost-artifacts/
+          if-no-files-found: ignore

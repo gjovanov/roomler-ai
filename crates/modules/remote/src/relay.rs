@@ -39,7 +39,8 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
 use roomler_ai_remote_control::models::{ConsentMode, InputMode, RcOverlayMode, SessionPolicy};
-use roomler_ai_remote_control::signaling::{ClientMsg, Role};
+use roomler_ai_remote_control::signaling::{ClientMsg, Role, ServerMsg};
+use roomler_core::cluster::bus::BusError;
 use tracing::{debug, info, warn};
 
 use crate::RemoteState;
@@ -224,6 +225,17 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     return Ok(serde_json::json!({ "dispatched": handled }));
                 }
 
+                // FR-138 P1b-2 — this pod holds the device, so the session a
+                // relayed redial `replaces`, and what is held for this person
+                // on the device, end here before the org's slot is claimed
+                // below and before the hub's own capacity gate, as on the
+                // local path. Inert at window 0.
+                if let ClientMsg::SessionRequest {
+                    agent_id, replaces, ..
+                } = &frame
+                {
+                    crate::row_end::before_request(&state, user_id, *agent_id, *replaces).await;
+                }
                 // FR-115 P3b — this pod owns the device, so the org's slot is
                 // claimed here, exactly as the local path claims it.
                 let mut org_session_cap = org_session_cap;
@@ -357,33 +369,30 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     })
                     .map(|e| (e.key().clone(), e.value().origin_pod.clone()))
                     .collect();
-                for (conn, origin) in quiet {
-                    if origin.is_empty() {
-                        continue;
-                    }
-                    let alive = match bus
-                        .request(
-                            &origin,
-                            "rc.conn_alive",
-                            serde_json::json!({ "conn": conn }),
-                        )
-                        .await
-                    {
-                        Ok(rep) => rep.get("alive").and_then(|v| v.as_bool()).unwrap_or(false),
-                        // Deadline = origin pod presumed dead; its
-                        // sockets died with it.
-                        Err(_) => false,
-                    };
-                    if !alive {
-                        warn!(conn = %conn, %origin, "rc relay: origin conn gone; reaping proxy");
-                        remove_proxy(&state, &conn);
-                    } else {
-                        // Alive: push last_seen forward so the next
-                        // sweep does not re-probe immediately.
-                        if let Some(p) = state.rc_proxy_controllers.get(&conn) {
+                // #3840 — the decision is `probe_verdict`, the walk `sweep`.
+                let unsettled = sweep(
+                    quiet,
+                    |conn, origin| {
+                        let bus = bus.clone();
+                        async move {
+                            let body = serde_json::json!({ "conn": conn });
+                            probe_verdict(&bus.request(&origin, "rc.conn_alive", body).await)
+                        }
+                    },
+                    |conn, origin, verdict| {
+                        if verdict == ProbeVerdict::Gone {
+                            warn!(conn = %conn, %origin, "rc relay: origin conn gone; reaping proxy");
+                            remove_proxy(&state, conn);
+                        } else if let Some(p) = state.rc_proxy_controllers.get(conn) {
+                            // Alive: push last_seen forward so the next
+                            // sweep does not re-probe immediately.
                             *p.last_seen.lock().unwrap() = Instant::now();
                         }
-                    }
+                    },
+                )
+                .await;
+                if unsettled > 0 {
+                    warn!(unsettled, "{SWEEP_STOPPED_LINE}");
                 }
             }
         });
@@ -411,8 +420,9 @@ pub fn remove_proxy(state: &RemoteState, conn: &str) -> bool {
 ///   (replies stream back conn-addressed).
 /// - `Ok(Some((code, message)))`: the owner's Hub refused - surface it
 ///   locally as `rc:error` (same as a local dispatch failure).
-/// - `Err(())`: the relay itself failed (no bus / deadline / NACK) -
-///   fall back to the PR-1 rehome path.
+/// - `Err(failed)`: the relay itself failed (no bus / deadline / NACK /
+///   Redis) - fall back to the PR-1 rehome path. [`RelayFailed`] says
+///   whether the owner pod is gone (#3840).
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_rc_frame(
     state: &RemoteState,
@@ -447,12 +457,12 @@ pub async fn relay_rc_frame(
     // session landing on the other pod would skip the cap.
     org_session_cap: Option<u32>,
     raw_frame: &serde_json::Value,
-) -> Result<Option<(String, String)>, ()> {
+) -> Result<Option<(String, String)>, RelayFailed> {
     let Some(bus) = state.cluster_bus.clone() else {
-        return Err(());
+        return Err(RelayFailed::NotSent);
     };
     if owner_pod.is_empty() {
-        return Err(());
+        return Err(RelayFailed::NotSent);
     }
     let (rc_overlay_on, rc_overlay_auto, rc_overlay_far_turn) = rc_overlay_to_relay(rc_overlay);
     let body = serde_json::json!({
@@ -511,13 +521,9 @@ pub async fn relay_rc_frame(
             }
         }
         Err(e) => {
-            debug!(%owner_pod, %e, "rc relay: rc.cmd failed; falling back to rehome");
-            // The owner may have moved meanwhile - forget this route.
-            if let Some(mut set) = state.remote_rc_conns.get_mut(conn) {
-                set.remove(owner_pod);
-            }
-            state.remote_rc_conns.remove_if(conn, |_, s| s.is_empty());
-            Err(())
+            let failed = settle_failed_relay(&state.remote_rc_conns, conn, owner_pod, &e);
+            debug!(%owner_pod, %e, ?failed, "rc relay: rc.cmd failed; falling back to rehome");
+            Err(failed)
         }
     }
 }
@@ -623,6 +629,187 @@ fn lock_ask_from_relay(
             .ok()
             .filter(|l| *l > LockOnEnd::Never),
     }
+}
+
+// ── #3840 — what a failed relay says about the other pod ────────────────────
+//
+// A bus request fails three ways. A deadline (no answer from the other pod in
+// time) and a NACK (it answered that it cannot take the request) are answers
+// about that pod. A Redis error (the publish failed, or the shared
+// connection's response timeout fired) is not: Redis paused or restarted, and
+// the other pod may be fine. Since the shared connection fails a command it
+// gets no answer to within its response timeout (#3840), this error comes with
+// every Redis restart and every pause longer than that timeout. So what tears
+// something down acts on the first two only.
+
+/// The one wording of a session frame dropped because Redis failed its
+/// relay, with the frame type and a short session id. At most one line a
+/// second per pod, with how many were held back.
+pub const FRAME_DROPPED_LINE: &str = "rc relay: frame dropped, Redis failed its relay";
+
+/// The one wording of a janitor sweep that a Redis failure stopped: the
+/// proxies it could not settle are kept, and asked about at the next sweep.
+pub const SWEEP_STOPPED_LINE: &str = "rc relay: sweep stopped, Redis failed a probe";
+
+/// Why the relay of an rc frame to its owner pod failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFailed {
+    /// Nothing was sent: this pod has no bus, or no owner pod was named.
+    NotSent,
+    /// The owner pod gave no answer within the deadline, or NACKed the frame:
+    /// it is gone or cannot take it, so the route to it is forgotten.
+    OwnerGone,
+    /// Redis failed the publish. That says nothing about the owner pod, so
+    /// the route to it is kept.
+    Unknown,
+}
+
+/// What a failed bus request says about the pod it was sent to.
+pub fn relay_failed(e: &BusError) -> RelayFailed {
+    match e {
+        // No answer from the owner pod within the deadline, or its answer
+        // that it cannot take the request.
+        BusError::Deadline(_) | BusError::Nack(_) => RelayFailed::OwnerGone,
+        // Redis failed the publish. It may even have delivered it after the
+        // timeout: nothing is known of the owner pod.
+        BusError::Redis(_) => RelayFailed::Unknown,
+    }
+}
+
+/// The route bookkeeping after the relay of `conn`'s frame to `owner_pod`
+/// failed with `e`: the route is forgotten only when the owner pod is gone.
+fn settle_failed_relay(
+    conns: &RemoteRcConns,
+    conn: &str,
+    owner_pod: &str,
+    e: &BusError,
+) -> RelayFailed {
+    let failed = relay_failed(e);
+    if failed == RelayFailed::OwnerGone {
+        // The owner may have moved meanwhile - forget this route.
+        if let Some(mut set) = conns.get_mut(conn) {
+            set.remove(owner_pod);
+        }
+        conns.remove_if(conn, |_, s| s.is_empty());
+    }
+    failed
+}
+
+/// What one `rc.conn_alive` probe says about a quiet proxy's origin pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// The origin pod still holds the browser socket: keep the proxy.
+    Alive,
+    /// The origin pod answered that it does not hold the socket, or NACKed
+    /// the probe (it runs no relay, so it holds no relayed socket, and every
+    /// later probe would NACK too), or gave no answer within the deadline
+    /// (presumed dead, its sockets with it): reap the proxy.
+    Gone,
+    /// Redis failed the probe: keep the proxy and ask again at the next
+    /// sweep.
+    Unknown,
+}
+
+/// The verdict of one probe's answer.
+pub fn probe_verdict(answer: &Result<serde_json::Value, BusError>) -> ProbeVerdict {
+    match answer {
+        Ok(rep) if rep.get("alive").and_then(|v| v.as_bool()) == Some(true) => ProbeVerdict::Alive,
+        Ok(_) => ProbeVerdict::Gone,
+        Err(e) => match relay_failed(e) {
+            RelayFailed::Unknown => ProbeVerdict::Unknown,
+            RelayFailed::OwnerGone | RelayFailed::NotSent => ProbeVerdict::Gone,
+        },
+    }
+}
+
+/// One janitor sweep over the quiet proxies, `(conn, origin pod)`: probe
+/// each origin in turn and hand `act` every verdict that settles one (reap
+/// it, or keep it and move its clock). The first probe Redis fails stops the
+/// sweep: it settles nothing, and Redis is failing for the probes after it
+/// too, each of which would wait out the response timeout. Returns how many
+/// proxies the sweep left as they were, that one and every one after it; the
+/// next sweep asks about them again, since their clocks did not move.
+pub async fn sweep<P, F>(
+    quiet: Vec<(String, String)>,
+    mut probe: P,
+    mut act: impl FnMut(&str, &str, ProbeVerdict),
+) -> usize
+where
+    P: FnMut(String, String) -> F,
+    F: std::future::Future<Output = ProbeVerdict>,
+{
+    // A proxy with no origin pod is never probed, as before.
+    let quiet: Vec<(String, String)> = quiet
+        .into_iter()
+        .filter(|(_, origin)| !origin.is_empty())
+        .collect();
+    let total = quiet.len();
+    for (i, (conn, origin)) in quiet.into_iter().enumerate() {
+        let verdict = probe(conn.clone(), origin.clone()).await;
+        if verdict == ProbeVerdict::Unknown {
+            return total - i;
+        }
+        act(&conn, &origin, verdict);
+    }
+    0
+}
+
+/// The relay of one session frame (`rc:sdp.offer`, `rc:ice`) to every owner
+/// pod its socket's route names, when none of them dispatched it.
+#[derive(Debug, Default)]
+pub struct Scoped {
+    refusal: Option<(String, String)>,
+    lost_to_redis: bool,
+}
+
+impl Scoped {
+    /// An owner pod's hub refused the frame, in these words.
+    pub fn refused(&mut self, said: (String, String)) {
+        self.refusal = Some(said);
+    }
+
+    /// The relay to one owner pod failed.
+    pub fn failed(&mut self, failed: RelayFailed) {
+        self.lost_to_redis |= failed == RelayFailed::Unknown;
+    }
+
+    /// The `rc:error` for an owner's refusal: its words, as a local dispatch
+    /// failure reads.
+    pub fn refusal(&mut self, session_id: Option<ObjectId>) -> Option<ServerMsg> {
+        self.refusal.take().map(|(code, message)| ServerMsg::Error {
+            session_id,
+            code,
+            message,
+            open_nonce: None,
+        })
+    }
+
+    /// No owner refused the frame, and Redis failed its relay to one: the
+    /// frame is dropped, as one lost in flight. The controller is told nothing
+    /// (its own timers recover a setup) and the route is kept.
+    pub fn dropped(&self, frame: &serde_json::Value) -> bool {
+        if self.refusal.is_some() || !self.lost_to_redis {
+            return false;
+        }
+        static FRAME_DROPPED: roomler_core::ws::redis_conn::LineBound =
+            roomler_core::ws::redis_conn::LineBound::per_second();
+        if let Some(suppressed) = FRAME_DROPPED.admit() {
+            let (kind, session) = frame_tag(frame);
+            warn!(frame = kind, session, suppressed, "{FRAME_DROPPED_LINE}");
+        }
+        true
+    }
+}
+
+/// The frame type and a short session id of a relayed frame, for its log
+/// line: `t`, and the last 6 characters of `session_id`.
+pub fn frame_tag(frame: &serde_json::Value) -> (&str, &str) {
+    let kind = frame.get("t").and_then(|v| v.as_str()).unwrap_or("?");
+    let sid = frame
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    (kind, sid.get(sid.len().saturating_sub(6)..).unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -765,5 +952,284 @@ mod session_policy_relay_tests {
                 ..SessionPolicy::default()
             })
         );
+    }
+}
+
+/// #3840 — the relay's reading of a failed bus request. A Redis error says
+/// nothing about the other pod; a deadline or a NACK does.
+#[cfg(test)]
+mod relay_failure_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    fn redis_error() -> BusError {
+        BusError::Redis(redis::RedisError::from(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )))
+    }
+
+    fn deadline() -> BusError {
+        BusError::Deadline(roomler_core::cluster::bus::RPC_DEADLINE)
+    }
+
+    fn nack() -> BusError {
+        BusError::Nack("no handler for class rc.cmd".to_string())
+    }
+
+    fn routes(conns: &RemoteRcConns, conn: &str) -> Vec<String> {
+        let mut owners: Vec<String> = conns
+            .get(conn)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        owners.sort();
+        owners
+    }
+
+    #[test]
+    fn only_a_deadline_or_a_nack_says_the_owner_pod_is_gone() {
+        assert_eq!(relay_failed(&redis_error()), RelayFailed::Unknown);
+        assert_eq!(relay_failed(&deadline()), RelayFailed::OwnerGone);
+        assert_eq!(relay_failed(&nack()), RelayFailed::OwnerGone);
+    }
+
+    /// A relay Redis failed keeps the route to the owner pod, so the next
+    /// frame goes there again; one the owner pod did not answer, or NACKed,
+    /// forgets that owner and only that one.
+    #[test]
+    fn a_relay_redis_failed_keeps_the_route_and_a_gone_owner_is_forgotten() {
+        for (e, kept) in [(redis_error(), true), (deadline(), false), (nack(), false)] {
+            let conns = RemoteRcConns::new();
+            conns
+                .entry("c1".to_string())
+                .or_default()
+                .insert("pod-b".to_string());
+            let failed = settle_failed_relay(&conns, "c1", "pod-b", &e);
+            assert_eq!(
+                failed == RelayFailed::Unknown,
+                kept,
+                "{e}: read as {failed:?}"
+            );
+            let expect: Vec<String> = if kept {
+                vec!["pod-b".to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(routes(&conns, "c1"), expect, "{e}");
+            assert_eq!(
+                conns.contains_key("c1"),
+                kept,
+                "{e}: an empty route is removed"
+            );
+        }
+        // The socket's other owner keeps its route when one owner is gone.
+        let conns = RemoteRcConns::new();
+        for pod in ["pod-b", "pod-c"] {
+            conns
+                .entry("c1".to_string())
+                .or_default()
+                .insert(pod.to_string());
+        }
+        settle_failed_relay(&conns, "c1", "pod-b", &deadline());
+        assert_eq!(routes(&conns, "c1"), vec!["pod-c".to_string()]);
+    }
+
+    /// The janitor's probe: a live answer keeps the proxy; a negative answer,
+    /// an answer that says nothing, a NACK or a deadline reaps it; a probe
+    /// Redis failed settles nothing.
+    #[test]
+    fn a_probe_redis_failed_is_unknown_and_every_answer_is_a_verdict() {
+        use serde_json::json;
+        assert_eq!(
+            probe_verdict(&Ok(json!({ "alive": true }))),
+            ProbeVerdict::Alive
+        );
+        assert_eq!(
+            probe_verdict(&Ok(json!({ "alive": false }))),
+            ProbeVerdict::Gone
+        );
+        assert_eq!(probe_verdict(&Ok(json!({}))), ProbeVerdict::Gone);
+        assert_eq!(probe_verdict(&Err(deadline())), ProbeVerdict::Gone);
+        assert_eq!(probe_verdict(&Err(nack())), ProbeVerdict::Gone);
+        assert_eq!(probe_verdict(&Err(redis_error())), ProbeVerdict::Unknown);
+    }
+
+    fn quiet(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(c, o)| (c.to_string(), o.to_string()))
+            .collect()
+    }
+
+    /// Runs `sweep` with scripted verdicts: which conns it probed, what it
+    /// handed `act`, and how many it left unsettled.
+    async fn run_sweep(
+        quiet: Vec<(String, String)>,
+        verdicts: &[ProbeVerdict],
+    ) -> (Vec<String>, Vec<(String, ProbeVerdict)>, usize) {
+        let script = Mutex::new(verdicts.iter().copied().collect::<VecDeque<_>>());
+        let probed = Mutex::new(Vec::new());
+        let mut acted = Vec::new();
+        let unsettled = sweep(
+            quiet,
+            |conn, _origin| {
+                probed.lock().unwrap().push(conn);
+                let verdict = script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("a scripted verdict for every probe");
+                async move { verdict }
+            },
+            |conn, _origin, verdict| acted.push((conn.to_string(), verdict)),
+        )
+        .await;
+        (probed.into_inner().unwrap(), acted, unsettled)
+    }
+
+    /// A sweep reaps no proxy and moves no clock on a probe Redis failed, and
+    /// stops there: the probes after it would wait out the bound on a failing
+    /// Redis. Those proxies are left for the next sweep.
+    #[tokio::test]
+    async fn a_sweep_stops_at_a_probe_redis_failed_and_keeps_every_proxy_left() {
+        let (probed, acted, unsettled) = run_sweep(
+            quiet(&[("c1", "pod-a"), ("c2", "pod-b"), ("c3", "pod-c")]),
+            &[
+                ProbeVerdict::Alive,
+                ProbeVerdict::Unknown,
+                ProbeVerdict::Gone,
+            ],
+        )
+        .await;
+        assert_eq!(
+            probed,
+            ["c1", "c2"],
+            "the sweep stops at the probe Redis failed"
+        );
+        assert_eq!(
+            acted,
+            [("c1".to_string(), ProbeVerdict::Alive)],
+            "c2 and c3 are neither reaped nor refreshed"
+        );
+        assert_eq!(unsettled, 2, "c2 and c3 are left for the next sweep");
+    }
+
+    /// Control: with no Redis failure a sweep settles every quiet proxy, and
+    /// skips one with no origin pod, as before.
+    #[tokio::test]
+    async fn a_sweep_without_a_redis_failure_settles_every_proxy() {
+        let (probed, acted, unsettled) = run_sweep(
+            quiet(&[
+                ("c1", "pod-a"),
+                ("c2", ""),
+                ("c3", "pod-c"),
+                ("c4", "pod-d"),
+            ]),
+            &[ProbeVerdict::Gone, ProbeVerdict::Alive, ProbeVerdict::Gone],
+        )
+        .await;
+        assert_eq!(probed, ["c1", "c3", "c4"]);
+        assert_eq!(
+            acted,
+            [
+                ("c1".to_string(), ProbeVerdict::Gone),
+                ("c3".to_string(), ProbeVerdict::Alive),
+                ("c4".to_string(), ProbeVerdict::Gone),
+            ]
+        );
+        assert_eq!(unsettled, 0);
+    }
+
+    const SID: &str = "6738f0a1b2c3d4e5f6a7b8c9";
+
+    /// The two session frames the relay carries for a controller. Its
+    /// `rc:terminate` is never relayed: the hub of the controller's pod
+    /// answers one for a session it does not hold with Ok (`Hub::dispatch`).
+    fn relayed_frames() -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({ "t": "rc:sdp.offer", "session_id": SID, "sdp": "v=0" }),
+            serde_json::json!({ "t": "rc:ice", "session_id": SID, "candidate": {} }),
+        ]
+    }
+
+    /// Redis lost the frame on its way to the owner pod, and no owner
+    /// refused it: the frame is dropped and the controller is told nothing.
+    #[test]
+    fn a_frame_redis_lost_is_dropped_and_the_controller_is_told_nothing() {
+        for frame in relayed_frames() {
+            let mut said = Scoped::default();
+            said.failed(RelayFailed::Unknown);
+            assert!(said.refusal(None).is_none(), "{frame}: no refusal");
+            assert!(said.dropped(&frame), "{frame}: dropped, nothing told");
+        }
+        // One owner gone and another lost to Redis: still dropped.
+        let mut said = Scoped::default();
+        said.failed(RelayFailed::OwnerGone);
+        said.failed(RelayFailed::Unknown);
+        assert!(said.refusal(None).is_none());
+        assert!(said.dropped(&relayed_frames()[1]));
+    }
+
+    /// A deadline or a NACK from every owner keeps today's answer: the frame
+    /// is not dropped, and the caller answers `session_not_found` as before.
+    /// So does a relay that sent nothing.
+    #[test]
+    fn a_frame_whose_owner_is_gone_falls_through_to_session_not_found() {
+        for failed in [RelayFailed::OwnerGone, RelayFailed::NotSent] {
+            for frame in relayed_frames() {
+                let mut said = Scoped::default();
+                said.failed(failed);
+                assert!(said.refusal(None).is_none());
+                assert!(!said.dropped(&frame), "{failed:?} {frame}: falls through");
+            }
+        }
+        assert!(
+            !Scoped::default().dropped(&relayed_frames()[0]),
+            "no owner tried: falls through"
+        );
+    }
+
+    /// An owner's refusal is told in its words, whatever the relay to another
+    /// owner did.
+    #[test]
+    fn an_owners_refusal_is_told_whatever_another_relay_did() {
+        let sid = ObjectId::parse_str(SID).unwrap();
+        let mut said = Scoped::default();
+        said.failed(RelayFailed::Unknown);
+        said.refused(("agent_busy".to_string(), "busy".to_string()));
+        match said.refusal(Some(sid)) {
+            Some(ServerMsg::Error {
+                session_id,
+                code,
+                message,
+                open_nonce,
+            }) => {
+                assert_eq!(session_id, Some(sid));
+                assert_eq!((code.as_str(), message.as_str()), ("agent_busy", "busy"));
+                assert_eq!(open_nonce, None);
+            }
+            other => panic!("expected the owner's refusal, got {other:?}"),
+        }
+    }
+
+    /// The dropped frame's line names its type and the last 6 characters of
+    /// its session id.
+    #[test]
+    fn a_dropped_frame_is_named_by_its_type_and_a_short_session_id() {
+        use serde_json::json;
+        assert_eq!(
+            frame_tag(&json!({ "t": "rc:ice", "session_id": SID })),
+            ("rc:ice", "a7b8c9")
+        );
+        assert_eq!(
+            frame_tag(&json!({ "t": "rc:sdp.offer" })),
+            ("rc:sdp.offer", "")
+        );
+        assert_eq!(
+            frame_tag(&json!({ "t": "rc:ice", "session_id": "abc" })),
+            ("rc:ice", "abc")
+        );
+        assert_eq!(frame_tag(&json!({ "session_id": 7 })), ("?", ""));
     }
 }

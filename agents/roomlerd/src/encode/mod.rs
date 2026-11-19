@@ -23,11 +23,21 @@ use crate::capture::{DirtyRect, Frame};
 pub mod bench;
 pub mod caps;
 pub mod caps_cache;
+/// FR-135 R9 — one table of encoder cells; the hello's encoder fields derived
+/// from it beside the code that writes them. It drives nothing yet: its readers
+/// are R10's, so outside the gate's tests most of it is unread.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod cell_table;
 pub mod cells;
 pub mod color;
 /// FR-130 P1 — the colour description every encoder writes, in one place.
 pub mod color_desc;
+/// #3439 — how busy the host and a probe child were, so a child that ran out of
+/// time can say whether it was starved or stuck.
+pub mod host_cpu;
 pub mod hwid;
+/// #3652 — the plain `encoder-smoke`: one cell, judged by the bench's verdict.
+pub mod smoke;
 
 /// FR-130 P1 — TEST-ONLY readers of the colour description a bitstream
 /// carries (H.264/HEVC SPS VUI, AV1 `color_config`, a VP9 keyframe header).
@@ -71,6 +81,10 @@ pub mod clock;
 /// evidence about the PIPE? (pure; no clock, no I/O, and no kill switch —
 /// it replaced three).
 pub mod evidence;
+/// FR-148 P1 — the pair memory's path model: the key that names the path, its
+/// own file (`path_memory.json`), the write at a close and the opening the
+/// model would take (pure).
+pub mod pair_memory;
 /// FR-79 V3b / FR-74 — ONE belief about what the path carries, split into a
 /// DEMONSTRATED floor (what arrived; available every window on every carrier)
 /// and a pushed-back CAPACITY estimate (only when the path resisted). Pure.
@@ -465,6 +479,21 @@ pub fn viewer_rate_clamp_enabled() -> bool {
 )]
 pub fn queue_drain_enabled() -> bool {
     tunnel_core::env::node_env("QUEUE_DRAIN").as_deref() != Some("0")
+}
+
+/// FR-79 V5b kill switch (2026-11-02): when on (default), only a measurement is
+/// evidence about the rate. A transit stall is judged against a live reading and
+/// never the prior's stand-in, and it no longer walks that prior; a later
+/// delivery at twice a reading or more takes the reading out; a hold counts for
+/// the pair memory only if a valid window carried it; the memory records a
+/// reading or nothing; and a growing viewer queue counts only while the sender
+/// offered more than arrived. `0` = V5a's rules.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn measured_evidence_enabled() -> bool {
+    tunnel_core::env::node_env("MEASURED_EVIDENCE").as_deref() != Some("0")
 }
 
 /// FR-59 P5 kill switch (2026-09-01): when on (default), a constrained
@@ -1513,16 +1542,21 @@ pub fn open_default(
                         %e,
                         "mf-encoder init failed — falling back to openh264"
                     );
+                    // #3652 — for a smoke's "tried"; a session records none.
+                    crate::media_plan::note_candidate_failed(cells::MF_H264, &e);
                 }
             }
         }
         #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
         {
             if preference == EncoderPreference::Hardware {
+                // #3652 — what this OS and build lack, with rebuild advice
+                // only where a rebuild could add Media Foundation.
+                let why = NoMf::here().map_or("", NoMf::why);
                 tracing::warn!(
-                    "Hardware encoder requested but this build has no HW backend \
-                     compiled in (rebuild with --features mf-encoder on Windows); \
-                     falling back to software"
+                    "Hardware encoder requested, and the RTP track's H.264 has no hardware \
+                     encoder here ({why}): falling back to software. Hardware H.264 is the \
+                     DataChannel's, through FFmpeg"
                 );
             }
             // On Auto with no mf-encoder feature, fall through silently —
@@ -1554,59 +1588,151 @@ pub fn open_default(
     Box::new(NoopEncoder)
 }
 
-/// Open a codec-specific encoder, falling back to H.264 if the
-/// requested codec has no compiled-in backend on this host.
-///
-/// `codec` is the MIME-style short name from
-/// `caps::pick_best_codec` (`"h264"`, `"h265"`, `"av1"`, etc.).
-/// Today only `"h264"` and `"h265"` have encoder backends; anything
-/// else demotes to H.264 with a warning so the session still works
-/// (the browser negotiated H.264 too, that's the universal default).
-///
-/// H.265 path: gated on `target_os = "windows"` + `mf-encoder` feature.
-/// The HEVC cascade is HW-only (Windows ships no software HEVC encoder
-/// CLSID); on failure we fall back to `open_default` which still walks
-/// the H.264 cascade + openh264 fallback. The browser is already told
-/// (via `set_codec_preferences`) which codec to expect — demotion at
-/// this layer means the peer must re-advertise H.264 in the SDP
-/// answer, which the caller in `peer.rs` handles.
 /// FR-78 P2 — open ONE named FFmpeg encoder (`hevc_d3d12va`, `av1_vulkan`,
 /// `h264_vaapi`, …) at the probe's settings, bypassing every cascade, so a
 /// backend that never wins the cascade on a host (the vendor SDK sits above
 /// it) can still be driven with real bytes by `encoder-smoke --name` and the
-/// FR-62 ladder. `None` when the name is not one of the tables', the build
-/// carries no FFmpeg, or no device on this host accepts it — the same open
-/// the capability probe runs, so a cell the probe advertised opens here too.
-/// Returns the codec's wire name with the encoder. Bypasses the denylist as
-/// well, by design: the name is the operator's explicit request, and a
-/// denied cell is exactly what `--name` exists to drive under the harness
-/// before it is allowed back.
+/// FR-62 ladder. The same open the capability probe runs, so a cell the probe
+/// advertised opens here too. Returns the codec's wire name with the encoder,
+/// or why nothing opened: the name is not one of the tables', the build
+/// carries no FFmpeg, or no device on this host accepts it. Bypasses the
+/// denylist as well, by design: the name is the operator's explicit request,
+/// and a denied cell is exactly what `--name` exists to drive under the
+/// harness before it is allowed back.
+///
+/// #3652 — a Media Foundation cell's denylist name (`h264_mf`, `hevc_mf`,
+/// `av1_mf`) opens that codec's MF cascade and nothing else. For H.264 it ends
+/// on Microsoft's software MFT where no hardware MFT opens, which is what the
+/// release lane's smoke asserts on a runner with no GPU. MF's constructor
+/// still refuses a denied MF cell.
 pub fn open_named(
     name: &str,
     width: u32,
     height: u32,
-) -> Option<(Box<dyn VideoEncoder>, &'static str)> {
+) -> Result<(Box<dyn VideoEncoder>, &'static str), String> {
+    if let Some(codec) = mf_named_codec(name) {
+        return open_named_mf(name, codec, width, height);
+    }
     #[cfg(feature = "ffmpeg-encoder")]
     {
         use roomler_ai_remote_control::models::VideoBackend;
         let Some(name) = ffmpeg::FfmpegEncoder::static_name(name) else {
             tracing::warn!(name, "open_named: not a cascade-table encoder name");
-            return None;
+            return Err(format!(
+                "{name} is not an encoder of FFmpeg's cascade tables"
+            ));
         };
-        let codec = VideoBackend::from_ffmpeg_name(name).map(|(c, _)| c.wire())?;
+        let codec = VideoBackend::from_ffmpeg_name(name)
+            .map(|(c, _)| c.wire())
+            .ok_or_else(|| format!("{name}: no codec for this encoder name"))?;
         match ffmpeg::FfmpegEncoder::new_named_probe(name, width, height, false) {
-            Ok(enc) => Some((Box::new(enc), codec)),
+            Ok(enc) => Ok((Box::new(enc), codec)),
             Err(e) => {
                 tracing::warn!(name, %e, "open_named: the encoder did not open on this host");
-                None
+                Err(format!("{name} did not open on this host: {e:#}"))
             }
         }
     }
     #[cfg(not(feature = "ffmpeg-encoder"))]
     {
-        let _ = (name, width, height);
-        tracing::warn!("open_named: this build carries no FFmpeg backend");
-        None
+        let _ = (width, height);
+        tracing::warn!(name, "open_named: this build carries no FFmpeg backend");
+        Err(format!("{name}: this build carries no FFmpeg backend"))
+    }
+}
+
+/// #3652 — the wire codec of a Media Foundation cell's denylist name.
+fn mf_named_codec(name: &str) -> Option<&'static str> {
+    [
+        (cells::MF_H264, "h264"),
+        (cells::MF_HEVC, "hevc"),
+        (cells::MF_AV1, "av1"),
+    ]
+    .into_iter()
+    .find(|(n, _)| *n == name)
+    .map(|(_, codec)| codec)
+}
+
+/// #3652 — [`open_named`] for a Media Foundation name: that codec's MF
+/// cascade alone, with no fallback behind it.
+fn open_named_mf(
+    name: &str,
+    codec: &'static str,
+    width: u32,
+    height: u32,
+) -> Result<(Box<dyn VideoEncoder>, &'static str), String> {
+    #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+    {
+        let opened = match codec {
+            "h264" => mf::MfEncoder::new(width, height),
+            "hevc" => mf::MfEncoder::new_hevc(width, height),
+            _ => mf::MfEncoder::new_av1(width, height),
+        };
+        match opened {
+            Ok(e) => {
+                tracing::info!(
+                    width,
+                    height,
+                    encoder = e.name(),
+                    hardware = e.is_hardware(),
+                    "encoder selected by name (Media Foundation)"
+                );
+                Ok((Box::new(e), codec))
+            }
+            Err(e) => {
+                tracing::warn!(name, %e, "open_named: the Media Foundation encoder did not open on this host");
+                Err(format!("{name} did not open on this host: {e:#}"))
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+    {
+        let _ = (codec, width, height);
+        let why = if cfg!(target_os = "windows") {
+            "this build has no Media Foundation (built without mf-encoder)"
+        } else {
+            "Media Foundation is Windows only"
+        };
+        tracing::warn!(name, why, "open_named: no Media Foundation encoder here");
+        Err(format!("{name}: {why}"))
+    }
+}
+
+/// #3652 — why Media Foundation was not there to try, for an opener's
+/// warning, by what this OS and build lack: only a Windows build can be
+/// rebuilt with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(all(target_os = "windows", feature = "mf-encoder"), allow(dead_code))]
+enum NoMf {
+    /// A Windows build without `mf-encoder`.
+    NotCompiled,
+    /// Linux or macOS.
+    OffWindows,
+}
+
+#[cfg_attr(all(target_os = "windows", feature = "mf-encoder"), allow(dead_code))]
+impl NoMf {
+    fn from_reach(reach: bench::Reach) -> Option<Self> {
+        match reach {
+            bench::Reach::InBuild => None,
+            bench::Reach::NotCompiled => Some(Self::NotCompiled),
+            // `WindowsOnly`: nothing switches Media Foundation off.
+            _ => Some(Self::OffWindows),
+        }
+    }
+
+    /// This OS and build's, or `None` with Media Foundation compiled in.
+    fn here() -> Option<Self> {
+        Self::from_reach(bench::BuildCaps::this_build().reach(bench::Backend::MediaFoundation))
+    }
+
+    fn why(self) -> &'static str {
+        match self {
+            Self::NotCompiled => {
+                "this Windows build has no Media Foundation (rebuild with --features mf-encoder)"
+            }
+            Self::OffWindows => "Media Foundation is Windows only",
+        }
     }
 }
 
@@ -1656,6 +1782,18 @@ pub fn above_openh264_ceiling(encoder: &str, width: u32, height: u32) -> bool {
     encoder == "openh264" && fit_for_openh264(width, height) != (width, height)
 }
 
+/// The RTP track's encoder for `codec` (`caps::pick_best_codec`'s short name),
+/// the one `peer.rs`'s pump opens, with the codec it produces.
+///
+/// - `h264`: [`open_default`], the only arm that reads `preference`. A codec
+///   this opener does not know takes this arm too, with a warning.
+/// - `h265` or `hevc`: FFmpeg's HEVC cascade first (on unless
+///   `ROOMLERD_USE_FFMPEG=0`), then Media Foundation's.
+/// - `av1`: Media Foundation's alone.
+///
+/// No build has a software HEVC or AV1 encoder, and the track is already
+/// bound to its codec, so those two fail closed to a [`NoopEncoder`] rather
+/// than put H.264 bytes on it.
 pub fn open_for_codec(
     codec: &str,
     width: u32,
@@ -1697,6 +1835,7 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
                     %e,
                     "mf-av1 init failed; track is bound to video/AV1 so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
                 );
+                crate::media_plan::note_candidate_failed(cells::MF_AV1, &e);
                 (Box::new(NoopEncoder), "av1")
             }
         }
@@ -1704,8 +1843,10 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
     #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
     {
         let _ = (width, height);
+        let why = NoMf::here().map_or("", NoMf::why);
         tracing::warn!(
-            "AV1 requested but this build has no MF AV1 backend — session will have no video until reconnect with a lower Quality preference."
+            "AV1 requested on the RTP track, whose only AV1 encoder is Media Foundation's, and \
+             {why}: the session will have no video until reconnect with a lower Quality preference"
         );
         (Box::new(NoopEncoder), "av1")
     }
@@ -1713,11 +1854,10 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
 
 /// HEVC opener — same fail-closed semantics as `open_for_codec_av1`.
 ///
-/// rc.72: when `ROOMLERD_USE_FFMPEG=1` is set AND the
-/// `ffmpeg-encoder` feature is compiled in, try the FFmpeg backend first
-/// (`hevc_nvenc` → `hevc_qsv` → `hevc_amf`). Falls through to MF on
-/// FFmpeg construction failure so a misconfigured opt-in doesn't break
-/// existing sessions. Unset = MF default (preserves rc.71 behaviour).
+/// FFmpeg's HEVC cascade first wherever it is compiled in and on
+/// (`ffmpeg::available()`: on unless `ROOMLERD_USE_FFMPEG=0`, since rc.107),
+/// then Media Foundation's on Windows. No build has a software HEVC encoder,
+/// so with neither it fails closed to a `NoopEncoder`.
 fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'static str) {
     #[cfg(feature = "ffmpeg-encoder")]
     {
@@ -1732,12 +1872,13 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
                     );
                     return (Box::new(e), "h265");
                 }
-                Err(err) => {
-                    tracing::warn!(
+                Err(err) => match NoMf::here() {
+                    None => tracing::warn!(
                         %err,
-                        "ROOMLERD_USE_FFMPEG=1 but ffmpeg HEVC construction failed; falling back to MF cascade"
-                    );
-                }
+                        "ffmpeg HEVC cascade did not open; trying Media Foundation's HEVC"
+                    ),
+                    Some(_) => tracing::warn!(%err, "ffmpeg HEVC cascade did not open"),
+                },
             }
         }
     }
@@ -1753,6 +1894,7 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
                     %e,
                     "mf-h265 init failed; track is bound to video/HEVC so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
                 );
+                crate::media_plan::note_candidate_failed(cells::MF_HEVC, &e);
                 (Box::new(NoopEncoder), "h265")
             }
         }
@@ -1760,8 +1902,15 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
     #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
     {
         let _ = (width, height);
+        let ffmpeg_state = match bench::BuildCaps::this_build().reach(bench::Backend::Ffmpeg) {
+            bench::Reach::InBuild => "FFmpeg's HEVC cascade did not open",
+            bench::Reach::SwitchedOff => "FFmpeg is switched off (ROOMLERD_USE_FFMPEG=0)",
+            _ => "this build has no FFmpeg",
+        };
+        let why = NoMf::here().map_or("", NoMf::why);
         tracing::warn!(
-            "HEVC requested but this build has no MF HEVC backend — session will have no video until reconnect with a lower Quality preference."
+            "HEVC requested, and no HEVC encoder opened: {ffmpeg_state}, and {why}. The \
+             session will have no video until reconnect with a lower Quality preference"
         );
         (Box::new(NoopEncoder), "h265")
     }
@@ -1797,6 +1946,28 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3652 — an opener's warning names what this OS and build lack, and
+    /// advises a rebuild only on Windows, the one OS a rebuild can add Media
+    /// Foundation to.
+    #[test]
+    fn the_no_media_foundation_warning_follows_the_os_and_build() {
+        use bench::Reach;
+        assert_eq!(NoMf::from_reach(Reach::InBuild), None);
+        assert_eq!(
+            NoMf::from_reach(Reach::NotCompiled),
+            Some(NoMf::NotCompiled)
+        );
+        assert_eq!(NoMf::from_reach(Reach::WindowsOnly), Some(NoMf::OffWindows));
+        let here = if cfg!(all(target_os = "windows", feature = "mf-encoder")) {
+            None
+        } else if cfg!(target_os = "windows") {
+            Some(NoMf::NotCompiled)
+        } else {
+            Some(NoMf::OffWindows)
+        };
+        assert_eq!(NoMf::here(), here);
+    }
 
     /// FR-62 AC5 — with `encoder_inplace_rate` OFF an in-place move writes
     /// the pre-A1 1× window, whatever the session opened with; ON writes the

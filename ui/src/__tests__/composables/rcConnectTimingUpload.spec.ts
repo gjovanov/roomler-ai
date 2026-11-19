@@ -6,6 +6,7 @@ import {
   buildConnectTimingUpload,
   createConnectTimingUploader,
   RC_CONNECT_LOG_TARGET,
+  RC_CONNECT_RECORD_VERSION,
   RC_CONNECT_UPLOAD_MAX_PER_MIN,
   RC_CONNECT_UPLOAD_PATH,
   type RcConnectUploadContext,
@@ -76,7 +77,8 @@ describe('FR-22 part 4 — the connect record', () => {
 
   it('carries the attempt, afterDrop, the outcome, the hidden flag, the ttff and every mark reached', () => {
     const f = buildConnectTimingUpload(painted, ctx(), 0)!.lines[0].fields
-    expect(f.v).toBe(1)
+    expect(f.v).toBe(RC_CONNECT_RECORD_VERSION)
+    expect(RC_CONNECT_RECORD_VERSION).toBe(2)
     expect(f.outcome).toBe('first_frame')
     expect(f.attempt).toBe(1)
     expect(f.after_drop).toBe(false)
@@ -124,6 +126,34 @@ describe('FR-22 part 4 — the connect record', () => {
     expect(f.agent_org_id).toBe(OTHER_ORG)
     expect(f.error_code).toBe('agent_offline')
     expect(f.outcome).toBe('retried')
+  })
+
+  it("#3582 — names the page's build, so a field read can tell a stale viewer directly", () => {
+    const f = buildConnectTimingUpload(painted, ctx({ build: 'a8924d0890b924c2' }), 0)!.lines[0].fields
+    expect(f.build).toBe('a8924d0890b924c2')
+    // Absent, never a guess, where the page has none (the dev server, an older shell)…
+    expect('build' in buildConnectTimingUpload(painted, ctx(), 0)!.lines[0].fields).toBe(false)
+    expect('build' in buildConnectTimingUpload(painted, ctx({ build: null }), 0)!.lines[0].fields).toBe(false)
+    // …and hex by shape: nothing else rides in the slot.
+    const odd = buildConnectTimingUpload(painted, ctx({ build: 'https://evil.example/x' }), 0)!
+    expect('build' in odd.lines[0].fields).toBe(false)
+  })
+
+  it("#3582 — the uploader fills the page's build in, from its option or the shell", () => {
+    const fetch = vi.fn((_u: string, _i: RequestInit) => Promise.resolve({ ok: true }))
+    createConnectTimingUploader({ fetch, build: 'a8924d0890b924c2' }).send(painted, ctx())
+    expect(JSON.parse(fetch.mock.calls[0][1].body as string).lines[0].fields.build).toBe('a8924d0890b924c2')
+
+    const meta = document.createElement('meta')
+    meta.setAttribute('name', 'roomler-build')
+    meta.setAttribute('content', '0123456789abcdef')
+    document.head.appendChild(meta)
+    try {
+      createConnectTimingUploader({ fetch }).send(painted, ctx())
+      expect(JSON.parse(fetch.mock.calls[1][1].body as string).lines[0].fields.build).toBe('0123456789abcdef')
+    } finally {
+      meta.remove()
+    }
   })
 
   it('files nothing without a tenant, and drops ids that are not ObjectId hex', () => {

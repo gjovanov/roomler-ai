@@ -5,7 +5,8 @@ import { test, expect } from '@playwright/test'
  *
  * The harness page (`/rc-vp9-444-harness.html`) is a self-contained
  * test rig that exercises the production worker
- * (`src/workers/rc-vp9-444-worker.ts`) end-to-end without needing a
+ * (`src/workers/rc-dc-worker.ts`, the one data-channel worker since
+ * FR-135 R3) end-to-end without needing a
  * real agent. Two RTCPeerConnections in the same window are looped
  * via direct SDP exchange; one side encodes synthetic frames with
  * `VideoEncoder({codec:'vp09.01.10.08'})` and DC.sends them
@@ -147,7 +148,7 @@ test.describe('Phase Y.3 VP9 4:4:4 DataChannel pipeline', () => {
     // PC/SDP loop. Using a fresh worker keeps the test independent
     // of harness state.
     const verdict = await page.evaluate(async () => {
-      const w = new Worker('/src/workers/rc-vp9-444-worker.ts', { type: 'module' })
+      const w = new Worker('/src/workers/rc-dc-worker.ts', { type: 'module' })
       const off = new OffscreenCanvas(2, 2)
       let rejected: { reason?: string; size?: number } | null = null
       const done = new Promise<typeof rejected>((resolve, reject) => {

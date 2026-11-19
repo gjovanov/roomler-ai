@@ -4,6 +4,7 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import vuetify from 'vite-plugin-vuetify'
 import { resolve } from 'path'
+import { buildIdPlugin } from './buildIdPlugin'
 
 const apiTarget = process.env.VITE_API_URL || 'http://localhost:5001'
 
@@ -11,6 +12,10 @@ export default defineConfig({
   plugins: [
     vue(),
     vuetify({ autoImport: true }),
+    // #3582 — the build's id, in `/version.json` and in the shell's
+    // `<meta name="roomler-build">`, so a tab that never navigates can tell
+    // it runs an older build than the server serves (buildIdPlugin.ts).
+    buildIdPlugin(),
   ],
   resolve: {
     alias: {

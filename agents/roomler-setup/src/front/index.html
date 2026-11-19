@@ -33,8 +33,8 @@
         <p id="detect-agent-summary" class="muted">Probing…</p>
         <p id="detect-tunnel-summary" class="muted"></p>
         <p id="detect-ambiguous-warning" class="warning" hidden>
-          Both perUser and perMachine daemon installs detected. The MSI's cleanup
-          custom action will remove the one not selected.
+          Roomler is installed twice here, for this user only and for the whole
+          computer. The install removes the one you did not pick.
         </p>
       </div>
 
@@ -55,23 +55,26 @@
             <input type="radio" name="role" value="daemon-system">
             <div>
               <strong id="role-title-daemon-system">Be accessed — background service (pre-logon, recommended)</strong>
-              <p class="muted" id="role-desc-daemon-system">perMachine install + SystemContext: remote control works on
-              the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).</p>
+              <p class="muted" id="role-desc-daemon-system">Installed for the whole computer as a Windows service, so
+              remote control works on the lock screen, on UAC prompts and in administrator apps too. Needs an
+              administrator's approval (a UAC prompt).</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-machine">
             <input type="radio" name="role" value="daemon-machine">
             <div>
               <strong id="role-title-daemon-machine">Be accessed — attended service</strong>
-              <p class="muted" id="role-desc-daemon-machine">perMachine install for all users on this PC, without the
-              SystemContext swap. Requires admin (UAC prompt) during install.</p>
+              <p class="muted" id="role-desc-daemon-machine">Installed for everyone on this computer. Remote control
+              reaches the desktop of whoever is signed in, not the lock screen or UAC prompts. Needs an
+              administrator's approval (a UAC prompt) to install.</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-user">
             <input type="radio" name="role" value="daemon-user">
             <div>
               <strong id="role-title-daemon-user">Be accessed — this user only</strong>
-              <p class="muted" id="role-desc-daemon-user">perUser install under my account. No admin password needed.</p>
+              <p class="muted" id="role-desc-daemon-user">Installed for your account only, and runs while you are signed
+              in. No administrator needed.</p>
             </div>
           </label>
           <label class="radio" id="role-card-tunnel">
@@ -100,10 +103,11 @@
              when the note does; it restarts the wizard through Windows'
              administrator prompt with the role kept (cmd_relaunch_elevated). -->
         <div id="elevation-note" class="warning" hidden>
-          <p>This device already has the background service, and its settings are
-          in a folder only administrators may open. To install it again, Roomler
-          Setup has to run as administrator: restart it that way (Windows asks you
-          to approve it once), or pick another option above.</p>
+          <p><span id="elevation-note-lead">This device already has the background
+          service, and its settings are in a folder only administrators may
+          open.</span> To install it again, Roomler Setup has to run as
+          administrator: restart it that way (Windows asks you to approve it
+          once), or pick another option above.</p>
           <footer class="actions">
             <button id="elevation-relaunch" type="button">Restart as administrator</button>
           </footer>
@@ -175,14 +179,17 @@
         <p id="adv-existing-note" class="muted" hidden>This machine already has an
         enrollment: the daemon keeps its current settings, and only the options you
         change here are written over them.</p>
-        <label class="field checkline">
-          <input id="adv-local-subnets" type="checkbox" checked>
-          <span>Advertise directly-connected subnets (admin approval required before use)</span>
-        </label>
+        <!-- #3714: auto_grant_session is this device's own floor under the
+             organization's consent policy, not a blanket approval. -->
         <label class="field checkline">
           <input id="adv-auto-grant" type="checkbox" checked>
-          <span>Auto-approve incoming remote-control sessions on this device</span>
+          <span>Trust the organization's consent policy (no extra prompt on this machine)</span>
         </label>
+        <p class="muted">Sessions the policy lets in without asking start without asking
+        here: the owner's own (whoever approves this device), an administrator's Force
+        control, and every session once this device is set to Auto-grant. Everyone else
+        is asked at this screen. Whoever is here sees a notice with Disconnect while
+        someone is viewing.</p>
         <label class="field">
           <span>Overlay subnet routes</span>
           <input id="adv-overlay-routes" type="text" spellcheck="false"
@@ -190,6 +197,15 @@
           <small class="muted">Comma-separated CIDRs this node offers to route
           for overlay peers. Leave empty unless this is a subnet router.</small>
         </label>
+        <!-- #3714: advertise_local_subnets only suggests routes to the tunnel
+             mesh, so it sits beside the tunnel field it adds to. -->
+        <label class="field checkline">
+          <input id="adv-local-subnets" type="checkbox" checked>
+          <span>Suggest this machine's local networks as tunnel routes</span>
+        </label>
+        <p class="muted">An administrator sees them under the device's Tunnel mesh
+        routes. Nothing on those networks can be reached through this machine until an
+        administrator approves a route.</p>
         <label class="field">
           <span>Tunnel subnet routes</span>
           <input id="adv-tunnel-routes" type="text" spellcheck="false"
@@ -210,8 +226,8 @@
          the SPA sees the user code, the page to open and the clock. -->
     <section id="step-token" class="step" hidden>
       <h1>Join your organization</h1>
-      <p class="lead" id="token-lead">Approve this device from your browser — nothing to
-      copy. Or paste a token you already have.</p>
+      <p class="lead" id="token-lead">Approve this device from your browser with a short
+      code. Or paste a token you already have.</p>
 
       <div id="pair-card" class="card">
         <!-- Idle: the primary action. -->
@@ -227,8 +243,11 @@
 
         <!-- Waiting: the code, large; the page; the clock. -->
         <div id="pair-active" hidden>
-          <p class="muted">Type this code at <code id="pair-uri"></code>:</p>
+          <p class="muted">Type this code in your browser, at <code id="pair-uri"></code>:</p>
           <div class="pair-code" id="pair-code" aria-live="polite">····-····</div>
+          <p class="muted" id="pair-cover-note">The browser opens over this window and can
+          hide the code. Press Copy code first to take it along, then paste it into the
+          page.</p>
           <footer class="actions actions-start">
             <button id="pair-copy" class="secondary">Copy code</button>
             <button id="pair-open">Open the page</button>
@@ -310,6 +329,7 @@
         <div id="token-warn-expired" class="error" hidden>
           This token has already expired. Ask your admin to issue a new one.
         </div>
+        <div id="token-warn-clock" class="warning" hidden></div>
         <div id="token-warn-parse" class="error" hidden>
           Could not parse this as a JWT. Make sure you copied the whole token
           (three dot-separated parts).
@@ -369,6 +389,11 @@
       <div id="install-error" class="error" hidden>
         <h3 id="install-error-title">Install failed</h3>
         <p id="install-error-message"></p>
+        <!-- #3432: every cause under the words, outermost first. -->
+        <details id="install-error-details" hidden>
+          <summary>Details</summary>
+          <ol id="install-error-chain"></ol>
+        </details>
         <footer class="actions">
           <button id="install-retry" class="secondary">Retry</button>
           <button id="install-back-to-welcome">← Back to start</button>
@@ -424,20 +449,22 @@
         shell. If it isn't found, run it directly via the path above.
       </div>
 
-      <div id="done-anchor-note" class="warning" hidden>
-        <strong>Not anchored for SYSTEM exec.</strong>
-        <p id="done-anchor-reason"></p>
-        <p>The install itself is complete. To anchor this device later, run this from an
-        elevated shell, with a fresh enrollment token from the dashboard:</p>
-        <pre class="code" id="done-anchor-command"></pre>
+      <!-- #3590: every warning the install raised, in the order it came, and
+           each once: why the device was not anchored (FR-104) and why the
+           service was not restarted onto the new enrollment (#3116) are
+           among them, with what to do. -->
+      <div id="done-warnings" class="warning" hidden>
+        <strong>What the install warned about</strong>
+        <ul id="done-warnings-list"></ul>
       </div>
 
-      <!-- #3116: a reinstall whose daemon was not restarted onto the new
-           enrollment. The config is written; the daemon takes it at its next
-           start. -->
-      <div id="done-restart-note" class="warning" hidden>
-        <strong>The Roomler service still runs the previous enrollment.</strong>
-        <p id="done-restart-reason"></p>
+      <!-- FR-104: the anchor step ran and did not anchor. Why is in the
+           warnings above; this is how to anchor the device later. -->
+      <div id="done-anchor-note" class="info" hidden>
+        <strong>To anchor this device for SYSTEM exec later</strong>
+        <p>The install itself is complete. Run this from an elevated shell, with a fresh
+        enrollment token from the dashboard:</p>
+        <pre class="code" id="done-anchor-command"></pre>
       </div>
 
       <!-- FR-129 B1: what the daemon on Linux / macOS still needs from the
@@ -448,13 +475,12 @@
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
-        <strong>SystemContext mode active.</strong>
-        <p>The perMachine MSI is installed, the daemon is enrolled, and the SCM
-        service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code> in its
-        <code>Environment</code> block. Remote control can now drive the Windows
-        lock screen, UAC dialogs, and admin apps when an operator connects from
-        the browser.</p>
-        <p class="muted">To disable SystemContext mode later, run
+        <strong>Lock-screen access is on.</strong>
+        <p>Roomler is installed for the whole computer, this device is enrolled,
+        and its Windows service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code>.
+        Remote control can now drive the Windows lock screen, UAC prompts and
+        administrator apps when someone connects from the browser.</p>
+        <p class="muted">To turn it off later, run
         <code>roomlerd disable-system-context</code> from an elevated shell,
         or re-run this wizard and pick the attended-service role.</p>
       </div>

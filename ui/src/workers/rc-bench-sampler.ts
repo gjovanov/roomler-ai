@@ -8,7 +8,7 @@
  * clones each decoded frame before painting it, stamps the paint, and reads
  * the bottom-right marker off the clone. The first painted frame carrying an
  * armed probe answers it with `bench-probe {seq, paintedAt}`, and the main
- * thread subtracts the send time on the same epoch clock.
+ * thread subtracts the send time, both stamps on the page's clock (#3566).
  *
  * ⚠️ Cost is paid only while a probe is outstanding. A GPU-backed frame
  * reads back whole (about 1–2 ms at 1080p) however small the rect, so
@@ -29,7 +29,8 @@ import { decodeLumaAt, lumaFromRgba, probeRegion } from './rc-bench-marker'
 export interface BenchProbeMessage {
   type: 'bench-probe'
   seq: number
-  /** Epoch ms (`epochNowMs`) right after the frame was handed to the canvas. */
+  /** Epoch ms right after the frame was handed to the canvas, on the page's
+   *  clock: the worker's own, through the skew the page measured (#3566). */
   paintedAt: number
 }
 

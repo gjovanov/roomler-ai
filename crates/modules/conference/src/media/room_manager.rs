@@ -255,24 +255,24 @@ impl RoomManager {
         Ok(serde_json::to_value(caps)?)
     }
 
-    /// Removes a room and all its media state.
-    pub fn remove_room(&self, room_id: &ObjectId) -> bool {
-        if let Some((_, room)) = self.rooms.remove(room_id) {
-            // Clean up connection_rooms mappings
-            let conn_ids: Vec<String> = room
-                .participants
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            for cid in conn_ids {
-                self.connection_rooms.remove(&cid);
-            }
-            // Dropping the room closes the router and all transports/producers/consumers
-            info!(?room_id, "mediasoup room removed");
-            true
-        } else {
-            false
+    /// Removes a room and all its media state. Returns the connections that
+    /// were seated in it, none when there was no such room.
+    pub fn remove_room(&self, room_id: &ObjectId) -> Vec<String> {
+        let Some((_, room)) = self.rooms.remove(room_id) else {
+            return Vec::new();
+        };
+        // Clean up connection_rooms mappings
+        let conn_ids: Vec<String> = room
+            .participants
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for cid in &conn_ids {
+            self.connection_rooms.remove(cid);
         }
+        // Dropping the room closes the router and all transports/producers/consumers
+        info!(?room_id, "mediasoup room removed");
+        conn_ids
     }
 
     pub fn has_room(&self, room_id: &ObjectId) -> bool {
@@ -943,9 +943,12 @@ impl RoomManager {
         removed
     }
 
-    /// Removes ALL participant entries for a given user_id from a room.
-    /// Used by HTTP leave endpoint which doesn't have a connection_id.
-    pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) {
+    /// Removes ALL participant entries for a given user_id from a room, and
+    /// returns the connections it closed. Used by the HTTP leave endpoint,
+    /// which doesn't have a connection_id, and by a membership's end
+    /// (`revoke`), which closes every connection of the person.
+    pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) -> Vec<String> {
+        let mut closed = Vec::new();
         if let Some(room) = self.rooms.get(room_id) {
             let conn_ids: Vec<String> = room
                 .participants
@@ -954,11 +957,36 @@ impl RoomManager {
                 .map(|e| e.key().clone())
                 .collect();
             for cid in conn_ids {
-                room.participants.remove(&cid);
-                self.connection_rooms.remove(&cid);
+                if room.participants.remove(&cid).is_some() {
+                    self.connection_rooms.remove(&cid);
+                    closed.push(cid);
+                }
             }
         }
-        debug!(?room_id, ?user_id, "participant media closed (by user_id)");
+        debug!(
+            ?room_id,
+            ?user_id,
+            closed = closed.len(),
+            "participant media closed (by user_id)"
+        );
+        closed
+    }
+
+    /// Every connection in a room's media.
+    pub fn connection_ids(&self, room_id: &ObjectId) -> Vec<String> {
+        self.rooms
+            .get(room_id)
+            .map(|room| room.participants.iter().map(|e| e.key().clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The rooms on this pod in whose media `user_id` holds a connection.
+    pub fn rooms_with_user(&self, user_id: &ObjectId) -> Vec<ObjectId> {
+        self.rooms
+            .iter()
+            .filter(|room| room.participants.iter().any(|p| &p.user_id == user_id))
+            .map(|room| *room.key())
+            .collect()
     }
 
     /// Returns all producer IDs in a room except those belonging to the given connection.
@@ -1050,6 +1078,14 @@ impl RoomManager {
     /// Returns the room ID that a connection is currently in, if any.
     pub fn get_connection_room(&self, connection_id: &str) -> Option<ObjectId> {
         self.connection_rooms.get(connection_id).map(|v| *v)
+    }
+
+    /// Does `connection_id` hold a participant entry in this room's media, as
+    /// `user_id`? The seat every `media:*` command but the join requires
+    /// (`media_gate::seat`); only a join the gate admitted creates one.
+    pub fn holds_seat(&self, room_id: &ObjectId, connection_id: &str, user_id: &ObjectId) -> bool {
+        self.participant(room_id, connection_id, |p| p.user_id == *user_id)
+            .unwrap_or(false)
     }
 
     /// Creates a DirectTransport consumer that taps into a producer's RTP stream.

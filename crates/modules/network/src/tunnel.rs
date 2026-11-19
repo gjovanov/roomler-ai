@@ -36,18 +36,17 @@ use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     models::{AgentStatus, OsKind, RelayMode, TunnelAuditEvent, TunnelAuditKind},
     signaling::{
-        ClientMsg, CloseReason, REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_MISMATCH,
-        RejectKind, ServerMsg,
+        ClientMsg, CloseReason, NET_GRANT_REFUSED, REJECT_REASON_NO_SESSION,
+        REJECT_REASON_SESSION_MISMATCH, RejectKind, ServerMsg,
     },
-    vault::{NET_GRANT_REFUSED, NetKind, canonical_net_host},
 };
-use roomler_ai_services::auth::AuthService;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use tunnel_core::policy::{
-    GateResult, Principal, ProtocolKind, ResolvedSubject, check_forward_request,
+    GateResult, PolicySubject, Principal, ProtocolKind, ResolvedSubject, TunnelPolicy,
+    check_forward_request,
 };
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
@@ -223,8 +222,8 @@ pub async fn handle_tunnel_client_socket(
             } => {
                 // The dedicated CLI is single-open, so `open_nonce` is
                 // normally None; the server echoes back whatever it sent.
-                // A grant here is refused: a session's flows ride only its
-                // own device's WS (FR-90 P3-7-2a).
+                // A grant here is refused, as everywhere since FR-137 parked
+                // FR-90 (S-B3).
                 session = handle_tunnel_open(
                     &state,
                     &orig,
@@ -457,129 +456,6 @@ pub struct TunnelSession {
     agent_tenant_id: ObjectId,
     #[allow(dead_code)] // T2.6 will plumb this into the agent-WS relay
     transport: String,
-    /// FR-90 P3-7-2a — the grant this tunnel was opened under: its flows
-    /// are an agent SESSION's, decided for the session and held to the
-    /// grant. `None` for a device's or a person's own tunnel.
-    grant: Option<SessionGrant>,
-}
-
-impl TunnelSession {
-    /// FR-90 P3-7-2a — whose flows these are, as the audit records them: the
-    /// session's owner under a grant, else the originator's.
-    fn flow_user(&self, orig: &Originator) -> ObjectId {
-        self.grant
-            .as_ref()
-            .map_or(orig.owner_user_id, |g| g.owner_user_id)
-    }
-
-    /// FR-90 P3-7-2a — the session a row names, under a grant.
-    fn grant_session_id(&self) -> Option<ObjectId> {
-        self.grant.as_ref().map(|g| g.session_id)
-    }
-
-    /// FR-90 P3-7-2a — the grant a row names, under a grant.
-    fn grant_id(&self) -> Option<String> {
-        self.grant.as_ref().map(|g| g.grant_id.clone())
-    }
-}
-
-/// FR-90 P3-7-2a — a grant the vault signed (P3-7-1b), bound to one tunnel at
-/// its open. It holds only from the device it names, toward the exit it
-/// names, until its end; the flows it carries are the session's.
-#[derive(Debug, Clone)]
-struct SessionGrant {
-    session_id: ObjectId,
-    /// The device the session runs on: the connection that carries its flows.
-    device: ObjectId,
-    /// The person the session acts for: its flows' `user_id`.
-    owner_user_id: ObjectId,
-    /// The grant's id, as the vault recorded its allow (`grant:<id>`).
-    grant_id: String,
-    /// A forward's one destination, its host canonical; `None` for SOCKS.
-    dst: Option<(String, u16)>,
-    /// Its end, in seconds since the epoch.
-    exp: i64,
-}
-
-impl SessionGrant {
-    /// The principal its flows are decided for.
-    fn principal(&self) -> Principal {
-        Principal::Session {
-            session_id: self.session_id,
-            agent_id: self.device,
-        }
-    }
-
-    /// Whether one flow stays inside the grant: TCP only, before its end, and
-    /// for a forward toward its one destination, in the spelling the vault
-    /// decided it in (`canonical_net_host`). The reason it does not,
-    /// otherwise. Checked before any policy is read.
-    fn admits(
-        &self,
-        proto: ProtocolKind,
-        dst_host: &str,
-        dst_port: u16,
-        now_s: i64,
-    ) -> Result<(), &'static str> {
-        if proto != ProtocolKind::Tcp {
-            return Err("a session's grant carries TCP only");
-        }
-        if now_s >= self.exp {
-            return Err("the session's grant has ended");
-        }
-        if let Some((host, port)) = &self.dst
-            && (canonical_net_host(dst_host).as_deref() != Some(host.as_str()) || dst_port != *port)
-        {
-            return Err("outside the session's grant");
-        }
-        Ok(())
-    }
-}
-
-/// FR-90 P3-7-2a — verify a grant presented at `rc:tunnel.open` and bind it to
-/// the tunnel. `verify_net_grant` checks its signature, its audience, its
-/// kind, its destination and its life; this checks it names THIS
-/// connection's device as its origin, this open's target as its exit, and
-/// this originator's organization. The reason it does not hold, otherwise.
-///
-/// ⚠️ Only from an agent's own WS: a session's flows ride its device's
-/// connection, never a person's tunnel client.
-fn bind_net_grant(
-    auth: &AuthService,
-    orig: &Originator,
-    exit: ObjectId,
-    token: &str,
-) -> Result<SessionGrant, &'static str> {
-    let Principal::Agent(origin) = orig.principal else {
-        return Err("a session's grant rides only its own device's connection");
-    };
-    let claims = auth
-        .verify_net_grant(token)
-        .map_err(|_| "not a grant this server signed, or it has ended")?;
-    let id =
-        |hex: &str| ObjectId::parse_str(hex).map_err(|_| "a grant naming an id that is not one");
-    if id(&claims.tenant_id)? != orig.tenant_id {
-        return Err("a grant for another organization");
-    }
-    if id(&claims.origin_agent_id)? != origin {
-        return Err("a grant for another device");
-    }
-    if id(&claims.exit_agent_id)? != exit {
-        return Err("a grant for another exit");
-    }
-    let dst = match NetKind::from_wire(&claims.net) {
-        Some(NetKind::Socks) => None,
-        Some(NetKind::Forward) => Some((claims.dst_host.clone(), claims.dst_port)),
-        None => return Err("a grant of a kind this build cannot name"),
-    };
-    Ok(SessionGrant {
-        session_id: id(&claims.sub)?,
-        device: origin,
-        owner_user_id: id(&claims.owner_user_id)?,
-        grant_id: claims.jti,
-        dst,
-        exp: claims.exp,
-    })
 }
 
 /// Identity + reply channel of whoever originated a tunnel-CLIENT session
@@ -623,24 +499,20 @@ impl Originator {
     fn tunnel_client_id(&self) -> Option<ObjectId> {
         match self.principal {
             Principal::TunnelClient(id) => Some(id),
-            Principal::Agent(_) | Principal::Session { .. } => None,
+            Principal::Agent(_) => None,
         }
     }
     /// The originating agent id, or `None` for a dedicated-client origin.
-    /// (An originator is a connection, so never a session; its arm names
-    /// the device the session runs on.)
     fn origin_agent_id(&self) -> Option<ObjectId> {
         match self.principal {
-            Principal::Agent(id) | Principal::Session { agent_id: id, .. } => Some(id),
+            Principal::Agent(id) => Some(id),
             Principal::TunnelClient(_) => None,
         }
     }
     /// Stable id for log lines, regardless of principal kind.
     fn log_id(&self) -> ObjectId {
         match self.principal {
-            Principal::TunnelClient(id)
-            | Principal::Agent(id)
-            | Principal::Session { agent_id: id, .. } => id,
+            Principal::TunnelClient(id) | Principal::Agent(id) => id,
         }
     }
 }
@@ -654,7 +526,8 @@ async fn handle_tunnel_open(
     open_nonce: Option<String>,
     // R4 - the client's DERP identity from TunnelOpen (quic-derp-v1 only).
     derp_pubkey: Option<String>,
-    // FR-90 P3-7-2a - an agent session's grant, from the vault.
+    // FR-137 S-B3 - an agent session's grant (FR-90, parked), which an older
+    // agent may still send. Refused, never verified.
     net_grant: Option<String>,
     client_supported: &[String],
 ) -> Option<TunnelSession> {
@@ -817,40 +690,26 @@ async fn handle_tunnel_open(
         }
     }
 
-    // 3c. FR-90 P3-7-2a — an agent SESSION's grant. Bound here, or the open
-    // is refused: a grant that does not hold must never fall back to the
-    // device's own principal, which would hand the session whatever its
-    // device may reach.
-    let grant = match net_grant.as_deref() {
-        None => None,
-        Some(token) => match bind_net_grant(&state.core.auth, orig, agent_id, token) {
-            Ok(g) => {
-                info!(
-                    origin = %orig.log_id(), %agent_id, session = %g.session_id,
-                    grant = %g.grant_id, forward = g.dst.is_some(),
-                    "tunnel open: bound to an agent session's grant"
-                );
-                Some(g)
-            }
-            Err(why) => {
-                warn!(
-                    origin = %orig.log_id(), %agent_id, why,
-                    "tunnel open refused: its session grant does not hold"
-                );
-                send_msg(
-                    &orig.outbound_tx,
-                    ServerMsg::Error {
-                        session_id: None,
-                        code: NET_GRANT_REFUSED.into(),
-                        message: why.into(),
-                        open_nonce: open_nonce.clone(),
-                    },
-                )
-                .await;
-                return None;
-            }
-        },
-    };
+    // 3c. FR-137 S-B3 — an agent SESSION's grant (FR-90, parked) refuses the
+    // open whenever one is presented. The wire keeps the field, parse-only,
+    // while a 0.4.199 agent may still send one, and the open must never fall
+    // back to the device's own principal, which would hand the session
+    // whatever its device may reach.
+    if net_grant.is_some() {
+        let why = "an agent session's grant, and FR-90 is parked";
+        warn!(origin = %orig.log_id(), %agent_id, why, "tunnel open refused");
+        send_msg(
+            &orig.outbound_tx,
+            ServerMsg::Error {
+                session_id: None,
+                code: NET_GRANT_REFUSED.into(),
+                message: why.into(),
+                open_nonce: open_nonce.clone(),
+            },
+        )
+        .await;
+        return None;
+    }
 
     // Transport negotiation (Phase 1c + Phase 4 agent-version gate).
     // Negotiate quic-v1 only when the client requested it, advertised it
@@ -931,7 +790,6 @@ async fn handle_tunnel_open(
         agent_id,
         agent_tenant_id: agent.tenant_id,
         transport: negotiated_transport.clone(),
-        grant,
     };
     state
         .tunnel_clients_by_session
@@ -948,12 +806,12 @@ async fn handle_tunnel_open(
             )
             .await
         {
+            // Kept anyway (#3840): the heartbeat re-sets an absent record.
             debug!(%tunnel_session_id, %e, "tunnel ownership claim failed");
-        } else {
-            state
-                .tunnel_presence_tokens
-                .insert(tunnel_session_id, token);
         }
+        state
+            .tunnel_presence_tokens
+            .insert(tunnel_session_id, token);
     }
     // P7 flap resilience: index the session by its TARGET agent so
     // `terminate_sessions_targeting_agent` can kill it the moment that
@@ -965,9 +823,7 @@ async fn handle_tunnel_open(
         .insert(tunnel_session_id);
 
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
-    // T2.7 updates this after candidate selection. Under a grant the row
-    // names the session, its grant, and the session's owner (P3-7-2a).
-    let grant_id = new_session.grant_id();
+    // T2.7 updates this after candidate selection.
     let _ = state
         .tunnel_audit
         .append(&TunnelAuditEvent {
@@ -977,7 +833,7 @@ async fn handle_tunnel_open(
             tunnel_client_id: orig.tunnel_client_id(),
             origin_agent_id: orig.origin_agent_id(),
             agent_id,
-            user_id: new_session.flow_user(orig),
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::PeerOpen,
             flow_id: None,
@@ -993,8 +849,6 @@ async fn handle_tunnel_open(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: new_session.grant_session_id(),
-            grant_id: grant_id.clone(),
         })
         .await;
 
@@ -1057,9 +911,6 @@ async fn handle_tunnel_open(
             ice_servers: quic_ice_servers,
             quic_auth_token,
             open_nonce,
-            // P3-7-2a — the device's proof the grant was bound: a device
-            // that sent one and finds no echo carries no session flow here.
-            net_grant_id: grant_id,
         },
     )
     .await;
@@ -1135,6 +986,45 @@ fn forward_forward_msg(
     }
 }
 
+/// The role ids a forward is matched with (#3635): what `lookup` reads, which
+/// in the gate is the roles the originator's owner holds in the org whose
+/// `policies` decide the forward, read on every forward request so a role
+/// given or taken back counts from the next forward on.
+///
+/// - No live policy names a role: empty, and `lookup` is never called. A
+///   role list can change no decision then, and the common case should not
+///   pay a read for the rare one.
+/// - `lookup` fails: empty, with a WARN naming the origin. Role subjects then
+///   match nobody and every other subject kind evaluates as before; an
+///   unreadable role list never turns into an allow.
+async fn forward_role_ids<F, Fut, E>(
+    policies: &[TunnelPolicy],
+    lookup: F,
+    origin: ObjectId,
+) -> Vec<ObjectId>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ObjectId>, E>>,
+    E: std::fmt::Display,
+{
+    let names_a_role = policies.iter().any(|p| {
+        p.deleted_at.is_none()
+            && p.subjects
+                .iter()
+                .any(|s| matches!(s, PolicySubject::RoleId { .. }))
+    });
+    if !names_a_role {
+        return Vec::new();
+    }
+    match lookup().await {
+        Ok(role_ids) => role_ids,
+        Err(e) => {
+            warn!(%origin, %e, "tunnel forward: roles unreadable; role subjects will not match this forward");
+            Vec::new()
+        }
+    }
+}
+
 /// Server-side forward gate + relay, shared by TCP CONNECT
 /// (`proto = Tcp`) and UDP ASSOCIATE (`proto = Udp`) forwards. The ACL
 /// eval, cross-tenant gate, agent-liveness re-check, and audit trail are
@@ -1181,39 +1071,6 @@ async fn handle_forward_request(
         return;
     }
 
-    // FR-90 P3-7-2a — a session's flow is held to its grant before any
-    // policy is read: TCP only, before the grant's end, and a forward toward
-    // its one destination.
-    if let Some(g) = &s.grant {
-        let now_s = DateTime::now().timestamp_millis().div_euclid(1000);
-        if let Err(why) = g.admits(proto, dst_host, dst_port, now_s) {
-            info!(origin = %orig.log_id(), session = %g.session_id, %flow_id, %dst_host, %dst_port, ?proto, why, "session flow rejected by its grant");
-            audit_tcp_reject(
-                state,
-                s,
-                orig,
-                flow_id,
-                dst_host,
-                dst_port,
-                RejectKind::AclDenied,
-                why,
-            )
-            .await;
-            send_msg(
-                &orig.outbound_tx,
-                forward_reject_msg(
-                    proto,
-                    request_session_id,
-                    flow_id,
-                    RejectKind::AclDenied,
-                    why.into(),
-                ),
-            )
-            .await;
-            return;
-        }
-    }
-
     // Re-fetch the agent row each time so a quarantine that lands
     // mid-session bites the next forward.
     let agent = match state.fleet.agents.base.find_by_id(s.agent_id).await {
@@ -1245,12 +1102,22 @@ async fn handle_forward_request(
         }
     };
 
+    // The org whose policies decide this forward: the target device's. A
+    // forward between two orgs is refused below (`CrossTenant`) whatever its
+    // policies say.
+    let policy_tenant = s.agent_tenant_id;
+
     // Active policies for the agent's tenant. Server-side ACL is
     // the auth boundary; the agent runs its own minimal allowlist
     // as defence-in-depth (T2.6).
+    //
+    // ⚠️ No permission bit is read here, by design: the policy IS the grant,
+    // and it exists to let people who hold no management bit reach what it
+    // names. What keeps that sound is who may WRITE a policy: `MANAGE_AGENTS`
+    // (`routes::tunnel::tunnel_policy_manager`).
     let policies = match state
         .tunnel_policies
-        .list_active_for_tenant(s.agent_tenant_id)
+        .list_active_for_tenant(policy_tenant)
         .await
     {
         Ok(p) => p,
@@ -1260,24 +1127,28 @@ async fn handle_forward_request(
         }
     };
 
+    // The roles a `RoleId` subject is matched against: those the originator's
+    // owner holds in `policy_tenant`, read now, on this forward (#3635).
+    let tenants = &state.tenants;
+    let owner = orig.owner_user_id;
+    let role_ids = forward_role_ids(
+        &policies,
+        move || tenants.member_live_role_ids(policy_tenant, owner),
+        orig.log_id(),
+    )
+    .await;
+
     let subject = ResolvedSubject {
-        // FR-90 P3-7-2a — under a grant, the session's owner.
-        user_id: s.flow_user(orig),
-        // T2.6 will resolve role_ids via the existing tenant
-        // membership lookup. For T2.5 we use an empty list — only
-        // UserId / TunnelClientId / AgentId / AllUsers policy subjects
-        // match.
-        role_ids: Vec::new(),
+        // `UserId` subjects match the originator's owner: the person who
+        // enrolled the tunnel client, or the device's owner, read when the
+        // device's socket connected.
+        user_id: orig.owner_user_id,
+        role_ids,
         // Subject-agnostic (P3b-2): a tunnel-client WS carries
         // `Principal::TunnelClient`, an agent driving the client role over
         // its own WS carries `Principal::Agent`. The ACL evaluator
         // discriminates the id-specific subjects on the principal kind.
-        // FR-90 P3-7-2a — a tunnel opened under a session's grant carries
-        // `Principal::Session`, which no subject matches before decision 20.
-        principal: s
-            .grant
-            .as_ref()
-            .map_or(orig.principal, SessionGrant::principal),
+        principal: orig.principal,
     };
 
     let result = check_forward_request(
@@ -1306,7 +1177,7 @@ async fn handle_forward_request(
                     dst_host.to_string(),
                     dst_port,
                     // Under a grant, the session's owner (P3-7-2a).
-                    s.flow_user(orig),
+                    orig.owner_user_id,
                 ),
             );
             match relay {
@@ -1383,7 +1254,7 @@ async fn audit_tcp_accept(
             tunnel_client_id: orig.tunnel_client_id(),
             origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: session.flow_user(orig),
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpAccept,
             flow_id: Some(flow_id),
@@ -1399,8 +1270,6 @@ async fn audit_tcp_accept(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: session.grant_session_id(),
-            grant_id: session.grant_id(),
         })
         .await;
 }
@@ -1425,7 +1294,7 @@ async fn audit_tcp_reject(
             tunnel_client_id: orig.tunnel_client_id(),
             origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: session.flow_user(orig),
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpReject,
             flow_id: Some(flow_id),
@@ -1441,8 +1310,6 @@ async fn audit_tcp_reject(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: Some(format!("{kind:?}: {reason}")),
-            session_id: session.grant_session_id(),
-            grant_id: session.grant_id(),
         })
         .await;
 }
@@ -1457,7 +1324,7 @@ async fn audit_peer_close(state: &NetworkState, session: &TunnelSession, orig: &
             tunnel_client_id: orig.tunnel_client_id(),
             origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: session.flow_user(orig),
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::PeerClose,
             flow_id: None,
@@ -1473,8 +1340,6 @@ async fn audit_peer_close(state: &NetworkState, session: &TunnelSession, orig: &
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: session.grant_session_id(),
-            grant_id: session.grant_id(),
         })
         .await;
 }
@@ -1723,7 +1588,7 @@ async fn audit_tcp_close(
             tunnel_client_id: orig.tunnel_client_id(),
             origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: session.flow_user(orig),
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpClosed,
             flow_id: Some(flow_id),
@@ -1739,8 +1604,6 @@ async fn audit_tcp_close(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: Some(format!("{reason:?}")),
-            session_id: session.grant_session_id(),
-            grant_id: session.grant_id(),
         })
         .await;
 }
@@ -1865,7 +1728,7 @@ pub async fn relay_tunnel_client_msg_from_agent(
                 transport,
                 open_nonce,
                 derp_pubkey,
-                // FR-90 P3-7-2a — an agent session's grant, bound here.
+                // FR-137 S-B3 — refused if present.
                 net_grant,
                 supported_transports,
             )
@@ -2324,208 +2187,217 @@ pub fn ws_upgrade_tunnel_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use tunnel_core::policy::{
+        Decision, DestinationRule, HostPattern, PolicyTarget, PortRange, evaluate,
+    };
 
-    fn grant(dst: Option<(&str, u16)>, exp: i64) -> SessionGrant {
-        SessionGrant {
-            session_id: ObjectId::new(),
-            device: ObjectId::new(),
-            owner_user_id: ObjectId::new(),
-            grant_id: "g1".into(),
-            dst: dst.map(|(h, p)| (h.to_string(), p)),
-            exp,
-        }
-    }
-
-    /// FR-90 P3-7-2a — a flow stays inside its session's grant: TCP only,
-    /// before its end, and a forward toward its one destination, in any
-    /// spelling of its host. SOCKS names no destination: the policies decide.
-    #[test]
-    fn a_flow_is_held_to_its_sessions_grant() {
-        let now = 1_000;
-        let forward = grant(Some(("db.internal", 5432)), now + 60);
-        assert_eq!(
-            forward.admits(ProtocolKind::Tcp, "db.internal", 5432, now),
-            Ok(())
-        );
-        assert_eq!(
-            forward.admits(ProtocolKind::Tcp, "DB.Internal.", 5432, now),
-            Ok(()),
-            "one spelling"
-        );
-        for (host, port) in [
-            ("db.internal", 22),
-            ("other.internal", 5432),
-            ("010.0.0.5", 5432),
-            ("", 5432),
-        ] {
-            assert!(
-                forward.admits(ProtocolKind::Tcp, host, port, now).is_err(),
-                "{host}:{port}"
-            );
-        }
-        assert!(
-            forward
-                .admits(ProtocolKind::Udp, "db.internal", 5432, now)
-                .is_err(),
-            "TCP only"
-        );
-        assert!(
-            forward
-                .admits(ProtocolKind::Tcp, "db.internal", 5432, now + 60)
-                .is_err(),
-            "not at its end"
-        );
-        let socks = grant(None, now + 60);
-        assert_eq!(
-            socks.admits(ProtocolKind::Tcp, "anything.example", 443, now),
-            Ok(())
-        );
-        assert!(
-            socks
-                .admits(ProtocolKind::Udp, "anything.example", 53, now)
-                .is_err()
-        );
-        assert!(
-            socks
-                .admits(ProtocolKind::Tcp, "anything.example", 443, now + 61)
-                .is_err()
-        );
-    }
-
-    /// FR-90 P3-7-2a — a grant's flows are decided for its session, on the
-    /// device that carries them, never for the device itself.
-    #[test]
-    fn a_grants_flows_are_decided_for_its_session() {
-        let g = grant(None, 1);
-        assert_eq!(
-            g.principal(),
-            Principal::Session {
-                session_id: g.session_id,
-                agent_id: g.device,
-            }
-        );
-        assert_ne!(g.principal(), Principal::Agent(g.device));
-    }
-
-    /// An auth service under a secret made at run time.
-    fn auth() -> AuthService {
-        AuthService::new(roomler_ai_config::JwtSettings {
-            secret: format!("p372a-{}-{}", ObjectId::new(), ObjectId::new()),
-            previous_secrets: String::new(),
-            access_token_ttl_secs: 3600,
-            refresh_token_ttl_secs: 3600,
-            issuer: "roomler-ai-test".into(),
-        })
-    }
-
-    fn originator(principal: Principal, tenant_id: ObjectId) -> Originator {
-        let (outbound_tx, _) = mpsc::channel(1);
-        Originator {
-            principal,
-            tenant_id,
-            owner_user_id: ObjectId::new(),
-            client_version: String::new(),
-            client_os: OsKind::Linux,
-            outbound_tx,
-            dialed_tid: None,
-            conn_established_ms: 0,
-        }
-    }
-
-    /// FR-90 P3-7-2a — a grant binds only where it holds: on an agent's own
-    /// connection, signed by this server, in its organization, from the device
-    /// it names and toward the exit it names. What it binds is the session's,
-    /// as the grant names it. Each refusal is in its own words.
-    #[test]
-    fn a_grant_binds_only_where_it_holds() {
-        use roomler_ai_services::auth::NetGrant;
-        let ours = auth();
-        let (tenant, device, exit) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        let (session, owner, grant_id) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        let exp = DateTime::now().timestamp_millis().div_euclid(1000) + 60;
-        let sign = |by: &AuthService, dst: Option<(&str, u16)>| {
-            by.issue_net_grant(&NetGrant {
-                session_id: session,
-                tenant_id: tenant,
-                fence: 1,
-                owner_user_id: owner,
-                origin_agent_id: device,
-                exit_agent_id: exit,
-                net: if dst.is_some() {
-                    NetKind::Forward
-                } else {
-                    NetKind::Socks
+    /// A policy granting `127.0.0.1:port` on every device to `subjects`.
+    fn policy(subjects: Vec<PolicySubject>, port: u16) -> TunnelPolicy {
+        let now = DateTime::now();
+        TunnelPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: format!("grant :{port}"),
+            subjects,
+            targets: vec![PolicyTarget::AllAgents],
+            allowlist: vec![DestinationRule {
+                host_pattern: HostPattern::Cidr("127.0.0.0/8".into()),
+                port_range: PortRange {
+                    low: port,
+                    high: port,
                 },
-                dst,
-                grant_id,
-                exp,
-            })
-            .expect("a grant that holds together is signed")
-        };
-        let on_device = originator(Principal::Agent(device), tenant);
-
-        let forward = sign(&ours, Some(("db.internal", 5432)));
-        let g = bind_net_grant(&ours, &on_device, exit, &forward).expect("it holds");
-        assert_eq!(
-            (g.session_id, g.device, g.owner_user_id, g.grant_id.as_str()),
-            (session, device, owner, grant_id.to_hex().as_str())
-        );
-        assert_eq!(
-            (g.dst, g.exp),
-            (Some(("db.internal".to_string(), 5432)), exp)
-        );
-        let socks = sign(&ours, None);
-        assert_eq!(
-            bind_net_grant(&ours, &on_device, exit, &socks)
-                .expect("it holds")
-                .dst,
-            None
-        );
-
-        let elsewhere = ObjectId::new();
-        for (orig, open_exit, token, why) in [
-            (
-                originator(Principal::TunnelClient(device), tenant),
-                exit,
-                socks.clone(),
-                "a session's grant rides only its own device's connection",
-            ),
-            (
-                originator(Principal::Agent(device), tenant),
-                exit,
-                sign(&auth(), None),
-                "not a grant this server signed, or it has ended",
-            ),
-            (
-                originator(Principal::Agent(device), tenant),
-                exit,
-                "a.b.c".to_string(),
-                "not a grant this server signed, or it has ended",
-            ),
-            (
-                originator(Principal::Agent(device), elsewhere),
-                exit,
-                socks.clone(),
-                "a grant for another organization",
-            ),
-            (
-                originator(Principal::Agent(elsewhere), tenant),
-                exit,
-                socks.clone(),
-                "a grant for another device",
-            ),
-            (
-                originator(Principal::Agent(device), tenant),
-                elsewhere,
-                socks.clone(),
-                "a grant for another exit",
-            ),
-        ] {
-            assert_eq!(
-                bind_net_grant(&ours, &orig, open_exit, &token).err(),
-                Some(why),
-                "{why}"
-            );
+                proto: ProtocolKind::Any,
+            }],
+            max_concurrent_flows: None,
+            max_bytes_per_session: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
         }
+    }
+
+    fn role(role_id: ObjectId) -> PolicySubject {
+        PolicySubject::RoleId { role_id }
+    }
+
+    /// [`forward_role_ids`] over `policies` with a lookup that answers
+    /// `answer`, and how many times the lookup ran.
+    fn resolve(
+        policies: &[TunnelPolicy],
+        answer: Result<Vec<ObjectId>, &'static str>,
+    ) -> (Vec<ObjectId>, u32) {
+        let calls = Cell::new(0);
+        let lookup = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(answer)
+        };
+        let roles =
+            futures::executor::block_on(forward_role_ids(policies, lookup, ObjectId::new()));
+        (roles, calls.get())
+    }
+
+    /// Whether `evaluate` lets `subject` reach `127.0.0.1:port` on some device.
+    fn allows(policies: &[TunnelPolicy], subject: &ResolvedSubject, port: u16) -> bool {
+        matches!(
+            evaluate(
+                policies,
+                subject,
+                ObjectId::new(),
+                "127.0.0.1",
+                port,
+                ProtocolKind::Tcp
+            ),
+            Decision::Allow { .. }
+        )
+    }
+
+    /// A `tracing` writer into a buffer, so a test reads the WARN line the
+    /// gate writes. Installed thread-scoped (`with_default`), so a parallel
+    /// test's events never land in it.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with every WARN+ event captured; return its value and the text.
+    fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// No live policy names a role: no role list can change the decision, so
+    /// none is read.
+    #[test]
+    fn without_a_role_subject_the_roles_are_not_read() {
+        let others = vec![
+            policy(
+                vec![PolicySubject::UserId {
+                    user_id: ObjectId::new(),
+                }],
+                9001,
+            ),
+            policy(
+                vec![PolicySubject::TunnelClientId {
+                    tunnel_client_id: ObjectId::new(),
+                }],
+                9002,
+            ),
+            policy(
+                vec![PolicySubject::AgentId {
+                    agent_id: ObjectId::new(),
+                }],
+                9003,
+            ),
+            policy(vec![PolicySubject::AllUsers], 9004),
+        ];
+        assert_eq!(resolve(&others, Ok(vec![ObjectId::new()])), (vec![], 0));
+        assert_eq!(resolve(&[], Ok(vec![ObjectId::new()])), (vec![], 0));
+    }
+
+    /// A policy the evaluator skips (deleted) names no role either.
+    #[test]
+    fn a_deleted_role_policy_reads_nothing() {
+        let mut gone = policy(vec![role(ObjectId::new())], 9000);
+        gone.deleted_at = Some(DateTime::now());
+        assert_eq!(resolve(&[gone], Ok(vec![ObjectId::new()])), (vec![], 0));
+    }
+
+    /// A live role subject: the roles are read once, returned as read, and
+    /// decide the role policy: a holder is allowed, anyone else is not.
+    #[test]
+    fn a_role_subject_reads_the_roles_and_they_decide_the_policy() {
+        let ops = ObjectId::new();
+        let other = ObjectId::new();
+        let policies = vec![policy(vec![role(ops)], 9000)];
+
+        let (held, calls) = resolve(&policies, Ok(vec![other, ops]));
+        assert_eq!((held.clone(), calls), (vec![other, ops], 1));
+        let holder = ResolvedSubject {
+            user_id: ObjectId::new(),
+            role_ids: held,
+            principal: Principal::TunnelClient(ObjectId::new()),
+        };
+        assert!(allows(&policies, &holder, 9000), "a holder of the role");
+
+        let (none_held, _) = resolve(&policies, Ok(vec![other]));
+        let not_holder = ResolvedSubject {
+            role_ids: none_held,
+            ..holder
+        };
+        assert!(!allows(&policies, &not_holder, 9000), "a person without it");
+    }
+
+    /// The read fails: no roles, a WARN that names the origin and the error,
+    /// and never an allow through a role. A user subject in the same set still
+    /// allows its user: only role subjects lose.
+    #[test]
+    fn an_unreadable_role_list_is_no_roles_and_a_warn_never_an_allow() {
+        let person = ObjectId::new();
+        let origin = ObjectId::new();
+        let ops = ObjectId::new();
+        let policies = vec![
+            policy(vec![role(ops)], 9000),
+            policy(vec![PolicySubject::UserId { user_id: person }], 9001),
+        ];
+        let calls = Cell::new(0);
+        let (roles, warns) = capture_warns(|| {
+            futures::executor::block_on(forward_role_ids(
+                &policies,
+                || {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Err::<Vec<ObjectId>, _>("role store unreachable"))
+                },
+                origin,
+            ))
+        });
+
+        assert_eq!((roles.clone(), calls.get()), (vec![], 1));
+        assert!(warns.contains("WARN"), "a WARN is written: {warns}");
+        assert!(warns.contains("roles unreadable"), "{warns}");
+        assert!(
+            warns.contains(&origin.to_hex()),
+            "the WARN names the origin: {warns}"
+        );
+        assert!(
+            warns.contains("role store unreachable"),
+            "and the error: {warns}"
+        );
+
+        let subject = ResolvedSubject {
+            user_id: person,
+            role_ids: roles,
+            principal: Principal::Agent(origin),
+        };
+        assert!(
+            !allows(&policies, &subject, 9000),
+            "an unreadable role list never allows through a role"
+        );
+        assert!(
+            allows(&policies, &subject, 9001),
+            "a user subject in the same set evaluates as before"
+        );
     }
 }

@@ -11,6 +11,38 @@ use std::sync::Arc;
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::TaskCategory;
 
+/// The room an export reads, through `chat`'s room guard (the one visibility
+/// rule the room routes, the xlsx export and `conference` share): the caller
+/// is a member of the path tenant, the room is a room of that tenant, and the
+/// room's visibility lets the caller read it. A room of another tenant, or
+/// none, answers 404 as a missing room does.
+async fn require_readable_room(
+    state: &AppState,
+    tid: ObjectId,
+    rid: ObjectId,
+    user_id: ObjectId,
+) -> Result<(), ApiError> {
+    #[cfg(feature = "chat")]
+    {
+        let rooms = roomler_ai_services::dao::room::RoomDao::new(&state.db);
+        roomler_ai_mod_chat::guards::require_room_in_tenant_with(
+            &state.tenants,
+            &rooms,
+            tid,
+            rid,
+            user_id,
+        )
+        .await
+        .map(|_| ())
+    }
+    // A build without `chat` has no rooms to export.
+    #[cfg(not(feature = "chat"))]
+    {
+        let _ = (state, tid, rid, user_id);
+        Err(ApiError::NotFound("Resource not found".to_string()))
+    }
+}
+
 /// POST /api/tenant/:tid/export/conversation-pdf
 /// Export conversation as PDF (background task).
 #[derive(Debug, Deserialize)]
@@ -29,9 +61,10 @@ pub async fn export_conversation_pdf(
     let rid = ObjectId::parse_str(&body.room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    // The room is resolved as every room route resolves it, before anything
+    // is read or a task is made: tenant membership, the room in the path
+    // tenant, and the room's visibility.
+    require_readable_room(&state, tid, rid, auth.user_id).await?;
 
     let task = state
         .tasks

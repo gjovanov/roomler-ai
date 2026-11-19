@@ -17,7 +17,7 @@
                  "Goran" and was refused as invalid credentials. -->
             <v-text-field
               v-model="username"
-              :label="$t('auth.username')"
+              :label="$t('auth.usernameOrEmail')"
               prepend-inner-icon="mdi-account"
               :rules="[rules.required]"
               autofocus

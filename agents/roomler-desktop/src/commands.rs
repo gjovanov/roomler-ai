@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
     pub enrolled: bool,
+    /// #4020 — whether this device is enrolled cannot be known: no config
+    /// this person reads holds an enrollment, the device service's own config
+    /// is there where they may not read it ([`ServiceConfig`]), and no
+    /// service named one. `enrolled` is `false` then, and the pages read it
+    /// as the service being offline, never as "Not enrolled": no set-up
+    /// offer. Until #4020 an enrolled Linux system install with its service
+    /// stopped, and a one-row Mac for a missed answer, offered set-up.
+    pub enrollment_unknown: bool,
     pub agent_id: Option<String>,
     pub tenant_id: Option<String>,
     pub server_url: Option<String>,
@@ -53,7 +61,8 @@ pub struct StatusReport {
 }
 
 /// Read current agent config + probe service state for the status view. Never
-/// errors — missing config = `enrolled: false`.
+/// errors — missing config = `enrolled: false`, and an enrollment that cannot
+/// be read is `enrollment_unknown` (#4020).
 ///
 /// ASYNC so the blocking service-state probe runs OFF the main (UI) thread:
 /// Tauri runs synchronous commands on the main thread, and `status.js` polls
@@ -67,23 +76,57 @@ pub async fn cmd_status() -> StatusReport {
         .await
         .unwrap_or_else(|_| status_report());
     // #1701 — the file said "not enrolled"; ask the daemon before believing it.
-    if !report.enrolled
-        && let Some(id) = daemon_node_status()
-            .await
-            .as_ref()
-            .and_then(daemon_identity)
-    {
-        apply_daemon_identity(&mut report, id);
+    if !report.enrolled {
+        let answer = daemon_node_status().await;
+        take_daemon_word(&mut report, answer.as_ref());
     }
     report
+}
+
+/// #1701 — `answer`, the daemon's `status`, settles a report whose files hold
+/// no enrollment when it names one ([`daemon_identity`]). No answer, or one
+/// that names none, leaves the report as the files left it: not enrolled, or,
+/// #4020, `enrollment_unknown`. A one-row Mac's screen worker answers with no
+/// name when the root half did not answer it (FR-43 P3a): a missed answer,
+/// never an un-enrollment, because the worker lives only while its root
+/// daemon does (#2987).
+fn take_daemon_word(report: &mut StatusReport, answer: Option<&NodeStatus>) {
+    if let Some(id) = answer.and_then(daemon_identity) {
+        apply_daemon_identity(report, id);
+    }
 }
 
 /// The blocking status-probe body — run on the blocking pool by [`cmd_status`],
 /// and directly by the (already-async, user-triggered) enroll commands.
 fn status_report() -> StatusReport {
-    let (service_kind, service_running) = probe_service_state();
+    let service = probe_service_state();
+    let own = load_optional_config(service.0 == "scmService");
+    status_report_from(Platform::HERE, service, own, ServiceConfig::of_held)
+}
+
+/// [`status_report`] from what it read: the device service's kind and state
+/// ([`probe_service_state`]), this person's own config (`own`, as
+/// [`load_optional_config`] loaded it), and `stat`, which says whether the
+/// device service's own config is there where this person may not read it
+/// ([`ServiceConfig`]). It is asked only when `own` holds no enrollment and
+/// [`enrollment_held_at`] names that config for `platform`.
+fn status_report_from(
+    platform: Platform,
+    (service_kind, service_running): (String, bool),
+    own: Option<AgentConfig>,
+    stat: impl FnOnce(HeldAt) -> ServiceConfig,
+) -> StatusReport {
     let is_scm = service_kind == "scmService";
-    let cfg = load_optional_config(is_scm);
+    // FR-43 P3a — a person's file on a one-row Mac holds their settings and no
+    // enrollment. That reads as no file, so `cmd_status` asks the daemon.
+    let own_without_enrollment = own.as_ref().is_some_and(|c| !c.has_primary_enrollment());
+    let cfg = own.filter(AgentConfig::has_primary_enrollment);
+    // #4020 — and the device service's own config, which this person may not
+    // read: is it there? Only whether it is; it is never read.
+    let held = match enrollment_held_at(platform, &service_kind, own_without_enrollment) {
+        Some(at) if cfg.is_none() => stat(at),
+        _ => ServiceConfig::Absent,
+    };
     // S1b — read BOTH sentinel locations (per-user + machine-global) and
     // parse message/reason; the old path-only read missed a SystemContext
     // host's machine-global sentinel entirely.
@@ -93,6 +136,7 @@ fn status_report() -> StatusReport {
         .map(|i| i.path.to_string_lossy().into_owned());
     StatusReport {
         enrolled: cfg.is_some(),
+        enrollment_unknown: cfg.is_none() && held.may_hold_an_enrollment(),
         agent_id: cfg.as_ref().map(|c| c.agent_id.clone()),
         tenant_id: cfg.as_ref().map(|c| c.tenant_id.clone()),
         server_url: cfg.as_ref().map(|c| c.server_url.clone()),
@@ -156,10 +200,135 @@ fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
         return;
     }
     report.enrolled = true;
+    // #4020 — the daemon named it, so it is known.
+    report.enrollment_unknown = false;
     report.agent_id = Some(id.agent_id);
     report.tenant_id = Some(id.tenant_id);
     report.server_url = id.server_url;
     report.device_name = Some(id.device_name);
+}
+
+/// #4020 — the OS this build runs on, as the rule of where the device service
+/// holds an enrollment reads it ([`enrollment_held_at`]). A value rather than
+/// `cfg!` alone, so that every platform's rule is tested on every lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    Linux,
+    Mac,
+}
+
+impl Platform {
+    const HERE: Self = if cfg!(windows) {
+        Self::Windows
+    } else if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Linux
+    };
+}
+
+/// #4020 — the device service's own config, where its person may not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldAt {
+    /// Windows: the machine-wide service's machine-global config
+    /// (`config::machine_global_config_path`). Its folder is SYSTEM's and the
+    /// Administrators' alone (#3609).
+    MachineGlobal,
+    /// [`ROOT_CONFIG`]: a Linux system install's, or a Mac's root half's.
+    RootConfig,
+}
+
+/// #4020 — the root daemon's config: the `--config` of the packaged
+/// `roomlerd.service` on Linux (`appdirs::system_config_path`) and of
+/// `com.roomler.daemon.plist` on a Mac (roomlerd's `one_row::ROOT_CONFIG`).
+/// `roomlerd enroll` and `install.sh` make its folder `0755`, and the file
+/// `0600`: its person can see that it is there, and cannot read it.
+const ROOT_CONFIG: &str = "/etc/roomler/config.toml";
+
+impl HeldAt {
+    /// Where it is on this OS; `None` for the machine-global config off
+    /// Windows, which names none.
+    fn path(self) -> Option<PathBuf> {
+        match self {
+            #[cfg(windows)]
+            HeldAt::MachineGlobal => Some(config::machine_global_config_path()),
+            #[cfg(not(windows))]
+            HeldAt::MachineGlobal => None,
+            HeldAt::RootConfig => Some(PathBuf::from(ROOT_CONFIG)),
+        }
+    }
+}
+
+/// #4020 — where the device service holds this host's enrollment, when the
+/// config this person reads holds none: the config to look for.
+///
+/// - **Windows**: the machine-global one, when the machine-wide service is
+///   registered (`scmService`), as [`active_config_path`] reads it. A
+///   per-user install with a machine copy left behind is not asked.
+/// - **Linux**: [`ROOT_CONFIG`], when the root unit is registered
+///   (`systemDaemon`). A per-user install is not asked.
+/// - **A Mac**: [`ROOT_CONFIG`], when the person's own file is there and holds
+///   no enrollment: the one-row layout, where the root half holds the device's
+///   (FR-43 P3a). A two-row Mac whose per-user half is not enrolled has no
+///   such file, and is still offered set-up.
+///
+/// ⚠️ A registered service that is not running is no sign of an enrollment:
+/// a daemon with no config exits ("no config found … Run 'roomlerd enroll'
+/// first"), so a fresh system install's service is registered and stopped.
+/// Only the config being there is, so the service's state never decides it.
+fn enrollment_held_at(
+    platform: Platform,
+    service_kind: &str,
+    own_without_enrollment: bool,
+) -> Option<HeldAt> {
+    match platform {
+        Platform::Windows => (service_kind == "scmService").then_some(HeldAt::MachineGlobal),
+        Platform::Linux => (service_kind == "systemDaemon").then_some(HeldAt::RootConfig),
+        Platform::Mac => own_without_enrollment.then_some(HeldAt::RootConfig),
+    }
+}
+
+/// #4020 — what a `stat` of the device service's own config ([`HeldAt`])
+/// answers its person. Never a read: the file is the service's, and it holds
+/// the agent token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceConfig {
+    /// Not there (`NotFound`, or any answer that is not a yes): the service
+    /// holds no enrollment, and a host not enrolled yet reads "Not enrolled".
+    Absent,
+    /// There. On Linux and a Mac its folder (`0755`) lets the person see it,
+    /// and its mode (`0600`, root's) does not let them read it.
+    There,
+    /// The folder does not say (`PermissionDenied`). On Windows that is the
+    /// answer for a file that is there: the machine-global folder answers
+    /// `NotFound` for one that is not (measured with a basic-user token). On
+    /// Linux or a Mac it is a folder closed to the person (`0700`, as the
+    /// legacy-config migration makes it, or under a restrictive umask), which
+    /// answers it whatever is inside. Counted as there: every path that
+    /// closes the folder comes with a config.
+    Closed,
+}
+
+impl ServiceConfig {
+    /// A `stat` of `path`, logging nothing: it runs on every status poll.
+    fn of(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(_) => Self::There,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Self::Closed,
+            Err(_) => Self::Absent,
+        }
+    }
+
+    /// [`Self::of`] the config `at` names on this OS.
+    fn of_held(at: HeldAt) -> Self {
+        at.path().map_or(Self::Absent, |path| Self::of(&path))
+    }
+
+    /// Whether the service may hold an enrollment that its person cannot read.
+    fn may_hold_an_enrollment(self) -> bool {
+        self != Self::Absent
+    }
 }
 
 /// The daemon's `status`, best-effort: a daemon that is down simply leaves
@@ -167,6 +336,11 @@ fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
 async fn daemon_node_status() -> Option<NodeStatus> {
     let mut client = localapi::connect().await.ok()?;
     client.status().await.ok()
+}
+
+/// [`daemon_node_status`], for code on the blocking pool.
+fn daemon_node_status_blocking() -> Option<NodeStatus> {
+    tauri::async_runtime::block_on(daemon_node_status())
 }
 
 /// The daemon log directory to show / open. `logging::log_dir()` only works IN
@@ -216,8 +390,9 @@ fn active_config_path(is_scm: bool) -> Result<PathBuf, String> {
 }
 
 /// Machine-global only for an SCM-service flavour AND when the file exists
-/// (an SCM install briefly runs on a per-user config until the daemon
-/// self-heals it to machine-global); per-user in every other case.
+/// (an SCM install with no machine enrollment runs the person's own per-user
+/// config, as that person, until one is written: #3387); per-user in every
+/// other case.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn choose_config_path(
     is_scm: bool,
@@ -323,10 +498,19 @@ impl DeviceView {
 /// absent, and this returns `available:false` + a `reason` so the SPA renders a
 /// clean "device service not running" state instead of a rejected promise. On
 /// success it issues `status` then `peers` on ONE connection.
+///
+/// #4020 — through [`connect_service`], so a stopped service on a Linux system
+/// install or a Mac reads `daemon_unreachable`, not `connect_error`.
 #[tauri::command]
 pub async fn cmd_device_view() -> DeviceView {
+    device_view(connect_service().await).await
+}
+
+/// [`cmd_device_view`] after its connect: `connected` is the connect's
+/// result.
+async fn device_view(connected: std::io::Result<localapi::Client>) -> DeviceView {
     const SURFACE: &str = "device_view";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => {
             let reason = if e.kind() == std::io::ErrorKind::NotFound {
@@ -384,7 +568,7 @@ pub async fn cmd_ping(
     timeout_ms: Option<u64>,
     prefer_v6: Option<bool>,
 ) -> Result<PingResult, String> {
-    let mut client = localapi::connect().await.map_err(|e| {
+    let mut client = connect_service().await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "device service not running".to_string()
         } else {
@@ -449,6 +633,26 @@ pub async fn cmd_enroll(
     Ok(status_report())
 }
 
+/// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
+/// no enrollment, or is not there: the device service holds it. A one-row
+/// Mac's person has a file with no enrollment in it, which the screen worker
+/// writes at its first start; a Windows background-service install's person
+/// has no file, and the machine-wide one only administrators read.
+fn enrollment_elsewhere() -> String {
+    if cfg!(target_os = "macos") {
+        "The root daemon holds this Mac's enrollment. Refresh it with \
+         `sudo roomlerd re-enroll --token <token>`."
+    } else if cfg!(windows) {
+        "The device service holds this device's enrollment, in its machine-wide \
+         configuration. Refresh it from an elevated shell with \
+         `roomlerd re-enroll --token <token>`."
+    } else {
+        "The device service holds this device's enrollment, in its system \
+         configuration. Refresh it with `sudo roomlerd re-enroll --token <token>`."
+    }
+    .to_string()
+}
+
 /// Refresh the token using an existing config. Mirrors the CLI's
 /// `re-enroll --token` subcommand. Targets the config the daemon
 /// actually reads (machine-global first) — writing the per-user copy
@@ -466,7 +670,11 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         .unwrap_or(false);
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    // FR-43 P3a — this file has nothing to refresh. #3996 — nor has a file
+    // that is not there: the device service holds the enrollment.
+    let Some(existing) = load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment) else {
+        return Err(enrollment_elsewhere());
+    };
     let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
@@ -504,7 +712,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
 /// human detail ("archived … -> …"); Err carries why nothing was done.
 #[tauri::command]
 pub async fn cmd_config_cleanup() -> Result<String, String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("daemon unreachable: {e}"))?;
     match client.config_cleanup_stale().await {
@@ -514,37 +722,304 @@ pub async fn cmd_config_cleanup() -> Result<String, String> {
     }
 }
 
+/// #2871 — what [`cmd_config_entries`] answers: the rows, and whether a
+/// two-half Mac's root half contributed its machine-side rows over the person
+/// socket it serves this account ([`merge_two_halves`]), so the page's banner
+/// can say what changes here and what an administrator changes.
+#[derive(Debug, Serialize, Default)]
+pub struct ConfigListing {
+    pub entries: Vec<localapi::ConfigEntry>,
+    pub machine_merged: bool,
+}
+
 /// S2 — the editable config surface (key + current value + editor
 /// metadata). Daemon-verb first (the daemon reads its OWN config, which
 /// is profile-correct under SCM/SystemContext); direct-file fallback
 /// reads the tray's active config so the editor still renders when the
 /// daemon is down.
+///
+/// #2871 (design A) — on a two-half Mac (FR-43 through P2) the daemon
+/// `connect()` reaches is the per-user half, whose listing is the SESSION's
+/// truth; the machine-side rows (`config_surface::owner_for`) are taken from
+/// the root half over the person socket it serves this account, which lists
+/// every key, marks the ones it will not set `read_only`
+/// (`localapi::person_view`) and sets the ones that are the person's own
+/// call. On a Mac with a root half alone (#2891) that socket serves the whole
+/// listing. A root half older than design A refuses the listing; the per-user
+/// rows then stand alone, as before, and the banner says so.
 #[tauri::command]
-pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> {
-    if let Ok(mut client) = localapi::connect().await {
-        match client.config_entries().await {
-            Ok(entries) => return Ok(entries),
+pub async fn cmd_config_entries() -> Result<ConfigListing, String> {
+    match localapi::connect().await {
+        Ok(mut client) => match client.config_entries().await {
+            Ok(entries) => {
+                return Ok(match machine_half_rows(&mut client).await {
+                    Some(machine) => ConfigListing {
+                        entries: merge_two_halves(entries, machine),
+                        machine_merged: true,
+                    },
+                    None => ConfigListing {
+                        entries,
+                        machine_merged: false,
+                    },
+                });
+            }
             // #2891 — a refusal from a ROOT daemon this unprivileged app
-            // reached (a Linux system install's person socket) is an answer,
-            // not an outage: the file the fallback below reads is not that
-            // daemon's — a per-user path a system install does not have, or a
-            // stale per-user copy no daemon reads — so the daemon's words
-            // stand, and the page explains them (`cmd_config_target`).
+            // reached (a Linux system install's person socket, from a daemon
+            // older than design A) is an answer, not an outage: the file the
+            // fallback below reads is not that daemon's — a per-user path a
+            // system install does not have, or a stale per-user copy no daemon
+            // reads — so the daemon's words stand, and the page explains them
+            // (`cmd_config_target`).
             Err(e) => {
                 if refused_by_root_daemon(&mut client).await {
                     return Err(daemon_message(&e.to_string()));
                 }
+            }
+        },
+        // #2871 — nothing per-user answers: a Mac with a root half alone
+        // (#2891) serves this person its person socket, and the listing over
+        // it. A refusal there is an older root half's, and final: the per-user
+        // file below is not its.
+        Err(_) => {
+            if let Some(answer) = root_half_alone_entries().await {
+                return answer.map(|entries| ConfigListing {
+                    entries,
+                    machine_merged: false,
+                });
             }
         }
     }
     tokio::task::spawn_blocking(|| {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(roomler_node_core::config_surface::entries(&cfg))
+        entries_from_file(&path)
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
+}
+
+/// The configuration page's rows from the file at `path`, when no device
+/// service answered the listing. #3996 — no file there is said so, with
+/// nothing in the log: the Welcome reads this listing as it opens, and a
+/// start with no service answering logged "the host must be re-enrolled"
+/// for a one-row Mac's person or a host not enrolled yet.
+fn entries_from_file(path: &PathBuf) -> Result<ConfigListing, String> {
+    let cfg = load_if_there(path)?.ok_or_else(|| no_config_here(path))?;
+    Ok(ConfigListing {
+        entries: roomler_node_core::config_surface::entries(&cfg),
+        machine_merged: false,
+    })
+}
+
+/// #3996 — what a page reads when no device service answered and no config
+/// file is there to fall back on.
+fn no_config_here(path: &Path) -> String {
+    format!(
+        "There is no configuration file at {} yet, and the device service did not answer.",
+        path.display()
+    )
+}
+
+/// #2871 — is `key` the root half's on a two-half Mac
+/// (`config_surface::owner_for`)? By this build's registry — the companion
+/// and the daemon move together (FR-117) — else by `group`, the group the
+/// daemon listed the row with, else the session half's, as the page always
+/// treated every key. ONE decision for both directions (#2871's review): the
+/// listing takes a row from the half this names ([`merge_two_halves`]), and
+/// [`cmd_config_set`] sends its change to the same half, by the same group —
+/// a key a newer root half lists that this build does not know would
+/// otherwise be shown from the root half and written to the per-user file,
+/// #2871's own failure.
+fn is_machine_side(key: &str, group: &str) -> bool {
+    use roomler_node_core::config_surface::{Owner, owner_for};
+    owner_for(key, group) == Owner::Machine
+}
+
+/// #2871 — pure: a two-half Mac's rows. The per-user (session) half's
+/// listing, with every MACHINE-side key's row taken from the root half's —
+/// which carries the root half's value and its `read_only` mark — in the
+/// per-user listing's order; a machine-side key only the root half lists is
+/// appended, in the root half's order; a session-side key only the root half
+/// lists is dropped, because the session half's listing is the session's
+/// truth. Which side a key is on: `config_surface::owner_for`, by the key,
+/// else by the group the daemon sent with it.
+fn merge_two_halves(
+    reached: Vec<localapi::ConfigEntry>,
+    machine: Vec<localapi::ConfigEntry>,
+) -> Vec<localapi::ConfigEntry> {
+    use std::collections::{HashMap, HashSet};
+    let machine_side = |e: &localapi::ConfigEntry| is_machine_side(&e.key, &e.group);
+    let by_key: HashMap<&str, &localapi::ConfigEntry> = machine
+        .iter()
+        .filter(|e| machine_side(e))
+        .map(|e| (e.key.as_str(), e))
+        .collect();
+    let reached_keys: HashSet<String> = reached.iter().map(|e| e.key.clone()).collect();
+    let mut out: Vec<localapi::ConfigEntry> = reached
+        .into_iter()
+        .map(|e| {
+            if machine_side(&e) {
+                by_key
+                    .get(e.key.as_str())
+                    .map(|m| (*m).clone())
+                    .unwrap_or(e)
+            } else {
+                e
+            }
+        })
+        .collect();
+    out.extend(
+        machine
+            .iter()
+            .filter(|e| machine_side(e) && !reached_keys.contains(&e.key))
+            .cloned(),
+    );
+    out
+}
+
+/// How long the root half has for an answer over its person socket: as the
+/// per-user half's own reads of it (FR-97 P2h). A slow root half leaves the
+/// per-user rows standing for this load.
+#[cfg(target_os = "macos")]
+const ROOT_HALF_READ: Duration = Duration::from_millis(1500);
+
+/// …and for a `ConfigSet`, which the person clicked for: long enough for a
+/// config load → validate → save on the root half, short enough that a
+/// wedged root half answers the click with an error, not a hang.
+#[cfg(target_os = "macos")]
+const ROOT_HALF_WRITE: Duration = Duration::from_secs(5);
+
+/// #2871 — a client on the root half's person socket for this account
+/// (`/var/run/roomler-person/<uid>.sock`, FR-97 P2g), kept only when ROOT
+/// serves it (`connect_unix_served_by_root`). `None` when no root half serves
+/// this person one.
+#[cfg(target_os = "macos")]
+async fn root_half_client() -> Option<localapi::Client> {
+    let path = localapi::own_person_socket_path()?;
+    if !path.exists() {
+        return None;
+    }
+    tokio::time::timeout(ROOT_HALF_READ, localapi::connect_unix_served_by_root(path))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// #2871 — the root half's listing, when `reached` is the per-user half of a
+/// two-half Mac ([`two_halves`], from both halves' `Status`) and the root half
+/// serves it over its person socket (design A). `None` keeps the per-user rows
+/// alone: no root half, a root half older than design A (it refuses the
+/// listing), or one that does not answer in time.
+#[cfg(target_os = "macos")]
+async fn machine_half_rows(reached: &mut localapi::Client) -> Option<Vec<localapi::ConfigEntry>> {
+    let mut root = root_half_client().await?;
+    let ask = async {
+        let reached_brief = DaemonBrief::from(&reached.status().await.ok()?);
+        let machine_brief = DaemonBrief::from(&root.status().await.ok()?);
+        if !two_halves(&reached_brief, Some(&machine_brief)) {
+            return None;
+        }
+        root.config_entries().await.ok()
+    };
+    tokio::time::timeout(ROOT_HALF_READ, ask)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Off macOS one daemon lists every key: Windows runs one, and a Linux
+/// system install's companion reaches the root daemon itself (its person
+/// socket is the first path `connect()` tries), whose listing arrives marked.
+#[cfg(not(target_os = "macos"))]
+async fn machine_half_rows(_reached: &mut localapi::Client) -> Option<Vec<localapi::ConfigEntry>> {
+    None
+}
+
+/// #2871 — a Mac with a root half alone (#2891): the listing over its person
+/// socket. `Some(Err)` is that half's refusal — a root half older than design
+/// A — and final; `None` = no root half serves this person one, or it did not
+/// answer in time.
+#[cfg(target_os = "macos")]
+async fn root_half_alone_entries() -> Option<Result<Vec<localapi::ConfigEntry>, String>> {
+    let mut root = root_half_client().await?;
+    match tokio::time::timeout(ROOT_HALF_READ, root.config_entries()).await {
+        Ok(Ok(entries)) => Some(Ok(entries)),
+        Ok(Err(e)) => Some(Err(daemon_message(&e.to_string()))),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_alone_entries() -> Option<Result<Vec<localapi::ConfigEntry>, String>> {
+    None
+}
+
+/// #2871 — on a two-half Mac, a `ConfigSet` of a machine-side key, answered
+/// by the root half over its person socket: it sets the keys that are the
+/// person's own call (`external_*`) and refuses the rest by name with the
+/// administrator's command. Either answer is FINAL — the per-user half's copy
+/// is a file the Mac's device never reads. `None` = not that layout: the
+/// caller's own path.
+#[cfg(target_os = "macos")]
+async fn root_half_config_set_beside(
+    reached: &mut localapi::Client,
+    key: &str,
+    value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    let mut root = root_half_client().await?;
+    let reached_brief = DaemonBrief::from(&reached.status().await.ok()?);
+    let machine_brief = DaemonBrief::from(&root.status().await.ok()?);
+    if !two_halves(&reached_brief, Some(&machine_brief)) {
+        return None;
+    }
+    Some(root_half_set(&mut root, key, value).await)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_config_set_beside(
+    _reached: &mut localapi::Client,
+    _key: &str,
+    _value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    None
+}
+
+/// #2871 — a Mac with a root half alone (#2891): a `ConfigSet` over its
+/// person socket, for any key; its answer is final. `None` = no root half
+/// serves this person one.
+#[cfg(target_os = "macos")]
+async fn root_half_config_set_alone(
+    key: &str,
+    value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    let mut root = root_half_client().await?;
+    Some(root_half_set(&mut root, key, value).await)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn root_half_config_set_alone(
+    _key: &str,
+    _value: Option<&str>,
+) -> Option<Result<localapi::ConfigEntry, String>> {
+    None
+}
+
+/// #2871 — the `ConfigSet` itself, bounded: the root half's answer in its
+/// own words, or a timeout the person can read.
+#[cfg(target_os = "macos")]
+async fn root_half_set(
+    root: &mut localapi::Client,
+    key: &str,
+    value: Option<&str>,
+) -> Result<localapi::ConfigEntry, String> {
+    match tokio::time::timeout(ROOT_HALF_WRITE, root.config_set(key, value)).await {
+        Ok(Ok(entry)) => Ok(entry),
+        Ok(Err(e)) => Err(daemon_message(&e.to_string())),
+        Err(_) => Err(format!(
+            "the root daemon did not answer within {} s; nothing was changed here",
+            ROOT_HALF_WRITE.as_secs()
+        )),
+    }
 }
 
 /// S2 — set (`value` present) or clear (`value` null) one editable
@@ -555,32 +1030,62 @@ pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> 
 /// The echoed entry's `restart_required` says whether the change is live
 /// or waits for the next daemon restart (FR-84 D2) — the front renders
 /// that, never a list of its own.
+///
+/// `group` is the group the row was LISTED with (`ConfigEntry::group`;
+/// the Settings page sends it, the pages that set a key of this build's
+/// own do not need to), so a change goes to the half its row came from
+/// ([`is_machine_side`]).
 #[tauri::command]
 pub async fn cmd_config_set(
     key: String,
     value: Option<String>,
+    group: Option<String>,
 ) -> Result<localapi::ConfigEntry, String> {
     let mut daemon_err: Option<String> = None;
-    if let Ok(mut client) = localapi::connect().await {
-        match client.config_set(&key, value.as_deref()).await {
-            Ok(entry) => return Ok(entry),
-            // FR-85 — where recordings go is the DAEMON's to accept: its
-            // listener refuses a `record_*` change from anyone but the
-            // console user. When it answered, its answer stands; writing the
-            // file behind its back would report a success it refused.
-            // FR-84 D4 — the same for `files_dir` (see `is_daemon_owned_key`).
-            Err(e) if is_daemon_owned_key(&key) => {
-                return Err(explain_daemon_owned_error(&key, &e.to_string()));
+    match localapi::connect().await {
+        Ok(mut client) => {
+            // #2871 (design A) — on a two-half Mac a machine-side key is the
+            // root half's (`is_machine_side`, by the group its row was listed
+            // with): it goes to the root half over the person socket, whose
+            // answer is final — set, or refused by name with the
+            // administrator's command. The per-user half's copy of such a key
+            // is a file the Mac's device never reads (#2871's failure), so it
+            // is not written.
+            if is_machine_side(&key, group.as_deref().unwrap_or(""))
+                && let Some(answer) =
+                    root_half_config_set_beside(&mut client, &key, value.as_deref()).await
+            {
+                return answer;
             }
-            Err(e) => {
-                // #2891 — the same for EVERY key when a ROOT daemon refused
-                // this unprivileged app (a Linux system install's person
-                // socket): the per-user file below is not its, and writing it
-                // would report a success the daemon refused.
-                if refused_by_root_daemon(&mut client).await {
-                    return Err(daemon_message(&e.to_string()));
+            match client.config_set(&key, value.as_deref()).await {
+                Ok(entry) => return Ok(entry),
+                // FR-85 — where recordings go is the DAEMON's to accept: its
+                // listener refuses a `record_*` change from anyone but the
+                // console user. When it answered, its answer stands; writing
+                // the file behind its back would report a success it refused.
+                // FR-84 D4 — the same for `files_dir` (see
+                // `is_daemon_owned_key`).
+                Err(e) if is_daemon_owned_key(&key) => {
+                    return Err(explain_daemon_owned_error(&key, &e.to_string()));
                 }
-                daemon_err = Some(e.to_string());
+                Err(e) => {
+                    // #2891 — the same for EVERY key when a ROOT daemon
+                    // refused this unprivileged app (a Linux system install's
+                    // person socket): the per-user file below is not its, and
+                    // writing it would report a success the daemon refused.
+                    if refused_by_root_daemon(&mut client).await {
+                        return Err(daemon_message(&e.to_string()));
+                    }
+                    daemon_err = Some(e.to_string());
+                }
+            }
+        }
+        // #2871 — nothing per-user answers: a Mac with a root half alone
+        // (#2891) takes the change over its person socket, for any key, and
+        // its answer is final.
+        Err(_) => {
+            if let Some(answer) = root_half_config_set_alone(&key, value.as_deref()).await {
+                return answer;
             }
         }
     }
@@ -603,7 +1108,7 @@ fn config_set_blocking(
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     roomler_node_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     roomler_node_core::config_surface::entry_for(&cfg, &key)
@@ -631,26 +1136,35 @@ pub struct ConfigTarget {
     /// `localapi::connect()` resolves, which on a Mac is the per-user half.
     pub reached: Option<DaemonBrief>,
     /// macOS only: the root half, read over the person socket it serves this
-    /// account. `Status` is on that socket's allowlist; its config verbs are
-    /// not (`localapi::person_may`), so this is a label, not a second editor.
-    /// `None` on every other OS, when the reached daemon is itself
+    /// account. `Status` is on that socket's allowlist; since design A
+    /// (#2871) so are the listing and `ConfigSet` of the keys that are the
+    /// person's own call (`localapi::person_may`), so [`cmd_config_entries`]
+    /// takes the machine-side rows from it and [`cmd_config_set`] sends them
+    /// there. `None` on every other OS, when the reached daemon is itself
     /// privileged, and when no root half answers. Asked for beside a
     /// per-user daemon (a two-half Mac) and when nothing was reached (#2891:
     /// a Mac with a root half alone).
     pub machine: Option<DaemonBrief>,
     /// `reached` is an unprivileged daemon and `machine` a root one of another
-    /// identity: the page edits the first and must say so ([`two_halves`]).
+    /// identity: the page shows both halves and must say so ([`two_halves`]).
     pub two_halves: bool,
-    /// #2891 — the daemon whose configuration this page would show runs as
-    /// root and this app does not: a Linux system install's root daemon,
-    /// reached over its person socket, or a Mac with a root half alone. Its
-    /// config verbs are refused there, so the page shows the administrator's
-    /// path in place of rows ([`root_daemon_only`]). Never on Windows, whose
-    /// pipe admits every interactive user to those verbs.
+    /// #2891 — the daemon whose configuration this page shows runs as root
+    /// and this app does not: a Linux system install's root daemon, reached
+    /// over its person socket, or a Mac with a root half alone
+    /// ([`root_daemon_only`]). Since design A that socket serves the listing,
+    /// marked per key; a daemon older than it refuses, and the page shows the
+    /// administrator's path in place of rows. Never on Windows, whose pipe
+    /// admits every interactive user to those verbs.
     pub root_only: bool,
-    /// What the page shows when `two_halves` ([`two_halves_note`]) or
-    /// `root_only` ([`root_only_note`]).
+    /// What the banner says when `two_halves` ([`two_halves_note`]) or
+    /// `root_only` ([`root_only_note`]) and the root daemon served its rows:
+    /// what changes here, what an administrator changes.
     pub note: Option<String>,
+    /// What it says instead when the root daemon predates design A and
+    /// refused its listing ([`two_halves_legacy_note`],
+    /// [`root_only_legacy_note`]): the rows are the per-user half's alone, or
+    /// there are none, and the root daemon's switches are an administrator's.
+    pub legacy_note: Option<String>,
 }
 
 /// How a daemon names itself for [`ConfigTarget`]: the fields of its `Status`
@@ -689,16 +1203,40 @@ fn two_halves(reached: &DaemonBrief, machine: Option<&DaemonBrief>) -> bool {
         && machine.is_some_and(|m| m.privileged == Some(true) && m.node_id != reached.node_id)
 }
 
-/// #2871 — the banner's text. It names both files, so a person can tell which
-/// one a `roomler config ls` printed, and gives the administrator's command for
-/// the root half: the person socket serves that half's status and never its
-/// configuration, so there is no in-app path to those switches today.
+/// The file a daemon names for itself, or a stand-in from an older one.
+fn config_file_of(d: &DaemonBrief) -> String {
+    d.config_path
+        .clone()
+        .unwrap_or_else(|| "its own config.toml".to_string())
+}
+
+/// #2871 (design A) — the banner's text on a two-half Mac whose root half
+/// serves its listing over the person socket: which half each kind of row
+/// comes from and goes to ([`merge_two_halves`]), both files, so a person can
+/// tell which one a `roomler config ls` printed, and the administrator's
+/// command for the rows marked.
 fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
-    let file = |d: &DaemonBrief| {
-        d.config_path
-            .clone()
-            .unwrap_or_else(|| "its own config.toml".to_string())
-    };
+    format!(
+        "This Mac runs two Roomler daemons, and this page shows both. Remote desktop, capture, \
+         video and file settings are the per-user half's ({}, {}), which serves the session, \
+         and change there. The private network, Roomler SSH, remote commands, access and the \
+         service itself are the root half's ({}, {}) — the device that `roomler ssh` and \
+         `roomler exec` reach — and are shown from its file: the ones that are the person at \
+         this Mac's own call (external access) change here; the rest, marked administrator's \
+         (overlay_enabled, ssh_enabled, exec_enabled, remote_config_enabled, …), are changed in \
+         a terminal: `sudo roomler config set <key> <value>`.",
+        reached.name,
+        config_file_of(reached),
+        machine.name,
+        config_file_of(machine)
+    )
+}
+
+/// #2871 — the banner's text on a two-half Mac whose root half predates
+/// design A and refuses the listing over its person socket: the rows are the
+/// per-user half's alone, and the root half's switches are an administrator's
+/// — the words the banner carried from #2879.
+fn two_halves_legacy_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
     format!(
         "This Mac runs two Roomler daemons. The switches on this page change the per-user half \
          ({}, {}), which captures the screen for remote desktop. The private network, Roomler SSH \
@@ -707,9 +1245,9 @@ fn two_halves_note(reached: &DaemonBrief, machine: &DaemonBrief) -> String {
          remote_config_enabled, …) are changed by an administrator in a terminal: \
          `sudo roomler config set <key> <value>`.",
         reached.name,
-        file(reached),
+        config_file_of(reached),
         machine.name,
-        file(machine)
+        config_file_of(machine)
     )
 }
 
@@ -738,31 +1276,60 @@ fn root_daemon_only<'a>(
     }
 }
 
-/// #2891 — the card's text when [`root_daemon_only`] names a daemon: which
-/// daemon runs, which file its settings are read from, and the administrator's
-/// commands — in place of the "Could not load the configuration" the page
-/// showed when the person socket refused `ConfigGet` and the fallback read a
-/// per-user file a system install does not have.
-fn root_only_note(daemon: &DaemonBrief) -> String {
-    let file = daemon.config_path.clone().unwrap_or_else(|| {
+/// The file a root daemon names for itself, or the packaged install's.
+fn root_config_file_of(daemon: &DaemonBrief) -> String {
+    daemon.config_path.clone().unwrap_or_else(|| {
         "its own config.toml (/etc/roomler/config.toml on a packaged install)".to_string()
-    });
+    })
+}
+
+/// #2871 (design A) — the banner's text when [`root_daemon_only`] names a
+/// daemon and it served its listing over the person socket (a Linux system
+/// install; a Mac with a root half alone, #2891): which file, which rows
+/// change here — the keys that are the person at the device's own call — and
+/// the administrator's command for the rows marked.
+fn root_only_note(daemon: &DaemonBrief) -> String {
+    format!(
+        "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
+         its settings are read from {}. The ones that are the person at this computer's own \
+         call change here: where incoming files land, whether a controller may record, what a \
+         remote session may use (clipboard, files, audio), privacy mode, lock on end, display \
+         match, the browser check, external access. The rest — the device-owned switches \
+         (exec_enabled, ssh_enabled, remote_config_enabled), the private network, Roomler SSH, \
+         the updater, the recordings folder — are marked administrator's and are changed in a \
+         terminal: `sudo roomler config set <key> <value>`.",
+        daemon.name,
+        daemon.version,
+        root_config_file_of(daemon)
+    )
+}
+
+/// #2891 — the card's text when [`root_daemon_only`] names a daemon that
+/// REFUSED its listing over the person socket (one older than design A on
+/// #2871): which daemon runs, which file its settings are read from, and the
+/// administrator's commands — in place of the "Could not load the
+/// configuration" the page showed when the fallback read a per-user file a
+/// system install does not have.
+fn root_only_legacy_note(daemon: &DaemonBrief) -> String {
     format!(
         "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
          its settings are read from {}. They are an administrator's to change, in a terminal: \
          `sudo roomler config ls` lists them, `sudo roomler config set <key> <value>` changes \
          one. This app reaches that service through the person-at-the-device socket, which \
          shows who is viewing this screen, ends a session, answers consent prompts and lists \
-         the devices this machine's private network reaches; it serves no configuration, so \
-         the device-owned switches (exec_enabled, ssh_enabled, remote_config_enabled, …) have \
-         no in-app path here.",
-        daemon.name, daemon.version, file
+         the devices this machine's private network reaches; this version of the service serves \
+         no configuration over it, so the device-owned switches (exec_enabled, ssh_enabled, \
+         remote_config_enabled, …) have no in-app path here.",
+        daemon.name,
+        daemon.version,
+        root_config_file_of(daemon)
     )
 }
 
 /// #2891 — does this companion run as root? Only then does `connect()` reach
 /// a root daemon's own socket; otherwise a root daemon it reaches is behind
-/// its person socket, where no config verb is served.
+/// its person socket, which sets only the console person's own keys (#2871,
+/// design A) and, on a daemon older than that, serves no config verb at all.
 fn process_is_root() -> bool {
     #[cfg(unix)]
     {
@@ -776,10 +1343,13 @@ fn process_is_root() -> bool {
 
 /// #2891 — did a config verb's refusal come from a ROOT daemon this
 /// unprivileged companion reached — a Linux system install's person socket,
-/// which serves `Status` and refuses every config verb? Then the per-user file
+/// which serves `Status` and refuses a config verb it does not serve (every
+/// one, on a daemon older than #2871's design A)? Then the per-user file
 /// the callers would fall back to is not that daemon's, and may be a stale
 /// copy no daemon reads: writing it reports a success the daemon refused
 /// (#2871's failure, on Linux). One `Status` on the same connection.
+/// #3831 — the encoding card asks it too, of a daemon that refused
+/// `encoder_caps` there (one older than #3831).
 async fn refused_by_root_daemon(client: &mut localapi::Client) -> bool {
     let Ok(status) = client.status().await else {
         return false;
@@ -844,10 +1414,13 @@ pub async fn cmd_config_target() -> ConfigTarget {
         process_is_root(),
         cfg!(windows),
     );
-    let note = match (&reached, &machine, root) {
-        (Some(r), Some(m), _) if two => Some(two_halves_note(r, m)),
-        (_, _, Some(d)) => Some(root_only_note(d)),
-        _ => None,
+    let (note, legacy_note) = match (&reached, &machine, root) {
+        (Some(r), Some(m), _) if two => (
+            Some(two_halves_note(r, m)),
+            Some(two_halves_legacy_note(r, m)),
+        ),
+        (_, _, Some(d)) => (Some(root_only_note(d)), Some(root_only_legacy_note(d))),
+        _ => (None, None),
     };
     ConfigTarget {
         root_only: root.is_some(),
@@ -855,6 +1428,7 @@ pub async fn cmd_config_target() -> ConfigTarget {
         machine,
         two_halves: two,
         note,
+        legacy_note,
     }
 }
 
@@ -875,8 +1449,9 @@ fn daemon_message(message: &str) -> String {
 pub struct EncoderCapsView {
     /// The daemon answered the verb.
     pub available: bool,
-    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb), or
-    /// the failing stage and error.
+    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb),
+    /// `root_only` (#3831: a root daemon's person socket that refuses the
+    /// verb), or the failing stage and error.
     pub reason: Option<String>,
     /// The daemon's answer, verbatim (`state`, `cells`, `denied`, …).
     pub caps: Option<localapi::EncoderCapsSummary>,
@@ -943,36 +1518,103 @@ impl EncoderCapsView {
     }
 }
 
+/// The encoding card's name in the refresh ledger.
+const ENCODER_CAPS_SURFACE: &str = "encoder_caps";
+
 /// FR-84 D4 — what this device can encode, from the daemon's CACHED probe
 /// (the verb never starts one). The card polls this only while the answer
 /// is `not_probed`, and re-reads it when the daemon comes back or changes.
+///
+/// #4020 — through [`connect_service`]: a stopped service on a Linux system
+/// install or a Mac is `daemon_unreachable`, which the card words "Offline",
+/// not the system socket's `PermissionDenied` under its `Error` chip.
 #[tauri::command]
 pub async fn cmd_encoder_caps() -> EncoderCapsView {
-    const SURFACE: &str = "encoder_caps";
-    let mut client = match localapi::connect().await {
+    encoder_caps_from(connect_service().await).await
+}
+
+/// [`cmd_encoder_caps`] after its connect: `connected` is the connect's
+/// result.
+async fn encoder_caps_from(connected: std::io::Result<localapi::Client>) -> EncoderCapsView {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return EncoderCapsView::unavailable("daemon_unreachable".into());
         }
         Err(e) => {
             return EncoderCapsView::unavailable(refresh_failed(
-                SURFACE,
+                ENCODER_CAPS_SURFACE,
                 describe_io("connect", &e),
             ));
         }
     };
-    match client.encoder_caps().await {
-        Ok(caps) => {
-            refresh_ok(SURFACE);
+    let reply = client.request(&localapi::Request::EncoderCaps).await;
+    // #3831 — only an ANSWER that refuses is asked about, and the way the
+    // config verbs ask it (#2891): one `Status` on the same connection. A
+    // reply that never came is a failure whatever the daemon is.
+    let refused_by_root = match &reply {
+        Ok(localapi::Response::Error { message }) if !older_than_the_verb(message) => {
+            refused_by_root_daemon(&mut client).await
+        }
+        _ => false,
+    };
+    encoder_caps_view(reply, refused_by_root)
+}
+
+/// Pure: what the encoding card shows for the daemon's reply to
+/// `encoder_caps`. `Ok` is an answer the daemon gave; `Err` is no answer at
+/// all, the transport's failure (a write, a read, a closed connection).
+/// `refused_by_root`: [`refused_by_root_daemon`], asked on the same
+/// connection after an answer that refuses.
+fn encoder_caps_view(
+    reply: std::io::Result<localapi::Response>,
+    refused_by_root: bool,
+) -> EncoderCapsView {
+    match reply {
+        Ok(localapi::Response::EncoderCaps(caps)) => {
+            refresh_ok(ENCODER_CAPS_SURFACE);
             EncoderCapsView::from_summary(caps)
         }
         // A daemon older than the verb: not a failure, a version.
-        Err(e) if e.to_string().contains("unknown variant") => {
+        Ok(localapi::Response::Error { message }) if older_than_the_verb(&message) => {
             EncoderCapsView::unavailable("old_daemon".into())
         }
-        Err(e) => {
-            EncoderCapsView::unavailable(refresh_failed(SURFACE, describe_io("encoder_caps", &e)))
+        // #3831 — refused by a ROOT daemon this unprivileged app reached
+        // over its person socket: a Linux system install whose daemon
+        // predates #3831, when that socket served no `encoder_caps`. An
+        // answer, not a failure: the card says whose the encoders are.
+        Ok(localapi::Response::Error { .. }) if refused_by_root => {
+            EncoderCapsView::unavailable("root_only".into())
         }
+        Ok(other) => encoder_caps_failed(&not_the_summary(other)),
+        Err(e) => encoder_caps_failed(&e),
+    }
+}
+
+/// A daemon that predates a verb cannot parse the request, and says so in
+/// its `bad request` answer.
+fn older_than_the_verb(message: &str) -> bool {
+    message.contains("unknown variant")
+}
+
+/// The card's `Error`: a failure, said with its stage and logged once a
+/// streak.
+fn encoder_caps_failed(e: &std::io::Error) -> EncoderCapsView {
+    EncoderCapsView::unavailable(refresh_failed(
+        ENCODER_CAPS_SURFACE,
+        describe_io("encoder_caps", e),
+    ))
+}
+
+/// A reply that is not the summary, in the words the client's typed helper
+/// gives it: the daemon's own `Error` as `localapi error: <message>`
+/// ([`daemon_message`]), anything else as an unexpected response.
+fn not_the_summary(reply: localapi::Response) -> std::io::Error {
+    match reply {
+        localapi::Response::Error { message } => {
+            std::io::Error::other(format!("localapi error: {message}"))
+        }
+        other => std::io::Error::other(format!("localapi: unexpected response: {other:?}")),
     }
 }
 
@@ -1019,10 +1661,19 @@ fn own_home() -> Option<String> {
 
 /// FR-84 D4 — the card's data: the daemon's effective folder (status) and
 /// the configured value (its config surface), on ONE connection.
+///
+/// #4020 — through [`connect_service`], as [`cmd_encoder_caps`]: a stopped
+/// service reads "Offline" on the card, on every OS.
 #[tauri::command]
 pub async fn cmd_files_dir_view() -> FilesDirView {
+    files_dir_view_from(connect_service().await).await
+}
+
+/// [`cmd_files_dir_view`] after its connect: `connected` is the connect's
+/// result.
+async fn files_dir_view_from(connected: std::io::Result<localapi::Client>) -> FilesDirView {
     const SURFACE: &str = "files_dir";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return FilesDirView::unavailable("daemon_unreachable".into());
@@ -1098,7 +1749,7 @@ fn files_dir_value_for(picked: &Path, home: Option<&str>) -> String {
 /// write, as whom, into which profile; its refusal is the answer, shown in
 /// its own words — never a cue to write the file directly.
 async fn set_files_dir_via_daemon(value: Option<&str>) -> Result<localapi::ConfigEntry, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .config_set("files_dir", value)
         .await
@@ -1179,7 +1830,7 @@ pub async fn cmd_files_dir_default() -> Result<localapi::ConfigEntry, String> {
 /// <file>` / `open <file>` would launch a file rather than show it.
 #[tauri::command]
 pub async fn cmd_open_files_dir() -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let status = client
         .status()
         .await
@@ -1410,9 +2061,34 @@ fn no_handler_message(scheme: &str) -> String {
 pub fn server_origin_blocking() -> Result<String, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
-    let cfg = config::load(&path)
-        .map_err(|_| "This device isn't enrolled yet — no server to open.".to_string())?;
-    let server = cfg.server_url.trim().trim_end_matches('/').to_string();
+    server_origin_from(&path, daemon_node_status_blocking)
+}
+
+/// [`server_origin_blocking`] for the config at `path`, asking the daemon
+/// (`daemon`) when that file holds no enrollment. #3996 — or is not there. A
+/// one-row Mac's screen worker (`run --supervised --unenrolled`) writes the
+/// person's `config.toml` at its first start, with no enrollment in it, so
+/// the file is missing only in the install's first seconds or on a device not
+/// enrolled yet. Until #3996 a missing file ended here as "not enrolled", with
+/// `config::load`'s "must be re-enrolled" in the log, and the daemon was never
+/// asked.
+fn server_origin_from(
+    path: &PathBuf,
+    daemon: impl FnOnce() -> Option<NodeStatus>,
+) -> Result<String, String> {
+    let not_enrolled = || "This device isn't enrolled yet — no server to open.".to_string();
+    let cfg = load_if_there(path).map_err(|_| not_enrolled())?;
+    // FR-43 P3a — on a one-row Mac the server is in the root daemon's enrollment,
+    // not in the person's file.
+    let server = match cfg.filter(AgentConfig::has_primary_enrollment) {
+        Some(cfg) => cfg.server_url,
+        None => daemon()
+            .as_ref()
+            .and_then(daemon_identity)
+            .and_then(|id| id.server_url)
+            .ok_or_else(not_enrolled)?,
+    };
+    let server = server.trim().trim_end_matches('/').to_string();
     if !server.starts_with("https://") && !server.starts_with("http://") {
         return Err("this device's config has no valid server URL".to_string());
     }
@@ -1441,6 +2117,9 @@ pub async fn cmd_open_roomler(app: tauri::AppHandle) -> Result<(), String> {
 /// org's server and tenant, which are read from this device's own
 /// `[[orgs]]` entry — still never from anything the page or a peer supplied.
 /// Absent / empty / `primary` = the primary enrollment, as before.
+///
+/// FR-43 P3a — a person's file on a one-row Mac holds no enrollment, so the same
+/// fields come from this machine's root daemon ([`daemon_remote_target`]).
 #[tauri::command]
 pub async fn cmd_open_remote(
     app: tauri::AppHandle,
@@ -1454,8 +2133,16 @@ pub async fn cmd_open_remote(
     let url = tokio::task::spawn_blocking(move || {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let (server, tid) = remote_target(&cfg, org.as_deref())?;
+        // #3996 — no file is a file with no enrollment: ask the daemon.
+        let (server, tid) = match load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment)
+        {
+            Some(cfg) => remote_target(&cfg, org.as_deref())?,
+            None => {
+                let status = daemon_node_status_blocking()
+                    .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
+                daemon_remote_target(&status, org.as_deref())?
+            }
+        };
         Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
     .await
@@ -1468,10 +2155,7 @@ pub async fn cmd_open_remote(
 /// entry's. Both validated: an http(s) origin and a 24-hex tenant id. Pure
 /// over the loaded config, so the resolution is unit-tested.
 fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String), String> {
-    let label = org
-        .map(str::trim)
-        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL);
-    let (server, tid) = match label {
+    let (server, tid) = match secondary_label(org) {
         None => (cfg.server_url.as_str(), cfg.tenant_id.as_str()),
         Some(label) => {
             let entry = cfg
@@ -1482,6 +2166,39 @@ fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String
             (entry.server_url.as_str(), entry.tenant_id.as_str())
         }
     };
+    checked_target(server, tid)
+}
+
+/// FR-43 P3a — [`remote_target`] from the daemon's own `orgs`, for a person's file
+/// that holds no enrollment. Still this machine's word, and validated the same.
+fn daemon_remote_target(
+    status: &NodeStatus,
+    org: Option<&str>,
+) -> Result<(String, String), String> {
+    let entry = match secondary_label(org) {
+        None => status
+            .orgs
+            .iter()
+            .find(|o| o.primary)
+            .ok_or_else(|| "this device has no primary enrollment".to_string())?,
+        Some(label) => status
+            .orgs
+            .iter()
+            .find(|o| o.label == label)
+            .ok_or_else(|| format!("this device has no enrollment labelled {label:?}"))?,
+    };
+    checked_target(&entry.server_url, entry.tenant_id.as_deref().unwrap_or(""))
+}
+
+/// The `[[orgs]]` label `org` names, if it names one and not the primary.
+fn secondary_label(org: Option<&str>) -> Option<&str> {
+    org.map(str::trim)
+        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL)
+}
+
+/// An http(s) origin and a 24-hex tenant id, or a refusal: what a "View screen"
+/// may open.
+fn checked_target(server: &str, tid: &str) -> Result<(String, String), String> {
     let tid = tid.trim().to_ascii_lowercase();
     if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("this device's config has no valid tenant id for that organization".into());
@@ -1583,7 +2300,7 @@ fn set_device_name_blocking(name: String) -> Result<StatusReport, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     cfg.machine_name = trimmed;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
@@ -1757,7 +2474,7 @@ pub struct RestartReport {
 /// not be asked at all.
 #[tauri::command]
 pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let answer = client
         .restart_daemon(&reason)
         .await
@@ -2069,48 +2786,227 @@ pub async fn cmd_open_config_dir() -> Result<(), String> {
 /// owns the profile-correct sentinel dir, so this works even when the agent runs
 /// as SYSTEM — where the tray writing the sentinel itself would land in the
 /// wrong profile and the agent would never see it.
+///
+/// #3873 — `session` is the question the page shows, `None` when it shows
+/// none: that click is logged too ([`answer_click`]). #3987 — `shown` is how
+/// long, in ms, the page has shown that question.
 #[tauri::command]
-pub async fn cmd_consent_approve(session: String) -> Result<String, String> {
-    consent_decide(&session, true).await
+pub async fn cmd_consent_approve(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), true, shown).await
 }
 
 /// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub async fn cmd_consent_deny(session: String) -> Result<String, String> {
-    consent_decide(&session, false).await
+pub async fn cmd_consent_deny(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), false, shown).await
 }
 
 /// Send an Approve/Deny decision to the daemon over the LocalAPI.
-async fn consent_decide(session: &str, allow: bool) -> Result<String, String> {
-    let mut client = localapi::connect()
-        .await
-        .map_err(|e| format!("Device service unreachable: {e}"))?;
-    let ok = client
-        .consent_decide(session, allow)
-        .await
-        .map_err(|e| format!("LocalAPI error: {e}"))?;
-    if ok {
-        Ok(if allow {
-            "approved".into()
-        } else {
-            "denied".into()
-        })
-    } else {
-        Err("The device service rejected the decision (unknown or invalid session).".into())
+async fn consent_decide(
+    session: Option<&str>,
+    allow: bool,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    // #3987 — how long the click's question has been in front of the person.
+    let in_front = crate::panels::in_front_for(
+        crate::panels::consent_raised_ago(std::time::Instant::now()),
+        shown_for(shown),
+    );
+    answer_click(
+        session,
+        allow,
+        in_front,
+        CONSENT_ANSWER_WITHIN,
+        |session, allow| async move {
+            let mut client = connect_service().await.map_err(AskError::Connect)?;
+            client
+                .consent_decide(&session, allow)
+                .await
+                .map_err(AskError::Request)
+        },
+    )
+    .await
+}
+
+/// #3873 — how long a click's answer may take, from the connect to the
+/// daemon's reply: above the daemon's own bounds on an answer, who is at the
+/// seat (1.5 s, `files::SEAT_LOOKUP_WAIT`) and a one-row Mac's relay to its
+/// root half (5 s, `consent_relay::DECIDE_WITHIN`). Until #3873 nothing
+/// bounded it: an answer that never came kept the page "sending" for good,
+/// and it dropped every later click on the question without a word.
+const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
+/// #3873 — what the page shows for a click with no question on it.
+const NO_QUESTION: &str = "No question is waiting for an answer here, so nothing was sent.";
+
+/// #3987 — the page's `shown`, in ms, as a time. Anything but a finite
+/// number at or above zero is not known.
+fn shown_for(ms: Option<f64>) -> Option<Duration> {
+    ms.filter(|m| m.is_finite() && *m >= 0.0)
+        .and_then(|m| Duration::try_from_secs_f64(m / 1000.0).ok())
+}
+
+/// #3873 — the consent read's name in the refresh ledger.
+const CONSENT_PENDING_SURFACE: &str = "consent_pending";
+
+/// Why a click's answer did not come back from the daemon.
+#[derive(Debug)]
+enum AskError {
+    /// The LocalAPI endpoint could not be reached.
+    Connect(std::io::Error),
+    /// Reached, and the request failed: the daemon's own refusal
+    /// (`localapi error: …`), or the connection.
+    Request(std::io::Error),
+}
+
+/// #3873 — one click on Approve or Deny, from the page to the daemon: in the
+/// log when it arrives and again with its outcome, and given `within` for the
+/// daemon's answer. `ask` is the round trip ([`consent_decide`]'s LocalAPI
+/// call). Returns what the page shows: `approved` / `denied`, or the reason.
+/// #3987 — `in_front` is how long the click's question has been in front of
+/// the person ([`crate::panels::in_front_for`]).
+///
+/// Until #3873 no step of a click logged anything and none had a bound: on a
+/// Linux system install two clicks on a question the prompt window showed
+/// left no line in this app's log or the daemon's, and the question timed
+/// out (0.4.221 release lab).
+async fn answer_click<F, Fut>(
+    session: Option<&str>,
+    allow: bool,
+    in_front: Option<Duration>,
+    within: Duration,
+    ask: F,
+) -> Result<String, String>
+where
+    F: FnOnce(String, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, AskError>>,
+{
+    let verb = if allow { "Approve" } else { "Deny" };
+    let Some(session) = session.filter(|s| !s.is_empty()) else {
+        tracing::warn!(
+            verb,
+            "consent: a click with no question on the page; nothing was sent"
+        );
+        return Err(NO_QUESTION.into());
+    };
+    // #3987 — a click this soon after its question came to the front may
+    // have been aimed at what was under the pointer before it: in the log
+    // with why, and never sent. The page shows why, and the next click goes.
+    if !crate::panels::click_armed(in_front) {
+        let after = in_front.unwrap_or_default();
+        tracing::warn!(
+            verb,
+            session,
+            ?after,
+            arming = ?crate::panels::CONSENT_ARMING,
+            "consent: a click arrived too soon after the question came to the front; nothing was sent"
+        );
+        return Err(format!(
+            "Nothing was sent: this click came {:.1} s after the question came up, too soon to \
+             be sure it was meant for it. Click again to answer.",
+            after.as_secs_f64()
+        ));
     }
+    tracing::info!(
+        verb,
+        session,
+        "consent: a click arrived; asking the device service"
+    );
+    let (shown, why) = match tokio::time::timeout(within, ask(session.to_string(), allow)).await {
+        Ok(Ok(true)) => {
+            tracing::info!(verb, session, "consent: the device service took the answer");
+            return Ok(if allow { "approved" } else { "denied" }.into());
+        }
+        Ok(Ok(false)) => (
+            "The device service did not take the answer: this question is no longer waiting for \
+             one (answered, withdrawn or expired)."
+                .to_string(),
+            "the device service has no such question waiting (answered, withdrawn or expired)"
+                .to_string(),
+        ),
+        // #3998 — no service at all, said plainly.
+        Ok(Err(AskError::Connect(e))) if crate::tray::no_service(&e) => (
+            "Could not reach the device service: it is not running.".to_string(),
+            describe_io("connect", &e),
+        ),
+        Ok(Err(AskError::Connect(e))) => (
+            format!("Could not reach the device service: {e}"),
+            describe_io("connect", &e),
+        ),
+        Ok(Err(AskError::Request(e))) => match e.to_string().strip_prefix("localapi error: ") {
+            // The daemon's own refusal: its words, as they are (#3845's seat
+            // check, a one-row Mac's relay, an id it does not know).
+            Some(words) => (words.to_string(), words.to_string()),
+            None => (
+                format!("No answer from the device service: {e}"),
+                describe_io("consent_decide", &e),
+            ),
+        },
+        Err(_) => {
+            tracing::warn!(
+                verb,
+                session,
+                ?within,
+                "consent: no answer from the device service in time; the click is not taken"
+            );
+            return Err(format!(
+                "No answer from the device service within {within:?}. Try again."
+            ));
+        }
+    };
+    tracing::warn!(verb, session, reason = %why, "consent: the answer was not taken");
+    Err(shown)
 }
 
 /// List consent requests currently awaiting a decision — asked of the daemon
-/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The SPA
-/// polls this to render the Approve/Deny modal. NEVER errors — the modal must
-/// stay quiet when the daemon is down or nothing is pending. `ConsentRequest`
+/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The
+/// prompt window and the main window's fallback modal poll this. `ConsentRequest`
 /// serialises to the same `{session_id, controller_name, permissions,
-/// timeout_secs}` shape the SPA already consumes.
+/// timeout_secs}` shape the pages already consume.
+///
+/// #3873 — a read that fails is an `Err`, not an empty list
+/// ([`pending_answer`]): both pages stay quiet on it and keep what they show.
 #[tauri::command]
-pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
-    match localapi::connect().await {
-        Ok(mut c) => c.consent_pending().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c
+            .consent_pending()
+            .await
+            .map_err(|e| ("consent_pending", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    pending_answer(read)
+}
+
+/// #3873 — what the pages get for their read of the questions: the list, or,
+/// for a read that failed, an error. An empty list clears the question a
+/// page shows; a failed read keeps it, since the daemon may still be asking
+/// it, and a click on it reaches [`answer_click`], which logs what becomes of
+/// it. Until #3873 a failed read was an empty list: the prompt window let go
+/// of the question while it stayed on screen, and dropped a click on it. The
+/// failure is in the log through the refresh ledger, once a streak; a daemon
+/// that is not running is quiet, as on every other surface.
+fn pending_answer(
+    read: Result<Vec<ConsentRequest>, (&'static str, std::io::Error)>,
+) -> Result<Vec<ConsentRequest>, String> {
+    match read {
+        Ok(list) => {
+            refresh_ok(CONSENT_PENDING_SURFACE);
+            Ok(list)
+        }
+        Err((stage, e)) if stage == "connect" && e.kind() == std::io::ErrorKind::NotFound => {
+            Err(describe_io(stage, &e))
+        }
+        Err((stage, e)) => Err(refresh_failed(
+            CONSENT_PENDING_SURFACE,
+            describe_io(stage, &e),
+        )),
     }
 }
 
@@ -2125,14 +3021,65 @@ pub fn cmd_consent_modal_needed() -> bool {
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
 ///
-/// Never errors, for the same reason as [`cmd_get_pending_consents`]: an empty
-/// list and a daemon-down are the same *render* (no banner), and the Overview
-/// already surfaces daemon-down properly.
+/// #3998 — a read that fails is an `Err`, not an empty list
+/// ([`sessions_answer`]): the banner keeps its words on it, and the session
+/// watch in `main.rs` decides whether the banner stays up.
 #[tauri::command]
-pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
+pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c.rc_sessions().await.map_err(|e| ("rc_sessions", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    sessions_answer(read)
+}
+
+/// #3998 — what the banner page gets for its read of the sessions: the list,
+/// or, for a read that failed, why. Until #3998 a failed read was an empty
+/// list, and the banner said "Being viewed" with no name and offered a
+/// Disconnect that ended nothing.
+fn sessions_answer(
+    read: Result<Vec<roomler_localapi::RcSessionInfo>, (&'static str, std::io::Error)>,
+) -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    read.map_err(|(stage, e)| describe_io(stage, &e))
+}
+
+/// #3998 — [`localapi::connect`] for the consent prompt, the session banner
+/// and the tray's red: a connect that failed while this person's own
+/// endpoint is gone comes back as no service ([`proven`]).
+///
+/// #4020 — and for every other connect of this app whose error is read: a
+/// read that tells "not running" apart from another failure (the Overview's
+/// encoders and files cards, the device view, the Routes, Recordings and
+/// Devices pages), and an action whose error is shown as text, which keeps
+/// its words. Until #4020 those used the plain connect, so on a Linux system
+/// install or a Mac with the service stopped the Overview's cards said
+/// `Error` with the system socket's `PermissionDenied` (the 0.4.225 lab). A
+/// connect whose error nothing reads stays plain: a best-effort read with a
+/// fallback of its own, where the proof would probe the person's own
+/// endpoint for nothing. The test `only_a_connect_nobody_reads_stays_plain`
+/// holds that list.
+pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
-        Ok(mut c) => c.rc_sessions().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(client) => Ok(client),
+        Err(e) => Err(proven(e, localapi::own_endpoint_gone().await)),
+    }
+}
+
+/// #3998 — a failed connect's error, or, when this person's own endpoint is
+/// gone (`own_endpoint_gone`), `NotFound`: no device service is there for
+/// them, which the tray reads as an answer ([`crate::tray::no_service`]).
+/// On a Linux system install and on a Mac, `connect`'s error is its last
+/// endpoint's, the system socket in a folder only root may enter, so a
+/// stopped daemon read there as `PermissionDenied` (os error 13), the words
+/// a click's status line showed in the 0.4.224 Linux lab.
+pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Error {
+    if own_endpoint_gone && !crate::tray::no_service(&e) {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the device service is not running: this account's own LocalAPI endpoint is gone",
+        )
+    } else {
+        e
     }
 }
 
@@ -2141,7 +3088,7 @@ pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
 /// overlay's own button does.
 #[tauri::command]
 pub async fn cmd_rc_disconnect(session: String) -> Result<(), String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("Device service unreachable: {e}"))?;
     let ok = client
@@ -2191,7 +3138,7 @@ impl TunnelsView {
 #[tauri::command]
 pub async fn cmd_tunnels_view() -> TunnelsView {
     const SURFACE: &str = "tunnels";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return TunnelsView::unavailable(refresh_failed(SURFACE, describe_io("connect", &e)));
@@ -2230,7 +3177,7 @@ pub async fn cmd_tunnels_view() -> TunnelsView {
 pub async fn cmd_route_update(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_update(route)
         .await
@@ -2255,7 +3202,7 @@ fn explain_route_edit_error(message: &str) -> String {
 pub async fn cmd_route_add(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_add(route).await.map_err(|e| e.to_string())
 }
 
@@ -2263,14 +3210,14 @@ pub async fn cmd_route_add(
 /// daemon config). `Ok(false)` when the id was unknown.
 #[tauri::command]
 pub async fn cmd_route_remove(id: String) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_remove(&id).await.map_err(|e| e.to_string())
 }
 
 /// Enable/disable a declared route (enabling clears a terminal `failed`).
 #[tauri::command]
 pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_set_enabled(&id, enabled)
         .await
@@ -2279,6 +3226,8 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
 
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
+/// #4020 — its callers connect through [`connect_service`], so a stopped
+/// service is `NotFound` here on a Linux system install and a Mac too.
 pub(crate) fn daemon_unreachable(e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         "device service not running".to_string()
@@ -2382,7 +3331,7 @@ pub(crate) fn explain_recording_error(message: &str) -> String {
 #[tauri::command]
 pub async fn cmd_recordings_view() -> RecordingsView {
     const SURFACE: &str = "recordings";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return RecordingsView::unavailable(refresh_failed(
@@ -2483,7 +3432,7 @@ pub async fn cmd_record_start(
     system_audio: Option<bool>,
     microphone: Option<bool>,
 ) -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_start(localapi::RecordStartOpts {
             fps,
@@ -2499,7 +3448,7 @@ pub async fn cmd_record_start(
 /// Stop the recording. Resolves once the file is final.
 #[tauri::command]
 pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_stop()
         .await
@@ -2509,7 +3458,7 @@ pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
 /// Delete a recording (and its sidecar) by file name.
 #[tauri::command]
 pub async fn cmd_recording_delete(name: String) -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .recording_delete(&name)
         .await
@@ -2539,7 +3488,7 @@ pub async fn cmd_recording_open(name: Option<String>, reveal: bool) -> Result<()
     if let Some(n) = &name {
         check_recording_name(n)?;
     }
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let listing = client
         .recordings_list()
         .await
@@ -2683,7 +3632,7 @@ pub async fn cmd_devices(
     dir: Option<String>,
 ) -> Result<localapi::DevicesPage, String> {
     const SURFACE: &str = "devices";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     let query = localapi::DevicesQuery {
@@ -2707,7 +3656,7 @@ pub async fn cmd_devices(
 #[tauri::command]
 pub async fn cmd_mesh(org: Option<String>) -> Result<localapi::MeshView, String> {
     const SURFACE: &str = "mesh";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     match client.mesh(org.as_deref().unwrap_or("")).await {
@@ -2865,10 +3814,30 @@ fn refresh_ok(surface: &'static str) {
 /// enrolled.
 fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
     let path = active_config_path(is_scm).ok()?;
+    load_if_there(&path).ok().flatten()
+}
+
+/// #3996 — the config at `path`, for a caller to whom no file there is a
+/// normal state. The companion never runs on a config (the device service
+/// does), so that is every read it makes. A one-row Mac's person has none in
+/// the install's first seconds, until the screen worker writes one with no
+/// enrollment in it at its first start: the root daemon holds the enrollment
+/// (FR-43). A host that is not enrolled yet has none, and the person at a
+/// Windows background-service install cannot see the machine-wide one.
+///
+/// No file is `Ok(None)`, with nothing logged. A file that is there goes
+/// through [`config::load`], so a broken one still logs its ERROR and is
+/// recovered from its `.prev`; [`config::read_if_present`] would hide it
+/// (FR-66). Until #3996 most of these reads went straight to `config::load`,
+/// and a start with no device service answering logged "the host must be
+/// re-enrolled" about a healthy one-row Mac.
+fn load_if_there(path: &PathBuf) -> Result<Option<AgentConfig>, String> {
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    config::load(&path).ok()
+    config::load(path)
+        .map(Some)
+        .map_err(|e| format!("Loading config: {e}"))
 }
 
 /// A `Command` that never flashes a console window on Windows. The tray is a GUI
@@ -3223,6 +4192,7 @@ mod tests {
     fn report(enrolled: bool) -> StatusReport {
         StatusReport {
             enrolled,
+            enrollment_unknown: false,
             agent_id: enrolled.then(|| "from-file".to_string()),
             tenant_id: enrolled.then(|| "tenant-from-file".to_string()),
             server_url: enrolled.then(|| "https://file.example".to_string()),
@@ -3277,6 +4247,74 @@ mod tests {
         );
         assert_eq!(r.agent_id.as_deref(), Some("from-file"));
         assert_eq!(r.server_url.as_deref(), Some("https://file.example"));
+    }
+
+    /// #3996 — a start while no device service answers, on a host whose
+    /// person holds no config (a one-row Mac, or one not enrolled yet), logs
+    /// no ERROR and no "must be re-enrolled". The Welcome reads the
+    /// configuration listing as it opens, and with no service answering the
+    /// listing falls back to the file. Open Roomler falls back to the daemon,
+    /// which a missing file no longer keeps it from asking. On 0.4.224 each
+    /// start of a one-row Mac's script install logged the ERROR.
+    #[test]
+    fn a_start_with_no_config_and_no_service_logs_no_error() {
+        // A second live dispatcher, so that no other test thread's visit
+        // caches `config::load`'s callsites as never logged (see
+        // `first_run::tests::a_reopen_logs_what_it_shows`).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        let no_service = server_origin_from(&path, || None);
+        let one_row = server_origin_from(&path, || {
+            Some(daemon_status(
+                "6ab7a24f352abff7547c5062",
+                Some("6a975e17971e2d55ddcdedb2"),
+            ))
+        });
+        drop(guard);
+        let shown = listing.expect_err("no file and no service: nothing to list");
+        assert!(
+            shown.starts_with("There is no configuration file at"),
+            "{shown}"
+        );
+        assert_eq!(
+            no_service,
+            Err("This device isn't enrolled yet — no server to open.".to_string())
+        );
+        assert_eq!(
+            one_row.as_deref(),
+            Ok("https://roomler.ai"),
+            "a one-row Mac's server is its root daemon's"
+        );
+        let text = log.text();
+        assert!(
+            !text.contains("ERROR") && !text.contains("re-enrolled"),
+            "{text}"
+        );
+    }
+
+    /// #3996 — a config that IS there and is broken still logs its ERROR:
+    /// that line is what a really broken config writes, and a missing file
+    /// must not be read the same way, nor hide it.
+    #[test]
+    fn a_broken_config_still_logs_its_error() {
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        // All NUL, as an unclean shutdown once left one (`config::load`).
+        std::fs::write(&path, [0u8; 64]).expect("the broken file");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        drop(guard);
+        let shown = listing.expect_err("a broken file lists nothing");
+        assert!(shown.starts_with("Loading config: "), "{shown}");
+        let text = log.text();
+        assert!(
+            text.contains("ERROR") && text.contains("the host must be re-enrolled"),
+            "{text}"
+        );
     }
 
     // #1681 — stdout as `roomlerd service status [--as-service]` really prints
@@ -3473,15 +4511,16 @@ mod tests {
         ));
     }
 
-    /// #2871 — the note names both files, so a person can tell which one
+    /// #2871 — both notes name both files, so a person can tell which one
     /// `roomler config ls` printed, and the administrator's command for the
-    /// root half's switches, which this app has no path to.
+    /// root half's switches. Design A's note says the page shows both halves
+    /// and which rows change here; the legacy note (a root half that refuses
+    /// its listing) says the rows are the per-user half's alone.
     #[test]
-    fn the_two_halves_note_names_both_files_and_the_root_command() {
+    fn the_two_halves_notes_name_both_files_and_the_root_command() {
         let user = brief("u", Some(false), USER_FILE);
         let root = brief("d", Some(true), ROOT_FILE);
-        let note = two_halves_note(&user, &root);
-        for must in [
+        let common = [
             "per-user half",
             "root half",
             USER_FILE,
@@ -3492,9 +4531,22 @@ mod tests {
             "exec_enabled",
             "ssh_enabled",
             "remote_config_enabled",
-        ] {
+        ];
+        let note = two_halves_note(&user, &root);
+        for must in common
+            .iter()
+            .chain(&["shows both", "change here", "external access"])
+        {
             assert!(note.contains(must), "the note must say {must:?}: {note}");
         }
+        let legacy = two_halves_legacy_note(&user, &root);
+        for must in common {
+            assert!(
+                legacy.contains(must),
+                "the legacy note must say {must:?}: {legacy}"
+            );
+        }
+        assert!(!legacy.contains("change here"), "{legacy}");
         // An older daemon without `config_path` still gets a sentence, not a
         // hole where the file name was.
         let old = brief("u", Some(false), USER_FILE);
@@ -3503,6 +4555,7 @@ mod tests {
             ..old
         };
         assert!(two_halves_note(&old, &root).contains("its own config.toml"));
+        assert!(two_halves_legacy_note(&old, &root).contains("its own config.toml"));
     }
 
     /// #2891 — the root-only layouts, and everything that is NOT one. The
@@ -3551,13 +4604,33 @@ mod tests {
         );
     }
 
-    /// #2891 — the note names the daemon, its file and both administrator
-    /// commands, and says why the app has no path: the person socket serves
-    /// no configuration.
+    /// #2891 — the notes name the daemon, its file and the administrator's
+    /// command. #2871 (design A): the note for a daemon that served its rows
+    /// says what changes here and which rows are marked; the legacy note, for
+    /// a daemon that refused them, says why the app has no path.
     #[test]
-    fn the_root_only_note_names_the_file_and_the_sudo_commands() {
+    fn the_root_only_notes_name_the_file_and_the_sudo_commands() {
         let root = brief("d", Some(true), ROOT_FILE);
         let note = root_only_note(&root);
+        for must in [
+            "mac-d",
+            "0.4.169",
+            ROOT_FILE,
+            "sudo roomler config set <key> <value>",
+            "change here",
+            "external access",
+            "marked administrator's",
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            // #2871 — where recordings are saved stays root's on a root-mode
+            // install; the note must not offer it.
+            "the recordings folder",
+        ] {
+            assert!(note.contains(must), "the note must say {must:?}: {note}");
+        }
+        assert!(!note.contains("recordings land"), "{note}");
+        let legacy = root_only_legacy_note(&root);
         for must in [
             "mac-d",
             "0.4.169",
@@ -3565,18 +4638,169 @@ mod tests {
             "sudo roomler config ls",
             "sudo roomler config set <key> <value>",
             "person-at-the-device socket",
+            "no configuration",
             "exec_enabled",
             "ssh_enabled",
             "remote_config_enabled",
         ] {
-            assert!(note.contains(must), "the note must say {must:?}: {note}");
+            assert!(
+                legacy.contains(must),
+                "the legacy note must say {must:?}: {legacy}"
+            );
         }
+        assert!(!legacy.contains("change here"), "{legacy}");
         // An older daemon without `config_path` still names a file.
         let old = DaemonBrief {
             config_path: None,
             ..root
         };
         assert!(root_only_note(&old).contains("/etc/roomler/config.toml"));
+        assert!(root_only_legacy_note(&old).contains("/etc/roomler/config.toml"));
+    }
+
+    /// #2871 (design A) — which half of a two-half Mac a key is sent to, by
+    /// this build's registry: the machine-side groups to the root half, the
+    /// session-side ones (and a key this build has never heard of) to the
+    /// per-user half, as the page always did. #2871's review — and a key this
+    /// build does not know goes where the group its row was LISTED with puts
+    /// it, the same decision the listing made.
+    #[test]
+    fn a_machine_side_key_goes_to_the_root_half_and_a_session_side_key_to_the_worker() {
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "external_access_enabled",
+            "external_consent_mode",
+            "auto_grant_session",
+            "auto_update",
+        ] {
+            assert!(is_machine_side(key, ""), "{key} is the root half's");
+        }
+        for key in [
+            "record_dir",
+            "files_dir",
+            "rc_clipboard",
+            "privacy_mode_allowed",
+            "lock_on_end",
+            "display_match",
+            "peer_auth",
+            "keep_busy_enabled",
+            "encoder_preference",
+            "brand_new_key",
+        ] {
+            assert!(!is_machine_side(key, ""), "{key} is the session half's");
+        }
+        // A key a newer daemon lists and this build does not know: by the
+        // group it came with — so the set follows the row (`merge_two_halves`
+        // takes it from the root half for exactly these groups).
+        assert!(is_machine_side("brand_new_key", "access"));
+        assert!(is_machine_side("brand_new_key", "ssh"));
+        assert!(!is_machine_side("brand_new_key", "files"));
+        assert!(!is_machine_side("brand_new_key", "no_such_group"));
+        // A key this build knows is placed by the registry, whatever a row says.
+        assert!(!is_machine_side("rc_clipboard", "access"));
+        assert!(is_machine_side("exec_enabled", "files"));
+        let row = |key: &str, group: &str| {
+            serde_json::from_value::<localapi::ConfigEntry>(serde_json::json!({
+                "key": key, "value": "x", "kind": "string", "restart_required": true,
+                "description": "", "group": group,
+            }))
+            .unwrap()
+        };
+        let merged = merge_two_halves(
+            vec![row("rc_clipboard", "remote_desktop")],
+            vec![
+                row("brand_new_key", "access"),
+                row("brand_new_key_2", "files"),
+            ],
+        );
+        let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["rc_clipboard", "brand_new_key"],
+            "the listing took the unknown machine-side row from the root half"
+        );
+        for e in &merged {
+            assert_eq!(
+                is_machine_side(&e.key, &e.group),
+                e.key == "brand_new_key",
+                "{}: the set goes where the row came from",
+                e.key
+            );
+        }
+    }
+
+    /// #2871 (design A) — a two-half Mac's rows: machine-side keys from the
+    /// root half (its value, its `read_only` mark), session-side keys from the
+    /// per-user half, in the per-user listing's order; a machine-side key only
+    /// the root half lists is appended; a session-side key only the root half
+    /// lists is dropped.
+    #[test]
+    fn a_two_half_listing_takes_machine_rows_from_the_root_half_and_session_rows_from_the_worker() {
+        let entry = |key: &str, group: &str, value: &str, read_only: Option<&str>| {
+            serde_json::from_value::<localapi::ConfigEntry>(serde_json::json!({
+                "key": key, "value": value, "kind": "bool", "restart_required": false,
+                "description": "", "group": group, "read_only": read_only,
+            }))
+            .unwrap()
+        };
+        // The per-user half's file, as #2871 measured it: `exec_enabled` on,
+        // `ssh_enabled` off — while the root half served SSH.
+        let worker = vec![
+            entry("exec_enabled", "access", "true", None),
+            entry("rc_clipboard", "remote_desktop", "false", None),
+            entry("ssh_enabled", "ssh", "false", None),
+            entry("record_dir", "files", "/Users/a/Movies", None),
+        ];
+        let root = vec![
+            entry("exec_enabled", "access", "false", Some("root_only")),
+            entry("rc_clipboard", "remote_desktop", "true", None),
+            entry("ssh_enabled", "ssh", "true", Some("root_only")),
+            entry("external_access_enabled", "access", "false", None),
+            entry("record_dir", "files", "/var/root/Movies", Some("root_only")),
+        ];
+        let merged = merge_two_halves(worker, root);
+        let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "exec_enabled",
+                "rc_clipboard",
+                "ssh_enabled",
+                "record_dir",
+                "external_access_enabled"
+            ]
+        );
+        let by_key = |k: &str| merged.iter().find(|e| e.key == k).unwrap();
+        // The root half's switches, as the root half has them, marked.
+        assert_eq!(by_key("exec_enabled").value.as_deref(), Some("false"));
+        assert_eq!(
+            by_key("exec_enabled").read_only.as_deref(),
+            Some("root_only")
+        );
+        assert_eq!(by_key("ssh_enabled").value.as_deref(), Some("true"));
+        assert_eq!(
+            by_key("ssh_enabled").read_only.as_deref(),
+            Some("root_only")
+        );
+        // The external-access surface: the root half's, and editable there.
+        assert_eq!(
+            by_key("external_access_enabled").value.as_deref(),
+            Some("false")
+        );
+        assert_eq!(by_key("external_access_enabled").read_only, None);
+        // The session's keys stay the per-user half's, whatever the root has.
+        assert_eq!(by_key("rc_clipboard").value.as_deref(), Some("false"));
+        assert_eq!(
+            by_key("record_dir").value.as_deref(),
+            Some("/Users/a/Movies")
+        );
+        // No root half's rows (an older root half): the listing is the
+        // per-user half's, untouched.
+        let worker = vec![entry("exec_enabled", "access", "true", None)];
+        assert_eq!(merge_two_halves(worker.clone(), Vec::new()), worker);
     }
 
     /// FR-85 — the page hands the companion a NAME to open, never a path.
@@ -3637,7 +4861,7 @@ mod tests {
         ] {
             assert!(is_daemon_owned_key(key), "{key}");
         }
-        let refusal = "only the person at this device's console can open it to people outside \
+        let refusal = "only the person at this device's screen can open it to people outside \
                        the organization, or change how";
         assert_eq!(
             explain_daemon_owned_error("external_access_enabled", refusal),
@@ -3880,6 +5104,59 @@ mod tests {
         assert!(remote_target(&cfg, Some("broken")).is_err());
     }
 
+    /// FR-43 P3a — a one-row Mac's person file names no server, so "View screen"
+    /// takes its origin and tenant from the root daemon's rows, by the same rules
+    /// as the file's: the org follows the device, and a bad row is never opened.
+    #[test]
+    fn a_daemons_rows_give_the_same_target_as_a_file() {
+        let status: NodeStatus = serde_json::from_value(serde_json::json!({
+            "node_id": "d", "name": "mac", "version": "0.4.199", "mode": "service",
+            "connected": true,
+            "orgs": [
+                { "label": "primary", "server_url": "https://roomler.ai/",
+                  "tenant_id": "AAAAAAAAAAAAAAAAAAAAAAAA", "primary": true,
+                  "enabled": true, "connected": true },
+                { "label": "acme", "server_url": "https://acme.example",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true },
+                { "label": "no-tenant", "server_url": "https://acme.example",
+                  "primary": false, "enabled": true, "connected": true },
+                { "label": "bad-origin", "server_url": "file:///etc/passwd",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true }
+            ]
+        }))
+        .unwrap();
+        let primary = (
+            "https://roomler.ai".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        assert_eq!(daemon_remote_target(&status, None).unwrap(), primary);
+        assert_eq!(daemon_remote_target(&status, Some("")).unwrap(), primary);
+        assert_eq!(
+            daemon_remote_target(&status, Some("primary")).unwrap(),
+            primary
+        );
+        assert_eq!(
+            daemon_remote_target(&status, Some("acme")).unwrap(),
+            (
+                "https://acme.example".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+            )
+        );
+        let unknown = daemon_remote_target(&status, Some("ghost")).unwrap_err();
+        assert!(unknown.contains("no enrollment labelled"), "{unknown}");
+        assert!(daemon_remote_target(&status, Some("no-tenant")).is_err());
+        assert!(daemon_remote_target(&status, Some("bad-origin")).is_err());
+
+        // A daemon with no rows (no answer from the root half) opens nothing.
+        let empty = NodeStatus {
+            orgs: Vec::new(),
+            ..status
+        };
+        assert!(daemon_remote_target(&empty, None).is_err());
+    }
+
     /// FR-84 D5c — a rejected `cmd_devices` is `{code, message, status?}`,
     /// with the cause the page keys its fallback on.
     #[test]
@@ -3948,10 +5225,10 @@ mod tests {
             explain_daemon_owned_error("files_dir", refused),
             "the service runs as SYSTEM/root, so files_dir must be inside the active user's profile (C:\\Users\\alice); D:\\Drops is outside it"
         );
-        let console = "localapi error: only the person at this device's console can change where incoming files land";
+        let not_the_screens = "localapi error: only the person at this device's screen can change where incoming files land";
         assert_eq!(
-            explain_daemon_owned_error("files_dir", console),
-            "only the person at this device's console can change where incoming files land"
+            explain_daemon_owned_error("files_dir", not_the_screens),
+            "only the person at this device's screen can change where incoming files land"
         );
         // An older daemon (key or verb unknown): a plain "update", not the
         // raw parse error — and still no direct write.
@@ -4005,6 +5282,120 @@ mod tests {
             view.caps.as_ref().unwrap().denied.len(),
             2,
             "the verbatim list travels whole"
+        );
+    }
+
+    /// The failures the refresh ledger holds for the encoding card's streak.
+    fn encoder_caps_failures() -> u32 {
+        REFRESH_LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaks
+            .get(ENCODER_CAPS_SURFACE)
+            .map_or(0, |s| s.failures)
+    }
+
+    /// #3831 — on a Linux system install this app reaches the root daemon over
+    /// its person socket, and a daemon older than #3831 refuses `encoder_caps`
+    /// there. That refusal is an ANSWER, confirmed to be a root daemon's by
+    /// `refused_by_root_daemon` (one `Status`): the card's state is
+    /// `root_only`, which it words plainly, never `Error`, and the refresh
+    /// ledger is not told the card failed. Only an answer reads that way. No
+    /// answer at all (the transport failed) stays a failure whatever the
+    /// daemon is, so a hiccup on a daemon that serves the verb shows the real
+    /// error; and the same answer from a daemon that is not a root one reached
+    /// over its person socket stays a failure too.
+    #[test]
+    fn a_person_socket_refusal_is_root_only_and_no_answer_stays_a_failure() {
+        let refusal = || {
+            Ok(localapi::Response::Error {
+                message: "this is the person-at-the-device socket of a system install: … run \
+                          `sudo roomler …`"
+                    .into(),
+            })
+        };
+        // The answer, from a root daemon this unprivileged app reached.
+        let before = encoder_caps_failures();
+        let view = encoder_caps_view(refusal(), true);
+        assert!(!view.available);
+        assert_eq!(view.reason.as_deref(), Some("root_only"));
+        assert!(view.caps.is_none() && view.denied_cells.is_empty());
+        assert_eq!(
+            encoder_caps_failures(),
+            before,
+            "a refusal is not a failure"
+        );
+        // The same answer, from a daemon that is not that one: a failure.
+        let view = encoder_caps_view(refusal(), false);
+        assert!(!view.available);
+        let reason = view.reason.unwrap();
+        assert!(
+            reason.starts_with("encoder_caps: localapi error: this is the person-at-the-device"),
+            "{reason}"
+        );
+        assert_eq!(encoder_caps_failures(), before + 1);
+        // No answer at all: a failure, even with a root daemon on the line.
+        for lost in [
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "localapi: connection closed before a response",
+            ),
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ] {
+            let kind = lost.kind();
+            let view = encoder_caps_view(Err(lost), true);
+            let reason = view.reason.unwrap();
+            assert_ne!(reason, "root_only", "{kind:?}");
+            assert!(reason.starts_with("encoder_caps: "), "{reason}");
+        }
+        assert_eq!(encoder_caps_failures(), before + 4);
+        // A daemon older than the verb is a version, on any socket.
+        for root in [true, false] {
+            let old = Ok(localapi::Response::Error {
+                message: "bad request: unknown variant `encoder_caps`, expected one of `status`"
+                    .into(),
+            });
+            assert_eq!(
+                encoder_caps_view(old, root).reason.as_deref(),
+                Some("old_daemon")
+            );
+        }
+        // The summary is the card's matrix, and ends the streak.
+        let view = encoder_caps_view(
+            Ok(localapi::Response::EncoderCaps(
+                localapi::EncoderCapsSummary {
+                    state: "ready".into(),
+                    ..Default::default()
+                },
+            )),
+            true,
+        );
+        assert!(view.available && view.reason.is_none());
+        assert_eq!(encoder_caps_failures(), 0);
+    }
+
+    /// #3831 — the page words `root_only` as a plain, muted state, before its
+    /// `Error` fallback can take it.
+    #[test]
+    fn the_encoding_card_words_root_only_plainly() {
+        let js = include_str!("front/overview.js");
+        let branch = js
+            .find("view.reason === 'root_only'")
+            .expect("overview.js does not word root_only");
+        let sentence = js
+            .find("The encoders are shown to this device's administrator.")
+            .expect("overview.js does not say whose the encoders are");
+        let error = js
+            .find("encChip('Error'")
+            .expect("the card's Error fallback");
+        assert!(
+            branch < sentence && sentence < error,
+            "{branch} {sentence} {error}"
+        );
+        assert!(
+            js[branch..sentence].contains("encChip('Unavailable', 'chip-muted')"),
+            "root_only is a plain state, not a warning"
         );
     }
 
@@ -4077,5 +5468,1118 @@ mod tests {
             no_handler_message("mailto"),
             "Nothing on this computer opens mailto: links."
         );
+    }
+
+    // ─── #3873 — a click on the consent prompt is acted on, or logged ────
+
+    /// A session the daemon could be asking about.
+    const SESSION: &str = "0123456789abcdef01234567";
+
+    /// The lines the code under test logs, as the desktop log writes them.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+        }
+    }
+
+    /// This thread's log lines while the guard lives. The tests below are
+    /// `#[tokio::test]`s, on the current thread, so a click's lines land here.
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let out = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (out, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// #3873 — a click whose answer never comes back ends at the bound, with
+    /// its reason on the page and in the log. On 0.4.221 nothing bounded it:
+    /// the page stayed "sending" for good, and its next click, 3 min later,
+    /// was dropped without a line anywhere.
+    #[tokio::test]
+    async fn a_click_whose_answer_never_comes_ends_at_the_bound() {
+        let (log, _guard) = capture();
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer_click(
+                Some(SESSION),
+                true,
+                None,
+                Duration::from_millis(50),
+                |_, _| std::future::pending::<Result<bool, AskError>>(),
+            ),
+        )
+        .await
+        .expect("5 s on, the click still waited for its answer: nothing bounds it");
+        let shown = answered.expect_err("no answer is not an approval");
+        assert!(
+            shown.starts_with("No answer from the device service within"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(text.contains("consent: a click arrived"), "{text}");
+        assert!(
+            text.contains("WARN") && text.contains("consent: no answer from the device service"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+    }
+
+    /// #3873 — every click is in the log when it arrives and again with its
+    /// outcome, and the page gets the daemon's own words where it gave some.
+    #[tokio::test]
+    async fn every_click_is_logged_when_it_arrives_and_with_its_outcome() {
+        let within = Duration::from_secs(5);
+
+        let (log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            within,
+            |session, allow| async move {
+                assert_eq!((session.as_str(), allow), (SESSION, true));
+                Ok(true)
+            },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Approve"),
+            "{text}"
+        );
+        assert!(
+            text.contains("consent: the device service took the answer"),
+            "{text}"
+        );
+
+        // Refused by the daemon, in its own words (#3845's seat check).
+        let words = "The answer was not taken: only the person signed in at this device's own \
+                     screen answers a request to see or control it, and that is not this account \
+                     right now (the seat changed since this connection opened).";
+        let (log, guard) = capture();
+        let refused = answer_click(Some(SESSION), false, None, within, |_, _| async move {
+            Err(AskError::Request(std::io::Error::other(format!(
+                "localapi error: {words}"
+            ))))
+        })
+        .await;
+        drop(guard);
+        assert_eq!(
+            refused,
+            Err(words.to_string()),
+            "the page shows the daemon's words"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Deny"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WARN") && text.contains("consent: the answer was not taken"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the seat changed"),
+            "the daemon's words are in the log: {text}"
+        );
+
+        // No such question any more: answered, withdrawn or expired.
+        let (log, guard) = capture();
+        let gone = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Ok(false)
+        })
+        .await;
+        drop(guard);
+        let shown = gone.expect_err("not taken");
+        assert!(shown.contains("no longer waiting"), "{shown}");
+        let text = log.text();
+        assert!(text.contains("consent: the answer was not taken"), "{text}");
+
+        // The device service could not be reached.
+        let (log, guard) = capture();
+        let unreachable = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Err(AskError::Connect(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        })
+        .await;
+        drop(guard);
+        let shown = unreachable.expect_err("not sent");
+        assert!(
+            shown.starts_with("Could not reach the device service"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: the answer was not taken") && text.contains("connect: "),
+            "{text}"
+        );
+    }
+
+    /// #3873 — a click with no question on the page reaches the app and is
+    /// logged; nothing goes to the daemon.
+    #[tokio::test]
+    async fn a_click_with_no_question_is_logged_and_sends_nothing() {
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, _guard) = capture();
+        let shown = answer_click(None, true, None, Duration::from_secs(5), |_, _| {
+            sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(true) }
+        })
+        .await
+        .expect_err("a click with no question is not an approval");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert_eq!(shown, NO_QUESTION);
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click with no question on the page"),
+            "{text}"
+        );
+    }
+
+    /// #3987 — a click that comes too soon after its question came to the
+    /// front (the app showed or raised the prompt, or the page put a new
+    /// question under the pointer) is logged with why and never sent, and
+    /// the page shows the reason. Escape, the Deny button's key, is held
+    /// back the same way. Once the question has been up for the arming
+    /// time, the click goes.
+    #[tokio::test]
+    async fn a_click_too_soon_after_the_question_came_up_is_logged_and_not_sent() {
+        let within = Duration::from_secs(5);
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            Some(Duration::from_millis(300)),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        let shown = shown.expect_err("a click 0.3 s after the question came up approves nothing");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert!(
+            shown.starts_with("Nothing was sent") && shown.contains("0.3 s"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click arrived too soon"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+
+        let (_log, guard) = capture();
+        let escape = answer_click(
+            Some(SESSION),
+            false,
+            Some(Duration::ZERO),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        assert!(
+            escape.is_err(),
+            "a Deny as the question comes up is held back too"
+        );
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            Some(crate::panels::CONSENT_ARMING),
+            within,
+            |_, _| async { Ok(true) },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+    }
+
+    /// #3987 — the page's `shown` is a time only when it is a finite number
+    /// at or above zero; anything else is not known, and the app's own show
+    /// or raise of the window then decides alone.
+    #[test]
+    fn the_pages_shown_time_is_read_only_when_it_is_a_time() {
+        assert_eq!(shown_for(Some(300.0)), Some(Duration::from_millis(300)));
+        assert_eq!(shown_for(Some(0.0)), Some(Duration::ZERO));
+        assert_eq!(shown_for(None), None);
+        assert_eq!(shown_for(Some(-5.0)), None);
+        assert_eq!(shown_for(Some(f64::NAN)), None);
+        assert_eq!(shown_for(Some(f64::INFINITY)), None);
+        assert_eq!(shown_for(Some(f64::MAX)), None, "too large for a time");
+    }
+
+    /// The refresh ledger's count for the page's read of the questions.
+    fn consent_pending_failures() -> u32 {
+        REFRESH_LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaks
+            .get(CONSENT_PENDING_SURFACE)
+            .map_or(0, |s| s.failures)
+    }
+
+    /// #3873 — the page's read of the questions. An empty list clears the
+    /// question the page shows; a read that FAILED is an error the page keeps
+    /// its question on, and it is in the log. On 0.4.221 a failed read was an
+    /// empty list: the page let go of the question while it stayed on screen,
+    /// and a click on it was dropped. A daemon that is not running is quiet,
+    /// as on every other surface.
+    #[test]
+    fn a_failed_read_of_the_questions_is_an_error_and_in_the_log() {
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let before = consent_pending_failures();
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = pending_answer(Err(("consent_pending", closed)))
+            .expect_err("a failed read is not 'no question'");
+        assert!(shown.starts_with("consent_pending: "), "{shown}");
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "in the refresh ledger"
+        );
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(pending_answer(Err(("connect", gone))).is_err());
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "a daemon that is not running is not a failure"
+        );
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        assert_eq!(
+            consent_pending_failures(),
+            0,
+            "a read that worked ends the streak"
+        );
+    }
+
+    /// The text of the function `head` starts in a page's script, to its
+    /// closing brace at the IIFE's indentation (two spaces). Line ends are
+    /// `\n` whatever the checkout wrote.
+    fn js_function(src: &str, head: &str) -> String {
+        let src = src.replace("\r\n", "\n");
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("no `{head}` in the page"));
+        let end = src[start..]
+            .find("\n  }\n")
+            .unwrap_or_else(|| panic!("`{head}` has no end"));
+        src[start..start + end].to_string()
+    }
+
+    /// A page's own limit on an answer (`PAGE_LIMIT_MS`), in milliseconds.
+    fn page_limit_ms(js: &str) -> u64 {
+        const DECL: &str = "const PAGE_LIMIT_MS = ";
+        let at = js.find(DECL).expect("the page has no limit of its own");
+        js[at + DECL.len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("PAGE_LIMIT_MS is a number")
+    }
+
+    /// #3873 — the prompt window sends every Approve and Deny to the app,
+    /// which logs it, and never drops one without a word: nothing returns
+    /// before it sends; its buttons are off only while there is no question,
+    /// an answer is on its way or this window answered it; and the status
+    /// line, its own element, says which. On 0.4.221 `decide()` returned
+    /// silently while `busy`, and its "Approving…" and "Failed: …" went into
+    /// the countdown, which repaints every second.
+    #[test]
+    fn the_prompt_sends_every_click_and_says_why_its_buttons_are_off() {
+        let html = include_str!("front/panel-consent.html");
+        let js = include_str!("front/panel-consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            html.contains(r#"id="p-status""#),
+            "no status line of its own"
+        );
+        assert!(
+            !decide.contains("p-countdown"),
+            "decide() writes into the countdown: {decide}"
+        );
+        assert!(decide.contains("setStatus("), "{decide}");
+        let paint = js_function(js, "function paintButtons(");
+        assert!(
+            paint.contains("!active || sending || answered === active"),
+            "{paint}"
+        );
+        assert!(
+            js.contains("e.key === 'Escape' && !$('p-deny').disabled"),
+            "Escape acts as the Deny button does"
+        );
+        // The page's own limit covers the app's: it fires only when the app
+        // itself never answers.
+        assert!(decide.contains("PAGE_LIMIT_MS"), "{decide}");
+        assert!(Duration::from_millis(page_limit_ms(js)) > CONSENT_ANSWER_WITHIN);
+    }
+
+    /// #3873 — the prompt keeps the question it shows when a read of the
+    /// questions fails, and clears it on an empty list only.
+    #[test]
+    fn the_prompt_keeps_its_question_on_a_failed_read() {
+        let js = include_str!("front/panel-consent.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("clear(") && !block.contains("active = null"),
+            "a failed read lets go of the question: {block}"
+        );
+        assert!(
+            poll.contains("pending.length === 0") && poll.contains("clear()"),
+            "{poll}"
+        );
+    }
+
+    /// #3873 — the main window's fallback modal sends every click too, with
+    /// the same limit of its own.
+    #[test]
+    fn the_fallback_modal_sends_every_click_too() {
+        let js = include_str!("front/consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            decide.contains("paintButtons()") && decide.contains("PAGE_LIMIT_MS"),
+            "{decide}"
+        );
+        assert_eq!(
+            page_limit_ms(js),
+            page_limit_ms(include_str!("front/panel-consent.js"))
+        );
+    }
+
+    /// #3987 — each page tells the app, with every click, how long the
+    /// question under the pointer has been shown, and that time starts again
+    /// only when the question changes: it is set where a new question is
+    /// put up and nowhere else, which happens only once the question shown
+    /// is gone. The app raises the prompt only for a question it has not
+    /// seen. A poll that changes nothing arms nothing again, or a person
+    /// could never click.
+    #[test]
+    fn a_poll_that_changes_nothing_does_not_arm_the_question_again() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        for (page, js, put_up, guard) in [
+            (
+                "panel-consent.js",
+                include_str!("front/panel-consent.js"),
+                "function render(",
+                "if(!active||!pending.some((p)=>p.session_id===active))render(pending[0])",
+            ),
+            (
+                "consent.js",
+                include_str!("front/consent.js"),
+                "function show(",
+                "if(!activeSession||!pending.some((p)=>p.session_id===activeSession)){show(pending[0])}",
+            ),
+        ] {
+            assert_eq!(
+                js.matches("shownAt = performance.now()").count(),
+                1,
+                "{page}: the time a question is shown is set in one place"
+            );
+            let body = js_function(js, put_up);
+            assert!(
+                body.contains("shownAt = performance.now()"),
+                "{page}: {body}"
+            );
+            let call = put_up.trim_start_matches("function ");
+            assert_eq!(
+                js.matches(call).count(),
+                2,
+                "{page}: `{call}` is defined and called once"
+            );
+            let poll = js_function(js, "async function poll(");
+            assert!(flat(&poll).contains(guard), "{page}: {poll}");
+            let decide = js_function(js, "async function decide(");
+            assert!(
+                flat(&decide).contains("{session,shown:Math.round(performance.now()-shownAt)}"),
+                "{page}: {decide}"
+            );
+        }
+        let main = flat(include_str!("main.rs"));
+        assert!(
+            main.contains("letshow_prompt=self.questions.difference(&seen).next().is_some();")
+                && main.contains("ifchange.show_prompt{panels::show_consent(&app);"),
+            "the app raises the prompt only for a question it has not seen"
+        );
+    }
+
+    /// #3998 — a click while the device service is stopped says so. In the
+    /// 0.4.224 Linux lab, `systemctl stop roomlerd` with a question up and
+    /// an Approve gave "Could not reach the device service: Permission denied
+    /// (os error 13)": the system socket's words, the last endpoint tried,
+    /// while the person's own endpoint was gone.
+    #[tokio::test]
+    async fn a_click_with_the_service_stopped_says_it_is_not_running() {
+        let (log, _guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            Duration::from_secs(5),
+            |_, _| async {
+                Err(AskError::Connect(proven(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ),
+                    true,
+                )))
+            },
+        )
+        .await
+        .expect_err("nothing was sent");
+        assert_eq!(
+            shown,
+            "Could not reach the device service: it is not running."
+        );
+        let text = log.text();
+        assert!(
+            text.contains("device service not running") && !text.contains("Permission denied"),
+            "{text}"
+        );
+    }
+
+    /// #3998 — the banner page's read of the sessions: a list, or, for a
+    /// read that failed, an error the page keeps its words on. Until #3998
+    /// a failed read was an empty list, and the banner read "Being viewed"
+    /// with no name and a Disconnect that ended nothing.
+    #[test]
+    fn a_failed_read_of_the_sessions_is_an_error() {
+        let live = vec![roomler_localapi::RcSessionInfo {
+            session_id: SESSION.into(),
+            ..Default::default()
+        }];
+        assert_eq!(sessions_answer(Ok(live.clone())), Ok(live));
+        assert_eq!(sessions_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = sessions_answer(Err(("rc_sessions", closed)))
+            .expect_err("a failed read is not 'no session'");
+        assert!(shown.starts_with("rc_sessions: "), "{shown}");
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(sessions_answer(Err(("connect", gone))).is_err());
+    }
+
+    /// #3998 — the banner keeps its words when a read of the sessions fails,
+    /// and paints only an answer.
+    #[test]
+    fn the_banner_keeps_its_words_on_a_failed_read() {
+        let js = include_str!("front/panel-viewing.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("sessions =") && !block.contains("paint("),
+            "a failed read changes the banner's words: {block}"
+        );
+        assert!(poll.contains("paint()"), "{poll}");
+    }
+
+    /// #4019 — a refresh that fails or recovers moves no row of the device
+    /// list. The stale-data line (`dv-grid-error`, "Showing data from 1 min
+    /// ago — …") and the status line (`dv-grid-status`) sat in the flow right
+    /// above the table, so showing one moved every row down by its height
+    /// while a person aimed at one: in the 0.4.225 lab two "View screen"
+    /// clicks landed on row padding. Both now sit in one slot above the
+    /// table whose height is fixed, shown or not, and the page shows and
+    /// hides the lines in it, never the slot.
+    #[test]
+    fn a_note_above_the_device_list_moves_no_row() {
+        let html = include_str!("front/index.html").replace("\r\n", "\n");
+        let css = include_str!("front/styles.css").replace("\r\n", "\n");
+        let js = include_str!("front/devices.js").replace("\r\n", "\n");
+        // The slot, never `hidden`, holds both lines, above the table.
+        let open = html
+            .find(r#"<div id="dv-notes" class="dv-notes">"#)
+            .expect("the list's notes have no slot");
+        let close = open + html[open..].find("</div>").expect("the slot's end");
+        let slot = &html[open..close];
+        for line in [r#"<p id="dv-grid-status""#, r#"<p id="dv-grid-error""#] {
+            assert_eq!(html.matches(line).count(), 1, "{line}");
+            assert!(slot.contains(line), "{line} is not in the slot: {slot}");
+        }
+        assert!(
+            close
+                < html
+                    .find(r#"<table id="dv-grid""#)
+                    .expect("the device list"),
+            "the slot is not above the list"
+        );
+        // Its height is fixed, and what does not fit in it is cut.
+        let start = css.find("\n.dv-notes {").expect("no rule for the slot");
+        let rule = &css[start..start + css[start..].find('}').expect("the rule's end")];
+        for decl in ["height: 32px;", "overflow: hidden;"] {
+            assert!(rule.contains(decl), "{decl}: {rule}");
+        }
+        assert!(
+            !rule.contains("min-height") && !rule.contains("max-height"),
+            "{rule}"
+        );
+        // The page shows and hides the lines, never the slot.
+        assert_eq!(js.matches("$('dv-notes')").count(), 1, "{js}");
+        assert!(js.contains("$('dv-notes').classList.toggle('both', !!note && !!warn);"));
+    }
+
+    /// #4020 — with the device service stopped on a Linux system install or
+    /// a Mac, a connect fails with the system socket's `PermissionDenied`
+    /// while the person's own endpoint is gone, and the Overview read that as
+    /// a failure: an `Error` chip and "Could not read …" on its encoders and
+    /// files cards (0.4.225 lab). Through `connect_service` ([`proven`]) it is
+    /// no service: the device view and both cards answer
+    /// `daemon_unreachable`, which the cards word "Offline". Where the own
+    /// endpoint is there, the same error stays a failure in its own words.
+    #[tokio::test]
+    async fn a_stopped_service_reads_not_running_on_the_overview() {
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )
+        };
+        let stopped = || -> std::io::Result<localapi::Client> { Err(proven(denied(), true)) };
+        let view = device_view(stopped()).await;
+        assert!(!view.available);
+        assert_eq!(view.reason.as_deref(), Some("daemon_unreachable"));
+        let caps = encoder_caps_from(stopped()).await;
+        assert!(!caps.available);
+        assert_eq!(caps.reason.as_deref(), Some("daemon_unreachable"));
+        let files = files_dir_view_from(stopped()).await;
+        assert!(!files.available);
+        assert_eq!(files.reason.as_deref(), Some("daemon_unreachable"));
+        // The own endpoint is there. (Not the encoders card: its failures
+        // count in the refresh ledger, which
+        // `a_person_socket_refusal_is_root_only_and_no_answer_stays_a_failure`
+        // counts while the tests run in parallel.)
+        let there = || -> std::io::Result<localapi::Client> { Err(proven(denied(), false)) };
+        let view = device_view(there()).await;
+        assert_eq!(view.reason.as_deref(), Some("connect_error"));
+        let reason = files_dir_view_from(there()).await.reason.unwrap();
+        assert!(
+            reason.starts_with("connect: Permission denied")
+                && reason.ends_with("[PermissionDenied]"),
+            "{reason}"
+        );
+    }
+
+    /// #4020 — every connect of this app whose error is read goes through
+    /// `connect_service`, so a stopped service reads "not running" on every
+    /// OS and every page. A connect stays plain only where nothing reads its
+    /// error, each listed here with what a failed one leads to.
+    #[test]
+    fn only_a_connect_nobody_reads_stays_plain() {
+        // Each with what a failed connect leads to.
+        const PLAIN: &[(&str, &str)] = &[
+            ("commands.rs", "connect_service"),     // the proof itself
+            ("commands.rs", "daemon_node_status"),  // no answer: the file's word stands
+            ("commands.rs", "cmd_config_entries"),  // the root half on a Mac, else the file
+            ("commands.rs", "cmd_config_set"),      // the root half on a Mac, else the file
+            ("commands.rs", "cmd_pick_files_dir"),  // the picker opens with no start folder
+            ("commands.rs", "cmd_tail_log"),        // the log file, read directly
+            ("commands.rs", "cmd_set_device_name"), // the file, written directly
+            ("tray.rs", "spawn_keep_busy_watch"),   // the item reads off, disabled
+            ("first_run.rs", "daemon_has_something_to_show"), // the tour, as always
+            ("first_run.rs", "device_autostart_switch"), // the switch counts as on
+        ];
+        let call = concat!("localapi::", "connect()");
+        let mut plain: Vec<(&str, String)> = Vec::new();
+        for (file, src) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("desktop_log.rs", include_str!("desktop_log.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+            ("first_run.rs", include_str!("first_run.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("panels.rs", include_str!("panels.rs")),
+            ("pin.rs", include_str!("pin.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let code = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or("");
+            // The function each line is in: the last `fn` line above it.
+            let mut within = String::new();
+            for line in code.lines().map(str::trim_start) {
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some((head, rest)) = line.split_once("fn ")
+                    && head
+                        .split_whitespace()
+                        .all(|w| w.starts_with("pub") || matches!(w, "async" | "const" | "unsafe"))
+                {
+                    within = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if line.contains(call) {
+                    plain.push((file, within.clone()));
+                }
+            }
+        }
+        plain.sort();
+        plain.dedup();
+        let mut want: Vec<(&str, String)> = PLAIN
+            .iter()
+            .map(|(file, within)| (*file, within.to_string()))
+            .collect();
+        want.sort();
+        assert_eq!(
+            plain, want,
+            "a plain connect whose error is read: it goes through connect_service (#4020)"
+        );
+    }
+
+    /// #4020 — the device service holds an enrollment its person cannot read:
+    /// with no service that names it, the status says so, and the pages read
+    /// it as the service being offline, never as "Not enrolled" with a set-up
+    /// offer. In the 0.4.226 lab a Linux system install with its service
+    /// stopped read "Not enrolled … Set up this device", and a one-row Mac
+    /// whose person socket to the root daemon was cut for 5 s read "Not
+    /// enrolled yet … Enroll this device…". A host with no such config is
+    /// still offered set-up.
+    mod enrollment {
+        use super::*;
+
+        /// The device service, as `probe_service_state` reads it.
+        fn service(kind: &str, running: bool) -> (String, bool) {
+            (kind.to_string(), running)
+        }
+
+        /// A per-user install's own config: it holds the enrollment.
+        fn enrolled_file() -> AgentConfig {
+            let mut cfg = AgentConfig::for_person_with_no_enrollment("host").expect("a config");
+            cfg.server_url = "https://file.example".to_string();
+            cfg.agent_token = "token".to_string();
+            cfg.agent_id = "from-file".to_string();
+            cfg.tenant_id = "tenant-from-file".to_string();
+            cfg
+        }
+
+        /// A one-row Mac's person file (FR-43 P3a): settings, no enrollment.
+        fn person_file_without_enrollment() -> AgentConfig {
+            AgentConfig::for_person_with_no_enrollment("mac").expect("a config")
+        }
+
+        /// A look the rule must not take: this person's own config is the
+        /// service's, so nothing else holds an enrollment for it.
+        fn not_asked(at: HeldAt) -> ServiceConfig {
+            panic!("{at:?} was looked for, where the person's own config is the service's")
+        }
+
+        /// What a one-row Mac's screen worker answers when the root half did
+        /// not answer it (`person_socket::with_machine_identity(own, None)`):
+        /// its own blank node and tenant, not connected, no orgs.
+        fn a_missed_answer() -> NodeStatus {
+            serde_json::from_str(
+                r#"{"node_id":"","name":"mac","version":"0.4.226","mode":"service",
+                    "privileged":false,"connected":false}"#,
+            )
+            .expect("a NodeStatus the worker could send")
+        }
+
+        /// Cell 1 — an enrolled system install with its service stopped: its
+        /// config is there and this person may not read it, and no service
+        /// answers. Not known, and the service is not running.
+        #[test]
+        fn an_enrolled_system_install_with_its_service_stopped_is_not_known() {
+            // Linux: `/etc/roomler/config.toml`, `0600` in a `0755` folder
+            // (There), or in a folder closed to the person (Closed).
+            for found in [ServiceConfig::There, ServiceConfig::Closed] {
+                let mut r = status_report_from(
+                    Platform::Linux,
+                    service("systemDaemon", false),
+                    None,
+                    |at| {
+                        assert_eq!(at, HeldAt::RootConfig);
+                        found
+                    },
+                );
+                take_daemon_word(&mut r, None);
+                assert!(!r.enrolled, "{found:?}");
+                assert!(r.enrollment_unknown, "{found:?}: there, unread, no service");
+                assert!(!r.service_running, "the card's words are 'not running'");
+            }
+            // Windows: the machine-wide service stopped, its config in the
+            // folder only SYSTEM and Administrators open.
+            let mut r = status_report_from(
+                Platform::Windows,
+                service("scmService", false),
+                None,
+                |at| {
+                    assert_eq!(at, HeldAt::MachineGlobal);
+                    ServiceConfig::Closed
+                },
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && r.enrollment_unknown);
+        }
+
+        /// Cell 2, THE TRAP — a system install never enrolled: its service is
+        /// registered and not running (a daemon with no config exits), and no
+        /// config is there. "Not enrolled", and set-up is offered, whatever the
+        /// service's state.
+        #[test]
+        fn a_system_install_never_enrolled_still_reads_not_enrolled() {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let none = dir.path().join("config.toml");
+            for (platform, kind) in [
+                (Platform::Linux, "systemDaemon"),
+                (Platform::Windows, "scmService"),
+            ] {
+                for running in [false, true] {
+                    let mut r = status_report_from(platform, service(kind, running), None, |_| {
+                        ServiceConfig::of(&none)
+                    });
+                    take_daemon_word(&mut r, None);
+                    assert!(!r.enrolled, "{platform:?} running={running}");
+                    assert!(
+                        !r.enrollment_unknown,
+                        "{platform:?} running={running}: no config is not enrolled"
+                    );
+                }
+            }
+            // A Mac whose root half holds nothing: the person's file alone.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                |_| ServiceConfig::of(&none),
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && !r.enrollment_unknown);
+        }
+
+        /// Cell 3 — a per-user install, not enrolled: "Not enrolled", as
+        /// before. Its enrollment is its person's own file, so no service
+        /// config is looked for, not even a machine-wide copy left behind.
+        #[test]
+        fn a_per_user_install_not_enrolled_reads_not_enrolled_as_before() {
+            for (platform, kind) in [
+                (Platform::Windows, "scheduledTask"),
+                (Platform::Linux, "scheduledTask"),
+                (Platform::Mac, "scheduledTask"),
+                (Platform::Windows, "none"),
+                (Platform::Linux, "none"),
+                (Platform::Mac, "none"),
+                // A Mac with a root half alone: no person file, so its
+                // per-user half is still offered set-up.
+                (Platform::Mac, "systemDaemon"),
+            ] {
+                let mut r = status_report_from(platform, service(kind, false), None, not_asked);
+                take_daemon_word(&mut r, None);
+                assert!(!r.enrolled, "{platform:?} {kind}");
+                assert!(!r.enrollment_unknown, "{platform:?} {kind}");
+            }
+        }
+
+        /// Cell 4 — the service runs and names the device: "Enrolled", as
+        /// before, over every file. A config this person reads that holds the
+        /// enrollment is "Enrolled" too, and nothing else is looked for.
+        #[test]
+        fn a_service_that_answers_reads_enrolled_as_before() {
+            let named = daemon_status("6ab7a24f352abff7547c5062", Some("6a975e17971e2d55ddcdedb2"));
+            for (platform, kind, own) in [
+                (Platform::Linux, "systemDaemon", None),
+                (Platform::Windows, "scmService", None),
+                (
+                    Platform::Mac,
+                    "systemDaemon",
+                    Some(person_file_without_enrollment()),
+                ),
+            ] {
+                let mut r = status_report_from(platform, service(kind, true), own, |_| {
+                    ServiceConfig::There
+                });
+                assert!(
+                    r.enrollment_unknown,
+                    "{platform:?}: the files alone cannot say"
+                );
+                take_daemon_word(&mut r, Some(&named));
+                assert!(r.enrolled, "{platform:?}");
+                assert!(!r.enrollment_unknown, "{platform:?}");
+                assert_eq!(r.agent_id.as_deref(), Some("6ab7a24f352abff7547c5062"));
+            }
+            let r = status_report_from(
+                Platform::Linux,
+                service("systemDaemon", false),
+                Some(enrolled_file()),
+                not_asked,
+            );
+            assert!(r.enrolled && !r.enrollment_unknown);
+            assert_eq!(r.agent_id.as_deref(), Some("from-file"));
+        }
+
+        /// Cell 5 — a one-row Mac: the person's file holds no enrollment, the
+        /// root half's config is there, and the daemon misses one answer (the
+        /// 0.4.226 lab's 5 s cut) or is stopped. Not known: never "Not
+        /// enrolled", and no enroll offer. What tells the companion it is on a
+        /// one-row Mac is the person's file with no enrollment beside the root
+        /// half's config, read afresh on every poll, so nothing is remembered:
+        /// the next answer that names the device ends it, and so does an
+        /// un-enrollment, which takes the root half's config away.
+        #[test]
+        fn a_one_row_mac_that_misses_an_answer_is_not_offered_to_enroll() {
+            let held = |at: HeldAt| {
+                assert_eq!(at, HeldAt::RootConfig);
+                ServiceConfig::There
+            };
+            // The root half runs, and its worker missed an answer.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", true),
+                Some(person_file_without_enrollment()),
+                held,
+            );
+            take_daemon_word(&mut r, Some(&a_missed_answer()));
+            assert!(!r.enrolled);
+            assert!(
+                r.enrollment_unknown,
+                "a missed answer is not 'Not enrolled'"
+            );
+            // The root half stopped: no answer at all.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                held,
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && r.enrollment_unknown);
+            // The next answer names the device.
+            take_daemon_word(
+                &mut r,
+                Some(&daemon_status(
+                    "6ab7a24f352abff7547c5062",
+                    Some("6a975e17971e2d55ddcdedb2"),
+                )),
+            );
+            assert!(r.enrolled && !r.enrollment_unknown);
+            // Un-enrolled: the root half's config is gone (an uninstall).
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                |_| ServiceConfig::Absent,
+            );
+            take_daemon_word(&mut r, None);
+            assert!(
+                !r.enrolled && !r.enrollment_unknown,
+                "an un-enrollment shows"
+            );
+        }
+
+        /// The look itself: a `stat`, never a read, and nothing in the log on
+        /// a poll. On Linux and a Mac a file this process may not read is
+        /// there, and a folder closed to it does not say.
+        #[test]
+        fn a_stat_tells_a_config_there_from_none_and_logs_nothing() {
+            // A second live dispatcher, so that no other test thread's visit
+            // caches a callsite as never logged (as in
+            // `a_start_with_no_config_and_no_service_logs_no_error`).
+            let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let path = dir.path().join("config.toml");
+            let (log, guard) = capture();
+            assert_eq!(ServiceConfig::of(&path), ServiceConfig::Absent);
+            std::fs::write(&path, "agent_token = \"secret\"\n").expect("the file");
+            assert_eq!(ServiceConfig::of(&path), ServiceConfig::There);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = |p: &Path, m: u32| {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("a mode")
+                };
+                if process_is_root() {
+                    eprintln!("as root every mode reads: the unreadable cases are skipped");
+                } else {
+                    // Cell 1's file: `0600` and root's, here `0000` and this process's.
+                    mode(&path, 0o000);
+                    assert_eq!(
+                        std::fs::read(&path).map_err(|e| e.kind()).err(),
+                        Some(std::io::ErrorKind::PermissionDenied)
+                    );
+                    assert_eq!(ServiceConfig::of(&path), ServiceConfig::There);
+                    mode(&path, 0o600);
+                    // A folder closed to its person: there or not, it does not say.
+                    let closed = dir.path().join("closed");
+                    std::fs::create_dir(&closed).expect("the folder");
+                    std::fs::write(closed.join("config.toml"), "").expect("the file");
+                    mode(&closed, 0o000);
+                    assert_eq!(
+                        ServiceConfig::of(&closed.join("config.toml")),
+                        ServiceConfig::Closed
+                    );
+                    assert_eq!(
+                        ServiceConfig::of(&closed.join("none.toml")),
+                        ServiceConfig::Closed
+                    );
+                    mode(&closed, 0o700);
+                }
+            }
+            // This build's own rule, over the real file: there, unread, and no
+            // service answering.
+            let (kind, own) = match Platform::HERE {
+                Platform::Windows => ("scmService", None),
+                Platform::Linux => ("systemDaemon", None),
+                Platform::Mac => ("systemDaemon", Some(person_file_without_enrollment())),
+            };
+            let mut r = status_report_from(Platform::HERE, service(kind, false), own, |_| {
+                ServiceConfig::of(&path)
+            });
+            take_daemon_word(&mut r, None);
+            drop(guard);
+            assert!(!r.enrolled && r.enrollment_unknown);
+            let text = log.text();
+            assert!(!text.contains("WARN") && !text.contains("ERROR"), "{text}");
+        }
+
+        /// The rule names this build's own platform, and on Linux the root
+        /// config is the packaged unit's.
+        #[test]
+        fn the_root_config_is_the_root_daemons() {
+            #[cfg(windows)]
+            assert_eq!(Platform::HERE, Platform::Windows);
+            #[cfg(target_os = "macos")]
+            assert_eq!(Platform::HERE, Platform::Mac);
+            #[cfg(target_os = "linux")]
+            assert_eq!(Platform::HERE, Platform::Linux);
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                Path::new(ROOT_CONFIG),
+                roomler_node_core::appdirs::system_config_path()
+            );
+            assert_eq!(HeldAt::RootConfig.path(), Some(PathBuf::from(ROOT_CONFIG)));
+            #[cfg(windows)]
+            assert_eq!(
+                HeldAt::MachineGlobal.path(),
+                Some(config::machine_global_config_path())
+            );
+            #[cfg(not(windows))]
+            assert_eq!(HeldAt::MachineGlobal.path(), None);
+        }
+
+        /// The pages: an unknown enrollment reads "Offline" with the encoders
+        /// and files cards' "The device service is not running.", and offers
+        /// no set-up anywhere: no "Not enrolled" banner on the Overview, no
+        /// Onboarding spotlight, no "Enroll this device…" on the Welcome, and
+        /// an Onboarding form that waits. A host that is not enrolled keeps
+        /// all of them.
+        #[test]
+        fn the_pages_read_an_unknown_enrollment_as_offline_with_no_setup_offer() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let html = flat(include_str!("front/index.html"));
+            let overview = flat(include_str!("front/overview.js"));
+            let app = flat(include_str!("front/app.js"));
+            let welcome = flat(include_str!("front/welcome.js"));
+            let onboarding = flat(include_str!("front/onboarding.js"));
+            for id in [
+                r#"id="ov-enrolled-note""#,
+                r#"id="wl-dev-unknown""#,
+                r#"id="onboard-unknown-note""#,
+            ] {
+                assert_eq!(html.matches(id).count(), 1, "{id}");
+            }
+            for line in [
+                "const unknown = !s.enrolled && !!s.enrollment_unknown;",
+                "if (s.enrolled || unknown) hide($('ov-not-enrolled')); else show($('ov-not-enrolled'));",
+                "chip.textContent = unknown ? 'Offline' : s.enrolled ? 'Enrolled' : 'Not enrolled';",
+                "const note = $('ov-enrolled-note');",
+                "note.textContent = !unknown ? '' : s.service_running ? 'The device service did not answer.' : 'The device service is not running.';",
+                "note.hidden = !unknown;",
+            ] {
+                assert!(overview.contains(line), "overview.js: {line}");
+            }
+            assert!(
+                app.contains(
+                    "onboardNav.classList.toggle('nav-onboard', !s.enrolled && !s.enrollment_unknown);"
+                ),
+                "app.js"
+            );
+            for line in [
+                "const unknown = !enrolled && !!(s && s.enrollment_unknown);",
+                "el('wl-dev-unenrolled').hidden = enrolled || unknown || !s;",
+                "el('wl-dev-unknown').hidden = !unknown;",
+            ] {
+                assert!(welcome.contains(line), "welcome.js: {line}");
+            }
+            for line in [
+                "enrollmentUnknown = !enrolledMode && !!s.enrollment_unknown;",
+                "btn.disabled = submitting || enrollmentUnknown;",
+                "if (unknownNote) unknownNote.hidden = !enrollmentUnknown;",
+                "if (enrollmentUnknown || submitting) return;",
+                "submitting = false; btn.disabled = enrollmentUnknown;",
+            ] {
+                assert!(onboarding.contains(line), "onboarding.js: {line}");
+            }
+            assert!(
+                !onboarding.contains("btn.disabled = false;"),
+                "a finished click leaves the form as the status says"
+            );
+        }
     }
 }

@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy,
-    ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecAnchor,
+    ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
 };
 
-use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct AgentDao {
     pub base: BaseDao<Agent>,
@@ -153,8 +153,6 @@ impl AgentDao {
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
-            // FR-90 P3-3a — the same: only a running daemon holds a vault key.
-            vault_key: String::new(),
             // FR-100 P1a — and the device key is made on the device, at its
             // first hello.
             peer_auth_key: String::new(),
@@ -216,8 +214,9 @@ impl AgentDao {
 
     /// Locate an agent by `(tenant_id, machine_id)` regardless of soft-delete
     /// state. The unique index on this pair is unconditional, so a soft-deleted
-    /// row still occupies the slot — the enroll path calls this to detect that
-    /// case and rehydrate via [`Self::rehydrate`] rather than failing with E11000.
+    /// row still occupies the slot. The enroll path calls this to tell its
+    /// three cases apart rather than failing with E11000: no row (create), a
+    /// live row ([`Self::rehydrate`]) and a removed one ([`Self::revive`]).
     pub async fn find_by_tenant_and_machine(
         &self,
         tenant_id: ObjectId,
@@ -231,10 +230,17 @@ impl AgentDao {
             .await
     }
 
-    /// Refresh an existing agent row at re-enrollment time: clear `deleted_at`
-    /// (in case the row was soft-deleted), update os / agent_version from the
+    /// Refresh a LIVE agent row at re-enrollment time, for a device nobody
+    /// removed (a lost token, a reinstall): update os / agent_version from the
     /// new enrollment payload, bump `updated_at`. Returns the updated row so
-    /// the caller can issue a fresh agent token against it.
+    /// the caller can issue a fresh agent token against it. Everything the
+    /// device was allowed stays.
+    ///
+    /// Live only: `NotFound` when the row is a tombstone, which includes a
+    /// removal that landed after the caller read the row live. This used to
+    /// clear `deleted_at` by `_id` alone, so such a removal was undone and the
+    /// device came back with every grant it held. A removed row comes back
+    /// through [`Self::revive`], and only there.
     ///
     /// `name` is refreshed ONLY while `name_admin_set` is unset: machine-
     /// reported names keep flowing for never-renamed devices, but a re-enroll
@@ -258,7 +264,6 @@ impl AgentDao {
             "os": os_bson,
             "agent_version": agent_version,
             "updated_at": DateTime::now(),
-            "deleted_at": bson::Bson::Null,
         };
         if let Some(install) = install {
             set.insert(
@@ -266,19 +271,108 @@ impl AgentDao {
                 bson::to_bson(install).unwrap_or(bson::Bson::Null),
             );
         }
+        // `deleted_at: null` matches null or absent: the live predicate every
+        // reader of this collection uses.
+        let live = doc! { "_id": agent_id, "deleted_at": null };
+        let matched = self
+            .base
+            .collection()
+            .update_one(live.clone(), doc! { "$set": set })
+            .await?
+            .matched_count;
+        if matched == 0 {
+            return Err(DaoError::NotFound);
+        }
+        // Second, FILTERED update for the name half. Matching zero docs (an
+        // admin-renamed row) is the intended no-op, not an error.
+        let mut unrenamed = live;
+        unrenamed.insert("name_admin_set", doc! { "$ne": true });
         self.base
-            .update_by_id(agent_id, doc! { "$set": set })
-            .await?;
-        // Second, FILTERED update for the name half — update_by_id can't
-        // carry the extra predicate. Matching zero docs (admin-renamed row)
-        // is the intended no-op, not an error.
-        self.base
-            .update_one(
-                doc! { "_id": agent_id, "name_admin_set": { "$ne": true } },
-                doc! { "$set": { "name": name } },
-            )
+            .update_one(unrenamed, doc! { "$set": { "name": name } })
             .await?;
         self.base.find_by_id(agent_id).await
+    }
+
+    /// Bring a REMOVED device's row back for a new enrollment of the same
+    /// machine id, as a new device (#3627): the row becomes what
+    /// [`Self::create`] makes from this request, and keeps only what identifies
+    /// it and its history. Before, a revive cleared `deleted_at` and nothing
+    /// else, so the row came back with everything the removed device had been
+    /// allowed.
+    ///
+    /// Kept from the tombstone: `_id` (sessions, audits, logs and crash reports
+    /// hang off it), `tenant_id` and `machine_id` (the unique key),
+    /// `created_at` and `enrolled_by` (when and by whom the row was first
+    /// enrolled), `token_gen` (FR-103: the removal advanced it, so every token
+    /// minted before the removal stays refused), `desired_config.revision`
+    /// (a counter, so the next save is one above every revision this row has
+    /// used) and a `Quarantined` status (a restriction, not a grant: enrolling
+    /// the machine again must not be the way to lift it). Everything else is a
+    /// new enrollment's: the SSH, exec and access
+    /// policies, the org-relay and External access approvals, the connect
+    /// code, approved routes, the pending config, the key-rotation order, the
+    /// owner (now `owner_user_id`, the enroller), labels, and what the removed
+    /// device last reported. That holds by construction: the document is
+    /// REPLACED with [`Self::new_row`]'s, so a field added to `Agent` later
+    /// comes back at its new-enrollment default too, with no list here to
+    /// forget it in.
+    ///
+    /// The write is a compare-and-swap on THIS tombstone: `deleted_at` must
+    /// still be the removal time the caller read. A concurrent revive (the row
+    /// is live) or a revive followed by a second removal (a new removal time,
+    /// a higher `token_gen`) makes it match nothing, and the answer is `None`:
+    /// the caller reads the row again and decides again. A stale read can
+    /// therefore never write a lower generation back.
+    pub async fn revive(
+        &self,
+        tombstone: &Agent,
+        owner_user_id: ObjectId,
+        name: String,
+        os: OsKind,
+        agent_version: String,
+        install: Option<InstallInfo>,
+    ) -> DaoResult<Option<Agent>> {
+        let (Some(id), Some(removed_at)) = (tombstone.id, tombstone.deleted_at) else {
+            return Err(DaoError::Validation(
+                "only a removed row with an id can be revived".to_string(),
+            ));
+        };
+        let mut row = Self::new_row(
+            tombstone.tenant_id,
+            owner_user_id,
+            name,
+            tombstone.machine_id.clone(),
+            os,
+            agent_version,
+            String::new(),
+            install,
+        );
+        row.id = Some(id);
+        row.created_at = tombstone.created_at;
+        row.enrolled_by = tombstone.enrolled_by;
+        row.token_gen = tombstone.token_gen;
+        row.desired_config.revision = tombstone.desired_config.revision;
+        if tombstone.status == AgentStatus::Quarantined {
+            row.status = AgentStatus::Quarantined;
+        }
+        let matched = self
+            .base
+            .collection()
+            .replace_one(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tombstone.tenant_id,
+                    "machine_id": &tombstone.machine_id,
+                    "deleted_at": removed_at,
+                },
+                &row,
+            )
+            .await?
+            .matched_count;
+        if matched == 0 {
+            return Ok(None);
+        }
+        self.base.find_by_id(id).await.map(Some)
     }
 
     /// FR-104 — record which enrollment token enrolled (or revived) this row.
@@ -311,34 +405,6 @@ impl AgentDao {
     pub async fn list_all_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
         self.base
             .find_many(doc! { "tenant_id": tenant_id, "deleted_at": null }, None)
-            .await
-    }
-
-    /// FR-90 P2c-2b — the live devices of `tenant_id` that could hold a copy
-    /// of a session `owner` runs: those whose last hello advertised
-    /// `hive-replica` and that are the owner's own (`owner_user_id` AND
-    /// `enrolled_by`) or among `archives`. A prefilter only: placement checks
-    /// every rule again on what this returns. The array match is equality,
-    /// so `hive-replicas` would not match — the `RpcCap` rule.
-    pub async fn list_replica_candidates(
-        &self,
-        tenant_id: ObjectId,
-        owner: ObjectId,
-        archives: &[ObjectId],
-    ) -> DaoResult<Vec<Agent>> {
-        self.base
-            .find_many(
-                doc! {
-                    "tenant_id": tenant_id,
-                    "deleted_at": null,
-                    "capabilities.rpc": RpcCap::HiveReplica.wire(),
-                    "$or": [
-                        { "owner_user_id": owner, "enrolled_by": owner },
-                        { "_id": { "$in": archives } },
-                    ],
-                },
-                None,
-            )
             .await
     }
 
@@ -396,9 +462,7 @@ impl AgentDao {
         tenant_id: ObjectId,
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
-        self.base
-            .find_live_by_id_in_tenant(tenant_id, agent_id)
-            .await
+        self.base.find_by_id_in_tenant(tenant_id, agent_id).await
     }
 
     /// The per-device lookup that also returns a TOMBSTONE — for the readers
@@ -410,16 +474,28 @@ impl AgentDao {
     ///   `NotFound` there would drop the socket and leave the device
     ///   reconnecting forever against what reads as a network fault;
     /// * an audit view of a removed device's history, where "removed" must
-    ///   not mean "unauditable".
+    ///   not mean "unauditable": `recording-`, `transfer-` and
+    ///   `privacy-activity`, the device's `…/logs` and `…/crash`;
+    /// * External access's re-read of its gates as a session opens
+    ///   (`extauth::org_gates_open`). A removed device is its removal's to
+    ///   end (`removal::kick`), not this read's, and a tombstone answering
+    ///   here keeps a removal that raced the open from reading as a failed
+    ///   read.
     ///
     /// Never for a write, never for a session start, never for a GET of the
     /// device itself — those are [`Self::find_live_in_tenant`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a revocation must say why a removed device is refused, and an audit view reads a removed device"
+    )]
     pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
-        self.base.find_by_id_in_tenant(tenant_id, agent_id).await
+        self.base
+            .find_any_by_id_in_tenant(tenant_id, agent_id)
+            .await
     }
 
     /// The filter every ADMIN-driven setter below writes through: this row,
@@ -470,7 +546,6 @@ impl AgentDao {
         capabilities: &AgentCaps,
         advertised_routes: &[String],
         ssh_host_pubkey: &str,
-        vault_key: &str,
         peer_auth_key: &str,
         arch: &str,
         arch_emulated: bool,
@@ -489,10 +564,6 @@ impl AgentDao {
             "capabilities": caps_bson,
             "advertised_routes": advertised_bson,
             "ssh_host_pubkey": ssh_host_pubkey,
-            // FR-90 P3-3a — on every hello too, and for a stronger reason:
-            // the daemon makes a new vault key at each start, so a key left
-            // standing would name a process that is gone.
-            "vault_key": vault_key,
             // FR-100 P1a — on every hello, the empty string included, for
             // the host key's reason: a rollback to a build without a device
             // key must not leave browsers expecting its signature.
@@ -902,8 +973,47 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "external_access_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-94 — record the device's anchor, replacing any earlier one: the fresh
+    /// `anchor_id` is what revokes the credentials an earlier anchor minted.
+    ///
+    /// Through [`Self::live_row`] because a removal ends the anchor (#2133): one
+    /// written after the removal would sit on the removed device's record as a
+    /// live SYSTEM credential. (Before a revive started the row from a new
+    /// device's settings, it also came back with the machine's next
+    /// enrollment.)
+    pub async fn set_exec_anchor(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        anchor: &ExecAnchor,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "exec_anchor": bson::to_bson(anchor)? } },
+            )
+            .await
+    }
+
+    /// Store the config an admin wants this device to apply
+    /// (`docs/remote-config.md`). Through [`Self::live_row`], so a push that races
+    /// the removal does not wait on the row for the machine's next enrollment.
+    pub async fn set_desired_config(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        desired: &DesiredConfig,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "desired_config": bson::to_bson(desired)? } },
             )
             .await
     }
@@ -926,7 +1036,7 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": {
                     "connect_code": code,
                     "connect_code_rotated_at": DateTime::now(),
@@ -1186,16 +1296,16 @@ impl AgentDao {
     /// sweep's calls to the same answer.
     ///
     /// #2133: a removal also ENDS the device's FR-94 exec anchor, in the same
-    /// update. Enrolling the same machine again revives this row in place
-    /// ([`Self::rehydrate`]), and an anchor left here would revive with it.
-    /// The service credential still on the machine's disk would then be
-    /// accepted again, with no elevated step. Removing a device must do at
-    /// least what un-anchoring it does.
+    /// update. Removing a device must do at least what un-anchoring it does:
+    /// the service credential still on the machine's disk is refused from the
+    /// removal on. (Enrolling the same machine again brings this row back as a
+    /// new device, [`Self::revive`], which has no anchor either.)
     ///
     /// FR-103: the same update advances `token_gen`, so every agent token
     /// minted before the removal is refused from now on, including after a
-    /// revival: re-enrollment mints at the new generation. `rehydrate`
-    /// touches neither field, because re-enrolling a LIVE device keeps both.
+    /// revival: [`Self::revive`] keeps the generation and re-enrollment mints
+    /// at it. `rehydrate` touches neither field, because re-enrolling a LIVE
+    /// device keeps both.
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(

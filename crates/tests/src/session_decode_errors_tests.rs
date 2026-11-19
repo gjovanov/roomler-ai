@@ -147,6 +147,248 @@ async fn the_server_stores_a_counted_decode_error_count_and_no_sample_unlearns_i
     assert_eq!(stats2.get_i64("bytes_recv").unwrap(), 2, "the merge ran");
 }
 
+/// One hand-made `rc:session.stats` with a `video` reading.
+async fn report_video(ws: &mut Ws, session_id: &str, video: Value) {
+    let msg = json!({
+        "t": "rc:session.stats", "session_id": session_id,
+        "bytes_sent": 1, "bytes_recv": 2, "fps": 30.0, "rtt_ms": 40.0,
+        "keyframe_requests": 0, "input_events": 0, "video": video,
+    });
+    ws.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// The session row's `video`, if it has one.
+async fn stored_video(app: &TestApp, sid: &ObjectId) -> Option<Document> {
+    app.db
+        .collection::<Document>("remote_sessions")
+        .find_one(doc! { "_id": sid })
+        .await
+        .unwrap()
+        .and_then(|row| row.get_document("video").ok().cloned())
+}
+
+/// `video.encoder`, polled until it reads `want` (or ~5 s pass).
+async fn await_video_encoder(app: &TestApp, sid: &ObjectId, want: &str) -> Document {
+    for _ in 0..50 {
+        if let Some(v) = stored_video(app, sid).await
+            && v.get_str("encoder") == Ok(want)
+        {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "video.encoder never read {want}: {:?}",
+        stored_video(app, sid).await
+    );
+}
+
+/// FR-132 P1d — the canary week's source. The row holds the newest reading of
+/// what the video ran on, beside `stats`. A sample without one leaves it alone,
+/// because absent is "not reported", never CPU. And the device is the only
+/// writer, so a reading that is not short lowercase names is dropped whole and
+/// the row keeps the last one it could trust.
+#[tokio::test]
+async fn the_server_stores_what_a_sessions_video_ran_on() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("sessvideo").await;
+    let (agent_id, mut agent) = connect_agent(&app, &seeded, "sessvideo-host").await;
+    let (_ctl, sid) = ask(&app, &seeded.admin.access_token, &agent_id).await;
+    wait_for_session_row(&app, &seeded, &sid).await;
+    let sid_oid = ObjectId::parse_str(&sid).unwrap();
+
+    // A sample before the pump's first heartbeat, or from an older agent.
+    report(&mut agent, &sid, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        stored_video(&app, &sid_oid).await.is_none(),
+        "not reported, so nothing is written"
+    );
+    assert_eq!(
+        stats_of(&app, &sid_oid)
+            .await
+            .unwrap()
+            .get_i64("bytes_recv")
+            .unwrap(),
+        2,
+        "the merge ran"
+    );
+
+    report_video(
+        &mut agent,
+        &sid,
+        json!({
+            "encoder": "h264_qsv", "capture": "dxgi",
+            "input_path": "cpu", "input_reason": "denied",
+        }),
+    )
+    .await;
+    let video = await_video_encoder(&app, &sid_oid, "h264_qsv").await;
+    assert_eq!(video.get_str("capture"), Ok("dxgi"));
+    assert_eq!(video.get_str("input_path"), Ok("cpu"));
+    assert_eq!(video.get_str("input_reason"), Ok("denied"));
+
+    // A later sample without one leaves it alone.
+    report(&mut agent, &sid, None).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        stored_video(&app, &sid_oid).await.as_ref(),
+        Some(&video),
+        "absent is not reported, never a reset"
+    );
+
+    // A newer reading replaces it whole: GPU input has no reason.
+    report_video(
+        &mut agent,
+        &sid,
+        json!({ "encoder": "av1_qsv", "capture": "dxgi", "input_path": "gpu" }),
+    )
+    .await;
+    let video = await_video_encoder(&app, &sid_oid, "av1_qsv").await;
+    assert!(video.get("input_reason").is_none(), "{video:?}");
+
+    // What a host cannot put on the row: not a name, or far too long.
+    for bad in [
+        json!({ "encoder": "<b>h264</b>", "capture": "wgc", "input_path": "gpu" }),
+        json!({ "encoder": "h264_qsv", "capture": "wgc", "input_path": "x".repeat(33) }),
+        json!({ "encoder": "h264_qsv", "capture": "A Name", "input_path": "gpu" }),
+    ] {
+        report_video(&mut agent, &sid, bad).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        stored_video(&app, &sid_oid).await.as_ref(),
+        Some(&video),
+        "a reading that is not names is dropped whole"
+    );
+}
+
+/// One hand-made `rc:session.stats` whose `bytes_recv` is `mark`, so a test can
+/// wait until the server has merged THIS sample before it asserts what the
+/// sample did not change (the review's note on the test above).
+async fn report_marked(ws: &mut Ws, session_id: &str, mark: i64, video: Option<Value>) {
+    let mut msg = json!({
+        "t": "rc:session.stats", "session_id": session_id,
+        "bytes_sent": 1, "bytes_recv": mark, "fps": 30.0, "rtt_ms": 40.0,
+        "keyframe_requests": 0, "input_events": 0,
+    });
+    if let Some(v) = video {
+        msg["video"] = v;
+    }
+    ws.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// Until the row's `stats.bytes_recv` reads `mark` (or ~5 s pass). One
+/// socket's messages are merged in order, so every sample before it is too.
+async fn await_merged(app: &TestApp, sid: &ObjectId, mark: i64) {
+    for _ in 0..50 {
+        if stats_of(app, sid)
+            .await
+            .and_then(|s| s.get_i64("bytes_recv").ok())
+            == Some(mark)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the sample marked {mark} was never merged");
+}
+
+/// FR-135 R0 (N16) — a session's media summary, beside FR-132 P1d's reading:
+/// the cell's chroma, seconds moving and sparse, frames encoded and kept
+/// alive, the most followers, the time to the first frame. Stored on the row
+/// with the reading, newest whole; a count out of range drops the reading
+/// whole, and the row keeps the last it could trust; a sample with no summary
+/// leaves the summary absent, never zero.
+#[tokio::test]
+async fn the_server_stores_a_sessions_media_summary_beside_its_video() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("sessmedia").await;
+    let (agent_id, mut agent) = connect_agent(&app, &seeded, "sessmedia-host").await;
+    let (_ctl, sid) = ask(&app, &seeded.admin.access_token, &agent_id).await;
+    wait_for_session_row(&app, &seeded, &sid).await;
+    let sid_oid = ObjectId::parse_str(&sid).unwrap();
+
+    // P1d's reading alone, as an agent before R0 sends it: no summary.
+    report_marked(
+        &mut agent,
+        &sid,
+        11,
+        Some(json!({
+            "encoder": "vp9_libvpx", "capture": "scrap",
+            "input_path": "cpu", "input_reason": "no_gpu_cell",
+        })),
+    )
+    .await;
+    await_merged(&app, &sid_oid, 11).await;
+    let v = stored_video(&app, &sid_oid).await.expect("the reading");
+    for absent in [
+        "chroma",
+        "moving_s",
+        "sparse_s",
+        "frames_encoded",
+        "frames_keepalive",
+        "followers",
+        "first_frame_ms",
+    ] {
+        assert!(v.get(absent).is_none(), "{absent} is not counted: {v:?}");
+    }
+
+    // An R0 agent's reading, the summary with it.
+    let summary = json!({
+        "encoder": "vp9_libvpx", "capture": "scrap",
+        "input_path": "cpu", "input_reason": "no_gpu_cell", "chroma": "yuv444",
+        "moving_s": 14, "sparse_s": 96, "frames_encoded": 1200,
+        "frames_keepalive": 96, "followers": 1, "first_frame_ms": 730,
+    });
+    report_marked(&mut agent, &sid, 12, Some(summary.clone())).await;
+    await_merged(&app, &sid_oid, 12).await;
+    let v = stored_video(&app, &sid_oid).await.expect("the reading");
+    assert_eq!(v.get_str("chroma"), Ok("yuv444"));
+    assert_eq!(
+        v.get_i64("moving_s")
+            .or(v.get_i32("moving_s").map(i64::from)),
+        Ok(14)
+    );
+    assert_eq!(
+        v.get_i64("sparse_s")
+            .or(v.get_i32("sparse_s").map(i64::from)),
+        Ok(96)
+    );
+    assert_eq!(v.get_i64("frames_encoded"), Ok(1200));
+    assert_eq!(v.get_i64("frames_keepalive"), Ok(96));
+    assert_eq!(
+        v.get_i64("followers")
+            .or(v.get_i32("followers").map(i64::from)),
+        Ok(1)
+    );
+    assert_eq!(
+        v.get_i64("first_frame_ms")
+            .or(v.get_i32("first_frame_ms").map(i64::from)),
+        Ok(730)
+    );
+
+    // A count no session can hold drops the reading whole.
+    let mut bad = summary.clone();
+    bad["moving_s"] = json!(u32::MAX);
+    report_marked(&mut agent, &sid, 13, Some(bad)).await;
+    await_merged(&app, &sid_oid, 13).await;
+    assert_eq!(
+        stored_video(&app, &sid_oid).await.as_ref(),
+        Some(&v),
+        "a count out of range is dropped whole"
+    );
+
+    // A sample without a reading leaves the row's alone.
+    report_marked(&mut agent, &sid, 14, None).await;
+    await_merged(&app, &sid_oid, 14).await;
+    assert_eq!(stored_video(&app, &sid_oid).await.as_ref(), Some(&v));
+}
+
 /// AC3 end to end: a REAL agent, a real viewer peer that opens the control
 /// channel and sends what the page sends. The session is held well under the
 /// agent's first 30 s heartbeat tick, so the only samples that can carry the

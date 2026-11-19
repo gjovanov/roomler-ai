@@ -1,6 +1,6 @@
 # FR-19: Peer relays — tenant-owned UDP relay nodes between direct and DERP
 
-Status: **P0–P4c field-verified** — shipped through **0.4.20** (`agent-v0.4.20`); the whole path is proven on the primary tenant: **CORPLAP-3↔mars carried real traffic on `relay:org/udp` (~84 ms) via the scw-m2-asahi relay** (`forwarded=128`), then torn down on revoke back to the DERP floor. Capability + gates + mint + forward + revoke all field-verified 2026-08-29; live behind `overlay_org_relay` + `peer_relay_mode`, default off. **27 of 29 criteria as of 2026-09-24**: the relay socket census ticked once FR-48 fixed the TURN client's leak, and the docs criterion was added retroactively and met by [`docs/peer-relays.md`](../peer-relays.md). The two still open are **decisions for the operator, not measurements**: the pre-FR-19 forward-compatibility box (#811's `unknown_relay_strategy_tag_keeps_the_whole_netmap_parseable` already asserts the parser tolerance its note calls unasserted) and the `peer_relay_mode=off` before/after diff (no pre-FR-19 build is left in the fleet to diff against). Proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
+Status: **P0–P4c field-verified** — shipped through **0.4.20** (`agent-v0.4.20`); the whole path is proven on the primary tenant: **CORPLAP-3↔a fleet server carried real traffic on `relay:org/udp` (~84 ms) via the org relay host** (`forwarded=128`), then torn down on revoke back to the DERP floor. Capability + gates + mint + forward + revoke all field-verified 2026-08-29; live behind `overlay_org_relay` + `peer_relay_mode`, default off. **27 of 29 criteria as of 2026-09-24**: the relay socket census ticked once FR-48 fixed the TURN client's leak, and the docs criterion was added retroactively and met by [`docs/peer-relays.md`](../peer-relays.md). The two still open are **decisions for the operator, not measurements**: the pre-FR-19 forward-compatibility box (#811's `unknown_relay_strategy_tag_keeps_the_whole_netmap_parseable` already asserts the parser tolerance its note calls unasserted) and the `peer_relay_mode=off` before/after diff (no pre-FR-19 build is left in the fleet to diff against). Proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
 Reference design: [Tailscale peer relays](https://tailscale.com/docs/features/peer-relay).
 Sibling of FR-18 (#801) and FR-17 (#799) — both are about the *cost* of the relay path;
 this FR is about **replacing that path with a better one** rather than tuning it.
@@ -63,7 +63,7 @@ written.
 | `CORPLAP-3` | **`relay:derp/tcp`** | 45 ms |
 | `CORPLAP-2` | **`relay:derp/tcp`** | 56 ms |
 | `neo16-wsl-2` | **`relay:derp/tcp`** | 42 ms |
-| neo16, jupiter, zeus, CORPLAP-1, winhost-j-2, scw-m2-asahi, macbook-pro | `direct` | 0–137 ms |
+| neo16, jupiter, zeus, CORPLAP-1, winhost-j-2, the org relay host, macbook-pro | `direct` | 0–137 ms |
 
 Three of twelve online peers are relayed and every one is on **TCP** — a whole
 head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 512-frame
@@ -75,26 +75,26 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
 
 | host | `stun/udp` | `relay band/udp` | NAT | role here |
 |---|---|---|---|---|
-| **mars** | ok | **reachable** | cone | ✅ relay server — utility tier, public IP |
-| **jupiter** | ok | **BLOCKED** | cone | relay server *only after host-firewall provisioning* |
-| **zeus** | ok | **BLOCKED** | cone | relay server *only after host-firewall provisioning* |
-| **CORPLAP-3** | ok | **BLOCKED** | **symmetric** | ✅ **client** — the target population |
-| **CORPLAP-2** | **NO MAPPING** | *(derived, not probed)* | untyped | ❌ UDP is dead; stays on the DERP floor |
+| **the utility server** | ok | **reachable** | cone | ✅ relay server — utility tier, public IP |
+| **cluster host A** | ok | **BLOCKED** | cone | relay server *only after host-firewall provisioning* |
+| **cluster host B** | ok | **BLOCKED** | cone | relay server *only after host-firewall provisioning* |
+| **a corporate laptop** | ok | **BLOCKED** | **symmetric** | ✅ **client** — the target population |
+| **another corporate laptop** | **NO MAPPING** | *(derived, not probed)* | untyped | ❌ UDP is dead; stays on the DERP floor |
 | CORPLAP-1 | ok | reachable | cone | already direct |
-| scw-m2-asahi | ok | reachable | cone | already direct |
+| the org relay host | ok | reachable | cone | already direct |
 
 **Established:**
 
-1. **`CORPLAP-3` is the proof the feature is worth building.** Its NAT is *symmetric* —
+1. **The symmetric-NAT laptop is the proof the feature is worth building.** Its NAT is *symmetric* —
    which is why direct fails and why no amount of hole-punching will ever fix it — and its
    STUN/UDP works. A relay on a port it can reach is precisely and only what it needs.
-2. **`CORPLAP-2` is the proof DERP must stay.** `stun/udp: NO MAPPING` means no UDP path at
+2. **The no-UDP laptop is the proof DERP must stay.** `stun/udp: NO MAPPING` means no UDP path at
    all. No relay on any port helps it. ⚠️ Note its `relay band` cell is **derived, not
    measured**: `run_measurement` short-circuits `if !stun_udp { Some(false) }`
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:5857` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:4065` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -170,7 +170,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 | `0x01`–`0x04` (Opt Len 1–4) | **WireGuard types 1–4, every one of them** |
 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
-`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2514`) requires `pkt[1..4] == 0`, and
+`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2895`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
 `payload_is_wg_or_disco` (`crates/remote_control/src/derp_frame.rs:39`) classifies on the
 first byte alone.
@@ -198,15 +198,15 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3338`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3878`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
-adding a variant later is forward-compatible"* (`:2015-2017`). **The comment is wrong about
+adding a variant later is forward-compatible"* (`:3755-3757`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
 `#[derive(Deserialize)]` with `#[serde(rename_all = "kebab-case")]`, **no `#[serde(other)]`**
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1696`).
+(`agents/roomlerd/src/signaling.rs:1938`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -214,7 +214,7 @@ installing peers — a fleet-wide outage delivered by the server, visible only a
 Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
-   `supports_server_relay_strategy`, `signaling.rs:2510`), gated at the existing both-ends
+   `supports_server_relay_strategy`, `crates/remote_control/src/signaling.rs:1644`), gated at the existing both-ends
    gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
@@ -223,7 +223,7 @@ Four requirements, all in P0:
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
    **`Copy`** (`:1985`); a `session` payload would break that derive and ripple through
    `netmap.rs:92`, `relay_link.rs:1148-1151` and three by-value returns at
-   `overlay.rs:1931/1952/2030` — and would also change the JSON from a string tag to a map.
+   `overlay.rs:1934/1952/2030` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
 
 ---
@@ -292,7 +292,7 @@ this, a customer's HQ box is a DDoS reflector at roughly 3×.
 
 Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
 (`crates/tunnel-core/src/overlay/carrier_plane.rs:705`; `UNKNOWN_INIT_MIN_INTERVAL = 2 s`,
-`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:725`), with a counter and a reader.
+`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:1007`), with a counter and a reader.
 
 ### Construction details that are security-relevant
 
@@ -318,12 +318,12 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   serialise identically (IPv4 vs IPv6 forms; digits sliding into the adjacent field).
 - **Constant-time comparison, using `subtle`.** ⚠️ Every MAC compare in this tree today is a
   plain slice compare — `disco.rs:222` (whose comment says *"Constant-time-ish"* and is not),
-  `wg.rs:2553`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
+  `wg.rs:2934`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
   *"a ROUTER's pre-filter … not an authenticator"*. Here the MAC **is** the authenticator, so
   "model it on the existing one" would propagate the defect.
 - **Membership.** A node may bind only into a session naming its own key in `members`.
 - **Re-bind is permitted only under a valid `tag₁`.** ⚠️ This is load-bearing in *both*
-  directions: forbid it and a symmetric-NAT host that rebinds its mapping — `CORPLAP-3`,
+  directions: forbid it and a symmetric-NAT host that rebinds its mapping — the symmetric-NAT laptop,
   the target population — loses its session with no recovery short of a control-plane
   re-mint, the round trip this feature exists to avoid; permit it unauthenticated and it is
   a hijack primitive. The overlay already models this event (`Carrier::set_direct_dst`,
@@ -369,9 +369,9 @@ Verdict machinery to extend, verified against master:
 | what | anchor |
 |---|---|
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
-| …delegating to the pure decision | `overlay.rs:2020` `relay_verdict_core` |
-| Measured caps supersede presence | `overlay.rs:1969-1978` (in `verdict_from_nodes`, `:1948`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:3340` `RelayStrategyWire` |
+| …delegating to the pure decision | `overlay.rs:2024` `relay_verdict_core` |
+| Measured caps supersede presence | `overlay.rs:1972-1981` (in `verdict_from_nodes`, `:1951`) |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:3457` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1125` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1992`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1799`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -423,19 +423,19 @@ the first:
 
 ⚠️ **"Fail closed" is not implementable through the API the first draft prescribed.**
 `load_acl` returns `AclCtx` — **not** `Result` — and its error path returns `AclCtx::off()`,
-logging *"failing OPEN"* (`overlay.rs:1846-1849`, `:1862`). That is byte-identical to a
+logging *"failing OPEN"* (`overlay.rs:1848-1851`, `:1864`). That is byte-identical to a
 tenant that genuinely has ACLs disabled, so a caller shaped like the existing precedent
 (`overlay.rs:726-750`) takes the "no ACL configured" branch on a Mongo blip and **grants**,
 while its author believes it fails closed. Required: a `try_load_acl(…) -> Result<AclCtx, _>`
 for the new gate, with the two existing callers keeping their posture via an explicit
 `.unwrap_or_else(|_| AclCtx::off())` — which also turns their fail-open into a visible
-decision. Same for `overlay_source_of` (`overlay.rs:1869`), which swallows both errors
+decision. Same for `overlay_source_of` (`overlay.rs:1871`), which swallows both errors
 (`.ok()` → `owner_user_id: None`; `unwrap_or_default()` → empty roles), silently failing to
 match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_every_silent_drop`.
 
 **Permissions.** ⚠️ Exit-node approval requires `MANAGE_AGENTS`
 (`crates/api/src/routes/overlay_route.rs:310`, checked at `:328`), which **is** in `DEFAULT_ADMIN`
-(`crates/db/src/models/role.rs:104`), and writes no audit row. Nominating a relay makes a
+(`crates/db/src/models/role.rs:153`), and writes no audit row. Nominating a relay makes a
 device a traffic chokepoint and a metadata observation point for the whole tenant (§12), so
 it belongs in the class `role.rs` already draws a line around — *"an admin should see every
 command the fleet ran without silently gaining the power to run one"*, which is why
@@ -470,7 +470,7 @@ The bullets below describe the design *once #888 lands*:
 **Rate limiting.** ⚠️ `handle_overlay_relay_request` has **none** — `crates/api/src/ws/overlay.rs`
 contains zero `RateLimiter` references. Both precedents this FR claims equivalence with do
 enforce one, deliberately after the identity gates so refusals are attributable:
-`agent_exec.rs:322` (30/min) and `agent_ssh.rs:541` (20/min). `CLAUDE.md` records why:
+`agent_exec.rs:332` (30/min) and `agent_ssh.rs:551` (20/min). `CLAUDE.md` records why:
 *"The HTTP `tower_governor` is per-IP and never saw the device-originated
 `rc:rpc.request` / `rc:ssh.request` WS legs, so those had no ceiling at all."* A mint is
 another device-originated WS leg and is **more** expensive, because it writes state onto a
@@ -507,12 +507,12 @@ sent to a responder on mars:
 
 | host | netcheck | **3478** | 11000 (coturn's relay band) | 41641 (high port) |
 |---|---|---|---|---|
-| **CORPLAP-3** — symmetric NAT, corp-managed, permanently on `relay:derp/tcp` | `relay band/udp: BLOCKED` | ✅ **PASS** | ❌ FAIL | ❌ FAIL |
+| **a corporate laptop** — symmetric NAT, corp-managed, permanently on `relay:derp/tcp` | `relay band/udp: BLOCKED` | ✅ **PASS** | ❌ FAIL | ❌ FAIL |
 | **CORPLAP-1** — Check Point corp, cone | band reachable | ✅ PASS | ✅ PASS | ✅ PASS |
-| **CORPLAP-2** | `stun/udp: NO MAPPING` | ❌ FAIL | ❌ FAIL | ❌ FAIL |
+| **another corporate laptop** | `stun/udp: NO MAPPING` | ❌ FAIL | ❌ FAIL | ❌ FAIL |
 
 Arrivals were confirmed at the responder, not merely inferred from a client timeout —
-CORPLAP-3's frame landed from `192.164.201.1:10400`, matching the `MEASURED PATH` its own
+CORPLAP-3's frame landed from `<its srflx address>:10400`, matching the `MEASURED PATH` its own
 `roomler why` reports.
 
 Three results, in order of consequence:
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:5880` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:4066` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -535,21 +535,21 @@ per the next warning, includes our own.
 
 ⚠️⚠️ **A relay host must be checked for DNAT, not just for a free socket — and `ss` will
 lie to you.** The first probe of this matrix *failed* on 3478 and nearly produced the
-opposite conclusion. The cause was not the corp egress: mars's `COTURN_DNAT` chain
+opposite conclusion. The cause was not the corp egress: the utility server's `COTURN_DNAT` chain
 redirects UDP/3478 on **both** public IPs to the coturn VM in `PREROUTING`, before any
 local socket is consulted. `ss -ulnp` showed 3478 free, `HOST_FW_INPUT` showed it
 ACCEPTed, and a bound listener still received nothing. The same chain consumes
 **10000–13000** and **443 on `.74`**. Consequences:
 
-✅ **The relay host is `scw-m2-asahi` (`62.210.194.66`)** — measured 2026-08-28, after mars
-was ruled out below. It is a Scaleway Apple-M2 running Fedora Asahi: a public IP, UDP/3478
-free, **no DNAT on it**, and firewalld the only gate. With 3478 opened, **`CORPLAP-3`
-reached it** — arrival confirmed server-side from its own srflx `192.164.201.1:10400` — as
-did `CORPLAP-1`. `CORPLAP-2` did not, as expected: it has no UDP anywhere.
+✅ **The relay host is a hosted box, "the org relay host" below** — measured 2026-08-28, after mars
+was ruled out below. It is a rented ARM server running Linux: a public IP, UDP/3478
+free, **no DNAT on it**, and firewalld the only gate. With 3478 opened, **the symmetric-NAT laptop
+reached it** — arrival confirmed server-side from its own srflx `<its srflx address>:10400` — as
+did `CORPLAP-1`. The no-UDP laptop did not, as expected: it has no UDP anywhere.
 
 ⚠️ **The two home-LAN candidates were measured and REJECTED, not assumed.**
 `MacBook-1` (`macbook-1-local-daemon`) and `neo16` share one consumer NAT behind
-`37.63.112.129`. With a listener bound on the MacBook's `0.0.0.0:3478` and four datagrams
+`<a consumer NAT's public IP>`. With a listener bound on the MacBook's `0.0.0.0:3478` and four datagrams
 sent from mars to that public IP, the listener reported **`NO-INBOUND (timeout)`** — there
 is no port forward, so neither can serve a relay to anyone off that LAN. Two traps caught
 on the way, both of which would have produced a false answer:
@@ -558,14 +558,14 @@ was the shell's own error text), and a first probe was sent from `CORPLAP-2`, wh
 UDP at all and would have failed against a working host. A relay on a roaming laptop behind
 a residential NAT is also the wrong shape regardless of reachability.
 
-- **mars cannot host an org relay on 3478** without displacing coturn — the one port the
+- **The utility server cannot host an org relay on 3478** without displacing coturn — the one port the
   target population can reach is already taken on the fleet's most natural relay host.
   E2E-1 must therefore either pick a host without coturn DNAT or move coturn first.
 - This is the FR-4 class recurring: a host-level DNAT eating a port silently. Add a
   `iptables -t nat -S | grep <port>` check to the relay-host preflight, not just a bind
   attempt, and make the daemon **refuse to start the relay and log why** rather than
   binding a port it will never receive on.
-- ⚠️ **40000 is likewise not testable on jupiter/zeus** — `coturn_dnat_rules[*].port_ranges`
+- ⚠️ **40000 is likewise not testable on the two cluster hosts** — `coturn_dnat_rules[*].port_ranges`
   includes `"40000:49999"` on every roomler-ai-hosting node. Use 41641 there.
 
 **Reachability is new plumbing, not a generalised probe.** ⚠️ The first draft said the
@@ -601,51 +601,51 @@ row makes `roomler why` unable to answer 'why am I on DERP when there is a relay
 there'."*
 
 **That reason describes the status quo the codebase already accepts.** `explain`
-(`path.rs:917`) iterates `DIRECT_TIERS.chain(once(&DirectTier::Relay))`, and
+(`path.rs:962`) iterates `DIRECT_TIERS.chain(once(&DirectTier::Relay))`, and
 `base(Relay) = B_RELAY` for **both TURN and DERP** — so `roomler why` *already* cannot
 distinguish a 52 ms coturn hop from a 175 ms DERP hop. That distinction has never lived in
 the tier ladder; it lives in `PeerInfo.relay_kind` + `relay_transport`, rendered by
-`relay_qualified_label` (`localclient.rs:1047`) as `relay:{kind}/{transport}`.
+`relay_qualified_label` (`localclient.rs:2232`) as `relay:{kind}/{transport}`.
 
 So the design is:
 
-- **`RelayKind::Org`** joins `Turn` and `Derp` (`crates/tunnel-core/src/overlay/relay_link.rs:158`).
+- **`RelayKind::Org`** joins `Turn` and `Derp` (`crates/tunnel-core/src/overlay/relay_link.rs:165`).
   `relay:org/udp` appears in the CONN column **for free** via `relay_transport_info`
   (`wg.rs:204`), with `relay_server()` supplying `relay_via`.
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
-  (`wg.rs:155`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:410`)
+  (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:296`), `DerpMux::conn_for` (`derp.rs:458`) vending one per
+  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:434`) vending one per
   peer off a shared connection — and there are already **three** production impls
-  (`DerpConn`, `TurnRelayConn` `transport/relay.rs:348`, `UdpRelayConn` `:491`). An org relay
+  (`DerpConn`, `TurnRelayConn` `transport/relay.rs:415`, `UdpRelayConn` `:564`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
-- **`relay_strategy` (`relay_link.rs:1125`) gains a branch**; the server verdict picks Org
+- **`relay_strategy` (`relay_link.rs:1160`) gains a branch**; the server verdict picks Org
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
-`send_ip_packet` (`wg.rs:938`) as *"the send path that must learn 'via peer X'"*. It is not:
-relay carriers already get a dedicated per-peer recv task (`wg.rs:1542`) and never touch the
+`send_ip_packet` (`wg.rs:1222`) as *"the send path that must learn 'via peer X'"*. It is not:
+relay carriers already get a dedicated per-peer recv task (`wg.rs:1825`) and never touch the
 carrier plane's shape demux. `send_ip_packet`, `send_to_peer`, `SendPeer` and the `Router`
 need **zero changes**. The first draft also pointed the receive arm at
-`CarrierPlane::route_by_index` (`carrier_plane.rs:738`) — which takes a WireGuard receiver
+`CarrierPlane::route_by_index` (`carrier_plane.rs:745`) — which takes a WireGuard receiver
 index *already extracted from a parsed WG packet* (its three callers are `handle_datagram`'s
-arms at `:561-563`), so a Geneve frame can never reach it; and its `expected_src` contract
-(`:766-800`) would trip the roam machinery on packets arriving from the relay's address.
+arms at `:568-570`), so a Geneve frame can never reach it; and its `expected_src` contract
+(`:773-807`) would trip the roam machinery on packets arriving from the relay's address.
 
 A new tier would additionally have required navigating four hazards, three of them **silent**:
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2804` makes **both ends initiate** the WG handshake, `:2770` books a direct-tier failure on demote-follow |
-| `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
-| `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1431`, `:1519`, `:1591`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:98` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:148`), `establish.rs:2898` makes **both ends initiate** the WG handshake, `:2864` books a direct-tier failure on demote-follow |
+| `is_sticky` `_ =>` catch-all | `path.rs:862` | silently inherits LAN/public's 2-strike escalation |
+| `suppression_half_life` `_ =>` catch-all | `path.rs:287` | same |
+| `PathAction` / `Incumbent` | `path.rs:459`, `:447` | neither can represent an org relay; `decide` (`:1073`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1525`, `:1613`, `:1685`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
-(`path.rs:850`) would leave a BASE-230 tier only **30 points** of penalty headroom against
+(`path.rs:887`) would leave a BASE-230 tier only **30 points** of penalty headroom against
 srflx's 60. But the penalty is **scaled to each tier's own headroom** —
-`weight(tier) = 2.0 * (base(tier) - B_RELAY)` (`path.rs:274-278`), whose doc states the
+`weight(tier) = 2.0 * (base(tier) - B_RELAY)` (`path.rs:276-280`), whose doc states the
 invariant: *"eligibility … is re-crossed after exactly one half-life."* Every tier is
 suppressed for exactly one half-life; there is no asymmetry, and both "fixes" the first
 draft proposed would have destroyed that invariant for every tier. The real constraint —
@@ -666,7 +666,7 @@ evidence that justifies it.
   `relay_max_bitrate_per_session`; the relay's own carriers are exempt from its forwarding
   budget. An org must not be able to cost its HQ box its own remote access.
 - **Failure is a downgrade, never a black hole**, convicted by `sweep_carrier_health`
-  (`runtime/establish.rs:305`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
+  (`runtime/establish.rs:315`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
   failed", it was *"both ends held a hold-down and went mutually deaf"* (#746).
 - **Revocation is a push, not an expiry.** ⚠️ The first draft had no unmint at all, so
   flipping `peer_relay_mode` to `off` would have left live sessions forwarding indefinitely
@@ -687,24 +687,30 @@ evidence that justifies it.
 ### 8. Observability — shipped with its reader, per counter
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
-the counter was added without a reader"*. Still true: `stale_drops()`
-(`transport/derp.rs:445`) has zero consumers in the tree.
+the counter was added without a reader"*. It has one now: the agent's `/derp` loop logs
+`stale_drops()` (`transport/derp.rs:421`) as `dropped_stale` whenever it moves
+(`agents/roomlerd/src/derp.rs:477`).
 
 | surface | addition |
 |---|---|
-| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`localclient.rs:1047`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_via`, `relay_endpoint` (`PeerInfo`, `crates/localapi/src/lib.rs:439`) |
+| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2232`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:860`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
-| `roomler netcheck` | relay node: `relay server: listening :3478, N sessions` |
-| relay node | per-session `packets_rx`/`bytes_rx`, **one labelled counter per refusal reason** — bad MAC, unknown VNI, wrong tenant, at-capacity, expired, unbound-source — each with a `NodeStatus` reader. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood |
-| process-global | `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` only. ⚠️ **Not a gauge**: `evidence.rs:1-4` is *"cumulative since daemon start — consumers DIFF two readings, never judge absolutes"*. The live session count is a `NodeStatus` field |
+| `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2850-2864`). `roomler netcheck` prints no org-relay line |
+| relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
+| process-global | none for the org relay. `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` were never added, and `crates/tunnel-core/src/evidence.rs` holds no org-relay counter. The session counts are the relay's own `sessions_installed`, `_revoked` and `_reaped` (above). ⚠️ **Not a gauge**: like the overlay's evidence counters (`crates/tunnel-core/src/evidence.rs:3-6`), they are *"cumulative since start; readers DIFF two snapshots, they never judge an absolute"* (`server.rs:44-45`). No surface shows the live session count |
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
-⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
-measured (`signaling.rs:2144`).
-⚠️ `relay_via` must resolve from **the requesting tenant's own node row**. A multi-org
+⚠️ A pair that is not on `relay:org` is not evidence of "no relay available": the node may
+never have measured, and an unmeasured capability is `None`, never `false` (`CapVectorWire`,
+`crates/remote_control/src/signaling.rs:3526-3530`).
+⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
+It does: the name is the one this network's netmap gives the relay node
+(`crates/tunnel-core/src/overlay/runtime.rs:3062`, `:4240`), and the netmap takes it from that
+network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:2925-2929`). A
+relay node missing from the map shows as its node id in hex.
 
 ### 9. Where the code goes — implementation map
 
@@ -713,25 +719,25 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:158` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:296` (`impl RelayConn for DerpConn`) and `derp.rs:458` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:434` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1125` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
-| Netmap shaping | `overlay.rs:2058` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:3360` `NetmapPeer`; `:3338` `RelayStrategyWire` |
+| Netmap shaping | `overlay.rs:2062` `shape_peer` |
+| Wire model | `crates/remote_control/src/signaling.rs:3477` `NetmapPeer`; `:3455` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
-| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:305` `sweep_carrier_health` |
-| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2514`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
+| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |
+| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2895`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
-| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
+| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:1007-1008` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
-| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
+| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:153`, `:183` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
-`crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3141`),
+`crates/agent-core/src/config_surface.rs:38-40`: field on `AgentConfig`; `const KEYS` entry
+(`config_surface.rs:42`); getter + setter arms; and `env_bridge_bools` (`config.rs:3180`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
@@ -757,7 +763,7 @@ appears in **two** places), and the customer-facing install docs (§12).
 | **P1** | **Bind-only responder** (bind + authenticated challenge, **forwards nothing**, no session table) + `rc:overlay.relay_probe` + `peer_relay_audit` + every counter **with its reader** | `relay_server_enabled=false` |
 | **P2** | Forwarding: Geneve framing, VNI table, full 3-way bind, caps, revocation, `catch_unwind` | `relay_server_enabled=false` |
 | **P3** | Server-side mint + gates + approval (`MANAGE_AGENTS`+`EXEC_DEVICE`, no free bit — §4) / audit behind `VIEW_EXEC_AUDIT` + rate limit + `peer_relay_mode`. Split: **P3a** models + wire (#890) · **P3b** DAO, routes, `peer_relay_audit`, fail-closed `try_load_acl` / `try_overlay_source_of`, limiter · **P3c** the mint | `peer_relay_mode=off` ⇒ zero mints |
-| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote. Split: **P4a** the client in `tunnel-core` (`orgrelay/client.rs`: bind handshake + `OrgRelayConn`, proven over loopback against the real P2 relay) · **P4b** runtime + agent wiring — `RelayKind::Org`, the `relay_strategy` branch, `OverlayEvent::OrgRelay{Session,Revoke}`, relay-side `relay_serve` install, the probe report, the join flags — behind the config key · **P4c** the first field mint (`warn`, then `on`) — **field-verified 0.4.20** (CORPLAP-3↔mars on `relay:org/udp` via asahi; caps-probe fix #915 unblocked it) | `overlay_org_relay=false` |
+| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote. Split: **P4a** the client in `tunnel-core` (`orgrelay/client.rs`: bind handshake + `OrgRelayConn`, proven over loopback against the real P2 relay) · **P4b** runtime + agent wiring — `RelayKind::Org`, the `relay_strategy` branch, `OverlayEvent::OrgRelay{Session,Revoke}`, relay-side `relay_serve` install, the probe report, the join flags — behind the config key · **P4c** the first field mint (`warn`, then `on`) — **field-verified 0.4.20** (the symmetric-NAT laptop↔the utility server on `relay:org/udp` via the org relay host; caps-probe fix #915 unblocked it) | `overlay_org_relay=false` |
 | **P5** | jupiter/zeus provisioning in `~/k8s-cluster-multi` + weekly drift-audit cron | revert host_vars |
 | **P6** | Admin UI: relay approval, org switch, audit section | UI-only |
 | **Docs** | [`docs/peer-relays.md`](../peer-relays.md): what shipped, in the house style. ✅ Written 2026-09-24, **added retroactively** because this spec predates the docs-before-close rule | docs only |
@@ -880,7 +886,7 @@ kill switch. That is what makes E2E-3 executable before P2.
       opposite of F2's raw-UDP result, and both are correct: the UDP blaster has no congestion
       control and measures raw forwarding capacity (org wins 3.18×), while SSH is one reliable
       TCP stream bounded by `window / RTT` and loss-sensitive, so org's extra hop (86 vs 50 ms,
-      Asahi/FR while both members are AT/DE) costs it more than the capacity gains. **The org
+      the relay in another country than both members) costs it more than the capacity gains. **The org
       relay's value is pod offload (~74×) and raw headroom, NOT universal performance.**
       Follow-ups: relay PLACEMENT dominates this number (a relay near the members would likely
       flip it), and the org path deserves a loss/reordering check (the UDP arm was one-way and
@@ -894,10 +900,10 @@ kill switch. That is what makes E2E-3 executable before P2.
 **Operations**
 
 - [x] `peer-relay-port-audit.sh check` fails on a host whose UDP port is closed, and the
-      weekly cron files an issue. *(BOTH scripts delivered: `scripts/peer-relay-port-audit.sh` (`check` field-proven — exit 1 on a closed Asahi:3479, exit 4 on DNAT-stolen mars:3478) AND `scripts/peer-relay-port-audit-cron.sh`, a **mesh-native** wrapper (Fleet RPC, not ssh/scp). **LIVE ON mars 2026-08-31 (#1056):** the "unattended host" residual was a **MISDIAGNOSIS** — `roomler exec` needs no user token (`roomler exec --help`: the local daemon relays it over its own server connection; the server authorizes on the ORIGINATING device's permission). mars runs it via `ROOMLER_EXEC="sudo -n roomler exec"` — its earlier `Permission denied` was only the CLI-as-gjovanov not reaching the root-owned LocalAPI socket. gjovanov crontab `45 4 * * 1` (30 min after the sibling mediasoup audit; gjovanov has passwordless sudo + gh + kubectl). Verified end-to-end from mars: Asahi:3478 → `AUDIT OK`/0; Asahi:3479 → `AUDIT FAILED` → `WOULD file GitHub issue`/1.)*
-- [x] The port rule is **scoped**, not merely present. *(`scripts/peer-relay-port-audit.sh`, field 0.4.20: Asahi’s explicit `3478/udp` → scoped/exit 0; a blanket allow-all → exit 2; mars’s DNAT-consumed `3478` → exit 4.)*
+      weekly cron files an issue. *(BOTH scripts delivered: `scripts/peer-relay-port-audit.sh` (`check` field-proven — exit 1 on the relay host's closed 3479, exit 4 on the utility server's DNAT-stolen 3478) AND `scripts/peer-relay-port-audit-cron.sh`, a **mesh-native** wrapper (Fleet RPC, not ssh/scp). **LIVE ON the utility server 2026-08-31 (#1056):** the "unattended host" residual was a **MISDIAGNOSIS** — `roomler exec` needs no user token (`roomler exec --help`: the local daemon relays it over its own server connection; the server authorizes on the ORIGINATING device's permission). The utility server runs it via `ROOMLER_EXEC="sudo -n roomler exec"` — its earlier `Permission denied` was only the CLI-as-gjovanov not reaching the root-owned LocalAPI socket. gjovanov crontab `45 4 * * 1` (30 min after the sibling mediasoup audit). Verified end-to-end from the utility server: the relay host's 3478 → `AUDIT OK`/0; its 3479 → `AUDIT FAILED` → `WOULD file GitHub issue`/1.)*
+- [x] The port rule is **scoped**, not merely present. *(`scripts/peer-relay-port-audit.sh`, field 0.4.20: the relay host’s explicit `3478/udp` → scoped/exit 0; a blanket allow-all → exit 2; the utility server’s DNAT-consumed `3478` → exit 4.)*
 - [x] A relay at `relay_max_sessions` refuses with a distinct reason; the pair falls back.
-- [x] Relay-node UDP socket census flat over 24 h (F6). *(2026-09-24, closed by [FR-48](FR-48-roomlerd-ice-socket-leak.md) — this criterion is the consumer of that fix. The leak was never FR-19's: `turn::Client` has no `Drop`, so a **cancelled** TURN allocate stranded its underlay socket on every overlay node, relay or not; fixed in `agent-v0.4.100` (#1556). Hourly census over 24 h including the relay node `scw-m2-asahi`: no host ever exceeded 7 sockets, and the longest single lifetime — 20.0 h on 0.4.100 — ran **0.000/h** on all four, where 0.4.99 ran ~9/h. Full series and method in FR-48's field log.)*
+- [x] Relay-node UDP socket census flat over 24 h (F6). *(2026-09-24, closed by [FR-48](FR-48-roomlerd-ice-socket-leak.md) — this criterion is the consumer of that fix. The leak was never FR-19's: `turn::Client` has no `Drop`, so a **cancelled** TURN allocate stranded its underlay socket on every overlay node, relay or not; fixed in `agent-v0.4.100` (#1556). Hourly census over 24 h including the org relay host: no host ever exceeded 7 sockets, and the longest single lifetime — 20.0 h on 0.4.100 — ran **0.000/h** on all four, where 0.4.99 ran ~9/h. Full series and method in FR-48's field log.)*
 
 **Documentation**
 
@@ -966,29 +972,29 @@ in the same PR as `peer_relay_tests.rs`.
 
 ### 10c. E2E on the real fleet — mars, zeus, jupiter
 
-> ⚠️⚠️ **jupiter is storage-pinned production.** `k8s-worker-3` holds the node-local PVCs for
+> ⚠️⚠️ **Cluster host A is storage-pinned production.** Its k8s node holds the node-local PVCs for
 > `mongodb-0`, `minio-0` and `roomler2`; taking it down is a full roomler.ai outage, and this
 > assumption caused a multi-hour one on 2026-07-19.
 >
 > ⚠️⚠️ **P5 and E2E-5 ARE disruptive to both cluster hosts, and an earlier draft denied it.**
 > Playbook `11-host-networking` **flushes and rebuilds the COTURN chains** — the chains
 > carrying the mediasoup RTC DNAT — and FR-4's field log records that a run *"demoted the
-> fleet hosts' mesh carriers to DERP"*. So P5 on jupiter **is** a firewall flush of jupiter.
+> fleet hosts' mesh carriers to DERP"*. So P5 on cluster host A **is** a firewall flush of cluster host A.
 > Every playbook run is bracketed by `mediasoup-rtc-forwarding.sh check` **before and
 > after**, in an announced window. E2E-5's hand-removal must name the exact chain and rule —
 > a bare `iptables -D` in `COTURN_DNAT` renumbers the mediasoup rules.
 
 | host | overlay | role | risk |
 |---|---|---|---|
-| **scw-m2-asahi** | 100.65.4.32 / `62.210.194.66` | ✅ **primary relay** — measured: 3478 free, no DNAT, and `CORPLAP-3` reaches it | **low** — hosted box, no prod pods, no coturn |
-| **mars** | 100.65.4.14 | ❌ **cannot serve 3478** — `COTURN_DNAT` consumes it on both public IPs. Retained only as the Fleet-RPC driver and probe origin | low |
-| **zeus** | 100.65.4.24 | second relay *only if a second is needed* | ⚠️ **high** — `k8s-worker-2` serves conference media for a hash-determined subset of **all** tenants (the FR-4 population). A COTURN flush is a media outage for that subset, and 3478 is DNAT'd there too |
-| **jupiter** | 100.65.4.15 | third relay, ranking only | ⚠️ **high** — storage-pinned prod; same DNAT |
-| ~~neo16~~, ~~MacBook-1~~ | 100.65.4.2 / .34 | ❌ **rejected by measurement** — one consumer NAT behind `37.63.112.129`, inbound UDP/3478 `NO-INBOUND` | n/a |
+| **the org relay host** | `<overlay address>` / `<its public IP>` | ✅ **primary relay** — measured: 3478 free, no DNAT, and the symmetric-NAT laptop reaches it | **low** — hosted box, no prod pods, no coturn |
+| **the utility server** | `<overlay address>` | ❌ **cannot serve 3478** — `COTURN_DNAT` consumes it on both public IPs. Retained only as the Fleet-RPC driver and probe origin | low |
+| **cluster host B** | `<overlay address>` | second relay *only if a second is needed* | ⚠️ **high** — it serves conference media for a hash-determined subset of **all** tenants (the FR-4 population). A COTURN flush is a media outage for that subset, and 3478 is DNAT'd there too |
+| **cluster host A** | `<overlay address>` | third relay, ranking only | ⚠️ **high** — storage-pinned prod; same DNAT |
+| ~~neo16~~, ~~MacBook-1~~ | `<overlay addresses>` | ❌ **rejected by measurement** — one consumer NAT behind `<its public IP>`, inbound UDP/3478 `NO-INBOUND` | n/a |
 
 ⚠️ **This table changed because of measurement, and it changes the plan.** The original
 E2E-1 assumed mars as primary relay; mars cannot serve the only port the target population
-can reach. `scw-m2-asahi` replaces it, which also removes the need to touch either
+can reach. The org relay host replaces it, which also removes the need to touch either
 prod cluster host to run E2E-1 at all — the multi-relay ranking case is the *only* thing
 that would need zeus or jupiter, and it is worth asking whether that case is worth a
 COTURN flush on a host serving live conference media.
@@ -997,8 +1003,8 @@ COTURN flush on a host serving live conference media.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
-startup, so the whole surface is `restart_required = true`"* (hardcoded `:604`, `:618`,
-asserted by `every_key_gets_and_applies` `:3184`), and the CLI's live-apply allowlist is
+startup, so the whole surface is `restart_required = true`"* (hardcoded `:495`, `:509`,
+asserted by `every_key_gets_and_applies` `:2948`), and the CLI's live-apply allowlist is
 exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`
@@ -1010,7 +1016,7 @@ regression test for the whole feature.
 **E2E-3 — port matrix. ✅ RUN 2026-08-28 (§5); open decision #3 closed.** {3478, 443, **41641**} × {mars, zeus, jupiter} ×
 {CORPLAP-3, CORPLAP-2, CORPLAP-1}. ⚠️ **Probe with Geneve-shaped payloads**, not a generic UDP
 echo, or a STUN-ALG egress is measured wrong (§5). ⚠️ **41641, not 40000** — the latter is
-DNAT'd on jupiter/zeus. Decides open decision #3.
+DNAT'd on the two cluster hosts. Decides open decision #3.
 
 **E2E-4 — kill switch.** `peer_relay_mode=off` ⇒ zero new mints immediately, **and** live
 sessions revoked (§7), not merely left to a deadline that never fires.
@@ -1063,7 +1069,7 @@ a result."*
 | F0 | **Rollout proof** — every host on the intended build | — | `readlink /proc/$(pgrep -x roomlerd)/exe` per host ⚠️ a `.deb` upgrade leaves `roomlerd` on the deleted inode and `--version` **lies**; `git merge-base --is-ancestor` before trusting the tag |
 | F1 | `CORPLAP-3` carrier | `relay:derp/tcp`, 45 ms | `relay:org/udp` via mars |
 | F2 | Throughput on that pair | **org 102.8 / DERP 32.3 Mbps delivered = 3.18×** (0.4.23, 2026-08-30) — org lossless at 102.8 (3 concurrent blasters); DERP saturated at 32.3 (29 % loss); org ceiling higher still | **≥3× MET (3.18×)** |
-| F3 | **SSH-over-overlay throughput** (re-scoped from RC `send_wait_max`, 2026-08-30 — RC doesn't ride the overlay) | **org 10.1–19.7 @ 86 ms · DERP 41.6 @ 50 ms · direct 44.4** (0.4.41, 2026-09-01, same-session A/B) | ⚠️ **PREDICTION WRONG** — org is 2–4× SLOWER for a single TCP stream. Not a defect: TCP is RTT/loss-bound where the UDP blaster is not; org's win is pod offload, not universal speed. Relay PLACEMENT (FR relay, AT/DE members) dominates |
+| F3 | **SSH-over-overlay throughput** (re-scoped from RC `send_wait_max`, 2026-08-30 — RC doesn't ride the overlay) | **org 10.1–19.7 @ 86 ms · DERP 41.6 @ 50 ms · direct 44.4** (0.4.41, 2026-09-01, same-session A/B) | ⚠️ **PREDICTION WRONG** — org is 2–4× SLOWER for a single TCP stream. Not a defect: TCP is RTT/loss-bound where the UDP blaster is not; org's win is pod offload, not universal speed. Relay PLACEMENT (the relay in another country than both members) dominates |
 | F4 | `CORPLAP-2` carrier | `relay:derp/tcp`, 56 ms | **unchanged** |
 | F5 | DERP bytes through `roomler2` | **5.99 MB** / blast (CORPLAP-3↔mars on DERP) | **81 KB** / same blast (on org) — **~74× lower**, = idle background |
 | F6 | Relay-node CPU, RSS, **UDP socket count** on mars | *to record at P1* | within budget; **no socket growth** |
@@ -1156,14 +1162,14 @@ property to test (E2E-2, E2E-4), not to assert.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite
   `roomler diagnose` as the path-MTU instrument — it is
-  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:637`); only its
+  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:576`); only its
   doc comment describes the probe.
 
 ---
 
 ## Out of scope
 
-- Sharing UDP/3478 with a co-resident coturn (mars). Pick another port; revisit only if
+- Sharing UDP/3478 with a co-resident coturn (the utility server). Pick another port; revisit only if
   E2E-3 says 3478 is the sole port that works there.
 - Relaying for other tenants (a public or paid relay marketplace). ⚠️ Note this is only out
   of *scope*, not out of *reach*, unless §4's authenticated bind holds — an attacker who
@@ -1188,7 +1194,7 @@ property to test (E2E-2, E2E-4), not to assert.
 2. ~~**Default port: 3478 vs 443**~~ — **CLOSED 2026-08-28 by E2E-3: 3478** (§5). The
    motivating host reaches 3478 on an arbitrary public IP and no other port tested. Newly
    opened by the same run, and now the harder question: **which host can actually serve
-   it**, given mars's `COTURN_DNAT` already consumes 3478 on both its public IPs.
+   it**, given the utility server's `COTURN_DNAT` already consumes 3478 on both its public IPs.
 3. Does a relay **advertise capacity** for server-side load-balancing, or simply refuse at
    the cap? Refusal is simpler; advertisement is better for an HQ node serving many devices.
 4. **Per-session byte-counter granularity** (§12a) — coarse by default is taken; is
@@ -1202,24 +1208,24 @@ property to test (E2E-2, E2E-4), not to assert.
 
 | date | build | result |
 |---|---|---|
-| 2026-08-28 | 0.4.10 | **Pre-implementation evidence sweep.** Fleet-wide `netcheck` + `peers` + `why` from mars over Fleet RPC. 3/12 online peers on `relay:derp/tcp`, **all TCP**. `relay band/udp` **BLOCKED** on `CORPLAP-3` (symmetric NAT), jupiter and zeus; `stun/udp: NO MAPPING` on `CORPLAP-2` (whose relay-band cell is **derived, not probed**). Live tier ladder captured for `100.65.4.30`. ⇒ cluster-host firewall provisioning promoted to its own phase (P5); default port set to **3478 as a hypothesis**, with E2E-3 to settle it. ⚠️ Also found while specifying: `blocked_by: "peer-relays-instead"` (`path.rs:590`) already uses "peer relay" for nearly the opposite thing — the product keeps the industry term, the wire uses `relay_kind:"org"`. |
+| 2026-08-28 | 0.4.10 | **Pre-implementation evidence sweep.** Fleet-wide `netcheck` + `peers` + `why` from the utility server over Fleet RPC. 3/12 online peers on `relay:derp/tcp`, **all TCP**. `relay band/udp` **BLOCKED** on a corporate laptop (symmetric NAT) and on the two cluster hosts; `stun/udp: NO MAPPING` on another corporate laptop (whose relay-band cell is **derived, not probed**). Live tier ladder captured for `<overlay address>`. ⇒ cluster-host firewall provisioning promoted to its own phase (P5); default port set to **3478 as a hypothesis**, with E2E-3 to settle it. ⚠️ Also found while specifying: `blocked_by: "peer-relays-instead"` (`path.rs:590`) already uses "peer relay" for nearly the opposite thing — the product keeps the industry term, the wire uses `relay_kind:"org"`. |
 | 2026-08-28 | — | **Independent review, three lenses, before publication.** Three material corrections, each retained inline as a warning rather than silently fixed: (1) **§6 inverted** — a fifth carrier tier was the wrong design; `RelayKind::Org` plus a fourth `RelayConn` impl needs zero changes to `send_ip_packet`/`SendPeer`/`Router`/`CarrierPlane`, and avoids four hazards in `path.rs`/`lifecycle.rs`, three of them silent. The first draft's own "30 points of headroom" blocker was a **misreading** of `weight() = 2×(base − B_RELAY)` and is retracted. (2) **§4 was insecure** — the bind proved return-routability only; it now carries a per-member `bind_secret` delivered over the authenticated control WS, plus nonce, domain separation, constant-time compare and anti-amplification padding. (3) **§2b overread its instrument** — `relay_band_udp` probes coturn's ~10–13k band and never touches 40000, so the port choice is a hypothesis for E2E-3, which must additionally use Geneve-shaped payloads because a STUN ALG on 3478 may pass STUN and drop us. Also corrected: gate 2 is inert (`OverlayAclMode` defaults `Off`), "fail closed" is unreachable through `load_acl`'s `AclCtx` return, VNI scoping was self-contradictory, P1 was not inert, `roomler config set` is not live outside a two-key allowlist, `three_node_relay_roundtrip` was not implementable (overlay isn't compiled into `crates/tests`), and several acceptance criteria named instruments that do not exist. |
-| 2026-08-28 | 0.4.11 | **E2E-3 RUN — open decision #3 CLOSED: the default port is 3478.** Geneve-shaped 64-byte frames (`Opt Len 0`, pinned proto `0x7788`, deliberately not STUN-shaped) from three clients to a non-amplifying responder on mars; arrivals verified server-side, not inferred from client timeouts. **CORPLAP-3 — symmetric NAT, corp-managed, the host this FR exists for — reached 3478 and NOTHING else** (11000 ✗, 41641 ✗); CORPLAP-1 reached all three; CORPLAP-2 reached none, confirming the DERP floor. ⇒ 3478 confirmed, 41641 dead as a fallback, 443 retained only as a documented alternative. Two corrections fell out: the codebase's *"drops the ~10-13k relay band"* is **narrower than measured** (CORPLAP-3 allows *only* 3478, not "all but the band"), and the STUN-ALG risk §5 flagged **did not materialise**. ⚠️ The run's first probe FAILED on 3478 and nearly produced the opposite conclusion — the cause was mars's own `COTURN_DNAT` redirecting udp/3478 on both public IPs in `PREROUTING`, invisible to `ss -ulnp` and downstream of an ACCEPTing `HOST_FW_INPUT`. Isolated by a STUN-shaped control (also blocked ⇒ not payload inspection), then by reading the nat table. **mars therefore cannot host an org relay on 3478 without displacing coturn** — a new open question for E2E-1. Test rig fully torn down and verified: DNAT restored, temp accepts removed, nothing bound, mesh carriers unchanged. |
-| 2026-08-28 | 0.4.11 | **Relay-host question ANSWERED: `scw-m2-asahi` (`62.210.194.66`).** mars was ruled out by its own `COTURN_DNAT`, so three further candidates were measured rather than argued about. **Asahi (Scaleway M2 / Fedora Asahi): public IP, 3478 free, no DNAT, firewalld the only gate — with 3478 opened, `CORPLAP-3` reached it** (arrival confirmed server-side from its srflx `192.164.201.1:10400`), as did `CORPLAP-1`; `CORPLAP-2` did not, consistent with having no UDP at all. **`MacBook-1` and `neo16` REJECTED**: they share one consumer NAT behind `37.63.112.129`, and a listener on the MacBook's `0.0.0.0:3478` reported `NO-INBOUND (timeout)` against four datagrams from mars ⇒ no port forward, so neither can serve anyone off that LAN. ⚠️ Two traps caught on the way, each of which would have produced a false answer: `timeout` does not exist on macOS, so the first listener never ran and its "33 bytes received" was the shell's own error text; and the first inbound probe was sent from `CORPLAP-2`, which has no UDP and would have failed against a *working* host. ⇒ E2E-1 is re-planned around Asahi, which also removes any need to touch a prod cluster host to run it. Rig fully torn down: responder stopped, firewalld port removed (`ports:` empty again), scratch files deleted, service list unchanged. |
-| 2026-08-29 | 0.4.15 | **P1 FIELD-VERIFIED — the real daemon serves probes on `scw-m2-asahi:3478`.** P1a–P1d shipped (#816, #826, #832, #852), deployed to Asahi, `relay_server_enabled=true`, firewalld `3478/udp` permanent. The daemon logs `org-relay probe responder listening … local=Some(0.0.0.0:3478)` and holds the socket. Against the **real responder** (not the Python stand-in): **`CORPLAP-3` PASS ×2** — the corp-managed symmetric-NAT host this FR exists for — and **`CORPLAP-1` PASS**; `CORPLAP-2` fails, as it must, having no UDP anywhere. ⚠️ **Deploying a non-release build is not possible on a host with an active updater**: a hand-installed 0.4.14 was silently overwritten **90 s later** by the published 0.4.15 (`post-install watcher … expected=agent-v0.4.15`). The first diagnosis — "my rollback timer fired" — was **wrong**; `journalctl -u fr19-rollback.service` said *No entries*, and the agent's own log named the updater. The fix was to stop fighting it rather than disable `auto_update` on a fleet host: master was already 0.4.15 **and** carried P1d while the *released* 0.4.15 tag predated the merge, so a master build reports a version the updater does not consider newer. ⚠️ **A mid-test FAIL on `CORPLAP-1` was the CLIENT, not the relay** — its own netcheck flipped to `stun/udp: NO MAPPING` / `nat: untyped` when its Check Point VPN came up, and flipped back to `ok`/`cone` when it dropped, with the probe passing again on the same relay. VPN-up ⇒ fail, VPN-down ⇒ pass, same host: the client's capability vector is what settles "the relay broke", not the server. ⚠️ Observability gap found in use: the Rust responder only aggregates counters every 300 s **and sleeps before its first report**, so there is a 5-minute blind window at startup and no per-datagram arrival evidence — the stand-in logged every packet, which is what made the earlier DNAT confound visible. Worth a `NodeStatus` field before P2. |
-| 2026-08-29 | — | **P2a–P2c implemented; the relay forwards on loopback.** P2a (#881, merged): the authenticated bind — two keys with two jobs, fixed-width domain-separated MACs, constant-time compare via `subtle` added as a real dependency; deleting the `tag₁` check (the first draft's design) fails four of eleven tests. P2b (#885): the session table — forward only between the two bound addresses (mutation-verified), `max_lifetime` because `idle_deadline` never fires under a 25 s keepalive (100 keepalive-spaced datagrams prove it), authenticated re-bind in both directions, revoke kills a live session at once, a 64-session cap that refuses rather than grows. P2c: `RelayServer` on one socket — probes, bind, forwarding — with `catch_unwind` **verified by a test-induced panic** (one datagram lost, counter incremented, relay still answers), a per-source limiter that runs *before* the MAC (mutation-verified: disabling it lets all 50 bad binds reach the MAC), and the spec's `three_node_relay_roundtrip` over **three loopback UDP sockets**: A↔B relay, an intruder on the known VNI dropped and counted by the open-proxy tripwire, revoke stops forwarding, and the relay still echoes a probe afterwards. ⚠️ **Design correction found by writing the loopback test**: P2a's `tag₁` covered the observed source address, which a NAT'd client cannot know on its first packet — the handshake was unimplementable for its own target population. Address is now bound at step 3 via the cookie, as in the reference design (§4). ⚠️ `#881`'s commit staged only `crates/tunnel-core` and left the one-line `Cargo.lock` update behind; CI did not notice because no Rust lane builds `--locked`. Committed in P2b. **Not field-verified**: no deploy yet — a P2c build on Asahi holds no sessions until P3 mints them, so it behaves exactly as P1. |
-| 2026-08-29 | 0.4.17/0.4.18 (server: #899 deploying) | **P4c BASELINE, taken before any relay exists.** From `CORPLAP-3` (`roomler peers` over Fleet RPC): EVERY online peer is `relay:derp/tcp` — mars 49 ms, jupiter 45, zeus 46, **scw-m2-asahi 67**, CORPLAP-1 88, CORPLAP-2 100, regal 129, winhost-j 164, MacBook 202; neo16 `upgrading`. The whole of CORPLAP-3's mesh traffic crosses the API pod today — the population §2 describes, exactly. Server side: primary tenant `100.65.4.0/22`, `acl_mode` and `peer_relay_mode` unset (off), **0 overlay policies**, no relay approved, nobody advertising `relay-server` (P3a's verb is not in a release yet). Asahi: `/etc/roomler/config.toml` has `relay_server_enabled = true` (from P1), `auto_update = true`, public NIC `62.210.194.66` — so the 0.4.19 release makes it a serving relay on arrival, and the mint will pair that address with 3478. ⚠️ Two exec traps on the way: on a Windows target the Fleet-RPC shell runs as SYSTEM with no `roomler` on PATH — locate `C:\Program Files\Roomler\roomlerd.exe` and run `cli peers`; and `roomler config` has `ls`/`set`/`clear`, no `get` — read `/etc/roomler/config.toml` on Linux. |
-| 2026-08-29 | 0.4.19 (Asahi, CORPLAP-3, mars all on it) | **P4c step 1 found a real defect on the first host: `relay-server` was never advertised.** Asahi on 0.4.19 with `relay_server_enabled = true`: `roomler status` reads `org relay 0.0.0.0:3478 — bound`, yet `agents.capabilities.rpc` lacks `relay-server`, so the mint's relay-candidate step could only ever answer `no_relay`. Cause: the hello's capability list is computed in the caps-probe CHILD (rc.433), which inherits the environment but NOT the process-local S2 config-fallback registry, so `relay_server_enabled()` read its built-in default there. Proven on the host: `sudo env ROOMLERD_RELAY_SERVER_ENABLED=1 ROOMLERD_CAPS_CHILD=1 roomlerd caps-probe` prints the verb, the bare probe prints nothing. Fix in 0.4.20: the parent exports every registered knob to the child as a real `ROOMLERD_*` env var (`config_fallbacks_for_child`, precedence preserved) AND recomputes `caps.rpc` itself, so a config-derived verb never depends on what the child saw. The relay had been serving the whole time; the fleet could not be told. Baseline for the fix: the `mint` audit has zero rows and CORPLAP-3's `peers` still reads `relay:derp/tcp` for every peer. |
-| 2026-08-29 | **0.4.20** (fleet) | **P4c COMPLETE — org relay carried real traffic and was revoked.** After #915 shipped, all three hosts advertised `relay-server`. `peer_relay_mode` off→warn→on, Asahi approved (`serve:true`) + one ACL rule granting the relay node. On `warn`, mint rows for CORPLAP-3↔mars carried `warn_only:true`; every non-opted pair `requester_unsupported`/`peer_unsupported`; a secondary-org node `secondary_org`. On `on`, the fourth ladder-climb window (vni=6/gen=6) caught a clean dual-bind and the carrier **flipped both directions to `relay:org/udp` ~84 ms** (`CORPLAP-3 why mars` = `carrier relay:org via 127.0.0.6`), Asahi `forwarded=128 bound=4 drop_bad_cookie=0`, sockets 36→18 (no leak). A dual-ended tcpdump caught the shaped-probe→challenge→bind on Asahi:3478 from both members. `PUT …/peer-relay-policy {serve:false}` tore the live session down → both ends back to `relay:derp/tcp` in ~20 s + `revoke` audit row; `mode:off` returned `relays:[]`. Floor control **CORPLAP-2** and every non-opted peer stayed `relay:derp/tcp` throughout — only the approved pair moved; never self-wedged. ⚠️ Org relay engages on a **ladder climb, not on the mode flip**: vni 4–5 minted but idle-reaped before both members bound (the reap is the make-before-break floor working), and a pair parked on a healthy DERP floor won't re-request until it churns — restart a member to provoke it. Tenant left at `mode:off`. |
-| 2026-08-29 | **0.4.20** (live route) | **P4d — non-routable static endpoint REJECTED on the live route (SSRF/port-scan guard).** `PUT …/agent/{asahi}/peer-relay-policy` with `static_endpoints=[…]` returned `400 bad_request "… is not a public ip:port"` for `169.254.169.254:3478` (cloud metadata), `10.0.0.5`/`192.168.1.1` (RFC1918), `127.0.0.1` + `[::1]` (loopback), `100.64.0.1` (CGNAT/overlay), and `1.2.3.4:0` (port 0); a globally-routable `8.8.8.8:3478` was ACCEPTED (200). Matches the unit test `a_non_routable_static_endpoint_is_an_error_not_a_skip`. Reverted to `serve:false`; tenant stayed `mode:off`. |
+| 2026-08-28 | 0.4.11 | **E2E-3 RUN — open decision #3 CLOSED: the default port is 3478.** Geneve-shaped 64-byte frames (`Opt Len 0`, pinned proto `0x7788`, deliberately not STUN-shaped) from three clients to a non-amplifying responder on the utility server; arrivals verified server-side, not inferred from client timeouts. **The symmetric-NAT laptop — corp-managed, the host this FR exists for — reached 3478 and NOTHING else** (11000 ✗, 41641 ✗); CORPLAP-1 reached all three; the no-UDP laptop reached none, confirming the DERP floor. ⇒ 3478 confirmed, 41641 dead as a fallback, 443 retained only as a documented alternative. Two corrections fell out: the codebase's *"drops the ~10-13k relay band"* is **narrower than measured** (the symmetric-NAT laptop allows *only* 3478, not "all but the band"), and the STUN-ALG risk §5 flagged **did not materialise**. ⚠️ The run's first probe FAILED on 3478 and nearly produced the opposite conclusion — the cause was the utility server's own `COTURN_DNAT` redirecting udp/3478 on both public IPs in `PREROUTING`, invisible to `ss -ulnp` and downstream of an ACCEPTing `HOST_FW_INPUT`. Isolated by a STUN-shaped control (also blocked ⇒ not payload inspection), then by reading the nat table. **The utility server therefore cannot host an org relay on 3478 without displacing coturn** — a new open question for E2E-1. Test rig fully torn down and verified: DNAT restored, temp accepts removed, nothing bound, mesh carriers unchanged. |
+| 2026-08-28 | 0.4.11 | **Relay-host question ANSWERED: a hosted box, the org relay host.** The utility server was ruled out by its own `COTURN_DNAT`, so three further candidates were measured rather than argued about. **The org relay host (a rented ARM server running Linux): public IP, 3478 free, no DNAT, firewalld the only gate — with 3478 opened, the symmetric-NAT laptop reached it** (arrival confirmed server-side from its srflx `<its srflx address>:10400`), as did `CORPLAP-1`; the no-UDP laptop did not, consistent with having no UDP at all. **`MacBook-1` and `neo16` REJECTED**: they share one consumer NAT behind `<its public IP>`, and a listener on the MacBook's `0.0.0.0:3478` reported `NO-INBOUND (timeout)` against four datagrams from the utility server ⇒ no port forward, so neither can serve anyone off that LAN. ⚠️ Two traps caught on the way, each of which would have produced a false answer: `timeout` does not exist on macOS, so the first listener never ran and its "33 bytes received" was the shell's own error text; and the first inbound probe was sent from the no-UDP laptop, which has no UDP and would have failed against a *working* host. ⇒ E2E-1 is re-planned around the org relay host, which also removes any need to touch a prod cluster host to run it. Rig fully torn down: responder stopped, firewalld port removed (`ports:` empty again), scratch files deleted, service list unchanged. |
+| 2026-08-29 | 0.4.15 | **P1 FIELD-VERIFIED — the real daemon serves probes on the org relay host's 3478.** P1a–P1d shipped (#816, #826, #832, #852), deployed to the org relay host, `relay_server_enabled=true`, firewalld `3478/udp` permanent. The daemon logs `org-relay probe responder listening … local=Some(0.0.0.0:3478)` and holds the socket. Against the **real responder** (not the Python stand-in): **the symmetric-NAT laptop: PASS ×2** — the corp-managed symmetric-NAT host this FR exists for — and **`CORPLAP-1` PASS**; the no-UDP laptop fails, as it must, having no UDP anywhere. ⚠️ **Deploying a non-release build is not possible on a host with an active updater**: a hand-installed 0.4.14 was silently overwritten **90 s later** by the published 0.4.15 (`post-install watcher … expected=agent-v0.4.15`). The first diagnosis — "my rollback timer fired" — was **wrong**; `journalctl -u fr19-rollback.service` said *No entries*, and the agent's own log named the updater. The fix was to stop fighting it rather than disable `auto_update` on a fleet host: master was already 0.4.15 **and** carried P1d while the *released* 0.4.15 tag predated the merge, so a master build reports a version the updater does not consider newer. ⚠️ **A mid-test FAIL on `CORPLAP-1` was the CLIENT, not the relay** — its own netcheck flipped to `stun/udp: NO MAPPING` / `nat: untyped` when its Check Point VPN came up, and flipped back to `ok`/`cone` when it dropped, with the probe passing again on the same relay. VPN-up ⇒ fail, VPN-down ⇒ pass, same host: the client's capability vector is what settles "the relay broke", not the server. ⚠️ Observability gap found in use: the Rust responder only aggregates counters every 300 s **and sleeps before its first report**, so there is a 5-minute blind window at startup and no per-datagram arrival evidence — the stand-in logged every packet, which is what made the earlier DNAT confound visible. Worth a `NodeStatus` field before P2. |
+| 2026-08-29 | — | **P2a–P2c implemented; the relay forwards on loopback.** P2a (#881, merged): the authenticated bind — two keys with two jobs, fixed-width domain-separated MACs, constant-time compare via `subtle` added as a real dependency; deleting the `tag₁` check (the first draft's design) fails four of eleven tests. P2b (#885): the session table — forward only between the two bound addresses (mutation-verified), `max_lifetime` because `idle_deadline` never fires under a 25 s keepalive (100 keepalive-spaced datagrams prove it), authenticated re-bind in both directions, revoke kills a live session at once, a 64-session cap that refuses rather than grows. P2c: `RelayServer` on one socket — probes, bind, forwarding — with `catch_unwind` **verified by a test-induced panic** (one datagram lost, counter incremented, relay still answers), a per-source limiter that runs *before* the MAC (mutation-verified: disabling it lets all 50 bad binds reach the MAC), and the spec's `three_node_relay_roundtrip` over **three loopback UDP sockets**: A↔B relay, an intruder on the known VNI dropped and counted by the open-proxy tripwire, revoke stops forwarding, and the relay still echoes a probe afterwards. ⚠️ **Design correction found by writing the loopback test**: P2a's `tag₁` covered the observed source address, which a NAT'd client cannot know on its first packet — the handshake was unimplementable for its own target population. Address is now bound at step 3 via the cookie, as in the reference design (§4). ⚠️ `#881`'s commit staged only `crates/tunnel-core` and left the one-line `Cargo.lock` update behind; CI did not notice because no Rust lane builds `--locked`. Committed in P2b. **Not field-verified**: no deploy yet — a P2c build on the org relay host holds no sessions until P3 mints them, so it behaves exactly as P1. |
+| 2026-08-29 | 0.4.17/0.4.18 (server: #899 deploying) | **P4c BASELINE, taken before any relay exists.** From `CORPLAP-3` (`roomler peers` over Fleet RPC): EVERY online peer is `relay:derp/tcp` — mars 49 ms, jupiter 45, zeus 46, **the org relay host 67**, CORPLAP-1 88, CORPLAP-2 100, regal 129, winhost-j 164, MacBook 202; neo16 `upgrading`. The whole of CORPLAP-3's mesh traffic crosses the API pod today — the population §2 describes, exactly. Server side: primary tenant `100.65.4.0/22`, `acl_mode` and `peer_relay_mode` unset (off), **0 overlay policies**, no relay approved, nobody advertising `relay-server` (P3a's verb is not in a release yet). The org relay host: `/etc/roomler/config.toml` has `relay_server_enabled = true` (from P1), `auto_update = true`, public NIC `<its public IP>` — so the 0.4.19 release makes it a serving relay on arrival, and the mint will pair that address with 3478. ⚠️ Two exec traps on the way: on a Windows target the Fleet-RPC shell runs as SYSTEM with no `roomler` on PATH — locate `C:\Program Files\Roomler\roomlerd.exe` and run `cli peers`; and `roomler config` has `ls`/`set`/`clear`, no `get` — read `/etc/roomler/config.toml` on Linux. |
+| 2026-08-29 | 0.4.19 (the org relay host, CORPLAP-3, mars all on it) | **P4c step 1 found a real defect on the first host: `relay-server` was never advertised.** The org relay host on 0.4.19 with `relay_server_enabled = true`: `roomler status` reads `org relay 0.0.0.0:3478 — bound`, yet `agents.capabilities.rpc` lacks `relay-server`, so the mint's relay-candidate step could only ever answer `no_relay`. Cause: the hello's capability list is computed in the caps-probe CHILD (rc.433), which inherits the environment but NOT the process-local S2 config-fallback registry, so `relay_server_enabled()` read its built-in default there. Proven on the host: `sudo env ROOMLERD_RELAY_SERVER_ENABLED=1 ROOMLERD_CAPS_CHILD=1 roomlerd caps-probe` prints the verb, the bare probe prints nothing. Fix in 0.4.20: the parent exports every registered knob to the child as a real `ROOMLERD_*` env var (`config_fallbacks_for_child`, precedence preserved) AND recomputes `caps.rpc` itself, so a config-derived verb never depends on what the child saw. The relay had been serving the whole time; the fleet could not be told. Baseline for the fix: the `mint` audit has zero rows and CORPLAP-3's `peers` still reads `relay:derp/tcp` for every peer. |
+| 2026-08-29 | **0.4.20** (fleet) | **P4c COMPLETE — org relay carried real traffic and was revoked.** After #915 shipped, all three hosts advertised `relay-server`. `peer_relay_mode` off→warn→on, the org relay host approved (`serve:true`) + one ACL rule granting the relay node. On `warn`, mint rows for CORPLAP-3↔mars carried `warn_only:true`; every non-opted pair `requester_unsupported`/`peer_unsupported`; a secondary-org node `secondary_org`. On `on`, the fourth ladder-climb window (vni=6/gen=6) caught a clean dual-bind and the carrier **flipped both directions to `relay:org/udp` ~84 ms** (`CORPLAP-3 why mars` = `carrier relay:org via 127.0.0.6`), the org relay host `forwarded=128 bound=4 drop_bad_cookie=0`, sockets 36→18 (no leak). A dual-ended tcpdump caught the shaped-probe→challenge→bind on the org relay host's 3478 from both members. `PUT …/peer-relay-policy {serve:false}` tore the live session down → both ends back to `relay:derp/tcp` in ~20 s + `revoke` audit row; `mode:off` returned `relays:[]`. Floor control **CORPLAP-2** and every non-opted peer stayed `relay:derp/tcp` throughout — only the approved pair moved; never self-wedged. ⚠️ Org relay engages on a **ladder climb, not on the mode flip**: vni 4–5 minted but idle-reaped before both members bound (the reap is the make-before-break floor working), and a pair parked on a healthy DERP floor won't re-request until it churns — restart a member to provoke it. Tenant left at `mode:off`. |
+| 2026-08-29 | **0.4.20** (live route) | **P4d — non-routable static endpoint REJECTED on the live route (SSRF/port-scan guard).** `PUT …/agent/{relay}/peer-relay-policy` with `static_endpoints=[…]` returned `400 bad_request "… is not a public ip:port"` for `169.254.169.254:3478` (cloud metadata), `10.0.0.5`/`192.168.1.1` (RFC1918), `127.0.0.1` + `[::1]` (loopback), `100.64.0.1` (CGNAT/overlay), and `1.2.3.4:0` (port 0); a globally-routable `8.8.8.8:3478` was ACCEPTED (200). Matches the unit test `a_non_routable_static_endpoint_is_an_error_not_a_skip`. Reverted to `serve:false`; tenant stayed `mode:off`. |
 | 2026-08-29 | **0.4.20** | **P4d — approval authz confirmed.** The live route runs `decide_approval` (my Owner session approves via the `ADMINISTRATOR` bypass; a `serve:false` clear and a `serve:true` approve each wrote a `peer_relay_audit` row, observed in the field). The permission split is locked by five unit tests: `an_admin_without_exec_device_cannot_approve`, `an_admin_with_exec_device_can_approve`, `a_member_is_not_a_device_admin_even_to_clear`, `exec_device_alone_is_not_a_device_admin`, `administrator_bypasses_as_everywhere_else`. |
-| 2026-08-29 | **0.4.20** (fleet, disruptive test authorized by operator) | **Kill-every-relay demote + relentless re-upgrade (box “killing every relay mid-session demotes…”).** With CORPLAP-3↔mars live on `relay:org/udp` (~85 ms) via scw-m2-asahi, the relay daemon was hard-killed (`pkill -9`, `KILL@20:19:19Z`). CORPLAP-3’s carrier read `blocked` by **20:19:33Z (+14 s)** and fully demoted to `relay:derp/tcp` by **20:19:45Z (+26 s)** — inside the carrier-health window — staying connected the whole time (never self-wedged). The relay was restored at `RESTART@20:21:19Z`; on the next member ladder-climb CORPLAP-3↔mars **re-upgraded to `relay:org/udp`** (81–85 ms) — the never-ratchet / relentless-re-upgrade commitment. Floor control **CORPLAP-2** stayed `relay:derp/tcp` throughout. |
-| 2026-08-29 | **0.4.20** | **RTT before/after (partial for box “same pair before/after”).** Same CORPLAP-3↔mars pair: `relay:org/udp` **81–86 ms** vs `relay:derp/tcp` **48–66 ms** — the org relay is *higher* RTT here because scw-m2-asahi (Scaleway/FR) adds a hop the cluster-hosted DERP does not. Expected, and the point: an org relay trades a little latency to keep the pair off the API pod (control-plane-as-data-path). The metric that captures the win is DERP-bytes-through-`roomler2` (box below), which needs a pod byte counter and is unmeasured; throughput / RC `send_wait_max` not captured, so that box stays open. |
-| 2026-08-29 | **0.4.20** | **Operational note from the kill test: `systemctl start` on an ORPHAN-daemon host starts a restart storm.** Asahi’s daemon was an unmanaged orphan (the 0.4.20 updater self-relaunched as `roomlerd run`, leaving `roomlerd.service` inactive). The kill-test’s `systemctl start roomlerd` recovery brought the service up beside the surviving orphan, and `Restart=always` then looped it against the singleton config-lock (`“Another roomlerd is already running… exiting”`, NRestarts=32) — `is-active` reads `activating`/`auto-restart` while the real daemon is perfectly healthy. Cleaned to a single service-managed daemon (`stop` → `pkill -9` → `start`); Asahi ended **better** than found (managed + auto-recovering, NRestarts=0). ⚠️ Recover an orphan host by killing the orphan FIRST, then `systemctl start` — never `start` beside it. |
-| 2026-08-29 | **0.4.20** | **`scripts/peer-relay-port-audit.sh` delivered + field-tested (boxes “port-audit check” / “scoped, not merely present”).** A relay-host firewall drift guard (firewalld / nftables / iptables) that asserts the UDP relay port is admitted by a rule that NAMES the port (scoped) and is not stolen by a DNAT. Field results: **Asahi** (firewalld) `3478` → scoped, exit 0; a closed `3479` → exit 1 (the drift signal, proven non-destructively rather than by removing Asahi’s real rule). **mars** (nft) `3478` → exit 4 — it machine-detects the `dnat to 10.10.10.11:3478` that steals the port upstream of the socket, i.e. WHY a cluster node cannot host a relay on 3478 even though the filter accepts it (the §5 line-565 hint). Two real bugs were caught and fixed during the field test: grep’s `[^
-]` means “not backslash-or-n” (broke matching on any rule containing “cou**n**ter”) — use `.*`; and a filter-accept audit alone gives a false PASS on a DNAT host, so the DNAT-conflict check is load-bearing. ⚠️ Still to wire: the weekly build-host cron that pushes it over the mesh and files a GitHub issue on non-zero, and the fire-on-zeus proof. |
-| 2026-08-30 | **0.4.23** (server; metric #952) | **THE POD-OFFLOAD MEASURED — box “DERP bytes through `roomler2` fall”.** Shipped `derp_bytes_relayed_total` (an `AtomicU64` in `cluster/metrics.rs`, incremented in `derp::forward_frame` ONLY on a successful enqueue, exported at `GET /api/cluster/status`), deployed to prod (`v20260829-ebbafd735cf4`, both pods), canary-confirmed the field is present. A/B on the primary tenant’s affinity pod (10.10.20.11): an identical 12.5 MB one-way UDP blast (mars → CORPLAP-3’s overlay IP @ 5 Mbit/s × 20 s; no CORPLAP-3 listener needed — the WG ciphertext still crosses the carrier). **CORPLAP-3↔mars on `relay:derp/tcp`** → pod delta **5,989,351 B (~6 MB)**; **same pair on `relay:org/udp`** (via scw-m2-asahi) → pod delta **81,193 B (~79 KB)** = the measured idle background (3 KB/s). **~74× reduction** — the org relay carried the pair’s traffic CORPLAP-3→asahi→mars, off the API pod entirely, which is the whole point of the FR. ⚠️ `derp_registrations` stayed **12** in both states — the floor is never torn down (the invariant the box demands). ⚠️ The ~6 MB vs 12.5 MB sent is loss-tolerant DERP drops to CORPLAP-3’s slow corp-Windows WS consumer, correctly UNCOUNTED (the metric increments only on a successful `try_send`). RTT note (box “same pair before/after”): org **85 ms** vs DERP **47 ms** — org is HIGHER (asahi/FR adds a hop); latency is the trade, pod-offload is the win. |
-| 2026-08-30 | **0.4.23** | **THROUGHPUT before/after on the same pair — box "same pair before/after" (throughput leg).** Same CORPLAP-3↔mars pair, same 1000 B UDP blaster (CORPLAP-3→mars overlay IP, PowerShell `UdpClient`); mars a python3 sink counting *delivered* bytes over a 10 s steady-state window; provoked onto `relay:org/udp` by a member restart, then revoked back. **DERP floor:** offered 45.4 → **delivered 32.3 Mbps (~29 % loss)**. **Org relay (`scw-m2-asahi`):** offered 42.3 → **delivered 44.5 Mbps (~0 % loss)**. Org carried the *whole* offered load losslessly where DERP dropped ~29 % (single-flow TCP-relay HOL through the pod), so org's true ceiling is ≥44.5 Mbps — the run is **send-capped by PowerShell (~45 Mbps)**, not by the relay. Offload cross-check on the same blasts: **73 KB** through the pod on the org leg vs tens of MB on DERP (re-confirms ~74×). `derp_registrations` stayed **12**; the mode-off revoke returned the pair to `relay:derp/tcp` (46 ms). ⚠️ The ≥3× *target* is not a hard-proven multiple (blaster send-capped below org's ceiling); org is shown strictly better (lossless vs 29 % loss). ⚠️ RC `send_wait_max_ms` leg still open (needs a browser RC session). [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5465358076). |
-| 2026-08-30 | **0.4.23** | **≥3× THROUGHPUT — HARD NUMBER (box "same pair before/after", throughput leg).** Follow-up to the send-capped row above: **3 concurrent** `UdpClient` blasters on CORPLAP-3 (`Start-Job`×3) push past the single-loop ~45 Mbps cap. Same CORPLAP-3↔mars pair on `relay:org/udp` (Asahi), same mars python3 sink, 10 s steady window: offered **104.3** → **delivered 102.8 Mbps @ ~0 % loss**. Against the DERP floor's established **32.3 Mbps** ceiling (saturated — 29 % loss already at 45 offered, so offering more only drops more): **102.8 / 32.3 = 3.18×**, still lossless so org's true ceiling is higher (now CORPLAP-3-uplink bound, not relay bound). ✅ **F2 ≥3× MET.** Carriers confirmed on both legs; symmetric-NAT CORPLAP-3 climbs on a member restart, `mode:off` revokes. ⚠️ RC `send_wait_max_ms` is MIS-SCOPED for an org-vs-DERP A/B (RC media rides WebRTC/TURN, NOT the overlay relay — no carrier swap to measure); needs a scope decision, not a measurement. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5471722265). |
-| 2026-08-30 | **0.4.33/34** | **F3 RE-SCOPED to SSH-over-overlay + measured (was RC `send_wait_max`).** RC media rides WebRTC/TURN, which the overlay org relay does NOT carry — no carrier swap to measure; SSH between two overlay nodes DOES ride the carrier, so F3 now measures SSH throughput. SSH `CORPLAP-3`→mars (mars sshd :22 reached over the overlay, ephemeral key, 60 MB `dd`→.NET FileStream, `Compression=no`): **DERP `relay:derp/tcp` = 58.9 Mbps** (stable, carrier-confirmed) vs **direct = 44.4 Mbps** — for this symmetric-NAT corp host DERP BEATS its own flaky direct, and SSH-over-DERP 58.9 > the raw-UDP DERP 32.3 because SSH is a reliable TCP stream (flow-controls, doesn't overrun the buffer). **Org SSH leg pending** — the host would not re-request the org climb (all server gates ready: `mode:on`, Asahi `serving:true`, but no `OverlayRelayRequest` — a re-request backoff after ~2 h of enable/disable churn; a silent-loss induced block just left it `upgrading`, not relay-locked). Org's advantage on this exact pair is established via the **3.18× UDP result** above. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5480692218). |
-| 2026-09-01 | **0.4.41** | **F3 COMPLETE — the org SSH leg, and the prediction was WRONG (in the useful direction).** The member's re-request backoff had cleared, so the climb was provoked normally and held. Same-session A/B, same pair, same 25 MB `dd` over SSH, carrier confirmed each run: **org `relay:org/udp` 10.1 & 19.7 Mbps @ 86 ms** vs **DERP `relay:derp/tcp` 41.6 Mbps @ 50 ms** — the org relay is **2–4× SLOWER than the DERP floor for a single TCP stream**, the opposite of F2's 3.18× raw-UDP win. Both results are correct and measure different things: the UDP blaster has no congestion control or reliability, so it reads the carrier's raw forwarding capacity (org excellent, DERP drops 29 %); SSH is one reliable TCP stream bounded by `window / RTT` and loss-sensitive, so org's extra hop (Asahi/FR while both members are AT/DE — 86 vs 50 ms, 1.7× RTT) plus any reordering costs more than the capacity gains. ⇒ **the org relay's value is pod offload (~74×) and raw headroom, NOT universal performance**; an interactive/single-stream TCP workload is faster on the DERP floor at this relay placement. Follow-ups worth doing: (1) relay **placement** dominates — a relay near the members would likely flip this; (2) a **loss/reordering check** on the org path (the UDP arm was one-way and loss-blind by construction). Recorded in full because reporting only the flattering half would have been the misleading one. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5491431943). |
+| 2026-08-29 | **0.4.20** (fleet, disruptive test authorized by operator) | **Kill-every-relay demote + relentless re-upgrade (box “killing every relay mid-session demotes…”).** With the symmetric-NAT laptop↔the utility server live on `relay:org/udp` (~85 ms) via the org relay host, the relay daemon was hard-killed (`pkill -9`, `KILL@20:19:19Z`). The symmetric-NAT laptop’s carrier read `blocked` by **20:19:33Z (+14 s)** and fully demoted to `relay:derp/tcp` by **20:19:45Z (+26 s)** — inside the carrier-health window — staying connected the whole time (never self-wedged). The relay was restored at `RESTART@20:21:19Z`; on the next member ladder-climb the symmetric-NAT laptop↔the utility server **re-upgraded to `relay:org/udp`** (81–85 ms) — the never-ratchet / relentless-re-upgrade commitment. Floor control **the no-UDP laptop** stayed `relay:derp/tcp` throughout. |
+| 2026-08-29 | **0.4.20** | **RTT before/after (partial for box “same pair before/after”).** Same CORPLAP-3↔mars pair: `relay:org/udp` **81–86 ms** vs `relay:derp/tcp` **48–66 ms** — the org relay is *higher* RTT here because the org relay host (in another country) adds a hop the cluster-hosted DERP does not. Expected, and the point: an org relay trades a little latency to keep the pair off the API pod (control-plane-as-data-path). The metric that captures the win is DERP-bytes-through-`roomler2` (box below), which needs a pod byte counter and is unmeasured; throughput / RC `send_wait_max` not captured, so that box stays open. |
+| 2026-08-29 | **0.4.20** | **Operational note from the kill test: `systemctl start` on an ORPHAN-daemon host starts a restart storm.** The org relay host’s daemon was an unmanaged orphan (the 0.4.20 updater self-relaunched as `roomlerd run`, leaving `roomlerd.service` inactive). The kill-test’s `systemctl start roomlerd` recovery brought the service up beside the surviving orphan, and `Restart=always` then looped it against the singleton config-lock (`“Another roomlerd is already running… exiting”`, NRestarts=32) — `is-active` reads `activating`/`auto-restart` while the real daemon is perfectly healthy. Cleaned to a single service-managed daemon (`stop` → `pkill -9` → `start`); the org relay host ended **better** than found (managed + auto-recovering, NRestarts=0). ⚠️ Recover an orphan host by killing the orphan FIRST, then `systemctl start` — never `start` beside it. |
+| 2026-08-29 | **0.4.20** | **`scripts/peer-relay-port-audit.sh` delivered + field-tested (boxes “port-audit check” / “scoped, not merely present”).** A relay-host firewall drift guard (firewalld / nftables / iptables) that asserts the UDP relay port is admitted by a rule that NAMES the port (scoped) and is not stolen by a DNAT. Field results: **the org relay host** (firewalld) `3478` → scoped, exit 0; a closed `3479` → exit 1 (the drift signal, proven non-destructively rather than by removing the org relay host’s real rule). **the utility server** (nft) `3478` → exit 4 — it machine-detects the `dnat to <an internal address>:3478` that steals the port upstream of the socket, i.e. WHY a cluster node cannot host a relay on 3478 even though the filter accepts it (the §5 line-565 hint). Two real bugs were caught and fixed during the field test: grep’s `[^
+]` means “not backslash-or-n” (broke matching on any rule containing “cou**n**ter”) — use `.*`; and a filter-accept audit alone gives a false PASS on a DNAT host, so the DNAT-conflict check is load-bearing. ⚠️ Still to wire: the weekly build-host cron that pushes it over the mesh and files a GitHub issue on non-zero, and the fire-on-cluster-host-B proof. |
+| 2026-08-30 | **0.4.23** (server; metric #952) | **THE POD-OFFLOAD MEASURED — box “DERP bytes through `roomler2` fall”.** Shipped `derp_bytes_relayed_total` (an `AtomicU64` in `cluster/metrics.rs`, incremented in `derp::forward_frame` ONLY on a successful enqueue, exported at `GET /api/cluster/status`), deployed to prod (`v20260829-ebbafd735cf4`, both pods), canary-confirmed the field is present. A/B on the primary tenant’s affinity pod (`<an internal address>`): an identical 12.5 MB one-way UDP blast (mars → CORPLAP-3’s overlay IP @ 5 Mbit/s × 20 s; no CORPLAP-3 listener needed — the WG ciphertext still crosses the carrier). **CORPLAP-3↔mars on `relay:derp/tcp`** → pod delta **5,989,351 B (~6 MB)**; **same pair on `relay:org/udp`** (via the org relay host) → pod delta **81,193 B (~79 KB)** = the measured idle background (3 KB/s). **~74× reduction** — the org relay carried the pair’s traffic CORPLAP-3→relay→mars, off the API pod entirely, which is the whole point of the FR. ⚠️ `derp_registrations` stayed **12** in both states — the floor is never torn down (the invariant the box demands). ⚠️ The ~6 MB vs 12.5 MB sent is loss-tolerant DERP drops to CORPLAP-3’s slow corp-Windows WS consumer, correctly UNCOUNTED (the metric increments only on a successful `try_send`). RTT note (box “same pair before/after”): org **85 ms** vs DERP **47 ms** — org is HIGHER (the relay host adds a hop); latency is the trade, pod-offload is the win. |
+| 2026-08-30 | **0.4.23** | **THROUGHPUT before/after on the same pair — box "same pair before/after" (throughput leg).** Same CORPLAP-3↔mars pair, same 1000 B UDP blaster (CORPLAP-3→mars overlay IP, PowerShell `UdpClient`); mars a python3 sink counting *delivered* bytes over a 10 s steady-state window; provoked onto `relay:org/udp` by a member restart, then revoked back. **DERP floor:** offered 45.4 → **delivered 32.3 Mbps (~29 % loss)**. **Org relay (the org relay host):** offered 42.3 → **delivered 44.5 Mbps (~0 % loss)**. Org carried the *whole* offered load losslessly where DERP dropped ~29 % (single-flow TCP-relay HOL through the pod), so org's true ceiling is ≥44.5 Mbps — the run is **send-capped by PowerShell (~45 Mbps)**, not by the relay. Offload cross-check on the same blasts: **73 KB** through the pod on the org leg vs tens of MB on DERP (re-confirms ~74×). `derp_registrations` stayed **12**; the mode-off revoke returned the pair to `relay:derp/tcp` (46 ms). ⚠️ The ≥3× *target* is not a hard-proven multiple (blaster send-capped below org's ceiling); org is shown strictly better (lossless vs 29 % loss). ⚠️ RC `send_wait_max_ms` leg still open (needs a browser RC session). [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5465358076). |
+| 2026-08-30 | **0.4.23** | **≥3× THROUGHPUT — HARD NUMBER (box "same pair before/after", throughput leg).** Follow-up to the send-capped row above: **3 concurrent** `UdpClient` blasters on the symmetric-NAT laptop (`Start-Job`×3) push past the single-loop ~45 Mbps cap. Same laptop↔utility-server pair on `relay:org/udp` (the org relay host), same python3 sink on the utility server, 10 s steady window: offered **104.3** → **delivered 102.8 Mbps @ ~0 % loss**. Against the DERP floor's established **32.3 Mbps** ceiling (saturated — 29 % loss already at 45 offered, so offering more only drops more): **102.8 / 32.3 = 3.18×**, still lossless so org's true ceiling is higher (now bound by the laptop's uplink, not the relay). ✅ **F2 ≥3× MET.** Carriers confirmed on both legs; the symmetric-NAT laptop climbs on a member restart, `mode:off` revokes. ⚠️ RC `send_wait_max_ms` is MIS-SCOPED for an org-vs-DERP A/B (RC media rides WebRTC/TURN, NOT the overlay relay — no carrier swap to measure); needs a scope decision, not a measurement. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5471722265). |
+| 2026-08-30 | **0.4.33/34** | **F3 RE-SCOPED to SSH-over-overlay + measured (was RC `send_wait_max`).** RC media rides WebRTC/TURN, which the overlay org relay does NOT carry — no carrier swap to measure; SSH between two overlay nodes DOES ride the carrier, so F3 now measures SSH throughput. SSH from the symmetric-NAT laptop to the utility server (its sshd :22 reached over the overlay, ephemeral key, 60 MB `dd`→.NET FileStream, `Compression=no`): **DERP `relay:derp/tcp` = 58.9 Mbps** (stable, carrier-confirmed) vs **direct = 44.4 Mbps** — for this symmetric-NAT corp host DERP BEATS its own flaky direct, and SSH-over-DERP 58.9 > the raw-UDP DERP 32.3 because SSH is a reliable TCP stream (flow-controls, doesn't overrun the buffer). **Org SSH leg pending** — the host would not re-request the org climb (all server gates ready: `mode:on`, the org relay host `serving:true`, but no `OverlayRelayRequest` — a re-request backoff after ~2 h of enable/disable churn; a silent-loss induced block just left it `upgrading`, not relay-locked). Org's advantage on this exact pair is established via the **3.18× UDP result** above. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5480692218). |
+| 2026-09-01 | **0.4.41** | **F3 COMPLETE — the org SSH leg, and the prediction was WRONG (in the useful direction).** The member's re-request backoff had cleared, so the climb was provoked normally and held. Same-session A/B, same pair, same 25 MB `dd` over SSH, carrier confirmed each run: **org `relay:org/udp` 10.1 & 19.7 Mbps @ 86 ms** vs **DERP `relay:derp/tcp` 41.6 Mbps @ 50 ms** — the org relay is **2–4× SLOWER than the DERP floor for a single TCP stream**, the opposite of F2's 3.18× raw-UDP win. Both results are correct and measure different things: the UDP blaster has no congestion control or reliability, so it reads the carrier's raw forwarding capacity (org excellent, DERP drops 29 %); SSH is one reliable TCP stream bounded by `window / RTT` and loss-sensitive, so org's extra hop (the relay in another country than both members — 86 vs 50 ms, 1.7× RTT) plus any reordering costs more than the capacity gains. ⇒ **the org relay's value is pod offload (~74×) and raw headroom, NOT universal performance**; an interactive/single-stream TCP workload is faster on the DERP floor at this relay placement. Follow-ups worth doing: (1) relay **placement** dominates — a relay near the members would likely flip this; (2) a **loss/reordering check** on the org path (the UDP arm was one-way and loss-blind by construction). Recorded in full because reporting only the flattering half would have been the misleading one. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5491431943). |

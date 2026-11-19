@@ -548,11 +548,15 @@ pub trait ScreenCapture: Send {
 
     /// FR-119 P2b-3 — the captured display's refresh rate in Hz, read once at
     /// the open (`capture::refresh`). A screen cannot produce frames faster
-    /// than it refreshes, so the grant refuses a rate above it. `None` from
-    /// every backend that cannot read it, which decides nothing.
-    fn refresh_hz(&self) -> Option<u16> {
-        None
-    }
+    /// than it refreshes, so the grant refuses a rate above it. `None` from a
+    /// backend that cannot read it, which decides nothing.
+    ///
+    /// ⚠️ Required, with no default, so that no backend can decide nothing
+    /// silently: each one answers, and a `None` says beside it why there is no
+    /// rate to read. A default once let the SYSTEM-context arm, which every
+    /// Windows SYSTEM-service install captures through, answer `None` without a
+    /// word, and a 120 was granted on a 60 Hz panel (FR-135 §13, 2026-11-07).
+    fn refresh_hz(&self) -> Option<u16>;
 
     /// FR-29 — cumulative frames the backend declined to produce because it
     /// PROVED the screen was unchanged.
@@ -643,6 +647,26 @@ impl CaptureArm {
     /// asks.
     pub fn attended(self) -> bool {
         matches!(self, Self::Portal)
+    }
+
+    /// #3918 — the arm a wire spelling names: [`Self::wire`] read back, in
+    /// this one place. `None` for a spelling this build does not know, which
+    /// every reader takes as an arm it knows nothing of.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        [Self::Drm, Self::Mutter, Self::Portal, Self::X11]
+            .into_iter()
+            .find(|arm| arm.wire() == s)
+    }
+
+    /// #3918 — whether this arm's capture is a client of an X server, which
+    /// on a device with the virtual desktop is the desktop's, and dies with it
+    /// (`media_share::try_join`). No wildcard: a new arm does not compile
+    /// until someone decides it here.
+    pub fn reads_an_x_server(self) -> bool {
+        match self {
+            Self::X11 => true,
+            Self::Drm | Self::Mutter | Self::Portal => false,
+        }
     }
 }
 
@@ -749,10 +773,9 @@ impl CaptureUnavailableCode {
                 if cfg!(target_os = "macos") {
                     "This agent runs as a system daemon, which has no desktop session and \
                      therefore no screen to capture. Connect to this machine's user-session \
-                     agent instead. Remote shell and file transfer work here."
+                     agent instead. Remote shell works here."
                 } else {
-                    "This host has no display to capture (headless, or no desktop session). \
-                     Remote shell and file transfer still work."
+                    no_display_hint(crate::files::follows_the_screen())
                 }
             }
             Self::NotBuilt => {
@@ -766,6 +789,41 @@ impl CaptureUnavailableCode {
             Self::WaylandNotEnabled => wayland_hint(running_as_root()),
             Self::X11NotEnabled => x11_hint(running_as_root()),
         }
+    }
+}
+
+/// #3711 — what a hint says of file transfer where it works only as the
+/// person signed in at the screen (`files::follows_the_screen`: a Linux
+/// system install, `docs/desktop-companion.md` §9.4): with nobody signed in
+/// there, it browses and sends nothing, and a received file is root's alone.
+/// A macro, so each hint stays one `&'static str`.
+///
+/// ⚠️ On the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+macro_rules! files_follow_the_screen {
+    () => {
+        "Remote shell still works. File transfer works as the person signed in at the \
+         screen: with nobody signed in there, this computer's files cannot be browsed or \
+         downloaded, and a file sent to it is kept where only root can read it."
+    };
+}
+
+/// [`files_follow_the_screen!`], for a sentence composed at run time
+/// (`apps::Unavailable::reason`).
+pub(crate) const FILES_FOLLOW_THE_SCREEN: &str = files_follow_the_screen!();
+
+/// The `no_display` sentence off macOS, which only Linux reaches. #3711 —
+/// with no display there may well be nobody at the screen, so where file
+/// transfer works only as the person signed in there, the hint says that.
+fn no_display_hint(follows_the_screen: bool) -> &'static str {
+    if follows_the_screen {
+        concat!(
+            "This host has no display to capture (headless, or no desktop session). ",
+            files_follow_the_screen!()
+        )
+    } else {
+        "This host has no display to capture (headless, or no desktop session). \
+         Remote shell and file transfer still work."
     }
 }
 
@@ -799,12 +857,33 @@ fn x11_hint(root: bool) -> &'static str {
         root,
         NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
         NO_LOCK_REPORT.load(std::sync::atomic::Ordering::Relaxed),
+        crate::files::follows_the_screen(),
     )
 }
 
 /// [`x11_hint`], with the last system plan's refusals passed in: "no
-/// surface", and (FR-113 D4) "the desktop does not report its lock".
-fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static str {
+/// surface", and (FR-113 D4) "the desktop does not report its lock". #3711 —
+/// and whether file transfer works only as the person signed in at the
+/// screen (`files::follows_the_screen`), which the login screen has nobody
+/// for. The first two find a person's desktop on screen, so it still works.
+fn x11_hint_with(
+    root: bool,
+    no_surface: bool,
+    no_lock_report: bool,
+    follows_the_screen: bool,
+) -> &'static str {
+    // The root sentence with nothing found, with either ending below.
+    macro_rules! not_captured {
+        () => {
+            "This computer is showing an X11 desktop that this system install does not capture \
+             by itself right now: nobody is signed in at the screen (the login screen is never \
+             captured by default), or automatic capture is switched off (wayland_auto), or a \
+             capture key is set. On the host an administrator can run sudo roomler config ls, \
+             clear wayland_auto and any capture key it shows as set (drm_capture, \
+             portal_capture, mutter_capture, window_capture) with sudo roomler config clear, \
+             then sudo roomler restart. "
+        };
+    }
     if root && no_lock_report {
         "This computer is showing an X11 desktop whose screen locker does not report a lock to \
          the system (GNOME and KDE do; this desktop does not), so a system install does not \
@@ -820,14 +899,13 @@ fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static
          drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
          That capture reads the screen below the desktop, the lock screen included. Remote \
          shell and file transfer still work."
+    } else if root && follows_the_screen {
+        concat!(not_captured!(), files_follow_the_screen!())
     } else if root {
-        "This computer is showing an X11 desktop that this system install does not capture by \
-         itself right now: nobody is signed in at the screen (the login screen is never captured \
-         by default), or automatic capture is switched off (wayland_auto), or a capture key is \
-         set. On the host an administrator can run sudo roomler config ls, clear wayland_auto \
-         and any capture key it shows as set (drm_capture, portal_capture, mutter_capture, \
-         window_capture) with sudo roomler config clear, then sudo roomler restart. Remote shell \
-         and file transfer still work."
+        concat!(
+            not_captured!(),
+            "Remote shell and file transfer still work."
+        )
     } else {
         "This computer is showing an X11 desktop, and this agent was started without access to \
          it (no DISPLAY). Restart it from inside the desktop session, with roomler restart in a \
@@ -845,11 +923,29 @@ fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static
 /// ⚠️ A hint goes on the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 fn wayland_hint(root: bool) -> &'static str {
-    wayland_hint_with(root, NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed))
+    wayland_hint_with(
+        root,
+        NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
+        crate::files::follows_the_screen(),
+    )
 }
 
 /// [`wayland_hint`], with the last system plan's "no surface" passed in.
-fn wayland_hint_with(root: bool, no_surface: bool) -> &'static str {
+/// #3711 — and whether file transfer works only as the person signed in at
+/// the screen (`files::follows_the_screen`): a Wayland login screen reaches
+/// the keys-only sentence too, with nobody signed in. "No surface" finds a
+/// person's session on screen, so it still works there.
+fn wayland_hint_with(root: bool, no_surface: bool, follows_the_screen: bool) -> &'static str {
+    // The root keys-only sentence, with either ending below.
+    macro_rules! switched_off {
+        () => {
+            "This computer is showing a Wayland desktop, and capturing it is switched off on \
+             this device. On the host an administrator can run sudo roomler config set \
+             drm_capture true and sudo roomler config set uinput true, then sudo roomler \
+             restart. That capture reads the screen below the desktop, the lock screen \
+             included. "
+        };
+    }
     if root && no_surface {
         "This computer is showing a Wayland desktop, and it is not captured by itself because \
          nobody at the screen could be told they are being viewed: the session on screen has no \
@@ -858,12 +954,13 @@ fn wayland_hint_with(root: bool, no_surface: bool) -> &'static str {
          drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
          That capture reads the screen below the desktop, the lock screen included. Remote \
          shell and file transfer still work."
+    } else if root && follows_the_screen {
+        concat!(switched_off!(), files_follow_the_screen!())
     } else if root {
-        "This computer is showing a Wayland desktop, and capturing it is switched off on this \
-         device. On the host an administrator can run sudo roomler config set drm_capture true \
-         and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
-         the screen below the desktop, the lock screen included. Remote shell and file transfer \
-         still work."
+        concat!(
+            switched_off!(),
+            "Remote shell and file transfer still work."
+        )
     } else {
         "This computer is showing a Wayland desktop, and capturing it is switched off on this \
          device. On the host, run roomler config clear wayland_auto, and roomler config clear for \
@@ -1354,7 +1451,7 @@ pub(crate) struct ArmFacts {
     /// FR-93 P4 — `mutter_input` (default on): a mutter arm's input rides
     /// mutter's RemoteDesktop.
     pub mutter_input: bool,
-    /// The daemon captures its own Xvfb.
+    /// The daemon captures its own virtual desktop, whose X server answers.
     pub virtual_desktop: bool,
     /// The session a controller would see is an X11 one.
     pub x11_session: bool,
@@ -1406,6 +1503,42 @@ pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::R
         CaptureArm::Portal => f.portal_input.then_some(RouteKind::Portal),
         CaptureArm::Drm | CaptureArm::X11 => None,
     }
+}
+
+/// #3671 — the facts say a session on this device captures its virtual
+/// desktop: the arm [`planned_arm`] gives with the desktop counted as up is
+/// X11. It is asked as the desktop goes down, when [`arm_facts`] counts it as
+/// gone. One decision for the device, which misses one session: one whose
+/// explicit `drm_capture` or `portal_capture` arm failed at its open and fell
+/// through to the desktop's X11. That session is not told; it shows its last
+/// picture until the person reconnects (`docs/linux-capture.md` §2.2), and
+/// its shared pipeline is not retired. The supervisor marks it all the same,
+/// as every session open at the exit (#3918): it has no input of the new
+/// desktop, and its pipeline takes no joiner (`media_share::try_join`), so a
+/// later viewer of its profile runs a capture of its own, where the marks are
+/// kept and read (`input::has_no_picture`). The exact per-session rule is
+/// FR-135's pipeline record to carry (#3293).
+#[cfg(target_os = "linux")]
+pub(crate) fn plans_the_virtual_desktop(facts: ArmFacts) -> bool {
+    planned_arm(&ArmFacts {
+        virtual_desktop: true,
+        ..facts
+    }) == Some(CaptureArm::X11)
+}
+
+/// #3671 — a session open on this device now captures the daemon's virtual
+/// desktop ([`plans_the_virtual_desktop`] on this device's facts). Read by
+/// the desktop's supervisor, on its own thread, when the desktop goes down
+/// and once it is back: with the desktop requested, both automatic plans
+/// answer at once (`wayland_plan`, `system_plan`), so this asks no bus.
+#[cfg(target_os = "linux")]
+pub(crate) fn sessions_capture_the_virtual_desktop() -> bool {
+    if !crate::virtual_desktop::requested() {
+        return false;
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    plans_the_virtual_desktop(arm_facts(None, uid == 0, uid, false))
 }
 
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
@@ -1462,7 +1595,7 @@ pub(crate) fn arm_facts(
         portal_input: tunnel_core::env::flag("PORTAL_INPUT", false),
         auto_portal_input: auto_portal_input(),
         mutter_input,
-        virtual_desktop,
+        virtual_desktop: virtual_desktop && crate::virtual_desktop::down().is_none(), // #3643
         x11_session,
         x11_built: cfg!(feature = "scrap-capture"),
     }
@@ -2442,6 +2575,12 @@ pub struct CaptureUnavailable {
     pub code: CaptureUnavailableCode,
     /// The backend's own words, capped. A quote, never a paraphrase.
     pub detail: String,
+    /// #3918 — the reason is this daemon's own virtual desktop: it is down,
+    /// or its X server is gone. A fact for the daemon, never on the wire: the
+    /// notice's payload carries the code, the detail and the hint only. A
+    /// session told this is marked: no input of the desktop while its input
+    /// would reach the desktop's X server (`input::told_no_picture`).
+    virtual_desktop_down: bool,
 }
 
 impl CaptureUnavailable {
@@ -2456,7 +2595,29 @@ impl CaptureUnavailable {
         } else {
             detail
         };
-        Self { code, detail }
+        Self {
+            code,
+            detail,
+            virtual_desktop_down: false,
+        }
+    }
+
+    /// #3643, #3918 — the reason a session has no picture of this daemon's
+    /// own virtual desktop while it is down, or after its X server went:
+    /// `backend_error` with `detail` (the down sentence). Made where the
+    /// sessions are told: the supervisor's tell, and a session's open refused
+    /// while the desktop is down.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn virtual_desktop_down(detail: impl Into<String>) -> Self {
+        Self {
+            virtual_desktop_down: true,
+            ..Self::new(CaptureUnavailableCode::BackendError, detail)
+        }
+    }
+
+    /// #3918 — whether this is [`Self::virtual_desktop_down`]'s reason.
+    pub(crate) fn is_the_virtual_desktop_down(&self) -> bool {
+        self.virtual_desktop_down
     }
 }
 
@@ -2511,6 +2672,10 @@ impl ScreenCapture for NoopCapture {
     }
     fn backend(&self) -> &'static str {
         "none"
+    }
+    // Nothing is captured, so there is no display to read.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
     }
 }
 
@@ -3331,12 +3496,22 @@ fn open_with(
         }
     }
 
+    // #3643 — the daemon's own virtual desktop is down. XShm would only say
+    // "connection refused", which reads like a network fault; say what the
+    // agent knows, and that it is already starting the desktop again.
+    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+    if let Some(detail) = crate::virtual_desktop::down_detail() {
+        tracing::warn!(%detail, "capture: the virtual desktop is down — nothing to capture until it is back");
+        let reason = CaptureUnavailable::virtual_desktop_down(detail);
+        return Box::new(NoopCapture::unavailable(reason));
+    }
+
     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
     let wayland_arm_failure = wayland_arm_error.as_deref();
     #[cfg(all(not(target_os = "linux"), feature = "scrap-capture"))]
     let wayland_arm_failure: Option<&str> = None;
     #[cfg(feature = "scrap-capture")]
-    let reason = match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
+    let reason = match scrap_open(_target_fps, _downscale) {
         Ok(c) => {
             tracing::info!(
                 width = c.width(),
@@ -3701,9 +3876,9 @@ mod frame_tests {
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
     use super::{
-        MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code, wayland_hint,
-        wayland_not_enabled_detail, x11_hint, x11_hint_with, x11_not_enabled_detail,
-        xwayland_verdict,
+        FILES_FOLLOW_THE_SCREEN, MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code,
+        no_display_hint, wayland_hint, wayland_hint_with, wayland_not_enabled_detail, x11_hint,
+        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
     };
 
     fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
@@ -3891,20 +4066,20 @@ mod wayland_reason_tests {
     /// `no_display`.
     #[test]
     fn the_x11_hint_names_what_this_install_can_use() {
-        let no_surface = x11_hint_with(true, true, false);
+        let no_surface = x11_hint_with(true, true, false, true);
         assert!(no_surface.contains("X11 desktop"), "{no_surface}");
         assert!(no_surface.contains("being viewed"), "{no_surface}");
         assert!(no_surface.contains("desktop companion"), "{no_surface}");
-        let off = x11_hint_with(true, false, false);
+        let off = x11_hint_with(true, false, false, true);
         assert!(off.contains("sudo roomler config clear"), "{off}");
         assert!(off.contains("login screen"), "{off}");
         assert!(!off.contains("x11_auto_system"), "{off}");
-        let user = x11_hint_with(false, false, false);
+        let user = x11_hint_with(false, false, false, true);
         assert!(user.contains("DISPLAY"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
         for (no_surface, no_lock_report) in [(true, false), (false, true), (true, true)] {
             assert_eq!(
-                x11_hint_with(false, no_surface, no_lock_report),
+                x11_hint_with(false, no_surface, no_lock_report, true),
                 user,
                 "the system half's refusals are not a per-user daemon's"
             );
@@ -3916,13 +4091,13 @@ mod wayland_reason_tests {
     /// operator's choice.
     #[test]
     fn an_unreported_lock_is_named_with_the_keys_that_read_it_anyway() {
-        let hint = x11_hint_with(true, false, true);
+        let hint = x11_hint_with(true, false, true, true);
         assert!(hint.contains("does not report a lock"), "{hint}");
         assert!(hint.contains("GNOME and KDE do"), "{hint}");
         assert!(hint.contains("drm_capture true"), "{hint}");
         assert!(hint.contains("the lock screen included"), "{hint}");
         assert_eq!(
-            x11_hint_with(true, true, true),
+            x11_hint_with(true, true, true, true),
             hint,
             "it outranks no surface"
         );
@@ -3948,13 +4123,18 @@ mod wayland_reason_tests {
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
         hints.push(x11_hint(false));
-        for root in [true, false] {
-            for no_surface in [true, false] {
-                for no_lock_report in [true, false] {
-                    hints.push(x11_hint_with(root, no_surface, no_lock_report));
+        for follows in [true, false] {
+            hints.push(no_display_hint(follows));
+            for root in [true, false] {
+                for no_surface in [true, false] {
+                    hints.push(wayland_hint_with(root, no_surface, follows));
+                    for no_lock_report in [true, false] {
+                        hints.push(x11_hint_with(root, no_surface, no_lock_report, follows));
+                    }
                 }
             }
         }
+        hints.push(FILES_FOLLOW_THE_SCREEN);
         for hint in hints {
             assert!(
                 !hint
@@ -3962,6 +4142,75 @@ mod wayland_reason_tests {
                     .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20),
                 "a hint would break the payload: {hint}"
             );
+        }
+    }
+
+    /// #3711 — a hint says what file transfer does here. Where it works only
+    /// as the person signed in at the screen (a Linux system install), the
+    /// sentences that may find nobody there (no display, the X11 and Wayland
+    /// ones with nothing found, the login screen among them) say so. Where a
+    /// person's desktop is on screen, or the install is a per-user one, or
+    /// the switch gives the daemon's identity back, it still works, in the
+    /// words the hints have always used.
+    #[test]
+    fn a_hint_says_what_file_transfer_does_here() {
+        const STILL: &str = "Remote shell and file transfer still work.";
+        assert!(
+            FILES_FOLLOW_THE_SCREEN.starts_with("Remote shell still works.")
+                && FILES_FOLLOW_THE_SCREEN.contains("cannot be browsed or downloaded")
+                && FILES_FOLLOW_THE_SCREEN.contains("only root can read"),
+            "{FILES_FOLLOW_THE_SCREEN}"
+        );
+        // May find nobody at the screen: the ending follows the install.
+        let maybe_nobody = |follows: bool| {
+            [
+                no_display_hint(follows),
+                x11_hint_with(true, false, false, follows),
+                wayland_hint_with(true, false, follows),
+            ]
+        };
+        for hint in maybe_nobody(true) {
+            assert!(hint.ends_with(FILES_FOLLOW_THE_SCREEN), "{hint}");
+            assert!(!hint.contains("file transfer still work"), "{hint}");
+        }
+        for hint in maybe_nobody(false) {
+            assert!(hint.ends_with(STILL), "{hint}");
+        }
+        // The switch off: each sentence exactly as it was.
+        assert_eq!(
+            no_display_hint(false),
+            "This host has no display to capture (headless, or no desktop session). \
+             Remote shell and file transfer still work."
+        );
+        assert_eq!(
+            x11_hint_with(true, false, false, false),
+            "This computer is showing an X11 desktop that this system install does not capture by \
+             itself right now: nobody is signed in at the screen (the login screen is never captured \
+             by default), or automatic capture is switched off (wayland_auto), or a capture key is \
+             set. On the host an administrator can run sudo roomler config ls, clear wayland_auto \
+             and any capture key it shows as set (drm_capture, portal_capture, mutter_capture, \
+             window_capture) with sudo roomler config clear, then sudo roomler restart. Remote shell \
+             and file transfer still work."
+        );
+        assert_eq!(
+            wayland_hint_with(true, false, false),
+            "This computer is showing a Wayland desktop, and capturing it is switched off on this \
+             device. On the host an administrator can run sudo roomler config set drm_capture true \
+             and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
+             the screen below the desktop, the lock screen included. Remote shell and file transfer \
+             still work."
+        );
+        // A person's desktop on screen, or a per-user daemon: still works.
+        for follows in [true, false] {
+            for hint in [
+                x11_hint_with(true, true, false, follows),
+                x11_hint_with(true, false, true, follows),
+                wayland_hint_with(true, true, follows),
+                x11_hint_with(false, false, false, follows),
+                wayland_hint_with(false, false, follows),
+            ] {
+                assert!(hint.ends_with(STILL), "{hint}");
+            }
         }
     }
 
@@ -4162,17 +4411,17 @@ mod system_auto_tests {
             system_plan(true, true, BOTH, false, false, alice(), told(false)),
             SystemPlan::NoSurface
         );
-        let hint = wayland_hint_with(true, true);
+        let hint = wayland_hint_with(true, true, true);
         assert!(hint.contains("being viewed"), "{hint}");
         assert!(hint.contains("desktop companion"), "{hint}");
         assert!(hint.contains("drm_capture"), "{hint}");
         assert!(
-            !wayland_hint_with(true, false).contains("being viewed"),
+            !wayland_hint_with(true, false, true).contains("being viewed"),
             "the keys-only hint stays as it was"
         );
         assert_eq!(
-            wayland_hint_with(false, true),
-            wayland_hint_with(false, false),
+            wayland_hint_with(false, true, true),
+            wayland_hint_with(false, false, true),
             "a per-user install's hint is not the system half's"
         );
     }
@@ -4810,5 +5059,105 @@ mod xwayland_probe_tests {
         // Scrap then reports its own connection error, which is the truth.
         assert_eq!(x_server_query(":4242", |_, _| true), None);
         assert!(!x_server_is_xwayland(":4242"));
+    }
+}
+
+/// #3260 — the scrap arm, with macOS's session question asked BEFORE anything
+/// waits on a window server.
+///
+/// A process outside every login session (on macOS the root LaunchDaemon, in
+/// session 0) has no WindowServer and never will, so it can never capture: the
+/// question [`classify_capture_failure`] asks to name `no_display`. It used to
+/// be asked only after the open had failed, and there the open took 30 s to
+/// fail, waiting on a window server that does not come. Measured on a
+/// supervised lab Mac on 0.4.200, in FR-43's black-row layout: `no_display`
+/// 30.0 s after each pump started, while the viewer re-creates a session that
+/// shows no frame at 10 s. So every notice went to a session already gone,
+/// three in a row, and the page blamed the network. Asked first, the refusal
+/// costs no wait at all and says the same `no_display`, with what is true of
+/// this process.
+#[cfg(feature = "scrap-capture")]
+fn scrap_open(target_fps: u32, downscale: DownscalePolicy) -> Result<scrap_backend::ScrapCapture> {
+    // Only macOS has a process that can never capture; elsewhere every
+    // process opens as before.
+    #[cfg(target_os = "macos")]
+    let in_session = crate::tcc::has_gui_session;
+    #[cfg(not(target_os = "macos"))]
+    let in_session = || true;
+    open_in_session(in_session, || {
+        scrap_backend::ScrapCapture::primary(target_fps, downscale)
+    })
+}
+
+/// #3260 — open only inside a login session: `open` never runs where
+/// `in_session` answers no, so nothing waits on a window server that is not
+/// there. Generic over the open, so a test on any platform pins the order.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+fn open_in_session<T>(
+    in_session: impl FnOnce() -> bool,
+    open: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let asked = std::time::Instant::now();
+    if !in_session() {
+        tracing::warn!(
+            checked_in_us = asked.elapsed().as_micros() as u64,
+            "capture: this process is outside every login session — nothing to open (#3260)"
+        );
+        anyhow::bail!(NO_LOGIN_SESSION);
+    }
+    open()
+}
+
+/// What a session-0 refusal tells the controller, under `no_display`.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+const NO_LOGIN_SESSION: &str = "this process runs outside every login session (the system service, \
+     a launchd daemon), where there is no window server to capture: the screen is captured in the \
+     person's own login session";
+
+#[cfg(test)]
+mod login_session_tests {
+    //! #3260 — the order `open_in_session` exists for, pinned on every platform.
+    use super::*;
+    use std::cell::Cell;
+
+    /// The black row's fix: no login session, so the open never runs, and the
+    /// refusal says why at once.
+    #[test]
+    fn no_login_session_refuses_before_the_open_runs() {
+        let opened = Cell::new(false);
+        let r = open_in_session(
+            || false,
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            !opened.get(),
+            "the open ran in a process with no login session: on a Mac it waits 30 s on a window server that never comes"
+        );
+        let e = r.expect_err("no login session refuses");
+        assert_eq!(format!("{e:#}"), NO_LOGIN_SESSION);
+    }
+
+    /// In a login session nothing changes: the open runs once, and its own
+    /// answer is the answer, a failure included.
+    #[test]
+    fn a_login_session_opens_as_before() {
+        let opened = Cell::new(0);
+        let r = open_in_session(
+            || true,
+            || {
+                opened.set(opened.get() + 1);
+                Ok(7)
+            },
+        );
+        assert_eq!((opened.get(), r.unwrap()), (1, 7));
+        let e = open_in_session(
+            || true,
+            || -> Result<()> { anyhow::bail!("creating scrap::Capturer: other error") },
+        )
+        .expect_err("the open's own failure");
+        assert_eq!(format!("{e:#}"), "creating scrap::Capturer: other error");
     }
 }

@@ -183,7 +183,93 @@ pub fn resolve_install_from(
     Ok(InstallInfo::new(method, scope))
 }
 
+/// What one enrollment produced: the server's answer, and the machine values
+/// the enrollment was made with. It is everything [`enroll`] writes into a
+/// fresh config that is not a default, and [`Issued::into_config`] is that
+/// config.
+///
+/// The setup wizard enrolls a background-service install as the person at the
+/// screen and hands this to its administrator step, which writes the machine
+/// config from it: the step builds the config itself, so the wizard chooses
+/// no key beyond these.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Issued {
+    /// The server, as [`enroll`] posted to it (TLS unless loopback).
+    pub server_url: String,
+    pub agent_id: String,
+    pub tenant_id: String,
+    /// The long-lived agent token.
+    pub agent_token: String,
+    pub machine_id: String,
+    pub machine_name: String,
+    /// FR-51 — what the server minted.
+    pub ephemeral: bool,
+}
+
+/// Never prints the agent token.
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("server_url", &self.server_url)
+            .field("agent_id", &self.agent_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("agent_token", &"<redacted>")
+            .field("machine_id", &self.machine_id)
+            .field("machine_name", &self.machine_name)
+            .field("ephemeral", &self.ephemeral)
+            .finish()
+    }
+}
+
 pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
+    enroll_issued(inputs).await.map(Issued::into_config)
+}
+
+/// [`enroll`] on a client the caller built.
+pub async fn enroll_with(
+    client: &reqwest::Client,
+    inputs: EnrollInputs<'_>,
+) -> Result<AgentConfig> {
+    enroll_issued_with(client, inputs)
+        .await
+        .map(Issued::into_config)
+}
+
+/// [`enroll`] up to the server's answer, before it becomes a config.
+pub async fn enroll_issued(inputs: EnrollInputs<'_>) -> Result<Issued> {
+    enroll_issued_with(&reqwest::Client::new(), inputs).await
+}
+
+/// The server answered the enrollment, and refused it. A type (#3432), so the
+/// setup wizard can tell an answer from a failure to get one; it reads as the
+/// `bail!` it replaces did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollRejected {
+    pub status: reqwest::StatusCode,
+    /// What the server said.
+    pub body: String,
+}
+
+impl std::fmt::Display for EnrollRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enrollment rejected (status {}): {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for EnrollRejected {}
+
+/// [`enroll_issued`] on a client the caller built: the setup wizard's, whose
+/// resolver fails with a type of its own (#3432). The daemon's own enroll is
+/// [`enroll_issued`], on `reqwest::Client::new()` as before.
+pub async fn enroll_issued_with(
+    client: &reqwest::Client,
+    inputs: EnrollInputs<'_>,
+) -> Result<Issued> {
     // Promote http:// to https://. The production ingress 301-redirects
     // plaintext to TLS; reqwest then downgrades the POST to a GET (RFC
     // 7231 historical behavior for 301/302) so the second hop hits a
@@ -203,7 +289,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         "posting enrollment"
     );
 
-    let resp = reqwest::Client::new()
+    let resp = client
         .post(&url)
         .json(&EnrollRequest {
             enrollment_token: inputs.enrollment_token,
@@ -220,22 +306,52 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("enrollment rejected (status {status}): {body}");
+        return Err(EnrollRejected { status, body }.into());
     }
 
     let body: EnrollResponse = resp.json().await.context("parsing enroll response")?;
 
-    Ok(AgentConfig {
+    Ok(Issued {
         server_url,
-        ws_url: None,
-        agent_token: body.agent_token,
         agent_id: body.agent_id,
         tenant_id: body.tenant_id,
+        agent_token: body.agent_token,
         machine_id: inputs.machine_id.to_string(),
         machine_name: inputs.machine_name.to_string(),
         // FR-51 — the server's answer, not the caller's flag: the credential
         // decides what was minted, and the config must not disagree.
         ephemeral: body.ephemeral,
+    })
+}
+
+impl Issued {
+    /// The fresh config of this enrollment: these values, and every other key
+    /// at what a new enrollment starts with.
+    pub fn into_config(self) -> AgentConfig {
+        fresh_config(self)
+    }
+}
+
+/// [`Issued::into_config`]: the one literal of a freshly enrolled config.
+fn fresh_config(issued: Issued) -> AgentConfig {
+    let Issued {
+        server_url,
+        agent_id,
+        agent_token,
+        tenant_id,
+        machine_id,
+        machine_name,
+        ephemeral,
+    } = issued;
+    AgentConfig {
+        server_url,
+        ws_url: None,
+        agent_token,
+        agent_id,
+        tenant_id,
+        machine_id,
+        machine_name,
+        ephemeral,
         encoder_preference: crate::config::EncoderPreferenceChoice::default(),
         update_check_interval_h: None,
         localapi_pipe_pool: None,
@@ -249,6 +365,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-43 P1 — macOS root-daemon supervision of the GUI worker; off at
         // enrollment like every other posture switch.
         macos_supervise_gui_worker: false,
+        // FR-43 P3 — the same: one device row is a posture switch.
+        macos_one_row: false,
         power_policy: String::new(),
         // FR-84 D6 — the companion opens after install and starts at login by
         // default; a RE-enrollment keeps whatever the device had (the
@@ -281,34 +399,6 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        // FR-90 — a freshly enrolled device runs no agent sessions: every
-        // Hive gate starts closed, and only whoever holds the box opens them.
-        hive_enabled: false,
-        hive_accounts: Default::default(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        // FR-90 P4-3b-1: nothing scanned until the owner lists a root.
-        knowhow_scan_roots: Vec::new(),
-        // FR-90 P4-3b-3: no listener reported until the owner says so.
-        knowhow_scan_listeners: false,
-        // FR-90 P4-5-1b: no probe reaches anywhere until the owner lists it.
-        knowhow_probe_reach: Vec::new(),
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
@@ -331,6 +421,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
+        rc_sessions_survive_reattach: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -340,6 +432,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -406,6 +499,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         measured_ceiling: None,
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
+        rc_carrier_rank: None,
+        path_model: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -418,6 +513,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         seed_contradiction: None,
         viewer_rate_clamp: None,
         queue_drain: None,
+        measured_evidence: None,
         slow_link_profile: None,
         slow_link_profile_bps: None,
         bg_rebuild: None,
@@ -446,7 +542,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         zero_copy: None,
         color_description: None,
         zero_copy_deny: None,
+        rc_media_legacy: None,
+        rc_media_canary: None,
         nvenc_split: None,
+        qsv_rate_mode: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
@@ -480,6 +579,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         // Stamp the current schema version directly on enrollment so
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
@@ -506,7 +606,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         advertise_local_subnets: true,
         tunnel_routes: Vec::new(),
         orgs: Vec::new(),
-    })
+    }
 }
 
 /// FR-51 P3 — tell the server this EPHEMERAL device is leaving, so a clean
@@ -582,6 +682,16 @@ pub fn apply_enrollment(
     let Some(existing) = existing else {
         return Ok((fresh, EnrollOutcome::FreshPrimary));
     };
+
+    // FR-43 P3 — a person's file on a one-row Mac holds their settings and no
+    // enrollment. One landing on it is the primary, with those settings kept:
+    // appended beside blank identity fields it would be a secondary of nothing.
+    if !existing.has_primary_enrollment() {
+        return Ok((
+            preserve_operator_config(fresh, existing),
+            EnrollOutcome::FreshPrimary,
+        ));
+    }
 
     if force_replace {
         let mut merged = preserve_operator_config(fresh, existing);
@@ -915,6 +1025,61 @@ pub(crate) fn detect_os() -> OsKind {
 mod tests {
     use super::*;
 
+    fn issued() -> Issued {
+        Issued {
+            server_url: "https://roomler.ai".into(),
+            agent_id: "6af285450d1b34b5d32ea7c1".into(),
+            tenant_id: "6a975e17971e2d55ddcdedb2".into(),
+            agent_token: "header.payload.signature".into(),
+            machine_id: "mid".into(),
+            machine_name: "Front desk".into(),
+            ephemeral: false,
+        }
+    }
+
+    /// The config an enrollment hands over is the one `enroll` writes: these
+    /// values, and every posture switch where a new enrollment starts it.
+    #[test]
+    fn an_issued_enrollment_becomes_a_fresh_config() {
+        let cfg = issued().into_config();
+        assert_eq!(cfg.server_url, "https://roomler.ai");
+        assert_eq!(cfg.agent_id, "6af285450d1b34b5d32ea7c1");
+        assert_eq!(cfg.tenant_id, "6a975e17971e2d55ddcdedb2");
+        assert_eq!(cfg.agent_token, "header.payload.signature");
+        assert_eq!(cfg.machine_id, "mid");
+        assert_eq!(cfg.machine_name, "Front desk");
+        assert!(!cfg.ephemeral);
+        assert!(cfg.ws_url.is_none());
+        assert!(!cfg.exec_enabled && !cfg.ssh_enabled && !cfg.remote_config_enabled);
+        assert!(!cfg.overlay_enabled && !cfg.allow_plaintext_server);
+        assert!(cfg.orgs.is_empty() && cfg.tunnel_routes.is_empty());
+        assert_eq!(
+            cfg.config_schema_version.as_deref(),
+            Some(crate::config::CURRENT_SCHEMA_VERSION)
+        );
+        let ephemeral = Issued {
+            ephemeral: true,
+            ..issued()
+        };
+        assert!(ephemeral.into_config().ephemeral);
+    }
+
+    /// What is handed over is logged without its token.
+    #[test]
+    fn an_issued_enrollment_never_prints_its_token() {
+        let shown = format!("{:?}", issued());
+        assert!(!shown.contains("header.payload.signature"), "{shown}");
+        assert!(shown.contains("6af285450d1b34b5d32ea7c1"), "{shown}");
+        let wire = serde_json::to_string(&issued()).unwrap();
+        let back: Issued = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, issued());
+        let extra = wire.replacen('{', r#"{"exec_enabled":true,"#, 1);
+        assert!(
+            serde_json::from_str::<Issued>(&extra).is_err(),
+            "no other key rides along"
+        );
+    }
+
     #[test]
     fn http_is_promoted_to_https() {
         assert_eq!(
@@ -1234,6 +1399,23 @@ mod tests {
         assert_eq!(outcome, EnrollOutcome::FreshPrimary);
         assert_eq!(cfg.agent_token, fresh.agent_token);
         assert!(cfg.orgs.is_empty());
+    }
+
+    /// FR-43 P3 — an enrollment landing on a person's blank file is the primary,
+    /// with their settings kept. Appended beside blank identity fields, it would
+    /// be a secondary of nothing.
+    #[test]
+    fn apply_enrollment_on_a_blank_file_is_the_primary_and_keeps_settings() {
+        let mut blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        blank.keep_busy_enabled = true;
+        let fresh = fresh_for("https://a.invalid", "t1", "tok1");
+        let (cfg, outcome) = apply_enrollment(Some(blank), fresh, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::FreshPrimary);
+        assert_eq!(cfg.server_url, "https://a.invalid");
+        assert_eq!(cfg.tenant_id, "t1");
+        assert_eq!(cfg.agent_token, "tok1");
+        assert!(cfg.orgs.is_empty());
+        assert!(cfg.keep_busy_enabled);
     }
 
     #[test]

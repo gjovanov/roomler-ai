@@ -14,7 +14,7 @@ half: a Windows peer probe that starts no process.
 
 | | |
 |---|---|
-| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4408`) |
+| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4591`) |
 | Kill switch | `ROOMLERD_RESOURCE_WATCH=0` |
 | The bar | 2,000 handles on Windows, 200 descriptors on Linux and macOS (`resource_watch.rs:38`, `:40`) |
 | A lower bar, for a field test | `ROOMLERD_RESOURCE_WATCH_MIN_RISE=<n>` |
@@ -93,19 +93,24 @@ have as few as 1,024 descriptors.
 ## 3. Reading it across the fleet
 
 ```bash
-roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-  < scripts/resource-watch-read.cjs | grep -o 'OUT .*'
-kubectl -n roomler-ai get pod mongodb-0     # RESTARTS must not have moved
+scripts/prod-mongo-read.sh --mars --yes scripts/resource-watch-read.cjs | grep -o 'OUT .*'
 ```
 
 It prints one line per reading: time, agent id, version, level, `handles`, and on a
 warning `rise` and `per_second`.
 
+The runner prints, on stderr, `mongodb-0`'s restart count and its container's
+`memory.current` and `memory.events` before and after, and exits 3 if the
+database restarted or was OOM-killed.
+
 ⚠️ **This is the one read of `agent_logs` to use, and the reason is an outage.**
-`mongosh` inside the database container counts against that container's memory
-limit, and an unbounded read there OOM-killed production Mongo on 2026-10-26. The
-script is bounded three ways: the text index on `lines.msg` picks the batches,
-`$limit` caps them, and only the matching lines leave the server.
+A `mongosh` started inside the database container counts against that
+container's memory limit, and an unbounded read there OOM-killed production
+Mongo on 2026-10-26. So the client runs outside it, in a container of its own
+([production-mongo-reads.md](production-mongo-reads.md)). The server still runs
+the query inside that limit, so the script is bounded three ways: the text index
+on `lines.msg` picks the batches, `$limit` caps them, and only the matching lines
+leave the server.
 
 The per-agent route (`GET /api/tenant/{tid}/agent/{aid}/logs?limit=N`) is safe but
 cannot answer this: it returns the newest 500 batches at most, and a chatty device
@@ -147,7 +152,7 @@ several reads, not one.
 
 ## 6. Field numbers
 
-Measured 2026-11-01 on 0.4.194.
+Measured 2026-11-01 on 0.4.194, and over the seven days to 2026-11-08 on 0.4.194 to 0.4.206.
 
 | | |
 |---|---|
@@ -159,6 +164,9 @@ Measured 2026-11-01 on 0.4.194.
 | Linux | 36 to 39 descriptors |
 | macOS | 20 to 33 descriptors |
 | The fleet read against 406,843 batches | one line per device, no restart |
+| Seven days of the fleet, 0.4.194 to 0.4.206 | 2,914 hourly lines; the one `WARN` was the lab climb above, and no other device warned |
+| The 9 Windows workers online all week | 396 to 1,776 handles |
+| The 7-day read against 371,501 batches | 2,914 matching batches, counted per day first: under the script's cap of 5,000, so nothing was cut; no restart |
 | `PING.EXE` started by the daemon, Windows | 0 in 610 s, with a positive control; 0.4.193 started 249 in 300 s |
 | The RTT column against a hand `ping`, median of 16 pairs | within 1 ms on a server and three LAN peers |
 | The same on a Wi-Fi peer, 40 pairs | minimum 4 and 4 ms, quartiles 5 to 54 and 6 to 63 ms: the same distribution, no offset |

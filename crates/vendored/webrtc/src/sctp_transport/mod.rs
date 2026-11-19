@@ -430,6 +430,23 @@ impl RTCSctpTransport {
         sctp_association.clone()
     }
 
+    /// roomler patch (FR-148): the association's acknowledgement clock, once
+    /// there is an association. Never waits: `stop()` holds the slot across
+    /// the association's close, and a caller on a media loop must not wait on
+    /// that, so a held slot answers `None` and the caller asks again later.
+    pub fn delivery_clock(&self) -> Option<sctp::association::delivery::DeliveryClock> {
+        let sctp_association = self.sctp_association.try_lock().ok()?;
+        sctp_association.as_ref().map(|a| a.delivery_clock())
+    }
+
+    /// roomler patch (FR-148 O10): the association's congestion gauges, once
+    /// there is an association. Never waits, for `delivery_clock`'s reason: a
+    /// held slot answers `None`.
+    pub fn gauges(&self) -> Option<sctp::association::gauges::GaugeReader> {
+        let sctp_association = self.sctp_association.try_lock().ok()?;
+        sctp_association.as_ref().map(|a| a.gauges())
+    }
+
     pub(crate) fn data_channels_accepted(&self) -> u32 {
         self.data_channels_accepted.load(Ordering::SeqCst)
     }

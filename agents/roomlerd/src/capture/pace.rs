@@ -140,6 +140,10 @@ mod tests {
         fn backend(&self) -> &'static str {
             "spinner"
         }
+        // A test double: no display.
+        fn refresh_hz(&self) -> Option<u16> {
+            None
+        }
     }
 
     /// The RTP pump's `Ok(None)` arm against a backend that spins: however fast

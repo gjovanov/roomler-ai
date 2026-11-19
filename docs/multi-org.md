@@ -257,30 +257,30 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:436-439`](../crates/modules/network/src/overlay.rs#L436-L439)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
 
-Only `store_unavailable` is retryable ([`signaling.rs:503`](../crates/remote_control/src/signaling.rs#L503)).
+Only `store_unavailable` is retryable ([`signaling.rs:491`](../crates/remote_control/src/signaling.rs#L491)).
 An unknown reason takes the conservative arm. The device does not retry on its own in
 either case: its signalling loop reconnects on its own ladder, and a retry at the
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:4374-4380`](../crates/remote_control/src/signaling.rs#L4374-L4380)) goes only to a
+  ([`signaling.rs:3436-3442`](../crates/remote_control/src/signaling.rs#L3436-L3442)) goes only to a
   node whose join set `supports_join_refusal`
-  ([`signaling.rs:2524`](../crates/remote_control/src/signaling.rs#L2524)). An older node keeps the
+  ([`signaling.rs:1681`](../crates/remote_control/src/signaling.rs#L1681)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
+  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
   keeps the refusal in a process-global slot
-  ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
+  ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2596-2618`](../agents/roomler-cli/src/localclient.rs#L2596-L2618)):
+  ([`localclient.rs:2703-2725`](../agents/roomler-cli/src/localclient.rs#L2703-L2725)):
 
   ```
     overlay ip  —
@@ -293,7 +293,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:284`](../crates/localapi/src/lib.rs#L284)), and then nothing is printed, never a
+  ([`lib.rs:289`](../crates/localapi/src/lib.rs#L289)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 
@@ -536,8 +536,12 @@ nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
   explicit org removal owns real adapter deletion — a loop end only drops
   the process's device handle, so an EDR-watched host never sees device
   churn on reconnects;
-- ICE never gathers on `roomler-*` (the peer.rs interface deny-list), and
-  the LAN gather's `roomler` prefix filter already covers them.
+- remote desktop's ICE stays off every `roomler-*` adapter unless the device
+  allows the overlay. The address filter does that, on every OS: the peer.rs
+  interface deny-list is a no-op on Windows, where webrtc-util names every
+  adapter `""` ([remote-control.md §4.4](remote-control.md#44-whether-a-session-may-ride-the-overlay-1882),
+  with its one gap, #3359). The LAN gather's `roomler` prefix filter already
+  covers them.
 
 The kill switch it shipped with (`overlay_tun_per_org = false`, back to the
 shared-TUN mux of §4.4 and §4b) went with the mux in W7c.
@@ -699,6 +703,12 @@ dropping of delta frames would break reference chains, because the 13-byte DC
 header carries no sequence number. A joiner buffers until the next IDR; a
 viewer that sustainedly needs far less than the shared rate spills to its own
 encoder, bounded at 2 pipelines total. The viewer badge shows `· shared ×N`.
+An owner whose capture has no picture tells every follower why, and every later
+joiner as it joins (FR-80's `rc:media-unavailable`, #3260,
+[`remote-control.md` §5.1a](remote-control.md#51a-when-capture-cannot-open-the-session-says-why-fr-80)).
+An owner whose capture waits on its host tells them that too, a later joiner
+with the time the wait has left, until its next frame (FR-93's
+`rc:media-waiting`, #3423).
 
 ## 7. P6 — InputArbiter (shipped rc.305/306, #329 + #334)
 
@@ -836,19 +846,18 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 
 ## 12. Open items
 
-- **The refusal path runs against a real kernel; the two-control-plane
-  field run is now unblocked but not yet done.** `TunMux`'s bookkeeping was
-  always unit-tested against a fake device; the half that touches the OS —
-  a REFUSED registration leaving no address behind, a disjoint block really
-  getting one, a released org really losing it — now runs on every CI push
-  (`tun_kernel_tests`, root + `ROOMLER_TUN_KERNEL_TEST=1`, skipped
-  everywhere else). It earned its keep on its first run by catching
-  `deregister` handing back the block BASE instead of the org's address.
-  What is still untested is the same path driven by two real control
-  planes. That needed a third organization on the legacy `/10` and a way to
-  retire it afterwards; **archiving now exists** (§13), so the remaining
-  work is scheduling it on a disposable host — deliberately not a prod
-  cluster node, since the test is an intentional address collision.
+- **The shared-TUN refusal path — RETIRED with the mux.** `TunMux`'s
+  kernel half (a REFUSED registration leaving no address behind, a disjoint
+  block really getting one, a released org really losing it) ran on every
+  CI push as `tun_kernel_tests`, and caught `deregister` handing back the
+  block BASE on its first run. #516 removed the shared-TUN mux and that
+  module with it; each organization now gets its own adapter. The CI step
+  that ran it ran no test from then until `tun_kernel_tests` came back with
+  one about the overlay TUN's descriptor
+  (`agents/roomlerd/src/overlay.rs:1394`, root +
+  `ROOMLER_TUN_KERNEL_TEST=1`, a named skip everywhere else). The step,
+  "Overlay TUN against real kernel networking", now fails unless the test
+  ran.
 - **macOS meshes, including multi-org — CLOSED.** `add_peer_route`,
   `add_cidr_route`, `del_*`, `purge_one` and the derived-v6 assign were
   `#[cfg(not(any(linux, windows)))]` no-ops and `add_address_sync` refused
@@ -893,7 +902,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2232-2234`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2142-2144`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
@@ -928,10 +937,15 @@ everything it knows.**
 
 1. hidden from the org switcher (`GET /api/tenant`; `?include_archived=true`
    still lists it — this is not erasure);
-2. no new device enrollments;
+2. no new device enrollments — a daemon or a `roomler` tunnel client, into a
+   new row or back into its old one — and no token minted for one (#3042): the
+   three mint routes refuse with the enroll routes' own sentence, so the person
+   hears it where they asked rather than in someone's terminal later;
 3. no new remote-control sessions;
-4. its devices leave its mesh — every enrollment revoked, every overlay
-   node released back to the address pool, its block quarantined;
+4. its devices leave its mesh — every enrollment revoked, tunnel clients
+   included (#3042), every overlay node released back to the address pool, its
+   block quarantined. A join into an archived org is refused whatever its row
+   says, so nothing racing the teardown takes an address on the way out;
 5. everything else — rooms, messages, files, members, roles, audit —
    retained untouched.
 

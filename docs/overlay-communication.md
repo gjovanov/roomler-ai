@@ -131,9 +131,9 @@ plan doc is retired):
   front accepts genuine ATYP=IPv6 targets when they are derived-ULA (v4-mapped
   unwraps; any other v6 is host-unreachable by design).
 
-**Removal releases the lease.** All three removal paths — `DELETE …/agent/{id}`,
-`DELETE …/overlay-node/{id}` (admin evict), `DELETE …/tunnel-client/{id}` — go
-through one writer, and the order is load-bearing:
+**Removal releases the lease.** Every removal path (`DELETE …/agent/{id}`, `DELETE …/overlay-node/{id}`
+(admin evict), `DELETE …/tunnel-client/{id}`, an archived org, a tunnel client whose owner left the
+org) goes through one writer, and the order is load-bearing:
 
 1. read the peer list while the node is still live;
 2. **compare-and-swap** the node's `deleted_at` (winning that CAS is the release
@@ -156,7 +156,17 @@ a tombstone holds neither its address nor its MagicDNS name.
 Two consequences worth knowing:
 
 - **Removal is final.** A removed machine that re-enrolls comes back as a *new*
-  node with a fresh address and a fresh name; the tombstone is never revived.
+  node with a fresh lease and a freshly de-duplicated name; the tombstone is never
+  revived. A fresh lease is the pool's head, so in an org whose pool holds no
+  older host it is the machine's own old address, handed out as it would be to
+  any joiner. Its agent row comes back as a new device too (#3627,
+  [`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)):
+  before that row is live, the revive releases a lease the removal left behind
+  (normally none), through this same writer and in this order.
+  Until it does, it takes no lease at all: a join is refused while the row behind
+  the socket is a tombstone (#1829), or its org is archived (#3042), and it is the
+  kick or the revocation poll that tells it why. A relay request naming a released
+  peer gets no grant.
 - **Evict is "force a new lease", not "ban".** It doesn't touch the backing
   agent / tunnel client, so a still-enrolled device rejoins on its next connect
   with a *different* address. To remove a device for good, delete it. There is
@@ -217,6 +227,13 @@ graph LR
 That uniformity is why adding DERP touched no WireGuard code: `DerpConn` is just
 another `RelayConn`.
 
+A remote-desktop session can read the carrier too. Behind `ROOMLERD_RC_CARRIER_RANK`
+(FR-148 P4, off by default), a session asks LocalAPI `peers` at its offer for the
+carrier to the viewer's device. Unless that carrier is `Direct`, neither upgrading nor
+stalled, every candidate only the mesh carries ranks below every TURN relay, so the
+video crosses the mesh only when nothing else connects
+([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)).
+
 ### The direct carrier's socket buffers (FR-110)
 
 A direct carrier is one UDP socket, and the kernel holds whatever arrives
@@ -257,7 +274,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:348`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:460`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -447,7 +464,7 @@ sequenceDiagram
 
     Note over A,B: neither advertises srflx ⇒ both UDP-blocked<br/>both advertise supports_derp ⇒ relay_strategy = Derp
 
-    A->>D: WSS connect ?token=<agent JWT>&role=agent
+    A->>D: WSS connect ?role=agent&tid=<tenant>, Authorization: Bearer <agent JWT>
     A->>D: frame 1 = own 32-byte WG pubkey
     Note over D: validate == overlay_nodes.wg_public_key<br/>register (network_id, pubkeyA) → conn
     B->>D: WSS connect + register pubkeyB
@@ -563,15 +580,15 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2158`](../crates/tunnel-core/src/overlay/runtime.rs#L2158),
+  ([`runtime.rs:2166`](../crates/tunnel-core/src/overlay/runtime.rs#L2166),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
-  ([`lib.rs:120`](../crates/localapi/src/lib.rs#L120)), parsed from
+  ([`lib.rs:116`](../crates/localapi/src/lib.rs#L116)), parsed from
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:2884`](../agents/roomler-cli/src/localclient.rs#L2884)):
+  reaches ([`localclient.rs:3220`](../agents/roomler-cli/src/localclient.rs#L3220)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -692,15 +709,15 @@ flowchart LR
 
 | Lever | Where | What it does |
 |---|---|---|
-| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:472` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
-| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:374`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:440`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:511` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:77`), called once per connect (`:392`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:40`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:416`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:479`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
 `getsockopt(SO_SNDBUF)` right after the set
-(`cap_tcp`, `agents/roomlerd/src/derp.rs:90`) and judges it in the request's
-units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:135`). This is
+(`cap_tcp`, `agents/roomlerd/src/derp.rs:96`) and judges it in the request's
+units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:141`). This is
 FR-18's AC4. In a Linux 6.6 container at stock sysctls (2026-10-30), a 262144
 request returned `Ok`, and the kernel then reported 425984: **212992 in
 force**. The daemon used to assume 256 KiB.
@@ -709,12 +726,12 @@ How each OS answers, from its documentation or source:
 
 | OS | `getsockopt` returns | What can change the request | Why one read is enough |
 |---|---|---|---|
-| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:104`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
+| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:110`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
 | Windows | the size in force | Winsock "can succeed even if the implementation did not provide the whole amount requested" and tells the caller to check with `getsockopt` | Dynamic send buffering "is enabled unless an application sets the SO_SNDBUF socket option" |
 | macOS | the size in force (`sb_hiwat`) | `kern.ipc.maxsockbuf` (8 MiB by default) clamps a larger request, far above this one | The set clears `SB_AUTOSIZE`, which TCP's send-buffer growth and trim both require. The MSS rounding runs only on a SYN, before the cap |
 
 Every connect logs one line, and every message opens with *"overlay derp: send
-buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
+buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:171`). It carries
 `relay`, `requested` and, where it was read, `applied` in the request's units:
 
 | Read-back | Level | Message |
@@ -727,11 +744,11 @@ buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
 | no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
 
 The verdict per OS and the line's fields are pinned by unit tests
-(`agents/roomlerd/src/derp.rs:675`, `:841`). Two more use a real loopback
+(`agents/roomlerd/src/derp.rs:1033`, `:1199`). Two more use a real loopback
 socket. In one, the cap reaches the socket under the WebSocket and reads back
-as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:753`).
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:1111`).
 In the other, a socket filled until the kernel takes no more keeps the size its
-cap read back (`agents/roomlerd/src/derp.rs:781`). CI runs them on Linux and
+cap read back (`agents/roomlerd/src/derp.rs:1139`). CI runs them on Linux and
 Windows.
 
 ⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
@@ -746,7 +763,7 @@ socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
 0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
 
 ⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
-answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
+answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:299`)
 so that a transient overflow never latches the carrier dead. FR-18's design
 also named a `dropped_full` counter, and it was never built.
 
@@ -754,7 +771,7 @@ also named a `dropped_full` counter, and it was never built.
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
 (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
-`crates/tunnel-core/src/overlay/runtime.rs:2576`), so that DERP can carry every
+`crates/tunnel-core/src/overlay/runtime.rs:2584`), so that DERP can carry every
 fresh pair from birth while better tiers upgrade over it. A server's force-DERP
 push can open it mid-run too. The lazy rule below is what a node does with the
 floor switched off.
@@ -814,8 +831,43 @@ long-lived sockets on the wrong pod after a roll.
 
 ⚠️ **The downtime is mostly Kubernetes, the image and the agent's ladder.** The binary listens
 under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), the image pull
-(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
+(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:50`), which is
 why per-roll medians land on 7.5, 15 and 25 s.
+
+**Since the pre-pull** (2026-11-07, the second lever below), the image is on both nodes before the roll
+begins ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull)):
+
+| Measure | Before the pre-pull | Since the pre-pull |
+|---|---|---|
+| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` |
+| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 |
+| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s |
+| `/derp` down, per socket | p50 7.6 s, p90 15.9 s (310 sockets, October) | p50 3.4 s, p90 3.7 s (156 sockets on eight promotes to 2026-11-16) |
+| Control socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (2026-11-02) | p50 3.5 s, p90 4.0 s (84 sockets, the same eight) |
+
+What is left of a wave is the old pod's exit, the scheduling and the start (about 2 s), then 10–12 s until
+Kubernetes marks the replacement Ready, which releases the second wave. That paces the roll, not the reattach:
+the front nginx sends to the node's address and never sees readiness, so a socket can land as soon as the
+binary listens. On the ladder it lands at the +3 s dial, as 80 of the 84 reattaches did, where it used to wait
+for +7 s.
+
+**Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
+
+| Lever | What it changes | Switch |
+|---|---|---|
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200. With the pre-pull it has about 1 s a wave left to buy, and its field read (FR-28's AC3) is owed | `ws_flat_redial`, default OFF |
+| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)). In force since 2026-11-07: a roll takes 25 s instead of 33.9 s (the table above) | The deploy repo's DaemonSet file |
+
+⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
+502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,
+such as a corporate proxy's.
+
+**A session that outlives the wait** ([FR-138](fr/FR-138-the-session-outlives-its-control-socket.md) P2a). With
+`rc_sessions_survive_reattach` on (default ON since P4-1: only `0`, `false`, `no` or `off` turns it off) and a
+window announced by the server, the device keeps a live remote-control session through the control socket's loss and
+claims it back in its next hello, for that window, capped at 120 s ([remote-control.md §11.16](remote-control.md#1116-a-session-outlives-its-control-socket-the-devices-half-fr-138-p2a)).
+With either off, the table's last row above still holds: with no window the switch on changes nothing (P4-0), so
+the server's resume scope decides.
 
 ---
 
@@ -844,6 +896,25 @@ absent from the list and the mesh graph as well as from the netmap. It adds
 display names, OS and version; machine ids, owner ids and keys never leave the
 server. Detail and the negative-control test:
 [desktop-companion.md](desktop-companion.md) §6.
+
+### A rule that names a role
+
+An overlay ACL rule can name its sources by role (`RoleId`). A node matches such a
+rule through its owner: the roles the owner holds in the node's org, as that org has
+them when the rule is compiled
+([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)).
+Each compile (a node's netmap, a delta fan, the DERP allow table, an org-relay
+decision) reads the org's role ids once and reuses them for every node it resolves
+(`CompileRoles`, `crates/modules/network/src/overlay.rs:2516`), so a role the org
+has deleted, or one of another org, never matches.
+
+When someone is given a role or loses one, or a role is deleted, the org's nodes are
+re-fanned about 750 ms later, one re-fan for a burst of changes, while the org's ACL
+is `warn` or `enforce` (`refan_for_role_change`,
+`crates/modules/network/src/routes/overlay_policy.rs:334`). Under `off` a role shapes
+nothing, so nothing is re-fanned. A node whose owner's roles cannot be read matches
+no role rule, with a WARN (`overlay acl: roles unreadable; role-scoped rules will not
+match this node`), and an org-relay grant that needs them is refused.
 
 ---
 
@@ -956,6 +1027,131 @@ server. Detail and the negative-control test:
   #1405). The remaining lever is routes we ADD, more specific than `/96`,
   which AnyConnect tolerates for v4. Nothing opens overlay-v6 sockets today
   (#1405), so that stays unbuilt until something does.
+
+### A peer whose clock stepped back (#3528)
+
+WireGuard refuses a handshake initiation that is not stamped later than the last
+one the responder accepted from that peer. That is its replay guard. boringtun
+keeps the stamp per `Tunn` (`last_handshake_timestamp`, boringtun 0.7.1
+`src/noise/handshake.rs:307`, checked at `:543`). An initiator stamps from the
+wall clock its `Tunn` read when it was built, plus the monotonic time since
+(`handshake.rs:187`). So a clock step while a `Tunn` lives changes nothing on
+the wire. The harm comes when a device's clock steps **back** and the device
+then builds a fresh `Tunn`: a restart, or a carrier rebuild. Every peer that
+kept its own `Tunn` refuses the device (`WrongTai64nTimestamp`) until the
+device's clock passes that peer's mark, which takes up to the size of the step.
+
+Measured before the fix (agent 0.4.203, two lab devices, the issue's AC2):
+
+| Pair | Step back | What happened |
+|---|---|---|
+| LAN | 300 s, 900 s | refused at the first initiation every time, but masked within 0.05 s: the peer demote-follows onto `/derp` with a fresh `Tunn` |
+| DERP-held | 300 s | 2 stalls of 15.5 s, 48 refusals over 234 s |
+| DERP-held | 900 s | 8 stalls of 13.7–15.5 s, the first at +93 s, then every ~104.5 s; 169 refusals over 835 s |
+| either | none, or forward | no refusals (12 controls) |
+
+The stall comes back because the device's own refused initiation keeps
+retrying for 90 s (`REKEY_ATTEMPT_TIME`, boringtun `src/noise/timers.rs:21`).
+Then `clear_all` (`timers.rs:142`) also drops the session that was working.
+Every peer of the stepped device stalls at once. A stall lasts ~15 s when the
+peer has replied since the device's last packet, ~30–35 s when it has sent
+nothing.
+
+**The fix is on the refusing side, and the replay guard stays.** A refused
+initiation has passed both AEAD opens under the peer's static key, so the
+peer's private key made it. It is either the peer, behind the mark, or an old
+initiation arriving again, and only the peer can tell the two apart. So the
+session answers it from a **shadow**: a second `Tunn` built from the same
+recipe, whose mark starts at zero (`HandshakeHeal`,
+`crates/tunnel-core/src/overlay/wg.rs:644`). It has the same keys and the same
+session index, so the carrier plane's index route reaches it. The session's own
+`Tunn` stays as it is. The shadow takes its place only when a data packet or a
+keepalive decrypts under one of the shadow's sessions (`HandshakeHeal::promote`,
+`wg.rs:776`). That needs the ephemeral private key of the initiation the shadow
+answered, so only the peer completing its own handshake can do it.
+
+```mermaid
+sequenceDiagram
+    participant A as Device A (clock stepped back, restarted)
+    participant B as Peer B (kept its Tunn)
+    participant S as B's shadow Tunn (mark 0)
+    A->>B: initiation, stamped below B's mark
+    Note over B: B's Tunn refuses it (WrongTai64nTimestamp)
+    B->>S: the same initiation
+    S-->>A: handshake response
+    Note over A: A's own handshake completes on its first try
+    A->>B: keepalive on the new session
+    Note over B: B's Tunn cannot open it, the shadow can.<br/>The shadow becomes B's Tunn (one INFO line).
+    A->>B: data
+    B->>A: data
+```
+
+What each initiation gets (`process_inbound`, `wg.rs:2713-2776`):
+
+| Initiation | B's `Tunn` | The shadow | The working session |
+|---|---|---|---|
+| stamped above the mark: no step, a forward step, a rekey | accepts it | none | stock WireGuard |
+| an ephemeral key B's `Tunn` already accepted: a duplicate or a replay | dropped before boringtun | none | untouched |
+| refused within 5 s of an accept (`HEAL_REORDER_WINDOW`, `wg.rs:587`): a reordered burst | refuses it | none | untouched |
+| refused otherwise: a stepped-back peer, or a replay | refuses it | answers it, at most once a second (`SHADOW_MIN_INTERVAL`, `wg.rs:592`) | untouched, until the peer completes the shadow's handshake; then the shadow carries it |
+
+* **A replay costs nothing.** The shadow's answer to a replayed initiation is
+  useless to anyone without that initiation's ephemeral private key, and the
+  working session keeps carrying the real peer's data. The unit test measures a
+  blip of zero packets
+  (`replayed_unseen_initiation_never_disturbs_the_working_session`).
+* **A stepped-back peer heals in about one round trip.** It completes its own
+  initiation, so nothing is left outstanding to expire 90 s later
+  (`backward_step_then_rebuild_heals_in_one_round_trip`, with the no-step and
+  forward-step controls beside it).
+* **It heals once the peers run the fix**, whatever the stepping device runs. A
+  peer on an older agent still refuses as above.
+* **The screen keeps the guard after a promotion.** A promoted shadow's mark is
+  the stepped-back peer's stamp, below the initiations the session accepted
+  before the step. The session remembers the ephemeral keys of the last 32
+  initiations its `Tunn` accepted (`HEAL_SEEN`, `wg.rs:606`: about an hour of
+  rekeys, 1 KiB a session) and drops a replay of any of them before boringtun
+  sees it (`already_accepted`, `wg.rs:716`). After a step larger than that, an
+  initiation the peer made more than an hour before the step can still be
+  accepted by the promoted `Tunn` until the peer's clock passes its old mark.
+  Such a replay opens a session nobody can use. Each one takes one of
+  boringtun's 8 session slots, so it takes a handful of them to push out the
+  session in use, and then a new handshake restores it within about 15 s of the
+  next traffic.
+* **A shadow is bounded.** There is one per session. It is rebuilt when it
+  refuses an initiation too and is older than 5 s (`SHADOW_REBUILD_AFTER`,
+  `wg.rs:596`), so a shadow that a replay built cannot lock out a peer that
+  steps back later. It is dropped when nobody completes it within 180 s
+  (`SHADOW_TTL`, `wg.rs:600`). A carrier rebuild or a restart on this side
+  starts over with an empty screen, beside a `Tunn` whose mark is zero anyway,
+  as stock WireGuard does after an interface restart.
+
+**What the logs say.** A promotion is one INFO line on the refusing side,
+naming the peer: `overlay: this peer's handshake was refused as a replay: its
+clock is behind the last handshake this session accepted …`. Refusals that do
+not heal are DEBUG lines, and `WgDevice::peer_replay_counts` reads both
+counters. When boringtun's own handshake expiry marks a carrier dead, the
+rebuild WARN now says so (`overlay: relay carrier's WireGuard handshake expired
+(its own initiation went unanswered for 90 s …)`), where it used to blame a
+`/derp` WS that never closed
+(`crates/tunnel-core/src/overlay/runtime/establish.rs:634`, `:750`, and the
+direct carrier's line at `:713`).
+
+### Only the daemon holds the TUN device
+
+The OS TUN's descriptor is close-on-exec, so no program the daemon starts
+holds the device, and a device that is not persistent goes away with the
+daemon that made it. The next daemon's bring-up finds the name free even while
+an installer the old daemon started is still running.
+
+| Platform | How | Window in which a fork on another thread gets a copy |
+|---|---|---|
+| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:2670`) | none |
+| macOS | a utun is a socket, and macOS takes no close-on-exec flag at `socket()`, so the descriptor is marked on the line after the create | create → mark. The long-lived children and every child that runs a caller's code sweep everything above stderr ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)) |
+| Windows | Wintun has no descriptor to inherit | — |
+
+`tun_kernel_tests` (`agents/roomlerd/src/overlay.rs:1394`) checks it against a
+real kernel in CI, as root.
 
 ---
 

@@ -61,11 +61,12 @@ pub struct MessageResponse {
     pub room_id: String,
     pub author_id: String,
     pub author_name: String,
-    /// FR-90 — `user` | `bot` | …: a client renders an agent's turn stub
-    /// differently from a person's message, and must not offer to DM a bot.
+    /// FR-90 — `user` | `bot` | …: a client renders a `bot` message (a
+    /// parked agent session's turn stub, FR-137) differently from a person's,
+    /// and must not offer to DM a bot.
     pub author_type: &'static str,
-    /// FR-90 — what owns this message's meaning (a turn stub's session), if
-    /// anything. Chat never interprets it.
+    /// FR-90 — what owns this message's meaning, if anything: a stored turn
+    /// stub keeps its parked session's. Chat never interprets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<roomler_ai_db::models::Binding>,
     pub content: String,
@@ -143,7 +144,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    let room = crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let thread_id = body
         .thread_id
@@ -159,30 +160,31 @@ pub async fn create(
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid referenced_message_id".to_string()))?;
 
-    // Parse mentions from request
-    let mentions = if let Some(ref mention_req) = body.mentions {
-        let user_ids: Vec<ObjectId> = mention_req
+    // The room's members: who hears about this message below, and the only
+    // people a mention in it can reach.
+    let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
+
+    // Parse mentions from request, keeping the members of this room
+    let mentions = body.mentions.as_ref().map(|mention_req| Mentions {
+        users: mention_req
             .users
             .iter()
             .filter_map(|s| ObjectId::parse_str(s).ok())
-            .collect();
-        Some(Mentions {
-            users: user_ids,
-            roles: Vec::new(),
-            rooms: Vec::new(),
-            everyone: mention_req.everyone,
-            here: mention_req.here,
-        })
-    } else {
-        None
-    };
+            .filter(|id| all_member_ids.contains(id))
+            .collect(),
+        roles: Vec::new(),
+        rooms: Vec::new(),
+        everyone: mention_req.everyone,
+        here: mention_req.here,
+    });
 
-    // Fetch file records for attachments (tenant-scoped to prevent cross-tenant access)
+    // Fetch file records for attachments: live files of this same room, as a
+    // file is shared in the room it was uploaded to. Any other id is left out.
     let attachments = if !body.attachment_ids.is_empty() {
         let mut att = Vec::new();
         for file_id_str in &body.attachment_ids {
             if let Ok(fid) = ObjectId::parse_str(file_id_str)
-                && let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await
+                && let Ok(file) = state.files.find_live_in_room(tid, rid, fid).await
             {
                 att.push(MessageAttachment {
                     file_id: file.id.unwrap(),
@@ -200,6 +202,8 @@ pub async fn create(
         Vec::new()
     };
 
+    // A thread or a quote that is not a live message of this room answers 404
+    // here, before anything is written.
     let message = state
         .messages
         .create_with_attachments(
@@ -210,7 +214,7 @@ pub async fn create(
             thread_id,
             ref_msg_id,
             body.nonce,
-            mentions,
+            mentions.clone(),
             attachments,
         )
         .await?;
@@ -224,8 +228,6 @@ pub async fn create(
         .await
         .unwrap_or_default();
 
-    // Fetch room member IDs once and reuse for WS broadcast, thread update, and notifications
-    let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
     let member_ids_excluding_sender: Vec<ObjectId> = all_member_ids
         .iter()
         .filter(|id| **id != auth.user_id)
@@ -252,9 +254,10 @@ pub async fn create(
     .await;
 
     // If this was a thread reply, broadcast an update for the parent message
-    // so other users see the updated is_thread_root + reply_count
+    // so other users see the updated is_thread_root + reply_count. The parent
+    // is re-read as the live message of this room it was resolved as.
     if let Some(parent_id) = thread_id
-        && let Ok(parent_msg) = state.messages.base.find_by_id(parent_id).await
+        && let Ok(parent_msg) = state.messages.find_live_in_room(tid, rid, parent_id).await
     {
         let parent_author_ids = vec![parent_msg.author_id];
         let parent_names = state
@@ -277,27 +280,20 @@ pub async fn create(
         .await;
     }
 
-    // Create notifications for mentioned users via helper
-    if let Some(ref mention_req) = body.mentions {
-        let mentioned_user_ids: Vec<ObjectId> = if mention_req.everyone {
+    // Create notifications for mentioned users via helper: members of this
+    // room only (`mentions` kept them above).
+    if let Some(ref mentions) = mentions {
+        let mentioned_user_ids: Vec<ObjectId> = if mentions.everyone {
             // @everyone: notify all room members except sender
             member_ids_excluding_sender.clone()
         } else {
-            mention_req
+            mentions
                 .users
                 .iter()
-                .filter_map(|s| ObjectId::parse_str(s).ok())
-                .filter(|id| *id != auth.user_id)
+                .filter(|id| **id != auth.user_id)
+                .copied()
                 .collect()
         };
-
-        let room_name = state
-            .rooms
-            .base
-            .find_by_id(rid)
-            .await
-            .map(|r| r.name)
-            .unwrap_or_default();
 
         let mentioner_name = names
             .get(&auth.user_id)
@@ -311,7 +307,7 @@ pub async fn create(
             message_id,
             auth.user_id,
             &mentioned_user_ids,
-            &room_name,
+            &room.name,
             &body.content,
             &mentioner_name,
             &tenant_id,
@@ -336,18 +332,23 @@ pub async fn update(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let (_room, message) =
+        crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    state
-        .messages
-        .update_content(tid, mid, auth.user_id, body.content.clone())
-        .await?;
+    // Only the author edits a message, and anyone else gets the answer a
+    // missing message gets: nothing is written, re-read or sent.
+    if message.author_id != auth.user_id
+        || !state
+            .messages
+            .update_content(tid, rid, mid, auth.user_id, body.content.clone())
+            .await?
+    {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
-    // Re-fetch the updated message for the full response. MUST be
-    // tenant-scoped: a bare `find_by_id(mid)` here returned ANY tenant's
-    // message content in the response even though `update_content` is
-    // tenant-scoped and modified nothing (cross-tenant read via edit).
-    let updated = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
+    // Re-fetch the updated message for the full response, as the live message
+    // of this room it was resolved as (never by bare id or by org alone).
+    let updated = state.messages.find_live_in_room(tid, rid, mid).await?;
     let names = state
         .users
         .find_display_names(&[updated.author_id])
@@ -385,19 +386,23 @@ pub async fn delete(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
-
-    // Verify ownership: only the author can delete their message (tenant-scoped)
-    let message = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
+    // Verify ownership: only the author can delete their message, a live
+    // message of the path room that the caller may read.
+    let (_room, message) =
+        crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
     if message.author_id != auth.user_id {
         return Err(ApiError::Forbidden(
             "Only the author can delete this message".to_string(),
         ));
     }
 
-    state.messages.base.soft_delete_in_tenant(tid, mid).await?;
+    // The soft delete matches a live message only, so a second delete that
+    // passed the guard before the first one landed finds nothing: it answers
+    // as a missing message does, keeps the first removal time and sends
+    // nothing.
+    if !state.messages.base.soft_delete_in_tenant(tid, mid).await? {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
     // All members incl. the sender — reaches their other browsers/devices;
     // delete-by-id is idempotent client-side.
@@ -465,11 +470,17 @@ pub async fn toggle_pin(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    state.messages.toggle_pin(tid, mid, body.pinned).await?;
+    // A message deleted after the guard read it matches nothing here, and
+    // the pin answers as for a missing message, with nothing sent.
+    if !state
+        .messages
+        .toggle_pin(tid, rid, mid, body.pinned)
+        .await?
+    {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
     let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
@@ -494,17 +505,24 @@ pub async fn toggle_pin(
 pub async fn thread_replies(
     State(state): State<ChatState>,
     auth: AuthUser,
-    Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    // The root is a live message of the path room, which the caller may read.
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    let result = state.messages.find_thread_replies(mid, &params).await?;
+    // The replies from the root's own room.
+    let result = state
+        .messages
+        .find_thread_replies(tid, rid, mid, &params)
+        .await?;
 
     let author_ids = collect_author_ids(&result.items);
     let names = state

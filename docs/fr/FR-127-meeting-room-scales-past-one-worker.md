@@ -28,7 +28,7 @@ Then **measure again**, with the bench and with real browsers. The published cap
 | the ceiling's unit | **packets**, about 85,000–110,000 a second per worker thread; the worker's log level and io_uring do not move it |
 | the client's side | at 50 people, each participant would receive about 78 Mbit/s of video |
 | the plans | `video_max_participants` is 10 · 50 · 100 for Free · Pro · Business (`crates/db/src/models/tenant.rs:578`, `:596`, `:614`), enforced at `media:join` (`crates/modules/conference/src/ws_media.rs:272-300`) |
-| production | 2 pods, a 2-CPU limit each, **4** mediasoup workers a pod (`ROOMLER__MEDIASOUP__NUM_WORKERS` in the deploy repo's base config; the code's default is 2, `crates/config/src/settings.rs:1733`); tenant affinity puts a tenant's meeting on one pod |
+| production | 2 pods, a 2-CPU limit each, **4** mediasoup workers a pod (`ROOMLER__MEDIASOUP__NUM_WORKERS` in the deploy repo's base config; the code's default is 2, `crates/config/src/settings.rs:1610`); tenant affinity puts a tenant's meeting on one pod |
 | **P0 finding — audio alone** | 50 people unmuted send 50 × 49 Opus streams at 50 packets/s: **122,000 packets/s, more than one worker carries**, before any video. FR-115's audio-only run saw it: 89 % delivered at N = 50 at 109,000 pkt/s. A muted participant costs nothing (FR-30 P4 pauses the producer server-side) but an unmuted silent one costs the full 50 pkt/s, because the client produces Opus without DTX (`ui/src/stores/conference.ts:315-319` passes no `codecOptions`) |
 | **P0 finding — the capture** | the camera is opened unconstrained (`ui/src/stores/conference.ts:305-308`), which Chrome serves at **640×480**. A simulcast ladder has to be stated relative to that, not as 16:9 sizes |
 | **P0 finding — what a viewer renders** | the tiled layout renders `tiledMaxTiles` tiles (default 16, 4–49) and **drops the rest without scrolling** (`ui/src/composables/useConferenceLayout.ts:306`); spotlight and sidebar render **everyone else in a scrolling strip** (`SpotlightLayout.vue:29-49`, `SidebarLayout.vue:29-49`). So "visible" is the grid's list in one layout and an on-screen test in the other two |
@@ -126,14 +126,14 @@ for the same reason `ingress_rules` keeps `None` apart from `Some([])`. Applying
 - `consume` (`room_manager.rs:389`): for a video consumer, `ConsumerOptions.paused = !wanted` when `view` is `Some`; the
   resume at `:436-440` runs only for a wanted or legacy consumer, and never for audio-off.
 - A view names a producer whose consumer does not exist yet (the client learns producer ids from `media:new_producer`,
-  `ws_media.rs:441-460` and `:579-603`, before it consumes): the set is kept and applied when the consumer is created.
+  `ws_media.rs:441-460` and `:594-618`, before it consumes): the set is kept and applied when the consumer is created.
 - A server cap, `[meetings] view_max` (default 49, the UI's own maximum, `useConferenceLayout.ts:393-394`): a report
   longer than the cap is truncated in the order sent. P5 may lower it with the plan caps; it is a load guard, not a policy.
 
 **The owner's pause and the viewer's pause are different states, in mediasoup too.** FR-30 P4's pause is
 `Producer::pause()` (`room_manager.rs:477`), which the worker mirrors into every consumer's `producer_paused`
 (`Consumer::producer_paused()`, mediasoup `src/router/consumer.rs:1015`). The viewer's pause is `Consumer::pause()`
-(`:1116`), a separate flag (`Consumer::paused()`, `:1009`). `media:consumer_created.producer_paused` (`ws_media.rs:683`)
+(`:1116`), a separate flag (`Consumer::paused()`, `:1009`). `media:consumer_created.producer_paused` (`ws_media.rs:698`)
 and the `media:producer_paused` event (`:753-769`) keep reading the **producer**; `media:view` only ever drives the
 consumer's own flag. So AC2 holds by construction: a viewer hiding a tile changes nothing another viewer can see, and an
 owner's pause reaches every viewer whatever their view says. ⚠️ With P3's piped producers this stays true only if
@@ -158,7 +158,7 @@ The on-screen test is an `IntersectionObserver` in `VideoTile.vue`, created in `
 (`ui/src/components/conference/VideoTile.vue:454`, `:465-473`), with the scrolling strip as its root, emitting
 `visible: [streamKey, boolean, w, h]` the way `picture-black` is emitted (`:221`) and forwarded by every layout
 (`TiledLayout.vue:22`, `SpotlightLayout.vue:24`, `SidebarLayout.vue:24`) to the view
-(`ui/src/views/conference/ConferenceView.vue:97-104`, next to `handlePictureBlack`, `:418-420`). The store turns stream
+(`ui/src/views/conference/ConferenceView.vue:97-104`, next to `handlePictureBlack`, `:426-428`). The store turns stream
 keys into video producer ids (it has them from `media:new_producer`, and `consumerStreamKey` maps the other way,
 `conference.ts:366-367`) and sends `media:view`. A tile that is rendered but whose owner paused the camera (FR-30) stays
 in the set: the producer is paused anyway, and the moment the owner resumes, the tile shows. A screen share is always
@@ -320,7 +320,7 @@ a pipe into it fails and is skipped, and the next `create_transports` drops the 
 `[meetings] pipe_rooms` room survives a worker death with 1/R of its participants cut, instead of all of them.
 
 **Stats and gauges.** `sample_transports` (`room_manager.rs:108`) and the sampler (`media_stats.rs:89`, `:238`) read
-per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:109`) gains
+per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:117`) gains
 `routers` and `pipes` per room, and the `MediaGauges` struct (`:101`) the totals; the cluster status snapshot shows them.
 Pipe transport bytes (`PipeTransport::get_stats`, mediasoup `src/router/pipe_transport.rs:185`) go to the docs as a
 P4 reading, not a sampled series.

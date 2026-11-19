@@ -25,8 +25,13 @@ audience-checked token types — a token of one audience is rejected everywhere 
 | `Refresh` | `POST /api/auth/refresh` only | 30 d (config) | browser |
 | `Enrollment` | `POST /api/agent/enroll` | 10 min, single-use (`jti`) | pasted into installer |
 | `Agent` | `/ws?role=agent`, agent ingest routes, `/derp` | long-lived | `roomlerd` config |
-| `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use | pasted into CLI |
+| `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use (`jti`) | pasted into CLI |
 | `TunnelClient` | `/ws?role=tunnel-client`, tunnel routes | long-lived | `roomler` CLI config |
+
+`/ws` (agent and tunnel-client roles) and `/derp` take the long-lived token as
+`Authorization: Bearer` too, like every other route. Clients older than 0.4.210
+send it in the query (`token=`), which keeps working; when both are present the
+header decides ([real-time.md](real-time.md#where-a-native-clients-credential-travels-3656)).
 
 ```mermaid
 sequenceDiagram
@@ -55,14 +60,52 @@ sequenceDiagram
     A-->>D: token handed to installer / wizard
     D->>S: POST /api/agent/enroll {enrollment_token, machine_id, machine_name, os, agent_version}
     S-->>D: {agent_id, tenant_id, agent_token}
-    D->>S: GET /ws?role=agent&token=<agent_token>  (always-on control link)
+    D->>S: GET /ws?role=agent&tid=<tenant_id>, Authorization: Bearer <agent_token>  (always-on control link)
 ```
 
 `machine_id` is a stable hardware-derived hash, unique per `(tenant_id, machine_id)`
-— re-enrolling a known machine reuses its row. The tunnel-client flow is identical
+— re-enrolling a known machine reuses its row. A live row keeps everything it was
+allowed; a **removed** one comes back as a new device, with only its identity, history
+and token generation kept (#3627,
+[device-credentials.md](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
+Two answers belong to that path: **503** when the removed device's grants could not be
+dropped (nothing is revived; the token is spent, so enroll again with a new one), and
+**409** when the row kept changing under the enrollment (removed or enrolled again at
+the same moment). The tunnel-client flow is identical
 in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` →
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.
+
+**An enrollment token enrolls once** (#3328). Every door that redeems one — the
+daemon's `POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anchor
+(`POST /api/agent/anchor`) — spends its `jti` on the `used_tokens` ledger after each
+refusal that must leave the token usable and before it writes anything. Spent before,
+it answers **401** `This enrollment token has already been used`; a ledger that cannot
+answer gives a retryable **503** (`Could not verify this enrollment token is unused;
+please retry`), and the token stays valid. The archived-org 403, the issuer's 403
+(below), the plan's cap and a refused tunnel re-enrollment (409, below) come before the
+spend, so they cost the token nothing. FR-51's ephemeral keys are reusable by design and
+are counted on their own row.
+
+A tunnel enrollment token acts for the person who minted it, since the enroll request
+carries no user session: a new `machine_id` becomes their tunnel client, and a known one
+re-enrolls its client only for **its owner, while the client is live, or a holder of
+`MANAGE_AGENTS`**. A **removed** client comes back only through a holder of
+`MANAGE_AGENTS`, its owner included, and comes back as **theirs** (`owner_user_id`, the
+person its new token acts for); a live client a holder re-enrolls keeps its owner.
+Anyone else gets **409** with a sentence the CLI prints, and nothing is written: no row,
+no ledger entry, no overlay change. Once the person a token was minted for is no longer
+a member of its org, it enrolls nothing (**403**, before the spend).
+
+A daemon enrollment token and an FR-51 ephemeral key act for the admin who minted them:
+the device they enroll is that person's, and an anchor records them. So
+`POST /api/agent/enroll` and `POST /api/agent/anchor` ask again what the mint asked,
+whether that person holds `MANAGE_AGENTS` in the org, after the archived-org gate and
+before the spend or the key's claim. When they no longer do (they left the org, or lost
+the permission), the answer is **403** `forbidden`, never `not_a_member`, with a sentence
+the daemon and the wizard print. The token stays unspent, the key's `uses` stay as they
+were, and nothing is written
+([security-baseline.md](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)).
 
 Since FR-129 A1 the installer can obtain the same `Enrollment` (or `TunnelEnrollment`)
 token **without anyone copying it**: `POST /api/pair/start` → the person types the
@@ -105,11 +148,11 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:387` | a difference is an oracle for `users.email`, the key account-linking resolves against |
+| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:417` | a difference is an oracle for `users.email`, the key account-linking resolves against |
 | The answer does not wait for the lookup | the same function, deliberately not `async` | a known address costs more Mongo round trips than an unknown one, which is the same oracle in the latency |
 | Per client address: 5, then one every 3 minutes, a 429 with `Retry-After` | `ip_rate_limit`, `crates/api/src/middleware/auth_rate_limit.rs:157` | the route mails whoever its body names, so the budget must not reset per address |
 | Per account: one new link every 15 minutes, silently | `ACTIVATION_RESEND_COOLDOWN_SECS`, `crates/services/src/dao/user.rs:28` | a 429 here would only ever fire for an address that has an account |
-| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:189` | it is one atomic update, so two pods cannot both send |
+| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:197` | it is one atomic update, so two pods cannot both send |
 
 ⚠️ Sign-up does not start the cooldown. At a 5-minute link, a person back at minute 6 would
 otherwise be told a new one is coming and get nothing until minute 15. So the first resend
@@ -135,8 +178,8 @@ capability URLs, webhook signatures).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199) |
-| POST | `/api/auth/login` | Password login (`email` or `username`) |
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199). A taken `tenant_slug` answers 409 before anything is created, a deleted organization's slug included, so no account or activation mail is left behind (#3247) |
+| POST | `/api/auth/login` | Password login (`email` or `username`). A `username` that matches no account and holds an `@` is looked up as an address, since the sign-in page sends its one box as `username` (#3247) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
 | POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
@@ -152,12 +195,12 @@ capability URLs, webhook signatures).
 | POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | POST | `/api/pair/start` | FR-129 A1: an installer starts a **device pairing** instead of asking for a pasted token — `{machine_name, os, arch, role: daemon\|tunnel, halves?, client, client_version}` → `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}`. The `device_code` is the installer's secret (stored only as a hash, in no other response); the `user_code` is what the person types on `/pair`. Per-address ceiling (429 `rate_limited`); 415 unless the body declares `application/json` (every `/api/pair/*` route — a cross-site `text/plain` form cannot reach the cookie-authenticated routes without a preflight); 400 `network_unmounted` for a tunnel role on a server without the network module; the **empty 404** while `ROOMLER__PAIRING__ENABLED=false` ([the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api)) |
 | POST | `/api/pair/poll` | FR-129 A1: `{device_code}` → `{status: authorization_pending \| slow_down (+interval) \| access_denied \| expired_token \| approved (+tokens[], org_name, org_slug, approver_name, approver_username)}` — the installer shows the two unique handles beside the display names before it installs. The device code **is** the auth; an unknown, delivered or expired code answers `expired_token` alike. The first poll after an approval mints the ordinary single-use enrollment token(s) behind the approver's gate, re-checked — delivery is once |
-| POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
-| GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
+| POST | `/api/agent/enroll` | Exchange enrollment token (or an FR-51 ephemeral key) → agent credential. 403 for an archived org, or for a credential whose admin may no longer enroll devices in it, before anything is spent (above) |
+| GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy). Readers: the daemon's update check; the Windows tray refresh and the Linux companion's sync, which look up their own `agent-v<own>` here and nowhere else; a rollback or an operator's pin, which looks here first (#3818). So every asset of a listed release stays in the answer, the companion's included |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
-| POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler) |
+| POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler). Every string of the report is scrubbed again on the way in, as a log line's is ([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)) |
 | POST | `/api/consent/{token}/approve` · `/deny` | Owner-consent capability URLs (token **is** the auth, single-use) |
-| POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential |
+| POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential. The token enrolls **once**: a second use is 401 `already used`, and a ledger that cannot answer a retryable 503 with the token still valid (#3328). 403 for an **archived** org, into a new row or back into an old one, in the daemon route's words. A known `machine_id` re-enrolls its client only for the client's owner while it is live, or for a holder of `MANAGE_AGENTS` (a removed client comes back only through one, as that holder's); anyone else gets **409** and nothing is written. **403 when the person the token was minted for (a pairing's approver) is no longer a member of its org**: the client would act for them, and a tunnel client ends with its owner's membership ([security-baseline.md](security-baseline.md#a-tunnel-client-ends-with-its-owners-membership)); asked again after the write, so an enrollment that raced the removal leaves no row. The archived-org 403, that 403, the plan's cap (403) and the 409 come before the spend and leave the token usable ([above](#authentication)) |
 | GET | `/api/tunnel-client/agents` | Reachable agents (TunnelClient bearer) |
 | GET | `/api/tunnel/latest-release` · `/installer/{platform}` (+`/health`) | Tunnel-CLI release manifest + artifact proxy |
 | GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy. `?version=` (default `latest`). FR-129 C2, `?format=exe\|zip` (default `exe`): on Windows the default streams the signed wizard EXE itself (`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, `application/vnd.microsoft.portable-executable`) from the first `setup-v*` release that publishes one (`setup-v0.4.197`), and that release's zip otherwise; `zip` streams the zip, for a proxy that refuses an EXE download. Linux and macOS ignore the value; any other value is a 400. The health's `uri` carries a `format` the caller named. A sidecar (`.sha256`, `.asc`) is never the download (`crates/modules/fleet/src/setup_release.rs`, `pick_setup_asset`) |
@@ -167,8 +210,8 @@ capability URLs, webhook signatures).
 | POST | `/api/releases/refresh` | CI cache-bust after a release is published (bearer; fans out to all pods) |
 | GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
 | GET | `/api/relay/regions` | Multi-region relay PoP topology (read-only) |
-| POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`) |
-| GET | `/api/cluster/status` | Per-pod identity, counters, gauges |
+| POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`), scrubbed on the way in as the device's batches are |
+| GET | `/api/cluster/status` | Per-pod identity, counters, gauges. Platform admins only (`require_platform_admin`, the 404 every `/api/admin/*` route gives): it names every live meeting room on the pod and the pods' ids |
 | POST | `/api/stats/pageview` | SPA route-change beacon (authed, paths normalized) |
 | GET | `/health` | Liveness — cheap process-alive 200 |
 | GET | `/health/ready` | Readiness — Mongo ping + Redis round-trip + live subscription |
@@ -272,6 +315,10 @@ before the search runs, so `q` cannot probe them.
 | GET | `/api/admin/growth/newsletter?since&until&include_internal` | FR-102 P5: the list over time (new · confirmed · unsubscribed · suppressed per day and by source, the size now) and one row per issue sent in the range — recipients and accepted from the ledger, delivered · bounced · complaints from SendGrid's signed events, unsubscribed through the issue's link, purestat visits and sign-ups by the issue's campaign key; delivery `not_measured` without the webhook key, never 0 ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | GET | `/api/admin/growth/campaigns?since&until&by&include_internal` | FR-102 P6: per normalised campaign key (`by` = `source`·`medium`·`campaign`·`content`), purestat's web plane queried **live** for the exact UTC-day range beside the account funnel; a purestat outage or revoked key reads `not_measured`, never 0; every rate `{n, value}` with a value only at n ≥ 30 ([growth-observability.md](growth-observability.md)) |
 | POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
+| POST | `/api/admin/room-members/prune` | `chat`: end the room memberships of people who are no longer in the room's org, through the same hook run as a removal (call seats, then the rows). `{dry_run?: bool (default true), limit?: 1..2000 (default 200)}` pairs of (org, person) per call; answers `{dry_run, pairs, rows, ended, failed, more}`. Idempotent: call again while `more` is true |
+| POST | `/api/admin/tunnel-clients/prune` | `network`: end the tunnel clients whose owner is no longer a member of their org, and the overlay leases their removed clients still hold, through the same hook run as a removal (the clients, then the call seats, then the room rows), the membership re-read per pair first. `{dry_run?: bool (default true), limit?: 1..2000 (default 200)}` pairs of (org, person) per call; answers `{dry_run, pairs, clients, leases, ended, failed, more, items: [{tenant_id, user_id, clients: [{id, name, last_seen_at}], leases}]}`, `items` being what a real run ends. A pair is `ended` only when nothing of theirs is left live, else `failed` and logged. Idempotent: call again while `more` is true ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)) |
+| GET/PUT | `/api/admin/rc-resume-scope` | `fleet`, [FR-138](fr/FR-138-the-session-outlives-its-control-socket.md): the orgs and devices a remote session may outlive its device's control socket on. GET answers `{window_secs, entries: [{kind: all\|org\|device, id?, note?, by, at}]}`, `window_secs` being `ROOMLER__RC__SESSION_RESUME_SECS` (0 is off, whatever the list holds). PUT replaces the list, `{entries: [{kind, id?, note?}]}` (an id for `org` and `device`, none for `all`; at most 1000; a target named twice is kept once), and answers the GET's shape; a kept entry keeps its `by` and `at`. An id that names no org or device matches nothing. Anyone else gets the 404, a malformed body included (the guard runs before the body is read). The hub reads the list when a device that advertises `rc-resume` registers, and a PUT tells every connected device whose cover changed its window again, on every pod, each under its own pod's window: the window, or 0, which withdraws it. Every pod reads the list itself (the PUT only nudges the others), and again every `rc.presence_sweep_secs` while the window is on (FR-138 P1b-2) |
+| POST | `/api/admin/rc-sessions/close-dead` | `remote`, [FR-138](fr/FR-138-the-session-outlives-its-control-socket.md) P1b-2: the one-time close of the live `remote_sessions` rows a pod that died before FR-138 left open. `{dry_run?: bool (default true), limit?: 1..500 (default 50), min_age_hours?: ≥ 1 (default 24), after?: <next>}`. A row is dead when it is live, older than `min_age_hours`, its own clock (`stats_at`) has not moved since, no hub on the answering pod holds it, its device has had a session since, and its device is offline everywhere or the pod that holds its socket answers, over the bus, that its hub does not hold the session. Answers `{dry_run, stats_enabled, rows: [{session_id, tenant_id, agent_id, created_at, started_at, ends_at, open_hours, evidence}], kept: [{session_id, tenant_id, agent_id, created_at, why, evidence}], closed, skipped, more, next}`, each `evidence` being `{stats_at, stats_age_hours, held_here, device, owner_pod, held_by_owner, later_row}`. A real run is refused (409) while `stats.enabled` is off; it ends each dead row `agent_disconnect` at its own last clock (`ends_at`), marked `end_source: backfill`, only while the row is still as it was read (live, at its `attach_seq`, `resume_by` and `stats_at`) and created before the cut-off. Platform operators only (404 otherwise, before the body is read; an operator's malformed body is a 400); idempotent — see [remote-control.md §11.18](remote-control.md#1118-a-session-outlives-its-control-socket-the-servers-half-fr-138-p1b) |
 | POST/GET | `/api/admin/newsletter/issues` | FR-58: create draft / list issues |
 | PUT/GET | `/api/admin/newsletter/issues/{slug}` | Edit while draft (409 after) / read back |
 | GET | `/api/admin/newsletter/issues/{slug}/preview` | The exact send-path bytes (sample unsubscribe link substituted) |
@@ -292,6 +339,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET | `/api/tenant/{tid}` | Tenant detail |
 | POST | `…/archive` · `…/unarchive` | Owner-only; archiving revokes every device enrollment and releases the mesh |
 | GET | `…/member` · POST `…/member` | List / add members |
+| DELETE | `…/member/{user_id}` | Remove a member (`KICK_MEMBERS`), or leave (yourself, no bit); the owner cannot be removed (409), and someone who is not a member is a 404. What the membership admitted ends with it, in `HOOK_ORDER` once the row is gone: the tunnel clients the person owns in the org ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)), the live enrollment keys they minted there ([ephemeral-nodes.md](ephemeral-nodes.md#ephemeral-enrollment-keys)), their call seats, their room memberships. Answers `{removed: true}` whatever the hooks report; a failure there is logged. Devices the person enrolled stay |
 | GET | `…/member/me` | My membership + permissions |
 | GET/POST | `…/role` | List / create roles |
 | PUT/DELETE | `…/role/{role_id}` | Update / delete a role |
@@ -299,7 +347,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET/POST | `…/invite` | List / create invites |
 | POST | `…/invite/batch` | Batch email invites |
 | DELETE | `…/invite/{invite_id}` | Revoke |
-| GET | `…/search?q=` | Full-text search: messages, rooms, people |
+| GET | `…/search?q=` | Full-text search: messages of rooms the caller may read, rooms the caller may see listed (a Secret room only to its members), people |
 
 ### Rooms, chat, calls
 
@@ -314,37 +362,55 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET | `…/room/{rid}/call/participant` | Live participants |
 | GET/POST | `…/room/{rid}/message` | Paginated history / send |
 | GET | `…/message/pin` | Pinned messages |
-| PUT/DELETE | `…/message/{mid}` | Edit / delete |
+| PUT/DELETE | `…/message/{mid}` | Edit (the author's; 404 for anyone else) / delete (the author's; 403 for anyone else) |
 | PUT | `…/message/{mid}/pin` | Toggle pin |
 | GET | `…/message/{mid}/thread` | Thread replies |
 | POST | `…/message/{mid}/reaction` | Add reaction |
 | DELETE | `…/message/{mid}/reaction/{emoji}` | Remove reaction |
 | POST | `…/message/read` · `/read-all` | Read markers |
 | GET | `…/message/unread-count` | Unread count |
-| GET/POST | `…/room/{rid}/recording` | List / create recordings |
-| DELETE | `…/recording/{rec_id}` | Delete recording |
+| GET/POST | `…/room/{rid}/recording` | List / create recordings (the room guard, visibility included) |
+| DELETE | `…/recording/{rec_id}` | Delete a live recording of the path room: by whoever started it, or by a `MANAGE_CHANNELS` holder (403 for anyone else). A recording of another room or org, or a deleted one, answers 404, as a missing one does |
 
-A room or message response may carry `binding {module, ref}` — another module owns what it
-means (FR-90: an agent session's room, and the turn stubs in it). Chat stores it and never
-interprets it. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`).
-An agent's message is authored by its **session**: `author_id` is the session's id and
-`author_name` is `Claude · <device>`, the device named as the device list names it (its display
-name, else its machine's name; FR-116 AC4). The edit and delete routes match the author, so they
-refuse every person, the session's owner included — a stub reads as the agent's, and only the
-agent's session can change it.
+A room or message response may carry `binding {module, ref}`: another module owns what it
+means. Chat stores it and never interprets it, and no module sets it now. The rooms and turn
+stubs that parked FR-90 wrote still carry it (FR-137), and such a room opens as a plain Secret
+room. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`). A non-user
+author keeps its own name in `author_name`, and the edit and delete routes match the author, so
+they refuse every person on such a message.
+
+Every route with `{mid}` in its path resolves it as a live message of the path room, and that
+room must be one the caller may read: a Secret room answers 404 and a Private one 403, as the
+room routes do. A message attachment is a live file of the message's own room. A deleted
+message answers 404 on all of them, a repeat `DELETE`, a pin and an unpin included, and a write
+that raced the delete matches nothing, so the first removal time stays (#3327). A room that
+still carries a removal date, from before a room's `DELETE` removed it outright, answers as a
+missing one.
+
+A send names its thread with `thread_id` and may quote with `referenced_message_id`. Either must be
+a live message of the same room, or the send answers 404 and stores nothing. A thread lists the
+replies of its own room, and `mentions.users` notifies members of the room only.
 
 ### Files, tasks, export
+
+A file is reached through the room it was uploaded to. `…/file/{fid}` and its download answer
+only for a live file of a room the caller may read: a Secret room answers 404 and a Private one
+403. A room's file list and both uploads take a room of the org that the caller may read. The
+org's file list (`GET …/file`) lists, and names, only such rooms' files. A deleted file answers
+404 on its GET, its download and a repeat `DELETE`, and keeps its first removal time (#3327).
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `…/room/{rid}/file` · POST `…/file/upload` | Room-scoped files (100 MB limit) |
 | GET/POST | `…/file` · `…/file/upload` | Tenant file library |
 | GET | `…/file/{fid}` · `/download` | Metadata / streamed download |
-| DELETE | `…/file/{fid}` | Delete |
+| DELETE | `…/file/{fid}` | Delete (the uploader's; 403 for anyone else) |
 | POST | `…/file/{fid}/recognize` | AI document recognition (Claude vision) |
 | GET | `…/task` · `…/task/{tid}` · `/download` | Background tasks + results |
 | POST | `…/export/conversation` | XLSX export |
 | POST | `…/export/conversation-pdf` | PDF export |
+
+Both exports take `{room_id}`: a room of the path org that the caller may read. They resolve it as the room routes do, before a task is made. Another org's room answers 404, the same as a room that does not exist. A Secret room the caller is not in answers 404, and a Private one 403.
 
 ### Fleet — agents & remote sessions
 
@@ -352,28 +418,28 @@ agent's session can change it.
 |---|---|---|
 | GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3) |
 | GET | `…/device` | The unified devices grid (agents and tunnel clients), searched, sorted and paged on the server. FR-55 P4: an agent that is not online and announced a sleep carries `sleep {since, power}`, which the dashboard reads as **asleep** ([power.md](power.md) §3.4) |
-| POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
+| POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use). 403 for an **archived** org |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
-| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`, `…/transfer-activity/{aid}`) still resolve a removed device |
-| GET | `…/agent/{aid}/crash` | Crash reports |
-| POST/GET | `…/agent/{aid}/logs` | Log batch ingest (agent JWT) / admin listing |
+| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/agent/{aid}/crash`, `…/agent/{aid}/logs`, `…/recording-activity/{aid}`, `…/transfer-activity/{aid}`, `…/privacy-activity/{aid}`) still resolve a removed device |
+| GET | `…/agent/{aid}/crash` | The device's last 50 crash reports, newest first. `MANAGE_AGENTS`, decided before the device is looked up, so a caller without it gets one 403 `forbidden` whatever the id names. For a holder, another org's device or an id that names nothing is a 404, and a removed device still reads (an audit view) — see [security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub) |
+| POST/GET | `…/agent/{aid}/logs` | **POST** — log batch ingest (agent JWT). Every string of every line (`msg`, `target`, each string in `fields`) is scrubbed again on the way in. **GET** `?limit=1..=500` (default 50) — the device's uploaded batches of the last 7 days, newest first, under the same gate as `…/crash` |
 | POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |
 | POST | `…/agent/{aid}/exec/{request_id}/cancel` | Cancel a running exec |
 | PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |
 | POST | `…/agent/{aid}/overlay-key/rotate` | Order the device to retire its overlay (WireGuard) key — it mints locally, re-joins and reports back; the server never sees a private key (FR-40). `MANAGE_AGENTS`, one order per device per minute. 200 `{request_id, dispatch: "pushed" \| "queued", delivered}`; 409 `rate_limited` / `agent_unsupported` (online device without the `key-rotate` verb) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
-| GET/POST | `…/agent/{aid}/connect-code` | The code an outsider names a device by (FR-52). `MANAGE_AGENTS`, and never in the ordinary device list. **GET** reads it whether or not the device is approved: 200 `{connect_code, connect_code_rotated_at}`, both null when none has been minted; 404 for a removed device. **POST** mints or rotates it: 200 `{connect_code, rotated_at}`, and the old code stops working at once |
-| GET/PUT | `…/external-access` | FR-52 gate 1, the org's switch ([external-access.md](external-access.md)). GET `MANAGE_AGENTS`, with the approved devices. PUT `MANAGE_TENANT`: it decides whether the org can be reached from outside at all |
-| PUT | `…/agent/{aid}/external-access-policy` | FR-52 gate 2: approve a device, with a ceiling and an optional expiry, or clear it. `MANAGE_AGENTS` + `REMOTE_CONTROL` to approve, `MANAGE_AGENTS` alone to clear. Both arms and every refusal reach the log |
+| GET/POST | `…/agent/{aid}/connect-code` | The code an outsider names a device by (FR-52). `MANAGE_AGENTS`, and never in the ordinary device list. **GET** reads it whether or not the device is approved: 200 `{connect_code, connect_code_rotated_at}`, both null when none has been minted; 404 for a removed device. **POST** mints or rotates it: 200 `{connect_code, rotated_at}`, and the old code stops working at once; 404 for a removed device too |
+| GET/PUT | `…/external-access` | FR-52 gate 1, the org's switch ([external-access.md](external-access.md)). GET `MANAGE_AGENTS`, with the approved devices. PUT `MANAGE_TENANT`: it decides whether the org can be reached from outside at all, and turning it off ends the org's external sessions |
+| PUT | `…/agent/{aid}/external-access-policy` | FR-52 gate 2: approve a device, with a ceiling and an optional expiry, or clear it. `MANAGE_AGENTS` + `REMOTE_CONTROL` to approve, `MANAGE_AGENTS` alone to clear, and clearing ends the device's external sessions. Both arms and every refusal reach the log. 404 for a removed device, with nothing written and no row in the log |
 | GET | `…/external-rc-audit` | Every external-access decision, the refusals included, newest first (`page`, `per_page`). `VIEW_REMOTE_AUDIT`. 90 d TTL |
 | GET | `…/external-principals` | Who has come in from outside, one row per person per device, the most recent first (`page`, `per_page`): `{agent_id, user_id, name, first_session_at, last_session_at, revoked_at}`. `name` is what the account calls itself today, a claim, and `null` once it is gone. `VIEW_REMOTE_AUDIT` (FR-52 P5) |
-| PUT | `…/agent/{aid}/external-principals/{user_id}` | Bar a person from this device, or let them back: `{revoked}`. `MANAGE_AGENTS` to bar, + `REMOTE_CONTROL` to let back, decided before the row is read, so a refused caller gets one 403 whether or not the person came in. A bar ends their external session on whichever pod holds it. 404 for a person with no row: only a session makes one (FR-52 P5) |
+| PUT | `…/agent/{aid}/external-principals/{user_id}` | Bar a person from this device, or let them back: `{revoked}`. `MANAGE_AGENTS` to bar, + `REMOTE_CONTROL` to let back, decided before the row is read, so a refused caller gets one 403 whether or not the person came in. A bar ends their external session on whichever pod holds it. 404 for a person with no row: only a session makes one (FR-52 P5), and 404 for a removed device |
 | GET | `…/exec-audit` | Org-wide exec attempt log (every refusal included) |
 | GET/PUT | `…/exec-settings` | Org exec kill-switch (gate 1 of 4) |
 | GET/PUT | `…/keep-busy-settings` | The org's keep-busy policy (FR-92): `{keep_busy_denied, keep_busy_default_pattern}`. **GET: any member** (a viewer pre-selects the default). **PUT: `MANAGE_TENANT`**; each field optional, absent = unchanged, `keep_busy_default_pattern: null` = the product default (circle); a pattern not in the agent's exact wire list is a 400; a deny in the body is pushed to every device — see [keep-busy.md](keep-busy.md) §7, §12 |
 | GET | `…/keep-busy-history` | The **permanent** keep-busy history (FR-92 P7), newest first: `?agent_id=<hex>&before=<RFC 3339 \| unix ms>&limit=<1..=200, default 50>`. `MANAGE_AGENTS`; always tenant-scoped (another org's device id answers with nothing). `source: server` rows are the server's own decisions, `device` rows the device's claims from its heartbeats — see [keep-busy.md](keep-busy.md) §11 |
 | GET | `…/session/{sid}` | Remote-desktop session detail |
-| POST | `…/session/{sid}/terminate` | Force-terminate |
+| POST | `…/session/{sid}/terminate` | Force-terminate: `{terminated, row_ended, broadcast}`. `terminated`: this pod's hub held the session and ended it. `row_ended` (FR-138 P1b-2): no hub here held it, so its end was written to its row in this org while the row was live, where the device's claim and the viewer's rejoin read it; always `false` at window 0. The `terminate` control event then reaches a pod that holds it — see [remote-control.md](remote-control.md#1118-a-session-outlives-its-control-socket-the-servers-half-fr-138-p1b) |
 | GET | `…/session/{sid}/audit` | Session audit trail |
 | GET | `…/recording-activity/{aid}` | What a device reported about remote recordings (FR-85), newest first; `VIEW_REMOTE_AUDIT` — see [recording.md](recording.md) §10 |
 | GET | `…/transfer-activity/{aid}` | The clipboard and file traffic a device reported for remote sessions (FR-101 P3): counts, bytes, and a SHA-256 of each file name. Never content, never a name. Newest first; `VIEW_REMOTE_AUDIT`. A removed device's trail still resolves — see [remote-control.md](remote-control.md) §11.3a |
@@ -390,10 +456,10 @@ before it leaves the host.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `…/tunnel-client` | List enrolled tunnel clients |
-| POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token |
+| POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token (membership; 10 min, single-use). It acts for whoever minted it: their own new machine, or a machine id they may re-enroll ([rule](#authentication)). 403 for an **archived** org |
 | PUT/DELETE | `…/tunnel-client/{cid}` | Rename / relabel / re-tag a client · revoke it (releases its overlay node; a live session is kicked by the 60 s revocation sweep with `rc:tunnel.revoked`). Removal is final: from then on the client is a **404 on both routes** — PUT and a repeat DELETE — like the listing that no longer shows it. There is no GET by id; the listing is the only read |
-| GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny) |
-| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again |
+| GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny). **`MANAGE_AGENTS` on every tunnel-policy route, the reads too**, as on `…/overlay-acl`: a policy is an access grant, and the list is the org's whole tunnel ACL. The bit is decided first, before the body is validated or a policy looked up, so a member without it gets one 403 `forbidden` whatever the id names or the body says, never `not_a_member` (someone outside the org still gets that) — see [security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included) |
+| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD, `MANAGE_AGENTS` as above. For a holder, another org's policy or an id that names nothing is a 404, and a deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again. The forward itself reads no permission bit: the policy is the grant ([tunnels.md](tunnels.md#policy--two-independent-gates)) |
 
 ### Overlay network
 
@@ -403,152 +469,14 @@ before it leaves the host.
 | PUT | `…/overlay-node/{nid}/approved-routes` | `{approved_routes: ["10.0.0.0/24", …]}` — approve subnet-router routes (the data-plane signal) |
 | PUT | `…/overlay-node/{nid}/exit-node` | `{enabled: bool}` — designate an exit node (also adds `/0` to approved routes) |
 | DELETE | `…/overlay-node/{nid}` | Evict from the mesh + release the address back to the pool |
-| GET/POST | `…/overlay-acl` | Overlay L3 ACL policies |
+| GET/POST | `…/overlay-acl` | Overlay L3 ACL policies. `MANAGE_AGENTS` on every overlay-acl route, the reads and the mode too |
 | GET/PUT | `…/overlay-acl/mode` | Tenant posture: `off` (default) \| `warn` \| `enforce` |
+| GET/PUT | `…/overlay-retired-keys` | FR-40 P2: `{mode: "off" (default) \| "warn" \| "enforce"}` — whether a join or a DERP registration presenting a RETIRED overlay key (one a node moved away from) is refused `key_retired`. Under `enforce` a refused device that advertises `key-rotate` is ordered to rotate. `MANAGE_AGENTS` for both; a mode outside the three is a 400. Read per join, so a change disturbs no live session — see [overlay-key-rotation.md](overlay-key-rotation.md#retired-keys) |
 | GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the netmap compiler's set — it is never served, edited (in particular never re-`enabled`) or compiled again, and a repeat DELETE re-fans nobody |
-| GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
+| GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers. **GET: any member** (every node of the org receives them in its netmap). **PUT: `MANAGE_AGENTS`**, decided before the body is read: every node applies the settings, so a member without the bit gets one 403 `forbidden` whatever the body says, never `not_a_member` (someone outside the org still gets that) — see [security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it) |
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
 | POST | `…/overlay-block/reconcile-hosts` | FR-47 P3: return leaked host ordinals to the tenant's recycle pool, each through `release_host`. Platform operator only (anyone else gets 404); **dry-run by default** ([overlay-communication.md](overlay-communication.md), *Pre-release gaps*) |
-
-### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true` or a `hive.tenants` list)
-
-FR-90 P1g — and only for the organizations in `hive.tenants` (`ROOMLER__HIVE__TENANTS`,
-comma-separated ids; empty or `*` is every organization). A member of any other organization gets
-**404** on every route below (`agent sessions are not available to this organization`), the viewer
-answers `not_found`, and its devices are told to stop what they still run for it when they connect.
-Membership is checked first, so someone outside an organization learns nothing about whether it is
-served. A list mounts the module by itself, with no `[modules] hive` (P1g-2): the form a hosted
-server uses, because no older image reads a list as the switch — promoting one leaves the module
-off instead of open to every organization.
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/hive` | P1g — whether agent sessions serve this organization: `{enabled: true}`, or **404** where they do not. The SPA asks before it shows any of the module's pages |
-| POST | `…/hive/session` | `{device_id, folder, title?, role?}` — start an agent session on a device; `role` (FR-90 P3-2b) is a vault role the vault must allow the starter on that device first ([vault.md](vault.md) §8). Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit`, and with `hive.replicaset` on so is the session's placement (`action: place`, `placed` or `short`) |
-| GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
-| GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it. `origin` is `started` or, for a terminal session its owner adopted (P1j), `adopted`. `replicaset` (P2c-2b) is where its copies go, chosen when it started with `hive.replicaset` on, or when its primary first connected with it on (P2c-4b): `{policy_revision, min, max, restricted_tags, members[{device_id, role, state, refusal?, answered_at?, tip?}], short?, placed_at}`, `role` being `primary`, `archive`, `owner` or (P2f-1, a teleport's target) `teleport`, and `short` (`restricted` · `no_device`) present when it holds fewer than `min`. Each member's `state` (P2c-3a) is `pending`, `joined`, `refused` (`refusal` says which of the device's gates) or, once placement no longer chooses it (P2c-4a), `leaving`. The primary is `joined` from its placement, and `pending` while it is owed its join (P2c-4b: its session gained its first member after a start that said it had none), then `joined` or `refused` by its own answer. `tip` is where its copy ends as it last said: `{fence, seq, hash, checkpoint_seq?, checkpoint_hash?, at}`, and `holds` (P2j-1) is how much of the session's chain that copy holds, as a `seq`, counted by the rule a promotion is decided by: a tail past where its fence ended counts for nothing, so the freshest copy holds the most; absent without a `tip`. Absent for a session placed nowhere |
-| POST | `…/hive/session/{sid}/stop` | Stop it — the owner only: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
-| POST | `…/hive/session/{sid}/promote` | FR-90 P2e-3 — `{device_id, folder?}` — the owner, holding `HIVE_RUN`, moves the session to a member of its replicaset that took its copy. Always **200** for a well-formed request: `outcome` is `promoting` (the member is ready; the primary drains), `refused` (`reason` names the gate: the server's `org_archived` · `no_permission` · `session_not_running` · `promotion_in_progress` · `moved_too_often` · `not_a_member` · `not_freshest` · `already_primary` · `device_offline` · `device_unsupported` · `primary_offline` · `primary_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided` (P3-2b: a session with a vault role moves with it only as the vault allows it on the target), or the member's own start refusals) or `pending` (no answer within 10 s). The session's `promotion` (`{id, to, to_name, folder, from, from_fence, by, state, started_at, deadline, teleport?}`, `state` being `preparing` · `joining` · `draining` · `syncing` · `moving`) and its room say how it goes on. **404** with `hive.replicaset` off; every attempt is in `hive_audit` (`action: promote`) |
-| POST | `…/hive/session/{sid}/teleport` | FR-90 P2f-1 — `{device_id, folder?}` — the same, to a device that holds no copy of the session: it prepares without one, takes a copy in a `joining` step while the session still runs, then the drain, the sync and the move are a promotion's. `outcome` is `teleporting`, `refused` or `pending`. The refusals are the promotion's, with `already_a_member` (the device holds a copy: promote to it) in place of `not_a_member`; the primary must be online (`primary_offline`: a teleport copies from it), and both ends must advertise `hive-teleport`. Audited as `action: teleport` |
-| POST | `…/hive/session/{sid}/fork` | FR-90 P2f-3 — `{device_id, folder, title?}` — the owner, holding `HIVE_RUN`, makes a new session from this one's conversation, on a device that holds a copy of it (its primary, or a member that took its copy) or, from P2f-3c, on one that takes a copy first. The fork is a record of its own, its owner's, with its own room and replicaset under the session's restricted tags, naming the session in `parent_session_id`. The answer is a start's (`accepted` · `refused` · `pending`), or `joining` while a device with no copy takes one. The server's refusals: `org_archived` · `no_permission` · `not_forkable` (an adopted session) · `not_replicated` · `no_conversation` · `in_progress` · `no_copy` · `same_folder` · `restricted` · `copy_behind` · `device_offline` · `device_unsupported` · `primary_offline` · `primary_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided` (P3-2b: the parent's vault role, decided again for the fork's device). **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: fork`, naming the session it forks |
-| POST | `…/hive/session/{sid}/manage` | FR-90 P2f-4 — `{folder?}` — the owner, holding `HIVE_RUN`, makes their ended adopted session (P1j) a managed one: the SAME record, at its fence, on the device that adopted it, which resumes the terminal's own history (P2f-4a). `folder` defaults to the terminal's. The answer is a start's: `accepted`, `refused` (the server's `org_archived` · `no_permission` · `in_progress` · `not_adopted` · `not_ended` · `stopped` (its mirroring was stopped from Roomler) · `ended_otherwise` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's own start refusals) or `pending`. A start the device refuses, or that never reaches it, leaves the adopted session it was, the word kept as `from_terminal.refused`. The session's `from_terminal` (`{at, refused?}`) says it began in a terminal. **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: manage` |
-| DELETE | `…/hive/session/{sid}` | FR-90 P2g-2 — the owner, holding `HIVE_RUN`, purges the session from every device that held it (where it runs, its replicaset's members, where it ran before). The record becomes the purge's tombstone at once, read by nobody, the owner included; its room, core memory snapshot and approvals are deleted. Each device is sent `rc:hive.purge` while it is connected, and first at its next connection, until it answers. Always **200** for a well-formed request: `outcome` is `purging`, `purged` (every device answered, or none could be asked) or `refused` (`reason`: `no_permission` · `in_progress`, a promotion in flight); `purge` is `{id, session_id, reason, at, done_at?, devices[{device_id, state, store?, account?, detail?, answered_at?, closed?}]}`, `state` being `pending` · `done` · `closed` (`closed`: `device_removed` · `holds_nothing`), `detail` `device_unsupported` for a device whose agent does not purge yet; `forks` counts the sessions forked from it, which keep its conversation up to their fork. Asking again answers with the same purge. **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: purge` (`issued`, `refused`, `complete`) |
-| GET | `…/hive/session/{sid}/purge` | FR-90 P2g-2 — the owner's read of the purge of their session: the `purge` above, while it is pending and for 90 days after it completed. Its `reason` is `owner`, or (P2g-3a) `retention` for one the server's sweep issued once the session had been over for longer than the organization's `retention_days`. **404** for anyone else, for a session never purged, and with `hive.replicaset` off |
-| GET | `…/hive/session/{sid}/participant` | FR-90 P1c — who takes part: `items[{user_id, display_name, role}]`, `role` `owner` · `driver` · `reader`, and `may_manage` (the owner alone). For anyone who may read the session |
-| PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400**. An adopted session (P1j) takes readers only: a driver is a **409**, because the terminal holds the harness |
-| DELETE | `…/hive/session/{sid}/participant/{user_id}` | The owner takes someone out: out of the room, driving nothing, their views ended (`removed`). Idempotent |
-| GET | `…/hive/brain?device_id=` | FR-90 P1e — core memory the caller may read: the org's facts, their own, and with `device_id` that device's (a live device of this org; 404 otherwise). `{brain_rev, facts[{id, scope, owner_id?, text, kind, version, created_by, created_at, updated_by, updated_at}], budgets[{scope, owner_id?, used, budget}]}` |
-| POST | `…/hive/brain` | `{scope: "org" \| "user" \| "device", owner_id?, text, kind?}` — keep a fact: one line, at most 500 characters, `kind` one of `preference` · `convention` (the default) · `path` · `gotcha` · `decision` · `warning`. Org needs `ADMINISTRATOR`; user is the caller's own (`owner_id` defaults to them), with `HIVE_RUN`; device names a live device of this org, with `MANAGE_AGENTS` (**403** otherwise). A fact that does not fit its scope's budget (org 3,000, user 1,500, device 800 characters) is **409** `{error: "over_budget", message, scope, used, budget, needed}`; nothing is evicted |
-| PUT | `…/hive/brain/{fact_id}` | `{text, kind?, version}` — change a fact at the version read: **409** `conflict` when it changed or was archived since, **409** `over_budget` when it grows past the budget. Someone else's user fact is a **404** |
-| DELETE | `…/hive/brain/{fact_id}` | Archive a fact: out of every future snapshot and out of its budget, kept as a record. `{archived}` — `false` when it was not active |
-| GET | `…/hive/policy` | FR-90 P2c-2a — where the organization's sessions are copied, for any member: `{replicaset: {min, max, archive, prefer[], restricted_tags[]}, retention_days, archive_devices[], revision, is_default, updated_by?, updated_at?}`. Until an administrator writes one, decision 2's defaults (`is_default: true`, `revision: 0`). **404** while the server's `hive.replicaset` is off |
-| PUT | `…/hive/policy` | `{replicaset, retention_days, archive_devices[], revision}` — an `ADMINISTRATOR` sets it from the `revision` they read (**403** otherwise): `min` 1–8, `max` `min`–8, `prefer` only `owner_devices`, `restricted_tags` normalized as device tags are, `retention_days` 0–3650 (0 keeps sessions for ever), at most 16 archive devices, each a live device of this organization and not ephemeral (**400** otherwise). A write from a revision no longer stored is **409**. Every attempt is audited (`hive_audit`, `action: policy`), and a stored one places the organization's live sessions again (P2c-4a). **404** while `hive.replicaset` is off |
-
-Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
-output — see [the design](roomler-hive-design.md) §3.3. Core memory is the one exception by design:
-curated facts, never a session's content. Every write is audited (`hive_audit`, `action: brain`),
-and every write bumps the org's `brain_rev`. A session pins it when it starts and gets a frozen
-snapshot of it (`rc:hive.memory`, sent just before `rc:hive.start` to a device that advertises
-`hive-memory`).
-
-**Reading a session (P0d-2) is not a route.** A member of the session's room sends
-`hive:view.open {session_id}` on the user WebSocket ([real-time.md](real-time.md)). The server
-checks org and room membership (anyone else gets `not_found`), the device (online, advertising
-`hive-view`) and a rate (20 opens per minute per user and session). It then mints a grant, and
-answers `hive:view.ready` with ICE servers only once the device has confirmed it. Refusals name
-who said no: the server's `not_found` · `device_offline` · `device_unsupported` ·
-`too_many_views` · `rate_limited` · `no_answer`, or the device's `hive_disabled` · `no_session` ·
-`at_capacity`. The transcript itself flows browser ⇄ device over the peer and never through the
-server. The starter of a live session may prompt it; everyone else reads. Every open is in
-`hive_audit` (`action: view`).
-
-**Searching (P2i-2) is not a route either.** A member sends `hive:search.open {tenant_id}` on the
-user WebSocket. The server checks the organization (copies on, served, the asker a member; anyone
-else gets `not_found`), then the policy's designated archive replicas online here that advertise
-`hive-search` (none: `no_archive_replica`), one connection's grants and a rate (20 opens per minute
-per user and organization). It names the sessions the asker may read whose copy the archive
-replica holds, at most 500, the most recently active first (none: `no_session`), and answers
-`hive:search.ready` with ICE servers and how many sessions it named once the device has confirmed
-the grant. The rest of the handshake is a view's, by its grant. The query and every hit flow
-browser ⇄ device over the peer and never through the server. Every open is in `hive_audit`
-(`action: search`, with the count, never a query). `GET …/hive` answers `search`: whether the
-organization can be searched, for the SPA's box.
-
-**Adopted sessions (P1j) are not started by a route either.** A person adopts the Claude Code
-sessions they run in a terminal (`roomler hive adopt`, on a device whose owner allows it:
-`hive_adopt`, advertised as `hive-adopt`). The device offers each one with `rc:hive.adopt
-{adopt_id, harness_session, keys, account, folder}`. The answer is `rc:hive.adopt_ack {adopt_id,
-session_id, fence}`, or `{adopt_id, refused}`: `hive_not_enabled` · `rate_limited` · `no_account`
-· `ambiguous_account` · `not_a_member` · `at_capacity`. The keys are the device's `hive_accounts` keys
-for that account. The server adopts only when they name exactly one person, a member of the org:
-an account two people share is refused, never attributed by guess. The record reads like any
-session's, with `origin: "adopted"`. It is its owner's alone, readers by name, no drivers. It is
-named after its folder, because a terminal's first prompt is content. An offer for a terminal
-session already held is answered with the same record. Every adoption is in `hive_audit`
-(`action: adopt`).
-
-### Vault (FR-90 P3-1, module `vault` — mounted only with `[modules] vault = true` or a `vault.tenants` list)
-
-The org gate reads like Hive's: `vault.tenants` (`ROOMLER__VAULT__TENANTS`) names the organizations
-served, a list mounts the module by itself, and a member of any other organization gets **404**
-(`the vault is not available to this organization`) after the membership check. Every route is
-for the organization's `ADMINISTRATOR`s (**403** otherwise), and **no route answers a value**.
-The vault lends to a served organization's PEOPLE (`roomler connect`, P3-9-1) only where
-`vault.people` (`ROOMLER__VAULT__PEOPLE`) lists it, opt-in and empty by default.
-Every `secret:*` and `vault:verify` decision is recorded in `vault_audit`, allow and deny; an allow
-is written before it is acted on. Full treatment: [vault.md](vault.md).
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/vault` | `{enabled, kek: {state: ready · missing · invalid, recipient? \| reason?}, secrets, versions, other_kek}` — `other_kek` counts the versions wrapped to another KEK than the one loaded |
-| GET | `…/vault/secret` | The live secrets, by path (`?prefix=` a folder). Metadata only, each with its `rrn` (`rrn:{org slug}:secret:{path}`) and the fields that hold a value |
-| POST | `…/vault/secret` | `{path, kind: static · structured, description?, audiences?, exec_allow?, tags?, rotation_days?, disabled?, owner_id?}` — **201**; **409** when a live secret holds the path; **422** for an unknown field, `value` included |
-| GET | `…/vault/secret/{id}` | One secret and `versions[]` — `{field, n, current, kek, created_by, created_at, expires_at}`, never the sealed bytes |
-| PATCH | `…/vault/secret/{id}` | Its rules; `path` and `kind` never change (**422**). `rotation_days: 0` clears it |
-| DELETE | `…/vault/secret/{id}` | Tombstone it and destroy every version: `{deleted: true, versions_destroyed}` |
-| PUT | `…/vault/secret/{id}/value` | `{field?, value, expires_at?}` — the field's next version, sealed: `{field, n, created_at, expires_at}`. **503** without a usable KEK |
-| POST | `…/vault/verify` | Open every version (up to 10,000): `{versions, ok, failed, failures[{secret_id, field, n, reason: other_kek · dek_unreadable · tampered}], truncated}`. **503** without a usable KEK |
-| GET | `…/vault/audit` | The decisions, newest first (`?before=` RFC 3339, `?limit=` 1–200) |
-| GET | `…/vault/activity` | P3-4d — what devices **report** doing with their leases, newest first (`?session_id=`, `?lease_id=`, `?before=` RFC 3339, `?limit=` 1–200): `{id, at, device_id, session_id, fence, kind: exec · render, lease_ids, target, exit_code, timed_out}`. Claims, never decisions; an empty answer is not evidence of disuse |
-| GET | `…/vault/approval/{approval_id}` | P3-4e — an approval card as its session's readers see it: `{id, session_id, device_id, secret_id, rrn, field, mode, audience, ttl_s, status, requested_at, expires_at, answered_by, answered_at, lease_id, used_at, may_answer, may_approve}` (`may_approve`: the caller drives it now and the policy would take their yes); one past its deadline answers `expired`, one whose session moved or ended `withdrawn`. 404 for a caller who does not read the session, as for an id that names nothing |
-| POST | `…/vault/approval/{approval_id}` | P3-4e — a driver's answer, `{answer: "approve" \| "deny"}`; a yes is decided by Cedar with the caller as the approver first. 403 for a caller who does not drive the session now, or whose yes the policy does not accept; 409 once it is answered, used, expired or withdrawn ([vault.md](vault.md) §18) |
-| GET | `…/vault/schema` | P3-2a — `{schema, actions, modes, oses, secret_prefix}`: what a policy is written against |
-| GET · POST | `…/vault/role` | P3-2a — the vault roles; `{name, description?}` declares one (**409** when a live role holds the name) |
-| DELETE | `…/vault/role/{name}` | P3-2a — tombstone a role; **409** naming the live policies that still name it |
-| GET · POST | `…/vault/policy` | P3-2a — the guardrails, then the organization's policies (`{id, name, description, text, effect, guardrail, rev, …}`); `{name, description?, text}` adds one, checked first (**400** in words) |
-| GET · PUT · DELETE | `…/vault/policy/{id}` | P3-2a — one policy; `PUT {name, description?, text, rev}` replaces it from the revision read (**409** if it moved); a `guardrail:*` id is **400** for `PUT` and `DELETE` |
-| POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing. Also `secret:list`, `net:socks`, `net:forward` and `ssh:run`, and (P3-9-1) `secret:connect`: `principal.user_id` must be the device's `owner_id`, with no `mode`, and (P3b-1a) `net:egress`: a `host` and a `port`, the host decided in its one spelling, with no `resource` ([vault.md](vault.md) §7, §24) |
-| POST | `…/vault/simulate/replay` | P3-2b — `{with?, without?, days?}` (1–7, default 7): the recorded Cedar decisions of those days, each decided again from the request it recorded → `{days, replayed, unreadable, flipped, flips[{at, action, op, user_id, target, session_id, device_id, was, now, determining}], truncated}`. Decides nothing for real; records nothing |
-
-### Knowhow (FR-90 P4-1, module `knowhow` — mounted only with `[modules] knowhow = true` or a `knowhow.tenants` list)
-
-The org gate reads like the vault's: `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS`) names the
-organizations whose map is kept, a list mounts the module by itself, and a member of any other
-organization gets **404** (`knowhow is not available to this organization`) after the membership
-check. Reads need `KNOWHOW_VIEW` (from `member` up), writes `KNOWHOW_EDIT` (`admin`), which
-includes reading. Every id resolves within the organization, every write is a compare-and-set on
-`rev` appended to `knowhow_history`, and the map grants nothing. Full treatment:
-[knowhow.md](knowhow.md).
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/knowhow` | `{entities, edges}`, the live counts |
-| GET | `…/knowhow/search` | `?q=&kind=&env=&limit=` (1–200, default 50) → `{entities[{id, kind, key, name, env?, status, rev, updated_at}], truncated}`, by kind and key; `q` matched as written, case aside |
-| GET | `…/knowhow/entity?kind=…&key=…` | One live entity's card, by its name |
-| GET | `…/knowhow/entity/{id}` | Its card: `{entity{id, kind, key, name, env?, owner_id?, attrs, facts[{path, value, source, by?, device?, observed_at, verified_at?, verified?, status}], status, source, device?, rev, created_by?, created_at, updated_by?, updated_at}, links[{direction: out · in, edge, other}], truncated, probes, probes_truncated}`; `device` (P4-3a-2) names a scan's device; a fact's `verified` (P4-5) is `{at, probe, from_device, rtt_ms?, carrier?, ok}`, what the last probe that measured it found; `probes` (P4-5-4) holds each device's last probe of the entity that found something (`ok` or `unreachable`), a row of each kind (`tcp`, `tls`; P4-5-4b), at most 16 devices, the newest first, each as `GET …/knowhow/probe` shows one, and `probes_truncated` says there were more |
-| GET | `…/knowhow/map/{id}` | Its neighbourhood: `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` |
-| GET | `…/knowhow/history` | The writes, newest first (`?entity=` one entity's, its links' included; `?limit=` 1–200) → `{history[{id, target, target_id, entity_ids, rev, op, source, by?, device?, at, set}]}` |
-| POST | `…/knowhow/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` — **201**; **409** when a live entity holds the kind and key; **400** for `machine` (the fleet's sync records machines) or a spelling outside the rules; **422** for an unknown field |
-| PATCH | `…/knowhow/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?}` — `facts` merged by path, null removing one; `""` clears `env` and `owner_id`; **409** at a rev already gone; `kind` and `key` never change (**422**); P4-2a — a machine's name, owner and synced facts are the fleet's (**400**); P4-2b — a person's own facts on a machine stop at 49, beside the 15 the sync and its scans keep room for (**400**); P4-3a-2 — a scan entity's name, owner and scanned facts, a machine's `tunnel.declared` and any fact a scan said are its device's (**400**), and a person's own facts on a scan entity stop at 55 |
-| DELETE | `…/knowhow/entity/{id}?rev=…` | Archive it and its links: `{archived, links_archived}`; **400** for a machine, which leaves the map when its device is removed, and for a scan entity (P4-3a-2), which leaves when its device's scans no longer report it |
-| POST | `…/knowhow/edge` | `{from, to, kind, attrs?}` — **201**; **409** when already linked by that kind; **404** for an end that is not a live entity of the organization |
-| PATCH | `…/knowhow/edge/{id}` | `{rev, attrs}` — its attributes, replaced |
-| DELETE | `…/knowhow/edge/{id}?rev=…` | Archive the link: `{archived}` |
-| POST | `…/knowhow/scan` | P4-3a-1 — `{device}`: ask a device to scan, `KNOWHOW_EDIT` → **202** with the scan, or the device's pending one (never doubled); **409** for a device whose last hello did not advertise `knowhow-scan`, or a secondary enrollment; **404** for one that is not the organization's |
-| GET | `…/knowhow/scan?device=…` | A device's scans, newest first → `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts{checkouts, contexts, listeners, tunnel_routes, unknown, refused}, truncated?, detail?, written?{checkouts, endpoints, repos, clusters, links, retired, full}}]}`; `state` is `requested` · `delivered` · `done` · `no_roots` · `failed` · `expired`; `written` (P4-3a-2) once its findings are on the map |
-| POST | `…/knowhow/probe` | P4-5-1a — `{entity, device, kind: tcp · tls}`: ask a device to probe an entity, `KNOWHOW_EDIT` → **202** with the probe, or the device's pending one when it is this same probe; the target is read from the entity's facts (`address` or `host`, `port`, `sni`), never from the request. **400** for an entity whose facts say nowhere a probe reaches (no host or port, a link-local or metadata address, a listener's bind address, a loopback address from another device) or a kind not known; **409** for a device without `knowhow-probe`, a secondary enrollment, or one running another probe; **429** past 30 a minute for the device; **404** for an entity or a device that is not the organization's |
-| GET | `…/knowhow/probe?entity=…` or `?device=…` | An entity's probes or a device's, newest first → `{probes[{id, entity_id, device_id, requested_by?, requested_at, kind, target{host, from, port, sni?}, state, delivered_at?, answered_at?, rtt_ms?, address?, carrier?, tls?{names, fingerprint}, detail?, measured?[{path, ok}]}]}`; `state` is `requested` · `delivered` · `ok` · `unreachable` · `not_allowed` · `failed` · `expired` |
 
 ### Observability
 

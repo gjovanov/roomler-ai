@@ -8,8 +8,23 @@
 # whole point. Re-run it after any change to the compose file or the doc.
 #
 #   bash scripts/selfhost-smoke.sh        # ~/selfhost-test, log at ~/selfhost-run.log
+#     --ref <ref>   clone this branch or tag instead of the default branch
+#     --pull        the Quickstart's `pull` + `up -d` instead of the source build, which
+#                   a small machine cannot run: about a minute, and it needs ~4 GB of RAM
 set -uo pipefail
 
+REF=""
+PULL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ref) REF=$2; shift 2 ;;
+    --pull) PULL=1; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+# The check comes from this script's own checkout, so a --ref older than the check still gets it.
+HERE="$(cd "$(dirname "$0")" && pwd)"
 RUN=~/selfhost-test
 LOG=~/selfhost-run.log
 : > "$LOG"
@@ -28,9 +43,9 @@ if [ -d "$RUN" ]; then
 fi
 
 # --- STEP 1: the document's clone ------------------------------------------
-say "STEP 1  git clone (document says: git clone https://github.com/gjovanov/roomler-ai.git)"
+say "STEP 1  git clone (document says: git clone https://github.com/gjovanov/roomler-ai.git)${REF:+, at $REF}"
 T0=$(date +%s)
-git clone --depth 1 https://github.com/gjovanov/roomler-ai.git "$RUN" >>"$LOG" 2>&1 \
+git clone --depth 1 ${REF:+--branch "$REF"} https://github.com/gjovanov/roomler-ai.git "$RUN" >>"$LOG" 2>&1 \
   || { say "FAIL: clone"; exit 1; }
 cd "$RUN"
 say "        cloned in $(( $(date +%s) - T0 ))s, HEAD=$(git rev-parse --short HEAD)"
@@ -54,10 +69,16 @@ sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$MINIOPW|" .env.selfhost
 say "        filled; remaining empty REQUIRED values: $(grep -cE '^(ROOMLER_JWT_SECRET|ROOMLER_TURN_SECRET|MONGO_ROOT_PASSWORD|MINIO_ROOT_PASSWORD)=$' .env.selfhost)"
 
 # --- STEP 3: the document's up ---------------------------------------------
-say "STEP 3  docker compose ... up -d --build   (document claims 10-20 min first build)"
 BUILD_T0=$(date +%s)
-docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build >>"$LOG" 2>&1
-RC=$?
+if [ "$PULL" = 1 ]; then
+  say "STEP 3  docker compose ... pull, then up -d   (the document's Quickstart)"
+  docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull >>"$LOG" 2>&1     && docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d >>"$LOG" 2>&1
+  RC=$?
+else
+  say "STEP 3  docker compose ... up -d --build   (document claims 10-20 min first build)"
+  docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build >>"$LOG" 2>&1
+  RC=$?
+fi
 BUILD_SECS=$(( $(date +%s) - BUILD_T0 ))
 say "        up exited rc=$RC after ${BUILD_SECS}s ($(( BUILD_SECS / 60 ))m$(( BUILD_SECS % 60 ))s)"
 if [ $RC -ne 0 ]; then
@@ -88,5 +109,14 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ 2>&1)
 say "        GET / -> $CODE"
 say "        install.sh -> $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/setup/install.sh)"
 say "        stripe/plans -> $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/stripe/plans)"
+
+# --- STEP 6: the relay, about which /health says nothing --------------------
+say "STEP 6  bash scripts/selfhost-coturn-check.sh  (document's own command)"
+bash "$HERE/selfhost-coturn-check.sh" --file "$PWD/docker-compose.selfhost.yml" --env-file "$PWD/.env.selfhost" 2>&1 | tee -a "$LOG"
+RC=$?
+if [ $RC -ne 0 ]; then
+  say "FAIL: the coturn check exited $RC"
+  exit 1
+fi
 
 say "=== P0 COMPLETE — build ${BUILD_SECS}s ==="

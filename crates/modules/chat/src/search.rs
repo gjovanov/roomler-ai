@@ -83,9 +83,15 @@ pub async fn search(
 
     let limit = query.limit.min(50) as i64;
 
+    // What the caller may reach: messages of the rooms they may read, and the
+    // rooms they may see listed (a Secret room only to its members), by the
+    // room guard's rule over every room of the org.
+    let reach = crate::guards::room_reach(&state, tid, auth.user_id).await?;
+
     // Search messages in tenant
     let msg_filter = doc! {
         "tenant_id": tid,
+        "room_id": { "$in": reach.readable.clone() },
         "deleted_at": null,
         "thread_id": null,
     };
@@ -107,7 +113,7 @@ pub async fn search(
         .unwrap_or_default();
 
     // Batch-fetch room names for message enrichment
-    let room_name_map = fetch_room_names(&state, &msg_room_ids).await;
+    let room_name_map = fetch_room_names(&state, tid, &msg_room_ids).await;
 
     let message_results: Vec<SearchMessageResult> = messages
         .into_iter()
@@ -140,6 +146,7 @@ pub async fn search(
     // Search rooms in tenant
     let room_filter = doc! {
         "tenant_id": tid,
+        "_id": { "$in": reach.listed.clone() },
         "deleted_at": null,
     };
     let rooms = state
@@ -189,8 +196,13 @@ pub async fn search(
     }))
 }
 
-/// Fetch room names for a list of room IDs and return a map.
-async fn fetch_room_names(state: &ChatState, room_ids: &[ObjectId]) -> HashMap<ObjectId, String> {
+/// Fetch room names for a list of room IDs, within the tenant, and return a
+/// map.
+async fn fetch_room_names(
+    state: &ChatState,
+    tenant_id: ObjectId,
+    room_ids: &[ObjectId],
+) -> HashMap<ObjectId, String> {
     use futures::TryStreamExt;
 
     let mut result = HashMap::new();
@@ -202,7 +214,7 @@ async fn fetch_room_names(state: &ChatState, room_ids: &[ObjectId]) -> HashMap<O
         .iter()
         .map(|id| bson::Bson::ObjectId(*id))
         .collect();
-    let filter = doc! { "_id": { "$in": ids_bson } };
+    let filter = doc! { "_id": { "$in": ids_bson }, "tenant_id": tenant_id };
     let projection = doc! { "_id": 1, "name": 1 };
 
     let coll = state

@@ -717,7 +717,7 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: PrivacyCtx) {
                     let msg = StateMsg::new(&id, session.is_on(), None).muted(session.host_muted());
                     send(&dc, &msg).await;
                 }
-                Err(e) => warn!(%e, "privacy DC: unparseable message"),
+                Err(e) => warn!(e = ?e.to_string(), "privacy DC: unparseable message"),
             }
         })
     }));

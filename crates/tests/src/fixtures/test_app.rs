@@ -474,6 +474,8 @@ fn test_settings() -> Settings {
         },
         redis: roomler_ai_config::RedisSettings {
             url: "redis://127.0.0.1:6379".to_string(),
+            response_timeout_ms: 3000,
+            connection_timeout_ms: 3000,
         },
         s3: roomler_ai_config::S3Settings {
             // Tests run on the local-disk backend — the file_tests suite
@@ -516,14 +518,6 @@ fn test_settings() -> Settings {
         // cost therefore reads "not priced" rather than 0.00.
         relay_costs: roomler_ai_config::RelayCosts::default(),
         modules: roomler_ai_config::ModulesSettings::default(),
-        // FR-90 P1g — every organization, as a deployment without `[hive]`.
-        hive: roomler_ai_config::HiveSettings::default(),
-        // FR-90 P3-1 — every organization and no KEK, as a deployment
-        // without `[vault]`; a vault test makes its own KEK.
-        vault: roomler_ai_config::VaultSettings::default(),
-        // FR-90 P4-1 — every organization, as a deployment without
-        // `[knowhow]`.
-        knowhow: roomler_ai_config::KnowhowSettings::default(),
         // #1731 — inert here: the stall watchdog is armed by the binary's
         // `main`, which these in-process servers never run.
         diag: roomler_ai_config::DiagSettings::default(),

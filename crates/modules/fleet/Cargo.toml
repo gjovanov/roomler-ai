@@ -43,6 +43,13 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# #3517 — the agent socket's disconnect line names a failed read's kind, which
+# means reading back the error axum wraps (`socket_end::error_kind`). ⚠️ This
+# must be the tungstenite axum links (axum 0.8 → tokio-tungstenite 0.29 →
+# tungstenite 0.29), or the downcast matches nothing and every error reads
+# `other`; `socket::tests::a_dropped_tcp_leg_reads_eof` fails first. Not the
+# workspace's `tokio-tungstenite` (0.28, the clients').
+tungstenite = { version = "0.29", default-features = false }
 uuid.workspace = true
 
 [dev-dependencies]

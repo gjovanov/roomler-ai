@@ -15,7 +15,10 @@
 //!   claim on the other pod still reaches the caller;
 //! - only the service publishes its endpoint, and re-anchoring retires it;
 //! - `ssh_audit.ran_as` records who served it; the kill switch restores the
-//!   worker path.
+//!   worker path;
+//! - #3511: on both paths the target's `expires_at_ms` (the worker's frame,
+//!   the service's claim) carries the device-leg slack, and the caller's
+//!   does not.
 
 use std::time::{Duration, Instant};
 
@@ -135,22 +138,6 @@ async fn claim(app: &TestApp, service: &str, grant_id: &str) -> reqwest::Respons
         .send()
         .await
         .unwrap()
-}
-
-/// FR-90 P3-8-2a — a claim from a service that holds an agent session's
-/// grant to one command, as its build says on every claim.
-async fn claim_holding_one_command(
-    app: &TestApp,
-    service: &str,
-    grant_id: &str,
-) -> reqwest::Response {
-    app.auth_post(
-        &format!("/api/agent/service/ssh/{grant_id}/claim?one_command=true"),
-        service,
-    )
-    .send()
-    .await
-    .unwrap()
 }
 
 /// A Windows device on the mesh: enrolled, an overlay address, SSH policy
@@ -342,6 +329,22 @@ async fn send_ack(ws: &mut AgentWs, grant_id: &str, refused: Option<&str>) {
         .unwrap();
 }
 
+/// #3511 — the target's `expires_at_ms` is the caller's plus
+/// `DEVICE_EXPIRY_SLACK_SECS`, so an agent from before the fix tolerates that
+/// much clock skew, and the caller's copy carries none. Both come from one
+/// reading of the server's clock, so the difference is exact.
+fn assert_target_copy_carries_the_slack(body: &Value, target_expires_at_ms: u64) {
+    use roomler_ai_remote_control::models::ssh_limits;
+    let caller = body["expires_at_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the caller's expires_at_ms: {body}"));
+    assert_eq!(
+        target_expires_at_ms,
+        caller + ssh_limits::DEVICE_EXPIRY_SLACK_SECS * 1000,
+        "the target's copy, against the caller's: {body}"
+    );
+}
+
 async fn audit_rows(app: &TestApp, seeded: &SeededTenant) -> Vec<Value> {
     let audit: Value = app
         .auth_get(
@@ -393,13 +396,17 @@ async fn a_grant_goes_to_the_service_and_its_claim_confirms_it() {
         let grant: Value = claimed.json().await.unwrap();
         assert_eq!(grant["public_key"], json!(session_key()));
         assert_eq!(grant["account_mode"], json!("daemon"));
-        (grant_id, Instant::now())
+        // What the service hands `record_grant`: the worker's copy.
+        assert_eq!(grant["expires_at_ms"], frame["expires_at_ms"], "{grant}");
+        let target_expiry = grant["expires_at_ms"].as_u64().expect("expires_at_ms");
+        (grant_id, Instant::now(), target_expiry)
     };
     let caller = async {
         let body = request_session(&app, &seeded, &dev.agent_id).await;
         (body, Instant::now())
     };
-    let ((grant_id, claimed_at), (body, answered_at)) = tokio::join!(target, caller);
+    let ((grant_id, claimed_at, target_expiry), (body, answered_at)) = tokio::join!(target, caller);
+    assert_target_copy_carries_the_slack(&body, target_expiry);
 
     assert!(
         answered_at >= claimed_at,
@@ -469,10 +476,12 @@ async fn without_both_halves_the_grant_goes_to_the_worker() {
             );
             let grant_id = frame["grant_id"].as_str().unwrap().to_string();
             send_ack(&mut dev.ws, &grant_id, None).await;
+            frame["expires_at_ms"].as_u64().expect("expires_at_ms")
         };
-        let (body, ()) = tokio::join!(request_session(&app, &seeded, &agent_id), target);
+        let (body, target_expiry) = tokio::join!(request_session(&app, &seeded, &agent_id), target);
         assert_eq!(body["port"], json!(2222), "{body}");
         assert_eq!(body["host_pubkey"], json!(worker_key()), "{body}");
+        assert_target_copy_carries_the_slack(&body, target_expiry);
     }
     let rows = audit_rows(&app, &seeded).await;
     assert_eq!(
@@ -746,108 +755,4 @@ async fn the_kill_switch_restores_the_worker_path() {
     };
     let (body, ()) = tokio::join!(request_session(&app, &seeded, &dev.agent_id), target);
     assert_eq!(body["port"], json!(2222), "{body}");
-}
-
-/// FR-90 P3-8-2a — the claim is where an agent session's grant would reach a
-/// service too old to hold it to one command, so it is the backstop:
-/// - such a grant is not handed to a claim that does not say
-///   `one_command=true` (the same 404 as every other refusal, audited
-///   `claim_refused`), and is to one that does, the word with it;
-/// - a person's grant is still handed to a claim that says nothing, which is
-///   the positive control;
-/// - what the service publishes of one command is what the record holds, and
-///   false when it says nothing.
-///
-/// No policy admits a session before decision 22, so the session's grant is
-/// written as `decide` would write it.
-#[tokio::test]
-async fn a_sessions_grant_is_claimed_only_by_a_service_that_holds_one_command() {
-    use roomler_ai_remote_control::models::SshPending;
-    use roomler_ai_services::dao::ssh_pending::SshPendingDao;
-
-    let app = TestApp::spawn().await;
-    let seeded = app.seed_tenant("sshonecmd").await;
-    enable_org_ssh(&app, &seeded).await;
-    let dev = device(
-        &app,
-        &seeded,
-        "win-onecmd",
-        "100.64.0.71",
-        "daemon",
-        "system",
-        SERVICE_CAPABLE,
-    )
-    .await;
-    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
-    let aid = ObjectId::parse_str(&dev.agent_id).unwrap();
-
-    // The record holds what the service said of one command.
-    let held = || async {
-        let row = app
-            .db
-            .collection::<bson::Document>("agents")
-            .find_one(bson::doc! { "_id": aid })
-            .await
-            .unwrap()
-            .expect("the device's row");
-        row.get_document("ssh_service")
-            .expect("an endpoint")
-            .get_bool("one_command")
-            .unwrap_or(false)
-    };
-    assert!(!held().await, "published without the word");
-    let republished = publish(
-        &app,
-        &dev.service,
-        json!({ "host_pubkey": service_key(), "ceiling": "system", "one_command": true }),
-    )
-    .await;
-    assert_eq!(republished.status(), 200);
-    assert!(held().await, "published with it");
-
-    let now = bson::DateTime::now();
-    let at = |secs: i64| bson::DateTime::from_millis(now.timestamp_millis() + secs * 1000);
-    let row = |grant_id: &str, one_command: bool| SshPending {
-        id: None,
-        grant_id: grant_id.to_string(),
-        tenant_id: tid,
-        agent_id: aid,
-        public_key: session_key(),
-        caller: "agent session 0 of someone (via a device)".to_string(),
-        account_mode: "daemon".to_string(),
-        expires_at_ms: (now.timestamp_millis() + 60_000) as u64,
-        session_secs: 60,
-        consent_mode: None,
-        one_command,
-        state: SshPending::PENDING.to_string(),
-        created_at: now,
-        claim_by: at(10),
-        expires_at: at(120),
-        claimed_at: None,
-    };
-    let dao = SshPendingDao::new(&app.db);
-    let (person, session) = (ObjectId::new().to_hex(), ObjectId::new().to_hex());
-    dao.insert(&row(&person, false)).await.unwrap();
-    dao.insert(&row(&session, true)).await.unwrap();
-
-    // A person's grant, to a claim that says nothing: handed over, as before.
-    let claimed = claim(&app, &dev.service, &person).await;
-    assert_eq!(claimed.status(), 200, "the positive control");
-    let body: Value = claimed.json().await.unwrap();
-    assert!(body.get("one_command").is_none(), "{body}");
-
-    // A session's, to a claim that says nothing: refused, and audited.
-    assert_eq!(claim(&app, &dev.service, &session).await.status(), 404);
-    let rows = audit_rows(&app, &seeded).await;
-    assert!(
-        rows.iter()
-            .any(|r| r["denied"] == json!("claim_refused") && r["grant_id"] == json!(session)),
-        "the refused claim is audited: {rows:?}"
-    );
-
-    // …and to a claim that holds one command: handed over, with the word.
-    let claimed = claim_holding_one_command(&app, &dev.service, &session).await;
-    assert_eq!(claimed.status(), 200);
-    let body: Value = claimed.json().await.unwrap();
-    assert_eq!(body["one_command"], json!(true), "{body}");
 }

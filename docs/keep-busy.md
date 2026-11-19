@@ -66,8 +66,8 @@ flowchart LR
 
 The engine is one std thread, `keep-busy`. It never touches the OS injector
 itself. It asks the input arbiter to read or move the pointer: the one injector,
-created lazily and cached for the life of the process
-(`input/arbiter.rs` `keep_busy_op`, L953).
+created lazily and cached, and opened again while it has no permission
+(`agents/roomlerd/src/input/arbiter.rs:1594` `keep_busy_op`; #2066).
 
 | Rule | Where |
 |---|---|
@@ -76,6 +76,25 @@ created lazily and cached for the life of the process
 | Every injected controller event bumps a counter the engine reads, so remote activity is known exactly. A heartbeat or a denied event is not counted | `input/arbiter.rs` L805, `keep_busy::note_remote_input` |
 | Only a session holding **INPUT** may set it, and in exclusive mode only the floor holder | `input/arbiter.rs` `keep_busy_may_set`, L523 |
 | An injector with **no pixel space** (uinput, below the compositor) is moved by a **fraction of the desktop** instead (`KbOp::MoveNorm`), under the same held-button rule | `input/arbiter.rs` `keep_busy_op`; `uinput_backend.rs` `move_norm` |
+
+**On the daemon's virtual desktop, keep busy follows its X server** (#3918).
+Its moves go through the arbiter's one injector, so when the desktop's X
+server exits and comes back
+([`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918))
+they follow that injector to the new server with no daemon restart
+([`remote-control.md` §6.1c](remote-control.md#61c-the-injector-follows-the-virtual-desktop-3918)).
+While the desktop is down a tick fails quietly: keep busy's own X connection
+drops and is tried again every 5 s (`X11Host::conn`,
+`agents/roomlerd/src/keep_busy/host_x11.rs:323`; `RECONNECT_EVERY`, `:45`),
+both at `DEBUG`; the engine finds no session, so its state reads locked or no
+session, which is what the viewer and the tray show, and it asks the arbiter
+nothing. A move that reaches the arbiter before keep busy's connection noticed
+fails as a host error, which logs nothing. Once the new server answers, keep
+busy says `keep-busy: X display opened` once, at `INFO`, and the arbiter's own
+`INFO` for the reopened injector comes with the next move. Nothing above
+`DEBUG` repeats while the desktop is down. Keep busy is not a session, so the
+marks of §6.1c do not concern it; a session the restart left behind cannot
+switch it, and a button that session had down no longer holds its moves off.
 
 The state machine (`keep_busy/engine.rs`) is pure. A `Host` trait (L308)
 carries every OS fact, and the tests drive the engine with a scripted fake host
@@ -220,7 +239,7 @@ show that one sentence.
 | **Moves only.** Never a click, a key or a scroll | — |
 | **The safe box**: the monitor's work area ∩ a 48 px inset from every monitor edge (`patterns.rs` `safe_box`, L233). macOS uses 96 pt (`host_mac.rs` `mac_safe_box`, L235): the release build has no AppKit, so no `visibleFrame`, and the margin keeps the menu bar and a Dock on any edge clear | The pointer never reaches a hot corner or edge: GNOME Activities, a macOS hot corner that can start the screensaver **or lock the screen**, an auto-hidden taskbar or Dock, Windows Peek |
 | **No jumps.** Each loop starts at the pointer, and a changing pattern (Shuffle, Wander, Lissajous) continues from where the last loop ended. The one exception is a blind host (GNOME through uinput), which resumes where it stopped | — |
-| **Never the first to create the injector before a display exists.** A boot-time restore waits for an unlocked session, and an injector the OS has not granted is answered for and not cached | The arbiter caches the injector, Noop included. Creating it too early would break remote control's input until a restart |
+| **Never the first to create the injector before a display exists.** A boot-time restore waits for an unlocked session, and an injector the OS has not granted is answered for and not cached | The arbiter caches the injector, and a Noop only until it opens another (#2066). Creating it too early would cost a controller its first input until that retry |
 | **The viewer never re-asserts keep busy on connect**, unlike display-match | A reconnecting tab must not undo the person's Stop |
 | **Wayland is refused from the display itself** (`host_x11.rs` `session`, L389): the `XWAYLAND` extension, or monitors named `XWAYLAND*`. The GNOME host is asked instead (`host_linux.rs`) | XTest there moves only Xwayland's own pointer, so a calibration could pass while nothing real moves |
 
@@ -395,18 +414,20 @@ does not spawn `loginctl` forever.
 | **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`, and (P10) `roomler keep-busy on [--pattern P] [--size s\|m\|l] [--speed slow\|normal\|fast] [--resume-after SECONDS] [--auto-off MINUTES]` |
 | **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
 
-**Who may turn it ON here (P10).** Whoever stands where the person does: the
-console session on Windows, the person's own uid elsewhere. Never root, and
-(P10b) never SYSTEM. `ClientPeer::may_start_keep_busy` (`crates/localapi`)
-answers per endpoint:
+**Who may turn it ON here (P10).** Whoever stands where the person does: on
+Windows the session whose screen the daemon shows (a machine-wide install's
+worker runs in the console session, a per-user daemon in its person's own
+session, over RDP too: `desktop-companion.md` §12.4), the person's own uid
+elsewhere. Never root, and (P10b) never SYSTEM.
+`ClientPeer::may_start_keep_busy` (`crates/localapi`) answers per endpoint:
 
 ```mermaid
 flowchart TD
   P[a LocalAPI keep_busy_on] --> R{peer is root?}
   R -- yes --> X[refused: sudo, and roomler exec on Unix]
   R -- no --> W{Windows peer?}
-  W -- yes --> S{the active console session, and not session 0?}
-  S -- no --> X2[refused: an RDP guest, a service in session 0]
+  W -- yes --> S{the session whose screen the daemon shows, and not session 0?}
+  S -- no --> X2[refused: another session, a service in session 0]
   S -- yes --> A{"the token's account (P10b)"}
   A -- "a person" --> OK[the engine starts it: set_by = the person at this computer]
   A -- "SYSTEM, LocalService, NetworkService" --> X4[refused: roomler exec in SystemContext mode]

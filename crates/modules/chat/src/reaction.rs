@@ -19,19 +19,20 @@ pub struct AddReactionRequest {
 pub async fn add(
     State(state): State<ChatState>,
     auth: AuthUser,
-    Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<AddReactionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    // The reaction is keyed by message id, which is decoupled from the path
-    // room — so the message, not the room, is the object we must bind to this
-    // tenant, and its own room is the correct fan-out target.
-    let message = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
-    let rid = message.room_id;
+    // The reaction is keyed by message id, so the message guard binds it: a
+    // live message of the path room, which the caller may read. The path room
+    // is therefore the message's own, and the fan-out target.
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
     let reaction = state
         .reactions
@@ -63,14 +64,16 @@ pub async fn add(
 pub async fn remove(
     State(state): State<ChatState>,
     auth: AuthUser,
-    Path((tenant_id, _room_id, message_id, emoji)): Path<(String, String, String, String)>,
+    Path((tenant_id, room_id, message_id, emoji)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    let message = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
     let removed = state
         .reactions
@@ -78,7 +81,6 @@ pub async fn remove(
         .await?;
 
     if removed {
-        let rid = message.room_id;
         let member_ids = state.rooms.find_member_user_ids(rid).await?;
         let event = serde_json::json!({
             "type": "message:reaction",

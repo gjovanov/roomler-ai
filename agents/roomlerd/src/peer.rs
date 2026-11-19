@@ -256,6 +256,10 @@ pub struct AgentPeer {
     /// connected, and the overlay that draws the curtain). Set once by
     /// [`Self::set_privacy_ctx`] before the offer is answered.
     privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>>,
+    /// FR-148 P1 — what the pair memory's key needs from this session's viewer:
+    /// the controlling user ([`Self::set_pair_user`]) and its server-reflexive
+    /// candidates, as they are trickled. The FFmpeg pump finds it by session.
+    pair_facts: Arc<crate::media_pair_memory::PairFacts>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -332,7 +336,7 @@ pub mod l0 {
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionTelemetry {
     pub bytes_sent: u64,
     pub bytes_recv: u64,
@@ -351,6 +355,9 @@ pub struct SessionTelemetry {
     /// (`session_telemetry::SessionCounters::decode_errors`); `None` = not
     /// counted, never zero.
     pub decode_errors: Option<u32>,
+    /// FR-132 P1d — what the session's video ran on, the pump's newest
+    /// reading; `None` = not reported, never CPU.
+    pub video: Option<roomler_ai_remote_control::models::SessionVideo>,
 }
 
 impl AgentPeer {
@@ -421,6 +428,10 @@ impl AgentPeer {
         // peer's own sender (the seam), which for a delegated session is the
         // delegation channel to the daemon, never the worker's own WS.
         carrier_ready_tx: mpsc::Sender<bson::oid::ObjectId>,
+        // FR-135 §7.1 — which media paths this session runs, old or new,
+        // decided once by the signalling loop from `rc_media_legacy` and
+        // `rc_media_canary` (`RemoteConfigServices::media_paths`).
+        media_paths: crate::media_paths::MediaPaths,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -482,6 +493,8 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
+        // FR-148 P4 — the carrier rank, when its switch is on (`rc_overlay`).
+        rc_overlay.rank_ice(&mut setting);
         // FR-101 P1 — GCM-only DTLS, with its switch back, and the SRTP/SRTCP
         // replay windows pinned at 64 (webrtc-srtp's session default too).
         let transport = crate::rc_transport::Policy::from_env();
@@ -876,6 +889,7 @@ impl AgentPeer {
         {
             let tx = outbound.clone();
             let tally = Arc::new(GatherTally::default());
+            let rank = rc_overlay.carrier_rank;
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let tx = tx.clone();
                 let tally = tally.clone();
@@ -886,23 +900,10 @@ impl AgentPeer {
                         return;
                     };
                     tally.note(c.typ);
-                    info!(
-                        %session_id,
-                        typ = %c.typ,
-                        protocol = %c.protocol,
-                        address = %c.address,
-                        port = c.port,
-                        related = %format_args!("{}:{}", c.related_address, c.related_port),
-                        "ICE: gathered local candidate"
-                    );
-                    let json = match c.to_json() {
-                        Ok(j) => j,
-                        Err(e) => {
-                            warn!(%e, "failed to serialize ICE candidate");
-                            return;
-                        }
-                    };
-                    let Ok(candidate) = serde_json::to_value(&json) else {
+                    // The line, and its payload (FR-148 P4: under switch `1`
+                    // a ranked-last line ends with ` network-cost 999`).
+                    let Some(candidate) = crate::carrier_rank::gathered(session_id, &c, rank)
+                    else {
                         return;
                     };
                     let _ = tx
@@ -1193,6 +1194,9 @@ impl AgentPeer {
         // (FR-102 P9d): a session someone leaves right after a black screen
         // would otherwise end before the next 30 s tick carried it.
         let stats_now_for_dc = carrier_ready_tx.clone();
+        // FR-135 R0 — the control handler keeps the viewer's media numbers
+        // only with `stats` on this session's new path.
+        let stats_new_for_dc = media_paths.is_new(crate::media_paths::MediaPath::Stats);
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let cursor_dc_for_callback = cursor_dc_stash.clone();
@@ -1205,10 +1209,13 @@ impl AgentPeer {
         let privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>> =
             Arc::new(std::sync::OnceLock::new());
         let privacy_ctx_for_callback = privacy_ctx.clone();
+        // FR-148 P1 — registered before the pump is spawned, which finds it by
+        // the session's id.
+        let pair_facts = crate::media_pair_memory::PairFacts::register(session_id);
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
-            info!(session = %session_id, %label, "data channel opened");
+            info!(session = %session_id, ?label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let native_dims_for_dc = native_dims_for_dc.clone();
@@ -1295,6 +1302,7 @@ impl AgentPeer {
                             viewer_report_for_dc,
                             priority_for_dc,
                             stats_now_for_dc,
+                            stats_new_for_dc,
                         )
                     }
                     "cursor" => {
@@ -1313,14 +1321,14 @@ impl AgentPeer {
                     "clipboard" => {
                         attach_clipboard_handler(dc, session_id, permissions, &session_end)
                     }
-                    // Multi-user P3 — same enforcement for FILES. New viewers
-                    // request the FILES bit by default; a session narrowed to
-                    // view-effective gets explicit errors instead of silent
-                    // transfers.
-                    "files" if !permissions.contains(Permissions::FILES) => {
-                        attach_files_denied(dc, session_id, &session_end)
+                    // Multi-user P3 — same enforcement for FILES (new viewers
+                    // ask for the bit by default), and #3757: a Mac's root
+                    // daemon declines the channel of a session no GUI worker
+                    // serves. Both are `attach_files`'s.
+                    "files" => {
+                        let served = files_channel_here();
+                        attach_files(dc, session_id, permissions, served, &session_end)
                     }
-                    "files" => attach_files_handler(dc, session_id, &session_end),
                     // FR-85 P3b — the same attach-time gate for RECORD: the
                     // hub strips it unless the controller may record AND this
                     // device's owner opted in, and a grant without it gets a
@@ -1524,7 +1532,7 @@ impl AgentPeer {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tick.tick().await;
-                        if !crate::display_match::owns_mode(sid) {
+                        if !crate::display_match::watch_due(sid) {
                             continue;
                         }
                         if let Ok(Some(answer)) =
@@ -1628,12 +1636,15 @@ impl AgentPeer {
 
         // FR-135 R2 — say what this session is set to send, before any pump
         // runs, so a pump that cannot start still leaves the viewer knowing.
+        // §7.1 — unless `media_plan` is on this session's old path, and with
+        // the session's other key-chosen paths named in the plan.
         crate::media_plan::start(
             session_id,
             negotiated_transport.as_deref(),
             &chosen_codec,
             control_dc.clone(),
             session_end.clone(),
+            &media_paths,
         );
 
         // Start the capture→encode→track pump. The pump is self-regulating:
@@ -1669,6 +1680,8 @@ impl AgentPeer {
             priority,
             rc_sessions,
             no_video.clone(),
+            carrier_ready_tx,
+            media_paths,
         ));
 
         // FR-93 P5h — told when this computer goes to sleep.
@@ -1685,6 +1698,7 @@ impl AgentPeer {
             #[cfg(feature = "recording")]
             record_ctx,
             privacy_ctx,
+            pair_facts,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -1746,6 +1760,13 @@ impl AgentPeer {
         let _ = self.privacy_ctx.set(ctx);
     }
 
+    /// FR-148 P1 — the controlling user, for the pair memory's key. Call
+    /// before [`Self::handle_offer`]; a pump that opens without it keeps no
+    /// path memory (`no_user`).
+    pub fn set_pair_user(&self, user: bson::oid::ObjectId) {
+        self.pair_facts.set_user(user);
+    }
+
     /// Wave 2 — a telemetry sample for `rc:session.stats`.
     ///
     /// Transport numbers come from the peer connection's own ICE
@@ -1784,6 +1805,8 @@ impl AgentPeer {
         out.carrier = self.carrier.get().copied();
         // FR-132 P1 — the viewer's decode errors, once it counts them.
         out.decode_errors = c.decode_errors();
+        // FR-132 P1d — and what the video ran on, once the pump has said.
+        out.video = c.video();
         out
     }
 
@@ -1840,6 +1863,9 @@ impl AgentPeer {
             other => serde_json::from_value(other)
                 .map_err(|e| anyhow!("bad ICE candidate shape: {e}"))?,
         };
+        // FR-148 P1 — the viewer's server-reflexive addresses name its network
+        // in the pair memory's key.
+        self.pair_facts.note_candidate(&init.candidate);
         // #1882 — a candidate on a mesh address is an overlay pair waiting to
         // happen even though this side offered no overlay candidate: the
         // srflx and relay sockets are bound to `0.0.0.0`, so a check to it
@@ -1930,8 +1956,8 @@ impl AgentPeer {
     }
 
     pub async fn close(&self) {
-        self.stop_serving();
-        if let Err(e) = self.pc.close().await {
+        self.stop_serving(); // #3716: the close runs on, past a caller's budget
+        if let Err(e) = crate::peer_close::close(Arc::clone(&self.pc), self.session_id).await {
             warn!(session = %self.session_id, %e, "PC close failed");
         }
     }
@@ -2012,6 +2038,8 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move.
+            let (pair, opening) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             let local = pair.local();
             let remote = pair.remote();
             // Loopback-TURN corp-relay (Phase 3): a relay candidate at a
@@ -2022,21 +2050,7 @@ async fn detect_constrained_transport(
                 && !crate::encode::relay_addr_is_fast_local(&local.address))
                 || (remote.typ == RTCIceCandidateType::Relay
                     && !crate::encode::relay_addr_is_fast_local(&remote.address));
-            // Relay-escape — log the ADDRESSES, not just the types: a
-            // "direct" Srflx↔Prflx pair whose remote is the router's WAN IP
-            // is a NAT hairpin, while a 192.168.x remote is the true LAN
-            // path. Types alone couldn't tell them apart in the field.
-            info!(
-                %session_id,
-                relay,
-                local_typ = ?local.typ,
-                local_proto = ?local.protocol,
-                local_addr = %format!("{}:{}", local.address, local.port),
-                remote_typ = ?remote.typ,
-                remote_proto = ?remote.protocol,
-                remote_addr = %format!("{}:{}", remote.address, remote.port),
-                "per-session ICE path detected (adaptive bitrate)"
-            );
+            crate::carrier_rank::path_detected(session_id, relay, local, remote, opening);
             return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2060,92 +2074,13 @@ async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — the rest of the opening's wait, shared with detect.
+            let (pair, _) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             return Some(pair.remote().address.clone());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
-}
-
-/// FR-79 V2 — the carrier under an overlay pair, as the memory key's second
-/// half. Asks the same LocalAPI the constrained-transport probe asks; a
-/// non-overlay remote (a TURN server's own address, say) is already its own
-/// key, and anything unknown or mid-churn returns `None`, which leaves the
-/// bare-address key this had before.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-async fn overlay_carrier_tag(remote_addr: &str) -> Option<String> {
-    if !addr_is_overlay_range(remote_addr) {
-        return None;
-    }
-    let query = async {
-        let mut client = tunnel_core::localapi::connect().await.ok()?;
-        let peers = client.peers().await.ok()?;
-        peers.into_iter().find(|p| {
-            p.overlay_ip.as_deref() == Some(remote_addr)
-                || p.overlay_ip6.as_deref() == Some(remote_addr)
-        })
-    };
-    let peer = tokio::time::timeout(Duration::from_millis(400), query)
-        .await
-        .ok()??;
-    let connection = format!("{:?}", peer.connection).to_lowercase();
-    crate::encode::rate_memory::carrier_tag(
-        &connection,
-        peer.relay_kind.as_deref(),
-        peer.relay_transport.as_deref(),
-    )
-}
-
-/// FR-35 P2 — persists the session's stable rate for its peer when the pump
-/// ends, whichever way it ends. The pump stores the governor's current stable
-/// rate into `stable` once per viewer window; `0` = nothing worth keeping.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-struct RateMemoryGuard {
-    path: Option<std::path::PathBuf>,
-    peer: Option<String>,
-    stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// FR-79 V4 — what the OPENER measured about this carrier, when its burst
-    /// queued enough for the estimator to say anything. Second-choice
-    /// evidence: the session belief above is the whole session's answer.
-    opener_measured: std::sync::Arc<std::sync::atomic::AtomicU32>,
-}
-
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-impl Drop for RateMemoryGuard {
-    fn drop(&mut self) {
-        let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
-            return;
-        };
-        // FR-79 V4 — a session writes what it MEASURED about this carrier, or
-        // nothing at all. The belief the validity gate accepted is the
-        // session's own answer; the opener's measurement stands in for a
-        // session too short to have produced one. With neither, the entry
-        // keeps its value AND its age, because refreshing a timestamp on no
-        // evidence would keep a stale number alive past its TTL.
-        let evidence = [
-            self.stable.load(std::sync::atomic::Ordering::Relaxed),
-            self.opener_measured
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ]
-        .into_iter()
-        .find(|v| *v > 0);
-        let mut mem = crate::encode::rate_memory::RateMemory::load(path);
-        let kept = mem.record_session(peer, evidence, crate::encode::rate_memory::now_unix());
-        if kept == 0 {
-            return;
-        }
-        match mem.save(path) {
-            Ok(()) => info!(
-                peer,
-                evidence_bps = ?evidence,
-                kept_bps = kept,
-                "FR-79 V4 rate memory: the carrier's measured rate remembered for the pair"
-            ),
-            Err(e) => {
-                warn!(peer, %e, "FR-35 rate memory: could not persist (memory stays off for this pair)")
-            }
-        }
-    }
 }
 
 /// Relay-escape — mid-session re-read of the selected ICE pair. The DC
@@ -2390,7 +2325,21 @@ async fn media_pump(
     // #3245 — set before the RTP pump asks for its session's end with no encoder
     // (`end_no_video`), so the signalling loop names that end.
     no_video: Arc<std::sync::atomic::AtomicBool>,
+    // FR-132 P1d — asks the signalling loop for one `rc:session.stats` now, by
+    // the carrier observation's road (FR-102 P9d). The two DC pumps have a
+    // reading to send (FR-135 R0 gave the VP9 pump its own).
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — which media paths this session runs (`stats` among them),
+    // decided once at the session's open.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
+    // `stats_now` is consumed only by the two DC pumps; keep the other
+    // builds warning-clean.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &stats_now;
+    // `media_paths` only by the two DC pumps.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &media_paths;
     // `viewer_report` is consumed only by the DC video pumps (vp9-444 +
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
@@ -2462,6 +2411,8 @@ async fn media_pump(
                     false,
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2506,6 +2457,8 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2547,6 +2500,8 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2626,6 +2581,8 @@ async fn media_pump(
                         wants_444,
                         chunk_framing,
                         rc_sessions,
+                        stats_now,
+                        media_paths.clone(),
                     )
                     .await;
                 }
@@ -2653,6 +2610,8 @@ async fn media_pump(
                 priority,
                 chunk_framing,
                 rc_sessions,
+                stats_now.clone(),
+                media_paths.clone(),
             )
             .await;
         }
@@ -2919,7 +2878,7 @@ async fn media_pump(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc, None) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -3790,6 +3749,10 @@ async fn run_ffmpeg_dc_session(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
@@ -3840,6 +3803,8 @@ async fn run_ffmpeg_dc_session(
             chroma444,
             chunk_framing,
             rc_sessions,
+            stats_now,
+            media_paths,
         )
         .await;
     }
@@ -3872,6 +3837,10 @@ async fn run_vp9_444_dc_session(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d, FR-135 R0 — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     loop {
         let sink = crate::media_share::FollowerSink {
@@ -3920,6 +3889,8 @@ async fn run_vp9_444_dc_session(
             priority,
             chunk_framing,
             rc_sessions,
+            stats_now,
+            media_paths,
         )
         .await;
     }
@@ -3977,6 +3948,10 @@ async fn media_pump_vp9_444_dc(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d, FR-135 R0 — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -3993,6 +3968,16 @@ async fn media_pump_vp9_444_dc(
         );
     }
     use crate::encode::libvpx::Vp9Encoder;
+
+    // FR-135 R0 — this pump's window too (see the FFmpeg pump): the session's
+    // summary, and its cell for `rc:session.stats`. Its heartbeat counts
+    // packets rather than time (ledger L02), so nothing here rides it.
+    let mut media_window = media_paths
+        .is_new(crate::media_paths::MediaPath::Stats)
+        .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
+    let pump_started = std::time::Instant::now();
+    let mut first_frame_noted = false;
 
     // rc.33: opt-in 60 fps via env var. Default 30 (the pre-rc.33
     // behaviour). Operators on hosts that can sustain SW VP9 encode at
@@ -4090,7 +4075,7 @@ async fn media_pump_vp9_444_dc(
         DC_BUFFERED_HIGH_BYTES
     };
     if constrained_transport {
-        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay-TCP) transport — clamping bitrate + tightening backpressure");
+        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay) transport — clamping bitrate + tightening backpressure");
     }
     // Relay-escape — re-check the selected pair periodically (see the loop).
     let mut last_transport_check = std::time::Instant::now();
@@ -4109,6 +4094,12 @@ async fn media_pump_vp9_444_dc(
         },
         session_id,
     );
+    // #3260 — and a capturer that cannot capture tells every viewer of this
+    // pipeline, the ones that join later included. Here rather than beside
+    // this session's own notice above: the pipeline exists only from here.
+    if let Some(reason) = capturer.unavailable() {
+        pipeline.tell_unavailable(reason);
+    }
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
@@ -4280,8 +4271,8 @@ async fn media_pump_vp9_444_dc(
     // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
     // control even while saturated) and the rc.188 viewer-rate fps cap.
     // The encode-pressure/tier halves sit unused here (libvpx has its own
-    // cpu_used/quality levers). See `encode::governor` module docs — incl.
-    // the preserved rebuild divergence (`on_encoder_rebuilt_mirror_only`).
+    // cpu_used/quality levers). See `encode::governor` module docs; a rebuild
+    // re-applies the target through `on_encoder_rebuilt`, as the FFmpeg pump's (#3472).
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         send_depth,
@@ -4364,6 +4355,24 @@ async fn media_pump_vp9_444_dc(
         // joiner finding this stale evicts the pipeline (a wedged encode
         // can block this task forever with no way to drop the Pipeline).
         pipeline.beat();
+        // FR-135 R0 (N16) — the summary folds on its own clock, and with it
+        // FR-132 P1d's reading: libvpx has no GPU form, so CPU, `no_gpu_cell`.
+        if let Some(w) = media_window.as_mut()
+            && let Some(f) =
+                w.fold_if_due(std::time::Instant::now(), crate::media_window::FOLD_EVERY)
+        {
+            let counters = crate::session_telemetry::counters(session_id);
+            counters.note_media_fold(f, pipeline.follower_count() as u32);
+            if counters.note_video(crate::session_telemetry::VideoForm {
+                encoder: crate::encode::cells::LIBVPX_VP9,
+                capture: capturer.backend(),
+                input_path: "cpu",
+                input_reason: "no_gpu_cell",
+                chroma: chroma_wire,
+            }) {
+                let _ = stats_now.try_send(session_id);
+            }
+        }
         // Relay-escape — every TRANSPORT_RECHECK_INTERVAL re-read the
         // selected ICE pair: Chrome renominates mid-session (relay→direct
         // once the mDNS-resolved host pair succeeds; direct→relay on a path
@@ -4530,11 +4539,19 @@ async fn media_pump_vp9_444_dc(
         // A local first, so `capturer`'s borrow ends before the idle arm asks
         // it what it waits for (FR-93 P3e).
         let next_frame = capturer.next_frame().await;
+        // FR-135 R0 (N7) — when the pump took this pass's real frame.
+        let mut frame_captured_at: Option<std::time::Instant> = None;
         let frame: std::sync::Arc<crate::capture::Frame> = match next_frame {
             Ok(Some(f)) => {
                 frames_captured += 1;
+                frame_captured_at = Some(std::time::Instant::now());
+                if let Some(w) = media_window.as_mut() {
+                    w.on_real_frame();
+                }
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
@@ -4549,7 +4566,12 @@ async fn media_pump_vp9_444_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -4563,6 +4585,9 @@ async fn media_pump_vp9_444_dc(
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
                     if let Some(ref f) = last_good_frame {
                         last_capture_at = std::time::Instant::now();
+                        if let Some(w) = media_window.as_mut() {
+                            w.on_keepalive();
+                        }
                         // rc.187 (burst-gated) — first keepalive after a real
                         // motion burst settles = keyframe, so a viewer that
                         // dropped frames mid-motion resyncs to the settled
@@ -4608,7 +4633,7 @@ async fn media_pump_vp9_444_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 encoder = None;
@@ -4791,7 +4816,7 @@ async fn media_pump_vp9_444_dc(
                     // boot-time default bitrate until we push the
                     // resolution-derived quality target through.
                     last_applied_quality = 0xFF;
-                    governor.on_encoder_rebuilt_mirror_only();
+                    governor.on_encoder_rebuilt();
                     // rc.45 — encoder rebuild starts at base cpu-used
                     // (apply_screen_content_controls reads the env
                     // var). Reset our tracking so the next motion
@@ -5007,6 +5032,9 @@ async fn media_pump_vp9_444_dc(
         encode_us += encode_start.elapsed().as_micros() as u64;
         encode_ops += 1;
         frames_encoded += packets.len() as u64;
+        if let Some(w) = media_window.as_mut() {
+            w.on_encoded();
+        }
 
         // P8 Phase 5 — fold the encoder's QP reports into the window.
         for pkt in &packets {
@@ -5188,6 +5216,7 @@ async fn media_pump_vp9_444_dc(
         // the queue drains. A single consumer preserves 16 KiB chunk order for
         // the browser reassembler. (frames_sent / bytes_written / send_errors
         // are incremented by the send task via the shared atomics now.)
+        let mut handed_bytes: u64 = 0;
         for p in packets {
             // FR-1 P7 — process-epoch stamp (see `agent_epoch_us`): the
             // browser maps this onto its own clock via the rc:clock probe.
@@ -5201,13 +5230,23 @@ async fn media_pump_vp9_444_dc(
                 native_dims_packed,
                 encoded_dims_packed,
             );
+            let wire_len = wire.len() as u64;
+            delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::Vp9444Dc); // FR-148 O10
             match send_tx.try_send(wire) {
                 Ok(()) => {
+                    handed_bytes += wire_len;
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
                     if p.is_keyframe {
                         kf_gate.on_key_frame_queued();
+                        // FR-135 R0 (N12) — and the viewer's ask it answers.
+                        if let Some(w) = media_window.as_mut()
+                            && let Some(waited) =
+                                crate::session_telemetry::counters(session_id).take_keyframe_ask()
+                        {
+                            w.on_key_queued(waited);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -5219,6 +5258,18 @@ async fn media_pump_vp9_444_dc(
                     warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
                     return;
                 }
+            }
+        }
+        // FR-135 R0 (N7, N10, N3) — once per frame that reached the queue.
+        if handed_bytes > 0
+            && let Some(w) = media_window.as_mut()
+        {
+            let now = std::time::Instant::now();
+            w.on_handoff(now, frame_captured_at, handed_bytes);
+            if !first_frame_noted {
+                first_frame_noted = true;
+                crate::session_telemetry::counters(session_id)
+                    .note_first_frame(now.saturating_duration_since(pump_started));
             }
         }
 
@@ -5295,12 +5346,17 @@ async fn media_pump_vp9_444_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — see the FFmpeg pump's heartbeat.
+                pipe_measured = ?governor
+                    .measured_bps(std::time::Instant::now(), constrained_transport),
+                readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -5326,6 +5382,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -5609,15 +5666,19 @@ fn capture_unavailable_payload(reason: &crate::capture::CaptureUnavailable) -> S
 ///
 /// Bounded: a session that never opens its control DC must not leave a task
 /// spinning for the life of the process.
+///
+/// #3260 — a shared pipeline's followers are told through here too, each
+/// under its own session (`media_share::Pipeline::tell_unavailable`).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn spawn_capture_unavailable_notice(
+pub(crate) fn spawn_capture_unavailable_notice(
     session_id: bson::oid::ObjectId,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     reason: crate::capture::CaptureUnavailable,
 ) {
+    crate::input::told_no_picture(session_id, &reason);
     const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     // #1738 — each send is bounded: one on a channel a network drop left
@@ -5944,12 +6005,14 @@ impl CaptureWait {
 
     /// The pumps' half: on a "no frame", `true` when the capture waits on its
     /// host (told now, earlier, or once the pump has been quiet for
-    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out.
+    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out. #3423 — `share`
+    /// is the pump's shared pipeline, whose followers are told with its owner.
     fn hold(
         &mut self,
         waits: Option<crate::capture::WaitFor>,
         session_id: bson::oid::ObjectId,
         control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+        share: Option<&crate::media_share::Pipeline>,
     ) -> bool {
         if !media_waiting_enabled() {
             return false;
@@ -5958,10 +6021,14 @@ impl CaptureWait {
             return false;
         };
         if tell {
-            media_waiting_hook(session_id, control_dc.clone())(crate::capture::OpenWait {
+            let wait = crate::capture::OpenWait {
                 gives_up_in: Self::TOLD_FOR,
                 why,
-            });
+            };
+            media_waiting_hook(session_id, control_dc.clone())(wait);
+            if let Some(pipeline) = share {
+                pipeline.tell_waiting(wait);
+            }
         }
         true
     }
@@ -5990,9 +6057,6 @@ fn media_waiting_hook(
     let asking: std::sync::Mutex<Option<crate::rc_sessions::AskingMark>> =
         std::sync::Mutex::new(None);
     Box::new(move |wait| {
-        const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
-        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-        const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
         // FR-93 P6h — while the desktop's own dialog asks the person at the
         // screen, nothing is shared yet, and the companion's "Being viewed"
         // banner would cover the very window that asks (measured on KDE,
@@ -6001,28 +6065,98 @@ fn media_waiting_hook(
         let mark = matches!(wait.why, crate::capture::WaitFor::Dialog { .. })
             .then(|| crate::rc_sessions::AskingMark::new(session_id));
         *asking.lock().unwrap_or_else(|p| p.into_inner()) = mark;
-        let payload = media_waiting_payload(wait);
-        info!(
-            %session_id,
-            gives_up_in_s = wait.gives_up_in.as_secs(),
-            why = ?wait.why,
-            "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
-        );
         // FR-93 P5g — one open can wait twice (the switch, then the unlock).
-        let control_dc = control_dc.clone();
-        runtime.spawn(async move {
-            // Bounded by the wait's own deadline too: past it, the notice
-            // would describe a wait that is already over.
-            let deadline = DEADLINE.min(wait.gives_up_in);
-            if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
-            {
-                warn!(
-                    %session_id,
-                    "media-waiting notice never reached the controller within its deadline"
-                );
-            }
-        });
+        spawn_media_waiting_notice(&runtime, session_id, control_dc.clone(), wait);
     })
+}
+
+/// #3423 — [`media_waiting_hook`] for an open whose pump already owns a shared
+/// pipeline (`media_share`): the viewers following it are told what the owner's
+/// own viewer is, and so are the ones that join while the open waits. The
+/// FFmpeg pump registers its pipeline before its first open, and both DC pumps
+/// reopen inside their loops.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn shared_media_waiting_hook(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pipeline: &crate::media_share::Pipeline,
+) -> crate::capture::OnOpenWait {
+    shared_media_waiting_hook_as(session_id, control_dc, pipeline, media_waiting_enabled())
+}
+
+/// [`shared_media_waiting_hook`] with the notices' switch given.
+///
+/// #3918 — and the pipeline's capture is being opened again: what it reads is
+/// unknown until the new capturer publishes its arm
+/// (`media_share::Pipeline::capture_opens_again`). Sound here because every
+/// open of a registered pipeline's capturer is built with this hook, and the
+/// open takes the hook by value, a type that cannot be cloned
+/// (`capture::OnOpenWait`): no open runs on a hook built for another. An open
+/// of such a capturer built with the plain [`media_waiting_hook`], or a hook
+/// that became shareable, would bring a stale arm back. First, before the
+/// switch: the switch turns the notices off, not this.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn shared_media_waiting_hook_as(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pipeline: &crate::media_share::Pipeline,
+    notices: bool,
+) -> crate::capture::OnOpenWait {
+    pipeline.capture_opens_again();
+    let own = media_waiting_hook(session_id, control_dc);
+    if !notices {
+        return own;
+    }
+    let share = pipeline.wait_teller();
+    Box::new(move |wait| {
+        own(wait);
+        share.tell(wait);
+    })
+}
+
+/// FR-93 P2d-2 — deliver [`media_waiting_payload`] to one controller, retrying
+/// until its control channel takes it. `runtime` spawns the sender, because an
+/// open's hook fires on the blocking pool.
+///
+/// #3423 — a shared pipeline's followers are told through here too, each under
+/// its own session (`media_share::Pipeline::tell_waiting`).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn spawn_media_waiting_notice(
+    runtime: &tokio::runtime::Handle,
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    wait: crate::capture::OpenWait,
+) {
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let payload = media_waiting_payload(wait);
+    info!(
+        %session_id,
+        gives_up_in_s = wait.gives_up_in.as_secs(),
+        why = ?wait.why,
+        "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
+    );
+    runtime.spawn(async move {
+        // Bounded by the wait's own deadline too: past it, the notice
+        // would describe a wait that is already over.
+        let deadline = DEADLINE.min(wait.gives_up_in);
+        if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await {
+            warn!(
+                %session_id,
+                "media-waiting notice never reached the controller within its deadline"
+            );
+        }
+    });
 }
 
 /// Retry one control-DC message until it is sent or `deadline` passes. The
@@ -6096,7 +6230,7 @@ async fn end_stopped_at_screen(
     );
     if let Some(p) = pipeline {
         for f in &followers {
-            if !rc_sessions.disconnect(f) {
+            if !rc_sessions.disconnect(f, crate::rc_sessions::Via::ShareStop) {
                 warn!(%session_id, follower = %f, "capture stopped at the screen: a follower's session could not be ended");
             }
         }
@@ -6110,7 +6244,7 @@ async fn end_stopped_at_screen(
     let mut ended = false;
     loop {
         if !ended {
-            ended = rc_sessions.disconnect(&session_id);
+            ended = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::ShareStop);
             if !ended && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "capture stopped at the screen: the session's Disconnect could not be queued yet");
             }
@@ -6154,7 +6288,7 @@ async fn end_no_video(
     let mut asked = false;
     loop {
         if !asked {
-            asked = rc_sessions.disconnect(&session_id);
+            asked = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::NoVideo);
             if !asked && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "no encoder: the session's end could not be queued yet");
             }
@@ -6385,8 +6519,22 @@ async fn media_pump_ffmpeg_dc(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     use crate::encode::VideoEncoder;
+
+    // FR-135 R0 — this pump's window of media numbers (`crate::media_window`):
+    // the heartbeat's new fields and the session's summary (N16). `None` with
+    // `stats` on the session's old path: today's heartbeat, and no summary.
+    let mut media_window = media_paths
+        .is_new(crate::media_paths::MediaPath::Stats)
+        .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
+    let pump_started = std::time::Instant::now();
+    let mut first_frame_noted = false;
 
     let codec_label = codec.label();
     // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
@@ -6456,69 +6604,21 @@ async fn media_pump_ffmpeg_dc(
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
-    // FR-35 P2 — per-peer rate memory: the pair's remembered stable rate
-    // seeds the opening ceiling (85 % of it), so the opening keyframe is
-    // sized by what the pair proved, not by the fleet constant. Keyed by the
-    // nominated pair's remote address (the viewer host).
+    // FR-35 P2 / FR-148 P1 — the pair memories (`media_pair_memory`): today's
+    // seeds the opening as before, unless the switch is `on` and the path
+    // model's entry decides it (`plan`); both are written when the pump ends.
     let rate_hi_bps = crate::encode::relay_max_hi_bps();
-    let rate_peer_key = if constrained && rate_hi_bps > 0 {
-        // The pair may not be nominated yet at pump start (the 0.4.27 field
-        // run's first packet came 4 s in): no key then means no seed AND no
-        // write-back, i.e. the memory silently off for the session. Poll
-        // briefly; the pump has nothing to send before the DC opens anyway.
-        let mut key = None;
-        for _ in 0..20 {
-            key = nominated_remote_ip(&pc).await;
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if key.is_none() {
-            info!(
-                %session_id,
-                "FR-35 rate memory: no nominated pair within 4 s of pump start — memory off for this session"
-            );
-        }
-        // FR-79 V2 — the carrier is half the key: one overlay address can be
-        // carried by a direct path, a UDP relay or DERP over TLS on different
-        // days, with four times the capacity between the ends of that range.
-        match key {
-            Some(addr) => {
-                let tag = overlay_carrier_tag(&addr).await;
-                Some(crate::encode::rate_memory::memory_key(
-                    &addr,
-                    tag.as_deref(),
-                ))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let rate_memory_path = crate::encode::rate_memory::default_path();
-    let rate_seed = match (&rate_peer_key, &rate_memory_path) {
-        (Some(peer), Some(path)) => crate::encode::rate_memory::RateMemory::load(path)
-            .seed_for(peer, crate::encode::rate_memory::now_unix()),
-        _ => None,
-    };
-    if let Some(seed) = rate_seed {
-        info!(
-            %session_id,
-            codec_label,
-            peer = rate_peer_key.as_deref().unwrap_or("-"),
-            seed_bps = seed,
-            hi_bps = rate_hi_bps,
-            "FR-35 rate memory: opening ceiling seeded from the pair's remembered stable rate"
-        );
-    }
-    let rate_memory_guard = RateMemoryGuard {
-        path: rate_memory_path,
-        peer: rate_peer_key,
-        stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-
-        opener_measured: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-    };
+    let mut pair_memory = crate::media_pair_memory::open(
+        &pc,
+        session_id,
+        codec_label,
+        delivery.mode(),
+        constrained,
+        rate_hi_bps,
+        || nominated_remote_ip(&pc),
+    )
+    .await;
+    let (rate_seed, seed_age) = (pair_memory.seed(), pair_memory.seed_age());
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
     // encoder AND reopens the capturer at the new profile fps — pre-P3 a
@@ -6649,7 +6749,7 @@ async fn media_pump_ffmpeg_dc(
     let mut capturer = capture::open_default_async(
         target_fps,
         downscale,
-        media_waiting_hook(session_id, control_dc.clone()),
+        shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
     )
     .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
@@ -6657,6 +6757,9 @@ async fn media_pump_ffmpeg_dc(
     // backend answers `None`, so a healthy session sends nothing.
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+        // #3260 — and so is every viewer sharing this pipeline: the ones
+        // that joined while the capture opened, and the ones that join later.
+        pipeline.tell_unavailable(reason);
     }
     // FR-93 P6g — and an arm the compositor shows nothing for still says, at
     // the screen, who is viewing it.
@@ -7087,13 +7190,13 @@ async fn media_pump_ffmpeg_dc(
     // emits continuous bitrate targets; `FfmpegEncoder::set_bitrate`
     // coarsens them to a ladder and applies in-place (NVENC reconfigure)
     // or as a debounced QSV/AMF rebuild whose first frame is an IDR.
-    let mut governor = crate::encode::governor::RateGovernor::new(
+    let mut governor = crate::encode::governor::RateGovernor::new_with(
         target_fps,
         ffmpeg_send_depth,
         crate::encode::governor::GovernorFlags::from_env(),
         // FR-35 — the constrained ceiling learns the pair (0 = off).
         rate_hi_bps,
-        rate_seed,
+        &pair_memory.plan(),
         std::time::Instant::now(),
     );
     if let Some(seed_bps) = governor.open_seed_bps() {
@@ -7105,6 +7208,9 @@ async fn media_pump_ffmpeg_dc(
              remembered rate, floor relief seeded from it, refine lift held while the profile is on"
         );
     }
+    // FR-148 P1 — the path model's entry, and its open line.
+    let dial = priority.load(std::sync::atomic::Ordering::Relaxed);
+    pair_memory.at_open(&mut governor, dial, slow_link_profile.is_some());
     // FR-70 M3a — the PLAN, in SHADOW (`encode::plan`). At the top of every
     // pass the pump computes the plan ONCE from the facts it has at that
     // instant and compares it, field by field, against the inline values it
@@ -7323,6 +7429,15 @@ async fn media_pump_ffmpeg_dc(
         // because an overrun whose named phases read ~0 is itself the finding.
         // ⚠️ The cost of the first rule: a wedged capture cannot trip this
         // watch — `capture_ms` shows it, nothing alerts on it.
+        // FR-135 R0 (N16) — the session's summary folds on its own clock, never
+        // the heartbeat's, which every `continue` below starves (ledger L03).
+        if let Some(w) = media_window.as_mut()
+            && let Some(f) =
+                w.fold_if_due(std::time::Instant::now(), crate::media_window::FOLD_EVERY)
+        {
+            crate::session_telemetry::counters(session_id)
+                .note_media_fold(f, pipeline.follower_count() as u32);
+        }
         if let Some(pass) = watch.turn_with(|| phase_accum!()) {
             warn!(
                 %session_id,
@@ -7638,7 +7753,11 @@ async fn media_pump_ffmpeg_dc(
                             capturer = capture::open_default_async(
                                 target_fps,
                                 downscale,
-                                media_waiting_hook(session_id, control_dc.clone()),
+                                shared_media_waiting_hook(
+                                    session_id,
+                                    control_dc.clone(),
+                                    &pipeline,
+                                ),
                             )
                             .await;
                             PassWatch::stop(t, &mut recapture_us);
@@ -8115,6 +8234,8 @@ async fn media_pump_ffmpeg_dc(
         // AREA leg already judged at capture time (tracked damage over the
         // floor); the bytes leg skips those (one note per frame).
         let mut is_real_frame = false;
+        // FR-135 R0 (N7) — when the pump took this pass's real frame.
+        let mut frame_captured_at: Option<std::time::Instant> = None;
         let mut area_judged = false;
         // Did EITHER significance leg count this frame as motion? A real
         // frame that stays false is QUIET EVIDENCE and feeds the refine
@@ -8130,9 +8251,15 @@ async fn media_pump_ffmpeg_dc(
                 // screen leg (free unless a live session has a limit).
                 crate::session_idle::note_frame(&arc);
                 last_capture_at = std::time::Instant::now();
+                frame_captured_at = Some(last_capture_at);
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 frames_captured += 1;
                 is_real_frame = true;
+                if let Some(w) = media_window.as_mut() {
+                    w.on_real_frame();
+                }
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
                 // P8a — AREA significance leg, judged at CAPTURE time on
@@ -8176,7 +8303,12 @@ async fn media_pump_ffmpeg_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -8193,6 +8325,9 @@ async fn media_pump_ffmpeg_dc(
                     && let Some(ref f) = last_good_frame
                 {
                     last_capture_at = std::time::Instant::now();
+                    if let Some(w) = media_window.as_mut() {
+                        w.on_keepalive();
+                    }
                     // rc.187 (burst-gated) — the FIRST keepalive after a real
                     // motion burst settles is a KEYFRAME. `keyframe_requested`
                     // is consumed by the force block below (which also exempts
@@ -8213,6 +8348,9 @@ async fn media_pump_ffmpeg_dc(
                             settle_kf_suppressed += 1;
                         } else {
                             keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(w) = media_window.as_mut() {
+                                w.on_force(crate::media_window::IdrCause::Settle);
+                            }
                             tracing::info!(
                                 %session_id,
                                 codec_label,
@@ -8336,7 +8474,7 @@ async fn media_pump_ffmpeg_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 PassWatch::stop(t, &mut recapture_us);
@@ -8610,7 +8748,7 @@ async fn media_pump_ffmpeg_dc(
                 let bps = crate::encode::policy::replacement_open_bps(
                     target_ceiling,
                     governor.applied_bps(),
-                    governor.open_seed_bps(),
+                    governor.open_at_bps(),
                 );
                 // FR-65 — a round trip to the encoder thread: `enc_cmd`.
                 let t = watch.start();
@@ -8834,7 +8972,7 @@ async fn media_pump_ffmpeg_dc(
                 // one frame later, and an encoder opened at the ceiling
                 // would be rebuilt right there (a second blocking QSV open
                 // before the first frame).
-                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
+                0 => governor.open_at_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
             // FR-65 — the open is BLOCKING (0.62-0.73 s measured on Iris Xe at
@@ -8845,7 +8983,7 @@ async fn media_pump_ffmpeg_dc(
             // late first frame.
             //
             // ⚠️ SIZE THE CLAIM HONESTLY. The runtime is `new_multi_thread()`
-            // with no `worker_threads` (main.rs), so it defaults to the core
+            // with no `worker_threads` (app.rs), so it defaults to the core
             // count and blocking one worker is a 1/N capacity hit that
             // work-stealing routes around — severe on a 2-core VM, a cluster
             // node or WSL, modest on a 16-core desktop. It is NOT a whole-
@@ -8921,6 +9059,7 @@ async fn media_pump_ffmpeg_dc(
                         session_id,
                         encoder_name,
                         enc.chroma444(),
+                        fps_state.is_none().then_some(target_fps),
                         capturer.backend(),
                         capture_gpu,
                         &open_trail.take(),
@@ -9034,6 +9173,9 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                w.on_force(crate::media_window::IdrCause::Lock);
+            }
         }
 
         // Apply browser-requested keyframe (PLI/RTCP equivalent on DC).
@@ -9049,6 +9191,14 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                if own_kf {
+                    w.on_force(crate::media_window::IdrCause::Asked);
+                }
+                if shared_kf {
+                    w.on_force(crate::media_window::IdrCause::Shared);
+                }
+            }
         }
 
         // Unanswered-force retry — see `kf_policy::KEYFRAME_BACKSTOP`
@@ -9060,6 +9210,9 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                w.on_force(crate::media_window::IdrCause::Backstop);
+            }
             if kf_gate.take_backstop_log() {
                 info!(
                     %session_id,
@@ -9184,28 +9337,7 @@ async fn media_pump_ffmpeg_dc(
                     "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
                 );
             }
-            // FR-35 P3b — the memory wants the rate the pipe actually CARRIED,
-            // not just the learner's above-nominal ceiling. On a short/frozen
-            // session the learner never rises, so `stable_bps()` is None; fall
-            // back to the AIMD's live applied rate so a session whose seed was
-            // too hot (the grace was cut short, the AIMD then cut) records the
-            // converged rate as a decrease and the pair stops re-seeding hot.
-            // FR-70 P1 — between the learner's stable rate and the applied-
-            // rate fallback sits what the session actually KNOWS about the
-            // pipe: a live measurement, or the prior as it has decayed. The
-            // applied rate at the last window is wherever the last decrease
-            // left it, which on a lumpy relay drifts the memory DOWN across
-            // sessions (200 kbps was an attractor, not a stale day).
-            rate_memory_guard.stable.store(
-                governor
-                    .stable_bps()
-                    .or_else(|| governor.pipe_bps(std::time::Instant::now(), constrained))
-                    // FR-79 V4 — evidence only: the applied rate used to stand in
-                    // here when nothing measured, which is the memory learning
-                    // from itself.
-                    .unwrap_or(0),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            pair_memory.window(&governor, constrained);
         }
         if let Some(vw) = viewer_window
             && (vw.changed
@@ -9296,9 +9428,7 @@ async fn media_pump_ffmpeg_dc(
             // 2026-09-08 — every opener there had a 0 ms worst wait).
             let target = measured.unwrap_or(0).min(rate_hi_bps.max(1));
             if constrained {
-                rate_memory_guard
-                    .opener_measured
-                    .store(target, std::sync::atomic::Ordering::Relaxed);
+                pair_memory.opener_measured(target);
                 info!(
                     %session_id,
                     codec_label,
@@ -9572,6 +9702,9 @@ async fn media_pump_ffmpeg_dc(
         let frame_encode_us = encode_start.elapsed().as_micros() as u64;
         encode_us += frame_encode_us;
         frames_encoded += 1;
+        if let Some(w) = media_window.as_mut() {
+            w.on_encoded();
+        }
         // FR-119 P2b-2 — a trial judges every real frame that left the
         // encoder, at its capture time and with its encode time: only an
         // encoder that cannot keep up fails it (a keepalive re-encode is no
@@ -9706,8 +9839,12 @@ async fn media_pump_ffmpeg_dc(
         // whole chunked send (its `if let` scrutinee keeps the guard alive
         // through the body), so this waits out the previous frame's send.
         let t = watch.start();
+        let dc_lock_from = std::time::Instant::now();
         let dc_arc = video_bytes_dc.lock().await.clone();
         PassWatch::stop(t, &mut dc_lock_us);
+        if let Some(w) = media_window.as_mut() {
+            w.on_dc_lock(dc_lock_from.elapsed());
+        }
         let Some(dc) = dc_arc else {
             // rc.97 — DC not open yet (offer/answer/ICE/SCTP still setting
             // up). Force a keyframe so that whenever the DC *does* open, the
@@ -9753,6 +9890,8 @@ async fn media_pump_ffmpeg_dc(
         // cap that rc.85 fixed). A single consumer preserves chunk order for
         // the browser reassembler.
         let send_start = std::time::Instant::now();
+        // FR-135 R0 — what of this frame reached the channel's queue.
+        let mut handed_bytes: u64 = 0;
         for pkt in packets {
             // FR-1 P7 — process-epoch stamp, same clock as the ffmpeg pump
             // and the rc:clock echo (was: the capture backend's own epoch,
@@ -9772,6 +9911,7 @@ async fn media_pump_ffmpeg_dc(
                 encoded_dims_packed,
             );
             let wire_len = wire.len();
+            delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::FfmpegDc); // FR-148 O10
             match send_tx.try_send((
                 send_epoch.load(std::sync::atomic::Ordering::Relaxed),
                 std::time::Instant::now(),
@@ -9781,17 +9921,28 @@ async fn media_pump_ffmpeg_dc(
                     // Byte-budget ledger (constrained gate): counted on entry,
                     // released by the send task once the frame leaves.
                     inflight_bytes.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
+                    handed_bytes += wire_len as u64;
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
                     if pkt.is_keyframe {
                         kf_gate.on_key_frame_queued();
+                        // FR-135 R0 (N12) — and the viewer's ask it answers.
+                        if let Some(w) = media_window.as_mut()
+                            && let Some(waited) =
+                                crate::session_telemetry::counters(session_id).take_keyframe_ask()
+                        {
+                            w.on_key_queued(waited);
+                        }
                     }
                     if kf_gate.take_resync() {
                         // First frame through after a drop burst — make the
                         // NEXT one a keyframe so the browser resyncs the
                         // deltas it missed during congestion.
                         enc.request_keyframe().await;
+                        if let Some(w) = media_window.as_mut() {
+                            w.on_force(crate::media_window::IdrCause::Resync);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -9828,6 +9979,22 @@ async fn media_pump_ffmpeg_dc(
             }
         }
         send_us += send_start.elapsed().as_micros() as u64;
+        // FR-135 R0 (N7, N10, N3) — once per frame that reached the queue.
+        if handed_bytes > 0
+            && let Some(w) = media_window.as_mut()
+        {
+            let now = std::time::Instant::now();
+            w.on_handoff(
+                now,
+                frame_captured_at.filter(|_| is_real_frame),
+                handed_bytes,
+            );
+            if !first_frame_noted {
+                first_frame_noted = true;
+                crate::session_telemetry::counters(session_id)
+                    .note_first_frame(now.saturating_duration_since(pump_started));
+            }
+        }
 
         // Heartbeat for log-grep observability. rc.88 adds per-stage
         // averages (capture/encode/send ms) so the field can localise
@@ -9932,11 +10099,48 @@ async fn media_pump_ffmpeg_dc(
             // one grep; read `idr_count` against `keyframe_requests` to isolate
             // rate-caused IDRs.
             let rate_stats = enc.rate_stats().await;
-            crate::media_plan::input_form(
-                session_id,
-                rate_stats.input.gpu,
-                rate_stats.input.reason,
-            );
+            // FR-135 R0 — a failed read (`RateStats::default()`: CPU with no
+            // reason) says nothing about the session, since a real CPU form
+            // always names its reason (`SessionCounters::note_video`'s rule).
+            // Passed on, it put a false "gpu → cpu" step and its way back into
+            // the viewer's plan whenever the encoder thread did not answer.
+            if rate_stats.input.gpu || !rate_stats.input.reason.is_empty() {
+                crate::media_plan::input_form(
+                    session_id,
+                    rate_stats.input.gpu,
+                    rate_stats.input.reason,
+                );
+            }
+            // FR-135 R0 — the window, taken whole. `None` with `stats` on the
+            // session's old path, and every field it feeds below reads `None`.
+            let media = media_window
+                .as_mut()
+                .map(|w| w.take(std::time::Instant::now()));
+            let kf_asks = media
+                .as_ref()
+                .map(|_| crate::session_telemetry::counters(session_id).keyframe_asks());
+            // FR-135 R0 — the viewer's windows since the last line, from its
+            // `rc:decodestat`s through `session_telemetry`, never the pump.
+            let viewer = media
+                .as_ref()
+                .and_then(|_| crate::session_telemetry::counters(session_id).take_viewer_window());
+            // FR-132 P1d — what `rc:session.stats` names: the heartbeat's own
+            // words, plus the capture backend the heartbeat does not carry. A
+            // new reading goes at once, by the carrier's road and as
+            // best-effort, so a session someone leaves before the next 30 s
+            // tick is still in a canary week's read.
+            if crate::session_telemetry::counters(session_id).note_video(
+                crate::session_telemetry::VideoForm {
+                    encoder: enc.name(),
+                    capture: capturer.backend(),
+                    input_path: rate_stats.input.path(),
+                    input_reason: rate_stats.input.reason,
+                    // FR-135 R0 — the opened chroma, so the reading names a cell.
+                    chroma: if enc.chroma444() { "yuv444" } else { "yuv420" },
+                },
+            ) {
+                let _ = stats_now.try_send(session_id);
+            }
             // FR-118 P0 — `avg_encode_ms` split into its four steps, and the
             // capture thread's own readback, per frame over this window (0.0
             // when the window had none, like `avg_encode_ms`). The readback runs
@@ -10016,12 +10220,21 @@ async fn media_pump_ffmpeg_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — what a stall is judged against: a live reading, never
+                // the prior's stand-in. None = no claim to contradict, so a stall
+                // cuts nothing. `readings_refuted` counts the deliveries that took
+                // out what stood below them; `goodput_bps` reads None after one.
+                // `link_unoffered` counts congested windows the sender was not
+                // feeding: a link loop gone quiet with this climbing is the rule.
+                pipe_measured = ?governor.measured_bps(std::time::Instant::now(), constrained),
+                readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow
@@ -10106,8 +10319,43 @@ async fn media_pump_ffmpeg_dc(
                 shadow_disagree_pct = ?governor.shadow_disagree_pct(),
                 shadow_pauses = governor.shadow_pauses(),
                 shadow_reason = governor.shadow_reason(),
+                // FR-135 R0 (N3, N7, N10, N12, §2.5), appended and never
+                // renamed; each reads `None` with `stats` on the session's old
+                // path. A `_ms` list is twelve log-2 ms buckets, [0,1) up to
+                // [1024,∞) (`crate::media_window`). `window_ms` is the window's
+                // real length, which the "≈2s" above only floors (ledger L03).
+                capture_backend = ?media.as_ref().map(|_| capturer.backend()),
+                window_ms = ?media.as_ref().map(|m| m.window_ms),
+                frames_keepalive = ?media.as_ref().map(|m| m.frames_keepalive),
+                keepalive_bytes = ?media.as_ref().map(|m| m.keepalive_bytes),
+                cap_to_handoff_ms = ?media.as_ref().map(|m| m.cap_to_handoff.counts()),
+                cap_to_handoff_p50_ms = ?media.as_ref().and_then(|m| m.cap_to_handoff_p50_ms),
+                cap_to_handoff_p95_ms = ?media.as_ref().and_then(|m| m.cap_to_handoff_p95_ms),
+                handoff_gap_ms = ?media.as_ref().map(|m| m.handoff_gap.counts()),
+                kf_ask_to_queued_ms = ?media.as_ref().map(|m| m.kf_ask_to_queued.counts()),
+                kf_asks = ?kf_asks.map(|(asks, _)| asks),
+                kf_asks_gapped = ?kf_asks.map(|(_, gapped)| gapped),
+                idr_causes = ?media.as_ref().map(|m| m.idr_causes),
+                dc_lock_ms = ?media.as_ref().map(|m| m.dc_lock.counts()),
+                maxrate_bps = ?media.as_ref().map(|_| enc.current_maxrate_bps()),
+                // FR-135 R0, the viewer's half (N9-N12, N16): its decode
+                // worker's 1 s windows since the last line, `viewer_windows` of
+                // them, summed in the same buckets; its counts are cumulative.
+                // `None` from a viewer that does not count, and with `stats` old.
+                viewer_windows = ?viewer.map(|v| v.windows),
+                viewer_dec_ms = ?viewer.and_then(|v| v.report.dec),
+                viewer_paint_ms = ?viewer.and_then(|v| v.report.paint),
+                viewer_fwd_ms = ?viewer.and_then(|v| v.report.fwd),
+                viewer_backlog_ms = ?viewer.and_then(|v| v.report.backlog),
+                viewer_arr_gap_ms = ?viewer.and_then(|v| v.report.arr_gap),
+                viewer_gate_ms = ?viewer.and_then(|v| v.report.gate),
+                viewer_chunk_gaps = ?viewer.and_then(|v| v.report.chunk_gaps),
+                viewer_freezes = ?viewer.and_then(|v| v.report.freezes),
+                viewer_painted = ?viewer.and_then(|v| v.report.painted),
+                viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block
@@ -10361,7 +10609,7 @@ fn attach_input_handler(
             let parsed: input::InputMsg = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%e, "input: parse failed");
+                    debug!(e = ?e.to_string(), "input: parse failed");
                     return;
                 }
             };
@@ -10564,6 +10812,25 @@ pub(crate) fn viewer_counts_decode_errors(val: &serde_json::Value) -> bool {
         .is_some_and(|v| v.as_u64() == Some(1) || v.as_bool() == Some(true))
 }
 
+/// FR-135 R0 (N9-N12, N16) — keep a `rc:decodestat`'s viewer numbers
+/// ([`crate::media_window::ViewerReport`]) in the session's counters, for the
+/// FFmpeg heartbeat's `viewer_*` fields and `rc:session.stats`. With `stats` on
+/// the session's old path (`rc_media_legacy=stats`) nothing is kept, so the
+/// heartbeat and the reading are what they were before R0.
+pub(crate) fn note_viewer_decodestat(
+    session_id: bson::oid::ObjectId,
+    val: &serde_json::Value,
+    stats_new: bool,
+) {
+    if !stats_new {
+        return;
+    }
+    let report = crate::media_window::ViewerReport::parse(val);
+    if !report.is_empty() {
+        crate::session_telemetry::counters(session_id).note_viewer_report(report);
+    }
+}
+
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
 /// applies them. Today the only message is `rc:quality` (mutating the
 /// shared atomic that the media pump polls before each encode); future
@@ -10585,6 +10852,9 @@ fn attach_control_handler(
     // FR-132 P1 — asks the signalling loop for one `rc:session.stats` for this
     // session now (the FR-102 P9d carrier-ready channel), on a decode error.
     stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — `stats` is on this session's new path: keep the viewer's
+    // media numbers from `rc:decodestat` (`note_viewer_decodestat`).
+    stats_new: bool,
 ) {
     // A handle the on_message closure sends replies through (e.g.
     // rc:logs-fetch.reply) over the same DC. #1740 — WEAK: the closure is
@@ -10648,7 +10918,7 @@ fn attach_control_handler(
             let val: serde_json::Value = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%session_id, %e, "control: malformed JSON, dropped");
+                    debug!(%session_id, e = ?e.to_string(), "control: malformed JSON, dropped");
                     return;
                 }
             };
@@ -10982,6 +11252,10 @@ fn attach_control_handler(
                             q.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
                         ));
                     }
+                    // FR-135 R0 (N9-N12, N16) — and the decode worker's window,
+                    // kept for the heartbeat and the session's reading. Record
+                    // only: nothing above reads it.
+                    note_viewer_decodestat(session_id, &val, stats_new);
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to
@@ -11006,8 +11280,8 @@ fn attach_control_handler(
                                 // P3: only the owning session's toggle-off
                                 // restores; a non-owner disabling its OWN match
                                 // preference must not revert the mode another
-                                // session applied.
-                                if crate::display_match::restore_for(session_id) {
+                                // session applied. Its waiting request goes too.
+                                if crate::display_match::turn_off(session_id) {
                                     tracing::info!("display-match: restored original mode");
                                 } else {
                                     tracing::debug!(
@@ -11080,6 +11354,9 @@ fn attach_control_handler(
                     let allow = guard
                         .map(|t| now.duration_since(t) >= MIN_KF_GAP)
                         .unwrap_or(true);
+                    // FR-135 R0 (N12) — every ask, and whether the gap dropped
+                    // it: R1's slow recoveries pointed here with no counter.
+                    crate::session_telemetry::counters(session_id).note_keyframe_ask(allow);
                     if allow {
                         *guard = Some(now);
                         drop(guard);
@@ -11601,7 +11878,7 @@ fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
 fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
-        debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
+        debug!(%session_id, ?label, bytes = msg.data.len(), "DC msg (unhandled)");
         // FR-101 P4b-2 — a view-only session's input channel lands here: what
         // it sends is never injected, but the person sending it is present,
         // and the idle limit must not end their session under them.
@@ -11688,6 +11965,18 @@ fn attach_clipboard_handler(
         warn!(%session_id, "clipboard: init failed — DC will no-op");
         return;
     };
+    attach_clipboard(dc, session_id, cb, session_end);
+}
+
+/// #3733 — [`attach_clipboard_handler`] past its two gates, moved here as it
+/// was: the channel's handlers on `cb`. A test hands it a clipboard of its own.
+#[cfg(feature = "clipboard")]
+fn attach_clipboard(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    cb: crate::clipboard::Clipboard,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
     // rc.44 — per-session reassembler for `clipboard:write-chunk`
     // envelopes. Shared across all on_message callbacks via the Arc.
     // Browser-side chunker is bounded at 14 KB per envelope; this
@@ -11773,7 +12062,7 @@ fn attach_clipboard_handler(
                     rx.frame(&msg.data)
                 };
                 if let Err(reason) = res {
-                    debug!(%session_id, %reason, "clipboard: dropped binary frame");
+                    debug!(%session_id, ?reason, "clipboard: dropped binary frame");
                 }
                 return;
             }
@@ -11785,7 +12074,7 @@ fn attach_clipboard_handler(
             let parsed = match parsed {
                 Ok(p) => p,
                 Err(e) => {
-                    debug!(%session_id, %e, "clipboard: unparseable JSON");
+                    debug!(%session_id, e = ?e.to_string(), "clipboard: unparseable JSON");
                     return;
                 }
             };
@@ -11838,13 +12127,13 @@ fn attach_clipboard_handler(
                     };
                     match outcome {
                         crate::clipboard::WriteChunkOutcome::Pending => {
-                            debug!(%session_id, id=%id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
+                            debug!(%session_id, id=?id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
                         }
                         crate::clipboard::WriteChunkOutcome::Complete(full_text) => {
                             let bytes = full_text.len();
                             match cb.write(full_text).await {
                                 Ok(()) => {
-                                    info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
+                                    info!(%session_id, id=?id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
                                     tally_clipboard(session_id, TransferDirection::ToHost, bytes);
                                     // v2 ack, keyed by the chunk id the
                                     // browser already assigns. Old UIs
@@ -11859,7 +12148,7 @@ fn attach_clipboard_handler(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(%session_id, id=%id, %e, "clipboard: chunked write failed");
+                                    warn!(%session_id, id=?id, %e, "clipboard: chunked write failed");
                                     let reply = serde_json::json!({
                                         "t": "clipboard:error",
                                         "message": format!("{e}"),
@@ -11872,7 +12161,7 @@ fn attach_clipboard_handler(
                             }
                         }
                         crate::clipboard::WriteChunkOutcome::Rejected(reason) => {
-                            warn!(%session_id, id=%id, %reason, "clipboard: chunk rejected");
+                            warn!(%session_id, id=?id, ?reason, "clipboard: chunk rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12161,10 +12450,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, w, h, bytes, "clipboard: image write begin")
+                            debug!(%session_id, ?id, w, h, bytes, "clipboard: image write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: image begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: image begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12187,10 +12476,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, html_bytes, text_bytes, "clipboard: html write begin")
+                            debug!(%session_id, ?id, html_bytes, text_bytes, "clipboard: html write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: html begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: html begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12214,10 +12503,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
+                            debug!(%session_id, ?id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: native begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: native begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12298,11 +12587,11 @@ async fn finish_rich_write(
             "id": id,
             "bytes": bytes,
         }),
-        Err(message) => {
-            warn!(%session_id, id, %message, "clipboard: rich write failed");
+        Err(reason) => {
+            warn!(%session_id, id, ?reason, "clipboard: rich write failed");
             serde_json::json!({
                 "t": "clipboard:error",
-                "message": message,
+                "message": reason,
                 "id": id,
             })
         }
@@ -12562,17 +12851,165 @@ async fn send_clipboard_image(
     }
 }
 
-/// Wire the `files` DC to a per-session file-transfer handler. Strings
-/// carry control frames (`files:begin`/`files:end` + agent replies);
-/// binary frames are chunk payloads appended to the current in-flight
-/// transfer. The handler enforces one active transfer at a time and
-/// replies with `files:accepted` / `files:progress` / `files:complete`
-/// / `files:error` over the same channel.
+/// #3757 — why a macOS system install's root daemon declines a session's
+/// `files` channel ([`FilesChannel::Declined`]): on a Mac, file transfer runs
+/// in the GUI worker, as the person signed in at the screen (FR-43 P2b), and
+/// no worker serves this session. It says what to do: once someone is signed
+/// in, the next session is the worker's; a Mac with two rows serves its
+/// screen and files on the person's own row. The viewer shows it on the
+/// transfer, or in the drawer.
+pub(crate) const FILES_IN_THE_PERSONS_SESSION: &str = "File transfer on this Mac needs someone \
+     signed in at its screen and runs in their session, not in this one. Reconnect once someone \
+     is signed in, or connect to the Mac's user-session agent.";
+
+/// #3757 — whether the process that holds a session's peer serves the
+/// session's `files` channel ([`files_channel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesChannel {
+    /// Served here, as before.
+    Served,
+    /// Declined: every request on the channel is answered with this reason
+    /// ([`attach_files_declined`]), and nothing on the host is touched.
+    Declined(&'static str),
+}
+
+/// #3757 — who serves a session's `files` channel, asked where the channel
+/// opens: in the process that holds the session's peer. `root` is the
+/// effective uid this process's file access runs under (`geteuid() == 0`).
 ///
-/// Public so `crates/tests/src/file_dc_tests.rs` can attach the same
-/// dispatcher to a loopback DC and lock the wire format end-to-end.
-/// The dispatcher itself stays private (free fns below) — only the
-/// wiring entry point is needed across crates.
+/// On a macOS system install the root daemon hands a session to the GUI
+/// worker in the session of the person signed in at the screen (FR-43 P2b):
+/// the offer crosses, the worker builds the peer, and every channel of that
+/// session, this one included, opens in the worker, which runs as that
+/// person (the supervisor starts none for the login window, and starts it
+/// with `sudo -u`). An offer no worker takes builds its peer in the root
+/// daemon. So a `files` channel that opens in a root process on a Mac
+/// belongs to a session no worker serves: it is declined with a reason the
+/// viewer shows, and consent, the grant and the session go on as they were.
+/// A worker that attaches later does not move that peer, and one that leaves
+/// never hands its own to the daemon; a new offer is decided again where it
+/// lands. Every other process serves the channel as before. Pure, so the
+/// rule is a test on every OS.
+pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
+    if on_macos && root {
+        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
+    } else {
+        FilesChannel::Served
+    }
+}
+
+/// [`files_channel`] for this process, by its own effective uid.
+pub(crate) fn files_channel_here() -> FilesChannel {
+    files_channel(cfg!(target_os = "macos"), effective_uid_is_root())
+}
+
+/// #3757 — whether this process's file access runs as root: its effective
+/// uid is 0. Never on Windows.
+fn effective_uid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` reads this process's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// #3757 — a session's `files` channel, by its grant and by whether this
+/// process serves it ([`files_channel`]). A grant without FILES gets the
+/// FILES-denied channel first, as before (Multi-user P3: new viewers ask for
+/// the bit by default, and a session narrowed to view-effective gets
+/// explicit errors instead of silent transfers). A session this process
+/// serves gets the file-transfer handler, as before; a declined one gets a
+/// channel that answers every request with the reason and touches nothing on
+/// the host ([`attach_files_declined`]).
+pub(crate) fn attach_files(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    permissions: roomler_ai_remote_control::permissions::Permissions,
+    served: FilesChannel,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
+    use roomler_ai_remote_control::permissions::Permissions;
+    if !permissions.contains(Permissions::FILES) {
+        attach_files_denied(dc, session_id, session_end);
+        return;
+    }
+    match served {
+        FilesChannel::Served => attach_files_handler(dc, session_id, session_end),
+        FilesChannel::Declined(why) => attach_files_declined(dc, session_id, why, session_end),
+    }
+}
+
+/// #3757 — a `files` channel this process declines
+/// ([`FilesChannel::Declined`]): every request is answered with
+/// `why`, in the frame the viewer's waiter for that request settles on
+/// ([`declined_reply`]), and a binary chunk is dropped. Nothing on the host
+/// is read or written, and the channel stays open: the session goes on.
+pub(crate) fn attach_files_declined(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    why: &'static str,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
+    info!(
+        session = %session_id,
+        "files DC declined: on a Mac, file transfer runs in the GUI worker, and none serves this session"
+    );
+    let dc_for_handler = dc.clone();
+    dc.on_message(Box::new(move |msg| {
+        let dc = dc_for_handler.clone();
+        Box::pin(async move {
+            if !msg.is_string {
+                return; // a chunk for a transfer that was never accepted
+            }
+            if let Some(reply) = declined_reply(&msg.data, why) {
+                let _ = dc.send_text(reply).await;
+            }
+        })
+    }));
+    // The stub holds its channel too: let go when the session ends.
+    on_session_end(&dc, session_end, || async {});
+}
+
+/// #3757 — what a declined `files` channel answers one control frame with,
+/// carrying `why`: `files:dir-error` for a listing (the drawer's waiter
+/// settles on its `req_id`), `files:error` for anything else (a transfer's
+/// waiter settles on its `id`). A frame that does not parse is answered with
+/// no id, as the FILES-denied channel answers it. Pure.
+fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
+    let parsed = std::str::from_utf8(frame)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+    let field = |key: &str| -> String {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let listing = parsed
+        .as_ref()
+        .and_then(|v| v.get("t"))
+        .and_then(|t| t.as_str())
+        == Some("files:dir");
+    let reply = if listing {
+        serde_json::to_string(&crate::files::FilesOutgoing::DirError {
+            req_id: &field("req_id"),
+            message: why,
+        })
+    } else {
+        serde_json::to_string(&crate::files::FilesOutgoing::Error {
+            id: &field("id"),
+            message: why,
+        })
+    };
+    reply.ok()
+}
+
 /// Multi-user P3 — the FILES-denied handler: every control frame gets an
 /// explicit `files:error` (addressed by the frame's own `id` when present, so
 /// the browser's per-transfer waiter rejects instead of timing out) and
@@ -12613,6 +13050,18 @@ pub fn attach_files_denied(
     on_session_end(&dc, session_end, || async {});
 }
 
+/// Wire the `files` DC to a per-session file-transfer handler. Strings
+/// carry control frames (`files:begin`/`files:end` + agent replies);
+/// binary frames are chunk payloads appended to the current in-flight
+/// transfer. The handler enforces one active transfer at a time and
+/// replies with `files:accepted` / `files:progress` / `files:complete`
+/// / `files:error` over the same channel. #3785 — a refused begin is its
+/// upload's only answer: the chunks and the end behind it get none.
+///
+/// Public so `agents/roomlerd/tests/file_dc.rs` can attach the same
+/// dispatcher to a loopback DC and lock the wire format end-to-end.
+/// The dispatcher itself stays private (free fns below) — only the
+/// wiring entry point is needed across crates.
 pub fn attach_files_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
@@ -12707,7 +13156,7 @@ async fn handle_files_control(
     let parsed = match parsed {
         Ok(p) => p,
         Err(e) => {
-            debug!(%session_id, %e, "files: unparseable control JSON");
+            debug!(%session_id, e = ?e.to_string(), "files: unparseable control JSON");
             return;
         }
     };
@@ -12720,7 +13169,7 @@ async fn handle_files_control(
             rel_path,
             dest_path,
         } => {
-            info!(%session_id, %id, %name, size, ?mime, ?rel_path, ?dest_path, "files: begin");
+            info!(%session_id, ?id, ?name, size, ?mime, ?rel_path, ?dest_path, "files: begin");
             match handler
                 .begin(
                     id.clone(),
@@ -12743,7 +13192,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %id, %e, "files: begin failed");
+                    warn!(%session_id, ?id, e = ?e.to_string(), "files: begin failed");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -12756,9 +13205,15 @@ async fn handle_files_control(
                 }
             }
         }
+        // #3785 — the end of an upload whose begin this channel refused: the
+        // begin's `files:error` was that upload's answer and the viewer has
+        // settled it, so the end gets none, as its chunks got none.
+        crate::files::FilesIncoming::End { id } if handler.refused_at_begin(&id) => {
+            debug!(%session_id, ?id, "files: the end of an upload whose begin was refused is dropped");
+        }
         crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
             Ok((path, bytes)) => {
-                info!(%session_id, %id, bytes, path = %path.display(), "files: complete");
+                info!(%session_id, %id, bytes, path = ?path, "files: complete");
                 // FR-101 P3 — the audit gets the name's hash, never the name.
                 crate::session_telemetry::counters(session_id).note_file(
                     TransferDirection::ToHost,
@@ -12780,7 +13235,7 @@ async fn handle_files_control(
                 .await;
             }
             Err(e) => {
-                warn!(%session_id, %id, %e, "files: end failed");
+                warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed");
                 let msg = format!("{e}");
                 send_files_json(
                     &dc,
@@ -12793,7 +13248,7 @@ async fn handle_files_control(
             }
         },
         crate::files::FilesIncoming::Get { id, path } => {
-            info!(%session_id, %id, path = %path, "files: get (download requested)");
+            info!(%session_id, ?id, path = ?path, "files: get (download requested)");
             spawn_outgoing_pump(dc.clone(), handler, session_id, id, path);
         }
         crate::files::FilesIncoming::GetFolder { id, path, format } => {
@@ -12801,7 +13256,7 @@ async fn handle_files_control(
             if let Some(f) = format.as_deref()
                 && f != "zip"
             {
-                warn!(%session_id, %id, format = %f, "files: get-folder unsupported format");
+                warn!(%session_id, ?id, format = ?f, "files: get-folder unsupported format");
                 send_files_json(
                     &dc,
                     &crate::files::FilesOutgoing::Error {
@@ -12812,7 +13267,7 @@ async fn handle_files_control(
                 .await;
                 return;
             }
-            info!(%session_id, %id, path = %path, "files: get-folder (zip) requested");
+            info!(%session_id, ?id, path = ?path, "files: get-folder (zip) requested");
             spawn_outgoing_zip_pump(dc.clone(), handler, session_id, id, path);
         }
         crate::files::FilesIncoming::Cancel { id } => {
@@ -12821,18 +13276,35 @@ async fn handle_files_control(
             // cancel_incoming clears upload state + removes the
             // .roomler-partial/<id>/ staging dir + registry entry so
             // the partial doesn't sit until the 24h orphan sweep.
-            // Browsers send files:cancel on terminal upload failure
-            // (6 reconnect attempts exhausted).
+            // The viewer sends files:cancel to stop a download; for an
+            // upload only when its resume loop gives up, which since
+            // rc.23's endless retry it never does.
             let out_cancelled = handler.cancel_outgoing(&id).await;
-            let in_cancelled = handler.cancel_incoming(&id).await;
-            info!(
-                %session_id, %id, out_cancelled, in_cancelled,
-                "files: cancel requested"
-            );
+            // #3688 — an upload's id is one plain name
+            // (`files::transfer_id`): any other is refused, and the viewer
+            // told, as at files:begin and files:resume.
+            match handler.cancel_incoming(&id).await {
+                Ok(in_cancelled) => info!(
+                    %session_id, %id, out_cancelled, in_cancelled,
+                    "files: cancel requested"
+                ),
+                Err(e) => {
+                    warn!(%session_id, ?id, out_cancelled, e = ?e.to_string(), "files: cancel refused");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         crate::files::FilesIncoming::Dir { req_id, path } => {
             if !crate::files::is_remote_browse_enabled() {
-                info!(%session_id, %req_id, path = %path, "files: dir refused — remote browse disabled");
+                info!(%session_id, ?req_id, path = ?path, "files: dir refused — remote browse disabled");
                 send_files_json(
                     &dc,
                     &crate::files::FilesOutgoing::DirError {
@@ -12846,8 +13318,8 @@ async fn handle_files_control(
             match crate::files::list_dir(&path).await {
                 Ok(listing) => {
                     info!(
-                        %session_id, %req_id,
-                        path = %listing.path,
+                        %session_id, ?req_id,
+                        path = ?listing.path,
                         entries = listing.entries.len(),
                         "files: dir listed"
                     );
@@ -12864,7 +13336,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %req_id, path = %path, %e, "files: dir failed");
+                    warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -12904,7 +13376,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %id, %offset, %e, "files: resume rejected");
+                    warn!(%session_id, ?id, %offset, e = ?e.to_string(), "files: resume rejected");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -12940,7 +13412,7 @@ fn spawn_outgoing_pump(
         let offer = match handler.begin_outgoing(id.clone(), &requested_path).await {
             Ok(o) => o,
             Err(e) => {
-                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing failed");
+                warn!(%session_id, ?id, path = ?requested_path, e = ?e.to_string(), "files: begin_outgoing failed");
                 let msg = format!("{e}");
                 send_files_json(
                     &dc,
@@ -12981,10 +13453,10 @@ fn spawn_outgoing_pump(
             Err(e) => {
                 handler.finish_outgoing(&offer.id).await;
                 if offer.cancel.is_cancelled() {
-                    info!(%session_id, id = %offer.id, "files: download stopped (cancelled, or the session ended)");
+                    info!(%session_id, id = ?offer.id, "files: download stopped (cancelled, or the session ended)");
                     return;
                 }
-                warn!(%session_id, id = %offer.id, %e, "files: pump_outgoing failed");
+                warn!(%session_id, id = ?offer.id, e = ?e.to_string(), "files: pump_outgoing failed");
                 let msg = format!("{e}");
                 let _ = or_stopped(
                     &offer.cancel,
@@ -13004,7 +13476,7 @@ fn spawn_outgoing_pump(
         // Successful end-of-stream: clear state, then send Eof so the
         // browser closes the writable cleanly.
         info!(
-            %session_id, id = %offer.id, bytes_sent, path = %offer.path.display(),
+            %session_id, id = ?offer.id, bytes_sent, path = ?offer.path,
             "files: outgoing complete"
         );
         crate::session_telemetry::counters(session_id).note_file(
@@ -13041,138 +13513,136 @@ fn spawn_outgoing_zip_pump(
     id: String,
     requested_path: String,
 ) {
-    tokio::spawn(async move {
-        let offer = match handler
-            .begin_outgoing_zip(id.clone(), &requested_path)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing_zip failed");
-                let msg = format!("{e}");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Error {
-                        id: &id,
-                        message: &msg,
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+    tokio::spawn(outgoing_zip(dc, handler, session_id, id, requested_path));
+}
 
-        // #1730 — as the single-file download: every message races the stop
-        // token, and the transfer's state goes first on every exit.
-        if or_stopped(
-            &offer.cancel,
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Offer {
-                    id: &offer.id,
-                    name: &offer.name,
-                    size: None, // streaming — total unknown
-                    mime: offer.mime,
-                },
-            ),
-        )
+/// [`spawn_outgoing_zip_pump`]'s task, over any [`DownloadSink`]: the
+/// channel in production; in the tests (#3669) a recorder, so they drive
+/// the path a `files:get-folder` takes, from its entry point to its last
+/// message.
+async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
+    dc: S,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    id: String,
+    requested_path: String,
+) {
+    let offer = match handler
+        .begin_outgoing_zip(id.clone(), &requested_path)
         .await
-        .is_err()
-        {
-            handler.finish_outgoing(&offer.id).await;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(%session_id, ?id, path = ?requested_path, e = ?e.to_string(), "files: begin_outgoing_zip failed");
+            let msg = format!("{e}");
+            dc.send_json(&crate::files::FilesOutgoing::Error {
+                id: &id,
+                message: &msg,
+            })
+            .await;
             return;
         }
+    };
 
-        // Bounded duplex pipe: write side fed by async_zip; read
-        // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
-        // chunks before async_zip's writes start blocking. Keeps
-        // memory usage low and gives backpressure-free crash
-        // protection if the DC is wedged.
-        const PIPE_BUFFER: usize = 256 * 1024;
-        let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
-        let cancel = offer.cancel.clone();
-        let path = offer.path.clone();
-        let walk_cancel = cancel.clone();
-        let walk_handle = tokio::spawn(async move {
-            crate::files::walk_and_zip(writer_half, &path, walk_cancel).await
-        });
-
-        let dc_for_pump = dc.clone();
-        let pump_cancel = cancel.clone();
-        let id_for_pump = offer.id.clone();
-        let pump_handle = tokio::spawn(async move {
-            zip_pump_loop(dc_for_pump, reader_half, pump_cancel, id_for_pump).await
-        });
-
-        // Wait for both sides. The walk task closes the writer
-        // half; the pump task sees EOF and exits.
-        let walk_res = walk_handle.await;
-        let pump_res = pump_handle.await;
-
-        let total_bytes = match (walk_res, pump_res) {
-            (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
-            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
-                handler.finish_outgoing(&offer.id).await;
-                if offer.cancel.is_cancelled() {
-                    info!(%session_id, id = %offer.id, "files: zip download stopped (cancelled, or the session ended)");
-                    return;
-                }
-                warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
-                let msg = format!("{e}");
-                let _ = or_stopped(
-                    &offer.cancel,
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::Error {
-                            id: &offer.id,
-                            message: &msg,
-                        },
-                    ),
-                )
-                .await;
-                return;
-            }
-            (Err(je), _) | (_, Err(je)) => {
-                handler.finish_outgoing(&offer.id).await;
-                warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
-                let _ = or_stopped(
-                    &offer.cancel,
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::Error {
-                            id: &offer.id,
-                            message: "zip pump task panicked",
-                        },
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        info!(
-            %session_id, id = %offer.id, total_bytes,
-            path = %offer.path.display(),
-            "files: outgoing zip complete"
-        );
-        crate::session_telemetry::counters(session_id).note_file(
-            TransferDirection::FromHost,
-            &offer.name,
-            total_bytes,
-        );
+    // #1730 — as the single-file download: every message races the stop
+    // token, and the transfer's state goes first on every exit.
+    if or_stopped(
+        &offer.cancel,
+        dc.send_json(&crate::files::FilesOutgoing::Offer {
+            id: &offer.id,
+            name: &offer.name,
+            size: None, // streaming — total unknown
+            mime: offer.mime,
+        }),
+    )
+    .await
+    .is_err()
+    {
         handler.finish_outgoing(&offer.id).await;
-        let _ = or_stopped(
-            &offer.cancel,
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Eof {
-                    id: &offer.id,
-                    bytes: total_bytes,
-                },
-            ),
-        )
-        .await;
+        return;
+    }
+
+    // Bounded duplex pipe: write side fed by async_zip; read
+    // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
+    // chunks before async_zip's writes start blocking. Keeps
+    // memory usage low and gives backpressure-free crash
+    // protection if the DC is wedged.
+    const PIPE_BUFFER: usize = 256 * 1024;
+    let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
+    let cancel = offer.cancel.clone();
+    let path = offer.path.clone();
+    let who = offer.who.clone();
+    let walk_cancel = cancel.clone();
+    let walk_handle = tokio::spawn(async move {
+        crate::files::walk_and_zip(writer_half, &path, &who, walk_cancel).await
     });
+
+    let dc_for_pump = dc.clone();
+    let pump_cancel = cancel.clone();
+    let id_for_pump = offer.id.clone();
+    let pump_handle = tokio::spawn(async move {
+        zip_pump_loop(dc_for_pump, reader_half, pump_cancel, id_for_pump).await
+    });
+
+    // Wait for both sides. The walk task closes the writer
+    // half; the pump task sees EOF and exits.
+    let walk_res = walk_handle.await;
+    let pump_res = pump_handle.await;
+
+    let total_bytes = match (walk_res, pump_res) {
+        (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
+        (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
+            handler.finish_outgoing(&offer.id).await;
+            if offer.cancel.is_cancelled() {
+                info!(%session_id, id = ?offer.id, "files: zip download stopped (cancelled, or the session ended)");
+                return;
+            }
+            warn!(%session_id, id = ?offer.id, e = ?e.to_string(), "files: zip pump failed");
+            let msg = format!("{e}");
+            let _ = or_stopped(
+                &offer.cancel,
+                dc.send_json(&crate::files::FilesOutgoing::Error {
+                    id: &offer.id,
+                    message: &msg,
+                }),
+            )
+            .await;
+            return;
+        }
+        (Err(je), _) | (_, Err(je)) => {
+            handler.finish_outgoing(&offer.id).await;
+            warn!(%session_id, id = ?offer.id, %je, "files: zip pump task panicked");
+            let _ = or_stopped(
+                &offer.cancel,
+                dc.send_json(&crate::files::FilesOutgoing::Error {
+                    id: &offer.id,
+                    message: "zip pump task panicked",
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    info!(
+        %session_id, id = ?offer.id, total_bytes,
+        path = ?offer.path,
+        "files: outgoing zip complete"
+    );
+    crate::session_telemetry::counters(session_id).note_file(
+        TransferDirection::FromHost,
+        &offer.name,
+        total_bytes,
+    );
+    handler.finish_outgoing(&offer.id).await;
+    let _ = or_stopped(
+        &offer.cancel,
+        dc.send_json(&crate::files::FilesOutgoing::Eof {
+            id: &offer.id,
+            bytes: total_bytes,
+        }),
+    )
+    .await;
 }
 
 /// Pump bytes from the duplex reader to the DC, applying SCTP
@@ -13313,7 +13783,7 @@ async fn handle_files_chunk(
             // Below the progress-report threshold; nothing to send.
         }
         Err(e) => {
-            warn!(%session_id, id = %active_id, %e, "files: chunk failed");
+            warn!(%session_id, id = %active_id, e = ?e.to_string(), "files: chunk failed");
             let msg = format!("{e}");
             send_files_json(
                 &dc,
@@ -13465,6 +13935,31 @@ pub(crate) fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServ
             "ICE relay-over-TCP: media pinned to TURNS/TCP relay (hostile-NAT mode)"
         );
         filtered
+    }
+}
+
+/// FR-138 — what the org loop's session table reads of a peer it keeps through
+/// the loss of its control socket (`crate::session_table::TablePeer`).
+impl AgentPeer {
+    /// Whether this peer's connection is `Connected` now. A peer kept after a
+    /// net change closes once it is not: the RC path has no ICE restart.
+    pub(crate) fn is_connected(&self) -> bool {
+        matches!(
+            self.pc.connection_state(),
+            RTCPeerConnectionState::Connected
+        )
+    }
+
+    /// P2a-2 (M1) — whether this peer's connection is `Failed` or `Closed`: it
+    /// cannot come back. Its state handler says `Terminate` once, on `Failed`,
+    /// and the watchdog stops watching there, so a peer that died while its
+    /// control socket was dying told only that socket. The table closes such
+    /// a peer instead of keeping it, and never resumes it.
+    pub(crate) fn is_dead(&self) -> bool {
+        matches!(
+            self.pc.connection_state(),
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        )
     }
 }
 
@@ -14518,6 +15013,44 @@ mod codec_cap_tests {
         );
     }
 
+    /// #3423 — a capture that waits inside its session (P3e's dark display,
+    /// P5f's user switch) is told to the pump's shared pipeline as it is told
+    /// to the owner's own viewer, so the viewers sharing the capture hear it
+    /// too, and the pipeline keeps it until the next frame. Red without
+    /// `hold`'s `share`.
+    // The pipeline registry's test guard is held across an await on purpose,
+    // as in `media_share`'s own tests: it serializes whole tests.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_held_wait_is_told_to_the_shared_pipeline() {
+        use super::CaptureWait;
+        use crate::capture::WaitFor::DisplayWake;
+        use std::time::Duration;
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3423-HOLD");
+        let owner = bson::oid::ObjectId::new();
+        let pipeline = crate::media_share::Pipeline::register(key, owner);
+        let control_dc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let mut w = CaptureWait::default();
+        assert!(
+            w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)),
+            "held at once"
+        );
+        assert_eq!(pipeline.kept_wait(), None, "not told yet: the quiet spell");
+        tokio::time::sleep(CaptureWait::QUIET_BEFORE_TELL + Duration::from_millis(100)).await;
+        assert!(w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)));
+        let (why, left) = pipeline
+            .kept_wait()
+            .expect("the pipeline was told with the owner's own viewer");
+        assert_eq!(why, DisplayWake);
+        assert!(
+            left > CaptureWait::TOLD_FOR - Duration::from_secs(5),
+            "the owner's whole notice: {left:?}"
+        );
+        pipeline.on_frame();
+        assert_eq!(pipeline.kept_wait(), None, "the next frame ends it");
+    }
+
     #[test]
     fn capture_unavailable_payload_wire_shape() {
         use crate::capture::{CaptureUnavailable, CaptureUnavailableCode};
@@ -14740,6 +15273,43 @@ mod tests {
         ] {
             assert!(!counts(&older), "{older}");
         }
+    }
+
+    /// FR-135 R0 — the control arm keeps a decodestat's viewer numbers only
+    /// with `stats` on the session's new path; with it old, or from an older
+    /// viewer, the session's reading and heartbeat stay as they were.
+    #[test]
+    fn a_decodestat_window_is_kept_only_with_stats_on_its_new_path() {
+        use super::note_viewer_decodestat as note;
+        use crate::session_telemetry::{counters, forget};
+        let sample = serde_json::json!({
+            "t": "rc:decodestat", "fps": 60, "struggling": false, "de": 1,
+            "gate_ms": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            "painted": 600, "freezes": 2,
+        });
+        let old = bson::oid::ObjectId::new();
+        note(old, &sample, false);
+        assert_eq!(
+            counters(old).take_viewer_window(),
+            None,
+            "stats on its old path"
+        );
+
+        let new = bson::oid::ObjectId::new();
+        note(
+            new,
+            &serde_json::json!({ "t": "rc:decodestat", "fps": 60, "de": 1 }),
+            true,
+        );
+        assert_eq!(counters(new).take_viewer_window(), None, "an older viewer");
+        note(new, &sample, true);
+        let w = counters(new).take_viewer_window().expect("kept");
+        assert_eq!(w.windows, 1);
+        assert_eq!(w.report.painted, Some(600));
+        assert_eq!(w.report.freezes, Some(2));
+        assert_eq!(w.report.gate.map(|g| g[8]), Some(1));
+        forget(old);
+        forget(new);
     }
 
     /// rc.227 / FR-97 P3e — the `rc:layout` envelope as the viewer's
@@ -15990,10 +16560,152 @@ mod download_stop_tests {
     }
 }
 
+/// #3669 — a folder download, driven from its entry point to its last
+/// message through the task a `files:get-folder` runs ([`outgoing_zip`]),
+/// walks as the reader it began for: the person its offer carries to the
+/// walk. The person is the low-integrity stand-in (`files::stand_in`).
+/// #3688 — a Linux system install's twin drives [`download`] from
+/// `files::seat_user_tests::as_root`, which CI runs as root.
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+pub(crate) mod folder_download_as_the_person_tests {
+    use super::*;
+    #[cfg(target_os = "windows")]
+    use crate::files::stand_in;
+
+    /// A channel that keeps what it was sent: the bytes, and each message
+    /// as its JSON.
+    #[derive(Clone, Default)]
+    pub(crate) struct Recorded {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        said: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl DownloadSink for Recorded {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            self.bytes.lock().unwrap().extend_from_slice(chunk);
+            Ok(())
+        }
+        async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
+            let json = serde_json::to_string(msg).expect("a message as JSON");
+            self.said.lock().unwrap().push(json);
+        }
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    impl Recorded {
+        pub(crate) fn has(&self, needle: &[u8]) -> bool {
+            let bytes = self.bytes.lock().unwrap();
+            bytes.windows(needle.len()).any(|w| w == needle)
+        }
+        pub(crate) fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap().clone()
+        }
+    }
+
+    /// `root` downloaded as a folder, read as whoever `FsAs::for_read()`
+    /// answers now.
+    pub(crate) async fn download(root: &std::path::Path) -> Recorded {
+        let sink = Recorded::default();
+        outgoing_zip(
+            sink.clone(),
+            crate::files::FilesHandler::new(),
+            bson::oid::ObjectId::new(),
+            "z3669-pump".into(),
+            root.to_string_lossy().into_owned(),
+        )
+        .await;
+        sink
+    }
+
+    /// Their file is in the zip; a file only the daemon may read, and one
+    /// inside a folder only the daemon may list, are left out; the zip
+    /// completes. Without a stand-in the daemon zips all three (the control).
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_folder_download_walks_as_the_person_its_offer_carries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        let shut = root.join("daemon-only");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::write(root.join("theirs.txt"), b"the person's file").unwrap();
+        std::fs::write(root.join("not-theirs.txt"), b"only the daemon reads this").unwrap();
+        std::fs::write(shut.join("inside.txt"), b"only the daemon lists this").unwrap();
+        stand_in::label_no_read_up(&root.join("not-theirs.txt"));
+        stand_in::label_no_read_up(&shut);
+        let theirs = {
+            let _as = stand_in::reader(stand_in::person(temp.path(), temp.path())).await;
+            download(&root).await
+        };
+        let said = theirs.said();
+        assert!(
+            said.last()
+                .is_some_and(|m| m.contains(r#""t":"files:eof""#)),
+            "the zip completes: {said:?}"
+        );
+        assert!(theirs.has(b"the person's file"), "their file is in");
+        assert!(
+            !theirs.has(b"only the daemon reads this"),
+            "a file they may not read is not: the walk read as the daemon"
+        );
+        assert!(
+            !theirs.has(b"only the daemon lists this"),
+            "nor one inside a folder they may not list"
+        );
+        let all = download(&root).await;
+        for needle in [
+            &b"the person's file"[..],
+            b"only the daemon reads this",
+            b"only the daemon lists this",
+        ] {
+            assert!(all.has(needle), "the daemon zips {needle:?}");
+        }
+    }
+
+    /// A person who signs out partway through ends the download with
+    /// `files:error`, never `files:eof`, so what was already sent is never
+    /// taken for the whole folder. The steps: the download's start (1), the
+    /// root resolved (2) and listed (3), the first file opened (4); by the
+    /// second file they have gone.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_person_who_signs_out_mid_folder_ends_it_with_an_error_not_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        // NTFS lists a folder in name order.
+        std::fs::write(root.join("a.txt"), b"the first file").unwrap();
+        std::fs::write(root.join("b.txt"), b"the second file").unwrap();
+        let got = {
+            let who = stand_in::person_signing_out_after(4, temp.path());
+            let _as = stand_in::reader(who).await;
+            download(&root).await
+        };
+        let said = got.said();
+        assert!(
+            got.has(b"the first file"),
+            "the entry sent before they went"
+        );
+        assert!(!got.has(b"the second file"), "none after");
+        assert!(
+            !said.iter().any(|m| m.contains("files:eof")),
+            "never files:eof: {said:?}"
+        );
+        let last = said.last().expect("a last message");
+        assert!(
+            last.contains(r#""t":"files:error""#) && last.contains(crate::files::NOT_THE_PERSON),
+            "the walk's error reaches the viewer: {last}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod stopped_at_screen_tests {
     use super::*;
-    use crate::rc_sessions::RcSessionRegistry;
+    use crate::rc_sessions::{RcSessionRegistry, Via};
     use bson::oid::ObjectId;
 
     fn listed(reg: &RcSessionRegistry, session: ObjectId, kill: crate::rc_sessions::KillSender) {
@@ -16023,7 +16735,7 @@ mod stopped_at_screen_tests {
             no_video.load(std::sync::atomic::Ordering::Relaxed),
             "the loop can name the end"
         );
-        assert_eq!(killed.try_recv().ok(), Some(sid), "the session's end");
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo))); // the session's end
         assert!(killed.try_recv().is_err(), "asked once, not every second");
     }
 
@@ -16045,7 +16757,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo)));
         assert!(!pump.is_finished(), "only the teardown ends the pump");
         pump.abort();
     }
@@ -16090,7 +16802,7 @@ mod stopped_at_screen_tests {
         );
         assert_eq!(
             killed.try_recv().ok(),
-            Some(sid),
+            Some((sid, Via::ShareStop)),
             "the session's Disconnect"
         );
         assert!(killed.try_recv().is_err(), "asked once, not every second");
@@ -16111,7 +16823,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::ShareStop)));
         pump.abort();
     }
 
@@ -16148,13 +16860,929 @@ mod stopped_at_screen_tests {
         tokio::select! {
             _ = end_stopped_at_screen(owner, &reg, Some(&pipeline)) => unreachable!("it never returns"),
             () = async {
-                assert_eq!(killed.recv().await, Some(follower), "the follower first");
+                assert_eq!(killed.recv().await, Some((follower, Via::ShareStop)), "the follower first");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 assert!(killed.try_recv().is_err(), "the owner waits while its follower is still on");
                 // The follower's own teardown aborts its task, which drops its guard.
                 drop(guard);
-                assert_eq!(killed.recv().await, Some(owner), "then the owner");
+                assert_eq!(killed.recv().await, Some((owner, Via::ShareStop)), "then the owner");
             } => {}
         }
+    }
+}
+
+/// #3688 — text the viewer sends on the files channel (an id, a path, a
+/// name), and an error that may quote it, is logged escaped: a line break in
+/// it never starts a log line of its own. At the end of the file, so no line
+/// above moves.
+#[cfg(test)]
+pub(crate) mod files_log_tests {
+    use super::*;
+
+    /// What is logged on this thread while it lives, as the daemon's log
+    /// file writes it: no colour, one event a line. A `#[tokio::test]` polls
+    /// its body, and the tasks it spawns, on its own thread.
+    pub(crate) struct Logged {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        _default: tracing::subscriber::DefaultGuard,
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread (`derp`'s `logged`).
+        _second: tracing::Dispatch,
+    }
+
+    impl Logged {
+        pub(crate) fn start(level: tracing::Level) -> Self {
+            #[derive(Clone)]
+            struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Buf(buf.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_max_level(level)
+                .with_writer(move || writer.clone())
+                .finish();
+            Self {
+                buf,
+                _default: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            }
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A channel that takes everything and keeps nothing.
+    #[derive(Clone)]
+    struct Quiet;
+    impl DownloadSink for Quiet {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A folder download asked with a line break in its id and in its path:
+    /// the line saying it failed holds both, each escaped. Off Windows the
+    /// path names a file, so the error quotes it too ("not a directory").
+    #[tokio::test]
+    async fn a_viewers_id_or_path_never_starts_a_log_line_of_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let asked = temp.path().join("a\nSECOND LINE from a path");
+        #[cfg(unix)]
+        std::fs::write(&asked, b"a file, not a folder").unwrap();
+        let log = Logged::start(tracing::Level::INFO);
+        outgoing_zip(
+            Quiet,
+            crate::files::FilesHandler::new(),
+            bson::oid::ObjectId::new(),
+            "z1\nSECOND LINE from an id".into(),
+            asked.to_string_lossy().into_owned(),
+        )
+        .await;
+        let text = log.text();
+        assert!(
+            text.contains("files: begin_outgoing_zip failed"),
+            "the failure is logged: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("SECOND LINE")),
+            "a line break from the viewer started a log line: {text}"
+        );
+        assert!(
+            text.contains(r"z1\nSECOND LINE from an id"),
+            "the id, escaped: {text}"
+        );
+    }
+}
+
+/// #3757 — a Mac's root daemon declines the `files` channel of a session no
+/// GUI worker serves, with a reason the viewer shows, and every other process
+/// serves it as before. On every lane's lib tests, and in the macOS job as
+/// the runner's user and again under sudo (`as_root`), where this process's
+/// own effective uid decides.
+#[cfg(test)]
+mod files_channel_tests {
+    use super::FILES_IN_THE_PERSONS_SESSION as WHY;
+    use super::*;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+
+    /// What the FILES-denied channel says (Multi-user P3), unchanged.
+    const NOT_GRANTED: &str = "FILES permission not granted for this session";
+
+    /// The decision: a root process on a Mac holds the peer of a session no
+    /// GUI worker serves, so it declines the channel with the reason. Red on
+    /// master, where every process served it.
+    #[test]
+    fn a_macs_root_daemon_declines_the_files_channel() {
+        assert_eq!(files_channel(true, true), FilesChannel::Declined(WHY));
+    }
+
+    /// Every other process serves the channel as before: a GUI worker (the
+    /// one a delegated session's peer lives in) and a per-user install run as
+    /// the person, and Linux and Windows keep their own rules (#3688, #3669).
+    #[test]
+    fn every_other_process_serves_it_as_before() {
+        for (on_macos, root) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                files_channel(on_macos, root),
+                FilesChannel::Served,
+                "on macOS: {on_macos}, root: {root}"
+            );
+        }
+    }
+
+    /// The reason says what to do: once someone is signed in at the Mac, a
+    /// new session runs in their session; a two-row Mac serves its screen and
+    /// files on the person's own row.
+    #[test]
+    fn the_reason_tells_the_viewer_what_to_do() {
+        for words in [
+            "needs someone signed in at its screen",
+            "Reconnect once someone is signed in",
+            "user-session agent",
+        ] {
+            assert!(WHY.contains(words), "{words:?} is not in {WHY:?}");
+        }
+    }
+
+    /// This process's own facts: on a Mac its effective uid decides, and
+    /// every other OS serves. The macOS job runs it as the runner's user
+    /// (served) and under sudo (declined).
+    #[test]
+    fn this_process_follows_its_own_effective_uid() {
+        let expected = if cfg!(target_os = "macos") && euid_is_root() {
+            FilesChannel::Declined(WHY)
+        } else {
+            FilesChannel::Served
+        };
+        assert_eq!(files_channel_here(), expected);
+    }
+
+    fn euid_is_root() -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: reads this process's own credentials.
+            unsafe { libc::geteuid() == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The declined channel's answer to one control frame, as JSON.
+    fn reply_to(frame: &[u8]) -> Value {
+        let reply = declined_reply(frame, WHY).expect("a declined frame is answered");
+        serde_json::from_str(&reply).expect("the answer is JSON")
+    }
+
+    /// A listing's answer is the drawer's: `files:dir-error` on its `req_id`.
+    #[test]
+    fn a_declined_listing_is_answered_on_its_req_id() {
+        let frame = json!({"t": "files:dir", "req_id": "ls-1", "path": "/"});
+        assert_eq!(
+            reply_to(frame.to_string().as_bytes()),
+            json!({"t": "files:dir-error", "req_id": "ls-1", "message": WHY})
+        );
+    }
+
+    /// Every other request is answered on its `id`, the transfer's waiter.
+    #[test]
+    fn every_other_request_is_answered_on_its_id() {
+        for frame in [
+            json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": 3}),
+            json!({"t": "files:end", "id": "up-1"}),
+            json!({"t": "files:get", "id": "dl-1", "path": "/etc/hosts"}),
+            json!({"t": "files:get-folder", "id": "zip-1", "path": "/", "format": "zip"}),
+            json!({"t": "files:resume", "id": "up-1", "offset": 0}),
+            json!({"t": "files:cancel", "id": "dl-1"}),
+        ] {
+            let id = frame["id"].clone();
+            assert_eq!(
+                reply_to(frame.to_string().as_bytes()),
+                json!({"t": "files:error", "id": id, "message": WHY}),
+                "{frame}"
+            );
+        }
+    }
+
+    /// A frame that does not parse is answered with no id, as the
+    /// FILES-denied channel answers it.
+    #[test]
+    fn a_frame_that_does_not_parse_is_answered_without_an_id() {
+        for frame in [&b"not json"[..], &[0xff, 0xfe, 0x00][..], &b"{\"t\":7}"[..]] {
+            assert_eq!(
+                reply_to(frame),
+                json!({"t": "files:error", "id": "", "message": WHY}),
+                "{frame:?}"
+            );
+        }
+    }
+
+    /// A viewer's `files` channel to a device end routed by [`attach_files`],
+    /// both in this process. Every candidate travels in the SDP (no trickle),
+    /// as `media_share`'s `viewer_channel` does. #3785's tests use it too
+    /// (`refused_upload_tests`).
+    pub(super) struct Pair {
+        /// The viewer's peer, then the device's.
+        pcs: [Arc<RTCPeerConnection>; 2],
+        pub(super) viewer: Arc<RTCDataChannel>,
+        heard: mpsc::UnboundedReceiver<String>,
+        session_end: CancellationToken,
+    }
+
+    impl Pair {
+        pub(super) async fn open(permissions: Permissions, served: FilesChannel) -> Self {
+            // The production router, as `AgentPeer`'s `on_data_channel` calls it.
+            Self::open_with("files", |device, session_end| {
+                attach_files(
+                    device,
+                    bson::oid::ObjectId::new(),
+                    permissions,
+                    served,
+                    session_end,
+                )
+            })
+            .await
+        }
+
+        /// #3733 — a channel named `label`, whose device end `attach` takes
+        /// with the session's end, before the channel opens.
+        pub(super) async fn open_with(
+            label: &str,
+            attach: impl FnOnce(Arc<RTCDataChannel>, &CancellationToken),
+        ) -> Self {
+            let pc = || async {
+                Arc::new(
+                    APIBuilder::new()
+                        .build()
+                        .new_peer_connection(RTCConfiguration::default())
+                        .await
+                        .expect("a peer connection"),
+                )
+            };
+            let (viewer_pc, device_pc) = (pc().await, pc().await);
+            let viewer = viewer_pc
+                .create_data_channel(label, None)
+                .await
+                .expect("a data channel");
+            let (heard_tx, heard) = mpsc::unbounded_channel();
+            viewer.on_message(Box::new(move |msg| {
+                let heard_tx = heard_tx.clone();
+                Box::pin(async move {
+                    if msg.is_string
+                        && let Ok(s) = std::str::from_utf8(&msg.data)
+                    {
+                        let _ = heard_tx.send(s.to_string());
+                    }
+                })
+            }));
+            let (dc_tx, dc_rx) = tokio::sync::oneshot::channel();
+            let dc_tx = std::sync::Mutex::new(Some(dc_tx));
+            device_pc.on_data_channel(Box::new(move |dc| {
+                if let Some(tx) = dc_tx.lock().unwrap().take() {
+                    let _ = tx.send(dc);
+                }
+                Box::pin(async {})
+            }));
+            let offer = viewer_pc.create_offer(None).await.expect("an offer");
+            let mut gathered = viewer_pc.gathering_complete_promise().await;
+            viewer_pc
+                .set_local_description(offer)
+                .await
+                .expect("the offer");
+            let _ = gathered.recv().await;
+            let offer = viewer_pc.local_description().await.expect("a local offer");
+            device_pc
+                .set_remote_description(offer)
+                .await
+                .expect("the offer");
+            let answer = device_pc.create_answer(None).await.expect("an answer");
+            let mut gathered = device_pc.gathering_complete_promise().await;
+            device_pc
+                .set_local_description(answer)
+                .await
+                .expect("the answer");
+            let _ = gathered.recv().await;
+            let answer = device_pc.local_description().await.expect("a local answer");
+            viewer_pc
+                .set_remote_description(answer)
+                .await
+                .expect("the answer");
+            let device = tokio::time::timeout(Duration::from_secs(30), dc_rx)
+                .await
+                .expect("the channel never reached the device")
+                .expect("the channel's sender");
+            let session_end = CancellationToken::new();
+            attach(device, &session_end);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while viewer.ready_state() != RTCDataChannelState::Open {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the viewer's {label} channel never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Self {
+                pcs: [viewer_pc, device_pc],
+                viewer,
+                heard,
+                session_end,
+            }
+        }
+
+        pub(super) async fn ask(&self, frame: &Value) {
+            self.viewer
+                .send_text(frame.to_string())
+                .await
+                .expect("the viewer's frame went out");
+        }
+
+        /// The next `n` frames the viewer heard, fewer if they stop coming.
+        pub(super) async fn heard(&mut self, n: usize) -> Vec<Value> {
+            let mut got = Vec::new();
+            while got.len() < n {
+                match tokio::time::timeout(Duration::from_secs(20), self.heard.recv()).await {
+                    Ok(Some(text)) => got.push(serde_json::from_str(&text).unwrap_or(Value::Null)),
+                    _ => break,
+                }
+            }
+            got
+        }
+
+        /// Anything more the viewer hears within `wait`.
+        async fn more_within(&mut self, wait: Duration) -> Vec<String> {
+            let mut got = Vec::new();
+            while let Ok(Some(text)) = tokio::time::timeout(wait, self.heard.recv()).await {
+                got.push(text);
+            }
+            got
+        }
+
+        /// The session ends, and both peers are closed: a peer that is only
+        /// dropped frees nothing (its sockets belong to its ICE agent's tasks).
+        pub(super) async fn close(self) {
+            self.session_end.cancel();
+            for pc in self.pcs {
+                let _ = pc.close().await;
+            }
+        }
+    }
+
+    /// Through the router, over a real channel, as the root daemon's peer
+    /// opens it: each request is answered with the reason in the frame its
+    /// waiter settles on, a chunk is dropped, nothing lands in or leaves the
+    /// folder asked about, and the channel and its peer stay up and go on
+    /// answering. Red on master, where the file-transfer handler served it.
+    #[tokio::test]
+    async fn a_declined_channel_answers_each_request_with_the_reason_and_stays_up() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let file = temp.path().join("b.txt");
+        std::fs::write(&file, b"hello").expect("a file to ask for");
+        let folder = temp.path().to_string_lossy().into_owned();
+        let file = file.to_string_lossy().into_owned();
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            files_channel(true, true),
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
+            .await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": 3, "dest_path": folder}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        pair.ask(&json!({"t": "files:get", "id": "dl-1", "path": file}))
+            .await;
+        pair.ask(&json!({"t": "files:get-folder", "id": "zip-1", "path": folder, "format": "zip"}))
+            .await;
+        pair.ask(&json!({"t": "files:resume", "id": "up-1", "offset": 0}))
+            .await;
+        let answered = pair.heard(6).await;
+        let unasked = pair.more_within(Duration::from_millis(500)).await;
+        // Still up: the channel and its peer, and a request after all of it is
+        // answered too.
+        let channel = pair.viewer.ready_state();
+        let peer = pair.pcs[1].connection_state();
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-2", "path": folder}))
+            .await;
+        let after = pair.heard(1).await;
+        pair.close().await;
+        let left: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("the folder reads")
+            .map(|e| {
+                e.expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        let error = |id: &str| json!({"t": "files:error", "id": id, "message": WHY});
+        assert_eq!(
+            answered,
+            vec![
+                json!({"t": "files:dir-error", "req_id": "ls-1", "message": WHY}),
+                error("up-1"),
+                error("up-1"),
+                error("dl-1"),
+                error("zip-1"),
+                error("up-1"),
+            ]
+        );
+        assert!(unasked.is_empty(), "the chunk was answered: {unasked:?}");
+        assert_eq!(left, vec!["b.txt".to_string()], "the folder changed");
+        assert_eq!(channel, RTCDataChannelState::Open, "the channel closed");
+        assert_eq!(
+            peer,
+            RTCPeerConnectionState::Connected,
+            "the peer went down"
+        );
+        assert_eq!(
+            after,
+            vec![json!({"t": "files:dir-error", "req_id": "ls-2", "message": WHY})]
+        );
+    }
+
+    /// The path a worker-served session takes is unchanged: a session this
+    /// process serves gets the file-transfer handler, which lists the folder.
+    #[tokio::test]
+    async fn a_served_channel_keeps_the_file_transfer_handler() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(temp.path().join("b.txt"), b"hello").expect("a file to list");
+        let folder = temp.path().to_string_lossy().into_owned();
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
+            .await;
+        let answered = pair.heard(1).await;
+        pair.close().await;
+
+        let listing = answered.first().expect("the listing was answered");
+        assert_eq!(listing["t"], "files:dir-list", "{listing}");
+        assert_eq!(listing["req_id"], "ls-1", "{listing}");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["b.txt"], "{listing}");
+    }
+
+    /// A session whose grant lacks FILES keeps the FILES-denied channel and
+    /// its words, whoever serves it: the grant is asked first, as before.
+    #[tokio::test]
+    async fn a_session_without_files_keeps_the_not_granted_channel() {
+        let mut pair = Pair::open(Permissions::default(), files_channel(true, true)).await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-9", "name": "a.txt", "size": 3}))
+            .await;
+        let answered = pair.heard(1).await;
+        pair.close().await;
+
+        assert_eq!(
+            answered,
+            vec![json!({"t": "files:error", "id": "up-9", "message": NOT_GRANTED})]
+        );
+    }
+
+    /// Under sudo on a Mac (the macOS job's step): this process is root, so
+    /// it declines. With `ROOMLERD_TEST_REQUIRE_ROOT` set, a run that is not
+    /// root fails here instead of passing by skipping.
+    #[cfg(target_os = "macos")]
+    mod as_root {
+        use super::*;
+
+        fn as_root() -> bool {
+            let root = euid_is_root();
+            if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+                panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+            }
+            root
+        }
+
+        #[test]
+        fn a_root_process_on_a_mac_declines_the_files_channel() {
+            if !as_root() {
+                return;
+            }
+            assert_eq!(files_channel_here(), FilesChannel::Declined(WHY));
+        }
+    }
+}
+
+/// #3785 — what the viewer hears of an upload whose `files:begin` the device
+/// refused, over a real channel through the production router
+/// ([`attach_files`]): the refusal, and nothing more of it. The viewer sends
+/// an upload's chunks and its end right behind its begin, without waiting for
+/// `files:accepted`, so a small file is wholly on the wire before the refusal.
+///
+/// Not inside `files_channel_tests`: the macOS job runs that module again
+/// under sudo, and an upload here writes into a temp folder, which a root
+/// writer outside the person's profile does not (FR-84 D4).
+#[cfg(test)]
+mod refused_upload_tests {
+    use super::files_channel_tests::Pair;
+    use super::*;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+
+    /// One byte over the 2 GiB cap: a begin refused on every OS, before
+    /// anything on the host is touched. The field's refusals (nobody signed in
+    /// to a Windows service's session, #3048; a seat0 lookup out of time on a
+    /// Linux system install, #3711) are answered from the same place, which a
+    /// test process cannot reach: it is neither LocalSystem nor root.
+    const OVER_THE_CAP: u64 = 2 * 1024 * 1024 * 1024 + 1;
+
+    /// The cap's refusal of upload `id`, as the viewer hears it.
+    fn over_the_cap(id: &str) -> Value {
+        json!({
+            "t": "files:error",
+            "id": id,
+            "message": format!("transfer size {OVER_THE_CAP} exceeds the 2147483648 B cap"),
+        })
+    }
+
+    async fn served() -> Pair {
+        Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await
+    }
+
+    /// The frames the viewer hears before the answer to `probe`: an end for an
+    /// upload this channel never began, which is always answered. One channel,
+    /// in order, so by then every frame sent before the probe has had its
+    /// answer, if it gets one.
+    async fn heard_before(pair: &mut Pair, probe: &str) -> Vec<Value> {
+        pair.ask(&json!({"t": "files:end", "id": probe})).await;
+        let mut before = Vec::new();
+        loop {
+            let Some(frame) = pair.heard(1).await.pop() else {
+                panic!("{probe} was never answered; heard before it: {before:?}");
+            };
+            if frame["id"] == probe {
+                return before;
+            }
+            before.push(frame);
+        }
+    }
+
+    /// The issue: a refused small upload's begin, its one chunk and its end,
+    /// sent back to back as the viewer sends them, are answered with exactly
+    /// one `files:error`, the begin's reason. Red on master, which answered
+    /// the chunk ("no active transfer") and the end ("no active transfer to
+    /// end") with one more each.
+    #[tokio::test]
+    async fn a_refused_small_upload_is_answered_once() {
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": OVER_THE_CAP}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        let errors = heard.iter().filter(|f| f["t"] == "files:error").count();
+        assert_eq!(
+            errors, 1,
+            "the files:error frames of one refused upload: {heard:?}"
+        );
+        assert_eq!(heard, vec![over_the_cap("up-1")]);
+    }
+
+    /// A `files:error` for upload `id`, saying `message`.
+    fn error(id: &str, message: &str) -> Value {
+        json!({"t": "files:error", "id": id, "message": message})
+    }
+
+    /// The control: a chunk and an end for an upload this channel never began
+    /// are still answered, each with its own `files:error` as before, and so
+    /// is an end for one never begun after a refused upload.
+    #[tokio::test]
+    async fn an_upload_never_begun_is_still_answered() {
+        let mut pair = served().await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-2"})).await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": OVER_THE_CAP}))
+            .await;
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        pair.ask(&json!({"t": "files:end", "id": "up-3"})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        assert_eq!(
+            heard,
+            vec![
+                error("", "no active transfer"),
+                error("up-2", "no active transfer to end"),
+                over_the_cap("up-1"),
+                error("up-3", "no active transfer to end"),
+            ]
+        );
+    }
+
+    /// A retry: a begin with an id this channel refused runs as a fresh
+    /// begin. Accepted, its chunk lands and its end completes it, and the file
+    /// holds that chunk alone, not the one dropped behind the refusal.
+    #[tokio::test]
+    async fn a_retry_with_a_refused_id_runs_as_a_fresh_begin() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let folder = temp.path().to_string_lossy().into_owned();
+        // Its own id: an accepted begin registers its partial process-wide.
+        let id = format!("up-retry-{}", std::process::id());
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "a.txt", "size": OVER_THE_CAP, "dest_path": folder}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        pair.ask(
+            &json!({"t": "files:begin", "id": id, "name": "a.txt", "size": 3, "dest_path": folder}),
+        )
+        .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"xyz"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        let kinds: Vec<&str> = heard.iter().filter_map(|f| f["t"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["files:error", "files:accepted", "files:complete"],
+            "{heard:?}"
+        );
+        assert_eq!(heard[0], over_the_cap(&id));
+        assert_eq!(heard[2]["id"], id.as_str(), "{heard:?}");
+        assert_eq!(heard[2]["bytes"], 3, "{heard:?}");
+        let placed = std::path::Path::new(heard[2]["path"].as_str().expect("the file's path"));
+        assert_eq!(std::fs::read(placed).expect("the file landed"), b"xyz");
+        assert_eq!(
+            placed.parent().and_then(|p| std::fs::canonicalize(p).ok()),
+            std::fs::canonicalize(temp.path()).ok(),
+            "it landed in the folder asked for"
+        );
+    }
+}
+
+/// #3733 — on every data channel, text a viewer sent (an id, a channel's name,
+/// a frame's type), and a reason or an error built from it, is logged with
+/// Debug escaping: a line break in it never starts a log line of its own.
+/// [`files_log_tests`] is the files channel's. Each test sends over a real
+/// channel, in this process, to the production handler. At the end of the
+/// file, so no line above moves.
+#[cfg(test)]
+mod wire_text_log_tests {
+    use super::files_channel_tests::Pair;
+    use super::files_log_tests::Logged;
+    use super::*;
+    #[cfg(feature = "clipboard")]
+    use serde_json::Value;
+    use serde_json::json;
+
+    /// What the viewer's text says after its line break: no log line may start
+    /// with it.
+    const SECOND: &str = "SECOND LINE";
+
+    /// The log lines that start with [`SECOND`], and each `(what, escaped)`
+    /// whose line, the first that says `what`, does not hold `escaped`: every
+    /// line a line break from the viewer broke.
+    fn broken<'a>(text: &'a str, expected: &[(&'a str, &str)]) -> Vec<&'a str> {
+        let started = text.lines().filter(|line| line.starts_with(SECOND));
+        let unescaped = expected
+            .iter()
+            .filter(|(what, escaped)| {
+                let line = text.lines().find(|line| line.contains(what));
+                !line.is_some_and(|line| line.contains(escaped))
+            })
+            .map(|(what, _)| *what);
+        started.chain(unescaped).collect()
+    }
+
+    /// The clipboard channel, with a host clipboard that takes what it is
+    /// given: a chunked write (one chunk, one out of order, one written, one
+    /// the host refuses), an image, an HTML and a native write begun and
+    /// refused, a binary frame past its image's length, a native write ended
+    /// short, and a frame whose type holds the line break. Each of their log
+    /// lines holds the id, the reason or the error escaped, and the viewer
+    /// hears every answer as before, with its ids as it sent them.
+    #[cfg(feature = "clipboard")]
+    #[tokio::test]
+    async fn a_viewers_clipboard_ids_never_start_a_log_line_of_their_own() {
+        const REFUSED: &str = "the host refuses this text";
+        let log = Logged::start(tracing::Level::DEBUG);
+        let mut pair = Pair::open_with("clipboard", |dc, session_end| {
+            let cb = crate::clipboard::Clipboard::for_tests(REFUSED);
+            attach_clipboard(dc, bson::oid::ObjectId::new(), cb, session_end)
+        })
+        .await;
+        let chunk = "c1\nSECOND LINE from a chunk id";
+        let written = "c2\nSECOND LINE from a written id";
+        let refused = "c3\nSECOND LINE from a refused id";
+        let image = "i1\nSECOND LINE from an image id";
+        let refused_image = "i2\nSECOND LINE from a refused image id";
+        let html = "h1\nSECOND LINE from an html id";
+        let refused_html = "h2\nSECOND LINE from a refused html id";
+        let native = "n1\nSECOND LINE from a native id";
+        let refused_native = "n2\nSECOND LINE from a refused native id";
+        for frame in [
+            json!({"t": "clipboard:write-chunk", "id": chunk, "seq": 0, "text": "ab", "last": false}),
+            json!({"t": "clipboard:write-chunk", "id": chunk, "seq": 7, "text": "cd", "last": false}),
+            json!({"t": "clipboard:write-chunk", "id": written, "seq": 0, "text": "fits", "last": true}),
+            json!({"t": "clipboard:write-chunk", "id": refused, "seq": 0, "text": REFUSED, "last": true}),
+            json!({"t": "clipboard:img-begin", "id": image, "w": 1, "h": 1, "bytes": 4, "format": "png"}),
+        ] {
+            pair.ask(&frame).await;
+        }
+        pair.viewer
+            .send(&Bytes::from_static(b"12345"))
+            .await
+            .expect("the frame went out");
+        for frame in [
+            json!({"t": "clipboard:img-begin", "id": refused_image, "w": 1, "h": 1, "bytes": 4, "format": "gif"}),
+            json!({"t": "clipboard:html-begin", "id": html, "html_bytes": 2, "text_bytes": 0}),
+            json!({"t": "clipboard:html-begin", "id": refused_html, "html_bytes": 0, "text_bytes": 0}),
+            json!({"t": "clipboard:native-begin", "id": native, "rtf_bytes": 2, "html_bytes": 0, "text_bytes": 0}),
+            json!({"t": "clipboard:native-end", "id": native}),
+            json!({"t": "clipboard:x\nSECOND LINE from a type"}),
+            json!({"t": "clipboard:native-begin", "id": refused_native, "rtf_bytes": 0, "html_bytes": 0, "text_bytes": 0}),
+        ] {
+            pair.ask(&frame).await;
+        }
+        // The channel answers in order, so the last answer comes after every
+        // line above is logged.
+        let heard = pair.heard(7).await;
+        pair.close().await;
+        let text = log.text();
+
+        let error = |id: &str, message: &str| -> Value {
+            json!({"t": "clipboard:error", "message": message, "id": id})
+        };
+        assert_eq!(
+            heard,
+            vec![
+                error(chunk, "clipboard chunk seq mismatch — expected 1, got 7"),
+                json!({"t": "clipboard:write-ack", "id": written, "bytes": 4}),
+                error(refused, "the test's clipboard refused it"),
+                error(
+                    refused_image,
+                    "unsupported clipboard image format \"gif\" (png only)"
+                ),
+                error(
+                    refused_html,
+                    &format!(
+                        "clipboard html payload 0 bytes outside the (0, {}] cap",
+                        crate::clipboard::CLIPBOARD_HTML_MAX_BYTES
+                    )
+                ),
+                error(
+                    native,
+                    "rich transfer n1\nSECOND LINE from a native id ended at 0 of 2 declared bytes"
+                ),
+                error(
+                    refused_native,
+                    &format!(
+                        "clipboard native payload 0 bytes outside the (0, {}] cap",
+                        crate::clipboard::CLIPBOARD_NATIVE_MAX_BYTES
+                    )
+                ),
+            ],
+            "what the viewer hears"
+        );
+        let broken = broken(
+            &text,
+            &[
+                (
+                    "clipboard: chunk accepted, awaiting more",
+                    r"c1\nSECOND LINE from a chunk id",
+                ),
+                (
+                    "clipboard: chunk rejected",
+                    r"c1\nSECOND LINE from a chunk id",
+                ),
+                (
+                    "clipboard: wrote chunked payload to host",
+                    r"c2\nSECOND LINE from a written id",
+                ),
+                (
+                    "clipboard: chunked write failed",
+                    r"c3\nSECOND LINE from a refused id",
+                ),
+                (
+                    "clipboard: image write begin",
+                    r"i1\nSECOND LINE from an image id",
+                ),
+                (
+                    "clipboard: dropped binary frame",
+                    r"i1\nSECOND LINE from an image id overflowed its declared length",
+                ),
+                (
+                    "clipboard: image begin rejected",
+                    r"i2\nSECOND LINE from a refused image id",
+                ),
+                (
+                    "clipboard: html write begin",
+                    r"h1\nSECOND LINE from an html id",
+                ),
+                (
+                    "clipboard: html begin rejected",
+                    r"h2\nSECOND LINE from a refused html id",
+                ),
+                (
+                    "clipboard: replacing dangling rich transfer",
+                    r"h1\nSECOND LINE from an html id",
+                ),
+                (
+                    "clipboard: native write begin",
+                    r"n1\nSECOND LINE from a native id",
+                ),
+                (
+                    "clipboard: rich write failed",
+                    r"n1\nSECOND LINE from a native id ended at 0 of 2 declared bytes",
+                ),
+                (
+                    "clipboard: unparseable JSON",
+                    r"clipboard:x\nSECOND LINE from a type",
+                ),
+                (
+                    "clipboard: native begin rejected",
+                    r"n2\nSECOND LINE from a refused native id",
+                ),
+            ],
+        );
+        assert!(
+            broken.is_empty(),
+            "lines a line break from the viewer broke: {broken:#?}\n{text}"
+        );
+    }
+
+    /// A channel the viewer named with a line break, given the handler every
+    /// channel of a name the device does not serve gets ([`attach_log_only`]):
+    /// the line that says a message came holds the name escaped.
+    #[tokio::test]
+    async fn a_channels_name_never_starts_a_log_line_of_its_own() {
+        const UNHANDLED: &str = "DC msg (unhandled)";
+        let log = Logged::start(tracing::Level::DEBUG);
+        let pair = Pair::open_with("odd\nSECOND LINE from a channel's name", |dc, _| {
+            attach_log_only(dc, bson::oid::ObjectId::new())
+        })
+        .await;
+        pair.ask(&json!({"t": "anything"})).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !log.text().contains(UNHANDLED) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pair.close().await;
+        let text = log.text();
+
+        let broken = broken(
+            &text,
+            &[(UNHANDLED, r"odd\nSECOND LINE from a channel's name")],
+        );
+        assert!(
+            broken.is_empty(),
+            "lines a line break from the viewer broke: {broken:#?}\n{text}"
+        );
     }
 }

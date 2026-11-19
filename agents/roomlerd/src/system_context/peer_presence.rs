@@ -76,25 +76,16 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// missed write without flagging stale.
 pub const PRESENCE_MAX_AGE: Duration = Duration::from_secs(15);
 
-/// Path to the marker file. On Windows: under `%PROGRAMDATA%`. On
-/// other targets: `/tmp/roomler-agent/` (test / dev only — the
+/// Path to the marker file. On Windows: under `C:\ProgramData`, the machine's
+/// folder as the system names it ([`crate::appdirs::machine_program_data`]).
+/// On other targets: `/tmp/roomler-agent/` (test / dev only — the
 /// cross-session semantics this module provides are Windows-specific).
 pub fn marker_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        if let Some(programdata) = std::env::var_os("PROGRAMDATA") {
-            return PathBuf::from(programdata)
-                .join("roomler-agent")
-                .join("peer-connected.lock");
-        }
-        // Fallback if PROGRAMDATA is somehow unset (extremely rare —
-        // even Windows PE has it). Use the SystemRoot temp dir.
-        if let Some(systemroot) = std::env::var_os("SystemRoot") {
-            return PathBuf::from(systemroot)
-                .join("Temp")
-                .join("roomler-agent-peer-connected.lock");
-        }
-        PathBuf::from("C:\\Windows\\Temp\\roomler-agent-peer-connected.lock")
+        crate::appdirs::machine_program_data()
+            .join("roomler-agent")
+            .join("peer-connected.lock")
     }
     #[cfg(not(target_os = "windows"))]
     {

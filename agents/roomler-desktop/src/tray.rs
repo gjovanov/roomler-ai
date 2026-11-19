@@ -5,7 +5,9 @@
 //! layer).
 //!
 //! Menu items:
-//!   - Open Roomler       — show the main window (Overview view)
+//!   - Device status      — show the main window on the Overview, or on the
+//!                           Welcome tour a start for a prompt held back (#3887)
+//!   - Open Roomler…      — S7: the Roomler web app in a window of its own
 //!   - Start/Stop recording — FR-85: record this screen through the device
 //!                           service; the label and the tray tooltip follow
 //!                           the recorder (a light poll, every 3 s), and
@@ -78,7 +80,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     )?;
 
     let on_menu = |app: &AppHandle<R>, event: tauri::menu::MenuEvent| match event.id.as_ref() {
-        "open_status" => show_window(app, "/overview"),
+        "open_status" => show_status(app, "Device status"),
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
         KEEP_BUSY_ITEM_ID => toggle_keep_busy(app),
@@ -106,7 +108,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             ..
         } = event
         {
-            show_window(tray.app_handle(), "/overview");
+            show_status(tray.app_handle(), "icon");
         }
     };
 
@@ -236,7 +238,8 @@ fn spawn_keep_busy_watch<R: Runtime>(item: MenuItem<R>) {
 fn toggle_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let outcome: std::io::Result<(bool, roomler_localapi::KeepBusyInfo)> = async {
-            let mut c = roomler_localapi::connect().await?;
+            // #4020 — its error is logged: a stopped service says so.
+            let mut c = crate::commands::connect_service().await?;
             let stopping = c.keep_busy_status().await?.on;
             let s = if stopping {
                 c.keep_busy_off().await?
@@ -360,7 +363,7 @@ fn recorder_running(answer: Option<Option<&roomler_localapi::RecordingState>>, w
 
 /// FR-85 — whether any session carries a recording mark, or what the last
 /// answer said when the poll failed (`None`).
-fn remote_marked(answer: Option<&[roomler_localapi::RcSessionInfo]>, was: bool) -> bool {
+pub(crate) fn remote_marked(answer: Option<&[roomler_localapi::RcSessionInfo]>, was: bool) -> bool {
     answer.map_or(was, |sessions| sessions.iter().any(|s| s.recording))
 }
 
@@ -438,7 +441,7 @@ fn spawn_recording_watch<R: Runtime>(app: AppHandle<R>, item: MenuItem<R>) {
         loop {
             // `Some(Some(state))` answered; `Some(None)` there is no service
             // at all; `None` the poll failed.
-            let answer = match roomler_localapi::connect().await {
+            let answer = match crate::commands::connect_service().await {
                 Ok(mut c) => c.record_status().await.ok().map(Some),
                 Err(e) if no_service(&e) => Some(None),
                 Err(_) => None,
@@ -506,7 +509,8 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome: Result<(), String> = async {
-            let mut client = roomler_localapi::connect()
+            // #4020 — its error is shown: a stopped service says so.
+            let mut client = crate::commands::connect_service()
                 .await
                 .map_err(|e| format!("connecting to the device service: {e}"))?;
             let state = client.record_status().await.map_err(|e| e.to_string())?;
@@ -522,7 +526,7 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
         }
         .await;
         if let Err(message) = outcome {
-            tracing::warn!(%message, "tray: recording toggle refused");
+            tracing::warn!(reason = %message, "tray: recording toggle refused");
             show_window(&app, "/recordings");
             if let Some(window) = app.get_webview_window("main") {
                 let text = serde_json::to_string(&message).unwrap_or_else(|_| "\"\"".into());
@@ -534,11 +538,22 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
+/// #3996 — the tray's icon and its Device status: the main window, on the
+/// view [`crate::first_run::tray_path`] names, with one line saying what it
+/// shows ([`crate::first_run::log_tray_open`]).
+fn show_status<R: Runtime>(app: &AppHandle<R>, item: &'static str) {
+    let tour_held = crate::first_run::tour_held();
+    let path = crate::first_run::tray_path();
+    crate::first_run::log_tray_open(item, tour_held, path.trim_start_matches('/'));
+    show_window(app, &path);
+}
+
 /// Show + focus the main window and route the SPA to `path` (a hash-router
 /// path like `/overview`). The router treats an unknown hash as `/overview`,
 /// so a stale path can't strand the window on a blank page.
 fn show_window<R: Runtime>(app: &AppHandle<R>, path: &str) {
     if let Some(window) = app.get_webview_window("main") {
+        crate::first_run::showing(path.trim_start_matches('/')); // #3887: a held tour, once
         // Navigate (no-op when already on the same path).
         let _ = window.eval(format!("window.location.hash = '#{path}'"));
         let _ = window.show();

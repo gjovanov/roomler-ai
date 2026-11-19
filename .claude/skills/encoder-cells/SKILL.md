@@ -41,6 +41,14 @@ records nothing.
 crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
 a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
 nobody would enforce the 60 s bound on a child hung in a driver.
+⚠️ **The start waits 10 s for the probe, and a session waits for all of it** (#3439). The
+probe runs on its own thread (`caps::start_probing`). Past `FIRST_ANSWER_WAIT` the hello
+carries the interim answer (`encoder-cells` code `probing`), and the first answer is announced
+the moment it lands (`caps::news`). The signalling loop reads `caps::answer_now()`, never
+`detect()`: a `detect()` there blocks a runtime thread on the probe's lock, which is a pump stall.
+A session request that comes before the first answer is held in its connection
+(`held_requests`) and is never served from the interim answer, which would open Media
+Foundation in the daemon before any child had proved it.
 ⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
 stuck in a kernel call outlives the kill, and whatever it started can hold its
 stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +
@@ -246,7 +254,7 @@ rebuild.
 | **VAAPI** | Takes **hardware frames**; `encode/ffmpeg/vaapi.rs` holds the raw `ffmpeg_sys_next` calls. Device opens ONCE per process; each encoder gets a frame pool whose ref goes onto `hw_frames_ctx` **before** `open`. libva + libdrm are **bundled**, with **no `Depends`** — a `Depends: libva2` only holds where apt reaches a mirror, and the updater's offline `dpkg --install` replaces the binary *before* the dependency failure |
 | **D3D12 / Vulkan** | `dlopen`'d by FFmpeg itself — the vendor jobs assert **no link directive / DT_NEEDED**, so a host without them loses cells, never the daemon. Set `bf=0` (both default to `bf=2`). `rc_mode` constants are **UPPERCASE** for d3d12va (`VBR`), lowercase for Vulkan (`vbr`) |
 | **Media Foundation** | `ActivateObject`'s caller must end what it made, and a release does not: `HwMftCandidate`'s `Drop` calls `ShutdownObject`, or each open leaves 72 threads behind on a host with an AMD GPU. ⚠️ Candidates end when the cascade ends, **never between adapters**: until then `ActivateObject` returns the same instance, and a new one would change what wins (`docs/encoders.md`) |
-| **VideoToolbox** | macOS ships **no FFmpeg at all**. Wiring it needs BOTH the `*_videotoolbox` names in the tables **and** a re-run of `vendor-ffmpeg-macos.yml` — restoring the feature alone re-ships a dyld crash on every end-user Mac |
+| **VideoToolbox** | macOS ships the vendored FFmpeg built with `--enable-videotoolbox` (`vendor-ffmpeg-macos.yml`), and the release builds `ffmpeg-encoder`, so the `*_videotoolbox` names in the tables run there. A new one needs BOTH its name in the tables **and** a re-run of that recipe, whose `--disable-autodetect` keeps the runner's Homebrew libraries out of the dylibs: with them, dyld kills the agent at launch on every end-user Mac |
 
 ⚠️ **The OPEN decides the device** (`open_on_some_device`: preferred first, then
 the rest, winner remembered). Vulkan device 0 may be an iGPU with no
@@ -263,12 +271,33 @@ truth.
 
 **CLI `--encoder` > env `ROOMLERD_ENCODER` > `encoder_preference` in config TOML >
 `Auto`.** Values: `auto` | `hardware` (`hw`/`mf`) | `software` (`sw`/`openh264`).
-`Auto` on Windows runs the MF H.264 probe-and-rollback cascade then falls back to
-openh264; everywhere else it is openh264 only. `ROOMLERD_HW_AUTO=0` reverts to
-openh264-first without a rebuild.
+The preference binds the RTP track's encoder (FR-135 Dv14). There `Auto` on
+Windows runs the MF H.264 probe-and-rollback cascade then falls back to openh264,
+and everywhere else that track's H.264 is openh264 whatever the preference; off
+Windows, hardware H.264 is the DataChannel's FFmpeg cascade. `ROOMLERD_HW_AUTO=0`
+reverts to openh264-first without a rebuild. `encoder-smoke --encoder hardware`
+passes only on a hardware encoder (#3652), so off Windows, with FFmpeg on, it
+opens that cascade for H.264.
 
 Legacy caps fields keep their exact pre-FR-77 meaning (first backend that opens),
 and **`data-channel-vp9-444` stays on the wire forever**. Unknown cell names are
 ignored, never an error. The viewer derives cells for old agents in
 `ui/src/composables/videoCells.ts` — the one reading the picker and the admin
 chips share.
+
+## 7 · The cell table derives the hello beside the code that writes it (FR-135 R9)
+
+`encode/cell_table.rs` has one row per cell the agent can advertise (`CELLS`), and derives
+the hello's six probed fields from the probe's `ProbeFindings`. `caps::assemble` still writes
+them; a gate over `tests/fixtures/cell-table.hellos.json` proves the two byte-identical, and
+`cell_table::shadow` compares them once per process, in the probe child, whose line reaches
+no uploaded log: the gate is the evidence, never the shadow's silence (`docs/encoders.md`).
+
+⚠️ **A new cascade name, 4:4:4 form, GPU form or vendored encoder needs its row**, or the
+table's tests fail: they read the columns against `*_ENCODER_NAMES`, `FFMPEG_444_CAPABLE`,
+`gpu_cell` and the vendor jobs' `--enable-encoder` lists.
+⚠️ **A change to what a probe's findings make the hello say re-records the fixtures**
+(`CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table`), with the reason in
+the commit message, the composition baseline's rule.
+⚠️ **Nothing reads the table yet.** A fix to what a session opens goes where the session
+reads it; R10 moves those readers onto the rows.

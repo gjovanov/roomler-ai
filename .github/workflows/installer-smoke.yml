@@ -41,6 +41,7 @@ on:
     paths:
       - 'agents/roomlerd/**'
       - 'agents/roomlerdw/**'
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
@@ -85,6 +86,9 @@ on:
       # code that shares the file changes far more often than the installer.
       - 'agents/roomlerd/src/win_service/lifecycle.rs'
       - 'agents/roomlerd/src/win_service/environment.rs'
+      # #3375 — the custom-action DLL the per-Machine MSI loads on every
+      # upgrade: a change to it changes what an update keeps.
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   workflow_dispatch: {}
@@ -125,6 +129,171 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #3754 — every installer run of this job goes through Invoke-Installer,
+      # never through `Start-Process -Wait`, which waits for every process in
+      # the child's job object and has no deadline. It waits for the one process
+      # it started, for at most its deadline. Past the deadline it saves the
+      # evidence (every process with its image path, and the service's and the
+      # per-User daemon's logs), ends that process's tree and fails the step.
+      # Any exit but 0 fails too, and 3010 or 1641 says that a restart was
+      # needed. Every failure prints the MSI log's RESTART MANAGER and held-in-use
+      # lines. Five jobs sat in an msiexec run until the job's limit and left no
+      # log at all (#3754). 300 s is twice the slowest passing per-Machine step
+      # (nine runs), and more than every bounded wait of the custom actions summed.
+      - name: "The installer runner: a deadline on every installer run, and its evidence (#3754)"
+        shell: pwsh
+        run: |
+          $runner = Join-Path $env:RUNNER_TEMP 'installer-run.ps1'
+          @'
+          $InstallerEvidence = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          New-Item -ItemType Directory -Path $InstallerEvidence -Force | Out-Null
+          # What a Windows Installer log says about a restart.
+          $RestartMarks = 'RESTART MANAGER', 'held in use', 'ReplacedInUseFiles', 'requires a system restart', 'MainEngineThread is returning'
+
+          # Every process with its image path and command line, and the logs of
+          # the service and of the per-User daemon, as they are now.
+          function Save-InstallerEvidence([string]$Label, [string]$Dir = $InstallerEvidence) {
+            $to = Join-Path $Dir ('evidence-' + ($Label -replace '[^A-Za-z0-9._-]+', '-'))
+            New-Item -ItemType Directory -Path $to -Force | Out-Null
+            $procs = @(Get-CimInstance Win32_Process -OperationTimeoutSec 60 | Sort-Object ProcessId)
+            $procs | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate |
+              Export-Csv -NoTypeInformation -Encoding utf8 -Path (Join-Path $to 'processes.csv')
+            $procs | Where-Object { $_.Name -match '^(msiexec|roomler)' } |
+              Format-Table -AutoSize ProcessId, ParentProcessId, Name, ExecutablePath | Out-String -Width 400 | Write-Host
+            $logs = @{ 'service-logs' = "$env:ProgramData\roomler\roomler\service-logs"; 'per-user-logs' = "$env:LOCALAPPDATA\roomler\roomler\data\logs" }
+            foreach ($name in $logs.Keys) {
+              if (Test-Path -LiteralPath $logs[$name]) { Copy-Item -LiteralPath $logs[$name] -Destination (Join-Path $to $name) -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            Write-Host "evidence saved: $to ($($procs.Count) processes)"
+          }
+
+          function Get-RestartLines([string]$Log) {
+            if (-not $Log -or -not (Test-Path -LiteralPath $Log)) { return @() }
+            @(Select-String -LiteralPath $Log -SimpleMatch -Pattern $RestartMarks | ForEach-Object { "{0,6}: {1}" -f $_.LineNumber, $_.Line.Trim() })
+          }
+
+          # Runs one installer process and waits for that process alone, for at
+          # most $DeadlineSeconds. -Output sends a console program's stdout and
+          # stderr to <Output>.out.log and <Output>.err.log. -RestartNote is added
+          # to the failure when the exit says a restart was needed.
+          function Invoke-Installer {
+            param(
+              [Parameter(Mandatory)][string]$Label,
+              [Parameter(Mandatory)][string]$FilePath,
+              [Parameter(Mandatory)][string]$Arguments,
+              [string]$Log,
+              [int]$DeadlineSeconds = 300,
+              [string]$Output,
+              [string]$RestartNote,
+              [string]$EvidenceDir = $InstallerEvidence,
+              [int]$Tail = 120,
+              [switch]$NoAnnotation
+            )
+            $start = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
+            if ($Output) { $start += @{ NoNewWindow = $true; RedirectStandardOutput = "$Output.out.log"; RedirectStandardError = "$Output.err.log" } }
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process @start
+            $null = $p.Handle   # held from here, so the exit code outlives the process
+            $why = $null
+            if (-not $p.WaitForExit($DeadlineSeconds * 1000)) {
+              Save-InstallerEvidence $Label $EvidenceDir   # before anything is ended
+              try { $p.Kill($true) } catch { Write-Host "ending pid $($p.Id): $($_.Exception.Message)" }
+              $null = $p.WaitForExit(30000)
+              $why = "still running at its deadline of $DeadlineSeconds s, so its process tree was ended"
+            } elseif ($p.ExitCode -eq 3010 -or $p.ExitCode -eq 1641) {
+              $why = "exited $($p.ExitCode): Windows Installer needed a restart ($(if ($p.ExitCode -eq 1641) { 'and started one' } else { 'held back by REBOOT=ReallySuppress' }))"
+              if ($RestartNote) { $why += ". $RestartNote" }
+            } elseif ($p.ExitCode -ne 0) {
+              $why = "exited $($p.ExitCode)"
+            }
+            $secs = [int]$clock.Elapsed.TotalSeconds
+            if (-not $why) { Write-Host "${Label}: exit 0 in $secs s"; return }
+            if ($why -notlike 'still running*') { Save-InstallerEvidence $Label $EvidenceDir }
+            $lines = @(Get-RestartLines $Log)
+            if ($Log) {
+              Write-Host "--- $(Split-Path $Log -Leaf): $($lines.Count) line(s) on RESTART MANAGER, files held in use and the engine's end ---"
+              $lines | ForEach-Object { Write-Host $_ }
+              if (Test-Path -LiteralPath $Log) { Write-Host "--- the last $Tail lines of $(Split-Path $Log -Leaf) ---"; Get-Content -LiteralPath $Log -Tail $Tail | Write-Host }
+            }
+            $msg = "${Label}: $why (after $secs s)"
+            if (-not $NoAnnotation) { Write-Host "::error title=installer run failed::$msg" }
+            $ex = [System.Exception]::new($msg)
+            $ex.Data['RestartLines'] = $lines
+            throw $ex
+          }
+
+          # msiexec with the workflow's usual switches; /norestart is
+          # REBOOT=ReallySuppress for /i and /x.
+          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
+            Invoke-Installer -Label "msiexec $verb $(Split-Path $msi -Leaf) [$props]" -FilePath 'msiexec.exe' `
+              -Arguments "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props" -Log $log
+          }
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+          'INSTALLER_RUN=' + $runner | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "installer runner: $runner"
+          # #3810 — the evidence step reads the System events since this moment.
+          'JOB_STARTED_UTC=' + [DateTime]::UtcNow.ToString('o') | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # #3754 — the negative control of the deadline above: an endless process
+      # with an endless child of its own is ended and reported within its limit,
+      # or every deadline in this job is a claim, not a check. And an exit of
+      # 3010 fails with the log's Restart Manager lines. Only then does it pass.
+      - name: "The installer runner ends an endless process at its deadline and reports it (#3754, negative control)"
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          $dir = Join-Path $env:RUNNER_TEMP 'deadline-control'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $endless = Join-Path $dir 'endless.ps1'
+          @'
+          param([string]$Marker, [switch]$Leaf)
+          if (-not $Leaf) {
+            Start-Process -FilePath (Get-Process -Id $PID).Path -WindowStyle Hidden `
+              -ArgumentList '-NoProfile', '-File', "`"$PSCommandPath`"", '-Marker', $Marker, '-Leaf'
+          }
+          while ($true) { Start-Sleep -Seconds 1 }
+          '@ | Set-Content -LiteralPath $endless -Encoding utf8
+          $marker = 'endless-' + [guid]::NewGuid().ToString('N')
+          $limit = 20
+          $clock = [System.Diagnostics.Stopwatch]::StartNew()
+          $failed = $null
+          try {
+            Invoke-Installer -Label 'deadline control' -FilePath (Get-Process -Id $PID).Path `
+              -Arguments "-NoProfile -File `"$endless`" -Marker $marker" -DeadlineSeconds $limit -EvidenceDir $dir -NoAnnotation
+          } catch { $failed = $_.Exception.Message }
+          $took = $clock.Elapsed.TotalSeconds
+          Write-Host ("the runner said, after {0:n1} s: {1}" -f $took, $failed)
+          if (-not $failed) { throw 'NEGATIVE CONTROL FAILED: an endless process came back as a success' }
+          if ($failed -notlike '*deadline*') { throw "NEGATIVE CONTROL FAILED: the runner failed, but not on its deadline: $failed" }
+          if ($took -lt $limit -or $took -gt $limit + 60) { throw "NEGATIVE CONTROL FAILED: the deadline was $limit s and the runner gave up after $took s" }
+          # Reported: the process list it saved before ending anything holds both.
+          $saved = @(Import-Csv (Join-Path $dir 'evidence-deadline-control\processes.csv') | Where-Object { $_.CommandLine -like "*$marker*" })
+          if ($saved.Count -ne 2) { throw "NEGATIVE CONTROL FAILED: the saved process list holds $($saved.Count) of the 2 endless processes" }
+          # Ended: neither outlives the deadline.
+          Start-Sleep -Seconds 2
+          $left = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$marker*" })
+          if ($left.Count) {
+            $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            throw "NEGATIVE CONTROL FAILED: $($left.Count) endless process(es) outlived the deadline"
+          }
+          Write-Host "OK: the endless process and its child were saved in the evidence, then ended, $([int]$took) s after a $limit s deadline"
+
+          # An exit of 3010 fails, and prints the log's restart lines.
+          $planted = Join-Path $dir 'planted.log'
+          @(
+            'MSI (s) (00:00) [00:00:00:000]: RESTART MANAGER: Did detect that a critical application holds file[s] in use, so a reboot will be necessary.',
+            'Info 1603. The file C:\Program Files\Roomler\roomlerd.exe is being held in use by the following process: Name: roomlerd, Id: 1.'
+          ) | Set-Content -LiteralPath $planted -Encoding utf8
+          $failed = $null
+          try {
+            Invoke-Installer -Label 'exit 3010 control' -FilePath "$env:SystemRoot\System32\cmd.exe" -Arguments '/d /c exit 3010' `
+              -Log $planted -EvidenceDir $dir -RestartNote 'planted' -NoAnnotation
+          } catch { $failed = $_ }
+          if (-not $failed -or $failed.Exception.Message -notlike '*exited 3010*') { throw "NEGATIVE CONTROL FAILED: an exit of 3010 came back as: $failed" }
+          $printed = @($failed.Exception.Data['RestartLines'])
+          if ($printed.Count -ne 2) { throw "NEGATIVE CONTROL FAILED: the runner printed $($printed.Count) of the log's 2 restart lines" }
+          Write-Host 'OK: an exit of 3010 failed, with the log''s RESTART MANAGER and held-in-use lines'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -149,13 +318,13 @@ jobs:
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
         run: |
-          choco install -y wixtoolset
+          choco install -y wixtoolset; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $wixBin = Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v*\bin' | Select-Object -First 1
           "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
           # Idempotent: the seed caches (#488) can restore ~/.cargo/bin with
           # the tool present; a plain install hard-errors on it.
           if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
-            cargo install cargo-wix --locked
+            cargo install cargo-wix --locked; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
       - name: Build agent (release, minimal feature set)
@@ -180,7 +349,7 @@ jobs:
           # ~150 KB shim that re-execs `roomlerd cli`; the INSTALLED name is
           # still roomler.exe, which is what the payload assert below checks.
           # Mirrors release-agent.yml's shim build step.
-          cargo build -p roomler-cli-shim --release
+          cargo build -p roomler-cli-shim --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomler-shim.exe)) {
             Write-Host "::error::roomler-shim.exe not produced — TunnelExe harvest would fail (LGHT0103)"
             exit 1
@@ -188,11 +357,30 @@ jobs:
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
           # #3292: the windowless launcher the per-user Scheduled Task runs.
-          cargo build -p roomlerdw --release
+          cargo build -p roomlerdw --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomlerdw.exe)) {
             Write-Host "::error::roomlerdw.exe not produced — LauncherExe harvest would fail (LGHT0103)"
             exit 1
           }
+
+      # #3375: the per-Machine MSI's custom-action DLL (agents/roomler-msi-ca),
+      # built as release-agent.yml builds it: the CRT linked in, in a target
+      # dir of its own so the flag never reaches another crate. msiexec loads
+      # it from the MSI's Binary table, alone in a temp folder, on machines
+      # that may have no VC++ redistributable. A plain build of the same crate
+      # is kept aside for the import audit's negative control below. Before
+      # the payload signing, which it joins.
+      - name: "Build the per-Machine MSI's custom-action DLL (#3375)"
+        shell: pwsh
+        run: |
+          cargo build -p roomler-msi-ca --release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\msi-ca" -Force | Out-Null
+          Copy-Item target\release\roomler_msi_ca.dll "$env:RUNNER_TEMP\msi-ca\plain-crt.dll" -Force
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build -p roomler-msi-ca --release --target-dir target\msi-ca
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item target\msi-ca\release\roomler_msi_ca.dll target\release\roomler_msi_ca.dll -Force
 
       # Mirrors release-agent.yml's payload-signing placement exactly: after
       # the binaries are built, BEFORE the third-party DLLs (wintun, VC-CRT)
@@ -210,6 +398,7 @@ jobs:
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
             target\release\roomlerdw.exe
+            target\release\roomler_msi_ca.dll
           mode:               local
           require:            'true'
           # The action imports the self-signed cert into the runner's Root +
@@ -331,17 +520,14 @@ jobs:
           # /quiet runs without UI; /norestart prevents implicit reboot
           # if the MSI calls for one; /l*v emits a verbose log so the
           # workflow's artifact upload below captures it on failure.
+          # #3754: under the installer runner's deadline.
+          . $env:INSTALLER_RUN
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           New-Item -ItemType Directory -Path $logDir -Force | Out-Null
           $log = Join-Path $logDir 'install.log'
-          $proc = Start-Process -FilePath 'msiexec.exe' `
-            -ArgumentList "/i `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
-            -Wait -PassThru
           'INSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 200
-            throw "msiexec /i failed with exit $($proc.ExitCode)"
-          }
+          Invoke-Installer -Label 'msiexec /i (per-User)' -FilePath 'msiexec.exe' `
+            -Arguments "/i `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" -Log $log -Tail 200
           Write-Host "Install succeeded (exit 0)"
 
       - name: Assert registry UpgradeCode present (rc.27 install_detect lock)
@@ -512,7 +698,7 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
           $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
                      Sort-Object FullName | Select-Object -Last 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
@@ -531,7 +717,7 @@ jobs:
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
               $imports = & $dumpbin /dependents $path |
                 Select-String -Pattern '^\s{4}(\S+\.dll)$' |
-                ForEach-Object { $_.Matches[0].Groups[1].Value }
+                ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
               if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
               if (-not $Quiet) { Write-Host "$exe imports $($imports.Count) DLLs" }
               foreach ($dll in $imports) {
@@ -588,6 +774,76 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3801 — until it, every per-user install registered `\Roomler`, one name
+      # for every account on a machine: a second account could not hold it, and a
+      # clean-up run for one account deleted the other's. Each account's task is
+      # now its own, `Roomler-<SID>`, and a task under a shared name is acted on
+      # only when its principal is the account acting. The unit tests decide that
+      # over a task library in memory; this reads Windows' own: the name the MSI
+      # registered, a principal read from a real definition, and a shared-name
+      # task of another account (SYSTEM's here) left alone by every path, from
+      # this elevated runner.
+      - name: "The per-user task is the account's own, and a shared one moves only when it is its own (#3801)"
+        shell: pwsh
+        run: |
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $own = "Roomler-$sid"
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
+          # The query's exit code is reset once read: the runner ends a pwsh step
+          # with the last native command's code, and 1 (no such task) is an answer.
+          function Test-Task([string]$Name) {
+            try { schtasks /Query /TN $Name 2>&1 | Out-Null } catch { return $false }
+            $found = ($LASTEXITCODE -eq 0)
+            $global:LASTEXITCODE = 0
+            return $found
+          }
+          # A disabled task under the shared name that runs as $UserId: what a
+          # release before #3801 registered for its account, or another account's.
+          function New-SharedTask([string]$UserId, [string]$Logon) {
+            $xml = '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>{0}</UserId>{1}<RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><Enabled>false</Enabled></Settings><Actions Context="Author"><Exec><Command>{2}</Command><Arguments>--version</Arguments></Exec></Actions></Task>' -f $UserId, $Logon, $exe
+            $file = Join-Path $env:RUNNER_TEMP 'shared-name-task.xml'
+            Set-Content -LiteralPath $file -Value $xml -Encoding Unicode
+            schtasks /Create /TN Roomler /XML $file /F | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "could not register a shared-name task that runs as $UserId" }
+          }
+          if (-not (Test-Task $own)) { throw "the per-user MSI registered no task of this account's own (Roomler-<SID>)" }
+          if (Test-Task 'Roomler') { throw 'the per-user MSI registered the shared name Roomler' }
+          Write-Host "the MSI registered this account's own task, Roomler-<SID>"
+
+          # 1. This account's task under the shared name, as a release before #3801
+          #    left it: the account's next registration moves it to its own name.
+          New-SharedTask "$env:USERDOMAIN\$env:USERNAME" '<LogonType>InteractiveToken</LogonType>'
+          & $exe service install
+          if ($LASTEXITCODE -ne 0) { throw "service install exited $LASTEXITCODE" }
+          if (Test-Task 'Roomler') { throw "this account's Roomler survived its registration: its principal was not read as this account" }
+          if (-not (Test-Task $own)) { throw "the registration left no task of this account's own" }
+          Write-Host "this account's shared-name task moved to its own name"
+
+          # 2. Another account's task under the shared name: no path of this account
+          #    acts on it, and the clean-up's report says it left it.
+          New-SharedTask 'S-1-5-18' ''
+          try {
+            & $exe service install
+            if ($LASTEXITCODE -ne 0) { throw "service install exited $LASTEXITCODE" }
+            if (-not (Test-Task 'Roomler')) { throw "service install deleted another account's Roomler" }
+            $said = & $exe service status | Out-String
+            if ($said -notmatch 'Auto-start: installed') { throw "service status: $said" }
+            $report = & $exe cleanup-legacy-install --target-flavour perMachine --dry-run 2>&1 | Out-String
+            Write-Host $report
+            if ($report -match 'Delete /TN Roomler /F') { throw "the clean-up would delete another account's Roomler" }
+            if ($report -notmatch 'Scheduled Task Roomler left in place') { throw 'the clean-up does not say it leaves Roomler' }
+            & $exe service uninstall
+            if ($LASTEXITCODE -ne 0) { throw "service uninstall exited $LASTEXITCODE" }
+            if (-not (Test-Task 'Roomler')) { throw "service uninstall deleted another account's Roomler" }
+            if (Test-Task $own) { throw "service uninstall left this account's own task" }
+            Write-Host "another account's shared-name task: left by install, status, the clean-up and uninstall"
+          } finally {
+            schtasks /Delete /TN Roomler /F 2>&1 | Out-Null
+          }
+          # The steps below start from what the MSI left: this account's own task.
+          & $exe service install
+          if (-not (Test-Task $own)) { throw "could not register this account's own task again" }
+
       # #3292 — Restart Manager stops nothing once the daemon runs through the
       # windowless launcher, so the MSI's StopDaemon custom action is what ends
       # it. Without that action `msiexec /x` still exits 0, and the daemon runs on
@@ -622,20 +878,30 @@ jobs:
             throw 'the daemon did not stay up on a config with no server, so this lane proves nothing'
           }
           Write-Host "Daemon up under the launcher: pid $($up.Id)"
+          # #3774: this daemon must not reach the live update channel, or it
+          # could put the newest published release over the build under test.
+          # ROOMLERD_AUTO_UPDATE=0 shuts it, and its own log says so.
+          $logFile = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          if (-not $logFile) { throw 'the daemon wrote no log, so nothing shows whether it armed its updater' }
+          $lines = Get-Content -LiteralPath $logFile.FullName
+          $armed = $lines | Select-String -SimpleMatch 'auto-updater armed'
+          if ($armed) { $armed | ForEach-Object { Write-Host "  $_" }; throw 'the started daemon armed its auto-updater: it can reach the live update channel' }
+          $shut = $lines | Select-String -SimpleMatch -Pattern 'auto-update disabled', 'auto-update opted out'
+          if (-not $shut) { throw 'the daemon log has no line saying its auto-update is disabled' }
+          $shut | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
+          Write-Host 'the started daemon does not reach the live update channel'
 
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
+          # #3754: under the installer runner's deadline.
+          . $env:INSTALLER_RUN
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           $log = Join-Path $logDir 'uninstall.log'
-          $proc = Start-Process -FilePath 'msiexec.exe' `
-            -ArgumentList "/x `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
-            -Wait -PassThru
           'UNINSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 200
-            throw "msiexec /x failed with exit $($proc.ExitCode)"
-          }
+          Invoke-Installer -Label 'msiexec /x (per-User)' -FilePath 'msiexec.exe' `
+            -Arguments "/x `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" -Log $log -Tail 200
           Write-Host 'Uninstall succeeded (exit 0)'
 
       - name: "Assert the uninstall stopped the daemon (#3292)"
@@ -710,7 +976,15 @@ jobs:
           if ($userPath -and $userPath -match [regex]::Escape('Programs\Roomler')) {
             throw "user PATH still contains Programs\Roomler after uninstall (HKCU\Environment PATH = '$userPath')"
           }
-          Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry and MSI registry record all clean'
+          # #3801: the uninstall's UnregisterAutostart removed this account's own task.
+          # The query's exit code is reset once read: the runner ends a pwsh step
+          # with the last native command's code, and here 1 (no such task) passes.
+          $own = 'Roomler-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          schtasks /Query /TN $own 2>&1 | Out-Null
+          $found = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($found) { throw "this account's own task survived the uninstall" }
+          Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry, MSI registry record and the task all clean'
 
       - name: Compile per-Machine MSI (wxs lint, no install)
         shell: pwsh
@@ -744,7 +1018,106 @@ jobs:
           if (-not $msi) { throw 'per-Machine MSI not produced by cargo-wix' }
           Write-Host "per-Machine MSI compiles clean: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
 
-      - name: "A hand-run per-Machine upgrade or reinstall keeps the service and the SystemContext mode (#1727, #3115)"
+      - name: "The per-Machine MSI carries the service's Environment: its tables and its DLL (#3375)"
+        # Read from the BUILT MSI, not the wxs: the order the carry depends on,
+        # that neither action can fail an upgrade, that the values stay out of
+        # the MSI's log, and the DLL itself, taken out of the Binary table.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1).FullName
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+          function Get-Row([string]$sql) {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          }
+          function Get-Field($row, [string]$kind) {
+            $row.GetType().InvokeMember($kind, 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          }
+          function Get-Seq([string]$action) {
+            $row = Get-Row "SELECT Sequence FROM InstallExecuteSequence WHERE Action='$action'"
+            if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
+            [int](Get-Field $row 'IntegerData')
+          }
+          # The capture before the old product's removal (afterInstallInitialize),
+          # the restore once the new entry exists, and every SystemContext action
+          # after it: each restarts the service and decides the switch.
+          $order = @('CaptureServiceEnvironment', 'InstallInitialize', 'RemoveExistingProducts', 'InstallFiles',
+                     'RegisterService', 'SetRestoreServiceEnvironment', 'RestoreServiceEnvironment',
+                     'RollbackSystemContext', 'EnableSystemContext')
+          $seq = @($order | ForEach-Object { Get-Seq $_ })
+          Write-Host "$($order -join ', '): $($seq -join ', ')"
+          for ($i = 1; $i -lt $seq.Count; $i++) {
+            if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
+          }
+          foreach ($a in 'DisableSystemContext', 'KeepSystemContext') {
+            if ((Get-Seq $a) -le (Get-Seq 'RestoreServiceEnvironment')) { throw "$a runs before RestoreServiceEnvironment" }
+          }
+          # msidbCustomActionTypeContinue (0x40): neither can fail an upgrade.
+          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+            $type = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='$a'") 'IntegerData')
+            Write-Host "$a Type: $type"
+            if (($type -band 0x40) -eq 0) { throw "$a can fail the install: its Return is not 'ignore'" }
+          }
+          # CustomActionData is logged under the restore's own name.
+          $hidden = Get-Field (Get-Row "SELECT Value FROM Property WHERE Property='MsiHiddenProperties'") 'StringData'
+          Write-Host "MsiHiddenProperties: $hidden"
+          foreach ($p in 'RoomlerServiceEnvironment', 'RestoreServiceEnvironment') {
+            if (@($hidden -split ';') -notcontains $p) { throw "$p is not hidden from the MSI's log" }
+          }
+          $db = $null
+          [GC]::Collect()
+
+          # The DLL as the MSI carries it. msiexec loads it alone in a temp
+          # folder, so every import must ship with Windows. The runner HAS the
+          # VC++ redistributable, so a redistributable found in System32 here
+          # proves nothing: those are refused by name.
+          $out = Join-Path $env:RUNNER_TEMP 'msi-ca\dark'
+          dark.exe -nologo -x $out $msi (Join-Path $out 'per-machine.wxs') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dark.exe failed: $LASTEXITCODE" }
+          $dll = Join-Path $out 'Binary\RoomlerMsiCa'
+          if (-not (Test-Path $dll)) { throw "the MSI's Binary table has no RoomlerMsiCa" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+          function Get-Problems([string]$path) {
+            $imports = & $dumpbin /dependents $path |
+              Select-String -Pattern '^\s{4}(\S+\.dll)$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
+            if (-not $imports) { return @('dumpbin listed no imports (parse broke?)') }
+            Write-Host "  $(Split-Path -Leaf $path) imports: $($imports -join ', ')"
+            @($imports | ForEach-Object {
+              if ($_ -match '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)') { "$_ is a redistributable" }
+              elseif ($_ -match '^(api-ms-win-|ext-ms-win-)') { }
+              elseif (-not (Test-Path (Join-Path $env:SystemRoot 'System32' $_))) { "$_ does not ship with Windows" }
+            })
+          }
+          $problems = @(Get-Problems $dll)
+          if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host "::error::roomler_msi_ca.dll: $_" }
+            throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
+          }
+          $exports = (& $dumpbin /exports $dll) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exited $LASTEXITCODE" }
+          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+            if ($exports -notmatch "\b$e\b") { throw "the DLL does not export $e" }
+          }
+          Write-Host 'OK: the DLL imports only what Windows ships, and exports both entry points'
+          # Negative control: the same crate built WITHOUT +crt-static imports the
+          # VC++ runtime, and the audit has to say so.
+          $neg = @(Get-Problems "$env:RUNNER_TEMP\msi-ca\plain-crt.dll")
+          if ($neg.Count -eq 0) { throw 'NEGATIVE CONTROL FAILED: the plain-CRT build passed the audit' }
+          Write-Host "OK: the plain-CRT build is refused: $($neg[0])"
+          if ($env:WIN_TEST_PFX_BASE64) {
+            $sig = Get-AuthenticodeSignature $dll
+            Write-Host "signature: $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "the DLL in the MSI is not signed: $($sig.Status)" }
+          }
+
+      - name: "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
         # SystemContext OFF: the property defaulted to "0", and every install
@@ -774,9 +1147,63 @@ jobs:
         # no hook in the product: the host's supervisor thread is held suspended.
         # Negative control: before #3115 that cell exits 1603 and leaves the
         # runner with no Roomler service.
+        #
+        # #3375 — and every other entry `roomlerd set-service-env-var` wrote:
+        # the kill switch ROOMLERD_SFTP_AS_USER=0, and one whose value holds
+        # every character the carry escapes. Each upgrade's removal of the old
+        # product deletes the service, and the MSI's two custom actions carry
+        # the entries across it. Asserted after every step. Then each action
+        # is made to fail on purpose (ROOMLER_TEST_CA_FAIL), and the upgrade
+        # must still complete, with only the entries lost. The repair and the
+        # uninstall are the next two steps (#3754). No MSI log may hold a
+        # carried value.
+        # Negative control: on master the v2 cell fails (the entries are gone).
+        #
+        # #3810 — a timeout of its own, well under the job's: it passes in 82 to
+        # 152 s, and one installer run may still reach its 300 s deadline and
+        # report itself first. A step that never returns then fails here, and
+        # "Save the evidence of a failure" runs.
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # #3810 — the service this step installs is opted out of the live update
+          # channel from its FIRST start, as the per-User daemon is (#3774). Its
+          # updater runs in the worker it spawns, and the worker gets the console
+          # user's environment built fresh from the registry at each spawn
+          # (`EnvBlock::for_token`, no inheritance, win_service/supervisor.rs),
+          # never the service's own Environment: only the host reads that, and it
+          # cannot hold an entry before the MSI creates the service. The machine
+          # environment is in that block from the first spawn, for the whole job.
+          [Environment]::SetEnvironmentVariable('ROOMLERD_AUTO_UPDATE', '0', 'Machine')
+          Write-Host "machine environment: ROOMLERD_AUTO_UPDATE=$([Environment]::GetEnvironmentVariable('ROOMLERD_AUTO_UPDATE', 'Machine'))"
+          $firstStart = [DateTime]::UtcNow
+          # What the service's processes logged about their updater since $since:
+          # an armed updater fails the step, the opt-out's line is printed.
+          function Assert-UpdateOptOut([string]$label, [datetime]$since) {
+            $dirs = @("$env:ProgramData\roomler", "$env:LOCALAPPDATA\roomler", "$env:SystemRoot\System32\config\systemprofile\AppData\Local\roomler") |
+              Where-Object { Test-Path -LiteralPath $_ }
+            $hits = @()
+            foreach ($i in 1..30) {
+              $hits = @(Get-ChildItem -LiteralPath $dirs -Recurse -File -Filter '*.log*' -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTimeUtc -ge $since } |
+                Select-String -SimpleMatch -Pattern 'auto-updater armed', 'auto-update disabled', 'auto-update opted out' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Line -match '^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s' -and [datetime]::Parse($Matches[1]).ToUniversalTime() -ge $since })
+              if ($hits) { break }
+              Start-Sleep -Seconds 1
+            }
+            $hits | ForEach-Object { Write-Host "${label}: $($_.Path): $($_.Line.Trim())" }
+            if (@($hits | Where-Object { $_.Line -like '*auto-updater armed*' })) {
+              throw "${label}: a process of the per-Machine service armed its auto-updater: it can reach the live update channel"
+            }
+            if (-not $hits) {
+              Write-Host "::warning title=no updater decision (#3810)::${label}: no log of the per-Machine service says how its updater started. The worker's starts:"
+              Get-ChildItem "$env:ProgramData\roomler\roomler\service-logs" -Filter 'roomlerd-service.log*' -ErrorAction SilentlyContinue |
+                Select-String -SimpleMatch -Pattern 'spawned worker', 'worker exited' | Select-Object -Last 6 | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+              return
+            }
+            Write-Host "${label}: the per-Machine service does not reach the live update channel"
+          }
           $out = Join-Path $env:RUNNER_TEMP 'pm-msi'
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           New-Item -ItemType Directory -Path $out, $logDir -Force | Out-Null
@@ -786,7 +1213,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item "agents\roomlerd\wix-perMachine\main.wxs" "$wixDir\main.wxs" -Force
           try {
-            foreach ($n in 1..4) {
+            foreach ($n in 1..6) {
               cargo wix -p roomlerd --nocapture --no-build --install-version "0.0.$n-smoke.1"
               if ($LASTEXITCODE -ne 0) { throw "cargo wix failed for v$n" }
               $msi = Get-ChildItem 'target/wix/*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -796,14 +1223,14 @@ jobs:
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
 
-          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
-            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
-            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
-            if ($p.ExitCode -ne 0) {
-              Get-Content $log -Tail 120
-              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
-            }
-          }
+          # #3754 — Invoke-Msi is the installer runner's. The cells' helpers go in
+          # a file that the repair and the uninstall steps below load too.
+          . $env:INSTALLER_RUN
+          $pmCells = Join-Path $env:RUNNER_TEMP 'pm-cells.ps1'
+          'PM_CELLS=' + $pmCells | Out-File -FilePath $env:GITHUB_ENV -Append
+          @'
+          $out = Join-Path $env:RUNNER_TEMP 'pm-msi'
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           function Get-Swap {
             $block = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment
             [bool](@($block) -contains 'ROOMLERD_ENABLE_SYSTEM_SWAP=1')
@@ -826,6 +1253,34 @@ jobs:
               throw "${label}: want exactly one per-Machine product at $version, found: $(($products | ForEach-Object { $_.DisplayVersion }) -join ',')"
             }
           }
+
+          # #3375 — what an operator set with `roomlerd set-service-env-var`: the
+          # kill switch, and a value with every character the carry escapes and a
+          # token that no MSI log may hold.
+          $token = 'smoke-carry-3375'
+          $entries = [ordered]@{
+            'ROOMLERD_SFTP_AS_USER' = '0'
+            'ROOMLERD_SMOKE_CARRY'  = "$token|100%[a]{b}"
+          }
+          function Set-Entries {
+            foreach ($name in $entries.Keys) {
+              & "$env:ProgramFiles\Roomler\roomlerd.exe" set-service-env-var --name $name --value $entries[$name]
+              if ($LASTEXITCODE -ne 0) { throw "set-service-env-var $name exited $LASTEXITCODE" }
+            }
+          }
+          function Assert-Carried([string]$label, [bool]$want) {
+            $block = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment)
+            Write-Host ("{0}: Environment names: {1}" -f $label, (($block | ForEach-Object { ($_ -split '=', 2)[0] }) -join ' '))
+            foreach ($name in $entries.Keys) {
+              $have = $block -ccontains "$name=$($entries[$name])"
+              if ($have -ne $want) { throw "${label}: $name is $(if ($have) { 'there' } else { 'gone' }), want $(if ($want) { 'there' } else { 'gone' })" }
+            }
+          }
+          function Assert-Logged([string]$log, [string]$line) {
+            if (-not (Select-String -Path (Join-Path $logDir $log) -SimpleMatch "roomler_msi_ca: $line")) { throw "${log}: no '$line' from the custom actions" }
+          }
+          '@ | Set-Content -LiteralPath $pmCells -Encoding utf8
+          . $pmCells
 
           # #3115 — a stop slower than the 5 s RegisterService used to wait,
           # made from OUTSIDE the product (no hook in it): the service host's
@@ -927,7 +1382,7 @@ jobs:
           [System.Diagnostics.Process]::EnterDebugMode()
           function Start-SlowStop([int]$holdMs) {
             # The host's pid, fresh: every restart of the service is a new host.
-            $hostPid = (Get-CimInstance Win32_Service -Filter "Name='Roomler'").ProcessId
+            $hostPid = (Get-CimInstance Win32_Service -Filter "Name='Roomler'" -OperationTimeoutSec 30).ProcessId
             if (-not $hostPid) { throw 'slow stop: the Roomler service has no host process' }
             # The supervisor thread is spawned a moment after RUNNING (the
             # firewall prep runs first): look for it for a while.
@@ -940,6 +1395,9 @@ jobs:
           try {
             Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1.log') 'ENABLE_SYSTEM_CONTEXT=1'
             Assert-Mode 'v1, installed with =1' $true '0.0.1.1'
+            Assert-UpdateOptOut 'v1, the first start' $firstStart
+            Set-Entries
+            Assert-Carried 'v1, set by set-service-env-var' $true
             # #3115 — THE regression cell for the field case: a reinstall of the
             # SAME MSI (a maintenance run) over a running SystemContext service
             # whose stop takes the field's 7.8 s. Up to 0.4.189 RegisterService
@@ -959,29 +1417,107 @@ jobs:
             if (-not $hold.Engaged) { throw 'slow stop: the service never went STOP_PENDING while its supervisor was held' }
             Write-Host "slow stop: the host stayed STOP_PENDING for $($hold.HeldMs) ms, then was let go"
             Assert-Mode 'v1, reinstalled over a running service that took 7.8 s to stop' $true '0.0.1.1'
-            # THE regression cell: a person upgrading by hand, no property.
+            Assert-Carried 'v1, reinstalled in place' $true
+            # THE regression cell: a person upgrading by hand, no property. #3375:
+            # the old product's removal deletes the service; the entries come across.
             Invoke-Msi '/i' (Join-Path $out 'pm-2.msi') (Join-Path $logDir 'pm-2.log') ''
             Assert-Mode 'v2, hand-run upgrade with no property' $true '0.0.2.1'
+            Assert-Carried 'v2, hand-run upgrade' $true
+            Assert-Logged 'pm-2.log' 'capture: carrying 3 entries'
+            Assert-Logged 'pm-2.log' 'restore: put back 2 entries'
             Invoke-Msi '/i' (Join-Path $out 'pm-3.msi') (Join-Path $logDir 'pm-3.log') 'ENABLE_SYSTEM_CONTEXT=0'
             Assert-Mode 'v3, upgrade with an explicit =0' $false '0.0.3.1'
-            Invoke-Msi '/i' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-4.log') ''
-            Assert-Mode 'v4, hand-run upgrade with no property' $false '0.0.4.1'
+            Assert-Carried 'v3, the switch is the installer''s, the rest comes across' $true
+            # #3375 — a failing action never fails the upgrade: only the entries
+            # are lost. The restore first, then the capture.
+            Invoke-Msi '/i' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-4.log') 'ROOMLER_TEST_CA_FAIL=restore'
+            Assert-Mode 'v4, the restore failing on purpose' $false '0.0.4.1'
+            Assert-Carried 'v4, the restore failing on purpose' $false
+            Assert-Logged 'pm-4.log' 'restore: failing on purpose'
+            Set-Entries
+            Invoke-Msi '/i' (Join-Path $out 'pm-5.msi') (Join-Path $logDir 'pm-5.log') 'ROOMLER_TEST_CA_FAIL=capture'
+            Assert-Mode 'v5, the capture failing on purpose' $false '0.0.5.1'
+            Assert-Carried 'v5, the capture failing on purpose' $false
+            Assert-Logged 'pm-5.log' 'capture: failing on purpose'
+            Set-Entries
+            Invoke-Msi '/i' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-6.log') ''
+            Assert-Mode 'v6, hand-run upgrade with no property' $false '0.0.6.1'
+            Assert-Carried 'v6, after the two failures' $true
           } finally {
             Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
             Copy-Item "$env:ProgramData\roomler\last-system-context-attempt.json" $logDir -Force -ErrorAction SilentlyContinue
           }
 
-          Invoke-Msi '/x' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-uninstall.log') ''
+      # #3754 — the repair over the running service, in a step of its own so that
+      # a failure names its cell. `/fa` takes no property, so `/norestart` never
+      # reached it, and a repair whose files Restart Manager could not free
+      # restarted Windows: the runner went with it, five times, with no log
+      # (#3455 measured the same on a lab machine). As `/i REINSTALL=ALL
+      # REINSTALLMODE=a` it takes REBOOT=ReallySuppress, and the server's own
+      # Command Line in the log has to show it. A repair that still needs a
+      # restart then ends 3010 with its log: that is #3455, the product's half.
+      # #3810 — it passes in 3 to 4 s; 6 min leaves its one 300 s deadline room.
+      - name: "A repair over the running per-Machine service never restarts Windows, and keeps the mode and the entries (#3754, #3455)"
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          . $env:PM_CELLS
+          $msi = Join-Path $out 'pm-6.msi'
+          $log = Join-Path $logDir 'pm-6-repair.log'
+          $is3455 = '#3455: the package does not free its own files before InstallFiles on a repair over the running service, so Windows Installer can only replace them at a restart. It is the product''s open bug, not this workflow''s'
+          $cmd = @()
+          try {
+            # A repair reconfigures the entry in place (#3115): nothing to carry.
+            Invoke-Installer -Label 'msiexec repair of pm-6.msi over the running service' -FilePath 'msiexec.exe' `
+              -Arguments "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=a REBOOT=ReallySuppress /qn /l*v `"$log`"" -Log $log -RestartNote $is3455
+          } finally {
+            $cmd = @(Select-String -LiteralPath $log -Pattern 'MSI \(s\) \([^)]*\) \[[^\]]*\]: Command Line: ' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line.Trim() })
+            $cmd | ForEach-Object { Write-Host "the server's $_" }
+            Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if ($cmd.Count -eq 0) { throw 'pm-6-repair.log holds no server Command Line line' }
+          $bare = @($cmd | Where-Object { $_ -notmatch '\bREBOOT=ReallySuppress\b' })
+          if ($bare.Count) { throw "the repair's server Command Line does not carry REBOOT=ReallySuppress: $($bare[0])" }
+          Write-Host 'OK: the server ran the repair with REBOOT=ReallySuppress'
+          $replaced = @(Select-String -LiteralPath $log -Pattern "ReplacedInUseFiles(?: property\. Its value is '|\s*=\s*)1")
+          if ($replaced.Count) {
+            Get-RestartLines $log | ForEach-Object { Write-Host $_ }
+            throw "the repair exited 0, and its log says ReplacedInUseFiles = 1 (line $($replaced[0].LineNumber)). $is3455"
+          }
+          Assert-Mode 'v6, repaired' $false '0.0.6.1'
+          Assert-Carried 'v6, repaired' $true
+
+      # #3810 — it passes in 1 to 2 s; 6 min leaves its one 300 s deadline room.
+      - name: "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)"
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          . $env:PM_CELLS
+          # The custom actions log names; no MSI log may hold a carried value.
+          $leak = Select-String -Path (Join-Path $logDir '*.log') -SimpleMatch $token | Select-Object -First 3
+          if ($leak) {
+            $leak | ForEach-Object { Write-Host "::error::$($_.Filename):$($_.LineNumber) holds a carried value" }
+            throw 'an MSI log holds a carried value'
+          }
+          Write-Host 'OK: no MSI log holds a carried value'
+
+          Invoke-Msi '/x' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-uninstall.log') ''
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived the uninstall' }
-          Write-Host 'per-Machine uninstall removed the service'
+          # #3375 — and every entry with it: an uninstall carries nothing.
+          if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler') { throw 'the service key, and its Environment, survived the uninstall' }
+          Write-Host 'per-Machine uninstall removed the service and its Environment'
 
       - name: An upgrade from the released MSIs leaves ONE entry, under the new name (FR-133 P1)
         # FR-133 P1 renamed what Apps & Features lists: "Roomler" and
         # "Roomler (per-Machine)". An upgrade is matched by the UpgradeCode,
         # never by that name, and this step proves it on real released bytes:
-        # install the NEWEST published release of each flavour, then this
-        # branch's MSI over it, built one patch version above so it is a real
-        # major upgrade, and count what a person would see: exactly one entry,
+        # install the newest published release of each flavour AT OR BELOW this
+        # build's version (#3774: on a ref behind the newest release, the
+        # newest of all is newer than this build), then this branch's MSI over
+        # it, built one patch version above so it is a real major upgrade, and
+        # count what a person would see: exactly one entry,
         # under the new name. The per-Machine cell also keeps the SystemContext
         # switch (#1727) and ends with the service Running.
         #
@@ -993,6 +1529,10 @@ jobs:
         #
         # Negative control: on master the per-User asserts fail, because
         # master's MSI still registers the pre-P1 name.
+        #
+        # #3810 — it passes in 38 to 56 s. 10 min leaves one installer deadline
+        # of 300 s room to report itself; the downloads have a bound of their own.
+        timeout-minutes: 10
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1023,7 +1563,7 @@ jobs:
             if ($a.Count -ne 1) { throw "$($rel.tag_name): want one $flavour MSI, found $($a.Count)" }
             $dst = Join-Path $out "$($rel.tag_name)-$flavour.msi"
             if (-not (Test-Path $dst)) {
-              Invoke-WebRequest -UseBasicParsing -Uri $a[0].browser_download_url -OutFile $dst
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $a[0].browser_download_url -OutFile $dst
             }
             $want = ([string]$a[0].digest -replace '^sha256:', '').ToLower()
             $got = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
@@ -1031,14 +1571,9 @@ jobs:
             Write-Host "released $flavour MSI: $($a[0].name) (sha256 verified)"
             $dst
           }
-          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
-            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
-            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
-            if ($p.ExitCode -ne 0) {
-              Get-Content $log -Tail 120
-              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
-            }
-          }
+          # #3754 — Invoke-Msi, and the deadline on install.ps1 below, are the
+          # installer runner's.
+          . $env:INSTALLER_RUN
           # Every product Apps & Features would show under a Roomler name, one row
           # per ProductCode (a per-User record can sit in more than one hive).
           function Get-Entries {
@@ -1082,23 +1617,43 @@ jobs:
             throw "${label}: the Roomler service is $($svc.Status), want Running"
           }
           # The served script, in the shell the field runs it in.
+          # It runs msiexec /x itself, so it gets the same deadline (#3754).
           function Invoke-UninstallScript([string]$label) {
-            $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall 2>&1
-            $rc = $LASTEXITCODE
-            $o | Out-File -FilePath (Join-Path $logDir "install-ps1-uninstall-$label.log") -Encoding utf8
-            $o | ForEach-Object { Write-Host "  install.ps1 | $_" }
-            if ($rc -ne 0) { throw "${label}: install.ps1 -Uninstall exited $rc" }
+            $base = Join-Path $logDir "install-ps1-uninstall-$label"
+            try {
+              Invoke-Installer -Label "${label}: install.ps1 -Uninstall" -FilePath 'powershell.exe' `
+                -Arguments '-NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall' -Output $base
+            } finally {
+              foreach ($f in "$base.out.log", "$base.err.log") {
+                if (Test-Path -LiteralPath $f) { Get-Content -LiteralPath $f | ForEach-Object { Write-Host "  install.ps1 | $_" } }
+              }
+            }
           }
 
-          # This branch's MSIs, one patch version above the newest release.
-          $newest = (Get-ReleaseJson 'releases?per_page=100') |
+          # This branch's MSIs, one patch version above the release they upgrade.
+          # #3774: that release is the newest published one AT OR BELOW this
+          # build's version. On a ref behind the newest release, upgrading from
+          # the newest would put this older build over newer bytes, which ended
+          # 1603; at or ahead of the newest release the two are the same.
+          $builtText = (& .\target\release\roomlerd.exe --version | Out-String).Trim()
+          $built = $null
+          if (-not [version]::TryParse((($builtText -split '\s+')[-1] -replace '[-+].*$', ''), [ref]$built)) {
+            throw "could not read this build's version from '$builtText'"
+          }
+          $published = @((Get-ReleaseJson 'releases?per_page=100') |
             Where-Object { $_.tag_name -like 'agent-v*' -and -not $_.draft -and -not $_.prerelease } |
-            Sort-Object { [datetime]$_.published_at } -Descending | Select-Object -First 1
-          if (-not $newest) { throw 'no published agent-v* release to upgrade from' }
+            Sort-Object { [datetime]$_.published_at } -Descending)
+          if (-not $published) { throw 'no published agent-v* release to upgrade from' }
+          $newest = $published | Where-Object {
+              $v = $null
+              [version]::TryParse(($_.tag_name -replace '^agent-v', ''), [ref]$v) -and $v -le $built
+            } | Select-Object -First 1
+          if (-not $newest) { throw "no published agent-v* release at or below this build's $built to upgrade from" }
           $base = [version]($newest.tag_name -replace '^agent-v', '')
           $next = '{0}.{1}.{2}' -f $base.Major, $base.Minor, ($base.Build + 1)
           $nextMsi = "$next.1"
-          Write-Host "newest release $($newest.tag_name); this branch's MSIs are built at $next-smoke.1 (MSI $nextMsi)"
+          Write-Host "this build is $built; the newest release is $($published[0].tag_name); upgrading from $($newest.tag_name), the newest at or below this build"
+          Write-Host "this branch's MSIs are built at $next-smoke.1 (MSI $nextMsi)"
           $pu = Join-Path $out "branch-$nextMsi-peruser.msi"
           $pm = Join-Path $out "branch-$nextMsi-permachine.msi"
           Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
@@ -1123,11 +1678,11 @@ jobs:
           Invoke-UninstallScript 'pre-p1-peruser'
           $null = Assert-Entries "$($pre.tag_name) per-User after install.ps1 -Uninstall" @() ''
 
-          # 2. per-User: the newest release, then this branch over it.
+          # 2. per-User: the release chosen above, then this branch over it.
           Invoke-Msi '/i' (Save-Msi $newest 'pu') (Join-Path $logDir 'fr133-newest-peruser.log') ''
           $was = Assert-Entries "$($newest.tag_name) per-User installed" @($old.pu, $new.pu) ''
-          if ($was -cne $new.pu) { Write-Host "the newest release registers the pre-P1 name: this cell is the rename upgrade" }
-          else { Write-Host "::notice::the newest release already registers '$was'; cell 1 above is the pre-P1 case" }
+          if ($was -cne $new.pu) { Write-Host "the newest release at or below this build registers the pre-P1 name: this cell is the rename upgrade" }
+          else { Write-Host "::notice::the newest release at or below this build already registers '$was'; cell 1 above is the pre-P1 case" }
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
           # The Start-menu entry follows the name, and the old one leaves with
@@ -1140,8 +1695,9 @@ jobs:
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
           if (Test-Path $exe) { throw "$exe survived install.ps1 -Uninstall" }
 
-          # 3. per-Machine + SystemContext: the newest release, then a hand-run
-          #    upgrade to this branch with NO property, which must keep the switch.
+          # 3. per-Machine + SystemContext: the newest release at or below this
+          #    build, then a hand-run upgrade to this branch with NO property,
+          #    which must keep the switch.
           Invoke-Msi '/i' (Save-Msi $newest 'pm') (Join-Path $logDir 'fr133-newest-permachine.log') 'ENABLE_SYSTEM_CONTEXT=1'
           Wait-Running "$($newest.tag_name) per-Machine"
           if (-not (Get-Swap)) { throw "$($newest.tag_name) per-Machine installed with ENABLE_SYSTEM_CONTEXT=1, but the swap is off" }
@@ -1155,24 +1711,81 @@ jobs:
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived install.ps1 -Uninstall' }
           Write-Host 'FR-133 P1: each upgrade left one entry under the new name, and install.ps1 -Uninstall removed both names'
 
-      # The MSIs the step above built one version above the newest release: what
-      # a vmtest field cell installs over a released one. CI builds, unsigned:
-      # never ship them. Not on a master push: nobody field-tests those, and at
-      # 40 MB a run they would only fill the account's Actions storage.
+      # The MSIs the step above built one version above the newest release at
+      # or below this build: what a vmtest field cell installs over that
+      # release. CI builds, unsigned: never ship them. Not on a master push:
+      # nobody field-tests those, and at 40 MB a run they would only fill the
+      # account's Actions storage.
       - name: Upload this branch's MSIs (FR-133 field cell)
         if: ${{ !cancelled() && github.event_name != 'push' }}
         uses: actions/upload-artifact@v4
         with:
-          name: installer-smoke-msis
+          # #3810: from attempt 2 on (a re-run), the name carries the attempt.
+          # Documented, of `overwrite` (default false): "If false, the action will
+          # fail if an artifact for the given name already exists"
+          # (https://github.com/actions/upload-artifact/blob/v4/README.md). Observed
+          # in run 43272025014: attempt 2 uploaded attempt 1's name without failing,
+          # and the run then held it twice. The suffix is safe either way, and the
+          # two uploads below carry the same one.
+          name: installer-smoke-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/fr133/branch-*.msi
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Upload MSI logs on failure
-        if: failure()
+      # #3810 — the six per-Machine MSIs of this run, pm-1.msi to pm-6.msi:
+      # the same binary at versions 0.0.1-smoke.1 to 0.0.6-smoke.1, built by
+      # the hand-run upgrade step above. CI builds, unsigned: never ship them.
+      # A lab replay of the per-Machine steps on a throwaway guest installs
+      # exactly these. No step after the build moves or deletes them. Only on
+      # a pull request from a `lab/` branch, the one that asks for them: at
+      # about 20 MB a file, every other run would only fill the account's
+      # Actions storage.
+      - name: Upload the per-Machine MSIs for a lab replay (#3810)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: msi-logs
+          name: installer-smoke-pm-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
+          path: ${{ runner.temp }}/pm-msi/pm-*.msi
+          if-no-files-found: warn
+          retention-days: 3
+
+      # #3754 — what a failure leaves for its reader, taken before the runner
+      # cleans up: every process with its image path, and the service's and the
+      # per-User daemon's logs. A failed installer run has saved its own already.
+      # On a cancel too: a job that hit its limit is a failure for its reader.
+      # #3810 — and what names a lost machine: the boot time, the System events
+      # 1074 (a restart something asked for), 41 (a restart with no clean
+      # shutdown) and 6008 (an unexpected shutdown) since the job began, and the
+      # service's state. Every per-Machine step has a timeout of its own, well
+      # under the job's, so a step that never returns is ended by the runner and
+      # this step runs. A job that STILL sits to the job's 40 min, with this step
+      # never run, proves the runner itself was gone (Windows restarted, the
+      # network was lost or the runner's process was ended), not a wait in a step.
+      - name: Save the evidence of a failure (#3754)
+        if: failure() || cancelled()
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          if (-not $env:INSTALLER_RUN -or -not (Test-Path -LiteralPath $env:INSTALLER_RUN)) { Write-Host 'no installer runner: nothing ran'; exit 0 }
+          . $env:INSTALLER_RUN
+          Save-InstallerEvidence 'job-end'
+          $to = Join-Path $InstallerEvidence 'evidence-job-end'
+          $since = if ($env:JOB_STARTED_UTC) { [datetime]::Parse($env:JOB_STARTED_UTC).ToUniversalTime() } else { [DateTime]::UtcNow.AddHours(-1) }
+          $boot = (Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 60).LastBootUpTime.ToUniversalTime()
+          "boot $($boot.ToString('o')); the job began $($since.ToString('o')); now $([DateTime]::UtcNow.ToString('o')) (UTC)" |
+            Tee-Object -FilePath (Join-Path $to 'boot.txt') | Write-Host
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074, 41, 6008; StartTime = $since } -ErrorAction SilentlyContinue)
+          @("System events 1074, 41 and 6008 since the job began: $($events.Count)") +
+            @($events | ForEach-Object { "$($_.TimeCreated.ToUniversalTime().ToString('o')) id=$($_.Id) $($_.ProviderName): $($_.Message -replace '\s+', ' ')" }) |
+            Tee-Object -FilePath (Join-Path $to 'system-events.txt') | Write-Host
+          (Get-Service Roomler -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String).Trim() |
+            Tee-Object -FilePath (Join-Path $to 'service.txt') | Write-Host
+
+      - name: Upload MSI logs on failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-logs${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/msi-logs/
           retention-days: 7
 
@@ -1198,10 +1811,18 @@ jobs:
   #
   # What this CAN prove on a hosted runner: the pkg builds, installs, puts both
   # binaries where the plists and the docs say they are, loads the LaunchAgent,
-  # and the CLI shim resolves the daemon inside the bundle. What it CANNOT: TCC
-  # grants, since there is no way to accept a privacy prompt headlessly — so it
-  # asserts the honest REFUSAL path instead, which is exactly what runtime
-  # permission reporting made assertable.
+  # and the CLI shim resolves the daemon inside the bundle. TCC is the image's
+  # to decide, not the job's: the hosted macos-15 image grants the process the
+  # job's shell starts both Screen Recording and Accessibility, so the
+  # permissions step checks that `roomlerd caps` reports the grants it holds
+  # consistently, and asserts the refusal path only where it is reachable.
+  #
+  # #3774: every step tests the build this job made. Before the first install
+  # the job opts out of the live update channel with the product's own marker,
+  # because the update helper the package loads would otherwise install the
+  # newest PUBLISHED release over this build whenever the ref is behind it; and
+  # every step that runs the bundle's `roomlerd` first checks its `--version`
+  # against the build. The marker comes off only for the job's last install.
   macos-pkg-install:
     name: macOS pkg install smoke
     # Pinned to the image release-agent.yml builds the shipped .pkg on (GitHub
@@ -1215,6 +1836,12 @@ jobs:
     env:
       # rust-cache set this for the job until wave 22; set it here.
       CARGO_INCREMENTAL: 0
+      # FR-46 P5a: the config folder's pre-rename path. The postinstall still
+      # migrates it and both readers of the opt-out marker still dual-read it,
+      # so two steps below seed it on purpose. This is the job's one name for
+      # it: every use is "$LEGACY_ETC".
+      # RETIRED-NAME-ANCHOR: the retired config folder, named once.
+      LEGACY_ETC: /etc/roomler-agent
     steps:
       - uses: actions/checkout@v4
 
@@ -1244,16 +1871,58 @@ jobs:
       # Feature set is a subset of release-agent.yml's build-macos: `full`
       # would drag in the whole media stack for no extra signal, and the
       # payload shape plus the launchd wiring are what this job is about.
+      # `enigo-input` is in it as in the shipped build: without it
+      # `has_input_permission` is false whatever the OS granted, and the
+      # permissions step would read a constant (#3774).
       - name: Build the agent + the CLI shim
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           set -euo pipefail
           cargo build -p roomlerd --release \
-            --features "media,vp9-444,vp9-444-bindgen,overlay-l3" \
+            --features "media,vp9-444,vp9-444-bindgen,overlay-l3,enigo-input" \
             --target aarch64-apple-darwin
           cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
           cargo build -p roomler-desktop --release --target aarch64-apple-darwin
+
+      # #3774: the version every later step holds the installed bundle to, read
+      # from the binary this job built before anything is installed, and the
+      # check those steps run first. A bundle that answers anything else was
+      # put there by something other than this job's package.
+      - name: Record the build under test, and the check each step runs first
+        run: |
+          set -euo pipefail
+          built="$(target/aarch64-apple-darwin/release/roomlerd --version)"
+          [ -n "$built" ] || { echo "::error::the built roomlerd printed no version"; exit 1; }
+          echo "this job built: $built"
+          echo "SMOKE_BUILT_VERSION=$built" >> "$GITHUB_ENV"
+          check="$RUNNER_TEMP/bundle-is-this-build.sh"
+          cat > "$check" <<'EOF'
+          #!/usr/bin/env bash
+          # The installed bundle's roomlerd must be the build this job made (#3774).
+          set -euo pipefail
+          bin="${1:-/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd}"
+          want="${SMOKE_BUILT_VERSION:?the build step did not record the version it built}"
+          got="$("$bin" --version 2>&1)" || { echo "::error::$bin --version failed: $got"; exit 1; }
+          if [ "$got" != "$want" ]; then
+            echo "::error::the bundle's roomlerd reports '$got' but this job built '$want': something other than this job's package replaced the build under test"
+            exit 1
+          fi
+          echo "  the bundle's roomlerd is this job's build ($got)"
+          EOF
+          chmod +x "$check"
+          # The check refuses a binary that answers another version (its
+          # negative control), and accepts the one this job built.
+          fake="$RUNNER_TEMP/roomlerd-of-another-version"
+          printf '#!/bin/sh\necho "roomlerd 0.0.1"\n' > "$fake"
+          chmod +x "$fake"
+          if SMOKE_BUILT_VERSION="$built" "$check" "$fake" > /dev/null; then
+            echo "::error::the check accepted a roomlerd that answers another version"
+            exit 1
+          fi
+          SMOKE_BUILT_VERSION="$built" "$check" target/aarch64-apple-darwin/release/roomlerd
+          echo "  the check refuses another version and accepts this build"
+          echo "BUNDLE_CHECK=$check" >> "$GITHUB_ENV"
 
       - name: Stage + build the pkg
         run: |
@@ -1407,6 +2076,45 @@ jobs:
             || { echo "::error::the refused install still put the daemon bundle down"; exit 1; }
           echo "refused, and nothing landed"
 
+      # The package's script writes the login items as the person at the
+      # console: a link at an item's path is replaced by a file of that
+      # person's, and what the link pointed at keeps its bytes, owner and mode.
+      # Planted before the first install, read right after it.
+      - name: Plant a link at the companion's login item (before the first install)
+        run: |
+          set -euo pipefail
+          console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+          if [ -z "$console_user" ] || [ "$console_user" = root ]; then
+            echo "::warning::no GUI session on this runner, so the login-item checks have nothing to read"
+            exit 0
+          fi
+          home=$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')
+          ls -ld "$home/Library" "$home/Library/LaunchAgents" 2>&1 || true
+          printf 'bytes the install leaves alone\n' > "$RUNNER_TEMP/login-item-expected"
+          scratch="$RUNNER_TEMP/login-item-link-target"
+          sudo cp "$RUNNER_TEMP/login-item-expected" "$scratch"
+          sudo chown root:wheel "$scratch"
+          sudo chmod 600 "$scratch"
+          sudo -u "$console_user" mkdir -p "$home/Library/LaunchAgents"
+          sudo -u "$console_user" ln -sfn "$scratch" "$home/Library/LaunchAgents/com.roomler.desktop.plist"
+          ls -l "$home/Library/LaunchAgents/com.roomler.desktop.plist"
+          sudo ls -l "$scratch"
+
+      # #3774: the product's own opt-out, before the first install. Without it
+      # the package loads the update helper (RunAtLoad), which fetches the
+      # newest PUBLISHED release and installs it over this job's build whenever
+      # the ref is behind that release, and every later step then tests the
+      # release instead. With it, every install skips the helper (`postinstall`,
+      # the `disable-auto-update` test). Pointing the update URL at a dead
+      # address would not do: the updater falls back to GitHub. The marker
+      # comes off at the job's last install, which asserts the default.
+      - name: Opt out of the live update channel (before the first install)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/roomler
+          sudo touch /etc/roomler/disable-auto-update
+          ls -l /etc/roomler/disable-auto-update
+
       - name: Install it
         run: sudo installer -verbose -pkg dist/smoke.pkg -target /
 
@@ -1437,6 +2145,49 @@ jobs:
           find /tmp/pkgexp -maxdepth 2 -name PackageInfo -o -maxdepth 2 -name Distribution 2>/dev/null \
             | while read -r f; do echo "--- $f"; cat "$f"; echo; done
 
+      - name: The login items are files of the person, and the link's target is as it was
+        run: |
+          set -euo pipefail
+          console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+          if [ -z "$console_user" ] || [ "$console_user" = root ]; then
+            echo "::warning::no GUI session on this runner, so there is no login item to read"
+            exit 0
+          fi
+          uid=$(id -u "$console_user")
+          home=$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')
+          scratch="$RUNNER_TEMP/login-item-link-target"
+          fail=0
+          if sudo cmp -s "$scratch" "$RUNNER_TEMP/login-item-expected"; then
+            echo "  the link's target holds the bytes it had"
+          else
+            echo "::error::the link's target does not hold its bytes"
+            fail=1
+          fi
+          was=$(sudo stat -f '%Su:%Sg:%Lp' "$scratch")
+          if [ "$was" = "root:wheel:600" ]; then
+            echo "  the link's target keeps owner and mode ($was)"
+          else
+            echo "::error::the link's target is $was, not root:wheel:600"
+            fail=1
+          fi
+          for item in com.roomler.agent.plist com.roomler.desktop.plist; do
+            p="$home/Library/LaunchAgents/$item"
+            if [ -L "$p" ] || [ ! -f "$p" ]; then
+              echo "::error::$p is not a regular file: $(ls -ld "$p" 2>&1)"
+              fail=1
+              continue
+            fi
+            got=$(stat -f '%u:%Lp' "$p")
+            if [ "$got" = "$uid:644" ]; then
+              echo "  $item is a regular file of uid $uid, mode 644"
+            else
+              echo "::error::$p is uid:mode $got, not $uid:644"
+              fail=1
+            fi
+          done
+          ls -l "$home/Library/LaunchAgents"
+          exit "$fail"
+
       - name: Assert the payload landed where everything expects it
         run: |
           set -euo pipefail
@@ -1450,7 +2201,7 @@ jobs:
           test -x /usr/local/bin/roomlerd || { echo "::error::missing /usr/local/bin/roomlerd"; exit 1; }
           [ "$(readlink /usr/local/bin/roomlerd)" = "$BIN" ] \
             || { echo "::error::roomlerd does not point at the bundle binary"; exit 1; }
-          "$BIN" --version
+          "$BUNDLE_CHECK"
           /usr/local/bin/roomlerd --version >/dev/null \
             || { echo "::error::roomlerd on PATH does not run"; exit 1; }
           echo "  payload OK"
@@ -1467,6 +2218,7 @@ jobs:
       - name: The pre-rename bundle is swept by an upgrade
         run: |
           set -euo pipefail
+          "$BUNDLE_CHECK"
           sudo mkdir -p /Library/Roomler/roomler-agent.app/Contents/MacOS
           sudo cp /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
             /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent
@@ -1518,22 +2270,42 @@ jobs:
           fi
           echo "  privileged half correctly absent"
 
-      - name: Assert the update helper is installed BY DEFAULT
+      # #3774: the marker went down before the first install, so every install
+      # so far skipped the update helper, and none loaded a job that could put
+      # the newest published release over this build. The helper is then run
+      # once by hand, as root as launchd runs it, and must exit on the marker.
+      # That the helper is installed BY DEFAULT is asserted by the job's last
+      # install, after every step that reads the bundle.
+      - name: The live update channel stays shut (the helper exits on the opt-out marker)
         run: |
           set -euo pipefail
-          # The update half is the OPPOSITE polarity of the overlay daemon:
-          # default ON, marker opts OUT. A default install must carry it, or
-          # the DEFAULT macOS flavour (per-user only) can never self-update —
-          # which is the exact state that left a Mac permanently stale.
-          test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
-          # Loaded, not merely placed: RunAtLoad/StartInterval/WatchPaths all
-          # hang off the loaded job. (Its RunAtLoad fires the helper once here;
-          # the smoke binary's version >= the latest published release, so the
-          # helper reports up-to-date/skipped and exits — no install happens.)
-          launchctl print system/com.roomler.update >/dev/null 2>&1 \
-            || { echo "::error::com.roomler.update installed but not loaded"; exit 1; }
-          echo "  update helper installed + loaded (default ON)"
+          "$BUNDLE_CHECK"
+          test -f /etc/roomler/disable-auto-update \
+            || { echo "::error::the opt-out marker is gone"; exit 1; }
+          if [ -f /Library/LaunchDaemons/com.roomler.update.plist ]; then
+            echo "::error::an install placed the update helper although the opt-out marker is set"
+            exit 1
+          fi
+          if launchctl print system/com.roomler.update >/dev/null 2>&1; then
+            echo "::error::com.roomler.update is loaded although the opt-out marker is set"
+            exit 1
+          fi
+          echo "--- the package's lines for the helper, from /var/log/install.log ---"
+          pkg_lines="$(sudo grep -F 'auto-update opted out' /var/log/install.log || true)"
+          printf '%s\n' "$pkg_lines" | sed 's/^.*postinstall: /    /' | tail -3
+          [ -n "$pkg_lines" ] \
+            || { echo "::error::no install said it skipped the helper for the opt-out marker"; exit 1; }
+          # The helper's own 60 s run spacing is Linux-only (launchd's
+          # ThrottleInterval spaces it here), so a run by hand answers at once.
+          echo "--- the update helper, run once by hand ---"
+          rc=0
+          out="$(sudo env RUST_LOG=info NO_COLOR=1 \
+            /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd update-helper 2>&1)" || rc=$?
+          printf '%s\n' "$out" | sed 's/^/    /'
+          [ "$rc" -eq 0 ] || { echo "::error::the update helper ended rc=$rc"; exit 1; }
+          printf '%s\n' "$out" | grep -qF 'auto-update opted out — exiting' \
+            || { echo "::error::the update helper did not exit on the opt-out marker"; exit 1; }
+          echo "  the update helper exits on the marker: nothing replaces this job's build"
 
       - name: Assert the menu-bar companion shipped and registered
         run: |
@@ -1560,6 +2332,8 @@ jobs:
       - name: Assert the CLI shim resolves the daemon inside the bundle
         run: |
           set -euo pipefail
+          # The shim execs the bundle's roomlerd.
+          "$BUNDLE_CHECK"
           # macOS is the one platform where the shim's sibling-`roomlerd` probe
           # cannot work, so this covers the bundle fallback. Nothing is enrolled
           # here, so the command itself will fail — what must NOT happen is the
@@ -1574,21 +2348,68 @@ jobs:
           esac
           echo "  shim resolves the daemon"
 
-      - name: Assert permissions are reported HONESTLY when denied
+      # `has_input_permission` used to be a compile-time constant, so a Mac with
+      # Accessibility denied still advertised working input. It is now
+      # feature && GUI session && the OS grant, and `permissions` lists what
+      # the OS granted (`input`, `screen-capture`) or `no-gui-session`
+      # (encode/caps.rs). With `enigo-input` built in, the two must agree.
+      #
+      # What the hosted image grants (#3774): on macos-15 the process this
+      # step's shell starts holds BOTH Screen Recording and Accessibility; runs
+      # on 2026-11-12 printed `permissions: ["screen-capture", "input"]`. So on
+      # this image the step reads the granted path, and the refused path is
+      # asserted only when this process's own `permissions` lacks `input`.
+      - name: Assert permissions are reported as the OS granted them (the hosted image grants both)
         run: |
           set -euo pipefail
-          # A hosted runner grants neither Screen Recording nor Accessibility,
-          # so this is the denied path — the one that used to advertise itself
-          # as working because `has_input_permission` was a compile-time
-          # constant. Being able to assert this at all is the point of moving
-          # it to a runtime probe.
+          "$BUNDLE_CHECK"
+          # judge HAS_INPUT PERMISSIONS_LINE: rc 0 when the two agree.
+          judge() {
+            local has="$1" perms="$2" input=0 nogui=0
+            case "$perms" in *'"input"'*) input=1 ;; esac
+            case "$perms" in *'"no-gui-session"'*) nogui=1 ;; esac
+            case "$has" in
+              true)
+                [ "$input" -eq 1 ] && [ "$nogui" -eq 0 ] && return 0
+                echo "::error::has_input_permission is true while permissions is $perms"
+                return 1 ;;
+              false)
+                if [ "$input" -eq 1 ] && [ "$nogui" -eq 0 ]; then
+                  echo "::error::has_input_permission is false while permissions is $perms (is enigo-input built in?)"
+                  return 1
+                fi
+                return 0 ;;
+              *)
+                echo "::error::has_input_permission is '$has', not true or false"
+                return 1 ;;
+            esac
+          }
+          # The check refuses what it exists to refuse (its negative controls).
+          for bad in 'true|["screen-capture"]' 'true|[]' 'true|["no-gui-session"]' \
+                     'true|["no-gui-session", "input"]' 'false|["screen-capture", "input"]' '|["input"]'; do
+            if judge "${bad%%|*}" "${bad#*|}" >/dev/null; then
+              echo "::error::the check accepted a contradictory report: $bad"
+              exit 1
+            fi
+          done
+          for good in 'true|["screen-capture", "input"]' 'true|["input"]' 'false|[]' \
+                      'false|["screen-capture"]' 'false|["no-gui-session"]'; do
+            judge "${good%%|*}" "${good#*|}" \
+              || { echo "::error::the check refused a consistent report: $good"; exit 1; }
+          done
+          echo "  the check refuses 6 contradictory reports and accepts 5 consistent ones"
+
           caps="$(/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd caps 2>&1 || true)"
-          echo "$caps"
-          if echo "$caps" | grep -qi 'has_input_permission: true'; then
-            echo "::error::input advertised as granted on a runner that granted nothing"
-            exit 1
-          fi
-          echo "  permissions reported honestly"
+          has="$(printf '%s\n' "$caps" | sed -n 's/^has_input_permission: //p' | head -1)"
+          perms="$(printf '%s\n' "$caps" | sed -n 's/^permissions: //p' | head -1)"
+          echo "  has_input_permission: ${has:-<missing>}    permissions: ${perms:-<missing>}"
+          [ -n "$has" ] && [ -n "$perms" ] \
+            || { printf '%s\n' "$caps"; echo "::error::roomlerd caps printed no has_input_permission or no permissions line"; exit 1; }
+          judge "$has" "$perms" || { printf '%s\n' "$caps"; exit 1; }
+          case "$perms" in
+            *'"input"'*) echo "  this image granted this process Accessibility; the refused path is not reachable here" ;;
+            *) echo "  Accessibility not granted to this process, and input is reported refused" ;;
+          esac
 
       - name: An enabled daemon must SURVIVE the next install (self-update)
         run: |
@@ -1642,9 +2463,18 @@ jobs:
           # happy path. A marker the migration failed to carry would fall through
           # to the else branch and BOOT OUT the daemon, which is the failure this
           # whole phase is shaped around.
-          # RETIRED-NAME-ANCHOR(2): the migration SOURCE, seeded on purpose.
-          sudo mkdir -p /etc/roomler-agent
-          sudo touch /etc/roomler-agent/enable-daemon
+          # The migration runs only while /etc/roomler is ABSENT, and the job's
+          # opt-out marker (#3774) made it exist: the whole directory is renamed
+          # to the legacy name, marker and all, so the migration still runs, and
+          # it must carry the opt-out across too. Both readers of the marker
+          # dual-read, so the live channel stays shut throughout.
+          "$BUNDLE_CHECK"
+          # The migration SOURCE, seeded on purpose (LEGACY_ETC: the job's env).
+          test ! -e "$LEGACY_ETC" \
+            || { echo "::error::the legacy config folder exists before the migration is seeded"; exit 1; }
+          sudo mv /etc/roomler "$LEGACY_ETC" \
+            && sudo touch "$LEGACY_ETC/enable-daemon" \
+            || { echo "::error::could not seed the migration source (the config folder under its legacy name, enable-daemon in it)"; exit 1; }
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
@@ -1655,9 +2485,11 @@ jobs:
           # left behind would be read again by the dual-read gates forever.
           test -f /etc/roomler/enable-daemon \
             || { echo "::error::the marker was not migrated to /etc/roomler"; exit 1; }
-          test ! -d /etc/roomler-agent \
-            || { echo "::error::the legacy /etc/roomler-agent survived the migration"; exit 1; }
-          echo "  config dir migrated off the retired name"
+          test ! -d "$LEGACY_ETC" \
+            || { echo "::error::the legacy $LEGACY_ETC survived the migration"; exit 1; }
+          test -f /etc/roomler/disable-auto-update \
+            || { echo "::error::the migration did not carry the opt-out marker to /etc/roomler"; exit 1; }
+          echo "  config dir migrated off the retired name, the opt-out marker with it"
 
           echo "=== install 2: plain, i.e. what a self-update runs ==="
           sudo installer -verbose -pkg dist/smoke.pkg -target /
@@ -1681,35 +2513,73 @@ jobs:
           fi
           echo "  opt-out still honoured"
 
-      - name: The update helper's opt-out round-trip (disable -> gone, enable -> back)
+      # The opt-out half of the update helper's round trip; the opt-in half is
+      # the job's last install. #3774: the marker has been set since before the
+      # first install, so the helper the removal branch removes is loaded here
+      # by hand, from the bundle's own plist, while the marker is set: a job
+      # loaded before the marker was set lingers like that until an install or
+      # a reboot, and it must exit on the marker too.
+      - name: The update helper's opt-out removes a loaded helper (and a loaded one exits on the marker)
         run: |
           set -euo pipefail
+          "$BUNDLE_CHECK"
           since=$(date -u "+%Y-%m-%d %H:%M:%S")
           dump_log() {
             echo "--- postinstall output from /var/log/install.log ---"
             sudo awk -v s="$since" '$0 ~ /roomler|update helper|disable-auto-update/ {print "    " $0}' \
               /var/log/install.log 2>/dev/null | tail -25 || true
           }
+          plist=/Library/LaunchDaemons/com.roomler.update.plist
 
-          # The three installs above all ran WITHOUT the disable marker, so the
-          # helper must still be present at this point (regression guard for
-          # "an unrelated re-install dropped the updater").
-          test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::update plist vanished across plain re-installs"; exit 1; }
+          # Every install above ran WITH the marker, so the helper must still be
+          # absent: each of them honoured it.
+          if [ -f "$plist" ]; then
+            echo "::error::an install placed the update helper although the opt-out marker is set"
+            exit 1
+          fi
 
-          echo "=== opt out: marker set -> the helper must GO ==="
-          # FR-46 P5a — by this point install 1 has already migrated the directory,
-          # so `/etc/roomler` EXISTS and the migration (dest-absent only) will not
-          # run again. That makes this block exercise the DUAL-READ fallback arm:
-          # an opt-out marker sitting at the legacy path must still be honoured,
-          # because reading only the current path would auto-update a Mac whose
-          # operator opted out. Deliberate coverage, not an accident of ordering.
-          # RETIRED-NAME-ANCHOR(2): the legacy opt-out path, seeded on purpose.
-          sudo mkdir -p /etc/roomler-agent
-          sudo touch /etc/roomler-agent/disable-auto-update
+          echo "=== a helper loaded while the marker is set: it runs once and exits on the marker ==="
+          sudo cp /Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist "$plist" \
+            && sudo chown root:wheel "$plist" \
+            && sudo chmod 644 "$plist" \
+            && sudo mkdir -p /var/log/roomler \
+            && sudo launchctl bootstrap system "$plist" \
+            || { echo "::error::could not place and load the bundle's update helper plist by hand"; exit 1; }
+          # RunAtLoad starts it at once, and on macOS the helper keeps no run
+          # spacing of its own. The removal below waits only 10 s for an idle
+          # job, so wait here until it has run and is idle.
+          idle=0
+          for _ in $(seq 1 60); do
+            state=$(sudo launchctl print system/com.roomler.update 2>/dev/null || true)
+            if printf '%s\n' "$state" | grep -qE 'runs = [1-9]' \
+               && ! printf '%s\n' "$state" | grep -q 'state = running'; then
+              idle=1
+              break
+            fi
+            sleep 3
+          done
+          [ "$idle" -eq 1 ] \
+            || { echo "::error::the loaded helper did not run and go idle within 180 s"; exit 1; }
+          echo "--- /var/log/roomler/update.log ---"
+          sudo tail -n 5 /var/log/roomler/update.log | sed 's/^/    /' || true
+          sudo grep -qF 'auto-update opted out — exiting' /var/log/roomler/update.log \
+            || { echo "::error::the helper launchd ran did not exit on the opt-out marker"; exit 1; }
+          echo "  the helper launchd ran exits on the marker"
+          "$BUNDLE_CHECK"
+
+          echo "=== opt out: the marker at the legacy path -> the loaded helper must GO ==="
+          # FR-46 P5a — install 1 above migrated the directory, so `/etc/roomler`
+          # EXISTS and the migration (dest-absent only) will not run again. That
+          # makes this block exercise the DUAL-READ fallback arm: an opt-out
+          # marker sitting at the legacy path must still be honoured, because
+          # reading only the current path would auto-update a Mac whose operator
+          # opted out. Deliberate coverage, not an accident of ordering.
+          # The legacy opt-out path, seeded on purpose (LEGACY_ETC: the job's env).
+          sudo mkdir -p "$LEGACY_ETC"
+          sudo mv /etc/roomler/disable-auto-update "$LEGACY_ETC/disable-auto-update"
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
-          if [ -f /Library/LaunchDaemons/com.roomler.update.plist ]; then
+          if [ -f "$plist" ]; then
             echo "::error::disable-auto-update did not remove the helper plist"
             exit 1
           fi
@@ -1720,16 +2590,104 @@ jobs:
             exit 1
           fi
           echo "  opt-out removes the helper"
+          # Back at the current path for the steps that follow.
+          sudo mv "$LEGACY_ETC/disable-auto-update" /etc/roomler/disable-auto-update \
+            && sudo rmdir "$LEGACY_ETC" \
+            || { echo "::error::could not move the opt-out marker back to /etc/roomler and remove the legacy folder"; exit 1; }
 
-          echo "=== opt back in: marker removed -> the helper must RETURN ==="
-          sudo rm -f /etc/roomler-agent/disable-auto-update
+      # A rewrite that fails over a login item of the person's: the script keeps
+      # the item that is there, still loads it, and says so in a WARNING
+      # instead of "installed and started". The person makes their own item
+      # immutable (uchg), so the person's copy over it fails.
+      - name: A login item the person cannot rewrite is kept, loaded and reported
+        run: |
+          set -euo pipefail
+          console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+          if [ -z "$console_user" ] || [ "$console_user" = root ]; then
+            echo "::warning::no GUI session on this runner, so there is no login item to read"
+            exit 0
+          fi
+          # The login item it loads runs the bundle's roomlerd.
+          "$BUNDLE_CHECK"
+          uid=$(id -u "$console_user")
+          home=$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')
+          item="$home/Library/LaunchAgents/com.roomler.agent.plist"
+          test -f "$item" || { echo "::error::no login item at $item to start from"; exit 1; }
+          sudo -u "$console_user" chflags uchg "$item"
+          trap 'sudo -u "$console_user" chflags nouchg "$item" || true' EXIT
+          before=$(sudo wc -l /var/log/install.log | awk '{print $1}')
           sudo installer -verbose -pkg dist/smoke.pkg -target /
-          dump_log
+          lines=$(sudo tail -n +"$((before + 1))" /var/log/install.log | grep 'postinstall:' || true)
+          echo "--- this install's postinstall lines ---"
+          printf '%s\n' "$lines" | sed 's/^.*postinstall: /    /'
+          fail=0
+          if printf '%s\n' "$lines" | grep -qF "WARNING: the account of $console_user could not rewrite the login item $item"; then
+            echo "  the log carries the WARNING"
+          else
+            echo "::error::the log has no WARNING for the login item that could not be rewritten"
+            fail=1
+          fi
+          # Every install in this job writes the item from this same package, so
+          # the person's cmp finds the kept item equal to the package's.
+          if printf '%s\n' "$lines" | grep -qF 'so the one already there stays in place'; then
+            echo "  the WARNING says the item there stays in place (equal to the package's)"
+          else
+            echo "::error::the WARNING does not say that the item there stays in place, though it is the package's own"
+            fail=1
+          fi
+          if printf '%s\n' "$lines" | grep -qF 'roomlerd installed and started for'; then
+            echo "::error::the log says installed and started, on a login item that could not be rewritten"
+            fail=1
+          else
+            echo "  the log does not say installed and started"
+          fi
+          if launchctl print "gui/$uid/com.roomler.agent" >/dev/null 2>&1; then
+            echo "  com.roomler.agent is loaded in gui/$uid"
+          else
+            echo "::error::com.roomler.agent is not loaded in gui/$uid"
+            fail=1
+          fi
+          exit "$fail"
+
+      # The opt-in half of the round trip, and the job's LAST install. The
+      # update half is the OPPOSITE polarity of the overlay daemon: default ON,
+      # marker opts OUT. A default install must carry it, or the DEFAULT macOS
+      # flavour (per-user only) can never self-update — which is the exact state
+      # that left a Mac permanently stale.
+      #
+      # #3774: taking the marker away opens the live update channel. The helper
+      # this install loads may fetch the newest published release and install it
+      # over this build, so it comes after every step that reads the bundle or
+      # the install log, and no step after it does. Every earlier step's
+      # isolation came from the marker, not from this build's version.
+      - name: Assert the update helper is installed BY DEFAULT (the job's last install)
+        run: |
+          set -euo pipefail
+          "$BUNDLE_CHECK"
+          sudo rm -f /etc/roomler/disable-auto-update
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
           test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::helper plist not restored after removing the opt-out"; exit 1; }
+            || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
+          # Loaded, not merely placed: RunAtLoad/StartInterval/WatchPaths all
+          # hang off the loaded job.
           launchctl print system/com.roomler.update >/dev/null 2>&1 \
-            || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
-          echo "  opt-in restores the helper"
+            || { echo "::error::com.roomler.update installed but not loaded"; exit 1; }
+          echo "  update helper installed + loaded (default ON)"
+
+      # The package's script keeps launchctl's error text in a variable, so no
+      # command in it names a path in /tmp.
+      - name: The package's script names no path in /tmp
+        run: |
+          set -euo pipefail
+          s=agents/roomlerd/packaging/macos/postinstall
+          test -f "$s" || { echo "::error::$s is missing, so there is nothing to read"; exit 1; }
+          hits=$(grep -nE '(^|[^[:alnum:]_])(/private)?/tmp/' "$s" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::$s names a path in /tmp:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "  no command in $s names a path in /tmp"
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
@@ -1743,5 +2701,64 @@ jobs:
           family: macos-pkg-smoke
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
+
+  # #3810 — when the Windows job did not succeed, this job reads it through
+  # the API and prints what it read, as an error annotation and in the job
+  # summary: the job's conclusion, the steps that reported an end other than
+  # success or skipped, the steps that reported no end, and GitHub's
+  # annotations on the job. The decision is scripts/job-steps-ended.sh:
+  # `complete` when GitHub lists at least one step and every step reported an
+  # end, `incomplete` otherwise (scripts/job-steps-ended-test.sh holds its
+  # cases). On attempt 1, `incomplete` means that the workflow
+  # installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, run
+  # from the default branch when this run completes) asks GitHub to re-run the
+  # Windows job once, as attempt 2, unless one of its guards refuses; that
+  # workflow never re-runs attempt 2. This job fails whenever it runs. A run
+  # whose Windows job was lost reads `cancelled` until a re-run replaces that
+  # job's check. This job is skipped when the Windows job passes or was
+  # skipped, and in a run cancelled first.
+  windows-steps-check:
+    name: "Did every step of the Windows job report an end? (#3810)"
+    needs: windows-msi-install-uninstall
+    if: ${{ !cancelled() && needs.windows-msi-install-uninstall.result != 'success' && needs.windows-msi-install-uninstall.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads only: the decision script (contents), the run's jobs and their
+    # steps (actions), the job's annotations (checks).
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/job-steps-ended.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read every step of the Windows job through the API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMOKE_JOB: per-User MSI install + uninstall (windows-latest)
+        run: |
+          set -uo pipefail
+          esc() { local s=${1//%/%25}; s=${s//$'\r'/%0D}; printf '%s' "${s//$'\n'/%0A}"; }
+          out=$(bash scripts/job-steps-ended.sh --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT" --job "$SMOKE_JOB")
+          rc=$?
+          case "$(head -n 1 <<<"$out")" in
+            verdict=complete) title='Every step of the Windows job reported an end (#3810)' ;;
+            verdict=incomplete) title='Not every step of the Windows job reported an end (#3810)' ;;
+            *) title='The Windows job could not be read (#3810)' ;;
+          esac
+          lines=$(grep -v '^verdict=' <<<"$out")
+          [ "$rc" -eq 0 ] || lines+=$'\n'"The decision script exited $rc with no verdict."
+          echo "::error title=$title::$(esc "$lines")"
+          {
+            printf '### %s\n\n' "$title"
+            while IFS= read -r l; do printf -- '- %s\n' "$l"; done <<<"$lines"
+          } >>"$GITHUB_STEP_SUMMARY"
+          # The Windows job did not succeed, so this check fails, whatever it read.
+          exit 1
 
 # RETIRED-NAME-ANCHOR-END

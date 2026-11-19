@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
@@ -49,11 +51,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::WinSize;
@@ -144,6 +146,10 @@ pub struct PtyProcess {
     /// is idempotent and leaves the handle valid.
     job: Arc<Owned>,
     handle: PtyHandle,
+    /// The pipe ends this process keeps (output read, input write), as raw
+    /// values, for the test that asks what a child can inherit.
+    #[cfg(test)]
+    kept: [usize; 2],
 }
 
 /// Write + resize half, cloneable across tasks.
@@ -236,14 +242,38 @@ impl PtyProcess {
         } else {
             spawn_attached(&pc, &cmdline, in_read.0, out_write.0)?
         };
+        // Close OUR copies of the console's ends, as soon as the shell holds
+        // its own. While either survives, the reader never sees EOF and a
+        // finished session hangs — the same trap as failing to close the pty
+        // slave on Unix. They are also the only ends here that are ever
+        // inheritable (`AttachedStartupInfo::new`), and only until this line.
+        drop(in_read);
+        drop(out_write);
         let process = Owned(pi.hProcess);
         // The thread handle is of no use to us and would leak.
         let _thread = Owned(pi.hThread);
 
         // Everything the child started dies with the job. Windows has no
         // process group to signal, so this IS the `killpg` equivalent — and it
-        // must be set up before anything can escape.
-        let job = Arc::new(make_job(pi.hProcess)?);
+        // must be set up before anything can escape: the shell was created
+        // suspended, and runs only from here on. One that cannot run is ended.
+        let job = match make_job(pi.hProcess) {
+            Ok(job) => job,
+            Err(e) => {
+                // SAFETY: a process handle this function owns.
+                unsafe { TerminateProcess(pi.hProcess, 1) };
+                return Err(e);
+            }
+        };
+        // SAFETY: the primary thread's handle, which CreateProcess opened with
+        // THREAD_SUSPEND_RESUME among its rights.
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            let e = last_error("ResumeThread");
+            // SAFETY: a process handle this function owns.
+            unsafe { TerminateProcess(pi.hProcess, 1) };
+            return Err(e);
+        }
+        let job = Arc::new(job);
 
         // THE WAITER. Without this the session never ends: the console host
         // holds the output pipe's write end for as long as the pseudoconsole
@@ -285,12 +315,8 @@ impl PtyProcess {
             let _ = exit_tx.send(code);
         });
 
-        // Close OUR copies of the child's ends. While either survives, the
-        // reader never sees EOF and a finished session hangs — the same trap as
-        // failing to close the pty slave on Unix.
-        drop(in_read);
-        drop(out_write);
-
+        #[cfg(test)]
+        let kept = [out_read.0 as usize, in_write.0 as usize];
         let (out_tx, out_rx) = mpsc::channel::<io::Result<Vec<u8>>>(64);
         let reader = out_read;
         tokio::task::spawn_blocking(move || {
@@ -374,6 +400,8 @@ impl PtyProcess {
             exit_rx: Some(exit_rx),
             exit: None,
             job,
+            #[cfg(test)]
+            kept,
         })
     }
 
@@ -481,14 +509,19 @@ impl PtyHandle {
     }
 }
 
-/// An inheritable anonymous pipe, `(read, write)`.
+/// An anonymous pipe, `(read, write)`, neither end inheritable.
+///
+/// The end the daemon keeps stays that way for the whole session, so no child
+/// gets it, whatever inheritance that child was started with. The end it
+/// hands the console becomes inheritable for the shell's handle list only
+/// ([`AttachedStartupInfo::new`]).
 fn pipe() -> Result<(Owned, Owned), String> {
     let mut r: HANDLE = std::ptr::null_mut();
     let mut w: HANDLE = std::ptr::null_mut();
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
+        bInheritHandle: 0,
     };
     // SAFETY: both out-params are valid; `sa` outlives the call.
     if unsafe { CreatePipe(&mut r, &mut w, &sa, 0) } == 0 {
@@ -561,6 +594,16 @@ impl AttachedStartupInfo {
         // into 41 min with three hangs. The handle list is what makes
         // inheritance mean "exactly these two".
         //
+        // The list takes inheritable handles only, and `pipe` creates none. So
+        // the console's two ends become inheritable here, and nowhere else:
+        // `PtyProcess::spawn` closes them right after the shell is created.
+        // The two ends the daemon keeps are never inheritable.
+        for h in [child_in, child_out] {
+            // SAFETY: a live handle the caller owns; only its inherit flag changes.
+            if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+                return Err(last_error("SetHandleInformation"));
+            }
+        }
         // SAFETY: `_inherit` is owned by `this` and outlives the CreateProcess
         // call the caller makes with this `si`.
         let ok = unsafe {
@@ -660,7 +703,8 @@ fn spawn_attached(
             // CONSOLE's (`CreatePseudoConsole` owns them), and what ends the
             // output stream is `ClosePseudoConsole`, not the child's copies.
             1,
-            EXTENDED_STARTUPINFO_PRESENT,
+            // Suspended until it is in its job (`PtyProcess::spawn`).
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             std::ptr::null(),
             std::ptr::null(),
             &si.StartupInfo,
@@ -763,8 +807,8 @@ fn spawn_attached_as_console_user(
             1,
             // No `CREATE_NO_WINDOW`: the pseudoconsole IS this child's console,
             // and suppressing console creation fights the attribute that just
-            // gave it one.
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            // gave it one. Suspended until it is in its job (`PtyProcess::spawn`).
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             env.raw,
             profile.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             &startup.si.StartupInfo,
@@ -856,6 +900,46 @@ mod tests {
         }
     }
 
+    /// The pipe ends a session keeps are not inheritable, from their creation
+    /// on, so a child that inherits everything inheritable (std's `Command`,
+    /// `bInheritHandles = TRUE` with no handle list) gets neither. Asked of
+    /// the handles' own flags and of such a child's handle table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ends_a_session_keeps_reach_no_other_child() {
+        use crate::win_service::inherited_handle::{held_by, unbounded_sibling};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+
+        let inheritable = |h: HANDLE| {
+            let mut flags = 0u32;
+            // SAFETY: `h` is a live handle this process owns; `flags` is valid.
+            assert_ne!(unsafe { GetHandleInformation(h, &mut flags) }, 0);
+            flags & HANDLE_FLAG_INHERIT != 0
+        };
+
+        let (r, w) = pipe().expect("a pipe");
+        assert!(!inheritable(r.0), "a new pipe's read end is inheritable");
+        assert!(!inheritable(w.0), "a new pipe's write end is inheritable");
+
+        let pty = PtyProcess::spawn(
+            Some("Start-Sleep -Seconds 5"),
+            "xterm",
+            WinSize { cols: 80, rows: 24 },
+            &crate::exec::RunAs::Daemon,
+        )
+        .expect("a conpty session");
+        let kept = pty.kept.map(|h| h as HANDLE);
+        let mut sibling = unbounded_sibling();
+        let sibling_handle = sibling.as_raw_handle() as HANDLE;
+        let held = kept.map(|h| held_by(sibling_handle, h));
+        let flagged = kept.map(inheritable);
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        pty.kill_group();
+        assert_eq!(flagged, [false, false], "a kept end is inheritable");
+        assert_eq!(held, [false, false], "a sibling holds a kept end");
+    }
+
     /// P4b (shipped in rc.429): a ConPTY session streams the application's
     /// output through the pipes and reports its exit status (`exit 3` → 3).
     ///
@@ -911,5 +995,45 @@ mod tests {
             .expect("resizing a live pseudoconsole");
         pty.kill_group();
         let _ = pty.wait().await;
+    }
+
+    /// Not a test by itself: a copy of the test binary runs it to play the
+    /// daemon. An ordinary run has no stand-in to play, and passes.
+    #[test]
+    fn the_stand_in_daemon() {
+        use crate::exec::session_lifetime::{exit_when_told, stand_in_args, starts_a_child_then};
+
+        let Some((_, dir)) = stand_in_args() else {
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _in_the_runtime = rt.enter();
+        let pty = PtyProcess::spawn(
+            Some(&starts_a_child_then(&dir, "Start-Sleep -Seconds 300")),
+            "xterm",
+            WinSize { cols: 80, rows: 24 },
+            &crate::exec::RunAs::Daemon,
+        )
+        .expect("a conpty session");
+        std::mem::forget(pty);
+        exit_when_told(&dir);
+    }
+
+    /// #3303 — the daemon goes, running no code of its own, and the shell and
+    /// what it started end. The job's promise on the path that has always had
+    /// one; `exec::session_lifetime` holds the one-shot's.
+    #[test]
+    fn a_shell_and_what_it_started_end_with_the_daemon() {
+        use crate::exec::session_lifetime::{GONE_WITHIN, StandIn};
+
+        let daemon = StandIn::start("pty::windows::tests::the_stand_in_daemon", "pty");
+        let processes = daemon.wait_for_its_processes();
+        daemon.exit();
+        for (what, p) in ["the shell", "what it started"].iter().zip(&processes) {
+            assert!(p.gone_within(GONE_WITHIN), "{what} outlived the daemon");
+        }
     }
 }

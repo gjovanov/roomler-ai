@@ -59,6 +59,8 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "media_fold_total": MEDIA_FOLD_TOTAL.load(Ordering::Relaxed),
             "media_belt_fallback_total":
                 MEDIA_BELT_FALLBACK_TOTAL.load(Ordering::Relaxed),
+            "media_frames_rate_limited_total":
+                MEDIA_FRAMES_RATE_LIMITED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_close_total": DERP_REHOME_CLOSE_TOTAL.load(Ordering::Relaxed),
             "derp_bytes_relayed_total": DERP_BYTES_RELAYED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_stuck_total":

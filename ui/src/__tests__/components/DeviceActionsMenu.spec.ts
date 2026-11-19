@@ -85,12 +85,14 @@ interface MenuProps {
   client?: TunnelClient
   node?: OverlayNode
   networkMounted?: boolean
+  mayReadDiagnostics?: boolean
   updateBlocked?: string
 }
 
+/** Opens the menu as a caller who may read diagnostics, unless told not to. */
 async function openMenu(props: MenuProps) {
   wrapper = mount(DeviceActionsMenu, {
-    props: { tenantId: TID, ...props },
+    props: { tenantId: TID, mayReadDiagnostics: true, ...props },
     global: { plugins: [vuetify, router] },
     attachTo: document.body,
   })
@@ -152,6 +154,14 @@ describe('DeviceActionsMenu', () => {
     // No overlay node: nothing to evict, no node to filter the routes by.
     expect(titles(items)).not.toContain('Evict / reassign overlay address')
     expect(titles(items)).not.toContain('Overlay routes')
+  })
+
+  it('leaves out the crash reports and logs for a caller who may not read them', async () => {
+    const items = await openMenu({ row: row(), agent: { id: 'a' } as Agent, mayReadDiagnostics: false })
+    expect(titles(items)).not.toContain('Crash reports')
+    expect(titles(items)).not.toContain('Agent logs')
+    // The rest of the diagnostics group stays: the console has its own gates.
+    expect(titles(items)).toContain('Device console')
   })
 
   it('says why Update now will not take, and greys it', async () => {

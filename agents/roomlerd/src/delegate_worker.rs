@@ -80,6 +80,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::delegate::DelegateFrame;
 use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
+use crate::delegate::{WorkerLane, WorkerOrder};
 use crate::macos_supervisor::{LIFELINE_BACKSTOP, LinkEnd};
 use roomler_ai_remote_control::signaling::ClientMsg;
 
@@ -144,6 +145,30 @@ async fn gates_changed(w: &mut GateWatch) {
     std::future::pending::<()>().await
 }
 
+/// FR-43 P3b — the person's floor as it stands: their `auto_grant_session`,
+/// fixed for the process (the consent broker is built from it at start), and
+/// their live `rc_*` floor.
+fn person_floor(auto_grant_session: bool) -> crate::delegate::PersonFloor {
+    crate::delegate::PersonFloor {
+        auto_grant_session,
+        session_policy: crate::session_policy::device_policy(),
+    }
+}
+
+/// FR-43 P3b — resolves when the person's `rc_*` floor changes; never for a
+/// worker that hands no floor over (or if the sender is ever gone, which a
+/// `static` cannot be — pending beats spinning).
+async fn floor_changed(
+    w: &mut Option<tokio::sync::watch::Receiver<roomler_ai_remote_control::models::SessionPolicy>>,
+) {
+    if let Some(w) = w
+        && w.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await
+}
+
 /// Run the worker's side of the channel for the process lifetime.
 ///
 /// Returns immediately unless this process was started as `run --supervised`,
@@ -151,12 +176,27 @@ async fn gates_changed(w: &mut GateWatch) {
 /// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
 pub async fn run(
     supervised: bool,
+    // FR-43 P3a — this worker holds no enrollment, so this channel is all it
+    // can serve, and without it the process is of no use to anyone.
+    unenrolled: bool,
+    // FR-43 P3b — the person's `auto_grant_session`, from their own file. A
+    // worker with no enrollment hands it to the daemon with their `rc_*`
+    // floor ([`DelegateFrame::PersonFloor`]); every other worker's row
+    // enforces its own, and sends nothing.
+    auto_grant_session: bool,
+    // FR-43 P3a — and its own log lines, which go to the daemon over the
+    // channel because this process has no row to upload them on. `None` for
+    // every other worker, which uploads its own.
+    mut logs: Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
+    // FR-138 P2b — and the third: the daemon's orders about the sessions it
+    // will claim, on their own lane.
     channels: Option<(
         tokio::sync::mpsc::Sender<WorkerInbound>,
         tokio::sync::mpsc::Receiver<ClientMsg>,
+        tokio::sync::mpsc::Sender<crate::delegate::WorkerOrder>,
     )>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     // #2987 — the agent's internal shutdown, which the stdin thread sends when
@@ -167,7 +207,7 @@ pub async fn run(
         tracing::debug!("delegation: not a supervised worker; not attaching");
         return;
     }
-    let Some((to_signaling, mut from_signaling)) = channels else {
+    let Some((to_signaling, mut from_signaling, orders)) = channels else {
         tracing::warn!("delegation: --supervised but no signalling channels; not attaching");
         return;
     };
@@ -179,13 +219,36 @@ pub async fn run(
         tracing::warn!(
             "delegation: started with --supervised but no secret arrived on stdin; not attaching"
         );
+        // FR-43 P3a — an enrolled worker still serves its own row. One with no
+        // enrollment would run on, serving nothing, and read as healthy: leave,
+        // and the supervisor's bound on fast exits applies.
+        if unenrolled {
+            std::process::exit(1);
+        }
         return;
     };
 
+    let person = unenrolled.then_some(auto_grant_session);
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(&secret, &to_signaling, &mut from_signaling, &mut shutdown).await {
+        let mut lane = OrdersLane::new(&orders);
+        let attach = attach_once(
+            &secret,
+            &to_signaling,
+            &mut from_signaling,
+            &mut lane,
+            &mut logs,
+            person,
+            &mut shutdown,
+        )
+        .await;
+        // FR-138 P2b — a greeted attach's end, with its cause.
+        lane.ended(match &attach {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        });
+        match attach {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -218,11 +281,57 @@ pub async fn run(
     }
 }
 
+/// FR-138 P2b (B4, B9) — the orders lane as one attach holds it: the daemon's
+/// orders go on it, and a greeted attach's end is said on it once, however
+/// the attach ends, with its cause ([`WorkerOrder::Paused`]). The delegated
+/// sessions close there, since the daemon ended each as `error` (D6, review
+/// MEDIUM-1), and the line that says so names the cause. Never waits.
+struct OrdersLane<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>,
+    /// Greeted, and its end not said yet.
+    up: bool,
+}
+
+impl<'a> OrdersLane<'a> {
+    fn new(tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>) -> Self {
+        Self { tx, up: false }
+    }
+
+    /// The daemon greeted the attach: the channel is up again.
+    fn attached(&mut self) {
+        let _ = self.tx.try_send(WorkerOrder::Attached);
+        self.up = true;
+    }
+
+    /// One of the daemon's orders. `false` when the lane is full or closed.
+    fn order(&self, order: WorkerOrder) -> bool {
+        self.tx.try_send(order).is_ok()
+    }
+
+    /// The attach ended: said once, and only for a greeted one.
+    fn ended(&mut self, cause: String) {
+        if std::mem::take(&mut self.up) {
+            let _ = self.tx.try_send(WorkerOrder::Paused { cause });
+        }
+    }
+}
+
+impl Drop for OrdersLane<'_> {
+    fn drop(&mut self) {
+        self.ended("the attach loop stopped".to_string());
+    }
+}
+
 /// One attach attempt: connect, authorise, then pump until the channel ends.
 async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
+    lane: &mut OrdersLane<'_>,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+    // FR-43 P3b — `Some(auto_grant_session)` when this worker hands the
+    // person's floor to the daemon.
+    person: Option<bool>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -284,6 +393,10 @@ async fn attach_once(
             return Err(std::io::Error::other(format!("unparseable greeting: {e}")));
         }
     }
+    // FR-138 P2b (B9) — the channel is up: the delegated sessions' links point
+    // at it again, and its end, whatever ends it, is said on the lane with
+    // its cause ([`OrdersLane::ended`]).
+    lane.attached();
 
     // FR-43 P2c — tell the daemon what THIS process can do, as the first thing
     // after the handshake. The daemon is in session 0 and honestly reports
@@ -310,9 +423,25 @@ async fn attach_once(
             &mut wr,
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
+                // #3864 — a worker with no enrollment relays the root half's
+                // consent questions to its person's app.
+                features: crate::delegate::worker_features(person.is_some()),
             },
         )
         .await?;
+    }
+    // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
+    // their row and its broker are gone, so the daemon's `Request` arm is the
+    // only consent there is. Subscribed BEFORE the first frame, so a change in
+    // between is never missed.
+    let mut floor_watch = person.map(|_| crate::session_policy::watch_device_policy());
+    if let Some(auto_grant_session) = person {
+        let floor = person_floor(auto_grant_session);
+        tracing::info!(
+            ?floor,
+            "delegation: handing the person's consent floor to the daemon"
+        );
+        write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
     }
 
     loop {
@@ -321,16 +450,19 @@ async fn attach_once(
                 match line? {
                     None => return Ok(()),
                     Some(line) if line.trim().is_empty() => {}
-                    Some(line) => match serde_json::from_str::<DelegateFrame>(&line) {
-                        Ok(DelegateFrame::Ping) => write_frame(&mut wr, &DelegateFrame::Pong).await?,
-                        Ok(DelegateFrame::Pong) => {}
-                        Ok(DelegateFrame::Attached { .. }) => {
+                    // FR-138 P2b (B4) — each frame takes its lane: params and
+                    // rc messages the inbound lane, the daemon's orders their
+                    // own, the rest this loop ([`crate::delegate::worker_lane`]).
+                    Some(line) => match serde_json::from_str::<DelegateFrame>(&line).map(crate::delegate::worker_lane) {
+                        Ok(WorkerLane::Here(DelegateFrame::Ping)) => write_frame(&mut wr, &DelegateFrame::Pong).await?,
+                        Ok(WorkerLane::Here(DelegateFrame::Pong)) => {}
+                        Ok(WorkerLane::Here(DelegateFrame::Attached { .. })) => {
                             tracing::debug!("delegation: a second `attached` frame; ignoring");
                         }
                         // Params must reach the signalling loop BEFORE the
                         // offer that consumes them; one ordered channel both
                         // ways is what guarantees it.
-                        Ok(DelegateFrame::SessionParams(p)) => {
+                        Ok(WorkerLane::Inbound(WorkerInbound::Params(p))) => {
                             let sid = p.session_id.clone();
                             if to_signaling.try_send(WorkerInbound::Params(p)).is_err() {
                                 tracing::warn!(
@@ -339,7 +471,24 @@ async fn attach_once(
                                 );
                             }
                         }
-                        Ok(DelegateFrame::ToWorker { msg }) => {
+                        // FR-138 P2b — the daemon's orders about the sessions
+                        // it holds a record of. Never waits: a full lane costs
+                        // the order, and the line names it. A session the
+                        // delegated table keeps still closes at its own
+                        // deadline, and the `Ended` of an attached session has
+                        // the server's `Terminate` crossing beside it.
+                        Ok(WorkerLane::Order(order)) => {
+                            let kind = order.kind();
+                            let sessions = order.session_ids();
+                            if !lane.order(order) {
+                                tracing::warn!(
+                                    order = kind,
+                                    ?sessions,
+                                    "delegation: orders queue full or closed; dropped an order (FR-138 P2b)"
+                                );
+                            }
+                        }
+                        Ok(WorkerLane::Inbound(WorkerInbound::Msg(msg))) => {
                             let kind = crate::delegate::server_msg_kind(&msg);
                             // A full queue means the signalling loop is wedged,
                             // not merely busy. Dropping and SAYING SO beats
@@ -360,7 +509,7 @@ async fn attach_once(
                         // sessions resolve the device's `rc_overlay` against
                         // this registry: empty, the `utunN` address read as
                         // foreign and stayed a host candidate.
-                        Ok(DelegateFrame::OverlayFootprint { v4_nets }) => {
+                        Ok(WorkerLane::Here(DelegateFrame::OverlayFootprint { v4_nets })) => {
                             tunnel_core::overlay_footprint::note_v4_blocks(&v4_nets);
                             tracing::info!(
                                 blocks = v4_nets.len(),
@@ -372,7 +521,7 @@ async fn attach_once(
                         // per-user socket), and keep busy runs HERE. Answered
                         // inline: a status is immediate and an `off` waits at
                         // most `LOCAL_OFF_WAIT`, well inside the ping cadence.
-                        Ok(DelegateFrame::KeepBusyAsk { id, off }) => {
+                        Ok(WorkerLane::Here(DelegateFrame::KeepBusyAsk { id, off })) => {
                             let info = crate::keep_busy::answer_local(off).await;
                             tracing::info!(
                                 id,
@@ -390,15 +539,26 @@ async fn attach_once(
                             )
                             .await?;
                         }
-                        Ok(
+                        Ok(WorkerLane::Here(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
-                            | DelegateFrame::KeepBusyTold { .. },
-                        ) => {
+                            | DelegateFrame::KeepBusyTold { .. }
+                            | DelegateFrame::WorkerLogs { .. }
+                            | DelegateFrame::PersonFloor(..),
+                        )) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
                             tracing::warn!("delegation: daemon sent a worker-only frame; ignoring");
                         }
+                        // `worker_lane` puts these on their lanes above.
+                        Ok(WorkerLane::Here(
+                            DelegateFrame::SessionParams(..)
+                            | DelegateFrame::ToWorker { .. }
+                            | DelegateFrame::Detached { .. }
+                            | DelegateFrame::Resumed { .. }
+                            | DelegateFrame::Close { .. }
+                            | DelegateFrame::Ended { .. },
+                        )) => tracing::debug!("delegation: a frame for another lane; skipping"),
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive
                         // protocol is only additive if old readers skip it.
@@ -419,6 +579,17 @@ async fn attach_once(
                     None => return Ok(()),
                 }
             }
+            // FR-43 P3a — this worker's own log lines, for the daemon to upload
+            // on its row. What is queued goes in one frame, so a burst is one
+            // write; lines logged while detached wait in the queue, which drops
+            // the newest when full, as it would for any uploader.
+            line = next_log_line(logs) => match line {
+                Some(first) => {
+                    let lines = log_batch(first, logs);
+                    write_frame(&mut wr, &DelegateFrame::WorkerLogs { lines }).await?;
+                }
+                None => *logs = None,
+            },
             _ = tokio::time::sleep(PING_EVERY) => {
                 write_frame(&mut wr, &DelegateFrame::Ping).await?;
             }
@@ -435,9 +606,21 @@ async fn attach_once(
                     &mut wr,
                     &DelegateFrame::WorkerCaps {
                         caps: Box::new(caps),
+                        // #3864 — the same words as the first frame: the
+                        // daemon keeps the words of the newest frame only.
+                        features: crate::delegate::worker_features(person.is_some()),
                     },
                 )
                 .await?;
+            }
+            // FR-43 P3b — the person changed their `rc_*` floor (a `config
+            // set`): the daemon holds the new one before the next session asks.
+            () = floor_changed(&mut floor_watch) => {
+                if let Some(auto_grant_session) = person {
+                    let floor = person_floor(auto_grant_session);
+                    tracing::info!(?floor, "delegation: the person's consent floor changed");
+                    write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -446,6 +629,38 @@ async fn attach_once(
             }
         }
     }
+}
+
+/// FR-43 P3a — the next of this worker's log lines, or never when it forwards
+/// none. `None` when the layer's sender has gone.
+async fn next_log_line(
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Option<crate::logs_upload::LogLine> {
+    match logs {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// FR-43 P3a — `first` and whatever else is queued behind it, up to one frame's
+/// worth, each trimmed to what a frame carries.
+fn log_batch(
+    first: crate::logs_upload::LogLine,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Vec<crate::logs_upload::LogLine> {
+    let mut lines = vec![first];
+    if let Some(rx) = logs.as_mut() {
+        while lines.len() < crate::delegate::WORKER_LOG_LINES_PER_FRAME {
+            match rx.try_recv() {
+                Ok(line) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+    for line in &mut lines {
+        crate::delegate::trim_worker_line(line);
+    }
+    lines
 }
 
 /// Start the thread that owns stdin (#2987). It reads the attach secret, then
@@ -529,5 +744,141 @@ async fn read_secret(secret: tokio::sync::oneshot::Receiver<Option<String>>) -> 
             tracing::warn!("delegation: timed out waiting for the secret on stdin");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegate::{WORKER_LOG_LINES_PER_FRAME, WORKER_LOG_MSG_MAX};
+
+    fn line(msg: String) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd".into(),
+            msg,
+            fields: bson::Document::new(),
+        }
+    }
+
+    /// FR-43 P3a — a burst of the worker's log lines leaves in frames of at most
+    /// one frame's worth, in order, none lost between frames, and a message too
+    /// long for a frame is cut.
+    #[tokio::test]
+    async fn queued_log_lines_leave_in_bounded_trimmed_frames() {
+        let total = WORKER_LOG_LINES_PER_FRAME * 2 + 7;
+        let (tx, rx) = tokio::sync::mpsc::channel(total + 1);
+        for i in 0..total {
+            tx.try_send(line(i.to_string())).unwrap();
+        }
+        tx.try_send(line("x".repeat(WORKER_LOG_MSG_MAX + 100)))
+            .unwrap();
+        drop(tx);
+
+        let mut logs = Some(rx);
+        let mut seen = Vec::new();
+        let mut frames = 0;
+        while let Some(first) = next_log_line(&mut logs).await {
+            let batch = log_batch(first, &mut logs);
+            assert!(batch.len() <= WORKER_LOG_LINES_PER_FRAME);
+            seen.extend(batch);
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(seen.len(), total + 1);
+        for (i, l) in seen.iter().take(total).enumerate() {
+            assert_eq!(l.msg, i.to_string());
+        }
+        assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
+    }
+
+    /// #3695 — a full frame of the longest lines a worker can log, each a
+    /// message that doubles when escaped plus a large field, still encodes
+    /// under the daemon's read limit, so the daemon never refuses a worker's
+    /// own frame.
+    #[tokio::test]
+    async fn a_full_log_frame_fits_under_the_daemons_read_limit() {
+        use crate::delegate::{DELEGATE_LINE_MAX, DelegateFrame, WORKER_LOG_LINE_MAX};
+        let n = WORKER_LOG_LINES_PER_FRAME;
+        let (tx, rx) = tokio::sync::mpsc::channel(n + 1);
+        for _ in 0..n + 1 {
+            let mut l = line("\"".repeat(WORKER_LOG_MSG_MAX));
+            l.fields.insert("big", "y".repeat(100 * 1024));
+            tx.try_send(l).unwrap();
+        }
+        drop(tx);
+        let mut logs = Some(rx);
+        let first = next_log_line(&mut logs).await.unwrap();
+        let lines = log_batch(first, &mut logs);
+        assert_eq!(lines.len(), n);
+        for l in &lines {
+            assert!(serde_json::to_vec(l).unwrap().len() <= WORKER_LOG_LINE_MAX);
+            assert!(!l.msg.is_empty(), "the message is cut, not dropped");
+        }
+        let frame = serde_json::to_vec(&DelegateFrame::WorkerLogs { lines }).unwrap();
+        assert!(frame.len() <= DELEGATE_LINE_MAX, "{} bytes", frame.len());
+    }
+
+    /// FR-43 P3b — a worker that hands no floor over never wakes for one; one
+    /// that does wakes when the person's `rc_*` floor is set (a `config set`),
+    /// and says their `auto_grant_session` as it was given.
+    #[tokio::test]
+    async fn the_floor_watch_wakes_only_a_worker_that_hands_its_floor_over() {
+        let mut none = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), floor_changed(&mut none))
+                .await
+                .is_err(),
+            "no floor handed over: never"
+        );
+        let mut watching = Some(crate::session_policy::watch_device_policy());
+        // The value it already holds: a change for the watch, none for any
+        // other test reading the floor.
+        crate::session_policy::set_device_policy(crate::session_policy::device_policy());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), floor_changed(&mut watching))
+                .await
+                .is_ok(),
+            "a set wakes it"
+        );
+        let floor = person_floor(false);
+        assert!(!floor.auto_grant_session);
+        assert_eq!(floor.session_policy, crate::session_policy::device_policy());
+    }
+
+    /// FR-138 P2b (review MEDIUM-1) — a greeted attach's end is said once on
+    /// the orders lane, with its cause, and so is one whose loop stopped; an
+    /// attach the daemon never greeted says nothing.
+    #[test]
+    fn a_greeted_attach_says_its_end_once_with_its_cause() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.ended("refused".to_string());
+        }
+        assert!(rx.try_recv().is_err(), "never greeted: nothing");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+            lane.ended("Broken pipe (os error 32)".to_string());
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(WorkerOrder::Paused {
+                cause: "Broken pipe (os error 32)".to_string()
+            })
+        );
+        assert!(rx.try_recv().is_err(), "said once");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert!(
+            matches!(rx.try_recv().ok(), Some(WorkerOrder::Paused { .. })),
+            "a greeted attach whose loop stopped says it too"
+        );
     }
 }

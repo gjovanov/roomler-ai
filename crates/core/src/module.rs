@@ -106,7 +106,8 @@ pub trait Module: Sized + Send + Sync + 'static {
     }
 
     /// The inverse edges — what this module does when core tells it a tenant
-    /// was archived or an agent removed. Invoked in [`crate::hooks::HOOK_ORDER`].
+    /// was archived, an agent removed, or someone's membership ended. Invoked
+    /// in [`crate::hooks::HOOK_ORDER`].
     fn hooks(&self) -> Hooks {
         Hooks::default()
     }

@@ -1,0 +1,1483 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! The `media:*` namespace admits a connection only while it is a participant
+//! of the room's call.
+//!
+//! Being a participant is what REST `call/join` establishes: a member of the
+//! room's tenant, allowed in the room by its visibility, holding an open call
+//! session. `media:join` requires all three for THIS connection, and every
+//! other `media:*` command requires that this connection joined that room's
+//! media. Each test reads both sides: what reached the caller's socket, and
+//! what reached the people already in the call.
+//!
+//! The seat lasts only as long as the membership that admitted it: a member
+//! removed from the org, or one who leaves it or leaves the room, is out of
+//! the call at once (`roomler_ai_mod_conference::revoke`). A room deleted
+//! mid-call ends every membership of it at once, and its call with them, for
+//! everyone in it.
+//!
+//! Ordering: a socket's frames are handled one at a time, and everything a
+//! frame causes is written to the sockets it reaches before the next frame is
+//! read. So the `pong` that answers a `ping` arrives after everything the
+//! frames before it caused on that socket ([`settle`]), and a test reads up to
+//! it before it asserts that something did NOT arrive.
+
+use std::time::Duration;
+
+use bson::oid::ObjectId;
+use futures::{SinkExt, StreamExt};
+use reqwest::multipart;
+use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::fixtures::seed::SeededTenant;
+use crate::fixtures::test_app::TestApp;
+use roomler_ai_mod_conference::ConferenceState;
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A user socket and the connection id the server minted for it.
+struct Peer {
+    ws: Ws,
+    conn: String,
+}
+
+/// The frames that admit a socket to a call or carry the call's media, its
+/// participants or its files. None may reach someone who is not in the call.
+const IN_CALL: [&str; 7] = [
+    "media:router_capabilities",
+    "media:transport_created",
+    "media:new_producer",
+    "media:consumer_created",
+    "media:produce_result",
+    "media:audio_playback",
+    "media:peer_left",
+];
+
+fn in_call(frames: &[Value]) -> Vec<&Value> {
+    frames
+        .iter()
+        .filter(|f| IN_CALL.contains(&f["type"].as_str().unwrap_or("")))
+        .collect()
+}
+
+fn conf(app: &TestApp) -> &ConferenceState {
+    app.state
+        .modules
+        .conference
+        .as_ref()
+        .expect("the conference module is mounted in tests")
+}
+
+fn oid(hex: &str) -> ObjectId {
+    ObjectId::parse_str(hex).unwrap()
+}
+
+async fn connect(app: &TestApp, token: &str) -> Peer {
+    let url = format!("ws://{}/ws?token={token}", app.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("the user socket opens");
+    let first = ws.next().await.expect("a frame").expect("a text frame");
+    let parsed: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(parsed["type"], "connected", "{parsed}");
+    let conn = parsed["connection_id"]
+        .as_str()
+        .expect("the connected frame carries connection_id")
+        .to_string();
+    Peer { ws, conn }
+}
+
+async fn send(peer: &mut Peer, msg_type: &str, data: Value) {
+    peer.ws
+        .send(Message::Text(
+            json!({ "type": msg_type, "data": data }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// Every frame up to and including the first of type `kind`, within 10 s.
+async fn frames_until(peer: &mut Peer, kind: &str) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        let left = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_else(|| panic!("no {kind} within 10 s; saw {seen:?}"));
+        let frame = match tokio::time::timeout(left, peer.ws.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            other => panic!("socket ended waiting for {kind}: {other:?}; saw {seen:?}"),
+        };
+        let Ok(text) = frame.to_text() else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let done = v["type"] == kind;
+        seen.push(v);
+        if done {
+            return seen;
+        }
+    }
+}
+
+async fn next_of(peer: &mut Peer, kind: &str) -> Value {
+    frames_until(peer, kind).await.pop().unwrap()
+}
+
+/// Everything this socket received up to the answer to a `ping` sent now:
+/// all that its earlier frames caused (see the module doc). The `pong` goes to
+/// every socket of the user, so a test pings only the socket it reads.
+async fn settle(peer: &mut Peer) -> Vec<Value> {
+    send(peer, "ping", Value::Null).await;
+    frames_until(peer, "pong").await
+}
+
+/// `call/{action}` as `token`, naming `connection_id` when given (what the
+/// web client sends). Returns the status.
+async fn call(
+    app: &TestApp,
+    tenant_id: &str,
+    room_id: &str,
+    token: &str,
+    action: &str,
+    connection_id: Option<&str>,
+) -> u16 {
+    let req = app.auth_post(
+        &format!("/api/tenant/{tenant_id}/room/{room_id}/call/{action}"),
+        token,
+    );
+    let req = match connection_id {
+        Some(cid) => req.json(&json!({ "connection_id": cid })),
+        None => req,
+    };
+    req.send().await.unwrap().status().as_u16()
+}
+
+/// `media:join` on a socket the call admits; returns the router capabilities
+/// (to consume with) and the frames the join brought.
+async fn join_media(peer: &mut Peer, room_id: &str) -> (Value, Vec<Value>) {
+    send(peer, "media:join", json!({ "room_id": room_id })).await;
+    let mut frames = frames_until(peer, "media:router_capabilities").await;
+    let caps = frames.last().unwrap()["data"]["rtp_capabilities"].clone();
+    frames.extend(frames_until(peer, "media:transport_created").await);
+    (caps, frames)
+}
+
+/// Parameters the worker accepts for a producer on a transport that never
+/// DTLS-connects: the router's VP8 and Opus, one SSRC each.
+fn producer_params(kind: &str, ssrc: u32) -> Value {
+    let codec = match kind {
+        "audio" => json!({
+            "mimeType": "audio/opus", "payloadType": 111, "clockRate": 48000, "channels": 2,
+            "parameters": {}, "rtcpFeedback": []
+        }),
+        _ => json!({
+            "mimeType": "video/VP8", "payloadType": 96, "clockRate": 90000,
+            "parameters": {}, "rtcpFeedback": []
+        }),
+    };
+    json!({
+        "codecs": [codec],
+        "headerExtensions": [],
+        "encodings": [{ "ssrc": ssrc }],
+        "rtcp": { "cname": format!("cname-{ssrc}"), "reducedSize": true }
+    })
+}
+
+fn produce_frame(room_id: &str, kind: &str, ssrc: u32) -> Value {
+    json!({
+        "room_id": room_id,
+        "kind": kind,
+        "rtp_parameters": producer_params(kind, ssrc),
+        "source": if kind == "audio" { "audio" } else { "camera" },
+    })
+}
+
+/// Produce `kind` on an admitted socket and return the producer id.
+async fn produce(peer: &mut Peer, room_id: &str, kind: &str, ssrc: u32) -> String {
+    send(peer, "media:produce", produce_frame(room_id, kind, ssrc)).await;
+    let frames = frames_until(peer, "media:produce_result").await;
+    frames.last().unwrap()["data"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("produce_result carries an id: {frames:?}"))
+        .to_string()
+}
+
+/// Consume `producer_id` on an admitted socket; returns `media:consumer_created`.
+async fn consume(peer: &mut Peer, room_id: &str, producer_id: &str, caps: &Value) -> Value {
+    send(
+        peer,
+        "media:consume",
+        json!({ "room_id": room_id, "producer_id": producer_id, "rtp_capabilities": caps }),
+    )
+    .await;
+    let frames = frames_until(peer, "media:consumer_created").await;
+    let created = frames.last().unwrap().clone();
+    assert_eq!(created["data"]["producer_id"], producer_id, "{frames:?}");
+    created
+}
+
+/// Upload a small file into `room_id` as `token`; returns its id.
+async fn upload_to_room(
+    app: &TestApp,
+    tenant_id: &str,
+    room_id: &str,
+    token: &str,
+    name: &str,
+) -> String {
+    let part = multipart::Part::bytes(b"a short jingle".to_vec())
+        .file_name(name.to_string())
+        .mime_str("text/plain")
+        .unwrap();
+    let form = multipart::Form::new()
+        .part("file", part)
+        .text("room_id", room_id.to_string());
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/tenant/{tenant_id}/file/upload")))
+        .header("Authorization", format!("Bearer {token}"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "upload of {name}: {body}");
+    body["id"]
+        .as_str()
+        .expect("an uploaded file id")
+        .to_string()
+}
+
+/// A call in progress: the org's admin started it in `room`, joined it over
+/// REST naming its socket, joined its media and sends a camera and a
+/// microphone.
+struct LiveCall {
+    tenant: SeededTenant,
+    room: String,
+    host: Peer,
+    caps: Value,
+    video: String,
+    audio: String,
+}
+
+async fn start_live_call(app: &TestApp, tenant: SeededTenant, room: String) -> LiveCall {
+    let (tid, token) = (tenant.tenant_id.clone(), tenant.admin.access_token.clone());
+    let mut host = connect(app, &token).await;
+    assert_eq!(call(app, &tid, &room, &token, "start", None).await, 200);
+    assert_eq!(
+        call(app, &tid, &room, &token, "join", Some(&host.conn)).await,
+        200
+    );
+    let (caps, _) = join_media(&mut host, &room).await;
+    let video = produce(&mut host, &room, "video", 31_001).await;
+    let audio = produce(&mut host, &room, "audio", 31_002).await;
+    LiveCall {
+        tenant,
+        room,
+        host,
+        caps,
+        video,
+        audio,
+    }
+}
+
+async fn live_call(app: &TestApp, slug: &str) -> LiveCall {
+    let tenant = app.seed_tenant(slug).await;
+    let room = tenant.rooms[0].id.clone();
+    start_live_call(app, tenant, room).await
+}
+
+/// Every `media:*` command a socket could send into `live`'s call: join it,
+/// consume the host's camera, send a camera of its own, play one of the
+/// room's files and stop a playback.
+async fn try_every_command(peer: &mut Peer, live: &LiveCall, file_id: &str) {
+    let room = live.room.as_str();
+    send(peer, "media:join", json!({ "room_id": room })).await;
+    send(
+        peer,
+        "media:consume",
+        json!({ "room_id": room, "producer_id": live.video, "rtp_capabilities": live.caps }),
+    )
+    .await;
+    send(peer, "media:produce", produce_frame(room, "video", 41_001)).await;
+    send(
+        peer,
+        "media:play_audio",
+        json!({ "room_id": room, "file_id": file_id }),
+    )
+    .await;
+    send(
+        peer,
+        "media:stop_audio",
+        json!({ "room_id": room, "playback_id": "" }),
+    )
+    .await;
+}
+
+/// Neither the refused socket nor anyone in the call saw anything of the
+/// other, and the room's media holds nothing for the refused connection.
+async fn assert_kept_out(app: &TestApp, live: &mut LiveCall, peer: &mut Peer, who: &str) {
+    let theirs = settle(peer).await;
+    assert!(
+        in_call(&theirs).is_empty(),
+        "{who} got into the call: {:?}",
+        in_call(&theirs)
+    );
+    let host = settle(&mut live.host).await;
+    assert!(
+        in_call(&host).is_empty(),
+        "{who} reached the people in the call: {:?}",
+        in_call(&host)
+    );
+    let rm = &conf(app).room_manager;
+    let rid = oid(&live.room);
+    assert_eq!(
+        rm.get_connection_room(&peer.conn),
+        None,
+        "{who} holds a seat in the room's media"
+    );
+    assert!(
+        rm.consumer_states(&rid, &peer.conn).is_empty(),
+        "{who} consumes the call's media"
+    );
+    assert_eq!(
+        rm.get_participant_user_ids(&rid).len(),
+        1,
+        "only the host is in the call's media"
+    );
+}
+
+async fn set_visibility(app: &TestApp, t: &SeededTenant, room_id: &str, visibility: &str) {
+    let resp = app
+        .auth_put(
+            &format!("/api/tenant/{}/room/{}", t.tenant_id, room_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "visibility": visibility }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "setting visibility={visibility} failed: {}",
+        resp.status()
+    );
+}
+
+/// A signed-in account of another org, holding a live call's room id, gets
+/// nothing from any `media:*` command: no transports, no TURN credential, no
+/// producer list, no consumer, no producer of its own in the call, and no
+/// file playback started or stopped in it.
+#[tokio::test]
+async fn another_orgs_account_gets_nothing_from_a_live_call() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mgate-org").await;
+    let file = upload_to_room(
+        &app,
+        &live.tenant.tenant_id,
+        &live.room,
+        &live.tenant.admin.access_token,
+        "board-minutes.txt",
+    )
+    .await;
+
+    let outsider = app.seed_tenant("mgate-org-out").await;
+    let mut x = connect(&app, &outsider.admin.access_token).await;
+    try_every_command(&mut x, &live, &file).await;
+    assert_kept_out(&app, &mut live, &mut x, "another org's account").await;
+}
+
+/// A member of the org who may not read a Private room is refused its call
+/// over REST — and gets nothing from the socket either.
+#[tokio::test]
+async fn a_member_outside_a_private_room_gets_nothing_from_its_call() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("mgate-priv").await;
+    let room = tenant.rooms[0].id.clone();
+    // The admin is added as a member when the room closes; the member is not.
+    set_visibility(&app, &tenant, &room, "private").await;
+    let mut live = start_live_call(&app, tenant, room).await;
+    let file = upload_to_room(
+        &app,
+        &live.tenant.tenant_id,
+        &live.room,
+        &live.tenant.admin.access_token,
+        "private-notes.txt",
+    )
+    .await;
+
+    let token = live.tenant.member.access_token.clone();
+    let mut m = connect(&app, &token).await;
+    assert_eq!(
+        call(
+            &app,
+            &live.tenant.tenant_id,
+            &live.room,
+            &token,
+            "join",
+            Some(&m.conn)
+        )
+        .await,
+        403,
+        "the REST join refuses a member outside the private room"
+    );
+    try_every_command(&mut m, &live, &file).await;
+    assert_kept_out(&app, &mut live, &mut m, "a member outside the private room").await;
+}
+
+/// A member who may be in the room but has not joined the call gets nothing
+/// from its media; a call session opened for another of its sockets does not
+/// admit this one; the session opened for this socket does.
+#[tokio::test]
+async fn a_member_gets_the_calls_media_only_after_joining_the_call_on_that_socket() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mgate-session").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let file = upload_to_room(
+        &app,
+        &tid,
+        &room,
+        &live.tenant.admin.access_token,
+        "agenda.txt",
+    )
+    .await;
+    let token = live.tenant.member.access_token.clone();
+
+    let mut m = connect(&app, &token).await;
+    try_every_command(&mut m, &live, &file).await;
+    assert_kept_out(&app, &mut live, &mut m, "a member not in the call").await;
+
+    // Joined over REST, but naming ANOTHER socket of the same account.
+    let other = connect(&app, &token).await;
+    assert_eq!(
+        call(&app, &tid, &room, &token, "join", Some(&other.conn)).await,
+        200
+    );
+    try_every_command(&mut m, &live, &file).await;
+    assert_kept_out(
+        &app,
+        &mut live,
+        &mut m,
+        "a socket whose account joined the call on another socket",
+    )
+    .await;
+
+    // The session for THIS socket is what was missing.
+    assert_eq!(
+        call(&app, &tid, &room, &token, "join", Some(&m.conn)).await,
+        200
+    );
+    let (caps, _) = join_media(&mut m, &room).await;
+    consume(&mut m, &room, &live.video, &caps).await;
+    assert_eq!(
+        conf(&app).room_manager.get_connection_room(&m.conn),
+        Some(oid(&room))
+    );
+    drop(other);
+}
+
+/// The participant path, end to end: a member joins over REST and then the
+/// media, hears the host's producers, consumes the camera, sends its own, a
+/// room file plays for both, a stop reaches both, and leaving tells the host.
+#[tokio::test]
+async fn participants_join_produce_consume_play_and_leave() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mgate-ok").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let file = upload_to_room(
+        &app,
+        &tid,
+        &room,
+        &live.tenant.admin.access_token,
+        "standup-jingle.txt",
+    )
+    .await;
+    let token = live.tenant.member.access_token.clone();
+    let member_id = live.tenant.member.id.clone();
+
+    let mut b = connect(&app, &token).await;
+    assert_eq!(
+        call(&app, &tid, &room, &token, "join", Some(&b.conn)).await,
+        200
+    );
+    let (caps, mut frames) = join_media(&mut b, &room).await;
+    frames.extend(settle(&mut b).await);
+    let announced: Vec<&str> = frames
+        .iter()
+        .filter(|f| f["type"] == "media:new_producer")
+        .filter_map(|f| f["data"]["producer_id"].as_str())
+        .collect();
+    assert!(
+        announced.contains(&live.video.as_str()) && announced.contains(&live.audio.as_str()),
+        "the join announces the host's camera and microphone: {frames:?}"
+    );
+
+    consume(&mut b, &room, &live.video, &caps).await;
+
+    let b_video = produce(&mut b, &room, "video", 51_001).await;
+    let heard = next_of(&mut live.host, "media:new_producer").await;
+    assert_eq!(heard["data"]["producer_id"], b_video.as_str(), "{heard}");
+    assert_eq!(heard["data"]["user_id"], member_id.as_str(), "{heard}");
+
+    send(
+        &mut b,
+        "media:play_audio",
+        json!({ "room_id": room, "file_id": file }),
+    )
+    .await;
+    for peer in [&mut b, &mut live.host] {
+        let start = next_of(peer, "media:audio_playback").await;
+        assert_eq!(start["data"]["action"], "start", "{start}");
+        assert_eq!(start["data"]["filename"], "standup-jingle.txt", "{start}");
+    }
+
+    send(
+        &mut live.host,
+        "media:stop_audio",
+        json!({ "room_id": room, "playback_id": "" }),
+    )
+    .await;
+    for peer in [&mut live.host, &mut b] {
+        let stop = next_of(peer, "media:audio_playback").await;
+        assert_eq!(stop["data"]["action"], "stop", "{stop}");
+    }
+
+    send(&mut b, "media:leave", json!({ "room_id": room })).await;
+    let left = next_of(&mut live.host, "media:peer_left").await;
+    assert_eq!(left["data"]["connection_id"], b.conn.as_str(), "{left}");
+    assert_eq!(
+        conf(&app).room_manager.get_connection_room(&b.conn),
+        None,
+        "the leave closed the member's media"
+    );
+}
+
+/// A participant plays only one of this room's live files, and each playback
+/// has an id of its own: a file of another room of the same org, or one that
+/// was removed, plays nowhere.
+#[tokio::test]
+async fn a_playback_is_one_of_this_rooms_live_files_with_its_own_id() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mgate-play").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let token = live.tenant.admin.access_token.clone();
+    let other_room = live.tenant.rooms[1].id.clone();
+
+    let here = upload_to_room(&app, &tid, &room, &token, "here.txt").await;
+    let elsewhere = upload_to_room(&app, &tid, &other_room, &token, "elsewhere.txt").await;
+    let removed = upload_to_room(&app, &tid, &room, &token, "removed.txt").await;
+    let resp = app
+        .auth_delete(&format!("/api/tenant/{tid}/file/{removed}"), &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the file is removed");
+
+    for file in [&elsewhere, &removed] {
+        send(
+            &mut live.host,
+            "media:play_audio",
+            json!({ "room_id": room, "file_id": file }),
+        )
+        .await;
+    }
+    let frames = settle(&mut live.host).await;
+    let played: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["type"] == "media:audio_playback")
+        .collect();
+    assert!(
+        played.is_empty(),
+        "another room's file, or a removed one, played: {played:?}"
+    );
+
+    send(
+        &mut live.host,
+        "media:play_audio",
+        json!({ "room_id": room, "file_id": here }),
+    )
+    .await;
+    let start = next_of(&mut live.host, "media:audio_playback").await;
+    assert_eq!(start["data"]["action"], "start", "{start}");
+    assert_eq!(start["data"]["filename"], "here.txt", "{start}");
+    let id = start["data"]["playback_id"].as_str().unwrap_or("");
+    assert!(!id.is_empty(), "a playback has an id of its own: {start}");
+}
+
+// ── Losing the membership ends the seat ─────────────────────────────
+
+/// The org's member, in `live`'s call the way the web client gets there:
+/// `call/join` naming its socket, then the media. It consumes the host's
+/// camera and sends a camera of its own, which the host consumes.
+struct Seated {
+    peer: Peer,
+    video: String,
+}
+
+async fn seat_member(app: &TestApp, live: &mut LiveCall) -> Seated {
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let token = live.tenant.member.access_token.clone();
+    let mut peer = connect(app, &token).await;
+    assert_eq!(
+        call(app, &tid, &room, &token, "join", Some(&peer.conn)).await,
+        200
+    );
+    let (caps, _) = join_media(&mut peer, &room).await;
+    consume(&mut peer, &room, &live.video, &caps).await;
+    let video = produce(&mut peer, &room, "video", 61_001).await;
+    let heard = next_of(&mut live.host, "media:new_producer").await;
+    assert_eq!(heard["data"]["producer_id"], video.as_str(), "{heard}");
+    let host_caps = live.caps.clone();
+    consume(&mut live.host, &room, &video, &host_caps).await;
+    Seated { peer, video }
+}
+
+/// The user ids `GET …/call/participant` lists, read as the host.
+async fn call_participants(app: &TestApp, live: &LiveCall) -> Vec<String> {
+    let body: Value = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/room/{}/call/participant",
+                live.tenant.tenant_id, live.room
+            ),
+            &live.tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body.as_array()
+        .unwrap_or_else(|| panic!("a participant list: {body}"))
+        .iter()
+        .filter_map(|p| p["user_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The room as `GET …/room/{room_id}` returns it to the host.
+async fn room_as_host(app: &TestApp, live: &LiveCall) -> Value {
+    app.auth_get(
+        &format!("/api/tenant/{}/room/{}", live.tenant.tenant_id, live.room),
+        &live.tenant.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap()
+}
+
+/// The membership is gone, and the seat went with it at once: the holder's
+/// client hears that its call ended, the host sees it leave, its transports,
+/// producers and consumers are closed (the host's consumer of its camera
+/// too), it is off the call's participant list, and its socket gets nothing
+/// more from the call.
+async fn assert_seat_withdrawn(app: &TestApp, live: &mut LiveCall, m: &mut Seated, who: &str) {
+    let room = live.room.clone();
+    let rid = oid(&room);
+
+    let ended = next_of(&mut m.peer, "room:call_ended").await;
+    assert_eq!(ended["data"]["room_id"], room.as_str(), "{who}: {ended}");
+    let left = next_of(&mut live.host, "media:peer_left").await;
+    assert_eq!(
+        left["data"]["connection_id"],
+        m.peer.conn.as_str(),
+        "{who}: {left}"
+    );
+
+    let rm = &conf(app).room_manager;
+    assert_eq!(
+        rm.get_connection_room(&m.peer.conn),
+        None,
+        "{who} still holds a seat in the call's media"
+    );
+    assert!(
+        rm.producer_states(&rid, &m.peer.conn).is_empty(),
+        "{who}'s camera is still in the call"
+    );
+    assert!(
+        rm.consumer_states(&rid, &m.peer.conn).is_empty(),
+        "{who} still receives the call"
+    );
+    assert_eq!(
+        rm.get_participant_user_ids(&rid),
+        vec![oid(&live.tenant.admin.id)],
+        "only the host is left in the call's media"
+    );
+    // The worker closes the host's consumer of that camera on its own, a
+    // moment after the producer goes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rm
+        .consumer_states(&rid, &live.host.conn)
+        .iter()
+        .any(|c| c.producer_id == m.video)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host still consumes {who}'s camera"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        !call_participants(app, live)
+            .await
+            .contains(&live.tenant.member.id),
+        "{who} is still on the call's participant list"
+    );
+    assert_eq!(
+        room_as_host(app, live).await["participant_count"],
+        1,
+        "the call counts {who} still"
+    );
+
+    // Nothing more from the call on that socket: a consume and a produce are
+    // both refused.
+    send(
+        &mut m.peer,
+        "media:consume",
+        json!({ "room_id": room, "producer_id": live.video, "rtp_capabilities": live.caps }),
+    )
+    .await;
+    send(
+        &mut m.peer,
+        "media:produce",
+        produce_frame(&room, "video", 61_002),
+    )
+    .await;
+    let after = settle(&mut m.peer).await;
+    assert!(
+        in_call(&after).is_empty(),
+        "{who} still gets the call: {:?}",
+        in_call(&after)
+    );
+    let refused = after.iter().filter(|f| f["type"] == "media:error").count();
+    assert_eq!(
+        refused, 2,
+        "{who}'s consume and produce are refused: {after:?}"
+    );
+}
+
+/// An admin removes a member from the org while they are in a call: the
+/// seat goes at once, with nothing for the member to do.
+#[tokio::test]
+async fn a_member_removed_from_the_org_mid_call_loses_the_seat_at_once() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mseat-kick").await;
+    let mut m = seat_member(&app, &mut live).await;
+
+    let resp = app
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/member/{}",
+                live.tenant.tenant_id, live.tenant.member.id
+            ),
+            &live.tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the admin removes the member");
+
+    assert_seat_withdrawn(&app, &mut live, &mut m, "a member removed from the org").await;
+}
+
+/// A member who leaves the org mid-call leaves the call with it.
+#[tokio::test]
+async fn a_member_who_leaves_the_org_mid_call_loses_the_seat() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mseat-quit").await;
+    let mut m = seat_member(&app, &mut live).await;
+
+    let resp = app
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/member/{}",
+                live.tenant.tenant_id, live.tenant.member.id
+            ),
+            &live.tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member leaves the org");
+
+    assert_seat_withdrawn(&app, &mut live, &mut m, "a member who left the org").await;
+}
+
+/// A member who leaves the room leaves its call: the room's membership is
+/// what the seat stood on, whatever the room's visibility.
+#[tokio::test]
+async fn a_member_who_leaves_the_room_mid_call_loses_the_seat() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mseat-room").await;
+    let mut m = seat_member(&app, &mut live).await;
+
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/leave",
+                live.tenant.tenant_id, live.room
+            ),
+            &live.tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member leaves the room");
+
+    assert_seat_withdrawn(&app, &mut live, &mut m, "a member who left the room").await;
+}
+
+/// The last person in a call leaves its room: the call ends, as it does when
+/// the last person hangs up, and the room's members hear it.
+#[tokio::test]
+async fn the_last_participant_leaving_the_room_ends_its_call() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mseat-last").await;
+    let mut m = seat_member(&app, &mut live).await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+
+    // The host hangs up, the way the web client does: the media, then REST.
+    send(&mut live.host, "media:leave", json!({ "room_id": room })).await;
+    let host_token = live.tenant.admin.access_token.clone();
+    let host_conn = live.host.conn.clone();
+    assert_eq!(
+        call(&app, &tid, &room, &host_token, "leave", Some(&host_conn)).await,
+        200
+    );
+    assert_eq!(room_as_host(&app, &live).await["participant_count"], 1);
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/room/{room}/leave"),
+            &live.tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member leaves the room");
+
+    let ended = next_of(&mut m.peer, "room:call_ended").await;
+    assert_eq!(ended["data"]["room_id"], room.as_str(), "{ended}");
+    let heard = next_of(&mut live.host, "room:call_ended").await;
+    assert_eq!(heard["data"]["room_id"], room.as_str(), "{heard}");
+    let after = room_as_host(&app, &live).await;
+    assert_ne!(
+        after["conference_status"], "in_progress",
+        "the call outlived its last participant: {after}"
+    );
+    assert_eq!(after["participant_count"], 0, "{after}");
+    assert!(
+        !conf(&app).room_manager.has_room(&oid(&room)),
+        "the call's media outlived it"
+    );
+}
+
+/// A member who is in the room but not in its call loses their memberships:
+/// the call is left alone. Nobody in it hears anything, its count stays, and
+/// it goes on.
+#[tokio::test]
+async fn ending_the_membership_of_someone_not_in_the_call_leaves_the_call_alone() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "mseat-bystander").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let member_token = live.tenant.member.access_token.clone();
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/room/{room}/join"),
+            &member_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member joins the room");
+    assert_eq!(room_as_host(&app, &live).await["participant_count"], 1);
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/room/{room}/leave"),
+            &member_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member leaves the room");
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/room/{room}/join"),
+            &member_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "and joins it again");
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{tid}/member/{}", live.tenant.member.id),
+            &live.tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the admin removes the member");
+
+    let host = settle(&mut live.host).await;
+    assert!(
+        !host.iter().any(|f| matches!(
+            f["type"].as_str(),
+            Some("media:peer_left" | "room:call_ended" | "room:call_updated")
+        )),
+        "the call heard of someone who was never in it: {host:?}"
+    );
+    let after = room_as_host(&app, &live).await;
+    assert_eq!(after["conference_status"], "in_progress", "{after}");
+    assert_eq!(after["participant_count"], 1, "{after}");
+    assert_eq!(
+        conf(&app)
+            .room_manager
+            .get_participant_user_ids(&oid(&room)),
+        vec![oid(&live.tenant.admin.id)]
+    );
+}
+
+// ── Deleting the room ends its call ─────────────────────────────────
+
+/// `DELETE …/room/{room_id}` as `token`; returns the status.
+async fn delete_room(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) -> u16 {
+    app.auth_delete(&format!("/api/tenant/{tenant_id}/room/{room_id}"), token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The id of the call running in `room`, read from the room's document. It
+/// goes with the document when the room is deleted, so a test reads it first.
+async fn current_call_id(app: &TestApp, room: &str) -> ObjectId {
+    let found = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .find_one(bson::doc! { "_id": oid(room) })
+        .await
+        .unwrap()
+        .expect("the room exists");
+    found
+        .get_object_id("current_call_id")
+        .unwrap_or_else(|_| panic!("a call is running in the room: {found}"))
+}
+
+/// The call's stats record (`call_sessions`).
+async fn call_record(app: &TestApp, call_id: ObjectId) -> bson::Document {
+    app.db
+        .collection::<bson::Document>("call_sessions")
+        .find_one(bson::doc! { "_id": call_id })
+        .await
+        .unwrap()
+        .expect("the call has a stats record")
+}
+
+/// Nothing of `room`'s call is left on this pod: no router, no seat for any
+/// of `conns`, and no claim, neither the pod's token nor the shared record.
+async fn assert_no_media_left(app: &TestApp, room: &str, conns: &[&str]) {
+    let rid = oid(room);
+    let c = conf(app);
+    assert!(
+        !c.room_manager.has_room(&rid),
+        "the call's router outlived its room"
+    );
+    for conn in conns {
+        assert_eq!(
+            c.room_manager.get_connection_room(conn),
+            None,
+            "a seat of the call outlived its room"
+        );
+    }
+    assert!(
+        !c.media_claim_tokens.contains_key(&rid),
+        "this pod still holds the call's claim"
+    );
+    if let Some(dir) = app.state.cluster_directory.clone() {
+        let key = roomler_ai_api::cluster::directory::media_key(room);
+        assert_eq!(
+            dir.get(&key).await.unwrap(),
+            None,
+            "the call's claim outlived its room"
+        );
+    }
+}
+
+/// The room a call runs in is deleted mid-call: the call ends for everyone in
+/// it at once. Each participant's socket hears that it ended, and why; no
+/// seat, router or claim of it is left; its stats record closes; and the
+/// sockets get nothing more from it, a late join included.
+#[tokio::test]
+async fn deleting_a_room_mid_call_ends_its_call_for_everyone_in_it() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "rdel-live").await;
+    let mut m = seat_member(&app, &mut live).await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let call_id = current_call_id(&app, &room).await;
+    let admin = live.tenant.admin.access_token.clone();
+
+    assert_eq!(
+        delete_room(&app, &tid, &room, &admin).await,
+        200,
+        "the admin deletes the room"
+    );
+
+    for (who, peer) in [("the host", &mut live.host), ("the member", &mut m.peer)] {
+        let ended = next_of(peer, "room:call_ended").await;
+        assert_eq!(ended["data"]["room_id"], room.as_str(), "{who}: {ended}");
+        assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+    }
+    assert_no_media_left(
+        &app,
+        &room,
+        &[live.host.conn.as_str(), m.peer.conn.as_str()],
+    )
+    .await;
+
+    let record = call_record(&app, call_id).await;
+    assert!(
+        matches!(record.get("ended_at"), Some(bson::Bson::DateTime(_))),
+        "the call's stats record is still open: {record}"
+    );
+    assert_eq!(
+        record.get_str("end_reason").ok(),
+        Some("room_deleted"),
+        "{record}"
+    );
+
+    // Nothing more from the call on either socket: a produce, a consume and a
+    // late join are each refused.
+    let caps = live.caps.clone();
+    let video = live.video.clone();
+    for (who, peer) in [("the host", &mut live.host), ("the member", &mut m.peer)] {
+        send(peer, "media:produce", produce_frame(&room, "video", 71_001)).await;
+        send(
+            peer,
+            "media:consume",
+            json!({ "room_id": room, "producer_id": video, "rtp_capabilities": caps }),
+        )
+        .await;
+        send(peer, "media:join", json!({ "room_id": room })).await;
+        let after = settle(peer).await;
+        assert!(
+            in_call(&after).is_empty(),
+            "{who} still gets the call: {:?}",
+            in_call(&after)
+        );
+        let refused = after.iter().filter(|f| f["type"] == "media:error").count();
+        assert_eq!(
+            refused, 3,
+            "{who}'s produce, consume and join are refused: {after:?}"
+        );
+    }
+}
+
+/// A room with no call is deleted while a call runs in another room of the
+/// org, and both of the call's people are members of the deleted room too:
+/// the call is left alone. Nobody in it hears anything, its media, count and
+/// stats record stay as they were, and it goes on.
+#[tokio::test]
+async fn deleting_a_room_leaves_a_call_in_another_room_alone() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "rdel-other").await;
+    let mut m = seat_member(&app, &mut live).await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let other = live.tenant.rooms[1].id.clone();
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tid}/room/{other}/join"),
+            &live.tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the member joins the other room (its creator, the admin, is in it)"
+    );
+    let call_id = current_call_id(&app, &room).await;
+    settle(&mut live.host).await;
+    settle(&mut m.peer).await;
+
+    let admin = live.tenant.admin.access_token.clone();
+    assert_eq!(
+        delete_room(&app, &tid, &other, &admin).await,
+        200,
+        "the admin deletes the room with no call"
+    );
+
+    for (who, peer) in [("the host", &mut live.host), ("the member", &mut m.peer)] {
+        let heard = settle(peer).await;
+        assert!(
+            !heard.iter().any(|f| matches!(
+                f["type"].as_str(),
+                Some(
+                    "room:call_ended"
+                        | "room:call_updated"
+                        | "media:peer_left"
+                        | "media:room_closed"
+                )
+            )),
+            "{who}'s call heard of another room's delete: {heard:?}"
+        );
+    }
+    let after = room_as_host(&app, &live).await;
+    assert_eq!(after["conference_status"], "in_progress", "{after}");
+    assert_eq!(after["participant_count"], 2, "{after}");
+    let rid = oid(&room);
+    let rm = &conf(&app).room_manager;
+    assert!(
+        rm.has_room(&rid),
+        "the call's router went with another room"
+    );
+    assert_eq!(rm.get_connection_room(&live.host.conn), Some(rid));
+    assert_eq!(rm.get_connection_room(&m.peer.conn), Some(rid));
+    let record = call_record(&app, call_id).await;
+    assert_eq!(
+        record.get("ended_at"),
+        Some(&bson::Bson::Null),
+        "the call's stats record closed: {record}"
+    );
+
+    // And it goes on: the member sends a new track, and the host hears of it.
+    let audio = produce(&mut m.peer, &room, "audio", 71_101).await;
+    let heard = next_of(&mut live.host, "media:new_producer").await;
+    assert_eq!(heard["data"]["producer_id"], audio.as_str(), "{heard}");
+}
+
+/// The removal finds nothing left to end, and does nothing: for a room whose
+/// call had already ended when it was deleted, and for a second removal of
+/// it. No one hears anything of that room, and a call in another room goes
+/// on.
+#[tokio::test]
+async fn removing_a_room_whose_call_ended_or_a_second_time_tells_no_one() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "rdel-again").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let other = live.tenant.rooms[1].id.clone();
+    let admin = live.tenant.admin.access_token.clone();
+
+    // A call in the other room, started and ended before the room goes.
+    assert_eq!(call(&app, &tid, &other, &admin, "start", None).await, 200);
+    let other_call = current_call_id(&app, &other).await;
+    assert_eq!(call(&app, &tid, &other, &admin, "end", None).await, 200);
+    settle(&mut live.host).await;
+    let ended_before = call_record(&app, other_call).await;
+    assert_eq!(
+        ended_before.get_str("end_reason").ok(),
+        Some("ended"),
+        "{ended_before}"
+    );
+
+    assert_eq!(delete_room(&app, &tid, &other, &admin).await, 200);
+    app.state
+        .core
+        .hooks
+        .room_removed(oid(&tid), oid(&other))
+        .await
+        .expect("a second removal finds nothing left to end");
+
+    let heard = settle(&mut live.host).await;
+    let of_other: Vec<&Value> = heard
+        .iter()
+        .filter(|f| f["data"]["room_id"] == other.as_str())
+        .collect();
+    assert!(
+        of_other.is_empty(),
+        "the host heard of a room whose call had ended: {of_other:?}"
+    );
+    assert_eq!(
+        call_record(&app, other_call)
+            .await
+            .get_str("end_reason")
+            .ok(),
+        Some("ended"),
+        "an ended call's record is left as it was closed"
+    );
+    assert!(
+        conf(&app).room_manager.has_room(&oid(&room)),
+        "the live call's router went with another room"
+    );
+    assert_eq!(
+        room_as_host(&app, &live).await["conference_status"],
+        "in_progress"
+    );
+}
+
+/// A room deleted mid-call is removed a second time (a retried delete, or a
+/// second holder's call): its call ended once, and the second removal tells
+/// no one anything and leaves the closed stats record as the first one
+/// closed it.
+#[tokio::test]
+async fn a_room_removed_again_after_its_call_ended_ends_nothing_twice() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "rdel-twice").await;
+    let mut m = seat_member(&app, &mut live).await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let call_id = current_call_id(&app, &room).await;
+    let admin = live.tenant.admin.access_token.clone();
+
+    assert_eq!(delete_room(&app, &tid, &room, &admin).await, 200);
+    for (who, peer) in [("the host", &mut live.host), ("the member", &mut m.peer)] {
+        let ended = next_of(peer, "room:call_ended").await;
+        assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+        settle(peer).await;
+    }
+    let closed = call_record(&app, call_id).await;
+    assert!(
+        matches!(closed.get("ended_at"), Some(bson::Bson::DateTime(_))),
+        "the delete closed the call's stats record: {closed}"
+    );
+
+    app.state
+        .core
+        .hooks
+        .room_removed(oid(&tid), oid(&room))
+        .await
+        .expect("a second removal finds nothing left to end");
+
+    for (who, peer) in [("the host", &mut live.host), ("the member", &mut m.peer)] {
+        let heard = settle(peer).await;
+        let of_room: Vec<&Value> = heard
+            .iter()
+            .filter(|f| f["data"]["room_id"] == room.as_str())
+            .collect();
+        assert!(
+            of_room.is_empty(),
+            "{who} heard of the room a second time: {of_room:?}"
+        );
+    }
+    let after = call_record(&app, call_id).await;
+    assert_eq!(
+        after.get("ended_at"),
+        closed.get("ended_at"),
+        "the second removal closed the record again: {after}"
+    );
+    assert_eq!(
+        after.get_str("end_reason").ok(),
+        Some("room_deleted"),
+        "{after}"
+    );
+    assert_no_media_left(
+        &app,
+        &room,
+        &[live.host.conn.as_str(), m.peer.conn.as_str()],
+    )
+    .await;
+}
+
+/// Where a deleted room's teardown stands, as [`SlowTeardown`] says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    Untold,
+    Running(ObjectId),
+    Done(ObjectId),
+}
+
+/// The module id [`SlowTeardown`] registers under. `saas` holds no membership
+/// hook, so nothing is replaced, and it runs last in `HOOK_ORDER`, after
+/// conference and chat.
+const SLOW_UNDER: &str = "saas";
+
+/// A holder of a deleted room whose teardown takes `takes`, longer than the
+/// delete waits for it. It says when it starts and when it has run to its end.
+struct SlowTeardown {
+    takes: Duration,
+    stage: tokio::sync::watch::Sender<Teardown>,
+}
+
+#[async_trait::async_trait]
+impl roomler_core::MembershipLifecycle for SlowTeardown {
+    async fn room_removed(&self, _tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        self.stage.send_replace(Teardown::Running(room_id));
+        tokio::time::sleep(self.takes).await;
+        self.stage.send_replace(Teardown::Done(room_id));
+        Ok(())
+    }
+}
+
+/// A room delete whose teardown outlasts the delete's bound
+/// (`ROOM_REMOVED_BOUND`, 5 s, in chat's room delete): the delete answers 200
+/// at the bound, without waiting for the rest, and the teardown is not cut off
+/// there: it runs on to its end in a task of its own. A delete that awaited
+/// its hook inline would answer only once the teardown ended; one that dropped
+/// the hook at the bound (a plain timeout around it) would stop the teardown
+/// half-way, as with a router removed whose people nobody told.
+#[tokio::test]
+async fn a_room_delete_answers_at_its_bound_and_its_teardown_runs_on() {
+    let bound = Duration::from_secs(5);
+    let takes = bound + Duration::from_secs(4);
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("rdel-slow").await;
+    let room = tenant.rooms[1].id.clone();
+    let (stage, mut seen) = tokio::sync::watch::channel(Teardown::Untold);
+    app.state.core.hooks.register(
+        SLOW_UNDER,
+        roomler_core::Hooks {
+            membership: Some(std::sync::Arc::new(SlowTeardown { takes, stage })),
+            ..Default::default()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let status = delete_room(&app, &tenant.tenant_id, &room, &tenant.admin.access_token).await;
+    let took = started.elapsed();
+    assert_eq!(status, 200, "the admin deletes the room");
+    assert!(
+        took >= bound,
+        "the delete did not wait for its teardown: {took:?}"
+    );
+    // The delete's own reads and writes come before the bound starts; the
+    // rest is slack for a loaded runner, well short of the teardown's end.
+    assert!(
+        took < bound + Duration::from_secs(2),
+        "the delete waited for its teardown past its bound: {took:?}"
+    );
+    let now = *seen.borrow();
+    assert_eq!(
+        now,
+        Teardown::Running(oid(&room)),
+        "the teardown is still running when the delete answers"
+    );
+
+    let ended = tokio::time::timeout(takes, seen.wait_for(|s| matches!(s, Teardown::Done(_))))
+        .await
+        .map(|done| done.map(|s| *s));
+    assert_eq!(
+        ended.ok().and_then(Result::ok),
+        Some(Teardown::Done(oid(&room))),
+        "the teardown was cut off at the delete's bound"
+    );
+}
+
+/// Delete `room`'s document and nothing else: the room is gone and no one
+/// told conference, as when a delete's request died after the delete or a pod
+/// whose code ends no call served it.
+async fn delete_room_document(app: &TestApp, room: &str) {
+    let gone = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .delete_one(bson::doc! { "_id": oid(room) })
+        .await
+        .unwrap();
+    assert_eq!(gone.deleted_count, 1, "the room's document was there");
+}
+
+/// Two passes of the reconcile on `app`, the pod's own 10 s loop. Nothing
+/// else runs: the claim refresh is a loop of its own.
+async fn two_reconciles(app: &TestApp) {
+    for _ in 0..2 {
+        roomler_ai_mod_conference::media_cluster::end_calls_of_rooms_gone(conf(app)).await;
+    }
+}
+
+/// A call runs here while its room's document goes, and nothing tells
+/// conference. The pod serving the call ends it on its own once two reconcile
+/// reads in a row found no document: each participant's socket hears that it
+/// ended because its room was deleted, no seat, router or claim of it is left,
+/// and its stats record closes. A call whose room is still there is left
+/// alone.
+#[tokio::test]
+async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it() {
+    let app = TestApp::spawn().await;
+    let mut gone = live_call(&app, "rdel-gone").await;
+    let mut m = seat_member(&app, &mut gone).await;
+    let mut kept = live_call(&app, "rdel-kept").await;
+    let room = gone.room.clone();
+    let call_id = current_call_id(&app, &room).await;
+    let kept_call = current_call_id(&app, &kept.room).await;
+
+    delete_room_document(&app, &room).await;
+    two_reconciles(&app).await;
+
+    for (who, peer) in [("the host", &mut gone.host), ("the member", &mut m.peer)] {
+        let ended = next_of(peer, "room:call_ended").await;
+        assert_eq!(ended["data"]["room_id"], room.as_str(), "{who}: {ended}");
+        assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+        let after = settle(peer).await;
+        assert!(
+            after.iter().all(|f| f["type"] != "room:call_ended"),
+            "{who} heard it twice: {after:?}"
+        );
+    }
+    assert_no_media_left(
+        &app,
+        &room,
+        &[gone.host.conn.as_str(), m.peer.conn.as_str()],
+    )
+    .await;
+    let record = call_record(&app, call_id).await;
+    assert!(
+        matches!(record.get("ended_at"), Some(bson::Bson::DateTime(_))),
+        "the call's stats record is still open: {record}"
+    );
+    assert_eq!(
+        record.get_str("end_reason").ok(),
+        Some("room_deleted"),
+        "{record}"
+    );
+
+    // The call whose room is there goes on, untouched.
+    let heard = settle(&mut kept.host).await;
+    assert!(
+        heard.iter().all(|f| f["type"] != "room:call_ended"),
+        "a call whose room is there was ended: {heard:?}"
+    );
+    let kept_rid = oid(&kept.room);
+    assert!(conf(&app).room_manager.has_room(&kept_rid));
+    assert_eq!(
+        conf(&app).room_manager.get_connection_room(&kept.host.conn),
+        Some(kept_rid)
+    );
+    // A claim exists only where there is a directory (Redis) to hold it.
+    if app.state.cluster_directory.is_some() {
+        assert!(conf(&app).media_claim_tokens.contains_key(&kept_rid));
+    }
+    let kept_record = call_record(&app, kept_call).await;
+    assert!(
+        !matches!(kept_record.get("ended_at"), Some(bson::Bson::DateTime(_))),
+        "{kept_record}"
+    );
+    assert_eq!(
+        room_as_host(&app, &kept).await["conference_status"],
+        "in_progress"
+    );
+}
+
+/// A router this pod built for a room that is already gone, with no one in it
+/// and no claim behind it (a `call/start` whose room was deleted while it was
+/// on its way builds one after the delete looked): the claim heartbeat adopts
+/// it, and the reconcile does not let it stay, it reaps it, with the claim the
+/// heartbeat took.
+#[tokio::test]
+async fn a_router_left_for_a_room_already_gone_is_reaped() {
+    let app = TestApp::spawn().await;
+    let ghost = ObjectId::new();
+    conf(&app)
+        .room_manager
+        .create_room(ghost)
+        .await
+        .expect("a router builds");
+
+    roomler_ai_mod_conference::media_cluster::refresh_media_claims_once(conf(&app)).await;
+    if app.state.cluster_directory.is_some() {
+        assert!(
+            conf(&app).media_claim_tokens.contains_key(&ghost),
+            "the claim heartbeat adopts a tokenless router"
+        );
+    }
+    two_reconciles(&app).await;
+
+    assert_no_media_left(&app, &ghost.to_hex(), &[]).await;
+}

@@ -198,8 +198,9 @@ enum Command {
     /// Pairs with Fleet RPC: `roomler exec <host> -- roomler logs --grep ICE`.
     Logs {
         /// Which log: `daemon` (this process's rolling log — the one with the
-        /// overlay/media events), `service` (the SCM host log), or `panic`
-        /// (the newest panic dump).
+        /// overlay/media events), `service` (the SCM host log), `installer`
+        /// (Windows: the per-Machine MSI's own steps, #3230), or `panic` (the
+        /// newest panic dump).
         #[arg(long, default_value = "daemon")]
         source: String,
         /// Tail size in bytes; the daemon clamps it (≤64 KiB).
@@ -323,8 +324,8 @@ enum Command {
     },
     /// Record this device's screen to an HQ MP4 in the recordings folder
     /// (FR-85). Change the folder with `roomler config set record_dir <path>`.
-    /// The daemon runs the recorder; only the person at the console may
-    /// start, stop or delete a recording.
+    /// The daemon runs the recorder; only the person at this device's screen
+    /// may start, stop or delete a recording.
     Record {
         #[command(subcommand)]
         action: RecordAction,
@@ -338,8 +339,10 @@ enum Command {
         #[command(subcommand)]
         action: KeepBusyAction,
     },
-    /// FR-90 — Claude Code sessions you run in a terminal, adopted into
-    /// Roomler: mirrored by this device and shown to you alone, read-only.
+    /// FR-137 S-B2 — `roomler hive hook`, which Claude Code still runs at the
+    /// three hooks `roomler hive adopt` once wrote into a person's own
+    /// settings (FR-90, parked). Hidden; nothing else of `hive` is left.
+    #[command(hide = true)]
     Hive {
         #[command(subcommand)]
         action: HiveAction,
@@ -461,50 +464,6 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Reach a database, an HTTP API, a Kubernetes API server or an SSH host
-    /// as a vault secret's user, through a local endpoint this device's
-    /// daemon serves (FR-90 P3-9). The secret's value never leaves the
-    /// daemon: your client connects to the endpoint with no credential, and
-    /// the endpoint signs in upstream.
-    ///
-    /// It acts as this DEVICE'S OWNER, so only root or the account the daemon
-    /// runs as may run it (on Windows: SYSTEM, an elevated administrator, or
-    /// that account), and it serves the account that ran it, no other.
-    /// It stays in the foreground: the endpoint lives while this runs, its
-    /// leases renewed before they end. Ctrl-C closes it.
-    ///
-    ///   sudo roomler connect db/orders --engine postgres --upstream db.internal:5432
-    ///   roomler connect ci/kube --engine kubernetes --upstream https://api.k8s.internal:6443 --auth bearer
-    Connect {
-        /// The secret: its path, or this organization's RRN, with no `#field`.
-        handle: String,
-        /// What the endpoint speaks.
-        #[arg(long, value_parser = ["postgres", "mongodb", "http", "kubernetes", "ssh"])]
-        engine: String,
-        /// The upstream, exactly as the secret's `audiences` names it:
-        /// `host:port` for a database, `https://host[:port]` for http and
-        /// kubernetes, `ssh://[user@]host[:port]` for ssh.
-        #[arg(long)]
-        upstream: String,
-        /// How `http` and `kubernetes` present the secret.
-        #[arg(long, value_parser = ["basic", "bearer", "client-cert"])]
-        auth: Option<String>,
-        /// A database's: named in the connection string.
-        #[arg(long)]
-        database: Option<String>,
-        /// A secret whose value is the upstream's CA (PEM).
-        #[arg(long)]
-        ca: Option<String>,
-        /// MongoDB's: the database the secret's user is defined in.
-        #[arg(long)]
-        auth_source: Option<String>,
-        /// Each lease's life in seconds (30 to 900; the daemon's default 300),
-        /// renewed before it ends.
-        #[arg(long)]
-        ttl: Option<u32>,
-        #[command(flatten)]
-        fmt: OutputFmt,
-    },
     /// stdio↔TCP pipe for OpenSSH's `ProxyCommand`, so stock `ssh`, `scp`,
     /// `rsync` and `git` can reach mesh devices BY NAME.
     ///
@@ -606,35 +565,18 @@ enum ConfigAction {
     },
 }
 
-/// `roomler record …` — FR-85 local screen recording. Every verb talks to the
-/// LOCAL daemon; `start`, `stop` and `rm` are refused unless the caller is the
-/// console user (an RDP guest must not record the console user's desktop).
+/// FR-137 S-B2 — the one `roomler hive` verb left ([`Command::Hive`]).
 #[derive(Debug, Subcommand)]
 enum HiveAction {
-    /// Mirror the Claude Code sessions YOU run in a terminal on this machine
-    /// into Roomler, where only you see them (read-only). Adds three hooks to
-    /// your own user-level Claude Code settings and touches nothing else. The
-    /// device's owner must allow it (`hive_adopt`) and map your account in
-    /// `hive_accounts`.
-    Adopt {
-        /// The Claude Code settings file. Default: `/settings.json`,
-        /// else `~/.claude/settings.json`.
-        #[arg(long)]
-        settings: Option<PathBuf>,
-    },
-    /// Take out exactly the hooks `adopt` put in; every other setting and hook
-    /// stays.
-    Unadopt {
-        #[arg(long)]
-        settings: Option<PathBuf>,
-    },
     /// What Claude Code runs at those hooks: reads the hook's input on stdin
-    /// and hands the session's new transcript lines to this device. Prints
-    /// nothing; always exits 0.
+    /// and exits 0, printing nothing.
     #[command(hide = true)]
     Hook,
 }
 
+/// `roomler record …` — FR-85 local screen recording. Every verb talks to the
+/// LOCAL daemon; `start`, `stop` and `rm` are refused unless the caller is the
+/// person at the screen the daemon shows (another session must not record it).
 #[derive(Debug, Subcommand)]
 enum RecordAction {
     /// Start recording the screen. Answers once the recorder is encoding.
@@ -879,6 +821,23 @@ fn daemon_exe(origin: Origin) -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
+/// The standalone CLI's log subscriber: `env_filter`, then #3656's cap
+/// (`upgrade_auth::may_log`). tungstenite writes the tunnel token's upgrade
+/// request at TRACE, `Authorization` header included, and no `RUST_LOG` may
+/// reach those lines. An embedded `roomlerd cli` logs through the daemon's
+/// subscriber, which carries the same cap.
+fn log_subscriber(
+    env_filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(
+            roomler_ai_remote_control::upgrade_auth::may_log,
+        ))
+}
+
 /// Entry point for the standalone `roomler` binary — parses the process's
 /// own argv.
 pub async fn run() -> Result<()> {
@@ -911,12 +870,9 @@ where
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(log_subscriber(env_filter));
 
     let cli = Cli::parse_from(args);
     match cli.command {
@@ -1102,16 +1058,17 @@ where
             ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
             ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
         },
-        Command::Hive { action } => match action {
-            HiveAction::Adopt { settings } => {
-                crate::hive_hooks::adopt(settings, origin == Origin::EmbeddedInDaemon)
-            }
-            HiveAction::Unadopt { settings } => crate::hive_hooks::unadopt(settings),
-            HiveAction::Hook => {
-                crate::hive_hooks::hook().await;
-                Ok(())
-            }
-        },
+        // FR-137 S-B2 — take the hook's input and succeed, so no session's
+        // start, stop or end fails on a hook this build no longer serves.
+        Command::Hive {
+            action: HiveAction::Hook,
+        } => {
+            use std::io::Read as _;
+            let _ = std::io::stdin()
+                .take(1024 * 1024)
+                .read_to_end(&mut Vec::new());
+            Ok(())
+        }
         Command::Record { action } => match action {
             RecordAction::Start {
                 fps,
@@ -1204,29 +1161,6 @@ where
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
-        }
-        Command::Connect {
-            handle,
-            engine,
-            upstream,
-            auth,
-            database,
-            ca,
-            auth_source,
-            ttl,
-            fmt,
-        } => {
-            let args = tunnel_core::localapi::ConnectArgs {
-                handle,
-                engine,
-                upstream,
-                auth,
-                database,
-                ca,
-                auth_source,
-                ttl_s: ttl,
-            };
-            crate::connectcmd::run(args, fmt.json).await
         }
         Command::Proxy { host, port } => crate::sshcmd::proxy(&host, port).await,
         Command::Diag { action } => match action {
@@ -1327,6 +1261,26 @@ fn hostname_lossy() -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// #3656 — no `RUST_LOG` writes the tunnel token's upgrade request, and
+    /// everything else keeps what the spec gives it.
+    #[test]
+    fn no_rust_log_writes_the_upgrade_request() {
+        use tracing::Level;
+        let trace = tracing_subscriber::EnvFilter::new("trace");
+        let dispatch = tracing::Dispatch::new(log_subscriber(trace));
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(!tracing::enabled!(
+                target: "tungstenite::handshake::client",
+                Level::TRACE
+            ));
+            assert!(tracing::enabled!(
+                target: "tungstenite::handshake::client",
+                Level::DEBUG
+            ));
+            assert!(tracing::enabled!(target: "roomler_cli::forward", Level::TRACE));
+        });
+    }
 
     #[test]
     fn parses_forward() {
@@ -1655,102 +1609,6 @@ mod tests {
                 assert_eq!((page, per_page), (1, 50));
             }
             other => panic!("expected Devices, got {other:?}"),
-        }
-    }
-
-    /// FR-90 P3-9-2b — `roomler connect`: a handle, an engine and an
-    /// upstream are required; the rest are the daemon's to check, but an
-    /// engine or an auth outside the words it knows is refused here first.
-    #[test]
-    fn parses_connect() {
-        let cli = Cli::try_parse_from([
-            "roomler",
-            "connect",
-            "ci/kube",
-            "--engine",
-            "kubernetes",
-            "--upstream",
-            "https://api.k8s.internal:6443",
-            "--auth",
-            "bearer",
-            "--ttl",
-            "120",
-            "--json",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Connect {
-                handle,
-                engine,
-                upstream,
-                auth,
-                database,
-                ca,
-                auth_source,
-                ttl,
-                fmt,
-            } => {
-                assert_eq!(
-                    (handle.as_str(), engine.as_str(), upstream.as_str()),
-                    ("ci/kube", "kubernetes", "https://api.k8s.internal:6443")
-                );
-                assert_eq!(auth.as_deref(), Some("bearer"));
-                assert_eq!((database, ca, auth_source), (None, None, None));
-                assert_eq!(ttl, Some(120));
-                assert!(fmt.json);
-            }
-            other => panic!("expected Connect, got {other:?}"),
-        }
-        let cli = Cli::try_parse_from([
-            "roomler",
-            "connect",
-            "db/orders",
-            "--engine",
-            "mongodb",
-            "--upstream",
-            "db.internal:27017",
-            "--auth-source",
-            "orders",
-            "--database",
-            "orders",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Connect { ref auth_source, ref database, ttl: None, .. }
-                if auth_source.as_deref() == Some("orders") && database.as_deref() == Some("orders")
-        ));
-        for bad in [
-            &[
-                "roomler",
-                "connect",
-                "db/orders",
-                "--upstream",
-                "db.internal:5432",
-            ][..],
-            &["roomler", "connect", "db/orders", "--engine", "postgres"],
-            &[
-                "roomler",
-                "connect",
-                "db/orders",
-                "--engine",
-                "oracle",
-                "--upstream",
-                "db.internal:1521",
-            ],
-            &[
-                "roomler",
-                "connect",
-                "api/x",
-                "--engine",
-                "http",
-                "--upstream",
-                "https://api.internal",
-                "--auth",
-                "digest",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -18,7 +18,16 @@
 //! - **A final verdict (2xx or 4xx) this process may not delete** — typically a
 //!   sidecar another account wrote — is recorded in `<log dir>/crash-verdicts.txt`
 //!   and never sent again (#1748). Before, it went out again on every drain:
-//!   a 4xx forever, or a duplicate crash.
+//!   a 4xx forever, or a duplicate crash. On Windows the service removes one in
+//!   the machine's `crashes` once that ledger names it (#3799), so that one is
+//!   logged at INFO; one kept anywhere else stays, with a WARN.
+//!
+//! #4022 — each answered sidecar gets two lines, in this order. The drain's
+//! says what the server did: `uploaded`, or `server rejected payload` with the
+//! status and the body. Then `settle`'s, after it tried the delete, says what
+//! became of the file: `sidecar deleted`, or one of the lines above for a
+//! sidecar this process may not delete. Until #4022 the drain said `uploaded +
+//! deleted` (and `deleting` for a 4xx) before the delete was tried.
 //!
 //! ## Concurrency
 //!
@@ -30,7 +39,7 @@
 //!
 //! ## Where this runs
 //!
-//! Spawned as a `tokio::task::spawn` from `main.rs` AFTER the first
+//! Spawned as a `tokio::task::spawn` from `app.rs` AFTER the first
 //! successful WS connect — proves the agent JWT is valid + the
 //! network can reach roomler.ai, so we're not hammering an offline
 //! host with retry storms. Gated through `tokio::sync::Notify` from
@@ -50,7 +59,7 @@ use crate::crash_recorder;
 /// + the K8s ingress before reaching the API pod.
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// rc.58: cadence for the periodic mid-session drain in `main.rs`.
+/// rc.58: cadence for the periodic mid-session drain in `app.rs`.
 /// Before rc.58 the drain ran ONLY at startup; long-running agents
 /// that crashed once early (during, say, a flaky-network cold start
 /// like the field-test host 2026-05-24 watchdog-loop) never got their
@@ -58,7 +67,7 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// days away. 5 min keeps the loop cheap (one HTTP HEAD-equivalent
 /// per drain when no sidecars are pending) while ensuring the admin
 /// UI sees evidence within a single coffee break of the network
-/// coming back. Pub so `main.rs` can import without re-defining.
+/// coming back. Pub so `app.rs` can import without re-defining.
 pub const CRASH_DRAIN_INTERVAL_SECS: u64 = 5 * 60;
 
 /// Minimum delay between consecutive sidecar POSTs. The backend's
@@ -82,7 +91,8 @@ const INTER_REQUEST_DELAY: Duration = Duration::from_millis(1100);
 /// drain: this task runs for the life of the process, and the token it
 /// started with may since have been renewed.
 pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::TokenSlot) {
-    let ledger = verdicts_path();
+    let ledger = verdicts_dir();
+    let swept = swept_dir();
     let settled = ledger.as_deref().map(load_settled).unwrap_or_default();
     let pending = without_settled(crash_recorder::pending_all(), &settled);
     if pending.is_empty() {
@@ -104,11 +114,9 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
     let url = format!("{}/api/agent/crash", cfg.server_url.trim_end_matches('/'));
     let agent_token = token.get();
 
-    let mut ok_count = 0u32;
-    let mut keep_count = 0u32;
-    let mut drop_count = 0u32;
+    let mut tally = Tally::default();
     let mut first = true;
-    for (path, payload) in pending {
+    for (sidecar, payload) in pending {
         // Inter-request delay to stay under the backend's 60-req/min
         // rate-limit (tower_governor). Skipped for the first upload
         // so a single-sidecar drain is still instant.
@@ -116,43 +124,73 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
             tokio::time::sleep(INTER_REQUEST_DELAY).await;
         }
         first = false;
-        match upload_one(&client, &url, &agent_token, &payload).await {
-            UploadOutcome::Accepted => {
-                tracing::info!(file = %path.display(), "crash_uploader: uploaded + deleted");
-                settle(&path, ledger.as_deref(), "uploaded", |p| {
-                    std::fs::remove_file(p)
-                });
-                ok_count += 1;
-            }
-            UploadOutcome::Rejected { status, body } => {
-                tracing::warn!(
-                    file = %path.display(),
-                    status = %status,
-                    body = %body,
-                    "crash_uploader: server rejected payload; deleting (4xx is permanent)"
-                );
-                settle(&path, ledger.as_deref(), "rejected (4xx)", |p| {
-                    std::fs::remove_file(p)
-                });
-                drop_count += 1;
-            }
-            UploadOutcome::Transient { reason } => {
-                tracing::warn!(
-                    file = %path.display(),
-                    reason = %reason,
-                    "crash_uploader: transient failure; keeping sidecar for next startup"
-                );
-                keep_count += 1;
-            }
-        }
+        let outcome = upload_one(&client, &url, &agent_token, &payload).await;
+        answered(
+            &sidecar,
+            outcome,
+            ledger.as_deref(),
+            swept.as_deref(),
+            crash_recorder::Sidecar::remove,
+            &mut tally,
+        );
     }
 
     tracing::info!(
-        uploaded = ok_count,
-        kept = keep_count,
-        dropped = drop_count,
+        uploaded = tally.uploaded,
+        kept = tally.kept,
+        dropped = tally.dropped,
         "crash_uploader: drain complete"
     );
+}
+
+/// What one drain did with the sidecars it sent, for its last line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    uploaded: u32,
+    kept: u32,
+    dropped: u32,
+}
+
+/// #4022 — one sidecar the server answered. The drain's own line says what the
+/// server did. A final verdict (2xx or 4xx) then settles the file ([`settle`]),
+/// which says what became of it, once, after it tried: where this process may
+/// not delete it (a person's drain in the machine's `crashes`, #3799), nothing
+/// says it was deleted. `remove` is [`crash_recorder::Sidecar::remove`]
+/// outside the tests.
+fn answered(
+    sidecar: &crash_recorder::Sidecar,
+    outcome: UploadOutcome,
+    ledger: Option<&Path>,
+    swept: Option<&Path>,
+    remove: impl FnOnce(&crash_recorder::Sidecar) -> std::io::Result<()>,
+    tally: &mut Tally,
+) {
+    let file = sidecar.path().display();
+    match outcome {
+        UploadOutcome::Accepted => {
+            tracing::info!(file = %file, "crash_uploader: uploaded");
+            settle(sidecar, ledger, swept, "uploaded", remove);
+            tally.uploaded += 1;
+        }
+        UploadOutcome::Rejected { status, body } => {
+            tracing::warn!(
+                file = %file,
+                status = %status,
+                body = %body,
+                "crash_uploader: server rejected payload (4xx is permanent)"
+            );
+            settle(sidecar, ledger, swept, "rejected (4xx)", remove);
+            tally.dropped += 1;
+        }
+        UploadOutcome::Transient { reason } => {
+            tracing::warn!(
+                file = %file,
+                reason = %reason,
+                "crash_uploader: transient failure; keeping sidecar for next startup"
+            );
+            tally.kept += 1;
+        }
+    }
 }
 
 /// Build the reqwest client with the same posture as
@@ -249,8 +287,9 @@ async fn classify_status_for_test(status: StatusCode, body: &str) -> UploadOutco
     classify_status(status, || async move { owned }).await
 }
 
-/// Where the verdicts on undeletable sidecars are kept: this process's own
-/// log folder, which it can always write. `None` without file logging.
+/// The folder that keeps the verdicts on undeletable sidecars
+/// ([`crash_recorder::VERDICTS_FILE`]): this process's own log folder, which
+/// it can always write. `None` without file logging.
 ///
 /// A sidecar gets a FINAL verdict when it is uploaded, or rejected as
 /// permanent. Normally it is then deleted. One this process may not delete is
@@ -260,86 +299,122 @@ async fn classify_status_for_test(status: StatusCode, body: &str) -> UploadOutco
 /// sent it again: a rejected report as another 4xx forever (field: the
 /// supervised MacBook, one 2026-09-08 report re-sent every five minutes), and
 /// an accepted one as a duplicate crash.
-fn verdicts_path() -> Option<std::path::PathBuf> {
-    crate::logging::log_dir().map(|d| d.join("crash-verdicts.txt"))
+fn verdicts_dir() -> Option<std::path::PathBuf> {
+    crate::logging::log_dir()
 }
 
-/// A sidecar's identity for the ledger: `<len>:<mtime> <file name>`. A file
-/// nobody can delete does not change, and a new crash never reuses a name
-/// (names carry the crash time and pid).
-fn signature(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let name = path.file_name()?.to_str()?;
-    Some(format!("{}:{} {}", meta.len(), mtime, name))
+/// #3799 — the folder whose records the service removes once a drainer's
+/// ledger names them: the machine's `crashes`, on Windows
+/// (`crash_recorder::sweep_settled`). A worker that runs as the signed-in
+/// person reads the supervisor's records there but may not delete them
+/// (`Seal::Readable`). A per-user install runs no service: a record an
+/// earlier per-Machine install left there stays until a service sweeps again.
+/// `None` off Windows, where nothing removes a record this process may not.
+fn swept_dir() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        crash_recorder::crashes_dir_for(crash_recorder::WriterContext::Supervisor).ok()
+    } else {
+        None
+    }
 }
 
-/// Every recorded signature. A missing or unreadable ledger is an empty one:
-/// the cost is one more send, never a lost crash.
-fn load_settled(ledger: &Path) -> std::collections::HashSet<String> {
-    std::fs::read_to_string(ledger)
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Whose sidecar this process may not delete, outside [`swept_dir`]: measured
+/// on macOS, where `sudo` keeps `HOME` ([`verdicts_dir`]). On Windows a
+/// drainer reads another account's records only in [`swept_dir`], SYSTEM's;
+/// its own folder holds what its own account's processes wrote.
+const OWNER: &str = if cfg!(windows) {
+    ""
+} else {
+    " (typically one another account wrote, e.g. a root process run with this user's HOME)"
+};
+
+/// Every signature recorded in the ledger in `dir`. A missing or unreadable
+/// ledger is an empty one: the cost is one more send, never a lost crash.
+fn load_settled(dir: &Path) -> std::collections::HashSet<String> {
+    crash_recorder::read_verdicts(dir)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
-fn record_settled(ledger: &Path, sig: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ledger)?;
-    writeln!(f, "{sig}")
+fn record_settled(dir: &Path, sig: &str) -> std::io::Result<()> {
+    crash_recorder::append_verdict(dir, sig)
 }
 
-/// The queue less every sidecar that already has a final verdict.
+/// The queue less every sidecar that already has a final verdict. A
+/// sidecar's identity for the ledger is `<len>:<mtime> <file name>`
+/// ([`crash_recorder::Sidecar::signature`]): a file nobody can delete does
+/// not change, and a new crash never reuses a name (names carry the crash time
+/// and pid).
 fn without_settled<T>(
-    pending: Vec<(std::path::PathBuf, T)>,
+    pending: Vec<(crash_recorder::Sidecar, T)>,
     settled: &std::collections::HashSet<String>,
-) -> Vec<(std::path::PathBuf, T)> {
+) -> Vec<(crash_recorder::Sidecar, T)> {
     if settled.is_empty() {
         return pending;
     }
     pending
         .into_iter()
-        .filter(|(path, _)| !signature(path).is_some_and(|s| settled.contains(&s)))
+        .filter(|(sidecar, _)| !settled.contains(&sidecar.signature()))
         .collect()
 }
 
 /// A sidecar has its final verdict: delete it, or, when this process may not,
 /// record the verdict so the sidecar is never sent again. `remove` is
-/// `std::fs::remove_file` outside the tests.
+/// [`crash_recorder::Sidecar::remove`] outside the tests: below the machine's
+/// folder, by handle through the folder it was read from (FR-145). `swept` is
+/// [`swept_dir`]: a recorded sidecar there is the service's to remove, so
+/// nothing is wrong and the line is INFO; one anywhere else stays, a WARN.
+/// #4022 — the one line that says what became of the file, said after the
+/// delete was tried: deleted, gone already, or kept with its verdict recorded.
 fn settle(
-    path: &Path,
+    sidecar: &crash_recorder::Sidecar,
     ledger: Option<&Path>,
+    swept: Option<&Path>,
     verdict: &str,
-    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    remove: impl FnOnce(&crash_recorder::Sidecar) -> std::io::Result<()>,
 ) {
-    let err = match remove(path) {
-        Ok(()) => return,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+    let path = sidecar.path();
+    let err = match remove(sidecar) {
+        Ok(()) => {
+            tracing::info!(file = %path.display(), "crash_uploader: {verdict}; sidecar deleted");
+            return;
+        }
+        // Another drainer, or the service's sweep, took it since the scan.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                file = %path.display(),
+                "crash_uploader: {verdict}; the sidecar was gone already"
+            );
+            return;
+        }
         Err(e) => e,
     };
-    match (ledger, signature(path)) {
-        (Some(l), Some(sig)) if record_settled(l, &sig).is_ok() => tracing::warn!(
-            file = %path.display(),
-            error = %err,
-            ledger = %l.display(),
-            "crash_uploader: {verdict}, but this process may not delete the sidecar \
-             (typically one another account wrote, e.g. a root process run with this \
-             user's HOME); its verdict is recorded so it is not sent again. Remove it \
-             as the account that owns it"
-        ),
+    match ledger {
+        Some(l) if record_settled(l, &sidecar.signature()).is_ok() => {
+            let ledger = l.join(crash_recorder::VERDICTS_FILE);
+            if swept.is_some_and(|dir| path.parent() == Some(dir)) {
+                tracing::info!(
+                    file = %path.display(),
+                    error = %err,
+                    ledger = %ledger.display(),
+                    "crash_uploader: {verdict}; this process may not delete the sidecar in the \
+                     machine's crashes folder, so its verdict is recorded and it is not sent \
+                     again. The service removes it once this ledger names it"
+                );
+            } else {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %err,
+                    ledger = %ledger.display(),
+                    "crash_uploader: {verdict}, but this process may not delete the sidecar\
+                     {OWNER}; its verdict is recorded so it is not sent again. Remove it as \
+                     the account that owns it"
+                );
+            }
+        }
         _ => tracing::warn!(
             file = %path.display(),
             error = %err,
@@ -349,10 +424,10 @@ fn settle(
     }
 }
 
-/// Delete a sidecar at `path` if it exists. Idempotent.
+/// Delete a sidecar if it is still there. Idempotent.
 #[allow(dead_code)] // used by future Phase 2 + manual smoke tooling
-pub fn delete_sidecar(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
+pub fn delete_sidecar(sidecar: &crash_recorder::Sidecar) -> std::io::Result<()> {
+    match sidecar.remove() {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -363,8 +438,14 @@ pub fn delete_sidecar(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn denied(_: &Path) -> std::io::Result<()> {
+    fn denied(_: &crash_recorder::Sidecar) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    /// The sidecar at `path`, as the drain reads one outside the machine's
+    /// folder.
+    fn plain(path: &Path) -> crash_recorder::Sidecar {
+        crash_recorder::Sidecar::plain(path).expect("a sidecar the test wrote")
     }
 
     /// The field bug: a rejected sidecar this process may not delete was sent
@@ -373,14 +454,15 @@ mod tests {
     #[test]
     fn an_undeletable_verdict_is_recorded_and_never_sent_again() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("1788894634-71069.json");
-        std::fs::write(&sidecar, b"{}").unwrap();
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let path = dir.path().join("1788894634-71069.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let sidecar = plain(&path);
+        let ledger = dir.path();
 
-        settle(&sidecar, Some(&ledger), "rejected (4xx)", denied);
+        settle(&sidecar, Some(ledger), None, "rejected (4xx)", denied);
 
-        assert!(sidecar.exists(), "the test's remove refused, so it stays");
-        let left = without_settled(vec![(sidecar.clone(), ())], &load_settled(&ledger));
+        assert!(path.exists(), "the test's remove refused, so it stays");
+        let left = without_settled(vec![(plain(&path), ())], &load_settled(ledger));
         assert!(
             left.is_empty(),
             "a settled sidecar must not be queued again: {left:?}"
@@ -392,16 +474,23 @@ mod tests {
     #[test]
     fn a_deletable_sidecar_leaves_no_record() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("1.json");
-        std::fs::write(&sidecar, b"{}").unwrap();
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let path = dir.path().join("1.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let ledger = dir.path();
 
-        settle(&sidecar, Some(&ledger), "uploaded", |p| {
-            std::fs::remove_file(p)
-        });
+        settle(
+            &plain(&path),
+            Some(ledger),
+            None,
+            "uploaded",
+            crash_recorder::Sidecar::remove,
+        );
 
-        assert!(!sidecar.exists());
-        assert!(!ledger.exists(), "nothing to record for a deleted sidecar");
+        assert!(!path.exists());
+        assert!(
+            !ledger.join(crash_recorder::VERDICTS_FILE).exists(),
+            "nothing to record for a deleted sidecar"
+        );
     }
 
     /// A new crash is never mistaken for a settled one: only the recorded
@@ -413,21 +502,250 @@ mod tests {
         let new = dir.path().join("200-2.json");
         std::fs::write(&old, b"{}").unwrap();
         std::fs::write(&new, b"{}").unwrap();
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let ledger = dir.path();
 
         let none = without_settled(
-            vec![(old.clone(), ()), (new.clone(), ())],
-            &load_settled(&ledger),
+            vec![(plain(&old), ()), (plain(&new), ())],
+            &load_settled(ledger),
         );
         assert_eq!(none.len(), 2, "no ledger yet: nothing is skipped");
 
-        settle(&old, Some(&ledger), "rejected (4xx)", denied);
+        settle(&plain(&old), Some(ledger), None, "rejected (4xx)", denied);
         let left = without_settled(
-            vec![(old.clone(), ()), (new.clone(), ())],
-            &load_settled(&ledger),
+            vec![(plain(&old), ()), (plain(&new), ())],
+            &load_settled(ledger),
         );
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].0, new);
+        assert_eq!(left[0].0.path(), new);
+    }
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// #3799 — a recorded sidecar in the folder the service sweeps is the
+    /// service's to remove: nothing is wrong, so the line is INFO and says the
+    /// service removes it. One anywhere else stays: a WARN that says to remove
+    /// it. Both are recorded, and the next drain skips both.
+    #[test]
+    fn a_record_the_service_removes_is_info_and_any_other_a_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let swept = dir.path().join("crashes");
+        std::fs::create_dir(&swept).unwrap();
+        let theirs = swept.join("100-1.json");
+        let elsewhere = dir.path().join("200-2.json");
+        std::fs::write(&theirs, b"{}").unwrap();
+        std::fs::write(&elsewhere, b"{}").unwrap();
+        let ledger = dir.path();
+
+        let line = logged(|| {
+            settle(
+                &plain(&theirs),
+                Some(ledger),
+                Some(swept.as_path()),
+                "uploaded",
+                denied,
+            )
+        });
+        assert!(line.trim_start().starts_with("INFO "), "{line}");
+        assert!(
+            line.contains("The service removes it once this ledger names it"),
+            "{line}"
+        );
+        assert!(!line.contains("Remove it as the account"), "{line}");
+
+        let line = logged(|| {
+            settle(
+                &plain(&elsewhere),
+                Some(ledger),
+                Some(swept.as_path()),
+                "uploaded",
+                denied,
+            )
+        });
+        assert!(line.trim_start().starts_with("WARN "), "{line}");
+        assert!(
+            line.contains("Remove it as the account that owns it"),
+            "{line}"
+        );
+        assert!(!line.contains("The service removes it"), "{line}");
+
+        let left = without_settled(
+            vec![(plain(&theirs), ()), (plain(&elsewhere), ())],
+            &load_settled(ledger),
+        );
+        assert!(left.is_empty(), "both are recorded: {left:?}");
+    }
+
+    /// The two answers that settle a sidecar: accepted, and rejected for good.
+    fn final_answers() -> [(UploadOutcome, &'static str); 2] {
+        [
+            (UploadOutcome::Accepted, "crash_uploader: uploaded "),
+            (
+                UploadOutcome::Rejected {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    body: "log_tail too big".into(),
+                },
+                "crash_uploader: server rejected payload (4xx is permanent) ",
+            ),
+        ]
+    }
+
+    /// #4022 — the field bug: a person's drain logged `uploaded + deleted` for
+    /// a record in the machine's `crashes`, then, 0.6 ms later, that it may not
+    /// delete it. An accepted or rejected sidecar this process may not delete
+    /// is never said deleted: the server's line comes first, then `settle`'s
+    /// words for a sidecar it may not delete, in the service's folder or
+    /// anywhere else, and nothing more.
+    #[test]
+    fn a_sidecar_this_process_may_not_delete_is_never_said_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let swept = dir.path().join("crashes");
+        std::fs::create_dir(&swept).unwrap();
+        let ledger = dir.path();
+        let folders = [
+            (
+                swept.clone(),
+                "The service removes it once this ledger names it",
+            ),
+            (
+                dir.path().to_path_buf(),
+                "Remove it as the account that owns it",
+            ),
+        ];
+        let mut tally = Tally::default();
+        for (f, (folder, settled)) in folders.into_iter().enumerate() {
+            for (o, (outcome, server)) in final_answers().into_iter().enumerate() {
+                let path = folder.join(format!("{f}{o}-1.json"));
+                std::fs::write(&path, b"{}").unwrap();
+                let log = logged(|| {
+                    answered(
+                        &plain(&path),
+                        outcome,
+                        Some(ledger),
+                        Some(swept.as_path()),
+                        denied,
+                        &mut tally,
+                    )
+                });
+                assert!(
+                    !log.contains("deleted") && !log.contains("deleting"),
+                    "{log}"
+                );
+                let lines: Vec<&str> = log.lines().collect();
+                assert_eq!(lines.len(), 2, "the server's line, then settle's: {log}");
+                assert!(lines[0].contains(server), "{log}");
+                assert!(lines[1].contains(settled), "{log}");
+                assert!(path.exists(), "the test's remove refused, so it stays");
+            }
+        }
+        let expected = Tally {
+            uploaded: 2,
+            kept: 0,
+            dropped: 2,
+        };
+        assert_eq!(tally, expected);
+    }
+
+    /// #4022 — the control: a sidecar this process deletes is said deleted
+    /// once, by `settle`, after the server's line, and the file is gone. A
+    /// transient answer deletes nothing and keeps the sidecar for the next
+    /// drain.
+    #[test]
+    fn a_sidecar_is_said_deleted_once_after_the_servers_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tally = Tally::default();
+        for (n, (outcome, server)) in final_answers().into_iter().enumerate() {
+            let path = dir.path().join(format!("{n}-1.json"));
+            std::fs::write(&path, b"{}").unwrap();
+            let log = logged(|| {
+                answered(
+                    &plain(&path),
+                    outcome,
+                    Some(dir.path()),
+                    None,
+                    crash_recorder::Sidecar::remove,
+                    &mut tally,
+                )
+            });
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 2, "{log}");
+            assert!(lines[0].contains(server), "{log}");
+            assert!(lines[1].contains("; sidecar deleted"), "{log}");
+            assert_eq!(log.matches("deleted").count(), 1, "said once: {log}");
+            assert!(!path.exists());
+        }
+
+        let path = dir.path().join("9-1.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let log = logged(|| {
+            answered(
+                &plain(&path),
+                UploadOutcome::Transient {
+                    reason: "HTTP 503".into(),
+                },
+                Some(dir.path()),
+                None,
+                |_| panic!("a transient answer deletes nothing"),
+                &mut tally,
+            )
+        });
+        assert!(log.contains("keeping sidecar"), "{log}");
+        assert!(path.exists());
+        let expected = Tally {
+            uploaded: 1,
+            kept: 1,
+            dropped: 1,
+        };
+        assert_eq!(tally, expected);
+        assert!(
+            !dir.path().join(crash_recorder::VERDICTS_FILE).exists(),
+            "nothing to record for a deleted sidecar"
+        );
+    }
+
+    /// #3799 — the folder the uploader calls the service's is the one the
+    /// service sweeps, the machine's `crashes` (`sweep_settled`), and only on
+    /// Windows: nothing removes a record anywhere else.
+    #[test]
+    fn only_windows_has_a_folder_the_service_sweeps() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                swept_dir(),
+                Some(crate::appdirs::machine_global_dir().join("crashes"))
+            );
+            assert_eq!(OWNER, "", "no root running with this user's HOME there");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(swept_dir(), None);
+            assert!(OWNER.contains("this user's HOME"), "{OWNER}");
+        }
     }
 
     #[tokio::test]
@@ -546,36 +864,23 @@ mod tests {
 
     #[test]
     fn delete_sidecar_is_idempotent_when_file_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "crash_uploader_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("nonexistent.json");
-        // Don't create the dir — call delete on a path that
-        // definitely doesn't exist. Must succeed (NotFound is mapped
-        // to Ok).
-        assert!(delete_sidecar(&path).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.json");
+        std::fs::write(&path, b"{}").expect("write");
+        let sidecar = plain(&path);
+        std::fs::remove_file(&path).unwrap();
+        // The sidecar is no longer there: must succeed (NotFound is
+        // mapped to Ok).
+        assert!(delete_sidecar(&sidecar).is_ok());
     }
 
     #[test]
     fn delete_sidecar_removes_existing_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "crash_uploader_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create_dir_all");
-        let path = dir.join("present.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("present.json");
         std::fs::write(&path, b"{}").expect("write");
         assert!(path.exists());
-        assert!(delete_sidecar(&path).is_ok());
+        assert!(delete_sidecar(&plain(&path)).is_ok());
         assert!(!path.exists());
-        // Cleanup.
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -40,6 +40,9 @@ pub mod child;
 /// ever waits on a resolver that has stopped answering for a name it has
 /// resolved before.
 pub mod ctl_dns;
+/// #3932 — the options every `.deb` install of ours hands dpkg (the daemon's
+/// own package, the companion's, the CLI's `self-update`), defined once.
+pub mod dpkg;
 /// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
 /// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
 pub mod driver;
@@ -50,6 +53,9 @@ pub mod evidence;
 /// connections (bounded) while none is.
 pub mod flow_listener;
 pub mod forward;
+/// #3530 — whether a carrier's silence is this agent's own pause (a freeze, a
+/// host sleep): wording for the lines that convict a carrier, never a verdict.
+pub mod frozen;
 /// LocalAPI — the daemon's local control surface (P1: read-only protocol).
 ///
 /// P3e lever E moved the module OUT to the leaf crate `roomler-localapi` and

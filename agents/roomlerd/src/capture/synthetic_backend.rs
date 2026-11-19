@@ -436,6 +436,11 @@ impl ScreenCapture for SyntheticCapture {
     fn backend(&self) -> &'static str {
         "synthetic"
     }
+
+    /// FR-119 P2b-3 — no display: the frames are painted, not captured.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// Construct the synthetic capture honouring the same `target_fps` +

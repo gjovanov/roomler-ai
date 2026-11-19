@@ -55,10 +55,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roomler_ai_remote_control::models::AgentCaps;
+use roomler_ai_remote_control::models::{AgentCaps, RecordCap, Unavailable};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
@@ -124,7 +124,14 @@ pub enum DelegateFrame {
     /// `no-gui-session`; the worker is in the GUI session and holds the real
     /// grants. While a worker is attached, the DEVICE is a capture target, and
     /// the row has to say so or the dashboard tells the operator it is not one.
-    WorkerCaps { caps: Box<AgentCaps> },
+    WorkerCaps {
+        caps: Box<AgentCaps>,
+        /// FR-138 P2b — what this worker does with a delegated session beyond
+        /// serving it, as words matched by equality ([`KEEP_DELEGATED`]). An
+        /// older worker sends none, and an older daemon ignores the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+    },
     /// Daemon → worker: everything the daemon resolved while answering
     /// `rc:session.request`, which the worker's `rc:sdp.offer` handler needs.
     SessionParams(Box<SessionParams>),
@@ -161,6 +168,466 @@ pub enum DelegateFrame {
         id: u64,
         info: Box<tunnel_core::localapi::KeepBusyInfo>,
     },
+    /// FR-43 P3a — worker → daemon: the worker's own log lines, as its upload
+    /// layer captured them. A worker with no enrollment has no row to upload
+    /// them on, so the daemon uploads them on its own, each marked as the
+    /// worker's ([`mark_worker_line`]). At most [`WORKER_LOG_LINES_PER_FRAME`]
+    /// a frame. An older daemon skips the frame, and the lines stay on the Mac.
+    WorkerLogs {
+        lines: Vec<crate::logs_upload::LogLine>,
+    },
+    /// FR-43 P3b — worker → daemon: the person's own consent floor, from the
+    /// file their row used to run on. Sent at attach and again when it changes.
+    /// A one-row Mac's daemon takes the stricter of it and its own for every
+    /// org's session ([`DelegateHost::person_floor`]); any other daemon, and an
+    /// older one, skips it.
+    PersonFloor(PersonFloor),
+    /// FR-138 P2b — daemon → worker: this loop's control socket was lost on a
+    /// transient exit, and the daemon will claim these sessions on its next
+    /// connection. The worker keeps their peers for `keep_ms` at most, from the
+    /// frame's receipt. Sent only to a worker that said [`KEEP_DELEGATED`].
+    Detached {
+        /// Hex, like every other id this channel carries.
+        sessions: Vec<String>,
+        /// The exit's label ([`crate::session_table::ConnExit::label`]).
+        exit: String,
+        /// The host's addresses moved: a kept peer closes once it leaves
+        /// `Connected`, since the remote-control path has no ICE restart.
+        netchange: bool,
+        keep_ms: u64,
+    },
+    /// FR-138 P2b — daemon → worker: the server accepted the claim, and the
+    /// session goes on.
+    Resumed { session_id: String },
+    /// FR-138 P2b — daemon → worker: close this session (the daemon's deadline,
+    /// a terminal exit, a claim it can no longer make). The worker's own
+    /// deadline closes a kept session anyway, so a lost `Close` leaks nothing.
+    Close { session_id: String, reason: String },
+    /// FR-138 P2b — daemon → worker: the server ended a session the daemon
+    /// keeps a record of (a kick, the maximum length, a refused claim, the
+    /// viewer's hang-up), with the `reason` and `limit` of its `rc:terminate`.
+    /// An order, so the worker serves it wherever it serves orders, its own
+    /// connection down included; the `Terminate` that crosses beside it waits
+    /// for that connection. Whichever of the two the worker reads first ends
+    /// the session, and the other finds nothing. Sent only to the worker whose
+    /// records these are, which said [`KEEP_DELEGATED`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
+    },
+}
+
+/// FR-138 P2b — the word a worker says in [`DelegateFrame::WorkerCaps`] when it
+/// keeps a delegated session's peer through the daemon's control-socket loss.
+/// Matched by equality, as `RpcCap` is.
+pub const KEEP_DELEGATED: &str = "keep-delegated";
+
+/// FR-138 P2b — the words this worker says in its caps frame: it keeps a
+/// delegated session's peer through the daemon's control-socket loss, on the
+/// daemon's orders ([`KEEP_DELEGATED`]).
+///
+/// #3864 — `relays_consent`: a worker with no enrollment (a one-row Mac's)
+/// lists and decides the root half's consent questions for its person's app.
+pub fn worker_features(relays_consent: bool) -> Vec<String> {
+    let mut words = vec![KEEP_DELEGATED.to_string()];
+    if relays_consent {
+        words.push(crate::consent_relay::RELAY_CONSENT.to_string());
+    }
+    words
+}
+
+/// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
+/// added here too, or the daemon never hears it.
+const WORKER_FEATURE_WORDS: [&str; 2] = [KEEP_DELEGATED, crate::consent_relay::RELAY_CONSENT];
+
+/// FR-138 P2b — what the daemon keeps of its worker's feature words, as
+/// [`worker_words`] keeps its capability words (#3706): the words this build
+/// knows ([`WORKER_FEATURE_WORDS`]), each once, in the worker's order,
+/// matched by equality. Any other word is dropped, a near miss of a known
+/// word too.
+fn worker_feature_words(features: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for word in features {
+        if WORKER_FEATURE_WORDS.contains(&word.as_str()) && !kept.contains(word) {
+            kept.push(word.clone());
+        }
+    }
+    kept
+}
+
+/// `skip_serializing_if` for a flag whose `false` an older reader already
+/// assumes.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// FR-138 P2b — the daemon's orders about the sessions it will claim, on the
+/// worker's own lane: served wherever the worker's signalling loop waits, its
+/// own connection's select and its backoff, so a roll's orders and the
+/// deadlines are served while the worker's own socket is down too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerOrder {
+    /// [`DelegateFrame::Detached`].
+    Detached {
+        sessions: Vec<String>,
+        exit: String,
+        netchange: bool,
+        keep_ms: u64,
+    },
+    /// [`DelegateFrame::Resumed`].
+    Resumed { session_id: String },
+    /// [`DelegateFrame::Close`].
+    Close { session_id: String, reason: String },
+    /// [`DelegateFrame::Ended`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        limit: Option<String>,
+    },
+    /// The channel to the daemon ended, and both processes may live on (D5):
+    /// the delegated sessions' links stop waiting until the next attach.
+    /// `cause` says why the channel ended.
+    Paused { cause: String },
+    /// The channel is back: the delegated sessions' links point at it again.
+    Attached,
+}
+
+impl WorkerOrder {
+    /// FR-138 P2b (second review LOW-B) — the order's kind, for a line that
+    /// says which order was lost.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Detached { .. } => "detached",
+            Self::Resumed { .. } => "resumed",
+            Self::Close { .. } => "close",
+            Self::Ended { .. } => "ended",
+            Self::Paused { .. } => "paused",
+            Self::Attached => "attached",
+        }
+    }
+
+    /// FR-138 P2b (second review LOW-B) — the sessions the order names, for
+    /// the same line. None for the channel's own `Paused` and `Attached`.
+    pub fn session_ids(&self) -> Vec<String> {
+        match self {
+            Self::Detached { sessions, .. } => sessions.clone(),
+            Self::Resumed { session_id }
+            | Self::Close { session_id, .. }
+            | Self::Ended { session_id, .. } => vec![session_id.clone()],
+            Self::Paused { .. } | Self::Attached => Vec::new(),
+        }
+    }
+}
+
+/// FR-138 P2b — where a frame from the daemon goes in the worker.
+#[derive(Debug)]
+pub enum WorkerLane {
+    /// The signalling loop's inbound lane, in order: params before the offer.
+    Inbound(WorkerInbound),
+    /// The orders lane ([`WorkerOrder`]).
+    Order(WorkerOrder),
+    /// Served by the attach loop itself (liveness, keep busy, the footprint).
+    Here(DelegateFrame),
+}
+
+/// FR-138 P2b — the worker's route for a frame from the daemon: params and rc
+/// messages to the inbound lane, the daemon's orders about the sessions it
+/// will claim to the orders lane, the rest to the attach loop. A pure function,
+/// because the attach loop is `cfg(unix)` and this must be testable everywhere.
+pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
+    match frame {
+        DelegateFrame::SessionParams(p) => WorkerLane::Inbound(WorkerInbound::Params(p)),
+        DelegateFrame::ToWorker { msg } => WorkerLane::Inbound(WorkerInbound::Msg(msg)),
+        DelegateFrame::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        } => WorkerLane::Order(WorkerOrder::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        }),
+        DelegateFrame::Resumed { session_id } => {
+            WorkerLane::Order(WorkerOrder::Resumed { session_id })
+        }
+        DelegateFrame::Close { session_id, reason } => {
+            WorkerLane::Order(WorkerOrder::Close { session_id, reason })
+        }
+        // The server's end of a session the daemon keeps a record of: on this
+        // lane it is served while the worker's own socket redials, where the
+        // `Terminate` beside it on the inbound lane waits for that socket.
+        DelegateFrame::Ended {
+            session_id,
+            reason,
+            limit,
+        } => WorkerLane::Order(WorkerOrder::Ended {
+            session_id,
+            reason,
+            limit,
+        }),
+        other => WorkerLane::Here(other),
+    }
+}
+
+/// FR-138 P2b (A1) — whether a delegable message about a session is served by
+/// the daemon instead of crossing: a session the daemon's own table holds,
+/// attached or kept, is the daemon's, and a worker that attached since must not
+/// be handed its `Terminate` or `Ice`. Only while the table is `keeping`
+/// (P4-0): otherwise, the switch on alone included, the gate is what it was.
+pub(crate) fn served_by_daemon(keeping: bool, daemon_holds: bool) -> bool {
+    keeping && daemon_holds
+}
+
+/// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: a
+/// window open on this connection (P4-0: the switch alone is not enough), an
+/// attached worker that said [`KEEP_DELEGATED`], and not an external session,
+/// never kept (FR-138 D3). Anything else is served as today.
+pub(crate) fn session_keepable(window_open: bool, worker_keeps: bool, external: bool) -> bool {
+    window_open && worker_keeps && !external
+}
+
+/// FR-138 P2b (A1) — the session a delegable server message is about.
+pub(crate) fn server_session_id(msg: &ServerMsg) -> Option<bson::oid::ObjectId> {
+    match msg {
+        ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpOffer { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. }
+        | ServerMsg::Ice { session_id, .. }
+        | ServerMsg::Terminate { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
+}
+
+/// FR-43 P3b — what the person at a one-row Mac asked of every session: the
+/// floor their own row's broker used to enforce. Before one row, a person's
+/// `auto_grant_session = false` bound their own row; with that row gone, the
+/// daemon's `Request` arm is the only consent there is, so the floor has to
+/// reach it.
+///
+/// It can only TIGHTEN the daemon's own floor, never loosen it, so it is not
+/// the authority over the root's gates that #2871 left open. A worker that
+/// sends a looser value than the daemon's changes nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersonFloor {
+    /// The person's `auto_grant_session`. Absent reads as `false`, the
+    /// stricter value: a frame that does not say whether it may auto-grant
+    /// does not get to.
+    #[serde(default)]
+    pub auto_grant_session: bool,
+    /// The person's `rc_clipboard`, `rc_files` and `rc_audio`. An absent or
+    /// unknown value reads as `off` ([`FeaturePolicy`]'s rule).
+    ///
+    /// [`FeaturePolicy`]: roomler_ai_remote_control::models::FeaturePolicy
+    #[serde(default = "PersonFloor::closed_policy")]
+    pub session_policy: roomler_ai_remote_control::models::SessionPolicy,
+}
+
+impl PersonFloor {
+    /// What a frame that names no session policy is held to: everything off.
+    fn closed_policy() -> roomler_ai_remote_control::models::SessionPolicy {
+        use roomler_ai_remote_control::models::FeaturePolicy;
+        roomler_ai_remote_control::models::SessionPolicy {
+            clipboard: FeaturePolicy::Off,
+            files: FeaturePolicy::Off,
+            audio: FeaturePolicy::Off,
+        }
+    }
+
+    /// The local consent mode with the person's floor folded in: a person who
+    /// refuses to auto-grant turns the daemon's `AutoGrant` into a prompt.
+    /// Anything else keeps the daemon's own, which is already as strict.
+    pub fn consent(floor: Option<Self>, local: crate::consent::Mode) -> crate::consent::Mode {
+        match (floor, local) {
+            (Some(f), crate::consent::Mode::AutoGrant) if !f.auto_grant_session => {
+                crate::consent::Mode::from_config(false)
+            }
+            (_, local) => local,
+        }
+    }
+
+    /// The device's `rc_*` floor with the person's folded in, feature by
+    /// feature: `off` beats `ask` beats `on`.
+    pub fn session_policy(
+        floor: Option<Self>,
+        device: roomler_ai_remote_control::models::SessionPolicy,
+    ) -> roomler_ai_remote_control::models::SessionPolicy {
+        let Some(f) = floor else { return device };
+        let p = f.session_policy;
+        roomler_ai_remote_control::models::SessionPolicy {
+            clipboard: device.clipboard.stricter(p.clipboard),
+            files: device.files.stricter(p.files),
+            audio: device.audio.stricter(p.audio),
+        }
+    }
+}
+
+/// FR-43 P3b — is this process a one-row Mac's daemon: `macos_one_row` with the
+/// supervisor on, and not itself the worker? Only there does a secondary org's
+/// loop get the host, and only there does the host apply the person's floor
+/// and hand a session over only once its params crossed. Everywhere else a
+/// secondary org keeps [`Delegation::Off`], as before P3b.
+pub fn one_row_daemon(one_row: bool, supervise_gui_worker: bool, supervised: bool) -> bool {
+    one_row && supervise_gui_worker && !supervised
+}
+
+/// FR-43 P3b — the org a loop hands sessions over for: `None` for the primary,
+/// a secondary's `[[orgs]]` label otherwise. Keyed on `is_primary` and not on
+/// the label, so no label stands in for the primary.
+pub fn org_key(is_primary: bool, label: &str) -> Option<&str> {
+    (!is_primary).then_some(label)
+}
+
+/// #3695 — the longest attach line the daemon reads off a fresh connection.
+/// The line is the worker's secret, `2 * SECRET_BYTES` = 64 hex characters;
+/// 1 KiB is 16 times that. A longer line closes the connection before any
+/// secret is compared.
+pub const ATTACH_LINE_MAX: usize = 1024;
+
+/// #3695 — the longest frame line the daemon reads from its worker. The
+/// largest frame a worker sends is a full [`DelegateFrame::WorkerLogs`]:
+/// [`WORKER_LOG_LINES_PER_FRAME`] lines of at most [`WORKER_LOG_LINE_MAX`]
+/// bytes each, about 1.6 MiB. Every other frame it sends (a session's
+/// answer, candidates and stats, a recording's claim, its capabilities, its
+/// keep-busy and consent-floor reports, liveness) is under 64 KiB. 4 MiB is
+/// 2.5 times the largest; a longer line closes the channel.
+pub const DELEGATE_LINE_MAX: usize = 4 * 1024 * 1024;
+
+/// FR-43 P3a — the most log lines one [`DelegateFrame::WorkerLogs`] carries.
+pub const WORKER_LOG_LINES_PER_FRAME: usize = 100;
+
+/// FR-43 P3a — the longest message a relayed worker line keeps, in bytes. With
+/// [`WORKER_LOG_LINES_PER_FRAME`] it bounds a frame, and it keeps a line well
+/// under the server's per-line limit, which refuses a whole batch over it.
+pub const WORKER_LOG_MSG_MAX: usize = 8 * 1024;
+
+/// FR-43 P3a — the field and value that mark a line as the GUI worker's on the
+/// daemon's row.
+pub const WORKER_LOG_FIELD: &str = "process";
+pub const WORKER_LOG_PROCESS: &str = "gui-worker";
+
+/// #3695 — the most bytes one relayed worker line takes, JSON-encoded as it
+/// travels in a [`DelegateFrame::WorkerLogs`]. With
+/// [`WORKER_LOG_LINES_PER_FRAME`] it holds a full frame to about 1.6 MiB,
+/// under [`DELEGATE_LINE_MAX`], so a worker never sends a frame its daemon
+/// refuses. Twice [`WORKER_LOG_MSG_MAX`]: a message cut to that and a few
+/// fields fit whole.
+pub const WORKER_LOG_LINE_MAX: usize = 16 * 1024;
+
+/// FR-43 P3a — cut `line`'s message to [`WORKER_LOG_MSG_MAX`] bytes, on a
+/// character boundary. #3695 — then hold the whole line, encoded, to
+/// [`WORKER_LOG_LINE_MAX`]: its fields go first, then its message and its
+/// target are halved until it fits. Both ends run this, the worker before it
+/// sends a line and the daemon before it keeps one.
+pub fn trim_worker_line(line: &mut crate::logs_upload::LogLine) {
+    cut_to(&mut line.msg, WORKER_LOG_MSG_MAX);
+    let encoded = |line: &crate::logs_upload::LogLine| {
+        serde_json::to_vec(line).map_or(usize::MAX, |bytes| bytes.len())
+    };
+    if encoded(line) <= WORKER_LOG_LINE_MAX {
+        return;
+    }
+    line.fields.clear();
+    while encoded(line) > WORKER_LOG_LINE_MAX {
+        if !line.msg.is_empty() {
+            let half = line.msg.len() / 2;
+            cut_to(&mut line.msg, half);
+        } else if !line.target.is_empty() {
+            let half = line.target.len() / 2;
+            cut_to(&mut line.target, half);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Cut `s` to at most `max` bytes, on a character boundary.
+fn cut_to(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
+/// #3695 — the `apps`, `audio` and `permissions` words a worker may give for
+/// its device: the words this build's own builders write
+/// (`encode/caps.rs`: `apps_caps_for`, and `compute_caps`'s audio and
+/// permission words). Its `record` words are those [`RecordCap`] reads. A
+/// word a builder gains is added here too, or a delegated Mac does not pass
+/// it on.
+const WORKER_APPS_WORDS: [&str; 4] = ["status", "list", "focus", "launch"];
+const WORKER_AUDIO_WORDS: [&str; 1] = ["opus"];
+const WORKER_PERMISSION_WORDS: [&str; 3] = ["screen-capture", "input", "no-gui-session"];
+
+/// #3695 — the longest `unavailable["audio"]` code the daemon keeps from its
+/// worker, a word of `[a-z0-9-]` (`no-session`). A code that is not one drops
+/// the reason.
+pub const WORKER_REASON_CODE_MAX: usize = 64;
+
+/// #3695 — the longest `unavailable["audio"]` reason the daemon keeps from
+/// its worker, cut on a character boundary. The reason is one sentence for
+/// the person at the viewer; the longest the agent writes today is under 200
+/// bytes.
+pub const WORKER_REASON_MAX: usize = 512;
+
+/// #3695 — what the daemon keeps of its worker's capabilities: the words that
+/// are the worker's to say, and nothing else. Those are the fields
+/// [`DelegateHost::effective_record`], [`DelegateHost::effective_apps`],
+/// [`DelegateHost::effective_audio`] and [`DelegateHost::effective_permissions`]
+/// hand on; codecs, encoders and every other field stay the daemon's own and
+/// are never read from the worker. Each list keeps the words this build knows,
+/// each once, in the worker's order; `permissions` keeps `None` apart from
+/// `Some([])`, which says the worker holds neither permission.
+fn worker_words(caps: AgentCaps) -> AgentCaps {
+    fn known(words: &[String], allowed: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut kept: Vec<String> = Vec::new();
+        for word in words {
+            if allowed(word) && !kept.contains(word) {
+                kept.push(word.clone());
+            }
+        }
+        kept
+    }
+    let mut kept = AgentCaps {
+        record: known(&caps.record, |w| RecordCap::from_wire(w).is_some()),
+        apps: known(&caps.apps, |w| WORKER_APPS_WORDS.contains(&w)),
+        audio: known(&caps.audio, |w| WORKER_AUDIO_WORDS.contains(&w)),
+        permissions: caps
+            .permissions
+            .as_deref()
+            .map(|words| known(words, |w| WORKER_PERMISSION_WORDS.contains(&w))),
+        has_input_permission: caps.has_input_permission,
+        ..AgentCaps::default()
+    };
+    if let Some(why) = caps.unavailable.get("audio") {
+        let code_ok = !why.code.is_empty()
+            && why.code.len() <= WORKER_REASON_CODE_MAX
+            && why
+                .code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if code_ok {
+            let mut reason = why.reason.clone();
+            cut_to(&mut reason, WORKER_REASON_MAX);
+            kept.unavailable
+                .insert("audio".into(), Unavailable::new(&why.code, &reason));
+        }
+    }
+    kept
+}
+
+/// FR-43 P3a — a worker's line as the daemon uploads it: trimmed, and marked as
+/// the worker's. The daemon sets the mark, so a worker cannot pass a line off
+/// as the daemon's own.
+pub fn mark_worker_line(line: &mut crate::logs_upload::LogLine) {
+    trim_worker_line(line);
+    line.fields.insert(WORKER_LOG_FIELD, WORKER_LOG_PROCESS);
 }
 
 /// FR-92 — how long the daemon waits for the worker's answer to a
@@ -226,6 +693,22 @@ pub struct SessionParams {
     /// the field) leaves the owner's own `lock_on_end`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
+    /// FR-135 §7.1 — the daemon's `rc_media_legacy` entries, its env fold
+    /// included (`RemoteConfigServices::media_legacy_for_delegate`). The worker
+    /// adds them to its own before it decides the session's media paths: it
+    /// builds the peer from its own file, which a push to the root's row never
+    /// reaches. Legacy entries only send a path back, so adding them can never
+    /// turn new code on. `None` from a daemon older than the field, or with no
+    /// entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_legacy: Option<String>,
+    /// FR-138 P2b — the daemon will claim this session through the loss of its
+    /// control socket, so the worker builds it on its delegated table, whose
+    /// peers it keeps on the daemon's orders. Said only to a worker that said
+    /// [`KEEP_DELEGATED`], and only with the device's switch on; absent (an
+    /// older daemon) reads `false`, which is today.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keepable: bool,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -250,6 +733,13 @@ pub struct DelegatedRecord {
 /// under anyway. Generous (≈ 30 KB), so a controller cannot push a live
 /// recording's session out by opening sessions while it records.
 const RECORD_SESSIONS_KEPT: usize = 1024;
+
+/// FR-43 P3b — how many handed-over sessions the daemon remembers the org of.
+/// Oldest out first; a reply for a session this far back goes to the primary,
+/// as every reply did before P3b. Generous for the same reason as
+/// [`RECORD_SESSIONS_KEPT`]: a controller cannot push a live session's org out
+/// by opening sessions.
+const SESSION_ORGS_KEPT: usize = 1024;
 
 /// What the worker's signalling loop receives over the delegation channel.
 ///
@@ -297,6 +787,12 @@ pub struct WorkerLink {
     /// Checked rather than assumed; a priority queue here would be machinery
     /// for a guarantee nothing needs.
     pub outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+    /// FR-138 P2b — the daemon's orders about the sessions it will claim
+    /// ([`WorkerOrder`]), on their own lane: the signalling loop serves them
+    /// wherever it waits, its own connection down included. Taken once by the
+    /// loop ([`Delegation::worker_side`]); `None` where no attach loop feeds
+    /// one.
+    pub orders: Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
 }
 
 /// How this process takes part in delegation.
@@ -317,6 +813,13 @@ pub enum Delegation {
 }
 
 impl Delegation {
+    /// FR-43 P3b — what a SECONDARY org's loop is given: the host on a one-row
+    /// Mac's daemon ([`one_row_daemon`]), which is the only caller to pass
+    /// one, and [`Delegation::Off`] everywhere else.
+    pub fn for_secondary(host: Option<&DelegateHost>) -> Self {
+        host.map_or(Delegation::Off, |h| Delegation::Daemon(h.clone()))
+    }
+
     /// The daemon's channel, when this process is the daemon.
     pub fn host(&self) -> Option<&DelegateHost> {
         match self {
@@ -335,6 +838,21 @@ impl Delegation {
     )> {
         match self {
             Delegation::Worker(link) => Some((&mut link.inbound, &link.outbound)),
+            _ => None,
+        }
+    }
+
+    /// FR-138 P2b (B1) — a worker's delegated side: the orders lane, taken
+    /// out once, and the channel's sender its delegated sessions speak up.
+    /// `None` for every process that is not a worker.
+    pub fn worker_side(
+        &mut self,
+    ) -> Option<(
+        Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
+        tokio::sync::mpsc::Sender<ClientMsg>,
+    )> {
+        match self {
+            Delegation::Worker(link) => Some((link.orders.take(), link.outbound.clone())),
             _ => None,
         }
     }
@@ -405,6 +923,57 @@ fn strictest_keep_busy(policies: &std::collections::BTreeMap<String, bool>) -> b
     policies.values().any(|d| *d)
 }
 
+/// FR-43 P3b — the session a delegable server message is about, as hex.
+fn server_session_of(msg: &ServerMsg) -> Option<String> {
+    match msg {
+        ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpOffer { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. }
+        | ServerMsg::Ice { session_id, .. }
+        | ServerMsg::Terminate { session_id, .. } => Some(session_id.to_hex()),
+        _ => None,
+    }
+}
+
+/// FR-43 P3b — the session a worker reply is about, as hex.
+fn client_session_of(msg: &ClientMsg) -> Option<String> {
+    match msg {
+        ClientMsg::SdpAnswer { session_id, .. }
+        | ClientMsg::Ice { session_id, .. }
+        | ClientMsg::Terminate { session_id, .. }
+        | ClientMsg::RecordingActivity { session_id, .. } => Some(session_id.to_hex()),
+        ClientMsg::SessionStats { session_id, .. } => Some(session_id.clone()),
+        _ => None,
+    }
+}
+
+/// FR-43 P3b — the org that handed `session` over (`Some(None)` = the
+/// primary), or `None` when no org did.
+fn owner_of(
+    held: &std::collections::VecDeque<(String, Option<String>)>,
+    session: &str,
+) -> Option<Option<String>> {
+    held.iter()
+        .find(|(s, _)| s == session)
+        .map(|(_, org)| org.clone())
+}
+
+/// FR-43 P3b — note that `org` handed `session` over. Once: a second note for
+/// the same session changes nothing. Oldest out past [`SESSION_ORGS_KEPT`].
+fn note_session(
+    held: &mut std::collections::VecDeque<(String, Option<String>)>,
+    session: String,
+    org: Option<&str>,
+) {
+    if held.iter().any(|(s, _)| *s == session) {
+        return;
+    }
+    held.push_back((session, org.map(str::to_string)));
+    while held.len() > SESSION_ORGS_KEPT {
+        held.pop_front();
+    }
+}
+
 /// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
 /// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
 pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
@@ -424,19 +993,43 @@ struct Inner {
     /// The socket path currently bound, so [`DelegateHost::revoke`] can unlink
     /// it. `None` = not listening.
     listening: Mutex<Option<std::path::PathBuf>>,
+    /// #3864 — the account the worker was started for ([`DelegateHost::open_for`]),
+    /// whose person socket its relay asks. `None` once revoked.
+    worker_uid: Mutex<Option<u32>>,
     /// The attached worker's capabilities, when it has sent them.
     ///
     /// Cleared when the channel closes — a row that keeps claiming a capture
     /// target which has gone hands the next session a black screen, which is
     /// the bug P2b existed to fix.
     worker_caps: Mutex<Option<AgentCaps>>,
-    /// Where a worker's replies go: the control WS's outbound queue.
+    /// Where a worker's replies go: the primary's control WS outbound queue.
     ///
     /// Re-set on every WS (re)connect, because the sender belongs to the
     /// connection and not to the daemon. `None` = no live WS, and a worker
     /// reply is then dropped with a log line rather than queued for a socket
     /// that may never come back.
     outbound: Mutex<Option<tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-43 P3b — the same, for each secondary org by its label. Only a
+    /// one-row Mac's daemon gives a secondary the host, so everywhere else
+    /// this stays empty.
+    org_outbounds: Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-43 P3b — which org handed each session to a worker (`None` = the
+    /// primary), so its replies go back on that org's WS and no other org can
+    /// reach into it. Written where a session's params cross
+    /// ([`DelegateHost::send_params`]). Kept across a transient detach, since
+    /// the worker re-attaches with its sessions live and a session's org does
+    /// not change with the process serving it; forgotten on
+    /// [`DelegateHost::revoke`], like [`Inner::record_sessions`], because the
+    /// next worker is a new one. Bounded ([`SESSION_ORGS_KEPT`]), oldest out.
+    sessions: Mutex<std::collections::VecDeque<(String, Option<String>)>>,
+    /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]). Set
+    /// once at start.
+    one_row: AtomicBool,
+    /// FR-43 P3b — the person's floor, as the worker last said it. Kept when
+    /// the worker leaves: it can only tighten, and a worker coming back must
+    /// not find a window in which the person's "ask me" lapsed. The next
+    /// worker's frame replaces it.
+    person_floor: Mutex<Option<PersonFloor>>,
     /// The queue toward the attached worker. Set while a worker is attached,
     /// `None` otherwise — so "is anyone there?" and "where do I send it?" are
     /// one question with one answer, and cannot disagree.
@@ -449,9 +1042,11 @@ struct Inner {
     record_sessions: Mutex<std::collections::VecDeque<String>>,
     /// FR-92 — every org's last keep-busy policy (tenant hex → denied), as
     /// this daemon's control WS loops received it. On a supervised Mac the
-    /// WORKER runs keep busy, while delegation itself is primary-only — so
-    /// the daemon is the one place that hears every org, and it hands the
-    /// worker the strictest ([`DelegateHost::note_keep_busy_policy`]).
+    /// WORKER runs keep busy, and hears no org itself — so the daemon is the
+    /// one place that hears every org, and it hands the worker the strictest
+    /// ([`DelegateHost::note_keep_busy_policy`]). Off one row only the
+    /// primary's loop holds the host and notes its policy; FR-43 P3b gives
+    /// every org's loop the host, so there every org's is noted.
     keep_busy: Mutex<std::collections::BTreeMap<String, bool>>,
     /// #1882 — where the frame loop reads the overlay footprint it pushes to
     /// an attached worker ([`DelegateFrame::OverlayFootprint`]). Set by the
@@ -469,6 +1064,25 @@ struct Inner {
         >,
     >,
     next_keep_busy_ask: std::sync::atomic::AtomicU64,
+    /// FR-43 P3a — where a worker's log lines go: the daemon's uploader for
+    /// them, on its own enrollment. `None` (the default, and every Mac not on
+    /// `macos_one_row`) drops them: such a worker uploads its own.
+    worker_logs: Mutex<Option<tokio::sync::mpsc::Sender<crate::logs_upload::LogLine>>>,
+    /// FR-138 P2b — the attached worker's words ([`KEEP_DELEGATED`]), from its
+    /// caps frame. Cleared with the channel, as its caps are.
+    worker_features: Mutex<Vec<String>>,
+    /// FR-138 P2b — the sessions whose params crossed `keepable`: the gate
+    /// makes a record for one when its offer crosses. Bounded
+    /// ([`SESSION_ORGS_KEPT`]), oldest out.
+    keepable: Mutex<std::collections::VecDeque<String>>,
+    /// FR-138 P2b — where a worker's reply about a session the daemon keeps a
+    /// record of goes: that record's link, in its org loop's table, which
+    /// forwards it while attached and keeps what the server must hear while
+    /// kept. Cleared with the channel.
+    bindings: Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-138 P2b (A9) — bumped each time a channel ends: a record made under
+    /// an older one belongs to a worker that is gone, with its peers.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -501,6 +1115,36 @@ impl DelegateHost {
         *self.inner.footprint.lock().expect("footprint mutex") = Some(source);
     }
 
+    /// FR-43 P3a — upload an attached worker's log lines through `sink`.
+    pub fn set_worker_log_sink(
+        &self,
+        sink: tokio::sync::mpsc::Sender<crate::logs_upload::LogLine>,
+    ) {
+        *self.inner.worker_logs.lock().expect("worker_logs mutex") = Some(sink);
+    }
+
+    /// FR-43 P3a — a worker's log lines, marked as its own, into the sink. A
+    /// full sink drops the rest of the frame: the lines are on the Mac's disk
+    /// either way, and waiting here would stall the session frames behind them.
+    fn worker_logs(&self, lines: Vec<crate::logs_upload::LogLine>) {
+        let Some(sink) = self
+            .inner
+            .worker_logs
+            .lock()
+            .expect("worker_logs mutex")
+            .clone()
+        else {
+            return;
+        };
+        for mut line in lines.into_iter().take(WORKER_LOG_LINES_PER_FRAME) {
+            mark_worker_line(&mut line);
+            if sink.try_send(line).is_err() {
+                tracing::debug!("delegation: the worker's log queue is full; dropped the rest");
+                return;
+            }
+        }
+    }
+
     /// The footprint frame to push to the worker, if the source holds blocks
     /// that `sent` (what this connection was last told) does not.
     fn footprint_update(&self, sent: &mut Vec<(std::net::Ipv4Addr, u8)>) -> Option<DelegateFrame> {
@@ -530,6 +1174,7 @@ impl DelegateHost {
     #[cfg(unix)]
     pub fn open_for(&self, uid: u32) -> String {
         let secret = self.mint();
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
         if let Err(e) = self.listen(uid) {
             tracing::warn!(uid, error = %e, "delegation: could not open the worker socket");
         }
@@ -589,16 +1234,10 @@ impl DelegateHost {
     #[cfg(unix)]
     async fn serve_stream(&self, stream: UnixStream) {
         let (rd, wr) = tokio::io::split(stream);
-        let mut lines = BufReader::new(rd).lines();
-        let offered = match lines.next_line().await {
-            Ok(Some(line)) => line.trim().to_string(),
-            _ => {
-                tracing::debug!("delegation: connection closed before offering a secret");
-                return;
-            }
+        let Some((offered, rd)) = read_attach(rd).await else {
+            return;
         };
-        self.serve(&offered, Box::new(lines.into_inner()), Box::new(wr))
-            .await;
+        self.serve(&offered, Box::new(rd), Box::new(wr)).await;
     }
 
     /// Mint a fresh secret, replacing any previous one.
@@ -617,23 +1256,83 @@ impl DelegateHost {
         secret
     }
 
-    /// Point the channel at the current control WS's outbound queue.
+    /// Point the channel at the current control WS's outbound queue, for the
+    /// org `org` ([`org_key`]: `None` = the primary).
     ///
     /// Called on every (re)connect. Until it is, a worker's replies are dropped
     /// — which is correct: there is no session without a WS, so a reply that
     /// arrives without one belongs to a session the server has already
     /// forgotten.
-    pub fn set_outbound(&self, tx: tokio::sync::mpsc::Sender<ClientMsg>) {
-        *self.inner.outbound.lock().expect("outbound mutex") = Some(tx);
+    pub fn set_outbound(&self, org: Option<&str>, tx: tokio::sync::mpsc::Sender<ClientMsg>) {
+        match org {
+            None => *self.inner.outbound.lock().expect("outbound mutex") = Some(tx),
+            Some(label) => {
+                self.inner
+                    .org_outbounds
+                    .lock()
+                    .expect("org outbounds mutex")
+                    .insert(label.to_string(), tx);
+            }
+        }
     }
 
-    /// Hand a server message to the attached worker.
+    /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]).
+    ///
+    /// #3864 — its consent questions reach its person's app only through this
+    /// host's worker, so the companion's verdict asks this host about that
+    /// road ([`crate::consent_relay::register`]). Not from a test, whose hosts
+    /// must not stand for the process.
+    pub fn set_one_row(&self) {
+        self.inner.one_row.store(true, Ordering::Release);
+        #[cfg(not(test))]
+        crate::consent_relay::register(self);
+    }
+
+    fn one_row(&self) -> bool {
+        self.inner.one_row.load(Ordering::Acquire)
+    }
+
+    /// FR-43 P3b — the person's floor, for a session's `Request` arm to fold
+    /// into the daemon's own ([`PersonFloor::consent`],
+    /// [`PersonFloor::session_policy`]). `None` until a worker has said it,
+    /// and always `None` on a daemon that is not one row's, so the root's
+    /// values stand there exactly as before.
+    pub fn person_floor(&self) -> Option<PersonFloor> {
+        if !self.one_row() {
+            return None;
+        }
+        *self.inner.person_floor.lock().expect("person floor mutex")
+    }
+
+    fn note_person_floor(&self, floor: PersonFloor) {
+        if !self.one_row() {
+            tracing::debug!(
+                "delegation: a person's floor on a daemon that is not one row's; ignoring"
+            );
+            return;
+        }
+        tracing::info!(
+            auto_grant_session = floor.auto_grant_session,
+            session_policy = ?floor.session_policy,
+            "delegation: the person's consent floor received"
+        );
+        *self.inner.person_floor.lock().expect("person floor mutex") = Some(floor);
+    }
+
+    /// Hand a server message to the attached worker, for the org `org`
+    /// ([`org_key`]: `None` = the primary).
     ///
     /// Returns `false` when there is no worker, which is the caller's signal to
     /// serve it locally exactly as before. ⚠️ It does NOT check
     /// [`delegable_inbound`] — that decision belongs at the call site, where
     /// the alternative (handling it locally) is visible.
-    pub fn send_to_worker(&self, msg: &ServerMsg) -> bool {
+    ///
+    /// FR-43 P3b — a message about a session crosses only for the org that
+    /// handed that session over, and on a one-row Mac only once its params did
+    /// ([`Self::send_params`]): a session crosses on its own org's consent and
+    /// no other. The primary off one row keeps P2's rule, where a session no
+    /// org has handed over still crosses.
+    pub fn send_to_worker(&self, org: Option<&str>, msg: &ServerMsg) -> bool {
         let tx = self
             .inner
             .to_worker
@@ -641,10 +1340,45 @@ impl DelegateHost {
             .expect("to_worker mutex")
             .clone();
         let Some(tx) = tx else { return false };
+        if let Some(session) = server_session_of(msg) {
+            let held = self.inner.sessions.lock().expect("sessions mutex");
+            match owner_of(&held, &session) {
+                Some(owner) if owner.as_deref() != org => {
+                    tracing::warn!(
+                        %session,
+                        org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                        kind = server_msg_kind(msg),
+                        "delegation: a session another org handed over; not crossing"
+                    );
+                    return false;
+                }
+                Some(_) => {}
+                None if org.is_some() || self.one_row() => {
+                    tracing::debug!(
+                        %session,
+                        kind = server_msg_kind(msg),
+                        "delegation: a session whose params never crossed; served here"
+                    );
+                    return false;
+                }
+                None => {}
+            }
+        }
         tx.try_send(DelegateFrame::ToWorker {
             msg: Box::new(msg.clone()),
         })
         .is_ok()
+    }
+
+    /// FR-43 P3b — the org a worker reply belongs to: the one that handed its
+    /// session over. `None` = a session no org handed over (P2's rule, or one
+    /// older than [`SESSION_ORGS_KEPT`] crossings); it goes to the primary.
+    fn owner_of_reply(&self, msg: &ClientMsg) -> Option<Option<String>> {
+        let session = client_session_of(msg)?;
+        owner_of(
+            &self.inner.sessions.lock().expect("sessions mutex"),
+            &session,
+        )
     }
 
     /// FR-92 — one org's keep-busy policy arrived on this daemon's control
@@ -660,7 +1394,8 @@ impl DelegateHost {
             m.insert(tenant.to_string(), denied);
             strictest_keep_busy(&m)
         };
-        if self.send_to_worker(&ServerMsg::KeepBusyPolicy { denied: strictest }) {
+        // About no session, so it crosses for any org.
+        if self.send_to_worker(None, &ServerMsg::KeepBusyPolicy { denied: strictest }) {
             tracing::info!(
                 denied = strictest,
                 "delegation: keep-busy policy handed to the GUI worker"
@@ -747,7 +1482,7 @@ impl DelegateHost {
     /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
     /// because both travel the same ordered channel and the daemon resolves
     /// them while handling `Request`, which the server always sends first.
-    pub fn send_params(&self, frame: DelegateFrame) -> bool {
+    pub fn send_params(&self, org: Option<&str>, frame: DelegateFrame) -> bool {
         // FR-85 P1e-mac — remembered HERE, where the grant crosses, so the
         // relay's admission of a worker's `RecordingActivity` cannot drift from
         // what the worker was actually given — and only once it DID cross: a
@@ -762,6 +1497,17 @@ impl DelegateHost {
             }
             _ => None,
         };
+        // FR-43 P3b — and the org that handed the session over, by the same
+        // rule: noted only once its params crossed.
+        let session = match &frame {
+            DelegateFrame::SessionParams(p) => Some(p.session_id.clone()),
+            _ => None,
+        };
+        // FR-138 P2b — and whether the daemon will claim it, by the same rule.
+        let keepable = match &frame {
+            DelegateFrame::SessionParams(p) if p.keepable => Some(p.session_id.clone()),
+            _ => None,
+        };
         let tx = self
             .inner
             .to_worker
@@ -769,8 +1515,35 @@ impl DelegateHost {
             .expect("to_worker mutex")
             .clone();
         let Some(tx) = tx else { return false };
+        // Held across the crossing, so no other org's loop can note the same
+        // session between the check and the note.
+        let mut held = self.inner.sessions.lock().expect("sessions mutex");
+        if let Some(session) = &session
+            && let Some(owner) = owner_of(&held, session)
+            && owner.as_deref() != org
+        {
+            tracing::warn!(
+                %session,
+                org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                "delegation: params for a session another org handed over; not crossing"
+            );
+            return false;
+        }
         if tx.try_send(frame).is_err() {
             return false;
+        }
+        if let Some(session) = session {
+            note_session(&mut held, session, org);
+        }
+        drop(held);
+        if let Some(session_id) = keepable {
+            let mut held = self.inner.keepable.lock().expect("keepable mutex");
+            if !held.iter().any(|s| *s == session_id) {
+                held.push_back(session_id);
+                while held.len() > SESSION_ORGS_KEPT {
+                    held.pop_front();
+                }
+            }
         }
         if let Some(session_id) = recorded {
             let mut held = self
@@ -850,6 +1623,19 @@ impl DelegateHost {
         })
     }
 
+    /// FR-43 P3c — the worker as the LocalAPI's `Status` reports it
+    /// ([`NodeStatus::gui_worker`](tunnel_core::localapi::NodeStatus::gui_worker)):
+    /// attached or not, the permission words the row advertises because of it
+    /// ([`Self::effective_permissions`]), and whether this daemon runs one row.
+    /// What `roomlerd one-row` verifies after its restart.
+    pub fn worker_status(&self) -> tunnel_core::localapi::GuiWorkerStatus {
+        tunnel_core::localapi::GuiWorkerStatus {
+            attached: self.inner.attached.load(Ordering::Acquire),
+            permissions: self.effective_permissions().map(|(words, _)| words),
+            one_row: self.one_row(),
+        }
+    }
+
     /// Forget the current secret — the worker it belonged to is gone.
     ///
     /// [`crate::macos_supervisor`] calls this from `stop_worker`, which takes a
@@ -857,6 +1643,8 @@ impl DelegateHost {
     /// caller can forget at one of the four places a worker can stop.
     pub fn revoke(&self) {
         *self.inner.secret.lock().expect("secret mutex") = None;
+        // #3864 — and whose account it ran for: no worker, no road.
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = None;
         // FR-85 P1e-mac — and what that worker was handed. The next worker is
         // a new one (another console user, after a switch), and it must not
         // report on sessions it never had. A transient channel drop does not
@@ -867,6 +1655,13 @@ impl DelegateHost {
             .lock()
             .expect("record sessions mutex")
             .clear();
+        // FR-43 P3b — and which org handed it what, by the same rule. The
+        // person's floor stays: it only tightens, and the next worker's first
+        // frames replace it.
+        self.inner.sessions.lock().expect("sessions mutex").clear();
+        // FR-138 P2b — and which sessions the daemon would have claimed: the
+        // next worker never got their params.
+        self.inner.keepable.lock().expect("keepable mutex").clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -914,7 +1709,21 @@ impl DelegateHost {
             return;
         }
         tracing::info!("delegation channel attached");
+        // ⚠️ `run` clears the sender, the caps and the questions without a
+        // check of which channel set them. It requires that no other channel
+        // attaches until that clear is done: `attached` is released only after
+        // `run` returns, and one channel is attached at a time.
         let result = self.run(rd, wr).await;
+        // FR-138 P2b — what P2b holds for the channel ends with it however
+        // `run` ended, a write or read error too, and BEFORE the flag clears,
+        // so the next worker to attach never shares this one's generation or
+        // bindings. (What `run` clears however the channel ended, the sender,
+        // the caps and the questions, is master's.)
+        let cause = match &result {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        };
+        self.records_channel_ended(&cause);
         self.inner.attached.store(false, Ordering::Release);
         match result {
             Ok(()) => tracing::info!("delegation channel closed"),
@@ -922,9 +1731,22 @@ impl DelegateHost {
         }
     }
 
+    /// The channel, and what it leaves behind cleared however it ends.
+    /// #3695 — a read or write error, or a line over [`DELEGATE_LINE_MAX`],
+    /// ends it as the worker's own close does.
+    async fn run(
+        &self,
+        rd: Box<dyn AsyncRead + Send + Unpin>,
+        wr: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> std::io::Result<()> {
+        let ended = self.frames(rd, wr).await;
+        self.channel_ended();
+        ended
+    }
+
     /// The frame loop: liveness, plus the rc-session messages in both
     /// directions (P2b).
-    async fn run(
+    async fn frames(
         &self,
         rd: Box<dyn AsyncRead + Send + Unpin>,
         mut wr: Box<dyn AsyncWrite + Send + Unpin>,
@@ -954,7 +1776,9 @@ impl DelegateHost {
         let (to_worker_tx, mut to_worker_rx) = tokio::sync::mpsc::channel(64);
         *self.inner.to_worker.lock().expect("to_worker mutex") = Some(to_worker_tx);
 
-        let mut lines = BufReader::new(rd).lines();
+        // #3695 — lines of at most DELEGATE_LINE_MAX: a longer one is an
+        // error, which ends the channel with it as the reason.
+        let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), DELEGATE_LINE_MAX);
         loop {
             let line = tokio::select! {
                 queued = to_worker_rx.recv() => {
@@ -995,19 +1819,37 @@ impl DelegateHost {
                 // of this daemon. Data for that caller only; nothing here
                 // reaches the control WS.
                 Ok(DelegateFrame::KeepBusyTold { id, info }) => self.keep_busy_told(id, *info),
-                Ok(DelegateFrame::WorkerCaps { caps }) => {
+                // FR-43 P3a — a worker with no enrollment's log lines.
+                Ok(DelegateFrame::WorkerLogs { lines }) => self.worker_logs(lines),
+                // FR-43 P3b — and its person's consent floor.
+                Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
+                Ok(DelegateFrame::WorkerCaps { caps, features }) => {
+                    // #3695 — only the words that are the worker's to say.
+                    let caps = worker_words(*caps);
+                    // FR-138 P2b — and of its feature words, the known ones.
+                    let features = worker_feature_words(&features);
                     tracing::info!(
                         permissions = ?caps.permissions,
                         has_input = caps.has_input_permission,
+                        ?features,
                         "delegation: worker announced its capabilities"
                     );
-                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(*caps);
+                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(caps);
+                    *self
+                        .inner
+                        .worker_features
+                        .lock()
+                        .expect("worker features mutex") = features;
                 }
                 Ok(
                     DelegateFrame::ToWorker { .. }
                     | DelegateFrame::SessionParams { .. }
                     | DelegateFrame::OverlayFootprint { .. }
-                    | DelegateFrame::KeepBusyAsk { .. },
+                    | DelegateFrame::KeepBusyAsk { .. }
+                    | DelegateFrame::Detached { .. }
+                    | DelegateFrame::Resumed { .. }
+                    | DelegateFrame::Close { .. }
+                    | DelegateFrame::Ended { .. },
                 ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
@@ -1022,6 +1864,12 @@ impl DelegateHost {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The channel to the worker ended: what belonged to it goes with it.
+    /// [`Self::run`] runs it however the channel ends.
+    fn channel_ended(&self) {
         *self.inner.to_worker.lock().expect("to_worker mutex") = None;
         // ⚠️ Clear the caps with the channel. Keeping them would leave the row
         // advertising a capture target that has gone, and the next session
@@ -1034,7 +1882,170 @@ impl DelegateHost {
             .lock()
             .expect("keep_busy_asks mutex")
             .clear();
-        Ok(())
+    }
+
+    /// FR-138 P2b — the channel to the worker ended, `cause` its why: what P2b
+    /// holds for it goes with it. Run by [`Self::serve`] on EVERY end of
+    /// [`Self::run`], an I/O error's too (a worker gone mid-write is EPIPE),
+    /// and a line over [`DELEGATE_LINE_MAX`]'s.
+    /// Before, only a clean end ran it, and a record of a worker gone that way
+    /// kept its generation: counted, claimed at the next roll, with no peer
+    /// behind it. With the switch off it changes nothing: the worker's word it
+    /// clears is read only with the switch on, no record reads the generation
+    /// it bumps, and the bindings it drains are empty.
+    fn records_channel_ended(&self, cause: &str) {
+        // The worker's word goes with it: a session asked next is not
+        // keepable until a worker says it again.
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .clear();
+        // (A9) The sessions it kept for the daemon's claim: a record of this
+        // generation belongs to a worker whose channel ended, whose process
+        // took its peers, or, alive, closes them (MEDIUM-1). Bumped BEFORE the
+        // ends below, so the table that reads one reads the record as gone.
+        // (D6) Each bound record hears its session end as `error`: attached,
+        // the table says it to the server on this connection, and the viewer
+        // stops watching a frozen picture; kept, after the next hello. The
+        // sends never wait.
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        let bound: Vec<(String, tokio::sync::mpsc::Sender<ClientMsg>)> = self
+            .inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .drain()
+            .collect();
+        for (session, link) in bound {
+            let Ok(session_id) = bson::oid::ObjectId::parse_str(&session) else {
+                continue;
+            };
+            tracing::info!(
+                %session,
+                %cause,
+                "delegation: the channel to the GUI worker that held a kept-for-claim session \
+                 ended; it ends as `error` (FR-138 P2b)"
+            );
+            let _ = link.try_send(ClientMsg::Terminate {
+                session_id,
+                reason: roomler_ai_remote_control::models::EndReason::Error,
+                limit: None,
+            });
+        }
+    }
+
+    /// FR-138 P2b (A2) — whether the attached worker keeps a delegated
+    /// session's peer through the daemon's control-socket loss: it said
+    /// [`KEEP_DELEGATED`], matched by equality. No worker, or an older one:
+    /// `false`, and its sessions are served as today.
+    pub fn worker_keeps(&self) -> bool {
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == KEEP_DELEGATED)
+    }
+
+    /// #3864 — whether the attached worker lists and decides this daemon's
+    /// consent questions for its person's app: it said
+    /// [`crate::consent_relay::RELAY_CONSENT`], matched by equality, on the
+    /// channel it holds now. No worker, or one that did not say it: `false`.
+    pub fn relays_consent(&self) -> bool {
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == crate::consent_relay::RELAY_CONSENT)
+    }
+
+    /// #3864 — the account the worker was started for, until it is revoked.
+    pub fn worker_uid(&self) -> Option<u32> {
+        *self.inner.worker_uid.lock().expect("worker uid mutex")
+    }
+
+    /// FR-138 P2b — whether `session`'s params crossed `keepable`.
+    pub(crate) fn is_keepable(&self, session: &str) -> bool {
+        self.inner
+            .keepable
+            .lock()
+            .expect("keepable mutex")
+            .iter()
+            .any(|s| s == session)
+    }
+
+    /// FR-138 P2b (A9) — the attach generation: bumped each time a channel
+    /// ends.
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    /// FR-138 P2b (A3) — send the worker's replies about `session` into
+    /// `link`, a record's link in its org loop's table.
+    pub(crate) fn bind(&self, session: String, link: tokio::sync::mpsc::Sender<ClientMsg>) {
+        self.inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .insert(session, link);
+    }
+
+    /// FR-138 P2b — the record of `session` is gone: its replies go where
+    /// every reply goes.
+    pub(crate) fn unbind(&self, session: &str) {
+        self.inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .remove(session);
+    }
+
+    /// FR-138 P2b — an order about a session the daemon holds a record of
+    /// ([`DelegateFrame::Detached`], [`DelegateFrame::Resumed`],
+    /// [`DelegateFrame::Close`], [`DelegateFrame::Ended`]). Never waits: a full
+    /// queue costs the order. A session the worker keeps still closes at its
+    /// own deadline, and the `Ended` of an attached session has the server's
+    /// `Terminate` crossing beside it. `false` with no worker.
+    pub(crate) fn send_order(&self, frame: DelegateFrame) -> bool {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone();
+        tx.is_some_and(|tx| tx.try_send(frame).is_ok())
+    }
+
+    /// A worker "attached" the way `run` attaches one, its queue set, for a
+    /// test that reads the frames the daemon sends it.
+    #[cfg(test)]
+    pub(crate) fn attach_for_test(&self) -> tokio::sync::mpsc::Receiver<DelegateFrame> {
+        let (tx, rx) = tokio::sync::mpsc::channel(RECORD_SESSIONS_KEPT * 2);
+        *self.inner.to_worker.lock().expect("to_worker mutex") = Some(tx);
+        rx
+    }
+
+    /// The channel's clean end, as `run` and `serve` end it, for a test.
+    #[cfg(test)]
+    pub(crate) fn end_channel_for_test(&self) {
+        self.channel_ended();
+        self.records_channel_ended("closed");
+    }
+
+    /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
+    /// brings, only its words ([`worker_words`]), for a test of what the daemon
+    /// announces with them.
+    #[cfg(test)]
+    pub(crate) fn hold_worker_caps_for_test(&self, caps: AgentCaps) {
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(worker_words(caps));
+    }
+
+    /// #3992 — and the person's floor, as their worker's frame gives it.
+    #[cfg(test)]
+    pub(crate) fn note_person_floor_for_test(&self, floor: PersonFloor) {
+        self.note_person_floor(floor);
     }
 
     /// Put a worker's reply on the control WS — if the whitelist allows it.
@@ -1043,7 +2054,7 @@ impl DelegateHost {
     /// the worker is unprivileged and may be compromised, so a filter it
     /// applies to itself is not a filter. Anything it may put on this socket it
     /// says AS THE DEVICE.
-    fn relay_upstream(&self, msg: ClientMsg) {
+    pub(crate) fn relay_upstream(&self, msg: ClientMsg) {
         if !delegable_outbound(&msg) && !self.records_session_of(&msg) {
             tracing::warn!(
                 kind = msg_kind(&msg),
@@ -1051,7 +2062,44 @@ impl DelegateHost {
             );
             return;
         }
-        let tx = self.inner.outbound.lock().expect("outbound mutex").clone();
+        // FR-138 P2b (A3) — a session the daemon keeps a record of: into that
+        // record's link, which forwards it to the connection while attached,
+        // and while kept hands what the server must hear to its table and drops
+        // the rest. Never waits, and never falls through to a connection: one
+        // the record has left may be a dead one.
+        if let Some(session) = client_session_of(&msg) {
+            let bound = self
+                .inner
+                .bindings
+                .lock()
+                .expect("bindings mutex")
+                .get(&session)
+                .cloned();
+            if let Some(link) = bound {
+                if link.try_send(msg).is_err() {
+                    tracing::debug!(
+                        %session,
+                        "delegation: a kept-for-claim session's link is full; dropped a reply \
+                         (FR-138 P2b)"
+                    );
+                }
+                return;
+            }
+        }
+        // FR-43 P3b — back on the WS of the org that handed the session over.
+        // A secondary's reply with its WS down is dropped, never sent to the
+        // primary, whose server holds no such session. A session no org
+        // handed over goes to the primary, as every reply did before P3b.
+        let tx = match self.owner_of_reply(&msg) {
+            Some(Some(label)) => self
+                .inner
+                .org_outbounds
+                .lock()
+                .expect("org outbounds mutex")
+                .get(&label)
+                .cloned(),
+            Some(None) | None => self.inner.outbound.lock().expect("outbound mutex").clone(),
+        };
         match tx {
             Some(tx) => {
                 if tx.try_send(msg).is_err() {
@@ -1086,6 +2134,27 @@ impl DelegateHost {
     }
 }
 
+/// Read the attach line off a fresh connection: the secret a worker offers,
+/// and the reader positioned at the first frame after it. `None` when the
+/// connection ends before offering one.
+/// #3695 — read with [`ATTACH_LINE_MAX`]: a longer line closes the
+/// connection, with the reason in the log.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn read_attach<R: AsyncRead + Unpin>(rd: R) -> Option<(String, BufReader<R>)> {
+    let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), ATTACH_LINE_MAX);
+    match lines.next_line().await {
+        Ok(Some(line)) => Some((line.trim().to_string(), lines.into_inner())),
+        Ok(None) => {
+            tracing::debug!("delegation: connection closed before offering a secret");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "delegation attach refused: the attach line was not read");
+            None
+        }
+    }
+}
+
 /// Write one newline-delimited frame and flush it.
 ///
 /// Flushing per frame is deliberate: this channel is latency-sensitive at
@@ -1108,7 +2177,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// local" is exactly the threat this secret exists for. Length is compared
 /// first and in variable time on purpose: the length of a hex secret is not a
 /// secret.
-fn secret_eq(expected: &str, offered: &str) -> bool {
+pub(crate) fn secret_eq(expected: &str, offered: &str) -> bool {
     use subtle::ConstantTimeEq;
     let a = expected.as_bytes();
     let b = offered.as_bytes();
@@ -1118,6 +2187,7 @@ fn secret_eq(expected: &str, offered: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     /// Read one line from the client side, or `None` if the daemon just closed.
     async fn first_line(client: tokio::io::DuplexStream) -> Option<String> {
@@ -1175,6 +2245,237 @@ mod tests {
         drop(cwr);
         drop(lines);
         task.await.unwrap();
+    }
+
+    /// #3695 — attach a worker with `secret`; the client's reader and writer.
+    async fn attached(
+        host: &DelegateHost,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let greeting = lines.next_line().await.unwrap().unwrap();
+        assert!(greeting.contains("\"attached\""), "got {greeting}");
+        (task, lines, cwr)
+    }
+
+    /// #3695 — the frame reader has a limit: a line over it closes the
+    /// channel, and nothing behind it is answered.
+    #[tokio::test]
+    async fn a_line_over_the_limit_closes_the_channel() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; 4 * 1024 * 1024 + 1]).await;
+            let _ = cwr.write_all(b"\n{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        drop(writer);
+    }
+
+    /// #3695 — the log frame's limit bounds what is read: a frame over it
+    /// closes the channel before any of its lines reach the sink.
+    #[tokio::test]
+    async fn a_log_frame_over_the_limit_reaches_no_sink() {
+        let host = DelegateHost::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        host.set_worker_log_sink(tx);
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let msg = "x".repeat(48 * 1024);
+        let frame = DelegateFrame::WorkerLogs {
+            lines: (0..101)
+                .map(|_| log_line(&msg, bson::Document::new()))
+                .collect(),
+        };
+        let writer = tokio::spawn(async move {
+            let _ = write_frame(&mut cwr, &frame).await;
+            let _ = cwr.write_all(b"{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        assert!(rx.try_recv().is_err(), "no line of the frame was kept");
+        drop(writer);
+    }
+
+    /// #3695 — a channel closed over the limit ends as the worker's own
+    /// close does: the words it advertised for the device are cleared.
+    #[tokio::test]
+    async fn a_channel_closed_over_the_limit_clears_the_workers_words() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let caps = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into()],
+                ..Default::default()
+            }),
+            features: Vec::new(),
+        };
+        write_frame(&mut cwr, &caps).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+        assert!(host.effective_record().is_some(), "held while attached");
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; DELEGATE_LINE_MAX + 1]).await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed");
+        task.await.unwrap();
+        assert_eq!(host.effective_record(), None, "cleared with the channel");
+        drop(writer);
+    }
+
+    /// #3695 — what the daemon takes from its worker's capabilities is known
+    /// words, each once, and a reason of bounded length.
+    #[tokio::test]
+    async fn the_workers_capability_words_are_known_words_only() {
+        use roomler_ai_remote_control::models::Unavailable;
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let mut caps = AgentCaps {
+            record: vec!["remote".into(), "remote".into(), "everything".into()],
+            apps: vec!["status".into(), "x".repeat(1 << 16)],
+            audio: vec!["opus".into(), "pcm".into()],
+            permissions: Some(vec!["screen-capture".into(), "root".into()]),
+            has_input_permission: true,
+            ..Default::default()
+        };
+        caps.unavailable.insert(
+            "audio".into(),
+            Unavailable::new("no-session", &"why ".repeat(1000)),
+        );
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(caps),
+            features: Vec::new(),
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+
+        assert_eq!(host.effective_record(), Some(vec!["remote".to_string()]));
+        assert_eq!(host.effective_apps(), Some(vec!["status".to_string()]));
+        let audio = host.effective_audio().unwrap();
+        assert_eq!(audio.audio, vec!["opus".to_string()]);
+        let why = audio.why.unwrap();
+        assert_eq!(why.code, "no-session");
+        assert!(why.reason.len() <= 512, "{}", why.reason.len());
+        assert_eq!(
+            host.effective_permissions(),
+            Some((vec!["screen-capture".to_string()], true))
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// #3695 — the attach line has a limit: a line over it is refused, and
+    /// one within it leaves the reader at the frame after it.
+    #[tokio::test]
+    async fn an_attach_line_over_the_limit_is_refused() {
+        let over = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024 + 1));
+        assert!(read_attach(over.as_bytes()).await.is_none());
+
+        let at = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024));
+        let (offered, rest) = read_attach(at.as_bytes()).await.expect("within it");
+        assert_eq!(offered.len(), 1024);
+        let next = rest.lines().next_line().await.unwrap();
+        assert_eq!(next.as_deref(), Some("{\"t\":\"ping\"}"));
+    }
+
+    fn log_line(msg: &str, fields: bson::Document) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd::signaling".into(),
+            msg: msg.into(),
+            fields,
+        }
+    }
+
+    /// FR-43 P3a — an attached worker's log lines reach the daemon's sink, each
+    /// marked as the worker's by the daemon, whatever the worker put in the
+    /// field, and a message too long for the server is cut. The control is the
+    /// same frame with no sink: nothing is kept.
+    #[tokio::test]
+    async fn a_workers_log_lines_reach_the_sink_marked_as_its_own() {
+        for with_sink in [true, false] {
+            let host = DelegateHost::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            if with_sink {
+                host.set_worker_log_sink(tx);
+            } else {
+                drop(tx);
+            }
+            let secret = host.mint();
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let (rd, wr) = tokio::io::split(server);
+            let h = host.clone();
+            let task =
+                tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+            let (crd, mut cwr) = tokio::io::split(client);
+            let mut lines = BufReader::new(crd).lines();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .contains("\"attached\"")
+            );
+
+            let spoofed = bson::doc! { WORKER_LOG_FIELD: "daemon", "session": "s1" };
+            let frame = DelegateFrame::WorkerLogs {
+                lines: vec![
+                    log_line("attached", spoofed),
+                    log_line(&"é".repeat(WORKER_LOG_MSG_MAX), bson::Document::new()),
+                ],
+            };
+            write_frame(&mut cwr, &frame).await.unwrap();
+            // A ping behind it: its pong proves the frame was read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .contains("\"pong\"")
+            );
+
+            if with_sink {
+                let first = rx.recv().await.unwrap();
+                assert_eq!(first.msg, "attached");
+                assert_eq!(
+                    first.fields.get_str(WORKER_LOG_FIELD),
+                    Ok(WORKER_LOG_PROCESS)
+                );
+                assert_eq!(first.fields.get_str("session"), Ok("s1"));
+                let second = rx.recv().await.unwrap();
+                assert!(second.msg.len() <= WORKER_LOG_MSG_MAX);
+                assert!(second.msg.len() > WORKER_LOG_MSG_MAX - 4);
+                assert_eq!(
+                    second.fields.get_str(WORKER_LOG_FIELD),
+                    Ok(WORKER_LOG_PROCESS)
+                );
+            } else {
+                assert!(rx.try_recv().is_err(), "no sink keeps nothing");
+            }
+            drop(cwr);
+            drop(lines);
+            task.await.unwrap();
+        }
     }
 
     /// #1882 — the source a test daemon's footprint is read from. A static,
@@ -1321,6 +2622,32 @@ mod tests {
             host.keep_busy_replay(),
             Some(DelegateFrame::ToWorker { .. })
         ));
+    }
+
+    /// FR-43 P3b — the person's floor crosses the real frame loop to a one-row
+    /// daemon, and a frame that leaves a value out is held to the strict one.
+    #[tokio::test]
+    async fn the_persons_floor_crosses_the_channel_to_a_one_row_daemon() {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        let (_task, _lines, mut wr) = attached_worker(&host).await;
+        wr.write_all(b"{\"t\":\"person_floor\",\"d\":{\"auto_grant_session\":false}}\n")
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.person_floor().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the floor within 5 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let floor = host.person_floor().unwrap();
+        assert!(!floor.auto_grant_session);
+        assert_eq!(
+            floor.session_policy.clipboard,
+            roomler_ai_remote_control::models::FeaturePolicy::Off
+        );
     }
 
     /// Attach a fake worker and wait until the daemon's frame loop is up (its
@@ -1611,6 +2938,322 @@ mod tests {
         assert!(!secret_eq("abc", "abd"));
         assert!(!secret_eq("", "x"));
     }
+
+    /// FR-138 P2b (R12, A2) — a delegated session is said `keepable` only to a
+    /// worker that said `keep-delegated` (by equality: a near miss is not the
+    /// word), only with a window open (P4-0), and never for an external
+    /// session; and this build's worker says the word.
+    #[tokio::test]
+    async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
+        assert!(
+            worker_features(false).contains(&KEEP_DELEGATED.to_string()),
+            "this build's worker says it"
+        );
+        assert!(
+            session_keepable(true, true, false),
+            "a window open, a P2b worker"
+        );
+        assert!(!session_keepable(false, true, false), "no window open");
+        assert!(
+            !session_keepable(true, false, false),
+            "an older worker, or none"
+        );
+        assert!(!session_keepable(true, true, true), "an external session");
+
+        let host = DelegateHost::new();
+        assert!(!host.worker_keeps(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        async fn caps(
+            cwr: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+            features: Vec<String>,
+        ) {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(cwr, &frame).await.unwrap();
+            // The daemon reads in order: its Pong means the caps were read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(lines).await, DelegateFrame::Pong));
+        }
+        caps(&mut cwr, &mut lines, Vec::new()).await;
+        assert!(!host.worker_keeps(), "an older worker says no word");
+        caps(
+            &mut cwr,
+            &mut lines,
+            vec!["keep-delegated-v2".into(), "keep".into()],
+        )
+        .await;
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        caps(&mut cwr, &mut lines, vec![KEEP_DELEGATED.to_string()]).await;
+        assert!(host.worker_keeps(), "a P2b worker");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.worker_keeps(), "gone with its channel");
+    }
+
+    /// #3864 — a worker with no enrollment (a one-row Mac's) says
+    /// `relay-consent`, and the daemon keeps the word: the road its questions
+    /// take to the person's app is open only through such a worker. A worker
+    /// with an enrollment (a two-row Mac's supervised half) does not say it,
+    /// an older worker says nothing, a near miss is not the word, and the
+    /// word goes with its channel. The account the worker was started for is
+    /// kept until it is revoked.
+    ///
+    /// Red before #3864: no worker said the word, and the daemon dropped it
+    /// as unknown.
+    #[tokio::test]
+    async fn a_one_row_worker_says_relay_consent_and_the_daemon_keeps_it() {
+        use crate::consent_relay::RELAY_CONSENT;
+        assert!(
+            worker_features(true).contains(&RELAY_CONSENT.to_string()),
+            "a worker with no enrollment says it"
+        );
+        assert!(
+            !worker_features(false).contains(&RELAY_CONSENT.to_string()),
+            "a worker with an enrollment does not"
+        );
+
+        let host = DelegateHost::new();
+        assert!(!host.relays_consent(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        for (features, relays, what) in [
+            (worker_features(true), true, "a one-row worker"),
+            (worker_features(false), false, "a two-row worker"),
+            (Vec::new(), false, "an older worker"),
+            (
+                vec!["relay-consent-v2".into(), "RELAY-CONSENT".into()],
+                false,
+                "a near miss",
+            ),
+            (worker_features(true), true, "a one-row worker again"),
+        ] {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(&mut cwr, &frame).await.unwrap();
+            // The daemon reads in order: its Pong means the caps were read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+            assert_eq!(host.relays_consent(), relays, "{what}");
+        }
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.relays_consent(), "gone with its channel");
+
+        assert_eq!(host.worker_uid(), None, "never started for anyone");
+        *host.inner.worker_uid.lock().expect("worker uid mutex") = Some(501);
+        assert_eq!(host.worker_uid(), Some(501));
+        host.revoke();
+        assert_eq!(host.worker_uid(), None, "gone with the worker");
+    }
+
+    /// FR-138 P2b (review HIGH-2) — the channel ends on an I/O error, its
+    /// worker gone while the daemon writes to it (EPIPE): what P2b holds for
+    /// the channel ends with it all the same, as on a clean end. The attach
+    /// generation moves on, each bound record hears its session end as
+    /// `error` (D6), the bindings go, and the worker's word with them. Written
+    /// first: before the fix only a clean end ran any of it.
+    #[tokio::test]
+    async fn p2b_review_a_channel_that_ends_on_a_write_error_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let secret = host.mint();
+        // Two pipes, one each way, so the daemon's writes can fail while its
+        // reads go on: the error exit, not the clean end of a read EOF.
+        let (mut to_daemon, daemon_rd) = tokio::io::duplex(4096);
+        let (daemon_wr, from_daemon) = tokio::io::duplex(4096);
+        let h = host.clone();
+        let task = tokio::spawn(async move {
+            h.serve(&secret, Box::new(daemon_rd), Box::new(daemon_wr))
+                .await
+        });
+        let mut lines = BufReader::new(from_daemon).lines();
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        write_frame(
+            &mut to_daemon,
+            &DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features: vec![KEEP_DELEGATED.to_string()],
+            },
+        )
+        .await
+        .unwrap();
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        // The worker is gone: the daemon's next write, the pong, is EPIPE.
+        drop(lines);
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon's loop ends on the write error")
+            .unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+    }
+
+    /// FR-138 P2b, over #3706 — one caps frame through both of the daemon's
+    /// known-words filters: `keep-delegated` survives, so a P2b worker is
+    /// still one (without it P2b would silently never engage), and a feature
+    /// word this build does not know is dropped, a near miss of the word too,
+    /// as #3706 drops a capability word it does not know.
+    #[tokio::test]
+    async fn p2b_the_keep_word_passes_the_workers_known_words_and_an_unknown_word_does_not() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into(), "everything".into()],
+                ..Default::default()
+            }),
+            features: vec![
+                "keep-delegated-v2".into(),
+                KEEP_DELEGATED.to_string(),
+                "x".repeat(1 << 16),
+                KEEP_DELEGATED.to_string(),
+                "KEEP-DELEGATED".into(),
+            ],
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "the word survives the worker's words");
+        assert_eq!(
+            host.effective_record(),
+            Some(vec!["remote".to_string()]),
+            "#3706's filter acts on the same frame"
+        );
+        assert_eq!(
+            *host
+                .inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex"),
+            vec![KEEP_DELEGATED.to_string()],
+            "the known word, once; nothing else"
+        );
+
+        let unknown = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec!["keep-delegated-v2".into(), "keep".into()],
+        };
+        write_frame(&mut cwr, &unknown).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        assert!(
+            host.inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex")
+                .is_empty(),
+            "an unknown word is dropped"
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-138 P2b, over #3706 — a channel #3706 closes over its line limit
+    /// ends what P2b held as every other end does, because `serve` runs
+    /// `records_channel_ended` after `run` however it ended: the attach
+    /// generation moves on, the bound record hears its session end as
+    /// `error` (D6), its binding goes, and the worker's word with it. #3706's
+    /// own clear of the worker's words holds beside it.
+    #[tokio::test]
+    async fn p2b_a_channel_closed_over_the_line_limit_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let caps = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into()],
+                ..Default::default()
+            }),
+            features: vec![KEEP_DELEGATED.to_string()],
+        };
+        write_frame(&mut cwr, &caps).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; DELEGATE_LINE_MAX + 1]).await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed");
+        task.await.unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        assert_eq!(host.effective_record(), None, "#3706's clear holds");
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+        drop(writer);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1842,6 +3485,138 @@ mod routing_tests {
         });
         assert!(!k.is_empty() && k != "?", "got {k}");
     }
+
+    /// FR-138 P2b (R2, A1) — while the daemon's table keeps (P4-0), a delegable
+    /// message about a session the daemon's own table holds is the daemon's,
+    /// and never crosses to a worker that attached since: its `Terminate` or
+    /// `Ice` would go to a process that never held the peer.
+    #[test]
+    fn p2b_a_session_the_daemon_holds_is_served_there_with_the_switch_on() {
+        assert!(
+            served_by_daemon(true, true),
+            "a daemon-held session's Terminate or Ice never crosses"
+        );
+        assert!(
+            !served_by_daemon(true, false),
+            "a session the daemon does not hold crosses as before"
+        );
+    }
+
+    /// FR-138 P2b (a6's amendment) — with the switch off the gate is today's: a
+    /// `Terminate` for a session the daemon holds still crosses, as on master.
+    /// A guard, so it passes before the implementation and after it (P4-0 too).
+    #[test]
+    fn p2b_with_the_switch_off_the_gate_is_todays() {
+        assert!(!served_by_daemon(false, true), "off, it still crosses");
+        assert!(!served_by_daemon(false, false));
+    }
+
+    /// FR-138 P2b (R23, B4) — the daemon's orders go to the worker's orders
+    /// lane, which is served wherever its loop waits; params and rc messages
+    /// keep their one ordered inbound lane, and liveness stays in the attach
+    /// loop.
+    #[test]
+    fn p2b_the_daemons_orders_go_to_their_own_lane_and_the_rest_as_before() {
+        let id = oid().to_hex();
+        let lane = worker_lane(DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        });
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Detached { ref sessions, keep_ms: 60_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "Detached: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Resumed {
+            session_id: id.clone(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Resumed { ref session_id }) if *session_id == id),
+            "Resumed: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Close {
+            session_id: id.clone(),
+            reason: "deadline".into(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Close { ref reason, .. }) if reason == "deadline"),
+            "Close: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::ToWorker {
+            msg: Box::new(ServerMsg::Ice {
+                session_id: oid(),
+                candidate: serde_json::Value::Null,
+            }),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Inbound(WorkerInbound::Msg(_))),
+            "an rc message: {lane:?}"
+        );
+        assert!(
+            matches!(
+                worker_lane(DelegateFrame::Ping),
+                WorkerLane::Here(DelegateFrame::Ping)
+            ),
+            "liveness stays in the attach loop"
+        );
+    }
+
+    /// FR-138 P2b (review HIGH-1) — the server's end of a session the daemon
+    /// keeps a record of travels the worker's ORDERS lane, which the worker
+    /// serves wherever its loop waits, its own socket's dial, hello and every
+    /// backoff included. The inbound lane, where the `Terminate` beside it
+    /// waits, is read only once that socket is up. Its wire is stable, and a
+    /// frame with no limit parses. Written first: before the fix it went to
+    /// the attach loop, which skips it.
+    #[test]
+    fn p2b_review_the_daemons_end_takes_the_orders_lane() {
+        use serde_json::json;
+        let id = oid().to_hex();
+        let frame = DelegateFrame::Ended {
+            session_id: id.clone(),
+            reason: EndReason::IdleTimeout,
+            limit: Some("max_duration".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).ok(),
+            Some(json!({"t": "ended", "d": {
+                "session_id": id, "reason": "idle_timeout", "limit": "max_duration"
+            }})),
+            "its wire"
+        );
+        let bare = serde_json::from_value::<DelegateFrame>(json!({"t": "ended", "d": {
+            "session_id": id, "reason": "admin_terminated"
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                bare,
+                Some(DelegateFrame::Ended {
+                    reason: EndReason::AdminTerminated,
+                    limit: None,
+                    ..
+                })
+            ),
+            "no limit: {bare:?}"
+        );
+        let lane = worker_lane(frame);
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Ended {
+                    ref session_id,
+                    reason: EndReason::IdleTimeout,
+                    ref limit,
+                }) if *session_id == id && limit.as_deref() == Some("max_duration")
+            ),
+            "the orders lane: {lane:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1854,6 +3629,7 @@ mod role_tests {
         Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         })
     }
 
@@ -1891,6 +3667,7 @@ mod role_tests {
         let mut role = Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         });
         let sid = bson::oid::ObjectId::new();
         in_tx
@@ -1959,6 +3736,8 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
+            keepable: false,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -1981,6 +3760,39 @@ mod params_tests {
         }
     }
 
+    /// FR-135 §7.1 — the daemon's `rc_media_legacy` entries cross with the
+    /// session, absent when there are none, and a frame from a daemon older
+    /// than the field still parses, as `None`.
+    #[test]
+    fn the_daemons_media_legacy_entries_cross_and_an_older_frame_parses() {
+        let mut p = SessionParams {
+            session_id: bson::oid::ObjectId::new().to_hex(),
+            codec: "h264".into(),
+            transport: None,
+            chroma: None,
+            chunk_framing: false,
+            audio: false,
+            permissions: roomler_ai_remote_control::permissions::Permissions::empty(),
+            controller_name: "someone".into(),
+            input_mode: None,
+            asking_org: None,
+            record: None,
+            rc_overlay: None,
+            idle_secs: None,
+            lock_on_end: None,
+            media_legacy: Some("media_plan".into()),
+            keepable: false,
+        };
+        let wire = serde_json::to_string(&p).unwrap();
+        let back: SessionParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.media_legacy.as_deref(), Some("media_plan"));
+        p.media_legacy = None;
+        let wire = serde_json::to_string(&p).unwrap();
+        assert!(!wire.contains("media_legacy"), "{wire}");
+        let older: SessionParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(older.media_legacy, None);
+    }
+
     /// `None` is a real negotiated value (the legacy track), not "unset" — so a
     /// future refactor must not collapse it with a missing field.
     #[test]
@@ -2000,6 +3812,8 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
+            keepable: false,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -2026,6 +3840,8 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
+            keepable: false,
         }
     }
 
@@ -2051,6 +3867,21 @@ mod params_tests {
         });
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
             .expect("serialises");
+        match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
+            DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
+            other => panic!("expected SessionParams, got {other:?}"),
+        }
+        // FR-148 P4 — in rank mode an `on` session's switch and blocks cross
+        // too: the worker ranks on the daemon's blocks.
+        p.rc_overlay = Some(crate::rc_overlay::RcOverlay::resolve_ranked(
+            true,
+            None,
+            crate::rc_overlay::RankMode::Prio,
+            vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+        ));
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
+            .expect("serialises");
+        assert!(wire.contains(r#""carrier_rank":"prio""#), "{wire}");
         match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
             DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
             other => panic!("expected SessionParams, got {other:?}"),
@@ -2157,10 +3988,10 @@ mod params_tests {
         id: bson::oid::ObjectId,
         permissions: roomler_ai_remote_control::permissions::Permissions,
     ) -> bool {
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &id.to_hex(),
-            permissions,
-        ))))
+        host.send_params(
+            None,
+            DelegateFrame::SessionParams(Box::new(params(&id.to_hex(), permissions))),
+        )
     }
 
     #[test]
@@ -2234,10 +4065,10 @@ mod params_tests {
             .back()
             .cloned()
             .unwrap();
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &last,
-            Permissions::RECORD,
-        ))));
+        host.send_params(
+            None,
+            DelegateFrame::SessionParams(Box::new(params(&last, Permissions::RECORD))),
+        );
         assert_eq!(
             host.inner.record_sessions.lock().unwrap().len(),
             RECORD_SESSIONS_KEPT
@@ -2281,11 +4112,14 @@ mod params_tests {
         let sid = bson::oid::ObjectId::new();
         assert!(hand_over(&host, sid, Permissions::RECORD));
         assert!(host.records_session_of(&activity(sid)));
+        assert!(host.owner_of_reply(&activity(sid)).is_some());
         host.revoke();
         assert!(
             !host.records_session_of(&activity(sid)),
             "a replaced worker's sessions must not be reportable by the next one"
         );
+        // FR-43 P3b — nor is which org handed them over remembered.
+        assert!(host.owner_of_reply(&activity(sid)).is_none());
     }
 
     /// Review finding — the relay itself, end to end: a handed-over RECORD
@@ -2299,7 +4133,7 @@ mod params_tests {
         let host = DelegateHost::new();
         let _worker = attach_worker(&host);
         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<ClientMsg>(8);
-        host.set_outbound(ws_tx);
+        host.set_outbound(None, ws_tx);
         let (recorded, other) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
         assert!(hand_over(
             &host,
@@ -2385,6 +4219,614 @@ mod params_tests {
             host.effective_apps(),
             Some(Vec::new()),
             "an older worker says nothing, and so does the device"
+        );
+    }
+
+    // ── FR-43 P3b — every org's session on one worker ──────────────────────
+
+    fn offer(session_id: bson::oid::ObjectId) -> ServerMsg {
+        ServerMsg::SdpOffer {
+            session_id,
+            sdp: String::new(),
+            ice_servers: Vec::new(),
+            extauth_mac: None,
+            peer_auth: None,
+        }
+    }
+
+    fn reply(session_id: bson::oid::ObjectId) -> ClientMsg {
+        ClientMsg::Ice {
+            session_id,
+            candidate: serde_json::Value::Null,
+        }
+    }
+
+    fn hand_over_for(host: &DelegateHost, org: Option<&str>, id: bson::oid::ObjectId) -> bool {
+        host.send_params(
+            org,
+            DelegateFrame::SessionParams(Box::new(params(
+                &id.to_hex(),
+                roomler_ai_remote_control::permissions::Permissions::empty(),
+            ))),
+        )
+    }
+
+    fn one_row_host() -> DelegateHost {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        host
+    }
+
+    /// The switch decides who gets the host: a secondary org only on a one-row
+    /// Mac's daemon, never on the worker, never with the supervisor off.
+    #[test]
+    fn a_secondary_org_gets_the_host_only_on_a_one_row_daemon() {
+        assert!(one_row_daemon(true, true, false));
+        assert!(
+            !one_row_daemon(false, true, false),
+            "the switch off: P2's layout"
+        );
+        assert!(
+            !one_row_daemon(true, false, false),
+            "the switch means nothing without the supervisor"
+        );
+        assert!(
+            !one_row_daemon(true, true, true),
+            "the worker is never the daemon"
+        );
+        let host = DelegateHost::new();
+        assert!(Delegation::for_secondary(Some(&host)).host().is_some());
+        assert!(
+            Delegation::for_secondary(None).host().is_none(),
+            "no host given: Off, as before P3b"
+        );
+    }
+
+    /// The primary is a role, not a label: a secondary labelled `primary` by a
+    /// hand-edited file still routes as that secondary.
+    #[test]
+    fn the_primary_is_named_by_its_role_not_its_label() {
+        assert_eq!(org_key(true, crate::config::PRIMARY_ORG_LABEL), None);
+        assert_eq!(org_key(false, "acme"), Some("acme"));
+        assert_eq!(
+            org_key(false, crate::config::PRIMARY_ORG_LABEL),
+            Some(crate::config::PRIMARY_ORG_LABEL)
+        );
+    }
+
+    /// AC15's routing half: two orgs' sessions on one worker, and each reply
+    /// goes back on the WS of the org that handed its session over.
+    #[test]
+    fn each_reply_goes_back_to_the_org_that_handed_its_session_over() {
+        let host = one_row_host();
+        let mut worker = attach_worker(&host);
+        let (primary_tx, mut primary_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        let (acme_tx, mut acme_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        host.set_outbound(None, primary_tx);
+        host.set_outbound(Some("acme"), acme_tx);
+        let (ours, theirs) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        assert!(hand_over_for(&host, None, ours));
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        assert!(host.send_to_worker(None, &offer(ours)));
+        assert!(host.send_to_worker(Some("acme"), &offer(theirs)));
+        let mut crossed = 0;
+        while worker.try_recv().is_ok() {
+            crossed += 1;
+        }
+        assert_eq!(
+            crossed, 4,
+            "both orgs' params and offers reached the worker"
+        );
+
+        host.relay_upstream(reply(theirs));
+        match acme_ws.try_recv() {
+            Ok(ClientMsg::Ice { session_id, .. }) => assert_eq!(session_id, theirs),
+            other => panic!("acme's reply belongs on acme's WS, got {other:?}"),
+        }
+        assert!(primary_ws.try_recv().is_err(), "and not on the primary's");
+
+        host.relay_upstream(reply(ours));
+        match primary_ws.try_recv() {
+            Ok(ClientMsg::Ice { session_id, .. }) => assert_eq!(session_id, ours),
+            other => panic!("the primary's reply belongs on its WS, got {other:?}"),
+        }
+        assert!(acme_ws.try_recv().is_err(), "and not on acme's");
+
+        // A session no org handed over: the primary, as every reply before P3b.
+        host.relay_upstream(reply(bson::oid::ObjectId::new()));
+        assert!(primary_ws.try_recv().is_ok());
+        assert!(acme_ws.try_recv().is_err());
+
+        // `rc:session.stats` names its session as a string; same routing.
+        let stats: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:session.stats",
+            "session_id": theirs.to_hex(),
+            "bytes_sent": 0, "bytes_recv": 0, "fps": 0.0, "rtt_ms": 0.0,
+            "keyframe_requests": 0, "input_events": 0,
+        }))
+        .unwrap();
+        host.relay_upstream(stats);
+        assert!(matches!(
+            acme_ws.try_recv(),
+            Ok(ClientMsg::SessionStats { .. })
+        ));
+        assert!(primary_ws.try_recv().is_err());
+    }
+
+    /// A secondary's reply with its WS down is dropped. Sending it to the
+    /// primary would hand one org's session to another org's server.
+    #[test]
+    fn a_secondarys_reply_with_its_ws_down_never_reaches_the_primary() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let (primary_tx, mut primary_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        host.set_outbound(None, primary_tx);
+        let theirs = bson::oid::ObjectId::new();
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        host.relay_upstream(reply(theirs));
+        assert!(primary_ws.try_recv().is_err());
+    }
+
+    /// A session one org handed over never crosses for another, whichever way
+    /// round: one org's server cannot reach into, or take the replies of, a
+    /// session another org's consent admitted.
+    #[test]
+    fn a_session_another_org_handed_over_never_crosses_for_this_one() {
+        let host = one_row_host();
+        let mut worker = attach_worker(&host);
+        let (theirs, ours) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        assert!(hand_over_for(&host, None, ours));
+        while worker.try_recv().is_ok() {}
+
+        assert!(
+            !hand_over_for(&host, None, theirs),
+            "params for acme's session"
+        );
+        assert!(
+            !host.send_to_worker(None, &offer(theirs)),
+            "an offer for acme's session"
+        );
+        assert!(!hand_over_for(&host, Some("other"), theirs));
+        assert!(!hand_over_for(&host, Some("acme"), ours), "and the reverse");
+        assert!(!host.send_to_worker(Some("acme"), &offer(ours)));
+        assert!(worker.try_recv().is_err(), "nothing crossed");
+
+        // The org that owns it still reaches it.
+        assert!(host.send_to_worker(Some("acme"), &offer(theirs)));
+        assert!(host.send_to_worker(None, &offer(ours)));
+    }
+
+    /// On one row a session crosses only once its params did, so every org's
+    /// session went through that org's consent first. Off one row the primary
+    /// keeps P2's rule (the control): byte-for-byte today's behaviour.
+    #[test]
+    fn on_one_row_a_session_crosses_only_once_its_params_did() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let id = bson::oid::ObjectId::new();
+        assert!(
+            !host.send_to_worker(None, &offer(id)),
+            "no params: served here"
+        );
+        assert!(!host.send_to_worker(Some("acme"), &offer(id)));
+        assert!(hand_over_for(&host, None, id));
+        assert!(host.send_to_worker(None, &offer(id)));
+
+        let p2 = DelegateHost::new();
+        let _w = attach_worker(&p2);
+        let id = bson::oid::ObjectId::new();
+        assert!(
+            p2.send_to_worker(None, &offer(id)),
+            "off one row the primary's session crosses as before"
+        );
+        assert!(
+            !p2.send_to_worker(Some("acme"), &offer(id)),
+            "a secondary's crosses only with its params, on any daemon"
+        );
+        // A message about no session (keep busy) crosses for anyone.
+        assert!(host.send_to_worker(Some("acme"), &ServerMsg::KeepBusyPolicy { denied: true }));
+    }
+
+    /// The memory of who handed what over is bounded: oldest out.
+    #[test]
+    fn the_session_org_memory_is_bounded() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let first = bson::oid::ObjectId::new();
+        assert!(hand_over_for(&host, Some("acme"), first));
+        for _ in 0..SESSION_ORGS_KEPT {
+            assert!(hand_over_for(&host, None, bson::oid::ObjectId::new()));
+        }
+        let held = host.inner.sessions.lock().unwrap();
+        assert_eq!(held.len(), SESSION_ORGS_KEPT);
+        assert!(
+            owner_of(&held, &first.to_hex()).is_none(),
+            "the oldest went first"
+        );
+    }
+
+    /// AC16's daemon half: the person's floor counts on a one-row daemon only,
+    /// and it only ever tightens.
+    #[test]
+    fn the_persons_floor_counts_only_on_one_row_and_only_tightens() {
+        use crate::consent::Mode;
+        use roomler_ai_remote_control::models::{FeaturePolicy, SessionPolicy};
+        let ask_me = PersonFloor {
+            auto_grant_session: false,
+            session_policy: SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Ask,
+                audio: FeaturePolicy::On,
+            },
+        };
+
+        let p2 = DelegateHost::new();
+        p2.note_person_floor(ask_me);
+        assert_eq!(
+            p2.person_floor(),
+            None,
+            "off one row: the root's values stand"
+        );
+        let host = one_row_host();
+        assert_eq!(host.person_floor(), None, "no worker has said it yet");
+        host.note_person_floor(ask_me);
+        assert_eq!(host.person_floor(), Some(ask_me));
+
+        assert!(matches!(
+            PersonFloor::consent(Some(ask_me), Mode::AutoGrant),
+            Mode::Prompt { .. }
+        ));
+        assert!(matches!(
+            PersonFloor::consent(None, Mode::AutoGrant),
+            Mode::AutoGrant
+        ));
+        let lets_it_through = PersonFloor {
+            auto_grant_session: true,
+            ..ask_me
+        };
+        assert!(
+            matches!(
+                PersonFloor::consent(Some(lets_it_through), Mode::from_config(false)),
+                Mode::Prompt { .. }
+            ),
+            "a root `false` holds whatever the person's file says"
+        );
+
+        let device = SessionPolicy {
+            clipboard: FeaturePolicy::On,
+            files: FeaturePolicy::On,
+            audio: FeaturePolicy::Off,
+        };
+        assert_eq!(
+            PersonFloor::session_policy(Some(ask_me), device),
+            SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Ask,
+                audio: FeaturePolicy::Off,
+            },
+            "feature by feature, the stricter: the person's `on` lifts nothing"
+        );
+        assert_eq!(PersonFloor::session_policy(None, device), device);
+    }
+
+    /// The frame's wire, and a frame that says nothing reads as the strictest.
+    #[test]
+    fn the_person_floor_frame_has_a_stable_wire_and_reads_strict_when_silent() {
+        use roomler_ai_remote_control::models::{FeaturePolicy, SessionPolicy};
+        let frame = DelegateFrame::PersonFloor(PersonFloor {
+            auto_grant_session: true,
+            session_policy: SessionPolicy::default(),
+        });
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({
+                "t": "person_floor",
+                "d": {
+                    "auto_grant_session": true,
+                    "session_policy": { "clipboard": "on", "files": "on", "audio": "on" },
+                },
+            })
+        );
+        let silent: DelegateFrame = serde_json::from_str(r#"{"t":"person_floor","d":{}}"#).unwrap();
+        let DelegateFrame::PersonFloor(f) = silent else {
+            panic!("not a person floor");
+        };
+        assert!(!f.auto_grant_session);
+        assert_eq!(
+            f.session_policy,
+            SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Off,
+                audio: FeaturePolicy::Off,
+            }
+        );
+    }
+
+    // ─── FR-138 P2b ─────────────────────────────────────────────────────────
+
+    /// FR-138 P2b (R13) — the three orders and both fields keep a stable wire,
+    /// and a frame from an older peer, without them, still parses. Written
+    /// first: at the seam the orders and the fields are off the wire.
+    #[test]
+    fn p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse() {
+        use serde_json::json;
+        let id = bson::oid::ObjectId::new().to_hex();
+        let detached = DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&detached).ok(),
+            Some(json!({"t": "detached", "d": {
+                "sessions": [id], "exit": "read_error", "netchange": false, "keep_ms": 60000
+            }})),
+            "Detached"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Resumed {
+                session_id: id.clone()
+            })
+            .ok(),
+            Some(json!({"t": "resumed", "d": {"session_id": id}})),
+            "Resumed"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Close {
+                session_id: id.clone(),
+                reason: "deadline".into()
+            })
+            .ok(),
+            Some(json!({"t": "close", "d": {"session_id": id, "reason": "deadline"}})),
+            "Close"
+        );
+        let back = serde_json::from_value::<DelegateFrame>(json!({"t": "detached", "d": {
+            "sessions": [id], "exit": "netchange_probe", "netchange": true, "keep_ms": 120000
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                back,
+                Some(DelegateFrame::Detached { ref sessions, netchange: true, keep_ms: 120_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "a Detached reads back: {back:?}"
+        );
+
+        let caps = serde_json::to_value(DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec![KEEP_DELEGATED.to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            caps["d"]["features"],
+            json!(["keep-delegated"]),
+            "the word is on the wire"
+        );
+        let older = serde_json::from_value::<DelegateFrame>(json!({
+            "t": "worker_caps",
+            "d": {"caps": serde_json::to_value(AgentCaps::default()).unwrap()}
+        }))
+        .unwrap();
+        assert!(
+            matches!(older, DelegateFrame::WorkerCaps { ref features, .. } if features.is_empty()),
+            "an older worker's caps parse, with no word"
+        );
+
+        let mut p = params(
+            &id,
+            roomler_ai_remote_control::permissions::Permissions::empty(),
+        );
+        p.keepable = true;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(wire["keepable"], json!(true), "keepable is on the wire");
+        let back: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(back.keepable);
+        p.keepable = false;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert!(wire.get("keepable").is_none(), "false stays off it: {wire}");
+        let older: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(
+            !older.keepable,
+            "an older daemon's params read not keepable"
+        );
+    }
+}
+
+/// FR-43 P3b, end to end on the daemon's side: a SECONDARY org's real loop
+/// against a control plane that asks for a session and then offers it. The
+/// gates read whether the loop holds the host, so the switch, composed as
+/// `run_cmd` composes it, is what decides.
+#[cfg(test)]
+mod secondary_org_tests {
+    use super::*;
+    use crate::signaling::{self, OrgCtx};
+    use futures::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// Asks for `session` (naming the org `Acme`) and offers it once the device
+    /// has answered the ask. Returns the URLs and what the device says.
+    async fn asking_server(
+        session: bson::oid::ObjectId,
+    ) -> (String, String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (said_tx, said_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let request = serde_json::json!({
+                "t": "rc:request",
+                "session_id": session.to_hex(),
+                "controller_user_id": bson::oid::ObjectId::new().to_hex(),
+                "controller_name": "a controller",
+                "permissions": serde_json::to_value(
+                    roomler_ai_remote_control::permissions::Permissions::empty()
+                ).unwrap(),
+                "consent_timeout_secs": 30,
+                "tenant_name": "Acme",
+            });
+            if ws
+                .send(Message::Text(request.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut offered = false;
+            while let Some(Ok(frame)) = ws.next().await {
+                let Message::Text(text) = frame else { continue };
+                if !offered && text.contains("rc:consent") {
+                    offered = true;
+                    let offer = ServerMsg::SdpOffer {
+                        session_id: session,
+                        sdp: String::new(),
+                        ice_servers: Vec::new(),
+                        extauth_mac: None,
+                        peer_auth: None,
+                    };
+                    let _ = ws
+                        .send(Message::Text(serde_json::to_string(&offer).unwrap().into()))
+                        .await;
+                }
+                let _ = said_tx.send(text.to_string()).await;
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}"),
+            format!("ws://127.0.0.1:{port}/ws"),
+            said_rx,
+        )
+    }
+
+    /// Waits until the device has said something containing `needle`.
+    async fn says(said: &mut tokio::sync::mpsc::Receiver<String>, needle: &str) -> bool {
+        tokio::time::timeout(PATIENCE, async {
+            while let Some(line) = said.recv().await {
+                if line.contains(needle) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[test]
+    fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+        // #3548 — the loop runs inside the probe's fixture, which puts its first
+        // answer in: no lib test runs the real probe, and no probe test runs
+        // beside a loop.
+        let probe = crate::encode::caps::loop_fixture();
+        probe.block_on(a_secondary_orgs_session_reaches_one_row());
+    }
+
+    async fn a_secondary_orgs_session_reaches_one_row() {
+        for one_row in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = DelegateHost::new();
+            // A worker is attached either way: what changes is whether the
+            // secondary's loop is given the host.
+            let (to_worker, mut worker) = tokio::sync::mpsc::channel(64);
+            *host.inner.to_worker.lock().unwrap() = Some(to_worker);
+            let given = one_row_daemon(one_row, true, false).then(|| {
+                host.set_one_row();
+                host.clone()
+            });
+
+            let session = bson::oid::ObjectId::new();
+            let (server, ws, mut said) = asking_server(session).await;
+            let mut cfg = crate::config::test_fixture();
+            cfg.server_url = server;
+            cfg.ws_url = Some(ws);
+            cfg.agent_token = "tok".into();
+            let (stop, stop_rx) = tokio::sync::watch::channel(false);
+            let (view_tx, _view_rx) =
+                tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+            let broker = crate::consent::ConsentBroker::new(
+                crate::consent::Mode::AutoGrant,
+                dir.path().join("consent"),
+            )
+            .unwrap();
+            let remote_cfg = crate::remote_config::RemoteConfigServices::new(
+                dir.path().join("config.toml"),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                false,
+            );
+            let task = tokio::spawn(signaling::run(
+                OrgCtx::secondary("acme", crate::token_slot::TokenSlot::new("tok")),
+                Delegation::for_secondary(given.as_ref()),
+                cfg,
+                crate::encode::EncoderPreference::Software,
+                stop_rx,
+                Arc::new(AtomicBool::new(false)),
+                view_tx,
+                Default::default(),
+                broker,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                remote_cfg,
+                crate::rc_sessions::RcSessionRegistry::new(),
+            ));
+
+            // The device answers the ask either way: the silence below, with
+            // the switch off, is the gate's and not a dead loop's.
+            assert!(
+                says(&mut said, "rc:consent").await,
+                "one_row={one_row}: the device answered the ask"
+            );
+            if one_row {
+                let frame = tokio::time::timeout(PATIENCE, worker.recv())
+                    .await
+                    .expect("the params within PATIENCE")
+                    .expect("a frame");
+                let DelegateFrame::SessionParams(p) = frame else {
+                    panic!("the params first, got {frame:?}");
+                };
+                assert_eq!(p.session_id, session.to_hex());
+                assert_eq!(
+                    p.asking_org.as_deref(),
+                    Some("Acme"),
+                    "the worker's banner names the org that asked"
+                );
+                let frame = tokio::time::timeout(PATIENCE, worker.recv())
+                    .await
+                    .expect("the offer within PATIENCE")
+                    .expect("a frame");
+                let DelegateFrame::ToWorker { msg } = frame else {
+                    panic!("then the offer, got {frame:?}");
+                };
+                assert!(
+                    matches!(*msg, ServerMsg::SdpOffer { session_id, .. } if session_id == session)
+                );
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), worker.recv())
+                        .await
+                        .is_err(),
+                    "the switch off: a secondary's session never reaches the worker"
+                );
+            }
+            let _ = stop.send(true);
+            let _ = tokio::time::timeout(PATIENCE, task).await;
+        }
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
         );
     }
 }

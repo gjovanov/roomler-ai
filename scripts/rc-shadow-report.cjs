@@ -17,12 +17,24 @@
 //   This script MEASURES that criterion. It does not decide it: whether the bar
 //   is the right one, and whether to flip, are the operator's calls.
 //
+//   Since FR-148 P0 the verdict has a second half, the UNDER-DRIVE clause
+//   (`UNDERDRIVE_*` below), because agreement alone cannot fail a shadow that
+//   asks for too little. Per path class, never pooled:
+//
+//       spent <= 1.25 × shadow in >= 90 % of the clean windows at or above the
+//       class's gate (2 Mbit/s direct, 0.5 Mbit/s constrained), over >= 20
+//       sessions of that class that reached the gate; fewer is INCONCLUSIVE.
+//
+//   The overall verdict is MET only when the agreement and both classes'
+//   clauses are. The agreement's own verdict is printed as it always was.
+//
 // TWO READS, ONE CORE
 //
-//   1. The FLEET read, the one AC2 is judged by. Run under mongosh inside the
-//      Mongo container, over `agent_logs`: every daemon and every RC worker
-//      uploads its INFO lines there (7-day TTL), across every org. That is the
-//      only unbiased population. An exec sweep of host logs reaches only
+//   1. The FLEET read, the one AC2 is judged by. Run under mongosh OUTSIDE the
+//      Mongo container (scripts/prod-mongo-read.sh,
+//      docs/production-mongo-reads.md), over `agent_logs`: every daemon and
+//      every RC worker uploads its INFO lines there (7-day TTL), across every
+//      org. That is the only unbiased population. An exec sweep of host logs reaches only
 //      exec-enabled, online hosts of one org, and the criterion is a fleet-wide
 //      PROPORTION. `GET …/agent/{id}/logs` cannot serve it either: it takes
 //      only `limit` (<= 500 recent batches per agent, roughly 40 minutes of a
@@ -66,8 +78,8 @@
 //   the shadow across a whole window proves it would have capped real spending.
 //   Under it proves less: a burst inside the window can still have been capped.
 //   The heartbeat has no maxrate field, so the spend bounds the encoder's demand
-//   from below and nothing bounds it from above. No bar is applied: the flip
-//   criterion is unchanged, and whether it gains a clause is the operator's call.
+//   from below and nothing bounds it from above. The spend table applies no bar
+//   of its own; the under-drive clause reads it at one gate per class.
 //
 // RUN
 //
@@ -93,6 +105,18 @@ const CONSTRAINED_FLOOR_BPS = 200000;
 /** The flip criterion, as the spec states it. */
 const FLIP_MIN_SESSIONS = 20;
 const FLIP_MIN_AGREEMENT = 0.9;
+/** FR-148's under-drive clause, the verdict's second half. These numbers were
+ *  published on 2026-11-02 (#1243, and FR-63's spec, "Open decisions"), BEFORE
+ *  the seven-day read, and FR-148's owner fixed them: never change one to fit
+ *  data. Per path class, never pooled: spent <= UNDERDRIVE_MAX_OVER × shadow in
+ *  >= UNDERDRIVE_MIN_SHARE of the clean windows spending the class's gate or more,
+ *  over >= UNDERDRIVE_MIN_SESSIONS sessions that reached the gate. Each gate and
+ *  the ratio are edges of the spend cube below, so the clause is read off it. */
+const UNDERDRIVE_GATE_BPS = { constrained: 500000, direct: 2000000 };
+const UNDERDRIVE_MAX_OVER = 1.25;
+const UNDERDRIVE_MIN_SHARE = 0.9;
+const UNDERDRIVE_MIN_SESSIONS = 20;
+const UNDERDRIVE_PUBLISHED = '2026-11-02';
 
 /** The lines this reads. Message text, not target: a heartbeat's message is
  *  stable across both pumps, and the fleet read filters on it server-side. */
@@ -602,6 +626,32 @@ class ShadowReport {
       pauseRisesOnDirect: out.classes.direct.pauseRisesOnDirect,
       constrainedBelowFloor: out.classes.constrained.belowFloor,
     };
+
+    // FR-148's under-drive clause, per class and never pooled, and the overall
+    // verdict that reads it beside the agreement criterion, which is left exactly
+    // as it was. The unknown class is judged at the lower gate, printed, and never
+    // decides.
+    out.underDrive = {
+      bar: { maxOver: UNDERDRIVE_MAX_OVER, minShare: UNDERDRIVE_MIN_SHARE, minSessions: UNDERDRIVE_MIN_SESSIONS, published: UNDERDRIVE_PUBLISHED },
+      classes: {},
+    };
+    for (const c of CLASSES) {
+      const decides = c !== 'unknown';
+      const gate = decides ? UNDERDRIVE_GATE_BPS[c] : Math.min(UNDERDRIVE_GATE_BPS.constrained, UNDERDRIVE_GATE_BPS.direct);
+      out.underDrive.classes[c] = underDrive(classes[c].bucket.spend.clean, classes[c].reached, gate, decides);
+    }
+    const agreement = out.criterion.verdict;
+    const halves = ['constrained', 'direct'].map((c) => out.underDrive.classes[c].status);
+    out.overall = {
+      verdict:
+        agreement === 'NOT MET' || halves.includes('NOT MET')
+          ? 'NOT MET'
+          : agreement === 'MET' && halves.every((s) => s === 'MET')
+            ? 'MET'
+            : 'INCONCLUSIVE',
+      agreement,
+      underDrive: { constrained: halves[0], direct: halves[1] },
+    };
     return out;
   }
 }
@@ -698,6 +748,47 @@ function spendSummary(cube) {
   return o;
 }
 
+/**
+ * FR-148's under-drive clause for one class, read off its clean spend cube, so
+ * `spent`, `shadow` (the higher of the window's two ends), `clean` and the class
+ * are the spend view's own. A window counts when it spent the gate or more, the
+ * first 120 s of a pump included; the opening / later split is information.
+ * `reached[i]` is how many of the class's counted sessions had a clean window in
+ * spend row i or above (`finish`), so a session counts as the agreement counts
+ * one (`--min-windows`), on this sample: when it gave the class at least one
+ * clean window at the gate. Fewer than UNDERDRIVE_MIN_SESSIONS of them is
+ * INCONCLUSIVE, whatever the share.
+ */
+function underDrive(cube, reached, gateBps, decides) {
+  const gateRow = SPENT_EDGES_BPS.indexOf(gateBps) + 1;
+  const withinAt = OVER_EDGES.indexOf(UNDERDRIVE_MAX_OVER);
+  if (gateRow < 1 || withinAt < 0) throw new Error('the under-drive gates and ratio must be edges of the spend cube');
+  const o = {
+    gateBps,
+    windows: 0,
+    within: 0,
+    share: null,
+    sessions: reached[gateRow],
+    opening: { windows: 0, within: 0 },
+    later: { windows: 0, within: 0 },
+    status: 'INCONCLUSIVE',
+    decides,
+  };
+  for (const [key, n] of cube) {
+    const [phase, spentAt, overAt] = key.split('|');
+    if (Number(spentAt) < gateRow) continue;
+    o.windows += n;
+    o[phase].windows += n;
+    if (Number(overAt) <= withinAt) {
+      o.within += n;
+      o[phase].within += n;
+    }
+  }
+  if (o.windows) o.share = o.within / o.windows;
+  if (o.sessions >= UNDERDRIVE_MIN_SESSIONS) o.status = o.share >= UNDERDRIVE_MIN_SHARE ? 'MET' : 'NOT MET';
+  return o;
+}
+
 function pctText(x) {
   return (Math.round(x * 1000) / 10).toFixed(1) + ' %';
 }
@@ -748,11 +839,15 @@ function render(r) {
   // A MET is the line a reader stops at, and it can only ever speak to asking for
   // too much. Said on every run, so the read does not depend on knowing that.
   L.push('');
-  L.push('This verdict can fail a shadow that asks for too much, never one that asks for too little: read it with "What the encoder spent" below.');
+  L.push(
+    'This verdict can fail a shadow that asks for too much, never one that asks for too little: ' +
+      'the under-drive clause below is the half that can, and the overall verdict reads both.',
+  );
   if (r.criterion.classesBelowBar.length) {
     L.push('');
     L.push(`⚠️ Below the bar on its own: ${r.criterion.classesBelowBar.join(', ')}.`);
   }
+  renderUnderDrive(r, L);
   L.push('');
   L.push('**B1 invariants, read in the field**');
   L.push('');
@@ -791,12 +886,44 @@ function share(over, of) {
   return of ? `${over}/${of} = ${pctText(over / of)}` : '—';
 }
 
+/** FR-148's under-drive clause, one line per class with its counts, then the
+ *  overall verdict. Counts only. */
+function renderUnderDrive(r, L) {
+  const u = r.underDrive;
+  L.push('');
+  L.push('**The under-drive clause (FR-148)**');
+  L.push('');
+  L.push(
+    `Per class, never pooled: spent ≤ ×${u.bar.maxOver} the shadow in ≥ ${u.bar.minShare * 100} % of the clean windows spending the class's gate or more, ` +
+      `over ≥ ${u.bar.minSessions} sessions that reached the gate; fewer sessions is INCONCLUSIVE. ` +
+      `The thresholds were published on ${u.bar.published}, before the seven-day read. ` +
+      "A pump's first 120 s count; the split beside them is for information.",
+  );
+  L.push('');
+  L.push(`| class | gate, Mbps | clean windows at the gate or more | spent ≤ ×${u.bar.maxOver} the shadow | sessions | first 120 s | later | status |`);
+  L.push('|---|---|---|---|---|---|---|---|');
+  for (const c of CLASSES) {
+    const x = u.classes[c];
+    if (!x.decides && !r.classes[c].windows) continue;
+    L.push(
+      `| ${x.decides ? c : c + ' (never decides)'} | ≥ ${x.gateBps / 1e6} | ${x.windows} | ${share(x.within, x.windows)} | ${x.sessions} | ` +
+        `${x.opening.within} of ${x.opening.windows} | ${x.later.within} of ${x.later.windows} | ${x.status} |`,
+    );
+  }
+  L.push('');
+  const o = r.overall;
+  L.push(
+    `**Overall verdict: ${o.verdict}** (agreement ${o.agreement}; under-drive: constrained ${o.underDrive.constrained}, direct ${o.underDrive.direct}).`,
+  );
+}
+
 /** What the encoder spent against what the shadow would have allowed. Counts
- *  only, and no bar: each row carries the share at its spend or more, so any gate
- *  can be read off this one report, and which gate is the operator's call. */
+ *  only, and no bar of its own: each row carries the share at its spend or more,
+ *  so any gate can be read off this one report. The under-drive clause reads it
+ *  at one gate per class. */
 function renderSpend(r, L) {
   L.push('');
-  L.push('**What the encoder spent, against the shadow (clean windows; the criterion does not judge these)**');
+  L.push('**What the encoder spent, against the shadow (clean windows; the agreement criterion does not judge these)**');
   L.push('');
   const present = CLASSES.filter((c) => r.classes[c].spend.clean.rated || r.classes[c].spend.noAge.rated);
   if (!present.length) {
@@ -805,7 +932,7 @@ function renderSpend(r, L) {
   }
   L.push(
     '`spent` is `Δbytes_written` between two heartbeats of one pump, against the higher of the shadow\'s targets at the two ends. ' +
-      'Over it across a whole window proves the shadow would have capped real spending, and a shadow pinned at its floor meets the criterion above and shows only here. ' +
+      'Over it across a whole window proves the shadow would have capped real spending, and a shadow pinned at its floor meets the agreement criterion above and shows here and in the under-drive clause. ' +
       'Under it proves less: a burst inside the window can still have been capped.',
   );
   for (const c of present) {
@@ -842,17 +969,19 @@ function renderSpend(r, L) {
 // ---------------------------------------------------------------- mongosh runner
 
 /**
- * The fleet read. Runs inside the Mongo container (the mars recipe in
- * scripts/rc-shadow-report.sh) and prints the report. Bounded by
- * construction, because an unbounded read inside that container once
- * OOM-killed production Mongo (2026-10-26):
+ * The fleet read. Runs through scripts/prod-mongo-read.sh, its client OUTSIDE
+ * the Mongo container (the mars recipe in scripts/rc-shadow-report.sh), and
+ * prints the report. Bounded by construction, because the server still runs it
+ * inside that container, and an unbounded read there once OOM-killed
+ * production Mongo (2026-10-26):
  *   - a time window of at most 8 days (`agent_logs` keeps 7), read one day per
  *     query, each with `maxTimeMS` and `allowDiskUse: false`;
  *   - only streaming stages after the index-backed `$match` + `$sort`, so the
  *     server holds no result set and mongosh holds one row at a time;
  *   - only the FIELDS above are projected; the fold keeps counters and sparse
  *     histograms, never the rows;
- *   - credentials come from the container's own environment, never argv.
+ *   - credentials come from the secret through the runner's files into the
+ *     client container's environment, never argv.
  */
 function runMongosh() {
   const env = typeof process !== 'undefined' && process.env ? process.env : {};
@@ -932,7 +1061,7 @@ function connectDb(dbName, env) {
     ).getDB(dbName);
   }
   if (typeof db !== 'undefined' && db) return db.getSiblingDB(dbName);
-  throw new Error('no connection: pass RC_SHADOW_URI, or run inside the Mongo container (its env has the credentials)');
+  throw new Error('no connection: pass RC_SHADOW_URI, or run through scripts/prod-mongo-read.sh (it sets the credentials)');
 }
 
 // ---------------------------------------------------------------- self-test
@@ -1385,6 +1514,183 @@ function selfTest() {
   ok(/\*\*Verdict: MET\*\*[^]*never one that asks for too little/.test(render(pin)), 'a MET says what it cannot see', render(pin).split('\n').filter((l) => /Verdict|too little/.test(l)));
   const none = render(run([FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 }), FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 })]));
   ok(/no window has a spend rate/.test(none), 'no rate is no evidence, not a clean bill', none.split('\n').slice(-4));
+
+  // --- FR-148's under-drive clause: the verdict's second half
+  ok(
+    UNDERDRIVE_GATE_BPS.constrained === 500000 && UNDERDRIVE_GATE_BPS.direct === 2000000 && UNDERDRIVE_MAX_OVER === 1.25 && UNDERDRIVE_MIN_SHARE === 0.9 && UNDERDRIVE_MIN_SESSIONS === 20,
+    'the clause holds the thresholds published on 2026-11-02',
+  );
+  ok(
+    SPENT_EDGES_BPS.includes(UNDERDRIVE_GATE_BPS.constrained) && SPENT_EDGES_BPS.includes(UNDERDRIVE_GATE_BPS.direct) && OVER_EDGES.includes(UNDERDRIVE_MAX_OVER),
+    'its gates and its ratio are edges of the spend cube, so the clause is read off it',
+  );
+  const ud = (r, c) => r.underDrive.classes[c];
+  const counts = (r, c) => [ud(r, c).windows, ud(r, c).within, ud(r, c).sessions, ud(r, c).status].join();
+  // `n` sessions of one class, built as row 2's are: an elevated window opens the
+  // pump, then one clean window per `plan` entry ({ spend: Mbps, shadow: bps }), 2 s apart.
+  const sessionsOf = (prefix, c, n, live, plan) => {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const sid = prefix + String(i).padStart(23, '0');
+      const p = typeof plan === 'function' ? plan(i) : plan;
+      let bytes = 1000;
+      out.push(FIX.ff(sid, { s: 1, c, live, shadow: p[0].shadow, age: 600, floor: 50, bytes }));
+      p.forEach((w, k) => {
+        bytes += mbps(w.spend, 2);
+        out.push(FIX.ff(sid, { s: 3 + 2 * k, c, live, shadow: w.shadow, age: 60, floor: 50, bytes }));
+      });
+    }
+    return out;
+  };
+  const twice = (spend, shadow) => [{ spend, shadow }, { spend, shadow }];
+
+  // a. The comment's row 2 (`pinned` above): master's file reads MET on it.
+  ok(
+    pin.criterion.verdict === 'MET' && counts(pin, 'constrained') === '40,0,20,NOT MET' && counts(pin, 'direct') === '40,0,20,NOT MET',
+    'a. pinned at its floor, the shadow still meets the agreement and fails the clause in both classes',
+    [pin.criterion.verdict, pin.underDrive.classes],
+  );
+  ok(pin.overall.verdict === 'NOT MET' && pin.overall.agreement === 'MET', 'so the overall verdict is NOT MET', pin.overall);
+  const pinMd = render(pin);
+  ok(
+    /\n\*\*Verdict: MET\*\* \(the measurement; the flip is the operator's call\)\.\n/.test(pinMd) &&
+      /\n\| constrained \| ≥ 0\.5 \| 40 \| 0\/40 = 0\.0 % \| 20 \| 0 of 40 \| 0 of 0 \| NOT MET \|\n/.test(pinMd) &&
+      /\n\| direct \| ≥ 2 \| 40 \| 0\/40 = 0\.0 % \| 20 \| 0 of 40 \| 0 of 0 \| NOT MET \|\n/.test(pinMd) &&
+      /\n\*\*Overall verdict: NOT MET\*\* \(agreement MET; under-drive: constrained NOT MET, direct NOT MET\)\.\n/.test(pinMd),
+    "the render keeps the agreement's line and adds one line per class and the overall verdict",
+    pinMd.split('\n').filter((l) => /Verdict|verdict|^\| (constrained|direct|unknown)/.test(l)),
+  );
+
+  // b. A shadow that covers the spend.
+  const covers = [...sessionsOf('t', true, 20, 3000000, twice(2, 2500000)), ...sessionsOf('u', false, 20, 89760000, twice(20, 24000000))];
+  const cov = run(covers);
+  ok(
+    cov.criterion.verdict === 'MET' && counts(cov, 'constrained') === '40,40,20,MET' && counts(cov, 'direct') === '40,40,20,MET' && cov.overall.verdict === 'MET',
+    'b. a shadow that covers the spend meets the clause, and the overall verdict is MET',
+    [cov.underDrive.classes, cov.overall],
+  );
+
+  // c. 19 sessions at the gate in one class. The agreement counts the class's 20, so
+  //    it stays MET, and the clause alone is short of sessions.
+  const nineteen = (shadow) =>
+    run([
+      ...sessionsOf('t', true, 20, 3000000, (i) => twice(i < 19 ? 2 : 0.1, shadow)),
+      ...sessionsOf('u', false, 20, 89760000, twice(20, 24000000)),
+    ]);
+  const c19 = nineteen(2500000);
+  ok(
+    c19.criterion.verdict === 'MET' && counts(c19, 'constrained') === '38,38,19,INCONCLUSIVE' && counts(c19, 'direct') === '40,40,20,MET',
+    'c. 19 sessions at the gate leave that class INCONCLUSIVE',
+    c19.underDrive.classes,
+  );
+  ok(c19.overall.verdict === 'INCONCLUSIVE', 'and the overall verdict INCONCLUSIVE, never MET', c19.overall);
+  const c19pinned = nineteen(200000);
+  ok(
+    counts(c19pinned, 'constrained') === '38,0,19,INCONCLUSIVE' && c19pinned.overall.verdict === 'INCONCLUSIVE',
+    'at 0 % too: too few sessions is no verdict either way',
+    [c19pinned.underDrive.classes.constrained, c19pinned.overall],
+  );
+  const c19all = run([...sessionsOf('t', true, 19, 3000000, twice(2, 2500000)), ...sessionsOf('u', false, 20, 89760000, twice(20, 24000000))]);
+  ok(
+    counts(c19all, 'constrained') === '38,38,19,INCONCLUSIVE' && c19all.criterion.verdict === 'NOT MET' && c19all.overall.verdict === 'NOT MET',
+    "19 sessions in the whole class: the agreement's own session clause is NOT MET, and so is the overall verdict",
+    [c19all.criterion.clauses[0], c19all.overall],
+  );
+
+  // d. Below the gate nothing counts: two more windows in every session and ten whole
+  //    sessions under it, most of them well over the shadow, leave the clause as it was.
+  const below = run([
+    ...sessionsOf('t', true, 20, 3000000, [...twice(2, 2500000), ...twice(0.45, 200000)]),
+    ...sessionsOf('u', false, 20, 89760000, [...twice(20, 24000000), ...twice(1.9, 500000)]),
+    ...sessionsOf('x', true, 5, 3000000, twice(0.45, 200000)),
+    ...sessionsOf('y', false, 5, 89760000, twice(1.9, 500000)),
+  ]);
+  ok(
+    clean(below, 'constrained').over === 30 && clean(below, 'direct').over === 30 && below.classes.constrained.sessions === 25 && below.classes.direct.sessions === 25,
+    'd. (the windows under the gate are there, and over the shadow)',
+    [clean(below, 'constrained').over, clean(below, 'direct').over],
+  );
+  ok(
+    JSON.stringify(below.underDrive) === JSON.stringify(cov.underDrive) && below.overall.verdict === 'MET',
+    'windows under the gate change nothing',
+    [below.underDrive.classes, cov.underDrive.classes],
+  );
+
+  // e. The edges: exactly the gate is gated, exactly ×1.25 the shadow is within, and
+  //    exactly 90 % meets the bar. The shadow is 400 k (constrained) and 1.6 M (direct),
+  //    so spending the gate is exactly ×1.25 of it.
+  const edges = (cSpend, dSpend) =>
+    run([
+      ...sessionsOf('t', true, 20, 3000000, (i) => [{ spend: cSpend(i), shadow: 400000 }]),
+      ...sessionsOf('u', false, 20, 89760000, (i) => [{ spend: dSpend(i), shadow: 1600000 }]),
+    ]);
+  const atEdge = edges(() => 0.5, () => 2);
+  ok(
+    counts(atEdge, 'constrained') === '20,20,20,MET' && counts(atEdge, 'direct') === '20,20,20,MET' && atEdge.overall.verdict === 'MET',
+    'e. spending exactly the gate is gated, and exactly ×1.25 the shadow is within',
+    atEdge.underDrive.classes,
+  );
+  const pastEdge = edges(() => 0.500004, () => 2.000004);
+  ok(counts(pastEdge, 'constrained') === '20,0,20,NOT MET' && counts(pastEdge, 'direct') === '20,0,20,NOT MET', 'a byte more a window is over ×1.25', pastEdge.underDrive.classes);
+  const underEdge = edges(() => 0.499996, () => 1.999996);
+  ok(counts(underEdge, 'constrained') === '0,0,0,INCONCLUSIVE' && counts(underEdge, 'direct') === '0,0,0,INCONCLUSIVE', 'a byte less a window is under the gate', underEdge.underDrive.classes);
+  const at90 = edges((i) => (i < 18 ? 0.5 : 0.6), (i) => (i < 18 ? 2 : 2.1));
+  ok(
+    counts(at90, 'constrained') === '20,18,20,MET' && counts(at90, 'direct') === '20,18,20,MET' && at90.overall.verdict === 'MET',
+    '18/20 = 90 % meets the clause (>=)',
+    at90.underDrive.classes,
+  );
+  const at85 = edges((i) => (i < 17 ? 0.5 : 0.6), (i) => (i < 17 ? 2 : 2.1));
+  ok(counts(at85, 'constrained') === '20,17,20,NOT MET' && at85.overall.verdict === 'NOT MET', '17/20 = 85 % does not', at85.underDrive.classes);
+
+  // The opening counts, and its split is printed beside the clause.
+  const lu = ud(long, 'direct');
+  ok(
+    lu.windows === 69 && lu.opening.windows === 59 && lu.later.windows === 10 && lu.within === 0,
+    "a pump's first 120 s count toward the clause, and the split says which",
+    lu,
+  );
+  // The unknown class is judged at the lower gate and printed, and never decides.
+  const unknowns = [];
+  for (let i = 0; i < 20; i++) {
+    const sid = 'z' + String(i).padStart(23, '0');
+    unknowns.push(FIX.vp9(sid, { s: 1, live: 3000000, shadow: 300000, age: 600, floor: 50, bytes: 1000 }));
+    unknowns.push(FIX.vp9(sid, { s: 2, live: 3000000, shadow: 300000, age: 60, floor: 50, bytes: 1000 + mbps(3, 1) }));
+  }
+  const withUnknown = run([...covers, ...unknowns]);
+  ok(
+    counts(withUnknown, 'unknown') === '20,0,20,NOT MET' && ud(withUnknown, 'unknown').decides === false && withUnknown.overall.verdict === 'MET',
+    'the unknown class is judged, and never decides',
+    [withUnknown.underDrive.classes.unknown, withUnknown.overall],
+  );
+  ok(
+    /\n\| unknown \(never decides\) \| ≥ 0\.5 \| 20 \| 0\/20 = 0\.0 % \| 20 \|/.test(render(withUnknown)) && !/\| unknown \(never decides\)/.test(render(cov)),
+    'and is printed when it has windows',
+  );
+  const short4 = run(covers, { minWindows: 4 });
+  ok(
+    ud(short4, 'constrained').windows === 40 && ud(short4, 'constrained').sessions === 0 && ud(short4, 'constrained').status === 'INCONCLUSIVE',
+    '--min-windows gates the sessions the clause counts, as it gates the criterion',
+    ud(short4, 'constrained'),
+  );
+  // The offline mode reads `--rows` output: each projected field as `value()` printed
+  // it, through JSON, and must give the same verdict as the text it came from.
+  const viaNdjson = new ShadowReport();
+  const viaLines = new ShadowReport();
+  for (const l of [...pinned, ...unknowns, ...sessionsOf('y', false, 5, 89760000, twice(1.9, 500000))]) {
+    const p = parseLogLine(l);
+    viaLines.add(p.msg, p.fields, p.ts, 'aaaaaaaaaaaaaaaaaaaaaaaa');
+    const f = {};
+    for (const k of FIELDS) if (k in p.fields) f[k] = value(p.fields[k]);
+    viaNdjson.addRow(JSON.parse(JSON.stringify({ a: 'aaaaaaaaaaaaaaaaaaaaaaaa', t: new Date(epochMs(p.ts)).toISOString(), m: p.msg, f })));
+  }
+  const nd = viaNdjson.finish();
+  const tx = viaLines.finish();
+  ok(
+    nd.overall.verdict === 'NOT MET' && JSON.stringify([nd.criterion, nd.underDrive, nd.overall]) === JSON.stringify([tx.criterion, tx.underDrive, tx.overall]),
+    "the offline mode over `--rows` gives the text read's verdict",
+    [nd.overall, tx.overall],
+  );
 
   // --- the constants still mirror the controller (a drift check, when run in a checkout)
   try {

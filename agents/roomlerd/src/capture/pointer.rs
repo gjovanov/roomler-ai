@@ -296,9 +296,11 @@ mod tests {
     }
 }
 
-/// The X11 source against a REAL X server. `ROOMLERD_TEST_X11=1` makes a
-/// missing server a failure rather than a skip, so the CI lane that runs this
-/// under Xvfb cannot pass by running nothing.
+/// The X11 source against a REAL X server. It moves the pointer, so it runs
+/// only under `ROOMLERD_TEST_X11=1`, which CI's Xvfb step sets for a server
+/// nobody sits at (#3813: before, it ran on whatever display it reached, a
+/// person's own included). There a missing server is a failure, so the step
+/// cannot pass by running nothing.
 #[cfg(all(test, target_os = "linux", feature = "scrap-capture"))]
 mod x11_tests {
     use super::*;
@@ -321,11 +323,12 @@ mod x11_tests {
 
     #[test]
     fn xfixes_says_where_the_pointer_is_in_the_frames_own_pixels() {
-        let Ok((conn, screen)) = x11rb::connect(None) else {
-            assert!(!required(), "ROOMLERD_TEST_X11=1 but there is no X server");
-            eprintln!("no X server — skipping (ROOMLERD_TEST_X11=1 makes this a failure)");
+        if !required() {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping: this test moves the pointer");
             return;
-        };
+        }
+        let (conn, screen) =
+            x11rb::connect(None).expect("ROOMLERD_TEST_X11=1 but there is no X server");
         let root = conn.setup().roots[screen].root;
         conn.xfixes_query_version(5, 0).unwrap().reply().unwrap();
         let hot = |c: &x11rb::rust_connection::RustConnection| {
@@ -363,5 +366,6 @@ mod x11_tests {
             Arc::ptr_eq(&m.shape, &s.shape),
             "an unchanged shape is not rebuilt"
         );
+        eprintln!("x11-real: the recorder's pointer read back where it was put, less its hotspot");
     }
 }

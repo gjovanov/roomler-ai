@@ -297,17 +297,20 @@ one since P4. The channel owns the lifetime:
 
 | Event | What ends the command |
 |---|---|
-| the client closes the channel (Ctrl-C, `ssh` exiting) | `Handler::channel_close` fires the channel's abort token → `ExecEngine::cancel` → process-**tree** kill (`taskkill /T` / the process group) |
+| the client closes the channel (Ctrl-C, `ssh` exiting) | `Handler::channel_close` fires the channel's abort token → `ExecEngine::cancel` → on Windows the session's job, then the process-**tree** kill (`taskkill /T` / the process group) |
 | the client disconnects, or the carrier dies | the handler drops; `Drop` cancels every exec it still tracks |
 | the grant's `session_secs` deadline | `arm_session_deadline` disconnects → the same `Drop` |
 | the session itself vanishes under the pump | `handle.data` fails → the pump cancels the abort |
+| the daemon leaves, by any route | on Windows the kernel ends the session's job as the process goes (§ [What outlives a session](#what-outlives-a-session-3303)) |
 | a key-list (break-glass) session | unbounded, as its pty is; the 600 s inactivity timeout still reaps a dead carrier |
 
 ⚠️ russh accepts and **discards** data for a channel the client has closed —
 the pump cannot tell — which is why `channel_close` is wired rather than
 relying on a failed write. The abort token is minted **before** the consent
 wait, so a channel closed while the operator is being asked leaves nothing to
-run; the engine re-checks it before spawning.
+run; the engine re-checks it before spawning. An interactive shell takes the same
+abort (#3303): its pump stops on it and drops the pty, because a shell at a prompt
+writes nothing that could fail.
 
 **Redaction cannot split a secret.** Every masked shape — the registered agent
 tokens, `Bearer <token>`, JWT-shaped runs — is whitespace-free, so
@@ -364,10 +367,28 @@ operator-consent gate, and process-group teardown.
 
 Mechanics worth knowing:
 
-- **`openpty`, not `posix_openpt`.** The latter needs `ptsname_r`, which does
-  not exist on macOS. `openpty` is one call, declared for both platforms, and on
-  glibc ≥ 2.34 needs no `-lutil`. Fewer moving parts across a boundary CI never
-  compiles — macOS builds only at release-tag time.
+- **A session's descriptors stay with the session.** Both ends of the pty are
+  close-on-exec, so no other program the daemon starts holds either end, and
+  the shell keeps its terminal on 0-2 and nothing else
+  (`agents/roomlerd/src/pty/unix.rs:52`, `:94`):
+
+  | Platform | How the ends are opened | Window in which a fork on another thread gets a copy |
+  |---|---|---|
+  | Linux | `posix_openpt(O_CLOEXEC)`, then the slave through `TIOCGPTPEER` with the same flags, or by its `ptsname_r` path with `O_CLOEXEC` on a kernel older than 4.13 (glibc's own `openpty` order) | none |
+  | macOS | `openpty`, then both ends marked on the next line (`tunnel_core::child::set_cloexec`). macOS has no `ptsname_r`, and its `ptsname` answers in one static buffer that two sessions opening at once would share | `openpty` → the mark, covered by the sweep below |
+
+  The macOS lane compiles this code on every PR that changes code
+  (`cargo check -p roomlerd --lib --features ssh-server`). Its tests do not
+  run on a Mac in CI: the Mac test build carries no `ssh-server`.
+- **The shell sweeps.** In the child, after the privilege drop, every
+  descriptor above stderr is marked close-on-exec
+  (`tunnel_core::child::inherit_only_stdio_async`,
+  `crates/tunnel-core/src/child.rs:382`; registered at
+  `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
+  cannot undo the drop. A one-shot command and a Fleet RPC command
+  (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
+  (`agents/roomlerd/src/ssh.rs:1253`) sweep the same way. The overlay's TUN
+  device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
   never see EOF and a session whose shell exited would hang forever.
 - **Linux reports `EIO`, not EOF**, on a master whose slave has been closed.
@@ -387,8 +408,8 @@ There is no pty pair to open. The console host owns the terminal:
 `CreatePseudoConsole` returns an `HPCON`, and a process is attached to it by
 passing that handle through a **process-thread attribute list**. Teardown is a
 **job object** (`KILL_ON_JOB_CLOSE`) rather than a process group — Windows has
-no `killpg`, and the job is what gives the same "nothing outlives the session"
-guarantee. The output stream ends at `ClosePseudoConsole`, which blocks until
+no `killpg`; § [What outlives a session](#what-outlives-a-session-3303) says
+what the job guarantees. The output stream ends at `ClosePseudoConsole`, which blocks until
 the host has flushed; a waiter closes it the moment the child exits, because
 otherwise a reader waits forever for an EOF that the console host will never
 send while the pseudoconsole lives.
@@ -408,6 +429,14 @@ Three things cost real debugging time and are commented where they live:
   whoever inherits a write end keeps its owner's reader from ever seeing EOF.
   A second `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute names exactly the two
   handles. Take both or neither.
+- **The ends the daemon keeps are never inheritable.** Both pipes are created
+  non-inheritable, so the input's write end and the output's read end, which
+  the daemon holds for the whole session, reach no child of any spawn.
+  The console's two ends are made inheritable only for the handle list, just
+  before `CreateProcess*`, and are closed right after it. A process that
+  another thread starts with unbounded inheritance inside that window gets
+  those two, never the daemon's ends. `CreatePseudoConsole` itself needs no
+  inheritable handle: it duplicates the two it is given.
 - ⚠️ **The HPCON is passed BY VALUE**, not as a pointer. Get it wrong and
   `CreateProcess` *succeeds*, then the child dies instantly with `0xC0000142`
   (`STATUS_DLL_INIT_FAILED`) because its console never initialised — visible
@@ -427,6 +456,159 @@ turns that on, and there `console_user` works on attended installs too
 (§ Through the device's SYSTEM service). `named:<account>` stays refused
 on Windows for the same reason `exec` refuses it — becoming an arbitrary local
 user needs that user's credentials.
+
+### What outlives a session (#3303)
+
+**A session that is lost ends what it started. A one-shot command that ends by
+itself leaves what it deliberately started.** On Windows:
+
+| How the session ends | `ssh node 'cmd'` | `ssh node` |
+|---|---|---|
+| the command ends by itself, or the shell `exit`s | what it left running **stays** | everything ends |
+| the client goes: closed, disconnected, the carrier dead, the grant's deadline | everything ends | everything ends |
+| the daemon stops | everything ends | everything ends |
+| the daemon crashes or is killed | everything ends | everything ends |
+
+"Everything" is the shell and whatever it started, at any depth, with the
+exceptions under *What a job cannot promise*.
+
+```mermaid
+flowchart TD
+  S["CreateProcess, suspended"] --> J["joins a kill-on-close job, then runs"]
+  J --> R{"how does it end?"}
+  R -->|"one-shot: the command ends and its output reaches EOF"| G["the job is let go:<br/>what it left running stays"]
+  R -->|"interactive: the shell exits"| C["the job closes:<br/>everything ends"]
+  R -->|"the client is gone"| T["the job is terminated:<br/>everything ends"]
+  R -->|"the daemon leaves, by any route"| K["the kernel closes the job's handle:<br/>everything ends, with no code running"]
+```
+
+**It rests on the kernel, not on code running.** A process-wide exit runs no
+destructor: a crash, `Stop-Process -Force`, or the runtime's budget
+(`runtime_exit.rs`), which leaves a blocking read behind on purpose. So
+`kill_on_drop` and `taskkill /T` cannot keep this promise, and `kill_on_drop`
+never reached a grandchild anyway. A kill-on-close job needs neither: the
+kernel closes the handle as the process goes, and ends every process in the
+job. The handle is not inheritable, so no child can hold it open past the
+daemon. The process is created suspended and joins before its first instruction,
+so nothing it starts can be outside. One-shot: `session_job`
+([`exec.rs`](../agents/roomlerd/src/exec.rs)). Interactive: `make_job`
+([`pty/windows.rs`](../agents/roomlerd/src/pty/windows.rs)). Both nest inside the
+Scheduled Task's job on a per-user daemon, and that outer job does not end them:
+it has no kill-on-close limit.
+
+**Measured on a Win11 guest** (#3303), on a candidate build of the change. Each
+cell held six forms at once: a one-shot held by its shell, `ssh -tt node 'script'`,
+a busy shell, a shell at a prompt, sftp, and a one-shot that had already returned
+and left a child. A watcher outside every session polled the process list every
+300 ms. "Gone" is every process of the five open forms, at any depth:
+
+| Event | Per-user daemon | SYSTEM service, SystemContext, `daemon` | the same, `console_user` |
+|---|---|---|---|
+| the daemon stops | gone 1.7 s before the daemon's own exit | gone 3.0 s before it | gone 2.7 s before it |
+| the client is killed | gone within 0.6 s; the daemon stays | within 0.9 s | within 0.6 s |
+| the daemon is killed | gone in the daemon's own poll | the worker killed: in its own poll, and the service restarts it; the service killed too: in its poll | not read |
+| the shell `exit`s, sftp says `bye` | its tree is gone | the same | not read |
+
+The ended one-shot's child stayed in every cell, as designed. So the bound is: no
+later than the daemon's own exit on a stop, within one 300 ms poll of it on a
+crash, and under a second after the client goes. Neither shape logged
+`could not put the session in a job object`. Unread: a corporate laptop with EDR,
+a full-tunnel VPN, a locked screen, nobody signed in, and the sessions the SYSTEM
+service serves itself (FR-105).
+
+**Why a one-shot's end is different.** `ssh node 'Start-Process notepad'` returns
+at once, and what it started is what the person asked for. Ending that would kill
+it within milliseconds and say nothing. The job was never a boundary against
+someone who means to leave something running (see below), so nothing is protected
+by ending it. A command that ended lost nothing: its job is let go, the limit
+first, so closing the handle ends nothing. A command has ended when it has exited
+and its output has reached EOF, so a plain `ssh node 'msiexec /i x.msi /qn'` had
+not ended when the daemon went: the session stayed open under the installer.
+
+**Fleet RPC is the other way round, on purpose.** A command there runs in no job,
+because it may stop this daemon and has to outlive it
+(`roomler exec … self-update`, [`fleet-rpc.md`](fleet-rpc.md) § Bounds).
+`ExecRequest::session_owned` is the switch: only `run_exec` here sets it, and
+`a_fleet_rpc_command_and_what_it_started_outlive_the_daemon` locks the other side.
+
+**What a job cannot promise.**
+- A process in the job can ask another process to start something, and that one
+  is outside: `schtasks`, WMI's `Win32_Process.Create`, a COM server, a service,
+  an elevation through `Start-Process -Verb RunAs`, and whatever runs inside WSL.
+  This is a promise about what a session leaves behind by accident, not a boundary
+  against a person with a shell.
+- If the session cannot join its job it still runs, because it may be the
+  operator's one way into the box. The daemon's log says
+  `ssh: could not put the session in a job object — descendants may outlive it`,
+  and a client gone gets `taskkill /T`, as before. Search a fleet's logs for it.
+  A command whose job cannot even be created runs the same way; a shell's is
+  refused, as it always was. A process that cannot be resumed is ended, and a
+  command says `failed to start …`.
+- `sftp-server` has no job and needs none: it starts nothing and ends on its
+  stdin's EOF, which a daemon leaving gives it.
+
+**Upgrading from inside a session.** An upgrade started in a session finishes, and
+the device comes back on the new version with nobody signing in, on both daemon
+shapes. The session does not survive it: the stop ends the shell and the script
+with the daemon. The install survives because `msiexec` in the session is only a
+client. The Windows Installer service does the work, outside every session's job,
+and finishes it with the client gone. Read on a Win11 guest from one candidate
+build of the change to the next, both with the job:
+
+| From inside the session | Per-user daemon | SYSTEM service, SystemContext |
+|---|---|---|
+| `msiexec /i x.msi /qn` typed at the prompt of `ssh node` | exit 0, back | exit 0, back |
+| `ssh -tt node 'script'`, the script runs `msiexec` and waits | exit 0, back; the script ends at the stop, before it logs `msiexec`'s exit | exit 0, back, the same |
+| `ssh node 'msiexec /i x.msi /qn'` | exit 0, back | not read |
+| `ssh node "Start-Process msiexec …"` | not read | exit 0, back; the command returns in 1 s and its `msiexec` lives to the end |
+| the client killed about a second after `msiexec` started | **1603**, rolled back: the old daemon never stopped and stayed online | not read |
+
+From released 0.4.197, which has no job for a command, every form read ended the
+same way on both shapes, except that the script outlived the stop and logged
+`msiexec`'s exit: the orphan this section is about.
+
+- **Back by itself, and nobody signs in.** The per-user daemon ran again 59 to 60 s
+  after the install finished, on the guest's own clock: the installer registers
+  the Scheduled Task with one-shot triggers 60, 180 and 600 s on
+  (`START_AFTER_REGISTERING`, [`service.rs`](../agents/roomlerd/src/service.rs)),
+  and the first starts it. The service ran again within 10 s of the upgrade's
+  start, because its installer starts it.
+- **The 1603 does no harm, and a retry works.** A client gone in the first seconds
+  takes the nested removal of the old product with it, so the running
+  `roomlerd.exe` cannot be replaced (`Error 1310`) and the installer rolls back.
+  It is the "by hand with it running" case in
+  [`installers.md`](../.claude/rules/installers.md). It predates the job:
+  released 0.4.197 ends the tree on a client gone too, and gave the same 1603.
+- **The `ssh` client is not told.** A stopping daemon sends no disconnect, so the
+  client waits for its carrier to give up: 600 s in the read, then
+  `roomler proxy` reports the connection reset.
+- **Not read:** `roomlerd self-update` typed in a session, and
+  `roomler exec … self-update`. By the code the first ends with the daemon, as
+  `msiexec`'s client does, and its watcher with it, so `last-install.json` stays
+  `InProgress` (#3289). The second runs in no job and outlives the daemon.
+
+**A stop from inside a session ends the session before the script's next line.**
+`Restart-Service Roomler`, or a script that stops the daemon and means to start it
+again, leaves the device stopped: nothing is left to run the start. Use
+`roomler restart`, which asks the daemon to restart itself and refuses unless it
+can prove a supervisor (`docs/remote-config.md`).
+
+**`ssh -t node 'cmd'` gets no terminal.** `exec_request` ignores the pty request,
+so a command with `-t` or `-tt` runs in the exec engine like any one-shot.
+`start_pty_session` runs only for a shell.
+
+**Linux and macOS: unread in the field, this is the code's account** (#3361).
+There is no job, and a process group is reached only by someone who signals it.
+Under systemd no unit sets `KillMode=`, so the default `control-group` ends
+everything in the unit's cgroup on a stop and on a crash. launchd and an unmanaged
+daemon reach no group, so a one-shot, which leads its own
+([`exec.rs`](../agents/roomlerd/src/exec.rs)), outlives them: a stop ends its direct
+child at most, through `kill_on_drop`, and a crash ends nothing. An interactive
+shell is hung up as the pty's master closes, with or without code running, and
+`PtyProcess`'s `Drop` signals its group. The pump's abort is shared code, so a
+client that goes ends a quiet shell here too, which
+`a_client_vanishing_ends_a_quiet_interactive_shell` locks on Linux. No lane runs it
+on macOS.
 
 ### Which account a session runs as (P5a)
 
@@ -448,23 +630,27 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1404`](../agents/roomlerd/src/exec.rs#L1404)). Exec, the pty and `sftp`
+[`exec.rs:1865`](../agents/roomlerd/src/exec.rs#L1865)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:807`](../agents/roomlerd/src/exec.rs#L807)), so one rule covers all
+([`exec.rs:819`](../agents/roomlerd/src/exec.rs#L819)), so one rule covers all
 three.
 
 ```mermaid
 flowchart TD
   S["a session or command asks for console_user"] --> L{"who is at the screen?"}
-  L -- "Linux: loginctl show-seat seat0 → ActiveSession" --> K{"that session's Class"}
-  L -- "macOS: stat -f %Su /dev/console" --> M{"root, empty, or _system?"}
+  L -- "Linux: loginctl show-seat seat0 → ActiveSession,<br/>off the async worker, 1.5 s at most (#3822)" --> K{"that session's Class"}
+  L -- "Linux: no answer within 1.5 s, or the lookup failed" --> X4["refused: could not tell who is there, try again"]
+  L -- "macOS: stat -f %Su /dev/console,<br/>off the async worker, 1.5 s at most (#3853)" --> M{"root, empty, or _system?"}
+  L -- "macOS: no answer within 1.5 s" --> X4
   L -- "no logind, no seat0, no active session" --> X1["refused: nobody is signed in"]
   K -- "greeter (the login screen), or any non-user class" --> X1
   K -- user --> A["that session's Name"]
   M -- yes --> X1
   M -- no --> A
-  A --> R{"resolve the account"}
-  R -- "uid 0" --> X2["refused: never root this way"]
+  A --> R{"resolve the account, off the async worker,<br/>1.5 s at most (#3853)"}
+  R -- "no answer within 1.5 s, or the lookup failed" --> X5["refused: could not look up the account, try again"]
+  R -- "uid 0, or root's session at seat0" --> X2["refused: never root this way"]
+  R -- "Linux: not the uid logind recorded for the session" --> X1
   R -- ok --> D{"the daemon runs as"}
   D -- root --> DROP["setgroups → setgid → setuid to them"]
   D -- "that same person" --> SELF["run as itself: no change of identity"]
@@ -473,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:1090`](../agents/roomlerd/src/companion.rs#L1090)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:616`](../agents/roomlerd/src/companion.rs#L616)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:4658`](../agents/roomlerd/src/companion.rs#L4658)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2120`](../agents/roomlerd/src/companion.rs#L2120)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -494,9 +680,53 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1240`](../crates/modules/network/src/routes/agent_ssh.rs#L1240)).
+  [`agent_ssh.rs:1105`](../crates/modules/network/src/routes/agent_ssh.rs#L1105)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
+
+**Who is at the screen is asked off the async worker, 1.5 s at most (#3822).** On
+Linux, logind and the account database are other processes, and either can stop
+answering: a stopped `systemd-logind`, an SSSD or LDAP server stalled on a large
+group. The agent used to run `loginctl` inline, on the async worker that applied
+the account, for as long as it took. It now asks through the one seat0 lookup in
+flight that a received file asks (`files::ask_seat0`, on a thread named
+`seat0-lookup`, [`files.rs:1046`](../agents/roomlerd/src/files.rs#L1046)), awaited
+from the session's own task, `SEAT_LOOKUP_WAIT` (1.5 s) at most
+(`exec::console_account`, [`exec.rs:919`](../agents/roomlerd/src/exec.rs#L919)). It
+asks at the same point as before: after every gate and the consent prompt, right
+before the drop. A hung logind holds one thread for files, exec and SSH together,
+and each later caller waits on that lookup within its own 1.5 s, starting none.
+
+Only a person's answer is an account (`exec::console_person`,
+[`exec.rs:972`](../agents/roomlerd/src/exec.rs#L972)):
+
+| The lookup answers | The command or session |
+|---|---|
+| a person | runs as them, as before |
+| nobody at the screen | refused, saying why, as before |
+| nothing within 1.5 s, a lookup that failed or panicked, logind or the account database failing | refused: "Could not tell who is signed in at this computer's screen. Try again.", with why (the words a received file gets, #3711) |
+| root's session at seat0 | refused, in words of its own since #3822 (before: the uid-0 check refused it) |
+| a name whose account has another uid than logind recorded for the session | refused as nobody since #3822 (before: it ran as that other uid) |
+
+The last two rows changed on purpose: a session and a received file now take one
+person by one rule (#3688's `files::seat_of`). Nothing ever stands in for the
+person: not root, not the daemon's own identity, not the person a lookup found
+before. A refusal reaches the caller where every refusal does: the Fleet RPC
+result's `error` (and so `exec_audit`), and `roomler-ssh: …` on the SSH client's
+stderr for a command or a shell, `roomler: …` for `sftp`. macOS reads
+`/dev/console`'s owner off the async worker too since #3853, and the account the
+person's name resolves to is looked up the same way on both
+(§ The account is looked up off the async worker, below).
+
+Tested in `exec::console_lookup_tests`, as the runner (rust-agent's "Test agent
+under vp9-444") and as root (rust-recorder's #3822 step): with the lookup held up,
+Fleet RPC's exec, SSH's exec, SSH's shell and SFTP are each refused within its wait
+with the try-again text and run nothing; a 10 ms timer stays on time on a two-worker
+runtime while they ask, and one lookup is in flight; an answer in time runs every
+way as the person; and no answer but a person's runs anything.
+`ssh::tests::a_console_user_refusal_reaches_the_ssh_clients_stderr` shows the
+refusal on a real SSH client's stderr. Field verification is owed (a paused logind
+on a Linux system install).
 
 Field-proven 2026-10-18 on candidates (FR-97 §8). On a Linux root daemon
 (Ubuntu, GDM), a command, a pty and `sftp` ran as the person signed in on seat0,
@@ -504,6 +734,117 @@ and were refused once GDM's greeter held the seat. A per-user daemon whose own
 account was at the screen ran them as itself. On a Mac's root daemon they ran as
 the GUI user and were refused at the login window. On the release, every one of
 them had been refused as "a Windows concept".
+
+#### The account is looked up off the async worker, 1.5 s at most (#3853)
+
+`named` and `console_user` both end in an account lookup: `getpwnam_r`, then
+`getgrouplist`, which reach the account database through NSS. On a domain-joined
+Linux host that is SSSD, LDAP or Active Directory, on a Mac Open Directory, and any
+of them can stop answering. The agent used to run the lookup inline, on the async
+worker that applied the account, for as long as it took, so a stalled SSSD held that
+worker and every socket and timer on it: the shape #3830 measured for a hung logind.
+
+The lookup now runs on a thread of its own, named `account-lookup`, through one
+lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
+[`one_in_flight.rs:407`](../agents/roomlerd/src/one_in_flight.rs#L407); the
+daemon's `ACCOUNTS`, [`exec.rs:1550`](../agents/roomlerd/src/exec.rs#L1550)). The
+session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
+(`unix_priv::session_account`,
+[`exec.rs:1572`](../agents/roomlerd/src/exec.rs#L1572)), at the same point as
+before: after every gate and the consent prompt, right before the drop.
+
+- **Keyed by the name.** `named:ana` and a `console_user` session whose person is
+  `ana` share one lookup, and another account gets its own. While the account
+  database hangs, every retry for an account waits on the lookup already running
+  and starts none, so the hang holds one thread per account asked, however often
+  it is asked.
+- **Only a lookup that began after the question answers it** (#3796's rule). A
+  lookup already running is waited out, and its answer is left to the callers it
+  was started for. No answer from before the question, late or remembered, ever
+  names the account a command runs as.
+- **The map holds only the lookups that run.** The lookup's own thread removes its
+  account's entry as it ends, answered, failed or panicked.
+- **Fork safety is unchanged.** The account (uid, gid, groups, home, name) is still
+  resolved in the parent, now on the lookup's thread, before the fork. The child
+  only calls `setgroups`, `setgid`, `setuid`, `getuid`, `geteuid` and `chdir` over
+  memory the drop already owns.
+
+What the lookup gives decides the session (`unix_priv::in_time`,
+[`exec.rs:1605`](../agents/roomlerd/src/exec.rs#L1605)):
+
+| The lookup, within 1.5 s | The command or session |
+|---|---|
+| resolves the account | runs as it, as before |
+| no such account, uid 0, a name with a NUL byte | refused in the words it always had, with no try-again |
+| gives no answer, returns an error from the account database (`getpwnam_r` failing), or panics | refused: `cannot run as "<name>": Could not look up the account to run as in this computer's account database. Try again. (<why>)`. Nothing runs, as anyone |
+
+`console_user` asks who is at the screen first (#3822's 1.5 s on Linux; on a Mac
+the owner of `/dev/console`, a `stat` child, now asked through one lookup in flight
+on a thread named `console-owner`, `exec::ask_console_owner`,
+[`exec.rs:1015`](../agents/roomlerd/src/exec.rs#L1015), with #3822's
+try-again words when it gives no answer), then looks the person's account up as
+above, so it waits 3 s at most. The refusal reaches the caller where every refusal
+does: the Fleet RPC result's `error` (and `exec_audit`), `roomler-ssh: …` on the SSH
+client's stderr for a command or a shell, and `roomler: …` for `sftp`.
+
+Tested, with the account database stood in for each test's own tasks:
+`exec::console_lookup_tests::account_database` runs as the runner (rust-agent's
+"Test agent under vp9-444", with the shell) and as root (rust-recorder's
+#3822/#3853 step). With the database stalled, `named` and `console_user` are refused
+every way within the wait with the try-again words and run nothing. A 10 ms timer on
+a two-worker runtime stays on time while they ask, and asks for one account share
+one lookup while another account gets its own. A lookup that answers in time drops
+as before, and no answer but an account runs anything.
+`exec::mac_console_lookup_tests` (the macOS lane) does the same for the console's
+owner and for `named` on a Mac. Field verification is owed: a paused SSSD on a Linux
+system install.
+
+#### The blocking callers share the lookup, 1.5 s at most (#3855)
+
+The other callers that drop to a person, or read an account's ids, run on blocking
+threads of their own: `exec::drop_to_std` (Remote Apps on a person's desktop, the
+recorder's launch, the portal's session helper and every helper it runs, the tray's
+session environment) and `account_ids` / `account_home` (the recorder's and received
+files' identity). Each looked the account up inline, so while the account database
+hung, every ask held its blocking thread for as long as the hang lasted. They now ask
+the same lookup in flight (`unix_priv::account_blocking`,
+[`exec.rs:1311`](../agents/roomlerd/src/exec.rs#L1311), through
+`OneInFlightPerKey::ask_blocking`,
+[`one_in_flight.rs:452`](../agents/roomlerd/src/one_in_flight.rs#L452)), 1.5 s at most
+from the caller's own thread. The recorder's uid is looked up through one lookup in
+flight per uid (`account_name`, [`exec.rs:1476`](../agents/roomlerd/src/exec.rs#L1476)).
+An ask from the recorder's launch and an exec as the same account share one lookup.
+A refusal carries the try-again words above through each caller's own error:
+
+| Caller | Its thread | The refusal |
+|---|---|---|
+| Remote Apps on a person's desktop (`apps::linux`, `LinuxWm::cmd`) | `spawn_blocking` for `rc:apps.*`, the caps probe's thread for the hello | `cannot_run_as`: ``cannot run `wmctrl` as <user>: cannot run as "<user>": Could not look up …`` |
+| The recorder's launch (`spawn_as_account`) and its identity (`Account::by_uid`) | `spawn_blocking` | `could not launch the recorder: …`; acting as them logs `could not act as the recorder's identity` |
+| The portal's session helper (`capture::portal::helper::spawn_child`): capture, detection, audio, keep busy, the notification prompt and the being-viewed notice | the capture, audio and keep-busy threads, a detection thread, `spawn_blocking` | `cannot run the portal helper as the session's owner: …` |
+| The tray's session environment (the prompt's start, `docs/desktop-companion.md` §10.2; the post-install launch; the post-update restart) | `tray-start`, `spawn_blocking` | the tray starts with logind's four variables, as on any failed read |
+| Received files' person (`files::seat_now`) | `seat0-lookup` | bounded by its own 1.5 s already |
+
+Fork safety is unchanged: the account is resolved in the parent, before the fork.
+Tested in `exec::console_lookup_tests::account_database::blocking` (both lanes above):
+with the database stalled, each blocking caller is refused within 1.5 s with the
+try-again words, and blocking asks and a `named` exec for one account share one
+lookup; the control resolves as before, and as root the child runs as the person.
+Remote Apps' and the recorder's own refusals are tested where they live
+(`apps::linux`, `recording::launch`).
+
+#### A session's hold on the device never waits for logind (#3871)
+
+Every SSH session, in any account mode, asks the device to stay awake while it lives:
+its handler holds the power keeper's activity count, as an exec run and a
+remote-control session do (FR-55's rule 1, [`power.md` §1](power.md)). On Linux the
+keeper takes a logind inhibitor for that, and logind may not answer. The keeper used
+to wait for it on an async worker, which on a lab host froze the whole runtime for
+20 s: every session, exec and the control connection, until the person socket's
+lookup gave up at `loginctl`'s 25 s timeout. That was the SFTP stall #3822 measured;
+SFTP was only the session that happened to start. The keeper now asks on a thread of
+its own and never waits for the answer ([`power.md` §1.1](power.md#11-the-keeper-never-waits-for-the-os-3871)).
+A session that starts while logind hangs runs as it would, and the device is held
+once logind answers.
 
 #### Where a session starts (FR-97 P5b)
 
@@ -559,7 +900,9 @@ privilege-retention bug and looks like a successful drop from outside. The
 result is then verified (`getuid`/`geteuid`) rather than assumed. Account and
 group lookup happen in the *parent*: everything between `fork` and `exec` must
 be async-signal-safe and must not allocate, since a malloc lock held by another
-thread at fork time is never released in the child.
+thread at fork time is never released in the child. Since #3853 that lookup runs
+on the parent's `account-lookup` thread, 1.5 s at most, never on the async worker
+(§ The account is looked up off the async worker, 1.5 s at most).
 
 Naming an account that resolves to uid 0 is refused. Not because running as
 root is impossible — `daemon` already is root there — but because it has to be
@@ -623,8 +966,8 @@ roomlerd anchor ssh off|console_user|system   # an anchor that exists
 roomlerd anchor status                        # "ssh: ON, …" and the service's host-key fingerprint
 ```
 
-The ceiling belongs to the anchor (`%ProgramData%\roomler\roomler\exec-service\anchor.json`,
-SYSTEM and Administrators only) and defaults to **off**, so every FR-94 anchor
+The ceiling belongs to the anchor (`HKLM\SOFTWARE\Roomler\ExecService`, SYSTEM and
+Administrators only, with the service's host key beside it since #3737: [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)) and defaults to **off**, so every FR-94 anchor
 reads as off and no device gains SYSTEM SSH by updating. `system` permits
 `daemon` and `console_user` grants; `console_user` permits only that one. A
 grant outside the ceiling takes the worker path, exactly as before: that is a
@@ -770,7 +1113,7 @@ sequenceDiagram
     alt recorded
         S->>C: address + port + host key
         C->>D: SSH over the overlay — authenticated by the grant
-    else refused (gate 4, expired on arrival, invalid)
+    else refused (gate 4, invalid, or expired from an older agent)
         S->>C: which one, by name
     else no ack within 10 s
         S->>C: grant_unconfirmed — never an address
@@ -801,7 +1144,7 @@ life to dial in), and logs `confirmed_after_ms` on every confirmed grant.
 |---|---|
 | recorded | where to dial |
 | `ssh_disabled` — gate 4 | `agent_disabled` |
-| `expired` — arrived past its deadline (clock skew) | `grant_expired_on_arrival` |
+| `expired` — only from an agent released before #3511: its clock read the grant's timestamp as already past, because it ran ahead of the server's | `grant_expired_on_arrival` |
 | `invalid`, or a reason newer than the server | `grant_refused` |
 | nothing within 10 s | `grant_unconfirmed` — **never an address**: the one thing known is that the device has not confirmed |
 
@@ -834,10 +1177,10 @@ reason to accept an unbounded table or an eternal key:
 
 - **Single use.** A redeemed grant is removed, so a captured public key cannot
   be replayed into a second session even inside its lifetime.
-- **A local deadline**, derived from *arrival* (`Instant`), not from the
-  server's wall clock. The server's timestamp can only ever shorten the window
-  — a skewed clock or a compromised control plane cannot mint an immortal
-  grant. Ceiling: 60 s.
+- **A local deadline**: 60 s from the grant's *arrival*, on the device's
+  monotonic clock (`Instant`), whatever the server's timestamp says (#3511,
+  next section). A skewed clock or a compromised control plane can neither
+  mint an immortal grant nor make a device refuse every grant.
 - **A capped table** (16 pending), so the control plane cannot grow agent
   memory. Overflow drops the oldest, which is the one closest to expiry anyway.
 - **A session lifetime** (`session_secs`, requested by the caller, clamped both
@@ -855,6 +1198,71 @@ reason to accept an unbounded table or an eternal key:
 Grants are tried before `ssh_authorized_keys` and take precedence; sessions
 authenticated by a grant carry the roomler principal into the log and the audit
 record, which a key-list session cannot.
+
+### The device's clock does not decide a grant's window (#3511)
+
+Until #3511 the target judged the grant's `expires_at_ms`, a reading of the
+**server's** wall clock, against its **own**: the window was
+`min(expires_at_ms − now, 60 s)`, and a zero window was refused as `expired`.
+That measured the skew between the two machines, not the grant's age. On
+2026-11-05 a Windows device whose clock ran about 73 s ahead of the server's
+refused every grant (`grant_expired_on_arrival`) while remote desktop, exec and
+tunnels worked on it. A device 60 s or more ahead could never take a grant, one
+30–60 s ahead got a window that a slow WireGuard handshake could outlast, and
+one behind the server took even a late grant for the full window.
+
+Now the window is the TTL from **arrival**, on the device's monotonic clock:
+
+| side | where | what it does |
+|---|---|---|
+| the device | `record_grant` ([`ssh.rs:3077`](../agents/roomlerd/src/ssh.rs#L3077)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3109-3118`), so a skewed clock stays visible |
+| the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
+
+The slack is for agents released before #3511, which still take
+`min(expires_at_ms − now, 60 s)`. From the server release that carries it they
+take up to ten minutes of skew, and the 60 s ceiling that every released agent
+applies (it came with SSH itself, #544) still caps the window. It does not make
+a grant longer: the caller's `expires_at_ms`, the row's `claim_by`
+(`agent_ssh.rs:496`) and the row's TTL stay on the server's clock. The device's
+daemon also measures its skew against the server's HTTP `Date` at start and
+warns past 60 s (`preflight: clock skew vs server`,
+`agents/roomlerd/src/preflight.rs:117`).
+
+**What bounds a grant that arrives late.** The absolute timestamp was the guard
+against a late grant, and only on a device whose clock was not behind the
+server's. These bounds hold whatever the device's clock says:
+
+1. **FR-83.** The caller is told where to dial only once the target's
+   `rc:ssh.grant_ack` is back, within `GRANT_ACK_TIMEOUT_SECS` (10 s,
+   `models.rs:2587`). Later than that the answer is `grant_unconfirmed`
+   (`agent_ssh.rs:599`), never an address.
+2. **FR-105.** The SYSTEM service can claim a via-service grant only before
+   `claim_by`, mint + 10 s on the server's clock (`agent_ssh.rs:496`; the claim
+   filters on it, `crates/services/src/dao/ssh_pending.rs:56`).
+3. **The caller's key is single-use.** `roomler ssh` makes a fresh key for every
+   session (`agents/roomler-cli/src/sshcmd.rs:46`) and drops it on any refusal
+   (`:59-61`), so a grant that lands late admits a key nobody holds.
+4. **A queued grant dies with its connection.** It waits on the connection's
+   own queue (`crates/modules/fleet/src/hub.rs:3291`), so a reconnect drops it,
+   and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
+   `agents/roomlerd/src/signaling.rs:66`, checked at `:2386`) reconnects. On a
+   live connection a grant cannot be recorded much later than that.
+5. **The table.** Single use, 16 pending at most
+   (`agents/roomlerd/src/ssh.rs:3024`), and no window longer than 60 s from
+   arrival.
+
+One case is left: a caller of the HTTP route who keeps a reusable key after a
+`grant_unconfirmed` and dials anyway (the route takes any OpenSSH public key,
+`agent_ssh.rs:1203`). On a stalled control connection, a grant that lands late
+could then be redeemed up to about 165 s after mint, instead of 60 s. That
+matters only if the caller's authorization was revoked in between, and a
+redeemed session already outlives a revocation for its `session_secs` (12 h at
+most, `MAX_SESSION_SECS`, `models.rs:2591`). #3511 records that decision.
+
+| | server before #3511 | server with #3511 |
+|---|---|---|
+| **agent before #3511** | refuses every grant from about 60 s ahead | takes grants up to about 10 min ahead; the window stays ≤ 60 s from arrival |
+| **agent with #3511** | takes grants at any skew, 60 s from arrival | takes grants at any skew, 60 s from arrival |
 
 ### Operator consent (P5d — shipped)
 
@@ -878,13 +1286,23 @@ roomler-ssh: waiting up to 30s for approval at the device…
 Without that line a policy of `prompt` is indistinguishable from a 30-second
 hang. Denial and timeout both refuse with their own reason and exit 1.
 
+A channel that joins a question already standing for its grant (below) waits
+only for what is left of that question's window, and is told so:
+
+```
+roomler-ssh: this is being asked at the device already; waiting up to the rest of its 30s for that answer…
+```
+
 **The prompt names the caller as the grant words it** (#2815): `«name» (via
 «device»)`, the way the screen-control and exec prompts word theirs. Until
 #2815 it showed the session's technical identity,
 `ssh:«name» (via «device»)@«overlay ip»:«port»`, which means nothing to the
 person deciding. That identity still attributes every log line and activity
 report (`ResolvedSessionPolicy::caller`). The prompt reads `prompt_name`, and
-so does the SYSTEM service's relay to the worker.
+so does the SYSTEM service's relay to the worker. A log line holds either one
+quoted and escaped, as it holds what a client sends: a line break in a name
+stays inside its line (#3815,
+[What an SSH client sends, and what a grant names, are escaped too](security-baseline.md#what-an-ssh-client-sends-and-what-a-grant-names-are-escaped-too-3815)).
 
 ⚠️ **The broker is threaded, not discovered.** The consent broker rides
 `ssh::SessionServices` from the daemon through `overlay::maybe_start` into the
@@ -892,6 +1310,76 @@ server's `Ctx`, and the field is non-optional — a server that can be
 constructed at all provably has someone to ask. (It used to be a process
 global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
+
+⚠️ **Armed before it is shown (#3442).** The device registers the question with
+the broker first (`ask_here`, [`ssh.rs:2452`](../agents/roomlerd/src/ssh.rs#L2452)), then puts it up: the native panel, the
+`.pending` marker the companion and `roomlerd consent --list` read, a companion
+it may have to start (up to 3 s), a notification. An answer counts from the
+moment anything shows the question. Until #3442 the question was armed last,
+so an answer given while the surfaces went up was refused ("no active prompt"),
+and the native panel went down with it, leaving the question asking with
+nothing on the screen. The window still runs from the show: the prompt starts
+its clock at its first look. A screen-control request and `rc:rpc.exec` arm
+first the same way ([`signaling.rs:4280`](../agents/roomlerd/src/signaling.rs#L4280), [`:5831`](../agents/roomlerd/src/signaling.rs#L5831)), as the recording question does
+(`docs/recording.md` §10).
+
+**One question per grant and activity, each under an id of its own (#3442,
+[`ssh.rs:2318`](../agents/roomlerd/src/ssh.rs#L2318)).** Channels of one session can ask at once: a command waits in a
+task of its own, so a second channel can ask while the first waits. A channel
+that asks what a question already standing for its grant asks (the same
+activity: "run a command", "open an interactive shell", "transfer files over
+SFTP") waits on that question, and one answer settles every channel waiting on
+it. A different activity is a different question: the question names the
+activity (FR-27), so an Allow given for a command never opens a shell. Each
+question is filed under a fresh object id, never the grant's, and the daemon
+logs the two side by side. A channel that joins a standing question logs that
+question's id ([`ssh.rs:2336`](../agents/roomlerd/src/ssh.rs#L2336)), and the answer's line carries the grant ([`:2530`](../agents/roomlerd/src/ssh.rs#L2530)), so a
+joiner is matched to the answer it took by id, not by timing.
+
+**One Allow settles every channel of the grant that asks about the same
+activity while the question stands,** including one that joins in the 250 ms
+before the broker next looks for the answer ([`consent.rs:73`](../agents/roomlerd/src/consent.rs#L73)). That is accepted
+on purpose: the prompt never shows the command text, so the person approves an
+activity, not a command, and one approved command can already run anything as
+the grant's identity.
+
+| Two channels of one grant ask about… | now | before #3442 |
+|---|---|---|
+| the same activity | one question, and one answer runs both | two questions under the grant's id: the second withdrew the first, whose channel was refused although nobody had said no |
+| different activities | two questions, two ids, each answered on its own | the same withdrawal; and on a desktop notification, which is dismissed by id, the older question's end took down the newer one's |
+
+A grant is single-use, so every question under it belongs to one connection.
+The question stands while any channel waits on it (a shared future): one
+channel closing does not withdraw it from the others. It comes off the table
+when it is answered, or when the last channel waiting on it goes. A channel
+that asks in the instant between the person's answer and the question coming
+off the table gets that answer. It is the same caller asking about the same
+activity, so the person could not have told the two channels apart.
+
+⚠️ **A channel's wait outlives its connection.** russh awaits the handler
+inside the connection's read loop and never aborts the session's task, and a
+command waits in a task of its own. So the last waiter going is, in practice,
+the daemon shutting down: a question runs until it is answered or its window
+ends, even after its connection died, and an Allow given then still starts
+what was asked (#3465).
+
+The SYSTEM service (FR-105) coalesces before it relays, and the relayed
+question carries its own id, which the worker checks is an object id
+([`ssh_service.rs:928`](../agents/roomlerd/src/ssh_service.rs#L928)). ⚠️ **The fix needs the service, not only the worker.** A
+service from before #3442 relays the grant's id for every question and does not
+coalesce, so a worker behind it still has the second question withdraw the
+first, until the service is updated too.
+
+Locked by five tests in `ssh::tests`. The first four were each RED on the code
+before #3442, and the fifth came with its review:
+
+| test | what it holds |
+|---|---|
+| `an_answer_given_as_the_ssh_question_goes_up_counts` | an answer given the moment the marker appears, with the companion still starting (2 s), runs the command. Before: refused, "no active prompt" |
+| `two_commands_asking_at_once_share_one_question` | two commands of one grant ask at once: one question, one Allow, both run. Before: the first was withdrawn |
+| `a_command_and_a_shell_asking_at_once_are_two_questions` | a command and a shell ask at once: two questions, neither the grant's id, both answered and both run. Before: one id, and the command was withdrawn |
+| `a_service_session_runs_once_the_worker_says_the_person_approved` | the SYSTEM service relays an object id of the question's own. Before: the grant's id |
+| `one_no_refuses_every_command_waiting_on_the_question` | two commands of one grant wait on one question, and one No refuses both, each told why. A timeout reaches every waiter through the same shared answer, but no test waits out the 30 s window |
 
 ⚠️ **A denied session burns its grant.** Authentication consumes the grant
 *before* the prompt runs, so a deny — or a timeout — means requesting a new
@@ -1013,7 +1501,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:937`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1184`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
@@ -1042,6 +1530,17 @@ Windows service install, set it with
 `roomlerd set-service-env-var --name ROOMLERD_SFTP_AS_USER --value 0`, then
 restart the service. The SystemContext worker inherits the service's
 environment, so a machine-wide variable reaches it only after a reboot.
+From 0.4.200 the switch stays through every update, the update into 0.4.200
+included, and through a repair. An uninstall removes it with the service. Up to
+0.4.199 an update dropped it with every other entry but the SystemContext switch,
+silently (#3375, `docs/installation.md`,
+[What the service's `Environment` keeps](installation.md#what-the-services-environment-keeps-3375)).
+To check that the switch holds, try a transfer. OpenSSH's `sftp` shows the
+refusal only as `subsystem request failed on channel 0`, without the reason the
+device sends on stderr. The device's log has
+`ssh: refused an unsupported request … request="sftp"`. An agent before #3815
+writes it unquoted, `request=sftp`, as measured on a Win11 SystemContext guest
+after an update (#3375).
 ⚠️ Never replace the service's registry `Environment` value by hand. On a
 SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
 Overwriting it turned a test device into a user-context one, whose worker,
@@ -1056,7 +1555,13 @@ the signed-in user, and still work.
 ⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
 covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
 for an unusual host. `sftp-server`'s stderr goes to the daemon log, never the
-channel — SFTP is binary and injected text corrupts a transfer.
+channel — SFTP is binary and injected text corrupts a transfer. It is one
+`ssh: sftp-server stderr` line a session, written when the child closes its
+stderr, with the text as ONE escaped field, `msg="…"`: its first 4 KiB, and
+`cut_bytes` counting the rest (#3890, `SftpStderr`,
+`agents/roomlerd/src/ssh.rs:2172`). A line break or a control character in
+it, or in a path it quotes from the client, stays inside that line. Up to 0.4.222
+the text was logged as it came, and on Windows one line per chunk.
 
 Field-proven 2026-08-22, buildhost → fleet-host-1: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
@@ -1306,240 +1811,30 @@ SYSTEM, the signed-in user on an attended install).
 until their mask is rewritten — the same friction `SSH_DEVICE` has. Owner is
 unaffected (it passes via the `ADMINISTRATOR` bypass).
 
-### An agent session's request (FR-90 P3-8-1b)
+### What parked agent sessions left behind (FR-137)
 
-A Hive agent session runs one command on another device of its organization
-(`ssh_run`, the FR-90 spec's §3e "P3-8, `ssh_run`, as designed"). It asks
-from its own device, on the device-originated leg, which today runs under
-the origin device's **owner**. A session that used it as it is would borrow
-its owner's SSH rights. So the session's request carries a decision of its
-own: the vault's **ticket** (`ssh_ticket`, [`vault.md`](vault.md) §22), and
-the network module holds the request to it. It is a ticket, not a grant,
-because `rc:ssh.grant` is already the target's grant, and the request
-carries both.
+Parked FR-90 let an agent session run one command on another device: it asked
+with a ticket its vault signed (`ssh_ticket` on `rc:ssh.request`), toward a
+target that advertised `ssh-one-command`. That code is off master. Three things
+stay, each for a reason that outlives it:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant D as the session's device
-    participant S as server (network module)
-    participant T as target device
-    D->>S: rc:ssh.request { …, ssh_ticket }
-    S->>S: bind the ticket: this org, this device, this target (else ticket_refused)
-    S->>S: its account still the target's? the target says ssh-one-command?
-    S->>S: gate 1 · gate 2 is the vault's · gate 3: no policy admits a session yet
-    S-->>D: rc:ssh.response { error, ssh_ticket_id }
-    Note over T: nothing reaches the target until a policy admits sessions
-```
+| What stays | Why | Where | It may go when |
+|---|---|---|---|
+| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:858` | no agent at 0.4.199 or older is left (FR-137 D8) |
+| a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:348`, and recorded by `dispatch` like any refusal | with the field |
+| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5163-5173` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
-| Check, in order | Refused as | The answer echoes the ticket |
-|---|---|---|
-| the ticket binds: this server's, unexpired, for THIS organization, from THIS connection's device, toward the request's target as resolved (by id) | `ticket_refused` | no: nothing it claims was verified |
-| the public key | `bad_public_key` | yes |
-| the account the ticket was decided for is still the one the target's policy maps | `ticket_refused` | yes |
-| the target advertises `ssh-one-command` (it can hold a grant to one command) | `target_too_old` | yes |
-| gate 1, the org's switch | `org_disabled` | yes |
-| gate 2 | (the vault decided `ssh:run` in its place: the owner's `SSH_DEVICE` is not read) | — |
-| gate 3: the device's `mode`, then which policies admit a session | `device_disabled`, then `session_not_allowed` until decision 22 | yes |
+A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
+`claim_service_grant` reads no query, so the word is ignored
+(`crates/modules/network/src/routes/agent_ssh.rs:1223`). The verb
+`ssh-one-command` is reserved with the rest of FR-90's verbs.
 
-What a session's request is held to once a policy admits it (decision 22,
-P3-8-1b-2), already in place:
-
-- **The rate limit counts the session**, not its owner: one session cannot
-  spend its owner's budget, nor the owner the session's.
-- **`session_secs` ends with the ticket at the latest**: the target closes the
-  session there, whatever the session asked for. What is left of a ticket is
-  never 0, which `clamp_session_secs` would read as the ceiling.
-- **The grant says `one_command`**, and so does FR-105's pending row and the
-  SYSTEM service's claim: the target serves the key one `exec` (P3-8-2a).
-
-⚠️ **Never served as the owner's request.** A ticket that does not hold
-refuses the request. It does not fall back to the owner's path, which the
-device-originated leg would otherwise take: a session's daemon that sent a
-forged or stale ticket gets a refusal, not its owner's rights.
-
-⚠️ **The audit names the session.** `ssh_audit` rows of a session's request
-are `source: session`. Once the ticket holds, they carry `session_id` and
-`ssh_ticket_id` (`ticket:<id>` in `vault_audit`), and `user_id` is the
-person the session acts for, who need not own the device it runs on. The
-`caller` names the session too. A refused ticket's row is `session` with no
-session id, since nothing it claimed was verified.
-
-⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
-`ssh_ticket`, an unknown field, and would answer the request as the owner's.
-So `rc:ssh.response` echoes `ssh_ticket_id` whenever the ticket held, and
-the session's daemon never dials on an answer that does not echo the ticket
-it presented (P3-8-2b).
-
-| Piece | Where |
-|---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:867`](../crates/remote_control/src/signaling.rs#L867)), `one_command` on `rc:ssh.grant` ([`:3920`](../crates/remote_control/src/signaling.rs#L3920)), `ssh_ticket_id` on `rc:ssh.response` ([`:3961`](../crates/remote_control/src/signaling.rs#L3961)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5182`](../crates/remote_control/src/models.rs#L5182)) |
-| the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
-| the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
-| the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
-| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. The target holding `one_command` (P3-8-2a), the device's client (P3-8-2b-1) and the tool `ssh_run` (P3-8-2b-2) are the next three sections |
-
-### A session's grant on the target: one command (FR-90 P3-8-2a)
-
-The grant a session's request earns says `one_command`, and the **target**
-holds the session it opens to exactly that: one `exec`, on one channel. It is
-the target's rule, not the client's. The session's daemon holds the key, and
-a key may ask for anything a key may ask for, so only the device being reached
-can keep the session to what its ticket was decided for.
-
-| The session asks for | What it gets |
-|---|---|
-| a session channel | the first one. A second is refused (`administratively prohibited`): it could carry a second command |
-| `exec` | the first one runs. Any later one is refused with the reason on stderr. The attempt is spent when it is asked, so a refused or failed `exec` is not followed by another |
-| a terminal (`pty-req`) | refused before it is recorded. The command runs without one |
-| a shell | refused, with the reason on stderr |
-| a subsystem, `sftp` included | refused, with the reason on stderr |
-| a forward (`direct-tcpip`) | refused, even to a destination this device's `forward_acl` admits, and reported as a denied forward |
-| `-R`, agent or X11 forwarding | what every session gets: nothing (none is implemented) |
-
-```mermaid
-flowchart LR
-    S["server: a session's grant<br/>one_command"] --> R{"the device's SYSTEM service<br/>published one_command?"}
-    R -- "yes, and it serves this account" --> V["the service claims it<br/>(claim says one_command=true)"]
-    R -- "no" --> W["the worker records it<br/>(its own ssh-one-command)"]
-    V --> H["the SSH server: one exec,<br/>on one channel"]
-    W --> H
-```
-
-**Who says the device can hold it.** The worker's hello advertises
-`ssh-one-command`, and P3-8-1b sends a session's grant to no connection that
-does not. That word speaks for the worker's own server. On an anchored Windows
-device, a grant may instead go to the SYSTEM service (FR-105), whose build can
-be older than the worker's. So the service says it for itself:
-- its endpoint publish carries `one_command: true`, and a session's grant is
-  routed to the service only when the published record says so. Otherwise the
-  worker serves it, as it serves any grant outside the service's reach;
-- its claim carries `one_command=true`, and a session's grant is handed to no
-  claim that does not say so: the same 404 as every other refusal, audited
-  `claim_refused`. Routing already keeps such a grant from a service that
-  never said the word, so this is the backstop for one whose build changed
-  since it published.
-
-⚠️ **The attempt counts, not the success.** A session that sent an `exec`
-the device refused, or whose command failed to start, has used its one
-command. Retrying would let a session probe the device's rules one refusal at
-a time.
-
-⚠️ **The key-list path is never one-command.** A key in the device's own
-`ssh_authorized_keys` is the owner's break-glass access, and no agent
-session's grant backs it.
-
-| Piece | Where |
-|---|---|
-| the grant's field | `Grant::one_command` ([`ssh.rs:2852`](../agents/roomlerd/src/ssh.rs#L2852)), recorded by `record_grant` ([`:2928`](../agents/roomlerd/src/ssh.rs#L2928)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
-| the rules | one channel ([`ssh.rs:1693`](../agents/roomlerd/src/ssh.rs#L1693)), no forward ([`:1759`](../agents/roomlerd/src/ssh.rs#L1759)), one `exec` ([`:1854`](../agents/roomlerd/src/ssh.rs#L1854)), no shell ([`:1964`](../agents/roomlerd/src/ssh.rs#L1964)), no terminal ([`:2003`](../agents/roomlerd/src/ssh.rs#L2003)), no subsystem ([`:2106`](../agents/roomlerd/src/ssh.rs#L2106)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:4459`](../agents/roomlerd/src/encode/caps.rs#L4459)) |
-| the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
-| the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
-
-### The session's own device: the client (FR-90 P3-8-2b)
-
-The SSH client is the session's own daemon, never the session. The session
-never holds a key, and no key reaches its transcript: this daemon mints one for
-each call, presents its public half once, and drops it when the call ends.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant D as the session's daemon
-    participant V as vault
-    participant N as network module
-    participant T as target
-    D->>V: rc:vault.ssh {session, fence, target, ttl}
-    V-->>D: rc:vault.ssh.granted {ticket_id, ticket, os, account}
-    D->>D: mint an ed25519 key for this call
-    D->>N: rc:ssh.request {target, public key, session_secs, ssh_ticket}
-    N-->>D: rc:ssh.response {address, port, host_pubkey, ssh_ticket_id}
-    D->>D: the echo is this ticket's, and a host key is named? (else nothing dials)
-    D->>T: dial the overlay address, pin the host key, one exec
-    T-->>D: exit status, stdout, stderr
-```
-
-| Step | What the client does |
-|---|---|
-| the ticket | asks the vault (`rc:vault.ssh`), the primary's connection only, as a lease is. An answer that is not whole is refused; `Debug` never shows the ticket |
-| the key | ed25519, minted for the call; its private half lives in this process's memory alone |
-| the request | `rc:ssh.request` with the ticket and the key's public half. `session_secs` is the command's time plus the target's 30 s prompt; the network module clamps it to what is left of the ticket |
-| the answer | refused unless it echoes the ticket it presented and names a host key that parses. A refusal is the server's words |
-| the dial | the target's overlay address: through the userspace stack on a netstack node, through the OS's routes on a node with a TUN |
-| the session | the target's host key pinned to the answer's; one `exec`; the exit status and both streams, each to 64 KiB (`truncated` when cut), all within the call's time |
-
-⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
-`ssh_ticket`, an unknown field, and would answer the request as the device
-owner's. Such an answer echoes nothing, and the client dials nothing on it.
-
-⚠️ **Another host key is refused before the key is offered.** The client
-checks the target's key during the handshake, before it authenticates, so a
-device that answers in the target's place learns no key and spends no grant.
-
-⚠️ **One command is the target's rule, not this client's.** The client asks
-for one `exec` because that is all it needs; the target refuses anything more
-(P3-8-2a), whatever a daemon holding the key might ask.
-
-| Piece | Where |
-|---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6645`](../agents/roomlerd/src/signaling.rs#L6645)) |
-| the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
-| the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6281`](../agents/roomlerd/src/signaling.rs#L6281), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
-
-### The tool: `ssh_run` (FR-90 P3-8-2b-2)
-
-A session asks for its one command with `ssh_run`, on its toolbelt. The tool is
-offered only where three things hold: the device's owner turned on `hive_ssh`,
-the vault is offered here (`vault_enabled`), and the build carries the `vault`
-and `ssh-server` features. Anywhere else `ssh_run` is an unknown tool.
-
-```mermaid
-flowchart LR
-    S["the session calls<br/>ssh_run {device, command, timeout_s}"] --> A{"a person approves<br/>(the settings ask)"}
-    A -- no --> X["denied: nothing is asked"]
-    A -- yes --> P{"one line, at most 8 KiB?<br/>timeout 1 to 300 s?"}
-    P -- no --> Y["refused in words:<br/>the vault is asked nothing"]
-    P -- yes --> V["rc:vault.ssh, its ticket for<br/>30 s + 30 s + the timeout"]
-    V -- refused --> Z["the vault's word"]
-    V -- a ticket --> C["the client, above:<br/>key, request, echo, host key, one exec"]
-    C --> R["os, account, ticket_id,<br/>exit_code, stdout, stderr, truncated"]
-```
-
-| Piece | What it does |
-|---|---|
-| the offer | `hive_ssh`: device-owned, default off, and never pushable (`DesiredConfig` cannot carry it). Only beside `vault_enabled` |
-| the call | `device`, a device's id; `command`, one line of at most 8 KiB for that device's shell (PowerShell on Windows, bash elsewhere); `timeout_s`, 1 to 300 seconds, 60 if not given. A call that breaks one of these is refused before the vault is asked |
-| the approval | the session's settings ASK for `mcp__roomler__ssh_run` on every call, as they do for the vault's uses, so a repository's own allow rule cannot skip the person |
-| the ticket | asked for the session at its fence, toward `device`, to last the server's answer (30 s), the target's prompt (30 s) and the command. The network module ends the SSH session with what is left of the ticket, so a shorter one would cut the command off |
-| the run | this daemon's own client (above), on the primary connection the vault answered on |
-| the answer | the target's `os`, the `account` it ran as, the ticket's id (the join key to `ssh_audit`), the exit code, and both streams with `truncated`. Never the ticket itself |
-
-⚠️ **The approval names the device and the command, not the account.** The
-person answers before the vault is asked: an approval may wait 25 minutes, and
-a ticket ends within 900 s. The account the target maps comes back in the
-answer. What an account may run is the organization's guardrail to decide
-beforehand: a Cedar `forbid` when `context.account == "daemon"` keeps a
-session off SYSTEM and root ([`vault.md`](vault.md) §7). Whether the vault
-seeds that guardrail is part of decision 22.
-
-⚠️ **Until decision 22, every call is refused at gate 3.** No `SshPolicy`
-admits a session yet, so the network module answers `session_not_allowed`
-(P3-8-1b-1), whatever ticket the vault gave. The tool, the ticket and the
-target's one command are all in place for that decision; until it lands,
-nothing reaches a target.
-
-⚠️ **The daemon never logs the command.** Its log line names the session, the
-target, the ticket and the account, for the reason a terminal's content is
-never recorded: what a session typed is its own.
-
-| Piece | Where |
-|---|---|
-| the owner's key | `hive_ssh` ([`config.rs:605`](../crates/agent-core/src/config.rs#L605)), never pushable ([`models.rs:9857`](../crates/remote_control/src/models.rs#L9857)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
-| the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1602`](../agents/roomlerd/src/hive/supervisor.rs#L1602)), made at start ([`:878`](../agents/roomlerd/src/hive/supervisor.rs#L878)); `Run.ssh` ([`toolbelt.rs:510`](../agents/roomlerd/src/hive/toolbelt.rs#L510)); the settings' ask ([`supervisor.rs:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055), `SSH_TOOLS` at [`toolbelt.rs:631`](../agents/roomlerd/src/hive/toolbelt.rs#L631)) |
-| the tool | its definition ([`toolbelt.rs:1378`](../agents/roomlerd/src/hive/toolbelt.rs#L1378)); the call ([`ssh_tools.rs:153`](../agents/roomlerd/src/hive/ssh_tools.rs#L153)), its checks ([`:113`](../agents/roomlerd/src/hive/ssh_tools.rs#L113)), the ticket's life ([`:146`](../agents/roomlerd/src/hive/ssh_tools.rs#L146)), the daemon's runner ([`:63`](../agents/roomlerd/src/hive/ssh_tools.rs#L63)) |
-| the ask | `VaultTools::ssh` ([`toolbelt.rs:481`](../agents/roomlerd/src/hive/toolbelt.rs#L481)), on the primary's queue ([`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668)) |
+`a_ticketed_ssh_request_is_refused_and_audited`
+(`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
+(`:118`) and `ssh_audit_rows_written_before_p2_still_load`
+(`crates/remote_control/src/models.rs:8990`) lock it. The other surfaces FR-90
+left reserved are listed in
+[retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
 ## 5. Roadmap
 

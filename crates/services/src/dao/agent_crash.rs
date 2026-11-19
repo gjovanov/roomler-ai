@@ -13,7 +13,7 @@
 //! returns an empty list rather than another tenant's data.
 //!
 //! TTL: the `agent_crashes` collection has a TTL index on
-//! `reported_at` set to 90 days in `crates/db/src/indexes.rs`. The
+//! `reported_at`, 30 days, in the fleet module's index plan. The
 //! DAO doesn't manage retention — Mongo does.
 
 use bson::{DateTime, doc, oid::ObjectId};

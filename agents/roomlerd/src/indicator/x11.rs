@@ -191,14 +191,14 @@ pub(super) struct Inner {
 /// today), and a real X session on the same host is unaffected — this reads
 /// the daemon's own configuration, not the display.
 fn display_is_our_own_virtual_desktop() -> bool {
-    // The SAME question `main.rs` asks before starting one, so the same
+    // The SAME question `app.rs` asks before starting one, so the same
     // function (`virtual_desktop::requested`), never a second copy.
     //
     // Two copies did disagree. A hand-rolled pair of env names here skipped
     // `node_env`'s middle arm (`ROOMLER_NODE_`) and, more importantly, its
     // config fallback — so the knob set through the S2 config surface
     // (`roomler config`, the way an operator is told to set it) was visible to
-    // main.rs and invisible here.
+    // app.rs and invisible here.
     crate::virtual_desktop::requested()
 }
 
@@ -725,7 +725,7 @@ mod tests {
         // silently start honouring the dead one. The MIDDLE arm is the
         // regression this array exists to catch: the hand-rolled version this
         // replaced read only the first and last, so `ROOMLER_NODE_*` — and the
-        // config fallback behind it — were invisible here while `main.rs` saw
+        // config fallback behind it — were invisible here while `app.rs` saw
         // them. docs/fr/FR-46
         const KEYS: [&str; 2] = ["ROOMLERD_VIRTUAL_DESKTOP", "ROOMLER_NODE_VIRTUAL_DESKTOP"];
         const RETIRED: &str = "ROOMLER_AGENT_VIRTUAL_DESKTOP";

@@ -3,6 +3,10 @@ mod association_test;
 
 mod association_internal;
 mod association_stats;
+// roomler (FR-148): the acknowledgement clock (`Association::delivery_clock`).
+pub mod delivery;
+// roomler (FR-148 P0): the congestion gauges (`Association::gauges`).
+pub mod gauges;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -246,6 +250,10 @@ pub struct Association {
     net_conn: Arc<dyn Conn + Send + Sync>,
     bytes_received: Arc<AtomicUsize>,
     bytes_sent: Arc<AtomicUsize>,
+    // roomler (FR-148): read without `association_internal`'s lock.
+    delivery: delivery::DeliveryClock,
+    // roomler (FR-148 P0): read without `association_internal`'s lock.
+    gauges: gauges::GaugeReader,
 
     pub(crate) association_internal: Arc<Mutex<AssociationInternal>>,
 }
@@ -346,6 +354,8 @@ impl Association {
         let max_message_size = Arc::clone(&ai.max_message_size);
         let inflight_queue_length = Arc::clone(&ai.inflight_queue_length);
         let will_send_shutdown = Arc::clone(&ai.will_send_shutdown);
+        let delivery = ai.delivery_clock(); // roomler (FR-148)
+        let gauges = ai.gauge_reader(); // roomler (FR-148 P0)
 
         let mut init = ChunkInit {
             initial_tsn: ai.my_next_tsn,
@@ -429,6 +439,8 @@ impl Association {
                 net_conn,
                 bytes_received,
                 bytes_sent,
+                delivery,
+                gauges,
                 association_internal,
             },
             handshake_completed_ch_rx,
@@ -537,8 +549,12 @@ impl Association {
                         // absent; ENOBUFS; an interface going away under a
                         // roam) killed a whole remote-desktop session. SCTP
                         // retransmits what was dropped, the way libwebrtc does.
-                        // A transport that is really gone is still caught: its
-                        // `recv` fails, and the read loop closes the association.
+                        // roomler (#3716): nothing below ever fails `recv` on a
+                        // dead path (the ICE agent's conn only ends when the
+                        // agent is closed), so it is the peer connection's close
+                        // that ends this association, and that close must not
+                        // wait behind a write the dead path never acks
+                        // (`PendingQueue::close`, `Stream::send_reset_request`).
                         match net_conn.send(raw.as_ref()).await {
                             Ok(_) => {
                                 bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
@@ -613,6 +629,23 @@ impl Association {
         }
 
         log::debug!("[{}] write_loop exited", name);
+    }
+
+    /// roomler (FR-148): what the peer has acknowledged, and when the queue of
+    /// written, not yet sent chunks filled and ran empty, read without this
+    /// association's lock (`delivery::DeliveryClock::read`). `bytes_sent`
+    /// below counts packets written to the wire, retransmissions included.
+    pub fn delivery_clock(&self) -> delivery::DeliveryClock {
+        self.delivery.clone()
+    }
+
+    /// roomler (FR-148 P0): the congestion window, the slow start threshold,
+    /// the peer's receive window, what is in flight and what waits, the loss
+    /// events and the acknowledgement delay, read without this association's
+    /// lock (`gauges::GaugeReader::take`, or `peek` to reset nothing). The
+    /// association stores them and never reads them back.
+    pub fn gauges(&self) -> gauges::GaugeReader {
+        self.gauges.clone()
     }
 
     /// bytes_sent returns the number of bytes sent

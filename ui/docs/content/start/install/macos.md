@@ -79,7 +79,7 @@ The screen streams as **wallpaper only**, and injected keys and clicks are
 shows a desktop with no windows, this is why.
 :::
 
-Open **System Settings → Privacy & Security** and enable **Roomler Daemon**
+Open **System Settings → Privacy & Security** and enable **roomlerd**
 under both:
 
 :::steps

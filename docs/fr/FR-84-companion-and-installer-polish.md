@@ -71,8 +71,8 @@ it. Do not shift these anchors with code that moved later.*
 | Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:171-173` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
 | swallowed errors | `agents/roomler-desktop/src/commands.rs:1143-1147`, `:1188-1193` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
-| pipe server | `crates/localapi/src/lib.rs:1796-1871` | ONE listening instance; the next is created only after `connect()` returns |
-| pipe client | `crates/localapi/src/lib.rs:2133-2153` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
+| pipe server | `crates/localapi/src/lib.rs:1833-1908` | ONE listening instance; the next is created only after `connect()` returns |
+| pipe client | `crates/localapi/src/lib.rs:2151-2171` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
 | settings list | `crates/agent-core/src/config_surface.rs:42-876` | 150 `(key, kind, description)` tuples, no grouping; `restart_required` hard-coded `true` (`:21, :827, :841`) |
 | live keys | `agents/roomler-desktop/src/front/settings.js:60-63` | a hand-kept `LIVE_KEYS` list the daemon does not know about |
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |
@@ -216,7 +216,7 @@ which can create a folder) and Use default.
 - **Server** — `GET /api/agent/self/devices` and `/api/agent/self/mesh`, host-owned (the
   network module is optional), agent-token authenticated through the fleet extractor's
   shared `authenticate()`. The visible set is **self ∪ the join-time netmap shaping**,
-  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:534-557` and
+  extracted as `shape_full_netmap` from `crates/modules/network/src/overlay.rs:624-647` and
   reused by `handle_overlay_join`, so the list can never show a peer the netmap withholds:
   `off`/`warn` list every live node, `enforce` only the shaped set. The device's own live node
   is found **before** any ACL read (`try_load_acl` creates the network on miss and must never

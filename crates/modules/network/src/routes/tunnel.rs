@@ -18,10 +18,13 @@ use axum::{
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
+use roomler_ai_mod_fleet::agent::org_accepts_enrollment;
 use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::auth::SpendPurpose;
+use roomler_ai_services::dao::base::{DaoError, PaginationParams};
+use roomler_ai_services::dao::tunnel_client::ReviveScope;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
@@ -47,9 +50,11 @@ pub struct TunnelEnrollmentTokenResponse {
 }
 
 /// POST /api/tenant/{tenant_id}/tunnel-client/enroll-token —
-/// admin/member issues a single-use token the operator pastes into
+/// a member issues a single-use token the operator pastes into
 /// `roomler enroll`. Mirrors `issue_enrollment_token` for
-/// agents.
+/// agents. The token acts for the person who minted it: it enrolls a
+/// new machine as theirs, and re-enrolls a known machine id only if
+/// they may (`enroll_tunnel_client`).
 pub async fn issue_tunnel_enrollment_token(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -61,6 +66,7 @@ pub async fn issue_tunnel_enrollment_token(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::NotAMember);
     }
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     let (token, jti) =
         state
@@ -90,41 +96,92 @@ pub struct TunnelEnrollResponse {
     pub tunnel_client_token: String,
 }
 
+/// What a re-enrollment of a LIVE tunnel client answers (409) when the
+/// enrollment token was minted for someone who may not make it (#3328).
+pub const SOMEONE_ELSES_TUNNEL_CLIENT: &str = "This machine is already enrolled as someone \
+     else's tunnel client in this organization. Only its owner, or someone with the Manage \
+     devices permission, can enroll it again. Enroll this machine under a different name, or \
+     ask an organization administrator.";
+
+/// What a re-enrollment of a REMOVED tunnel client answers (409) when the
+/// enrollment token was minted for someone without `MANAGE_AGENTS`, its
+/// owner included (#3328).
+pub const REMOVED_TUNNEL_CLIENT: &str = "This machine's tunnel client was removed from this \
+     organization, and only someone with the Manage devices permission can bring it back. Ask \
+     an organization administrator for an enrollment token.";
+
+/// What an enrollment answers (403) when the person its token was minted for
+/// is no longer a member of the token's org: the token acts for them, and a
+/// tunnel client ends with its owner's membership (`crate::membership`).
+pub const ENROLLER_LEFT_THE_ORG: &str = "This enrollment token was issued to someone who is no \
+     longer a member of this organization, so it cannot enroll a tunnel client. Ask a member of \
+     the organization for a new enrollment token.";
+
 /// POST /api/tunnel-client/enroll — public (no user JWT);
 /// authenticates via the tunnel-enrollment token and returns a
 /// long-lived TunnelClient JWT. Rehydrates an existing
 /// `(tenant_id, machine_id)` row if one is found (covers soft-deleted
 /// tombstones too — see [`TunnelClientDao::find_by_tenant_and_machine`]).
 ///
-/// `owner_user_id` is taken from the enrollment claim's `sub` — the
-/// admin who issued the token. v1 limitation: this records the
-/// admin's identity rather than the operator's. v1.1 can extend the
-/// enrollment request with an operator user-id once we have the
-/// admin-UI flow to enter it.
+/// The request carries no user session, so the enrollment acts for the
+/// person the token was minted for (its `sub`): a new row is theirs
+/// (`owner_user_id`), and so is the minted token's owner.
+///
+/// #3328 — the order is the contract:
+/// 1. the token is verified, and comes back unspent;
+/// 2. the archived-org gate (#3042);
+/// 3. the person the token was minted for is still a member of its org
+///    (403 [`ENROLLER_LEFT_THE_ORG`] otherwise): a tunnel client acts for
+///    them, and ends with their membership (`crate::membership`);
+/// 4. a known machine id re-enrolls only for its owner, while the client
+///    is live, or for a holder of `MANAGE_AGENTS` ([`revive_scope`], 409
+///    otherwise); a new one meets the plan's tunnel-client cap (403);
+/// 5. the token is spent on the used-token ledger: 401 if it was spent
+///    before, a retryable 503 if the ledger cannot answer;
+/// 6. the row is written; the membership is asked again (a removal that
+///    lands between steps 3 and 6 has already listed the person's clients
+///    and would not see this row, so a row written for someone who is no
+///    longer a member is removed here and refused like step 3); and the
+///    client's token is minted from the spent token.
+///
+/// Every refusal before step 5 leaves the token unspent and writes nothing.
 pub async fn enroll_tunnel_client(
     State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
 ) -> Result<Json<TunnelEnrollResponse>, ApiError> {
-    let claims = state
+    let token = state
         .auth
         .verify_tunnel_enrollment_token(&body.enrollment_token)?;
+    let claims = token.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
-    let admin_uid = ObjectId::parse_str(&claims.sub)
+    let enroller = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
+
+    // #3042 — before the row below: this is the door that revives a tombstone.
+    org_accepts_enrollment(&state.tenants, tid).await?;
+
+    // The token acts for the person it was minted for (a pairing's: its
+    // approver), so it enrolls nothing once they are no longer a member: the
+    // membership's end removed their clients, and this must not write a new
+    // one. A plain `Forbidden`, never `NotAMember` (the code a page leaves the
+    // org on): this door is an installer's.
+    if !state.tenants.is_member(tid, enroller).await? {
+        tracing::info!(
+            tenant_id = %tid, %enroller,
+            "tunnel-client: enrollment refused: the token's person is no longer a member"
+        );
+        return Err(ApiError::Forbidden(ENROLLER_LEFT_THE_ORG.to_string()));
+    }
 
     let existing = state
         .tunnel_clients
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
-    let client = match existing {
-        Some(c) => {
-            let id =
-                c.id.ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
-            state
-                .tunnel_clients
-                .rehydrate(id, &body.machine_name, body.os, &body.client_version)
-                .await?
+    let revival = match existing {
+        Some(row) => {
+            let scope = revive_scope(&state, tid, enroller, &row).await?;
+            Some((row, scope))
         }
         None => {
             // S5 — plan tunnel-client cap. Mirrors the device cap in
@@ -143,11 +200,39 @@ pub async fn enroll_tunnel_client(
                     d.plan, d.used, d.max
                 )));
             }
+            None
+        }
+    };
+
+    // #3328 — the token's one use, after every refusal above and before every
+    // write below. On BOTH branches: a replay against a known machine id would
+    // still mint a fresh year-long token for that client.
+    let spent = state
+        .used_tokens
+        .spend(token, SpendPurpose::TunnelEnroll)
+        .await?;
+
+    let client = match revival {
+        Some((row, scope)) => {
+            let id = row
+                .id
+                .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
+            // `None`: the row left the scope decided above in the meantime (an
+            // admin removed it, say). The token is spent by now, but bringing
+            // the client back would undo a removal this enrollment may not
+            // undo, so it is refused like any other.
+            state
+                .tunnel_clients
+                .rehydrate(id, &body.machine_name, body.os, &body.client_version, scope)
+                .await?
+                .ok_or_else(|| ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()))?
+        }
+        None => {
             state
                 .tunnel_clients
                 .create(
                     tid,
-                    admin_uid,
+                    enroller,
                     body.machine_name,
                     body.machine_id,
                     body.os,
@@ -160,12 +245,44 @@ pub async fn enroll_tunnel_client(
     let client_id = client
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
+    // The membership again, now that the row exists. A removal deletes the
+    // membership and THEN lists the person's clients to remove them: a write
+    // that landed after that list landed after the delete, so this read sees
+    // it, and the row is removed the way the removal would have removed it.
+    // A read that fails mints: the check above passed a moment ago, and a
+    // row the race and a fault left behind is what the operator step finds.
+    match state.tenants.is_member(tid, enroller).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                tenant_id = %tid, %enroller, %client_id,
+                "tunnel-client: the token's person stopped being a member during the enrollment; removing the row"
+            );
+            if let Err(e) =
+                end_tunnel_client(&state, tid, client_id, &client.machine_id, ENROLLER_LEFT).await
+            {
+                tracing::error!(
+                    tenant_id = %tid, %client_id, %e,
+                    alert = crate::membership::ALERT,
+                    "tunnel-client: could not remove a row written for a non-member; the operator step will find it"
+                );
+            }
+            return Err(ApiError::Forbidden(ENROLLER_LEFT_THE_ORG.to_string()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tid, %enroller, %client_id, %e,
+                "tunnel-client: could not read the membership again after the write; minting on the first read"
+            );
+        }
+    }
     // FR-103 — at the row's CURRENT generation, so a client revived after a
-    // removal gets a token that is accepted, and its old ones are not.
+    // removal gets a token that is accepted, and its old ones are not. The
+    // mint takes the spent token (#3328), and reads the org and the owner
+    // from it.
     let tunnel_client_token = state.auth.issue_tunnel_client_token(
+        spent,
         client_id,
-        tid,
-        admin_uid,
         client.token_gen,
         Some(state.fleet.settings.rc.agent_token_ttl_secs),
     )?;
@@ -175,6 +292,54 @@ pub async fn enroll_tunnel_client(
         tenant_id: tid.to_hex(),
         tunnel_client_token,
     }))
+}
+
+/// #3328 — may the person an enrollment token was minted for re-enroll a
+/// machine id that already has a tunnel client in the org? Its owner may,
+/// while the client is live. A holder of `MANAGE_AGENTS` may, live or
+/// removed: a removed client comes back only through one, its owner
+/// included, and comes back as theirs (the reviver owns it, as its new token
+/// acts for them; a live client keeps its owner). Anyone else is refused 409,
+/// here, before the token is spent, so nothing is written and the token can
+/// still enroll a machine of its own.
+///
+/// The answer is also the scope the write holds (`ReviveScope`), so a
+/// removal that lands between this read and that write is not undone.
+///
+/// The permission is read only when it decides something, so an owner
+/// re-enrolling their own live client costs no extra read: the enroll route
+/// asked whether they are still a member before this. A read that FAILED
+/// refuses as the archived-org gate does (500), and the token stays unspent.
+async fn revive_scope(
+    state: &NetworkState,
+    tid: ObjectId,
+    enroller: ObjectId,
+    row: &roomler_ai_remote_control::models::TunnelClient,
+) -> Result<ReviveScope, ApiError> {
+    let removed = row.deleted_at.is_some();
+    if !removed && row.owner_user_id == enroller {
+        return Ok(ReviveScope::LiveOwnedBy(enroller));
+    }
+    let manages_devices = match state.tenants.get_member_permissions(tid, enroller).await {
+        Ok(held) => permissions::has(held, permissions::MANAGE_AGENTS),
+        Err(DaoError::NotAMember) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if manages_devices {
+        return Ok(ReviveScope::LiveOrRemoved(enroller));
+    }
+    tracing::info!(
+        tenant_id = %tid, tunnel_client_id = ?row.id, %enroller, removed,
+        "tunnel-client: re-enrollment refused: not the owner of a live client, and no MANAGE_AGENTS"
+    );
+    Err(ApiError::Conflict(
+        if removed {
+            REMOVED_TUNNEL_CLIENT
+        } else {
+            SOMEONE_ELSES_TUNNEL_CLIENT
+        }
+        .to_string(),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -319,7 +484,7 @@ pub async fn renew_tunnel_client(
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
     let ttl = state.fleet.settings.rc.agent_token_ttl_secs;
-    let tunnel_client_token = state.auth.issue_tunnel_client_token(
+    let tunnel_client_token = state.auth.renew_tunnel_client_token(
         client_id,
         client.tenant_id,
         owner,
@@ -507,14 +672,68 @@ pub async fn update_tunnel_client(
     })))
 }
 
+/// The reason a removal of a row an enrollment wrote for a non-member is
+/// logged with (the overlay release's `reason`).
+const ENROLLER_LEFT: &str = "enroller_left";
+
+/// What removing one tunnel client did ([`end_tunnel_client`]).
+pub(crate) struct EndedTunnelClient {
+    /// This call tombstoned the row; `false` when it was removed already.
+    pub tombstoned: bool,
+    /// The overlay lease this call released, if the client held one.
+    pub released: Option<crate::overlay::ReleasedNode>,
+}
+
+/// Remove one tunnel client, in the order every removal needs: tombstone the
+/// row (`deleted_at`, and `token_gen` advanced so every token it holds is
+/// refused), THEN release its overlay node (peers get a `removes` delta, its
+/// address returns to the tenant pool).
+///
+/// The tombstone first: from there a join on the socket the client still
+/// holds is refused (`handle_overlay_join`), so the release cannot be
+/// followed by a fresh lease that nothing would release. The release reads
+/// the node, not the row, and logs a failure rather than returning it
+/// (`release_overlay_node`). A LIVE connection is closed by the 60 s
+/// `spawn_revocation_check` sweep in `ws::tunnel`, which sees `deleted_at`.
+///
+/// The one way a tunnel client is removed: a device manager's DELETE, and
+/// the end of its owner's org membership (`crate::membership`), both come
+/// here.
+pub(crate) async fn end_tunnel_client(
+    state: &NetworkState,
+    tenant_id: ObjectId,
+    client_id: ObjectId,
+    machine_id: &str,
+    reason: &str,
+) -> Result<EndedTunnelClient, DaoError> {
+    let tombstoned = state
+        .tunnel_clients
+        .soft_delete(tenant_id, client_id)
+        .await?;
+    let released = crate::overlay::release_overlay_node_for(
+        state,
+        tenant_id,
+        machine_id,
+        &NodeRef::TunnelClient {
+            tunnel_client_id: client_id,
+        },
+        reason,
+    )
+    .await;
+    Ok(EndedTunnelClient {
+        tombstoned,
+        released,
+    })
+}
+
 /// DELETE /api/tenant/{tenant_id}/tunnel-client/{client_id} — remove a tunnel
 /// client from the fleet.
 ///
-/// The mirror of `remote_control::delete_agent`: evicts the client's overlay
-/// node (peers get a `removes` delta, its address returns to the tenant pool)
-/// and soft-deletes the client row. Revocation of a LIVE connection rides the
-/// existing 60 s `spawn_revocation_check` sweep in `ws::tunnel`, which closes
-/// the socket once it sees `deleted_at`.
+/// The mirror of `remote_control::delete_agent`: soft-deletes the client row,
+/// then evicts its overlay node (peers get a `removes` delta, its address
+/// returns to the tenant pool), through [`end_tunnel_client`]. Revocation of a
+/// LIVE connection rides the existing 60 s `spawn_revocation_check` sweep in
+/// `ws::tunnel`, which closes the socket once it sees `deleted_at`.
 ///
 /// Gated on `MANAGE_AGENTS` — the device-management bit; there is no separate
 /// tunnel-client permission and minting one would mean a role migration.
@@ -544,29 +763,57 @@ pub async fn delete_tunnel_client(
     // someone else did. 404 is the one answer that leaves the state alone.
     let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
 
-    let released = crate::overlay::release_overlay_node_for(
-        &state,
-        tid,
-        &client.machine_id,
-        &NodeRef::TunnelClient {
-            tunnel_client_id: cid,
-        },
-        "tunnel_client_delete",
-    )
-    .await;
-
-    state.tunnel_clients.soft_delete(tid, cid).await?;
+    // Tombstone first, then the release: the order `end_tunnel_client` keeps.
+    let ended =
+        end_tunnel_client(&state, tid, cid, &client.machine_id, "tunnel_client_delete").await?;
 
     Ok(Json(serde_json::json!({
         "deleted": true,
-        "overlay_released": released.is_some(),
-        "overlay_ip": released.as_ref().map(|r| r.overlay_ip.clone()),
+        "overlay_released": ended.released.is_some(),
+        "overlay_ip": ended.released.as_ref().map(|r| r.overlay_ip.clone()),
     })))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tunnel policy CRUD (admin UI)
 // ────────────────────────────────────────────────────────────────────────────
+
+/// The gate on EVERY tunnel-policy route, the reads included: `MANAGE_AGENTS`
+/// in the path org, the bit the overlay ACL beside it already sits behind
+/// (`overlay_policy::gate`). A tunnel policy is an access grant: it names who
+/// may reach which `host:port` through which of the org's devices. Writing one
+/// is a device-management action, and the list is the org's whole ACL, its
+/// internal hosts and ports included. Membership alone authorizes neither
+/// (security-baseline.md §3).
+///
+/// Decided FIRST, before the policy id is parsed, the body validated or the
+/// policy looked up. A member without the bit therefore gets one 403
+/// `forbidden` whatever the id names (a policy of theirs, another org's,
+/// nothing) and whatever the body says. It is never `not_a_member`, the one 403
+/// the web app leaves the org on; someone outside the org still gets that,
+/// from the membership read inside `require_permission`.
+///
+/// ⚠️ The forward itself (`crate::tunnel::handle_forward_request`) reads no
+/// permission bit, and must not: the policy IS the grant. It exists to let
+/// people who hold no management bit reach what a holder named them for, so a
+/// bit there would either defeat it or repeat it.
+async fn tunnel_policy_manager(
+    state: &NetworkState,
+    tenant_id: &str,
+    auth: &AuthUser,
+) -> Result<ObjectId, ApiError> {
+    let tid = ObjectId::parse_str(tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    require_permission(
+        state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+    Ok(tid)
+}
 
 /// Wire shape for create + update. `subjects`, `targets`, and
 /// `allowlist` re-use the BSON serde representation of the
@@ -688,19 +935,31 @@ fn validate_policy_input(
     Ok(())
 }
 
+/// The role ids a policy's `RoleId` subjects name.
+fn subject_role_ids(subjects: &[PolicySubject]) -> Vec<ObjectId> {
+    subjects
+        .iter()
+        .filter_map(|s| match s {
+            PolicySubject::RoleId { role_id } => Some(*role_id),
+            _ => None,
+        })
+        .collect()
+}
+
 /// POST /api/tenant/{tenant_id}/tunnel-policy — create a new policy.
+/// `MANAGE_AGENTS`, decided before the body is validated
+/// ([`tunnel_policy_manager`]). A role subject names a role of this org, or
+/// the body is a 400 (`require_org_roles`).
 pub async fn create_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<TunnelPolicyCreateRequest>,
 ) -> Result<(StatusCode, Json<TunnelPolicyResponse>), ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     validate_policy_input(&body.name, &body.subjects, &body.targets, &body.allowlist)?;
+    roomler_core::guards::require_org_roles(&state, tid, &subject_role_ids(&body.subjects), &[])
+        .await?;
 
     let policy = state
         .tunnel_policies
@@ -718,18 +977,16 @@ pub async fn create_tunnel_policy(
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-policy — paginated list of live
-/// policies for the tenant. Soft-deleted rows are excluded.
+/// policies for the tenant. Soft-deleted rows are excluded. `MANAGE_AGENTS`
+/// like every route here: the list is the org's whole ACL
+/// ([`tunnel_policy_manager`]).
 pub async fn list_tunnel_policies(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let page = state.tunnel_policies.list_for_tenant(tid, &params).await?;
     let items: Vec<TunnelPolicyResponse> = page.items.into_iter().map(Into::into).collect();
     Ok(Json(serde_json::json!({
@@ -742,18 +999,16 @@ pub async fn list_tunnel_policies(
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-policy/{policy_id} — fetch one.
+/// `MANAGE_AGENTS`, decided before the id is looked up
+/// ([`tunnel_policy_manager`]).
 pub async fn get_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     // LIVE: a deleted policy is a 404 here exactly as it is absent from the
     // listing and from the gate's compile set (#1829).
     let policy = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
@@ -766,22 +1021,32 @@ pub async fn get_tunnel_policy(
 /// A deleted policy is a 404 (#1829): the lookup below is live, and the
 /// write underneath it is live-scoped on its own, so neither a stale page nor
 /// a caller that skips the read can edit a tombstone back into service.
+///
+/// `MANAGE_AGENTS`, decided before the id is looked up or the body validated
+/// ([`tunnel_policy_manager`]): editing a policy's subjects is granting.
 pub async fn update_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
     Json(body): Json<TunnelPolicyUpdateRequest>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     // Resolve the target LIVE before touching it — a removed policy is a 404
     // whatever the body says, like a bogus or foreign id.
-    state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
+    let stored = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
+    // A role subject names a role of this org; one the stored policy already
+    // names is accepted back (`require_org_roles`).
+    if let Some(s) = &body.subjects {
+        roomler_core::guards::require_org_roles(
+            &state,
+            tid,
+            &subject_role_ids(s),
+            &subject_role_ids(&stored.subjects),
+        )
+        .await?;
+    }
     // Validate only the fields that ARE being updated.
     if let Some(n) = &body.name
         && n.trim().is_empty()
@@ -843,19 +1108,16 @@ pub async fn update_tunnel_policy(
 /// soft-delete. Existing flows on live sessions are not killed; new
 /// `TcpForwardRequest`s using only this policy will start being
 /// denied at the next policy fetch (every request — there's no
-/// cache, see `list_active_for_tenant`).
+/// cache, see `list_active_for_tenant`). `MANAGE_AGENTS`, decided before
+/// the id is looked up ([`tunnel_policy_manager`]).
 pub async fn delete_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     let deleted = state.tunnel_policies.soft_delete(tid, pid).await?;
     if !deleted {
         return Err(ApiError::NotFound("Tunnel policy not found".into()));

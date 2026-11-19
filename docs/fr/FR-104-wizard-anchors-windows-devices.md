@@ -79,7 +79,7 @@ sequenceDiagram
   W->>E: UAC prompt, then anchor create --token --device
   E->>S: POST /api/agent/anchor (claims "jti:anchor", same device only)
   S-->>E: service credential
-  E->>E: write anchor.json (SYSTEM + Administrators)
+  E->>E: write the anchor key (SYSTEM + Administrators)
 ```
 
 ## 4. Phases

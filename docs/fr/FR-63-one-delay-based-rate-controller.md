@@ -1,12 +1,12 @@
 # FR-63 — One delay-based rate controller for remote desktop
 
-**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.cjs`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). What it shipped stays in the tree: the opener, the simulator (B0) and the shadow controller (B1). Its open work moved: the read of B1's shadow is FR-148 P0, the flip (B2) and the deletions (B3, B4) are FR-148 P5, and the flip criterion gains an under-drive clause. FR-148 §12 maps each open criterion. At the close: in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.cjs`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
 ## Goal
 
-Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:547`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
+Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:578`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
 
 ## Key design
 
@@ -24,9 +24,10 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
 | B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **shipped in `agent-v0.4.188`** (#3102, published 2026-10-30 14:21Z; merged after 0.4.187 was cut) — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
-| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
+| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass outside the Mongo pod (`scripts/prod-mongo-read.sh`); rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
+| B4 | FR-62's A4, moved here 2026-11-05: retire the IDR-rationing heuristics through the registry, per backend. NVENC only, while every other backend rebuilds with an IDR on every move (AC7) | none of their own: each deletion PR cites its row's precondition in [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) | not started; after B2 plus one release soak |
 
 **B-opener** was not in the original plan; it was added because the field
 evidence on #1243 showed the opener over-driving from *both* directions on
@@ -40,7 +41,7 @@ commitment — a proven floor (FR-59 P8's remembered-slow-pair open) still wins.
 ### The constrained cell (why this was blocked, and now is not)
 
 `constrained` is measured from the nominated ICE pair
-(`detect_constrained_transport`, `peer.rs:1500`), so the constrained posture
+(`detect_constrained_transport`, `peer.rs:1511`), so the constrained posture
 exists only on a path that actually relays. Field-measured 2026-09-03:
 CORPLAP-1 on 0.4.55 took a **direct** pair (`tgt=12096000`, `c=false`, paint
 age 11-42 ms), so slow-start could not engage and the A/B could not run —
@@ -256,12 +257,12 @@ hold the whole population — every daemon and every RC worker runs the uploader
 Windows host's pump runs in its console-session worker, `roomlerd run --supervisor
 scm`, which goes through `run_cmd` and spawns it), across every org, for 7 days.
 
-So the fleet read is a **mongosh pass inside the Mongo pod**, bounded by construction
-(the 2026-10-26 OOM was an unbounded read in that same container): at most 8 days, one
-day per query, `$match`/`$sort` served by an index (`explain`: `IXSCAN created_at_1`, no
-blocking SORT), streaming stages only, 14 projected fields, credentials from the pod's
-own environment. The production targets refuse without `--yes` and print the pod's
-restart count before and after.
+So the fleet read is a **mongosh pass over a port-forward, outside the Mongo pod**, bounded
+by construction (the 2026-10-26 OOM was an unbounded read inside that pod): at most 8 days,
+one day per query, `$match`/`$sort` served by an index (`explain`: `IXSCAN created_at_1`, no
+blocking SORT), streaming stages only, 14 projected fields, credentials from the pod's secret
+through `scripts/prod-mongo-read.sh`. The production targets refuse without `--yes` and print
+the pod's restart count before and after.
 
 ### The criterion, as the script measures it
 
@@ -392,6 +393,7 @@ checkout it runs from.
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
 - [x] AC6 — **docs.** `docs/rate-control.md` documents the shadow controller — its state machine (mermaid), the six `shadow_*` heartbeat fields, the `ROOMLERD_RATECTL` kill switch and the containment property — and `docs/README.md`'s rate-control row names it. (FR-63's issue opened after the docs-before-close rule reached master, so it carries this criterion; ticked with the docs shipped in the B1 PR.)
+- [ ] AC7 — Every IDR-rationing heuristic FR-62's A4 named is retired through the registry table with its evidence, per backend (B4). Moved from FR-62's AC4 on 2026-11-05. While QSV, VideoToolbox, AMF, D3D12 and Vulkan rebuild with an IDR on every move ([FR-62](FR-62-encoder-rate-changes-without-an-idr.md) AC1), a retirement covers NVENC only.
 
 ## The ramp-exit rule — measured, not argued
 
@@ -532,7 +534,7 @@ either — which is the number B1 has to beat.
   | number | why | how firm |
   |---|---|---|
   | a gate on the spend | a bar over all clean windows has no power: B1 scores 96 %, a pinned shadow 93 % | measured, one host |
-  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:292-297`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
+  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:302-307`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
   | 0.5 Mbps constrained | the constrained floor is 200 k against a ~3 M nominal cap | **not measured**: no real constrained line was read. Check it against the fleet table first |
   | ×1.25 | a small excess can be overshoot. The result does not hang on it: B1 at ≥ 2 Mbps is 43 % over by more than this, 57 % over at all | judgement |
   | 90 %, ≥ 20 sessions | mirror the existing bar, so no new number to defend | judgement |

@@ -551,7 +551,7 @@ fn verify_msi(_path: &Path, _claimed: &str) -> Result<String, VersionError> {
 /// That is accepted rather than special-cased. The only path that fetches an
 /// OLDER release is `updater::pin_version` — crash-loop rollback to
 /// `last_known_good_version`, or an operator-chosen `rc:agent.update` tag — and
-/// a refusal there folds into `CheckOutcome::Skipped`, which `main.rs` already
+/// a refusal there folds into `CheckOutcome::Skipped`, which `app.rs` already
 /// handles by raising the attention sentinel and leaving the operator to act.
 /// So the failure mode is "rollback needs a human", not a wedge.
 ///

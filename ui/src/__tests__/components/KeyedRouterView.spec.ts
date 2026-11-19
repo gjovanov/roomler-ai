@@ -138,7 +138,7 @@ describe('KeyedRouterView over the real route records (#1631)', () => {
     expect(counters.profile).toEqual({ setups: 2, unmounts: 1 })
   })
 
-  it('the record itself carries the contract: agent-remote keys on agentId, profile on userId, room-chat on nothing', () => {
+  it('the record itself carries the contract: agent-remote keys on agentId, profile on userId, room-call on roomId (#1637), room-chat on nothing', () => {
     const byName = new Map<string, RouteRecordRaw>()
     const walk = (rs: readonly RouteRecordRaw[]) => {
       for (const r of rs) {
@@ -149,6 +149,7 @@ describe('KeyedRouterView over the real route records (#1631)', () => {
     walk(router.options.routes)
     expect(byName.get('agent-remote')?.meta?.remountOn).toBe('agentId')
     expect(byName.get('profile')?.meta?.remountOn).toBe('userId')
+    expect(byName.get('room-call')?.meta?.remountOn).toBe('roomId')
     expect(byName.get('room-chat')?.meta?.remountOn).toBeUndefined()
     expect(byName.get('devices')?.meta?.remountOn).toBeUndefined()
   })

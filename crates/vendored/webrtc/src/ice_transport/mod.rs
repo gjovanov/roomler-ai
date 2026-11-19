@@ -89,10 +89,26 @@ impl RTCIceTransport {
             if let Some(ice_pair) = agent.get_selected_candidate_pair() {
                 let local = RTCIceCandidate::from(&ice_pair.local);
                 let remote = RTCIceCandidate::from(&ice_pair.remote);
-                return Some(RTCIceCandidatePair::new(local, remote));
+                // Roomler patch (FR-148 P0): and what carries the local relay.
+                let relay = ice_pair.local.relay_transport();
+                return Some(RTCIceCandidatePair::new(local, remote).with_local_relay(relay));
             }
         }
         None
+    }
+
+    /// Roomler patch (FR-148 P4): the local candidates gathered so far, empty
+    /// when the agent is gone. Unlike the gatherer's own accessor it never
+    /// creates an agent, so a read after close binds nothing.
+    pub async fn local_candidates(&self) -> Vec<RTCIceCandidate> {
+        match self.gatherer.get_agent().await {
+            Some(agent) => agent
+                .get_local_candidates()
+                .await
+                .map(|c| ice_candidate::rtc_ice_candidates_from_ice_candidates(&c))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Start incoming connectivity checks based on its configured role.
@@ -128,6 +144,8 @@ impl RTCIceTransport {
                       remote: &Arc<dyn Candidate + Send + Sync>| {
                     let on_selected_candidate_pair_change_handler_clone =
                         Arc::clone(&on_selected_candidate_pair_change_handler);
+                    // Roomler patch (FR-148 P0): as get_selected_candidate_pair.
+                    let relay = local.relay_transport();
                     let local = RTCIceCandidate::from(local);
                     let remote = RTCIceCandidate::from(remote);
                     Box::pin(async move {
@@ -135,7 +153,8 @@ impl RTCIceTransport {
                             &*on_selected_candidate_pair_change_handler_clone.load()
                         {
                             let mut f = handler.lock().await;
-                            f(RTCIceCandidatePair::new(local, remote)).await;
+                            f(RTCIceCandidatePair::new(local, remote).with_local_relay(relay))
+                                .await;
                         }
                     })
                 },

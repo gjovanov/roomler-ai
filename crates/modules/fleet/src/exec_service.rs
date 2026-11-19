@@ -43,6 +43,7 @@ use roomler_ai_remote_control::error::Error as HubError;
 use roomler_ai_remote_control::models::{
     Agent, ExecAnchor, ExecAuditEvent, ExecDenyReason, ExecOutcome, ExecPending, OsKind,
 };
+use roomler_ai_services::auth::SpendPurpose;
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
 
 use crate::FleetState;
@@ -114,6 +115,8 @@ pub struct AnchorResponse {
 /// What it checks, in order:
 /// - the token is a single-use enrollment token, and the org is not
 ///   archived;
+/// - the admin who minted it may still enroll devices in that org
+///   (`agent::issuer_may_enroll`, 403 otherwise): the anchor records them;
 /// - the device is LIVE in that same org, and is Windows;
 /// - the host name matches the device, unless `force`.
 ///
@@ -122,22 +125,36 @@ pub async fn anchor(
     State(state): State<FleetState>,
     Json(body): Json<AnchorRequest>,
 ) -> Result<Json<AnchorResponse>, ApiError> {
-    let claims = state.auth.verify_enrollment_token(&body.enrollment_token)?;
+    // #3328 — UNSPENT until the spend below, which every check before it may
+    // refuse without burning the token.
+    let token = state.auth.verify_enrollment_token(&body.enrollment_token)?;
+    let claims = token.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    if state
-        .tenants
-        .base
-        .find_by_id(tid)
-        .await
-        .map(|t| t.is_archived)
-        .unwrap_or(false)
-    {
+    // A failed read refuses (500, nothing spent), as `agent::org_accepts_enrollment` does.
+    match state.tenants.base.find_by_id(tid).await {
+        Ok(t) if t.is_archived => {
+            return Err(ApiError::Forbidden(
+                "This organization is archived and anchors no devices".to_string(),
+            ));
+        }
+        Ok(_) | Err(roomler_ai_services::dao::base::DaoError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // The token acts for the admin who minted it (`anchored_by` below), so it
+    // anchors only while they may still enroll devices in this org: the
+    // enroll route's own question, asked before either spend.
+    if let Some(lost) = crate::agent::issuer_may_enroll(&state, tid, admin_uid).await? {
+        tracing::info!(
+            tenant_id = %tid, issuer = %admin_uid, jti = %claims.jti, reason = lost.as_str(),
+            "fleet-rpc: anchor refused: the token's issuer may no longer enroll devices here"
+        );
         return Err(ApiError::Forbidden(
-            "This organization is archived and anchors no devices".to_string(),
+            crate::agent::TOKEN_ISSUER_CANNOT_ENROLL.to_string(),
         ));
     }
 
@@ -175,23 +192,16 @@ pub async fn anchor(
     // the single use it always was (its enrollment already spent it).
     let second_use =
         claims.anchor && agent.enrolled_with_jti.as_deref() == Some(claims.jti.as_str());
-    let use_key = if second_use {
-        format!("{}:anchor", claims.jti)
+    // The spend answers as the daemon door's does: 401 for a token used
+    // before, a retryable 503 when the ledger cannot answer.
+    let spent = if second_use {
+        state.used_tokens.spend_anchor_second_use(token).await?
     } else {
-        claims.jti.clone()
+        state
+            .used_tokens
+            .spend(token, SpendPurpose::AgentAnchor)
+            .await?
     };
-    state
-        .used_tokens
-        .claim(&use_key, "agent-anchor")
-        .await
-        .map_err(|e| match e {
-            roomler_ai_services::dao::base::DaoError::Validation(_) => {
-                ApiError::Unauthorized("This enrollment token has already been used".into())
-            }
-            _ => ApiError::ServiceUnavailable(
-                "Could not verify this enrollment token is unused; please retry".into(),
-            ),
-        })?;
 
     // A fresh id per anchor: writing it revokes every credential an earlier
     // anchor of this device minted. It binds a signed token, so it needs to
@@ -199,19 +209,24 @@ pub async fn anchor(
     let anchor_id = ObjectId::new().to_hex();
     let service_token = state
         .auth
-        .issue_agent_service_token(agent_id, tid, &anchor_id)?;
-    let anchor = bson::to_bson(&ExecAnchor {
+        .issue_agent_service_token(spent, agent_id, &anchor_id)?;
+    let anchor = ExecAnchor {
         anchored_at: DateTime::now(),
         anchored_by: admin_uid,
         anchor_id,
-    })
-    .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?;
-    state
+    };
+    // `false`: the removal won the race with the lookup above, and it ends the
+    // anchor, so this one must not land on the tombstone (#2133).
+    if !state
         .agents
-        .base
-        .update_by_id(agent_id, doc! { "$set": { "exec_anchor": anchor } })
+        .set_exec_anchor(tid, agent_id, &anchor)
         .await
-        .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?
+    {
+        return Err(ApiError::NotFound(
+            "No such device in this organization".to_string(),
+        ));
+    }
     info!(
         agent = %agent_id, tenant = %tid, admin = %admin_uid,
         with_enrolling_token = second_use,
@@ -250,7 +265,7 @@ pub async fn renew(
     let service_token =
         state
             .auth
-            .issue_agent_service_token(svc.agent_id, svc.tenant_id, anchor_id)?;
+            .renew_agent_service_token(svc.agent_id, svc.tenant_id, anchor_id)?;
     info!(agent = %svc.agent_id, "fleet-rpc: SYSTEM service renewed its credential");
     Ok(Json(RenewResponse { service_token }))
 }

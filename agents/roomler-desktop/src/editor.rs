@@ -23,12 +23,11 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use roomler_localapi as localapi;
 use serde::Serialize;
 
 use crate::commands::{
-    agent_exe_path, check_recording_name, daemon_unreachable, explain_recording_error,
-    no_window_command,
+    agent_exe_path, check_recording_name, connect_service, daemon_unreachable,
+    explain_recording_error, no_window_command,
 };
 
 /// The recorder's line protocol, which `roomlerd media` speaks too
@@ -58,7 +57,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 async fn recordings_dir() -> Result<PathBuf, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let listing = client
         .recordings_list()
         .await

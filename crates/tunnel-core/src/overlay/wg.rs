@@ -529,6 +529,20 @@ pub struct PeerStats {
     /// per [`RPF_LOG_THROTTLE_MS`] so neither a spoofing flood nor a
     /// misconfigured subnet router turns a per-packet check into a log flood.
     rpf_logged_at: AtomicU64,
+    /// #3528 — handshake initiations from this peer that this session's `Tunn`
+    /// refused as replays (boringtun's `WrongTai64nTimestamp`, or an ephemeral
+    /// key it already accepted): a duplicate, a reordered burst, a replay, or a
+    /// peer whose clock is behind the last initiation accepted here. Monotonic.
+    replay_refused: AtomicU64,
+    /// #3528 — how many times the peer completed a handshake the session's
+    /// shadow answered after such a refusal, so the shadow took over
+    /// ([`HandshakeHeal`]). Monotonic.
+    replay_heals: AtomicU64,
+    /// #3528 — latched when boringtun reported this session over
+    /// (`ConnectionExpired`: a rekey attempt gave up after 90 s), just before
+    /// the timer task marks the carrier dead. It words the rebuild line: that
+    /// death is the handshake's, not a closed WS or a reset allocation.
+    expired: AtomicBool,
     /// #2952 — woken the moment [`handshake`](Self::handshake) latches, on a
     /// session that is a make-before-break PROBE ([`WgDevice::insert_probe`]
     /// arms it; an installed peer's stays unset). The runtime promotes on it
@@ -563,15 +577,271 @@ pub(crate) fn short_key(k: &[u8; 32]) -> String {
     format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3])
 }
 
-/// P4 — everything the INGRESS path needs to authorize one peer's decapsulated
-/// packets: **who** is sending (its WG public key), the shared routing table
-/// that says which source addresses that peer owns, the mode, and the peer's
-/// counters.
+/// #3528 — a refused initiation that arrives within this long of one this
+/// session's `Tunn` ACCEPTED from the same peer is a reordered burst, not a
+/// clock step, and the shadow does not answer it. A peer that wakes from a
+/// freeze can fire several initiations at once, and the path can reorder them:
+/// field 2026-11-07, a thawed lab guest's two refusals came 0.2 ms after an
+/// accept. It is boringtun's REKEY_TIMEOUT, so a stepped-back peer whose first
+/// refusal lands inside it is answered on its next retry.
+const HEAL_REORDER_WINDOW: Duration = Duration::from_secs(5);
+/// #3528 — the shadow answers at most one refused initiation per session per
+/// this long. An answer costs one handshake's crypto and one datagram back. A
+/// genuine peer retries every 5 s (REKEY_TIMEOUT), so each of its retries is
+/// still answered.
+const SHADOW_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// #3528 — a shadow that refuses an initiation as a replay too is rebuilt only
+/// once it is this old. A younger one may hold the session the peer is
+/// completing, and the peer's next retry comes after REKEY_TIMEOUT anyway.
+const SHADOW_REBUILD_AFTER: Duration = Duration::from_secs(5);
+/// #3528 — a shadow the peer did not complete within this long is dropped.
+/// It is boringtun's REJECT_AFTER_TIME, past which none of its sessions would
+/// carry data anyway.
+const SHADOW_TTL: Duration = Duration::from_secs(180);
+/// #3528 — how many accepted initiations' ephemeral keys a session remembers.
+/// A promoted shadow's mark is the stepped-back peer's stamp, which is below
+/// initiations the session accepted before the step. The session refuses those
+/// itself, by ephemeral key, before boringtun sees them. 32 keys cover about an
+/// hour of a peer's rekeys (one per 120 s), 1 KiB a session.
+const HEAL_SEEN: usize = 32;
+
+/// #3528 — how a session takes a peer whose clock stepped back, without giving
+/// up boringtun's replay guard.
 ///
-/// Bundled into one parameter rather than four more arguments to
-/// [`process_inbound`] — and it is the seam the per-peer L4 ACL (server-compiled
-/// ingress rules on `NetmapPeer`) slots into, since it is already threaded to
-/// every inbound call site and already carries peer identity.
+/// boringtun keeps, per `Tunn`, the TAI64N timestamp of the last handshake
+/// initiation it accepted, and refuses any initiation that is not later
+/// (`WrongTai64nTimestamp`, its replay guard). An initiator stamps from the
+/// wall clock its own `Tunn` read when it was built. So once a device's clock
+/// steps back and the device builds a fresh `Tunn` (a restart, a carrier
+/// rebuild), every peer that kept its `Tunn` refuses the device until the
+/// device's clock passes that peer's mark: for up to the step size. Measured on
+/// a DERP-held pair: a ~15 s stall about every 105 s for that whole window.
+/// The device's own refused initiation expires after 90 s, and boringtun's
+/// `clear_all` takes the session that was working down with it.
+///
+/// A refused initiation has passed both AEAD opens under the peer's static
+/// key, so the peer's private key made it. It is either the peer itself, behind
+/// the mark, or an old initiation of the peer's arriving again, and only the
+/// peer can tell them apart. So the session answers it from a SHADOW: a second
+/// `Tunn` from the same recipe (the same keys and session index, so the plane's
+/// index route reaches it) whose mark starts at zero. The session's own `Tunn`
+/// is untouched. The shadow takes its place ([`HandshakeHeal::promote`]) only
+/// when a data packet or keepalive decrypts under one of the shadow's sessions.
+/// That takes the ephemeral private key of the initiation it answered, which
+/// only the peer completing its own handshake holds, about a round trip after
+/// the refusal. A replayed initiation gets a response nobody can use, and the
+/// working session never notices it.
+///
+/// The session screens every initiation before boringtun sees it
+/// ([`HandshakeHeal::already_accepted`]): one whose ephemeral key its `Tunn`
+/// already ACCEPTED (the last [`HEAL_SEEN`]) is dropped. A promotion lowers the
+/// mark to the stepped-back peer's stamp, and without this check a replay of an
+/// initiation accepted before the step would be accepted again.
+///
+/// One per session, shared by every [`Ingress`] of that session. A carrier
+/// rebuild or a restart on this side starts a new one, empty, beside a `Tunn`
+/// whose mark is zero anyway: stock WireGuard after an interface restart.
+pub(crate) struct HandshakeHeal {
+    secret: StaticSecret,
+    peer: PublicKey,
+    index: u32,
+    state: std::sync::Mutex<HealState>,
+}
+
+#[derive(Default)]
+struct HealState {
+    /// The ephemeral keys of the initiations the session's `Tunn` ACCEPTED,
+    /// newest last, at most [`HEAL_SEEN`]. Only those: a refused initiation
+    /// changed nothing, and an unpromoted shadow may have answered nothing but
+    /// replays. Kept across a promotion, which is when they matter.
+    accepted: std::collections::VecDeque<[u8; 32]>,
+    /// When the session's `Tunn` last accepted an initiation from the peer.
+    accepted_at: Option<Instant>,
+    /// The shadow answering the peer's refused initiations, and when it was
+    /// built. Boxed: a `Tunn` holds eight sessions with their replay windows
+    /// inline, and most sessions never need a shadow.
+    shadow: Option<(Box<Tunn>, Instant)>,
+    /// When the shadow was last given a refused initiation.
+    shadow_tried_at: Option<Instant>,
+}
+
+/// `true` if `t` is set and less than `d` before `now`.
+fn within(t: Option<Instant>, d: Duration, now: Instant) -> bool {
+    t.is_some_and(|t| now.saturating_duration_since(t) < d)
+}
+
+/// Why the shadow did not answer an initiation the session's `Tunn` refused as
+/// a replay ([`HandshakeHeal::answer_refused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotAnswered {
+    /// Within [`HEAL_REORDER_WINDOW`] of an initiation the session accepted: a
+    /// reordered burst.
+    Reordered,
+    /// The shadow was given another within [`SHADOW_MIN_INTERVAL`].
+    Throttled,
+    /// The shadow refused it too, and is younger than [`SHADOW_REBUILD_AFTER`].
+    ShadowRefused,
+}
+
+impl HandshakeHeal {
+    pub(crate) fn new(secret: StaticSecret, peer: [u8; 32], index: u32) -> Self {
+        Self {
+            secret,
+            peer: PublicKey::from(peer),
+            index,
+            state: Default::default(),
+        }
+    }
+
+    /// The session's `Tunn`, as it is installed and as a shadow is built. One
+    /// recipe, so a promoted shadow differs from the `Tunn` it replaced only in
+    /// its sessions and its replay mark.
+    pub(crate) fn build(&self) -> Tunn {
+        Tunn::new(
+            self.secret.clone(),
+            self.peer,
+            None,
+            Some(KEEPALIVE_SECS),
+            self.index,
+            None,
+        )
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HealState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `true` if the session's `Tunn` already accepted an initiation with this
+    /// ephemeral key: a duplicate or a replay, dropped before boringtun sees it.
+    fn already_accepted(&self, ephemeral: &[u8; 32]) -> bool {
+        self.lock().accepted.contains(ephemeral)
+    }
+
+    /// Record an initiation the session's `Tunn` accepted.
+    fn accepted(&self, ephemeral: &[u8; 32], now: Instant) {
+        let mut st = self.lock();
+        if !st.accepted.contains(ephemeral) {
+            if st.accepted.len() == HEAL_SEEN {
+                st.accepted.pop_front();
+            }
+            st.accepted.push_back(*ephemeral);
+        }
+        st.accepted_at = Some(now);
+    }
+
+    /// `true` while a shadow waits for the peer to complete a handshake it
+    /// answered.
+    fn has_shadow(&self) -> bool {
+        self.lock().shadow.is_some()
+    }
+
+    /// Answer, from the shadow, an initiation the session's `Tunn` refused as a
+    /// replay, building the shadow if there is none. `Ok` holds the datagram to
+    /// send back to the peer: the handshake response, or a cookie reply under
+    /// load.
+    fn answer_refused(&self, datagram: &[u8], now: Instant) -> Result<Vec<u8>, NotAnswered> {
+        let mut st = self.lock();
+        if within(st.accepted_at, HEAL_REORDER_WINDOW, now) {
+            return Err(NotAnswered::Reordered);
+        }
+        if within(st.shadow_tried_at, SHADOW_MIN_INTERVAL, now) {
+            return Err(NotAnswered::Throttled);
+        }
+        st.shadow_tried_at = Some(now);
+        if st
+            .shadow
+            .as_ref()
+            .is_some_and(|(_, built)| !within(Some(*built), SHADOW_TTL, now))
+        {
+            st.shadow = None;
+        }
+        let mut dst = vec![0u8; WG_BUF];
+        let (shadow, built) = st
+            .shadow
+            .get_or_insert_with(|| (Box::new(self.build()), now));
+        let mut reply = sent_back(shadow.decapsulate(None, datagram, &mut dst));
+        if reply.is_none() && !within(Some(*built), SHADOW_REBUILD_AFTER, now) {
+            **shadow = self.build();
+            *built = now;
+            reply = sent_back(shadow.decapsulate(None, datagram, &mut dst));
+        }
+        reply.ok_or(NotAnswered::ShadowRefused)
+    }
+
+    /// A data packet (or keepalive) the session's `Tunn` could not
+    /// decapsulate. If it decrypts under one of the shadow's sessions, the peer
+    /// completed a handshake the shadow answered: the shadow is returned with
+    /// its result, for the caller to install in place of the session's `Tunn`.
+    /// Otherwise the shadow stays, unless it is past [`SHADOW_TTL`].
+    fn promote<'a>(
+        &self,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+        now: Instant,
+    ) -> Option<(Tunn, TunnResult<'a>)> {
+        let mut st = self.lock();
+        let (mut shadow, built) = st.shadow.take()?;
+        if !within(Some(built), SHADOW_TTL, now) {
+            return None;
+        }
+        let res = shadow.decapsulate(None, datagram, dst);
+        if matches!(res, TunnResult::Err(_)) {
+            st.shadow = Some((shadow, built));
+            return None;
+        }
+        Some((*shadow, res))
+    }
+
+    /// Test-only: move this session's last accept, its last shadow answer and
+    /// its shadow's birth back by `by`, as if that much time had passed.
+    #[cfg(test)]
+    pub(crate) fn test_age(&self, by: Duration) {
+        let mut st = self.lock();
+        st.accepted_at = st.accepted_at.and_then(|t| t.checked_sub(by));
+        st.shadow_tried_at = st.shadow_tried_at.and_then(|t| t.checked_sub(by));
+        if let Some((_, built)) = st.shadow.as_mut()
+            && let Some(t) = built.checked_sub(by)
+        {
+            *built = t;
+        }
+    }
+}
+
+/// The datagram a `decapsulate` result sends back to the peer, if it is one.
+fn sent_back(res: TunnResult<'_>) -> Option<Vec<u8>> {
+    match res {
+        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+        _ => None,
+    }
+}
+
+/// `true` if `datagram` parses as a WireGuard data packet (type 4), keepalives
+/// included.
+fn is_data(datagram: &[u8]) -> bool {
+    matches!(
+        Tunn::parse_incoming_packet(datagram),
+        Ok(Packet::PacketData(_))
+    )
+}
+
+/// The cleartext ephemeral key of a WireGuard handshake initiation (bytes
+/// 8..40, after the message type and the sender index), `None` for any other
+/// datagram. boringtun's parsed `HandshakeInit` keeps its fields private, so
+/// the key is read by offset once the parse says the datagram is one.
+fn init_ephemeral(datagram: &[u8]) -> Option<[u8; 32]> {
+    match Tunn::parse_incoming_packet(datagram) {
+        Ok(Packet::HandshakeInit(_)) => datagram.get(8..40)?.try_into().ok(),
+        _ => None,
+    }
+}
+
+/// `true` if `res` is boringtun answering an initiation it ACCEPTED: a
+/// handshake response (type 2). Under load it answers with a cookie reply
+/// (type 3) instead, without processing the initiation.
+fn answers_init(res: &TunnResult<'_>) -> bool {
+    matches!(res, TunnResult::WriteToNetwork(b) if b.first() == Some(&2))
+}
+
 /// Why an inbound packet was refused. Distinguishes the two ingress tiers in
 /// logs and field reports: a forged SOURCE (the peer lying about who it is) vs.
 /// an out-of-scope DESTINATION (the peer aiming past us at something we never
@@ -587,6 +857,15 @@ enum IngressDeny {
     NotPermitted,
 }
 
+/// P4 — everything the INGRESS path needs to authorize one peer's decapsulated
+/// packets: **who** is sending (its WG public key), the shared routing table
+/// that says which source addresses that peer owns, the mode, and the peer's
+/// counters.
+///
+/// Bundled into one parameter rather than four more arguments to
+/// [`process_inbound`] — and it is the seam the per-peer L4 ACL (server-compiled
+/// ingress rules on `NetmapPeer`) slots into, since it is already threaded to
+/// every inbound call site and already carries peer identity.
 #[derive(Clone)]
 pub(crate) struct Ingress {
     peer: [u8; 32],
@@ -594,6 +873,9 @@ pub(crate) struct Ingress {
     send: WgSender,
     stats: Arc<PeerStats>,
     mode: RpfMode,
+    /// #3528 — the session's replay-refusal heal, shared by every `Ingress`
+    /// of that session.
+    heal: Arc<HandshakeHeal>,
 }
 
 impl Ingress {
@@ -1199,13 +1481,20 @@ impl WgDevice {
     }
 
     /// P4 — the [`Ingress`] context for one peer's inbound path: its identity,
-    /// the shared routing table, its counters, and this device's mode.
-    fn ingress_for(&self, peer_public: [u8; 32], stats: Arc<PeerStats>) -> Ingress {
+    /// the shared routing table, its counters, this device's mode, and (#3528)
+    /// the session's replay-refusal heal.
+    fn ingress_for(
+        &self,
+        peer_public: [u8; 32],
+        stats: Arc<PeerStats>,
+        heal: Arc<HandshakeHeal>,
+    ) -> Ingress {
         Ingress {
             peer: peer_public,
             send: self.send.clone(),
             stats,
             mode: self.rpf,
+            heal,
         }
     }
 
@@ -1485,15 +1774,10 @@ impl WgDevice {
     ) -> Peer {
         let index = self.alloc_index();
 
-        let tunn = Tunn::new(
-            self.secret.clone(),
-            PublicKey::from(peer_public),
-            None,
-            Some(KEEPALIVE_SECS),
-            index,
-            None,
-        );
-        let tunn = Arc::new(Mutex::new(tunn));
+        // #3528 — the `Tunn` comes from the session's heal recipe, so a heal
+        // can rebuild it with exactly these parameters.
+        let heal = Arc::new(HandshakeHeal::new(self.secret.clone(), peer_public, index));
+        let tunn = Arc::new(Mutex::new(heal.build()));
 
         let stats = Arc::new(PeerStats::default());
 
@@ -1523,7 +1807,7 @@ impl WgDevice {
         // (`index_alloc`, locked by a test), so this cannot capture another
         // engine's traffic.
         if let Some(h) = &self.plane {
-            let ingress = self.ingress_for(peer_public, stats.clone());
+            let ingress = self.ingress_for(peer_public, stats.clone(), heal.clone());
             h.register_route(
                 index,
                 tunn.clone(),
@@ -1537,7 +1821,7 @@ impl WgDevice {
         let recv_tunn = tunn.clone();
         let recv_carrier = carrier.clone();
         let tun_tx = self.tun_tx.clone();
-        let recv_ingress = self.ingress_for(peer_public, stats.clone());
+        let recv_ingress = self.ingress_for(peer_public, stats.clone(), heal);
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; WG_BUF];
             loop {
@@ -1556,6 +1840,7 @@ impl WgDevice {
         // timer task: drive handshake retries + keepalives.
         let timer_tunn = tunn.clone();
         let timer_carrier = carrier.clone();
+        let timer_stats = stats.clone();
         let timer_task = tokio::spawn(async move {
             let mut buf = vec![0u8; WG_BUF];
             let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
@@ -1578,6 +1863,7 @@ impl WgDevice {
                         // did) left the carrier to be rediscovered the slow
                         // way, by the rx-staleness bound.
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                            timer_stats.expired.store(true, Ordering::Relaxed);
                             timer_carrier.mark_dead();
                             None
                         }
@@ -1771,17 +2057,13 @@ impl WgDevice {
         let carrier = Carrier::direct(sock, dst);
 
         let index = self.alloc_index();
-        let tunn = Arc::new(Mutex::new(Tunn::new(
-            self.secret.clone(),
-            PublicKey::from(peer_public),
-            None,
-            Some(KEEPALIVE_SECS),
-            index,
-            None,
-        )));
+        // #3528 — built from the session's heal recipe, as in
+        // `build_carrier_session`.
+        let heal = Arc::new(HandshakeHeal::new(self.secret.clone(), peer_public, index));
+        let tunn = Arc::new(Mutex::new(heal.build()));
 
         let stats = Arc::new(PeerStats::default());
-        let ingress = self.ingress_for(peer_public, stats.clone());
+        let ingress = self.ingress_for(peer_public, stats.clone(), heal);
         // Register for demux BEFORE the handshake so inbound is routed —
         // on the plane by session index (unique across every attached
         // engine), else in the device's source-keyed table. Both register
@@ -1819,6 +2101,7 @@ impl WgDevice {
         // this peer's inbound.
         let timer_tunn = tunn.clone();
         let timer_carrier = carrier.clone();
+        let timer_stats = stats.clone();
         let timer_task = tokio::spawn(async move {
             let mut buf = vec![0u8; WG_BUF];
             let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
@@ -1841,6 +2124,7 @@ impl WgDevice {
                         // did) left the carrier to be rediscovered the slow
                         // way, by the rx-staleness bound.
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                            timer_stats.expired.store(true, Ordering::Relaxed);
                             timer_carrier.mark_dead();
                             None
                         }
@@ -2258,6 +2542,33 @@ impl WgDevice {
         Some(self.peers.get(peer_public)?.carrier.is_dead())
     }
 
+    /// #3528 — `true` if boringtun reported `peer_public`'s session over
+    /// (`ConnectionExpired`: a rekey attempt gave up after 90 s), which marks
+    /// the carrier dead without any send error. `None` if the peer is unknown.
+    /// Lock-free. It words the rebuild line, so a handshake that expired is
+    /// not reported as a closed WS or a reset allocation.
+    pub fn peer_handshake_expired(&self, peer_public: &[u8; 32]) -> Option<bool> {
+        Some(
+            self.peers
+                .get(peer_public)?
+                .stats
+                .expired
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// #3528 — `(refused, healed)`: how many handshake initiations from
+    /// `peer_public` its installed session refused as replays, and how many
+    /// times the peer then completed a handshake the session's shadow answered.
+    /// `None` if the peer is unknown.
+    pub fn peer_replay_counts(&self, peer_public: &[u8; 32]) -> Option<(u64, u64)> {
+        let s = &self.peers.get(peer_public)?.stats;
+        Some((
+            s.replay_refused.load(Ordering::Relaxed),
+            s.replay_heals.load(Ordering::Relaxed),
+        ))
+    }
+
     /// Phase C — LOCK-FREE: has the WG handshake to `peer_public` completed (a
     /// session exists)? `None` if the peer is unknown. The health sweep reads
     /// this to time out a srflx / public-direct punch carrier that NEVER
@@ -2396,10 +2707,72 @@ pub(crate) async fn process_inbound(
     ingress: &Ingress,
 ) -> bool {
     let stats = &ingress.stats;
+    // #3528 — an initiation whose ephemeral key this session's `Tunn` already
+    // accepted is a duplicate or a replay. It is dropped before boringtun sees
+    // it, because a promoted shadow's mark can be below it ([`HandshakeHeal`]).
+    let init_eph = init_ephemeral(&buf[..n]);
+    if let Some(eph) = &init_eph
+        && ingress.heal.already_accepted(eph)
+    {
+        stats.replay_refused.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            peer = %short_key(&ingress.peer),
+            "wg: handshake initiation dropped: this session already accepted its ephemeral key"
+        );
+        return false;
+    }
     // Decapsulate writes into a separate scratch buffer so the borrow on
     // the result doesn't alias the inbound `buf`.
     let mut out = vec![0u8; WG_BUF];
-    let res = t.decapsulate(None, &buf[..n], &mut out);
+    // #3528 — the scratch for the shadow's pass over a data packet, sized only
+    // when a shadow waits (the first result still borrows `out`).
+    let mut shadow_out = Vec::new();
+    let mut res = t.decapsulate(None, &buf[..n], &mut out);
+    let now = Instant::now();
+    // #3528 — an initiation refused as a replay: the peer's clock may be
+    // behind the last initiation this session accepted. The shadow answers it,
+    // and the session's `Tunn` is left as it is.
+    let mut shadow_reply = None;
+    if init_eph.is_some() && matches!(res, TunnResult::Err(WireGuardError::WrongTai64nTimestamp)) {
+        stats.replay_refused.fetch_add(1, Ordering::Relaxed);
+        match ingress.heal.answer_refused(&buf[..n], now) {
+            Ok(reply) => {
+                debug!(
+                    peer = %short_key(&ingress.peer),
+                    "wg: handshake initiation refused as a replay; answered from the shadow"
+                );
+                shadow_reply = Some(reply);
+            }
+            Err(why) => debug!(
+                peer = %short_key(&ingress.peer), ?why,
+                "wg: handshake initiation refused as a replay, not answered"
+            ),
+        }
+    }
+    // #3528 — a data packet this session's `Tunn` could not decapsulate may be
+    // the peer completing a handshake the shadow answered. Then the shadow
+    // takes the `Tunn`'s place, and its result stands for this packet.
+    if matches!(res, TunnResult::Err(_)) && is_data(&buf[..n]) && ingress.heal.has_shadow() {
+        shadow_out.resize(WG_BUF, 0);
+        if let Some((shadow, r)) = ingress.heal.promote(&buf[..n], &mut shadow_out, now) {
+            *t = shadow;
+            res = r;
+            let heals = stats.replay_heals.fetch_add(1, Ordering::Relaxed) + 1;
+            info!(
+                peer = %short_key(&ingress.peer), heals,
+                refused = stats.replay_refused.load(Ordering::Relaxed),
+                "overlay: this peer's handshake was refused as a replay: its clock is behind \
+                 the last handshake this session accepted (a backward clock step, then a \
+                 restart or rebuild). It completed the handshake answered from a fresh state, \
+                 which now carries the session (#3528)"
+            );
+        }
+    }
+    if let Some(eph) = &init_eph
+        && answers_init(&res)
+    {
+        ingress.heal.accepted(eph, now);
+    }
     let authenticated = n > 0 && !matches!(res, TunnResult::Err(_));
     // rc.206 — a non-empty inbound datagram that passed WG decapsulation (data, a
     // handshake step, OR a content-free persistent-keepalive → `Done`) proves we
@@ -2477,6 +2850,14 @@ pub(crate) async fn process_inbound(
         }
         TunnResult::Done => {}
         TunnResult::Err(e) => debug!(?e, "wg decapsulate error"),
+    }
+    // #3528 — the shadow's answer goes back over the carrier the initiation
+    // came in on, off this call path like every other reply.
+    if let Some(reply) = shadow_reply {
+        let c = carrier.clone();
+        tokio::spawn(async move {
+            let _ = c.send(&reply).await;
+        });
     }
     // Phase C — latch "handshake completed" the moment this peer's session is
     // live. `process_inbound` only runs on a packet FROM the peer, so a set flag
@@ -4597,6 +4978,368 @@ mod tests {
         // Garbage (right-length + short) is rejected, never panics.
         assert_eq!(dev_b.authenticate_init(&[0u8; 148]), None);
         assert_eq!(dev_b.authenticate_init(b"short"), None);
+    }
+
+    // ---- #3528: a peer whose clock stepped back ---------------------------
+    //
+    // No clock is stepped here. An initiation formatted EARLIER carries the
+    // lower TAI64N stamp, which is all a backward step changes on the wire: the
+    // stepped device's fresh `Tunn` stamps below the mark its peer kept.
+
+    /// #3528 — B's side of the clock-step tests: B's session for A, its `Tunn`
+    /// built from the heal recipe as `build_carrier_session` builds it, the
+    /// `Ingress` that shares the heal, and a carrier whose far end is a socket
+    /// the test reads B's replies from.
+    struct StepRig {
+        tunn: Tunn,
+        stats: Arc<PeerStats>,
+        ingress: Ingress,
+        carrier: Arc<Carrier>,
+        wire: UdpSocket,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        _tun_rx: mpsc::Receiver<Vec<u8>>,
+        _dev: WgDevice,
+        _dev_rx: mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl StepRig {
+        async fn new(a: &WgKeypair, b: &WgKeypair) -> Self {
+            let (dev, dev_rx) = WgDevice::new(b.secret.clone());
+            let heal = Arc::new(HandshakeHeal::new(
+                b.secret.clone(),
+                a.public.to_bytes(),
+                0x51,
+            ));
+            let tunn = heal.build();
+            let stats = Arc::new(PeerStats::default());
+            let ingress = dev.ingress_for(a.public.to_bytes(), stats.clone(), heal);
+            let wire = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let carrier = Carrier::direct(sock, wire.local_addr().unwrap());
+            let (tun_tx, tun_rx) = mpsc::channel(16);
+            Self {
+                tunn,
+                stats,
+                ingress,
+                carrier,
+                wire,
+                tun_tx,
+                _tun_rx: tun_rx,
+                _dev: dev,
+                _dev_rx: dev_rx,
+            }
+        }
+
+        /// Hand B one datagram, as its receive path does: `true` if it
+        /// authenticated against B's session.
+        async fn deliver(&mut self, datagram: &[u8]) -> bool {
+            let mut buf = datagram.to_vec();
+            process_inbound(
+                &mut self.tunn,
+                datagram.len(),
+                &mut buf,
+                &self.carrier,
+                &self.tun_tx,
+                &self.ingress,
+            )
+            .await
+        }
+
+        /// The next datagram B sent back, if one arrives within 300 ms.
+        async fn sent(&self) -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; WG_BUF];
+            match tokio::time::timeout(Duration::from_millis(300), self.wire.recv_from(&mut buf))
+                .await
+            {
+                Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+                _ => None,
+            }
+        }
+
+        /// `(refused, healed)`, as `peer_replay_counts` reads them.
+        fn counts(&self) -> (u64, u64) {
+            (
+                self.stats.replay_refused.load(Ordering::Relaxed),
+                self.stats.replay_heals.load(Ordering::Relaxed),
+            )
+        }
+
+        /// A completes a handshake with B from `init`, which B must accept:
+        /// B answers, A sends its keepalive, and B's session goes current.
+        async fn handshake(&mut self, a: &mut Tunn, init: &[u8]) {
+            assert!(self.deliver(init).await, "B accepts the initiation");
+            let resp = self.sent().await.expect("B answers it");
+            let keepalive = answer(a, &resp).expect("A completes the handshake");
+            assert!(
+                self.deliver(&keepalive).await,
+                "A's keepalive authenticates"
+            );
+        }
+    }
+
+    /// A's initiator `Tunn` toward B, as a device builds one on a (re)start:
+    /// its own mark at zero.
+    fn initiator(a: &WgKeypair, b: &WgKeypair, index: u32) -> Tunn {
+        Tunn::new(a.secret.clone(), b.public, None, None, index, None)
+    }
+
+    /// One handshake initiation from `t`, which keeps its state, so `t` can
+    /// complete the handshake from the response.
+    fn initiation(t: &mut Tunn) -> Vec<u8> {
+        let mut buf = vec![0u8; WG_BUF];
+        match t.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(b) => b.to_vec(),
+            _ => panic!("expected a handshake initiation"),
+        }
+    }
+
+    /// Feed `datagram` to `t`: the datagram it sends back, if any.
+    fn answer(t: &mut Tunn, datagram: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; WG_BUF];
+        sent_back(t.decapsulate(None, datagram, &mut buf))
+    }
+
+    /// `t` seals one IP packet on its current session: the data datagram.
+    fn seal(t: &mut Tunn, ip: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; WG_BUF];
+        match t.encapsulate(ip, &mut buf) {
+            TunnResult::WriteToNetwork(b) if b[0] == 4 => b.to_vec(),
+            _ => panic!("expected a data packet on a current session"),
+        }
+    }
+
+    /// `t` opens one data datagram: the IP packet, if it decrypts.
+    fn open(t: &mut Tunn, datagram: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; WG_BUF];
+        match t.decapsulate(None, datagram, &mut buf) {
+            TunnResult::WriteToTunnelV4(p, _) => Some(p.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// Long enough that two initiations formatted either side of it carry
+    /// stamps in that order on any clock this suite runs on.
+    const STAMP_GAP: Duration = Duration::from_millis(20);
+    /// Past [`HEAL_REORDER_WINDOW`] and [`SHADOW_REBUILD_AFTER`].
+    const PAST_WINDOWS: Duration = Duration::from_secs(6);
+
+    /// #3528 AC4 — the device's clock stepped back and it rebuilt its state (a
+    /// restart). Its new initiation is stamped below the mark B kept from the
+    /// session that was working, so B's `Tunn` refuses it. The shadow answers
+    /// it, the device completes its OWN handshake on the first try, and its
+    /// first packet moves the shadow into place: one round trip, where the
+    /// stock path stalled ~15 s every ~105 s (AC2's DERP arm). Afterwards a
+    /// replay of the initiation B accepted before the step, stamped above the
+    /// promoted mark, is still refused, by the screen.
+    #[tokio::test]
+    async fn backward_step_then_rebuild_heals_in_one_round_trip() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        // After the step: formatted first, so it carries the lower stamp.
+        let mut stepped = initiator(&a, &b, 1);
+        let init_stepped = initiation(&mut stepped);
+        tokio::time::sleep(STAMP_GAP).await;
+        // Before the step: the device's previous state and B work, and B's
+        // mark is that initiation's stamp, above the stepped one.
+        let mut before = initiator(&a, &b, 2);
+        let init_before = initiation(&mut before);
+        rig.handshake(&mut before, &init_before).await;
+        drop(before); // the restart
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        assert!(
+            !rig.deliver(&init_stepped).await,
+            "B's own Tunn refuses it: stamped below its mark"
+        );
+        assert_eq!(rig.counts(), (1, 0), "refused, not yet healed");
+        let resp = rig.sent().await.expect("the shadow answers the refusal");
+        assert_eq!(resp[0], 2, "a handshake response");
+        let keepalive = answer(&mut stepped, &resp).expect("the device completes its handshake");
+        assert!(
+            rig.deliver(&keepalive).await,
+            "its first packet authenticates: the shadow took over"
+        );
+        assert_eq!(rig.counts(), (1, 1));
+        assert!(
+            !rig.ingress.heal.has_shadow(),
+            "the shadow IS the session now"
+        );
+
+        // Data both ways on the healed session.
+        let ip = synthetic_ipv4(IP_A, IP_B, b"after-the-step");
+        assert!(rig.deliver(&seal(&mut stepped, &ip)).await);
+        let back = synthetic_ipv4(IP_B, IP_A, b"reply");
+        let sealed = seal(&mut rig.tunn, &back);
+        assert_eq!(open(&mut stepped, &sealed).as_deref(), Some(&back[..]));
+
+        // The pre-step initiation is above the promoted mark: boringtun alone
+        // would accept a replay of it. The screen drops it, unanswered.
+        assert!(!rig.deliver(&init_before).await);
+        assert!(rig.sent().await.is_none(), "dropped before boringtun");
+        assert_eq!(rig.counts(), (2, 1));
+    }
+
+    /// #3528 AC4 — a REPLAY of an initiation B never saw (captured before it
+    /// reached B) is refused by B's `Tunn` exactly as a stepped-back peer's is.
+    /// The shadow answers it, but nobody can complete that handshake without
+    /// the initiation's ephemeral private key, so B's working session carries
+    /// the real peer's data throughout. The measured blip is zero packets.
+    #[tokio::test]
+    async fn replayed_unseen_initiation_never_disturbs_the_working_session() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let captured = initiation(&mut initiator(&a, &b, 1));
+        tokio::time::sleep(STAMP_GAP).await;
+        let mut real = initiator(&a, &b, 2);
+        let init = initiation(&mut real);
+        rig.handshake(&mut real, &init).await;
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        assert!(!rig.deliver(&captured).await, "refused: below B's mark");
+        let useless = rig.sent().await.expect("the shadow answers it");
+        assert!(
+            answer(&mut real, &useless).is_none(),
+            "the real peer has no handshake that matches it"
+        );
+        for i in 0..5u8 {
+            let ip = synthetic_ipv4(IP_A, IP_B, &[i; 8]);
+            assert!(
+                rig.deliver(&seal(&mut real, &ip)).await,
+                "packet {i} after the replay rides the same session"
+            );
+        }
+        let back = synthetic_ipv4(IP_B, IP_A, b"still-here");
+        let sealed = seal(&mut rig.tunn, &back);
+        assert_eq!(open(&mut real, &sealed).as_deref(), Some(&back[..]));
+        assert_eq!(rig.counts(), (1, 0), "refused once, nothing promoted");
+    }
+
+    /// #3528 AC4 — an exact duplicate of an initiation B accepted is dropped
+    /// before boringtun sees it: no answer, no shadow, the session untouched.
+    #[tokio::test]
+    async fn duplicate_of_an_accepted_initiation_is_dropped_unanswered() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let mut real = initiator(&a, &b, 1);
+        let init = initiation(&mut real);
+        rig.handshake(&mut real, &init).await;
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        assert!(!rig.deliver(&init).await);
+        assert!(rig.sent().await.is_none());
+        assert!(!rig.ingress.heal.has_shadow());
+        assert_eq!(rig.counts(), (1, 0));
+        let ip = synthetic_ipv4(IP_A, IP_B, b"unaffected");
+        assert!(rig.deliver(&seal(&mut real, &ip)).await);
+    }
+
+    /// #3528 AC4 — an initiation refused within [`HEAL_REORDER_WINDOW`] of one
+    /// B accepted is a reordered burst (field 2026-11-07: a thawed guest's
+    /// refusals came 0.2 ms after an accept). No shadow, no answer.
+    #[tokio::test]
+    async fn reordered_initiation_inside_the_window_gets_no_shadow() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let older = initiation(&mut initiator(&a, &b, 1));
+        tokio::time::sleep(STAMP_GAP).await;
+        let mut newer = initiator(&a, &b, 2);
+        let init = initiation(&mut newer);
+        assert!(rig.deliver(&init).await);
+        assert!(rig.sent().await.is_some());
+
+        assert!(!rig.deliver(&older).await, "refused: below the new mark");
+        assert!(rig.sent().await.is_none(), "a reorder is not answered");
+        assert!(!rig.ingress.heal.has_shadow());
+        assert_eq!(rig.counts(), (1, 0));
+    }
+
+    /// #3528 AC4 — the shadow answers at most one refused initiation per
+    /// [`SHADOW_MIN_INTERVAL`].
+    #[tokio::test]
+    async fn shadow_answers_at_most_once_a_second() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let old1 = initiation(&mut initiator(&a, &b, 1));
+        let old2 = initiation(&mut initiator(&a, &b, 2));
+        tokio::time::sleep(STAMP_GAP).await;
+        let mut real = initiator(&a, &b, 3);
+        let init = initiation(&mut real);
+        rig.handshake(&mut real, &init).await;
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        assert!(!rig.deliver(&old1).await);
+        assert!(rig.sent().await.is_some(), "the first is answered");
+        assert!(!rig.deliver(&old2).await);
+        assert!(
+            rig.sent().await.is_none(),
+            "the next, within a second, is not"
+        );
+        assert_eq!(rig.counts(), (2, 0));
+    }
+
+    /// #3528 AC4 — a shadow a replay built cannot lock out a peer that steps
+    /// back later. Its mark is the replay's stamp; an initiation it refuses too
+    /// gets a fresh shadow once the old one is [`SHADOW_REBUILD_AFTER`] old.
+    #[tokio::test]
+    async fn a_stale_shadow_is_rebuilt_for_a_lower_stamp() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let mut stepped = initiator(&a, &b, 1);
+        let init_stepped = initiation(&mut stepped);
+        tokio::time::sleep(STAMP_GAP).await;
+        let replayed = initiation(&mut initiator(&a, &b, 2));
+        tokio::time::sleep(STAMP_GAP).await;
+        let mut real = initiator(&a, &b, 3);
+        let init = initiation(&mut real);
+        rig.handshake(&mut real, &init).await;
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+        assert!(!rig.deliver(&replayed).await);
+        assert!(rig.sent().await.is_some(), "the replay builds a shadow");
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        assert!(!rig.deliver(&init_stepped).await);
+        let resp = rig.sent().await.expect("a fresh shadow answers");
+        let keepalive = answer(&mut stepped, &resp).expect("the device completes");
+        assert!(rig.deliver(&keepalive).await);
+        assert_eq!(rig.counts(), (2, 1));
+    }
+
+    /// #3528 AC4 control — no step: a fresh handshake is accepted by B's own
+    /// `Tunn`. Nothing is refused, no shadow is built.
+    #[tokio::test]
+    async fn no_step_control_nothing_refused() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let mut dev_a = initiator(&a, &b, 1);
+        let init = initiation(&mut dev_a);
+        rig.handshake(&mut dev_a, &init).await;
+        let ip = synthetic_ipv4(IP_A, IP_B, b"no-step");
+        assert!(rig.deliver(&seal(&mut dev_a, &ip)).await);
+        assert_eq!(rig.counts(), (0, 0));
+        assert!(!rig.ingress.heal.has_shadow());
+    }
+
+    /// #3528 AC4 control — a FORWARD step, then the rebuild: the new state
+    /// stamps above B's mark, so B's own `Tunn` accepts it. Nothing is refused,
+    /// no shadow is built.
+    #[tokio::test]
+    async fn forward_step_control_nothing_refused() {
+        let (a, b) = (WgKeypair::generate(), WgKeypair::generate());
+        let mut rig = StepRig::new(&a, &b).await;
+        let mut before = initiator(&a, &b, 1);
+        let init_before = initiation(&mut before);
+        rig.handshake(&mut before, &init_before).await;
+        drop(before);
+        tokio::time::sleep(STAMP_GAP).await;
+        rig.ingress.heal.test_age(PAST_WINDOWS);
+
+        let mut after = initiator(&a, &b, 2);
+        let init_after = initiation(&mut after);
+        rig.handshake(&mut after, &init_after).await;
+        let ip = synthetic_ipv4(IP_A, IP_B, b"forward");
+        assert!(rig.deliver(&seal(&mut after, &ip)).await);
+        assert_eq!(rig.counts(), (0, 0));
+        assert!(!rig.ingress.heal.has_shadow());
     }
 
     /// Phase A CORE — a CLIENT dials a HUB's endpoint and the HUB, which never

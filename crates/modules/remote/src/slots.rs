@@ -18,13 +18,26 @@
 //!   know, so it drops it and claims once more. That is what keeps a Free org
 //!   from being locked out for a whole lease after a failed release, e.g. on
 //!   its viewer's reconnect. Another pod's holders are never judged here.
+//!   FR-138 (review 1, M5) — above window 0 a session no hub holds may be
+//!   detached, waiting for its device's claim, and its lease is its slot: the
+//!   holder's row is read first (once per such holder, only when the set is
+//!   full), and the lease is kept only while the row can still be resumed
+//!   (PR D's review, MEDIUM 1): live with a `resume_by` no more than 10 s
+//!   past, or live with no `resume_by` on a device in the resume scope, whose
+//!   detach may not have reached the row yet. Anything else is dropped as
+//!   before, so a dead pod's lease of a device outside the scope frees its
+//!   org at once. At window 0 nothing is read, as before.
 
 use std::sync::LazyLock;
 
-use bson::oid::ObjectId;
+use bson::{DateTime, oid::ObjectId};
 use dashmap::DashSet;
+use roomler_ai_remote_control::models::SessionPhase;
+use roomler_ai_services::dao::base::DaoError;
 use roomler_core::cluster::metrics::{RC_SLOT_CLAIM_FAILED_TOTAL, RC_SLOT_FULL_TOTAL, bump};
-use roomler_core::cluster::session_slots::{Lease, SlotClaim, SlotScope};
+use roomler_core::cluster::session_slots::{
+    Lease, SLOT_KEEP_PAST_RESUME_MS, SessionSlots, SlotClaim, SlotHolder, SlotScope,
+};
 use tracing::{debug, warn};
 
 use crate::RemoteState;
@@ -67,6 +80,80 @@ fn stale_here(state: &RemoteState, session_hex: &str) -> Option<ObjectId> {
     (state.fleet.rc_hub.session_snapshot(id).is_none() && !PENDING.contains(&id)).then_some(id)
 }
 
+/// The holders of a full set that this pod may drop as stale: claimed here,
+/// [`stale_here`], and, above window 0, over by their row (review 1, M5).
+async fn stale_holders(
+    state: &RemoteState,
+    scope: SlotScope,
+    holders: &[SlotHolder],
+    pod: &str,
+) -> Vec<ObjectId> {
+    let mut stale = Vec::new();
+    for h in holders.iter().filter(|h| h.pod == pod) {
+        let Some(id) = stale_here(state, &h.session) else {
+            continue;
+        };
+        if crate::row_end::enabled(state) && !over(state, scope, id).await {
+            debug!(?scope, session = %id, "session slot: a lease this pod no longer holds is kept; its session may still be resumed");
+            continue;
+        }
+        stale.push(id);
+    }
+    stale
+}
+
+/// Review 1, M5 — whether the session behind a lease no hub here holds is
+/// over, by its row. It may still be resumed only while it is live and
+/// either detached, with a `resume_by` no more than [`SLOT_KEEP_PAST_RESUME_MS`]
+/// past (a claim that began before the deadline may commit just after it;
+/// PR D's review, LOW 4), or has no `resume_by` while its device is in the
+/// resume scope: a detach whose write has not reached the row yet (PR D's
+/// review, MEDIUM 1). Everything else is over and dropped, as before FR-138:
+/// ended, not live, past the grace, no row in the org, or live with no
+/// deadline on a device outside the scope (a session of a pod that died
+/// without writing its ends, which nothing will resume). A row or a scope
+/// that cannot be read is no evidence either way, and its lease is kept. An
+/// account in no org runs only external sessions, which a device never keeps
+/// (D3): over, with no read.
+async fn over(state: &RemoteState, scope: SlotScope, session: ObjectId) -> bool {
+    let SlotScope::Org(tenant_id) = scope else {
+        return true;
+    };
+    let row = match state
+        .remote_sessions
+        .find_in_tenant(tenant_id, session)
+        .await
+    {
+        Ok(row) => row,
+        Err(DaoError::NotFound) => return true,
+        Err(e) => {
+            warn!(?scope, %session, %e, "session slot: the row of a lease this pod no longer holds could not be read; the lease is kept");
+            return false;
+        }
+    };
+    if row.ended_at.is_some() || row.phase != SessionPhase::Active {
+        return true;
+    }
+    if let Some(by) = row.resume_by {
+        return by
+            .timestamp_millis()
+            .saturating_add(SLOT_KEEP_PAST_RESUME_MS)
+            <= DateTime::now().timestamp_millis();
+    }
+    match state
+        .fleet
+        .rc_resume_scope
+        .covers(tenant_id, row.agent_id)
+        .await
+    {
+        Ok(covered) => !covered,
+        Err(e) => {
+            warn!(?scope, %session, %e, "session slot: the resume scope could not be read for a lease this pod no longer holds; the lease is kept");
+            false
+        }
+    }
+}
+
 /// Claim one of `scope`'s `cap` slots for a new session `user` starts on
 /// `device`, under a freshly minted session id.
 pub async fn claim(
@@ -76,13 +163,26 @@ pub async fn claim(
     device: ObjectId,
     cap: u32,
 ) -> SlotDecision {
+    claim_for(state, scope, ObjectId::new(), user, device, cap).await
+}
+
+/// [`claim`], under `session`'s own id: FR-138's claim takes a resumed
+/// session's slot again, finding its own lease (renewed) or claiming a new
+/// one. Pending from here until [`release_unused`] or [`settle`].
+pub async fn claim_for(
+    state: &RemoteState,
+    scope: SlotScope,
+    session: ObjectId,
+    user: ObjectId,
+    device: ObjectId,
+    cap: u32,
+) -> SlotDecision {
     let Some(slots) = &state.session_slots else {
         return SlotDecision::Fallback;
     };
-    let session = ObjectId::new();
     let pod = state.pod.pod_id.clone();
     PENDING.insert(session);
-    let mut retried = false;
+    let (mut retried, mut undropped) = (false, Vec::new());
     loop {
         match slots.claim(scope, session, user, device, cap, &pod).await {
             Ok(SlotClaim::Claimed | SlotClaim::Renewed) => {
@@ -95,20 +195,18 @@ pub async fn claim(
                 });
             }
             Ok(SlotClaim::Full(holders)) => {
-                let stale: Vec<ObjectId> = holders
-                    .iter()
-                    .filter(|h| h.pod == pod)
-                    .filter_map(|h| stale_here(state, &h.session))
-                    .collect();
-                if !retried && !stale.is_empty() {
-                    for id in &stale {
-                        warn!(?scope, session = %id, "session slot: dropping a stale lease this pod no longer holds");
-                        if let Err(e) = slots.release(scope, *id).await {
-                            warn!(%e, "session slot: the stale lease was not dropped");
-                        }
+                if !retried {
+                    let stale = stale_holders(state, scope, &holders, &pod).await;
+                    if !stale.is_empty() {
+                        undropped = drop_stale(slots, scope, &stale).await;
+                        retried = true;
+                        continue;
                     }
-                    retried = true;
-                    continue;
+                }
+                if full_but_stale(&holders, &undropped, cap) {
+                    // #3840: full only by leases Redis did not let go.
+                    PENDING.remove(&session);
+                    return stale_fallback(scope, &undropped);
                 }
                 PENDING.remove(&session);
                 bump(&RC_SLOT_FULL_TOTAL);
@@ -145,5 +243,137 @@ pub async fn release_unused(state: &RemoteState, lease: &Lease, created: Option<
         && let Err(e) = slots.release(lease.scope, lease.session).await
     {
         warn!(session = %lease.session, %e, "session slot: an unused slot was not given back; it expires on its own");
+    }
+}
+
+/// FR-138 — the claim is no longer pending, and the slot stays held: the hub
+/// holds the session now, or another claim of it will take the lease again.
+pub fn settle(lease: &Lease) {
+    PENDING.remove(&lease.session);
+}
+
+/// FR-138 — give back the slot of a session a claim found ended, or ended
+/// itself: the claim holds no lease of its own (it takes one only once its
+/// commit has won), and nobody holds the session, so its lease, which the
+/// detach kept, goes back by the session's id. Idempotent.
+pub async fn release_ended(state: &RemoteState, tenant_id: ObjectId, session: ObjectId) {
+    if !enabled(state) {
+        return;
+    }
+    let Some(slots) = &state.session_slots else {
+        return;
+    };
+    if let Err(e) = slots.release(SlotScope::Org(tenant_id), session).await {
+        warn!(%session, %e, "session slot: an ended session's slot was not given back; it expires on its own");
+    }
+}
+
+/// Review 1, L2 — keep a detached session's lease until `resume_by` plus
+/// 10 s, as the hub's detach does: the claim that wrote the detach back holds
+/// no session, so nobody renews it. A lease that already lapsed stays lapsed.
+pub async fn keep(
+    state: &RemoteState,
+    tenant_id: ObjectId,
+    session: ObjectId,
+    resume_by: DateTime,
+) {
+    if !enabled(state) {
+        return;
+    }
+    let Some(slots) = &state.session_slots else {
+        return;
+    };
+    let until = resume_by
+        .timestamp_millis()
+        .saturating_add(SLOT_KEEP_PAST_RESUME_MS);
+    // #3840: tried again while Redis does not answer it and the lease can
+    // still exist (`keep_retrying`), off this claim's path, as the hub's is.
+    let (slots, scope) = (slots.clone(), SlotScope::Org(tenant_id));
+    tokio::spawn(async move {
+        if let Err(e) = slots.keep_retrying(scope, session, until).await {
+            warn!(%session, %e, "session slot: a detached session's lease was not kept; it lapses at its own expiry");
+        }
+    });
+}
+
+/// #3840 — drop the stale leases a full set showed ([`stale_holders`]), and
+/// answer the ones Redis did not let go.
+async fn drop_stale(slots: &SessionSlots, scope: SlotScope, stale: &[ObjectId]) -> Vec<ObjectId> {
+    let mut undropped = Vec::new();
+    for id in stale {
+        warn!(?scope, session = %id, "session slot: dropping a stale lease this pod no longer holds");
+        if let Err(e) = slots.release(scope, *id).await {
+            warn!(%e, "session slot: the stale lease was not dropped");
+            undropped.push(*id);
+        }
+    }
+    undropped
+}
+
+/// #3840 — whether a set the claim found full again has room once the stale
+/// leases Redis did not let go are left out. Then it is full only by leases
+/// no session holds, and the claim decides as when Redis cannot answer it
+/// ([`stale_fallback`]): never a refusal that a Redis that is down would not
+/// make. A set full of live holders still refuses.
+fn full_but_stale(holders: &[SlotHolder], undropped: &[ObjectId], cap: u32) -> bool {
+    !undropped.is_empty()
+        && holders
+            .iter()
+            .filter(|h| !undropped.iter().any(|id| id.to_hex() == h.session))
+            .count()
+            < cap as usize
+}
+
+/// The claim's answer when [`full_but_stale`]: as when the claim itself
+/// fails, and counted the same, so the session proceeds uncounted, as before
+/// P3b.
+fn stale_fallback(scope: SlotScope, undropped: &[ObjectId]) -> SlotDecision {
+    bump(&RC_SLOT_CLAIM_FAILED_TOTAL);
+    warn!(
+        ?scope,
+        undropped = undropped.len(),
+        "session slot: full only by stale leases Redis did not let go; deciding as before P3b"
+    );
+    SlotDecision::Fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holder(session: ObjectId) -> SlotHolder {
+        SlotHolder {
+            session: session.to_hex(),
+            user: String::new(),
+            device: String::new(),
+            pod: "pod-a".into(),
+        }
+    }
+
+    /// #3840 — a set full only because a stale lease could not be dropped
+    /// (Redis did not answer its release) has room: the claim falls back as
+    /// a failed claim does, and is never refused for it.
+    #[test]
+    fn a_set_full_only_by_a_stale_lease_redis_kept_falls_back() {
+        let (live, stale) = (ObjectId::new(), ObjectId::new());
+        assert!(full_but_stale(&[holder(live), holder(stale)], &[stale], 2));
+        assert!(
+            full_but_stale(&[holder(stale)], &[stale], 1),
+            "a cap of one, held by the stale lease"
+        );
+    }
+
+    /// A set full of live holders still refuses, and so does a full set whose
+    /// stale leases were all dropped (today's refusal).
+    #[test]
+    fn a_set_full_of_live_holders_still_refuses() {
+        let (a, b, stale) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        assert!(!full_but_stale(
+            &[holder(a), holder(b), holder(stale)],
+            &[stale],
+            2
+        ));
+        assert!(!full_but_stale(&[holder(a), holder(b)], &[], 2));
+        assert!(!full_but_stale(&[holder(a)], &[], 1));
     }
 }

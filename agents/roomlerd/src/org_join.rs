@@ -468,7 +468,7 @@ mod tests {
 
 // ─── FR-49: a second org gets a mesh, or says it has none ───────────────────
 //
-// These two live in the LIB, not in `main.rs`, because CI runs
+// These two live in the LIB, not in the binary, because CI runs
 // `cargo test -p roomlerd --lib` and never `--bins`: a regression lock in the
 // binary compiles (clippy --tests) and never RUNS. `apply_overlay_flag` is
 // exactly the kind of thing that needs a lock that can fire.
@@ -762,7 +762,7 @@ pub fn set_org_overlay(
 mod fr49_tests {
     //! FR-49 — these locks live in the LIB because CI runs
     //! `cargo test -p roomlerd --lib` and never `--bins`: the same tests in
-    //! `main.rs` would compile (clippy --tests) and never RUN.
+    //! the binary would compile (clippy --tests) and never RUN.
     use super::*;
 
     fn two_org_cfg() -> crate::config::AgentConfig {

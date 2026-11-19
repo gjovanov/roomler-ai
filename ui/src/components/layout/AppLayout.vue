@@ -124,32 +124,6 @@
           :title="$t('nav.dashboard')"
           exact
         />
-        <!-- FR-90 — agent sessions; only where the server runs `hive`, which
-             is switched off unless an operator turns it on (the capability
-             gate fails CLOSED for it). -->
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed"
-          :to="`/tenant/${tenantId}/sessions`"
-          prepend-icon="mdi-robot-outline"
-          :title="$t('nav.agentSessions')"
-          data-testid="nav-agent-sessions"
-        />
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed"
-          :to="`/tenant/${tenantId}/memory`"
-          prepend-icon="mdi-brain"
-          :title="$t('nav.agentMemory')"
-          data-testid="nav-agent-memory"
-        />
-        <!-- FR-90 P2h-2 — where sessions are copied: only where the server
-             copies them at all (`hive.replicaset`, off by default). -->
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed && hiveCopied"
-          :to="`/tenant/${tenantId}/copies`"
-          prepend-icon="mdi-content-copy"
-          :title="$t('nav.agentCopies')"
-          data-testid="nav-agent-copies"
-        />
         <!-- Devices-first (2026-08-26): the flat Devices item became a
              collapsible group listing the fleet's AGENTS (a tap lands in the
              remote view; tunnel clients have none, so they live only on the
@@ -696,8 +670,8 @@
             />
             <v-text-field
               v-model="orgSlug"
-              label="Slug"
-              hint="URL-friendly identifier, globally unique"
+              label="Short name"
+              hint="Lowercase letters, digits and dashes, used in links. Unique on this server."
               :rules="[rules.required, rules.slug]"
               @update:model-value="orgSlugTouched = true"
             />
@@ -744,14 +718,13 @@ import {
 import { useRoomStore, type Room } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useCappedSearchList } from '@/composables/useCappedSearchList'
-import { api, ApiError } from '@/api/client'
+import { api, ApiError, uploadsInProgress } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
 import { useCallControls } from '@/composables/useCallControls'
 import { useWsStore } from '@/stores/ws'
 import { useCapabilitiesStore } from '@/stores/capabilities'
-import { useHiveStore } from '@/stores/hive'
 import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
@@ -760,6 +733,7 @@ import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
 import { immersiveViewer } from '@/composables/useImmersiveViewer'
+import { bindStaleBuildWatch } from '@/utils/staleBuildWatch'
 import {
   hasSeenTour,
   markTourSeen,
@@ -788,6 +762,17 @@ const wsStore = useWsStore()
 // server has answered.
 const caps = useCapabilitiesStore()
 const route = useRoute()
+// #3582 — the shell owns the socket and sees the call: every (re)connect is a
+// moment to compare builds, and a call is a reason never to reload
+// (utils/staleBuildWatch.ts). The call page counts whatever `isInCall` says:
+// it leaves and rejoins on a pod roll (`handleMediaRoomClosed`) and stays
+// after a call ends, and a reload there asks "Reload site?" mid-call.
+const unbindStaleBuildWatch = bindStaleBuildWatch({
+  wsStatus: () => wsStore.status,
+  meetingLive: () => conferenceStore.isInCall || route.name === 'room-call',
+  uploading: () => uploadsInProgress() > 0,
+})
+onUnmounted(unbindStaleBuildWatch)
 // FR-12 P2 — `?tour=<id>` starts a spotlight tour on arrival. The param is
 // stripped immediately: a tour is a one-time nudge, and leaving it in the URL
 // would replay on every refresh and follow a shared link to someone who never
@@ -1000,19 +985,6 @@ const tenantId = computed(
   () => (route.params.tenantId as string | undefined) || tenantStore.current?.id || '',
 )
 
-// FR-90 P1g — agent sessions may serve some organizations and not others:
-// their pages show only where the server says they do.
-const hive = useHiveStore()
-const hiveServed = computed(() => hive.served[tenantId.value] === true)
-const hiveCopied = computed(() => hive.copied[tenantId.value] === true)
-watch(
-  [tenantId, () => caps.has('hive')],
-  ([tid, on]) => {
-    if (tid && on) void hive.checkServed(tid)
-  },
-  { immediate: true },
-)
-
 // Route → store sync: keep tenantStore.current on the org the URL names —
 // on a deep link and a reload too, where the param never changes and the org
 // list lands after mount (useRouteTenantSync says why that mattered).
@@ -1200,7 +1172,7 @@ async function handleCreateOrg() {
     // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showCreateOrgError(
       e instanceof ApiError && e.status === 409
-        ? 'That slug is already taken — pick another'
+        ? 'That short name is already taken — pick another'
         : msg,
     )
   } finally {

@@ -33,12 +33,16 @@ impl KeyRotationAuditDao {
     }
 
     /// Record one decision. Exactly one of `dispatch` (`pushed` / `queued`)
-    /// and `denied` (the refusal's wire string) is `Some`.
+    /// and `denied` (the refusal's wire string) is `Some`. `trigger` is
+    /// `Some` only on an order the SERVER placed (FR-40 P2), whose `user_id`
+    /// is then the zero id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
         tenant_id: ObjectId,
         agent_id: ObjectId,
         user_id: ObjectId,
+        trigger: Option<&str>,
         request_id: &str,
         dispatch: Option<&str>,
         denied: Option<&str>,
@@ -50,6 +54,7 @@ impl KeyRotationAuditDao {
             user_id,
             at: DateTime::now(),
             request_id: request_id.to_string(),
+            trigger: trigger.map(|s| s.to_string()),
             dispatch: dispatch.map(|s| s.to_string()),
             denied: denied.map(|s| s.to_string()),
         };

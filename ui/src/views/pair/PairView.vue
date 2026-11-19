@@ -7,7 +7,7 @@
   The person types the code here (the URL never carries it, decision 1),
   sees the device that asked — its name, system, role, installer, country
   and when it started — picks the organization it joins, and approves or
-  denies. The installer polls the server and continues on its own.
+  denies. The installer polls the server, and its person presses Install there.
 
   Three states by the session: signed out (sign in, sign up or a provider,
   all of which come back here), signed in with no code yet, and the review.

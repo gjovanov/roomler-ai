@@ -344,6 +344,30 @@ if [ -n "$REPO" ]; then
   done
 fi
 
+# 5e. #3582 — the build's id file. A tab compares the build it runs (the SPA
+#     shell's <meta name="roomler-build">) with this file after every /ws
+#     reconnect and every 10 minutes, so it must be a REAL file (`location /`
+#     answers a missing one with the SPA shell: 200, text/html), revalidated
+#     like the shell, and name the same build the shell does.
+vh="$(headers "$BASE/version.json")"
+vct="$(printf '%s\n' "$vh" | grep -i '^content-type:' | head -1 | sed -E 's/^[^:]+:[[:space:]]*//')"
+vcc="$(printf '%s\n' "$vh" | grep -i '^cache-control:' | head -1 | sed -E 's/^[^:]+:[[:space:]]*//')"
+case "$vct" in
+  application/json*) ok "/version.json Content-Type: $vct" ;;
+  *) bad "/version.json Content-Type: '${vct:-none}' (want application/json; text/html is the SPA shell answering a missing file)" ;;
+esac
+case "$vcc" in
+  *no-cache*) ok "/version.json Cache-Control: $vcc" ;;
+  *) bad "/version.json Cache-Control: '${vcc:-none}' (want no-cache)" ;;
+esac
+vid="$(curl -ksS -m 15 "$BASE/version.json?smoke=$$" 2>/dev/null | grep -oE '"build":"[0-9a-f]{16}"' | grep -oE '[0-9a-f]{16}')"
+sid="$(curl -ksS -m 15 "$BASE/login" 2>/dev/null | grep -oE 'name="roomler-build" content="[0-9a-f]{16}"' | grep -oE '[0-9a-f]{16}')"
+if [ -n "$vid" ] && [ "$vid" = "$sid" ]; then
+  ok "/version.json and the SPA shell name the same build ($vid)"
+else
+  bad "/version.json names '${vid:-nothing}', the SPA shell '${sid:-nothing}' (want the same build in both)"
+fi
+
 # 6. Every asset a page names is content-hashed — the only kind of name for
 #    which nginx's one-year `immutable` is true — and actually loads. Every
 #    image reserves its box (width + height). The og:image is absolute and

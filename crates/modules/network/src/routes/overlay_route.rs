@@ -515,6 +515,11 @@ pub struct SetMagicDnsRequest {
 }
 
 /// GET /api/tenant/{tenant_id}/magic-dns — the tenant's current MagicDNS config.
+///
+/// Any member reads it, deliberately, unlike the write below and unlike the
+/// tunnel ACL's list: every overlay node of the org receives the domain and the
+/// upstreams in its netmap anyway, and a member reaches peers by
+/// `<node>.<domain>`. Nothing here is news to a member with a device in the mesh.
 pub async fn get_magic_dns(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -534,6 +539,16 @@ pub async fn get_magic_dns(
 
 /// PUT /api/tenant/{tenant_id}/magic-dns — set the MagicDNS domain + upstreams.
 /// An empty domain disables MagicDNS.
+///
+/// `MANAGE_AGENTS`, decided FIRST: before the body is normalized, the plan
+/// gate or the domain checks. Every overlay node of the org applies these
+/// settings: its resolver answers for the domain and forwards every other name
+/// to the upstreams, and under an exit node the host's whole DNS goes there.
+/// Changing them is a device-management action, like the overlay ACL's mode and
+/// the retired-key switch. A member without the bit gets one 403 `forbidden`
+/// whatever the body says (switching MagicDNS off included), never
+/// `not_a_member`; someone outside the org still gets `not_a_member`, from the
+/// membership read inside `require_permission`.
 pub async fn set_magic_dns(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -542,9 +557,14 @@ pub async fn set_magic_dns(
 ) -> Result<Json<MagicDnsResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
     // Normalize: blank domain → None (off); lowercase, strip surrounding dots.
     let domain = body
         .magic_dns_domain

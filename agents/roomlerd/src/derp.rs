@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::relay_probe::DerpTicketSlot;
+use crate::ws_connect::{Credential, Dial};
 use tunnel_core::transport::derp::DerpMux;
 
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
@@ -58,6 +59,11 @@ const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
 /// ACKing our pings after its upstream leg died, so send-success proves
 /// nothing — reconnect must key on frames RECEIVED.
 const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
+/// #3530 — how quiet the `/derp` WS gets while the loop runs: a keepalive whose
+/// pong was not read yet, and the period before it. A silence past the RX
+/// deadline that a late keepalive tick covers but for this slack is the
+/// agent's own pause ([`tunnel_core::frozen::did_not_run_for`]).
+const DERP_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(2 * DERP_KEEPALIVE.as_secs());
 
 /// FR-18 — request the [`DERP_SNDBUF_BYTES`] ceiling on the socket under the
 /// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
@@ -224,20 +230,20 @@ fn derp_url_from_ws(ws_url: &str) -> String {
 /// The central `/derp` URL for one dial. S6 — `tid` = tenant-affinity key for
 /// the front LB. DERP relays are pod-local, so both mesh peers must land on
 /// the SAME pod; hashing every /derp socket by tenant guarantees it. Pre-S6
-/// servers ignore the param.
-fn central_url(derp_base: &str, token: &str, tenant_id: &str) -> String {
+/// servers ignore the param. #3656 — the token is not in it: it rides the
+/// dial's `Authorization` header (`ws_connect::dial`).
+fn central_url(derp_base: &str, tenant_id: &str) -> String {
     format!(
-        "{derp_base}?token={}&role=agent&tid={}",
-        crate::signaling::urlencode(token),
+        "{derp_base}?role=agent&tid={}",
         crate::signaling::urlencode(tenant_id)
     )
 }
 
-/// FR-103 — the central URL, built per ATTEMPT from the live token: the WS
-/// owner outlives the connection that spawned it, and a URL fixed at spawn
-/// would keep dialling with a token renewed since.
+/// FR-103 — the central dial, built per ATTEMPT from the live token: the WS
+/// owner outlives the connection that spawned it, and a dial fixed at spawn
+/// would keep presenting a token renewed since.
 ///
-/// #2512 — and NO URL while the control socket's verdict on that token is
+/// #2512 — and NO dial while the control socket's verdict on that token is
 /// "refused" (`TokenSlot::is_refused`): a dial then is a request the server
 /// will only 401, and a device whose row was gone re-dialled every 10 s,
 /// forever. `run` backs off (≤ `DERP_BACKOFF_MAX`) and asks again, so a new
@@ -249,13 +255,16 @@ fn central_url_per_attempt(
     ws_url: &str,
     token: crate::token_slot::TokenSlot,
     tenant_id: &str,
-) -> Box<dyn Fn() -> Option<String> + Send> {
-    let (base, tenant_id) = (derp_url_from_ws(ws_url), tenant_id.to_string());
+) -> Box<dyn Fn() -> Option<Dial> + Send> {
+    let url = central_url(&derp_url_from_ws(ws_url), tenant_id);
     Box::new(move || {
         if token.is_refused() {
             return None;
         }
-        Some(central_url(&base, &token.get(), &tenant_id))
+        Some(Dial {
+            url: url.clone(),
+            credential: Credential::token(token.get()),
+        })
     })
 }
 
@@ -279,13 +288,15 @@ pub fn spawn(
         reg_frame,
         weak,
         outbound_rx,
+        crate::ws_connect::FlatRedial::from_config(),
     ));
 }
 
 /// Multi-region DERP: like [`spawn`] but for a REGIONAL relay authenticated by
-/// an admission ticket. The URL is rebuilt per connect attempt from the ticket
+/// an admission ticket. The dial is rebuilt per connect attempt from the ticket
 /// slot, so a refreshed ticket takes effect on the next reconnect; while the
-/// slot is empty the owner just backs off (ticket still in flight).
+/// slot is empty the owner just backs off (ticket still in flight). #3656 —
+/// the ticket rides the dial's `Authorization` header, never the URL.
 pub fn spawn_regional(
     derp_url: &str,
     ticket_slot: DerpTicketSlot,
@@ -293,8 +304,12 @@ pub fn spawn_regional(
     mux: &Arc<DerpMux>,
     outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
-    let base = derp_url.to_string();
-    // Host part only — the ticket query string must never reach a log line.
+    let sep = if derp_url.contains('?') { '&' } else { '?' };
+    let url = format!(
+        "{derp_url}{sep}tid={}",
+        crate::signaling::urlencode(tenant_id)
+    );
+    // Host part only, as it always was.
     let label = derp_url
         .trim_start_matches("wss://")
         .trim_start_matches("ws://")
@@ -302,7 +317,6 @@ pub fn spawn_regional(
         .next()
         .unwrap_or(derp_url)
         .to_string();
-    let tid = crate::signaling::urlencode(tenant_id);
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
     tokio::spawn(run(
@@ -313,24 +327,26 @@ pub fn spawn_regional(
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map(|(t, _)| t.clone())?;
-            let sep = if base.contains('?') { '&' } else { '?' };
-            Some(format!(
-                "{base}{sep}ticket={}&tid={tid}",
-                crate::signaling::urlencode(&ticket)
-            ))
+            Some(Dial {
+                url: url.clone(),
+                credential: Credential::ticket(ticket),
+            })
         }),
         reg_frame,
         weak,
         outbound_rx,
+        // FR-28 — no pod rolls under a regional relay: its ladder stays as it is.
+        crate::ws_connect::FlatRedial::off(),
     ));
 }
 
 async fn run(
     relay: String,
-    url_for_attempt: Box<dyn Fn() -> Option<String> + Send>,
+    dial_for_attempt: Box<dyn Fn() -> Option<Dial> + Send>,
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
     mut outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
+    mut flat_redial: crate::ws_connect::FlatRedial,
 ) {
     // FR-18 — resolved once: the queue-age bound is a deployment knob, not a
     // per-frame decision, and re-reading the env per frame would be the hot
@@ -350,7 +366,7 @@ async fn run(
         // retry (the signaling loop fills the slot within seconds). #2512 —
         // the central relay: the server refuses this enrollment's token, as
         // the control socket heard it (`central_url_per_attempt`).
-        let Some(url) = url_for_attempt() else {
+        let Some(dial) = dial_for_attempt() else {
             debug!(
                 %relay,
                 "overlay derp: no usable credential (no admission ticket yet, or the server \
@@ -361,9 +377,11 @@ async fn run(
             continue;
         };
         // #2187 — the relay's address comes from `ctl_dns`, as the control WS's does.
-        match tokio::time::timeout(DERP_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
+        // #3656 — the credential in a header, with the one-time query fallback.
+        match crate::ws_connect::dial(&dial, DERP_CONNECT_TIMEOUT).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);
+                let connected_at = std::time::Instant::now();
                 // FR-18 — bound the KERNEL's send buffer too. Shedding stale
                 // frames above is pointless if a frame we did choose to send
                 // then sits for seconds in a socket buffer the age check can no
@@ -398,15 +416,20 @@ async fn run(
                 keepalive.tick().await; // swallow the immediate first tick
                 let mut last_rx = std::time::Instant::now();
                 // A5 — resume detection (see signaling.rs RESUME_SKEW_MIN):
-                // monotonic timers exclude suspend, so a nap leaves a dead
-                // socket trusted for up to another RX-deadline window.
+                // monotonic timers exclude suspend on Linux and macOS, so a nap
+                // leaves a dead socket trusted for up to another RX-deadline
+                // window. On Windows QPC counts the sleep, so the RX deadline
+                // trips at once instead, as after a freeze (#3530).
                 let mut skew_wall = std::time::SystemTime::now();
                 let mut skew_mono = std::time::Instant::now();
 
                 // Pump until either half dies (or the mux is torn down).
                 loop {
                     tokio::select! {
-                        _ = keepalive.tick() => {
+                        due = keepalive.tick() => {
+                            // #3530 — how late this tick came: for at least that
+                            // long the loop read nothing, whatever the relay did.
+                            let late = due.elapsed();
                             let wall_gap = skew_wall.elapsed().unwrap_or_default();
                             let mono_gap = skew_mono.elapsed();
                             skew_wall = std::time::SystemTime::now();
@@ -420,11 +443,27 @@ async fn run(
                                 break;
                             }
                             if last_rx.elapsed() > DERP_RX_DEADLINE {
-                                warn!(
-                                    %relay,
-                                    silent_s = last_rx.elapsed().as_secs(),
-                                    "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
-                                );
+                                let silent = last_rx.elapsed();
+                                match tunnel_core::frozen::did_not_run_for(
+                                    silent,
+                                    late,
+                                    DERP_QUIET_WHILE_RUNNING,
+                                ) {
+                                    Some(paused) => warn!(
+                                        %relay,
+                                        silent_s = silent.as_secs(),
+                                        paused_s = paused.as_secs(),
+                                        "overlay derp: no inbound frames within the RX deadline, but this \
+                                         agent did not run for ~{} s of it (frozen or suspended): the \
+                                         silence is its own, not the relay's; reconnecting",
+                                        paused.as_secs()
+                                    ),
+                                    None => warn!(
+                                        %relay,
+                                        silent_s = silent.as_secs(),
+                                        "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
+                                    ),
+                                }
                                 break;
                             }
                             // FR-18 — report the shed count on the keepalive
@@ -514,8 +553,26 @@ async fn run(
                     m.mark_down();
                 }
                 warn!(%relay, "overlay derp: /derp WS closed; reconnecting");
+                // FR-28 — only a socket that lived earns the next outage its
+                // flat redials. This loop's own ladder restarts on any accept,
+                // as it always has (see the top of this arm).
+                flat_redial.connection_ended(connected_at.elapsed());
             }
-            Ok(Err(e)) => warn!(%relay, %e, "overlay derp: /derp connect failed"),
+            Ok(Err(e)) => {
+                warn!(%relay, %e, "overlay derp: /derp connect failed");
+                // FR-28 — the load balancer answered 502: this tenant's pod is
+                // rolling. A flat wait, and the ladder stays where it is.
+                if let Some(wait) = flat_redial.step(crate::ws_connect::is_lb_502(&e)) {
+                    info!(
+                        %relay,
+                        wait_ms = wait.as_millis() as u64,
+                        left = flat_redial.left(),
+                        "overlay derp: the load balancer has no pod for this org yet; redialling flat (FR-28)"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
             Err(_) => warn!(%relay, "overlay derp: /derp connect timed out"),
         }
         tokio::time::sleep(backoff).await;
@@ -546,16 +603,74 @@ mod tests {
     #[test]
     fn each_dial_carries_the_token_in_use_now() {
         let slot = crate::token_slot::TokenSlot::new("first");
-        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=first&role=agent&tid=t1")
-        );
+        let dial = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        assert_eq!(dial(), Some(central_dial("first")));
         slot.set("renewed".into());
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
+        assert_eq!(dial(), Some(central_dial("renewed")));
+    }
+
+    /// The central dial `central_url_per_attempt("wss://host/ws", …, "t1")`
+    /// makes with `token`.
+    fn central_dial(token: &str) -> Dial {
+        Dial {
+            url: "wss://host/derp?role=agent&tid=t1".into(),
+            credential: Credential::token(token),
+        }
+    }
+
+    /// #3656 — the central dial's URL names the role and the tenant, never the
+    /// token: a request line is what access logs and inspecting proxies record.
+    #[test]
+    fn the_central_url_carries_no_credential() {
+        let slot = crate::token_slot::TokenSlot::new("first");
+        let url = central_url_per_attempt("wss://host/ws", slot, "t1")()
+            .unwrap()
+            .url;
+        assert!(!url.contains("token="), "{url}");
+        assert!(!url.contains("first"), "{url}");
+    }
+
+    /// #3656 — the dialer itself, central and regional: the credential rides
+    /// `Authorization: Bearer`, and the URL the front sees holds none. The front
+    /// is a newer server that refuses with a verdict, so no dial goes again.
+    #[tokio::test]
+    async fn every_derp_dial_presents_its_credential_in_a_header() {
+        use crate::ws_connect::test_front::{self, Verdict};
+        let refused = Verdict::Refuse(
+            401,
+            Some(roomler_ai_remote_control::upgrade_auth::CHALLENGE_REFUSED),
         );
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([5u8; 32]);
+        spawn(
+            &format!("{base}/ws"),
+            crate::token_slot::TokenSlot::new("live-token"),
+            "t1",
+            &mux,
+            outbound_rx,
+        );
+        let central = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(central.uri.starts_with("/derp?"), "{central:?}");
+        assert!(!central.uri.contains("token="), "{central:?}");
+        assert!(!central.uri.contains("live-token"), "{central:?}");
+        assert!(central.uri.contains("role=agent"), "{central:?}");
+        assert!(central.uri.contains("tid=t1"), "{central:?}");
+        assert_eq!(central.authorization.as_deref(), Some("Bearer live-token"));
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([6u8; 32]);
+        let ticket: DerpTicketSlot = Arc::new(std::sync::Mutex::new(Some((
+            "the-ticket".to_string(),
+            u64::MAX,
+        ))));
+        spawn_regional(&format!("{base}/derp"), ticket, "t1", &mux, outbound_rx);
+        let regional = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(regional.uri.starts_with("/derp?"), "{regional:?}");
+        assert!(!regional.uri.contains("ticket="), "{regional:?}");
+        assert!(!regional.uri.contains("the-ticket"), "{regional:?}");
+        assert!(regional.uri.contains("tid=t1"), "{regional:?}");
+        assert_eq!(regional.authorization.as_deref(), Some("Bearer the-ticket"));
     }
 
     /// #2512 — while the control socket's verdict on the token is "refused",
@@ -564,26 +679,27 @@ mod tests {
     #[test]
     fn a_refused_token_is_never_dialled() {
         let slot = crate::token_slot::TokenSlot::new("dead");
-        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        let dial = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
         assert!(slot.mark_refused("dead"));
-        assert_eq!(url(), None);
+        assert_eq!(dial(), None);
         assert!(slot.mark_accepted("dead"));
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=dead&role=agent&tid=t1")
-        );
+        assert_eq!(dial(), Some(central_dial("dead")));
         assert!(slot.mark_refused("dead"));
-        assert_eq!(url(), None);
+        assert_eq!(dial(), None);
         assert!(slot.set("renewed".into()));
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
-        );
+        assert_eq!(dial(), Some(central_dial("renewed")));
     }
 
-    /// A loopback server that answers every upgrade with a plain 401, as
-    /// `/derp` does for a gone row and for any lookup error. Returns its
-    /// `ws://…/ws` base and a count of the dials it has seen.
+    /// The status line and challenge `/derp` refuses a presented token with,
+    /// for a gone row and for any lookup error alike. #3656 — the challenge
+    /// names an error, so no dialer redials it in the query form; the bare
+    /// 401 of a server older than that is `ws_connect`'s to test.
+    const REFUSED_TOKEN: &str =
+        "401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"roomler\", error=\"invalid_token\"";
+
+    /// A loopback server that refuses every upgrade as `/derp` refuses a token
+    /// ([`REFUSED_TOKEN`]). Returns its `ws://…/ws` base and a count of the
+    /// dials it has seen.
     async fn refusing_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -596,12 +712,10 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = s.read(&mut buf).await;
-                    let _ = s
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
-                              Connection: close\r\n\r\n",
-                        )
-                        .await;
+                    let reply = format!(
+                        "HTTP/1.1 {REFUSED_TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
                 });
             }
         });
@@ -620,6 +734,7 @@ mod tests {
             mux.registration_frame(),
             Arc::downgrade(mux),
             outbound_rx,
+            crate::ws_connect::FlatRedial::off(),
         ))
     }
 
@@ -666,6 +781,249 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         task.abort();
+    }
+
+    /// FR-28 — what a scripted front does with one dial.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Refuse the upgrade with this HTTP status line.
+        Status(&'static str),
+        /// Upgrade, keep the socket this long, then drop it with no close.
+        Accept(Duration),
+    }
+
+    const LB_502: Answer = Answer::Status("502 Bad Gateway");
+
+    /// FR-28 — the front load balancer in one process: `answer` picks the reply
+    /// from the dial's index. Hands back the `ws://…/ws` base and when each dial
+    /// arrived, in order.
+    async fn scripted_front(
+        answer: impl Fn(usize) -> Answer + Send + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = dials.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(std::time::Instant::now());
+                    seen.len() - 1
+                };
+                let this = answer(n);
+                tokio::spawn(async move {
+                    match this {
+                        Answer::Status(line) => {
+                            let mut buf = [0u8; 4096];
+                            let _ = s.read(&mut buf).await;
+                            let reply = format!(
+                                "HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = s.write_all(reply.as_bytes()).await;
+                        }
+                        Answer::Accept(keep) => {
+                            let ws = tokio_tungstenite::accept_async(s).await;
+                            tokio::time::sleep(keep).await;
+                            drop(ws);
+                        }
+                    }
+                });
+            }
+        });
+        (base, dials)
+    }
+
+    /// FR-28 — the real dialer against `base`, with `flat`. Hold the mux for as
+    /// long as it should run: a dropped one stops it.
+    fn dialing_with(
+        base: &str,
+        flat: crate::ws_connect::FlatRedial,
+    ) -> (tokio::task::JoinHandle<()>, Arc<DerpMux>) {
+        let (mux, outbound_rx) = DerpMux::new([9u8; 32]);
+        let slot = crate::token_slot::TokenSlot::new("live");
+        let task = tokio::spawn(run(
+            "central".to_string(),
+            central_url_per_attempt(base, slot, "t1"),
+            mux.registration_frame(),
+            Arc::downgrade(&mux),
+            outbound_rx,
+            flat,
+        ));
+        (task, mux)
+    }
+
+    fn dial_count(dials: &std::sync::Mutex<Vec<std::time::Instant>>) -> usize {
+        dials.lock().unwrap().len()
+    }
+
+    /// The wait between dial `n` and the one after it.
+    fn gap_after(dials: &std::sync::Mutex<Vec<std::time::Instant>>, n: usize) -> Duration {
+        let dials = dials.lock().unwrap();
+        dials[n + 1] - dials[n]
+    }
+
+    /// Hold until `n` dials have arrived; a dialer that stops fails here.
+    async fn until_dialled(dials: &std::sync::Mutex<Vec<std::time::Instant>>, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while dial_count(dials) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {n} dials",
+                dial_count(dials)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// FR-28 — the roll in one process: the front answers 502 until the
+    /// replacement listens, which it does just past the ladder's +3 s dial. That
+    /// is the case that costs a socket a whole step in the field, and flat lands
+    /// within a second of it. The ladder's own landing is pinned by the next test.
+    #[tokio::test]
+    async fn flat_lands_within_a_second_of_the_replacement_listening() {
+        let listens_at = Duration::from_millis(3200);
+        let started = std::time::Instant::now();
+        let (base, dials) = scripted_front(move |_| {
+            if started.elapsed() < listens_at {
+                LB_502
+            } else {
+                Answer::Accept(Duration::from_secs(60))
+            }
+        })
+        .await;
+        let (task, _mux) = dialing_with(&base, crate::ws_connect::FlatRedial::on());
+        // Dials at about 0.75 s apart: the replacement has been up for at most
+        // 1 s by the landing, with 500 ms of slack for a loaded runner.
+        let deadline = started + listens_at + Duration::from_millis(1500);
+        let mut landed = None;
+        while std::time::Instant::now() < deadline && landed.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let last = dials.lock().unwrap().last().copied();
+            landed = last.filter(|t| t.duration_since(started) >= listens_at);
+        }
+        task.abort();
+        assert!(
+            landed.is_some(),
+            "no dial within 1.5 s of the pod listening: {} dial(s)",
+            dial_count(&dials)
+        );
+    }
+
+    /// FR-28 — off is today: the same front, and the socket waits out the step.
+    #[tokio::test]
+    async fn off_the_same_roll_waits_out_the_ladder() {
+        let listens_at = Duration::from_millis(3200);
+        let started = std::time::Instant::now();
+        let (base, dials) = scripted_front(move |_| {
+            if started.elapsed() < listens_at {
+                LB_502
+            } else {
+                Answer::Accept(Duration::from_secs(60))
+            }
+        })
+        .await;
+        let (task, _mux) = dialing_with(&base, crate::ws_connect::FlatRedial::off());
+        until_dialled(&dials, 4).await;
+        task.abort();
+        let dials = dials.lock().unwrap();
+        // 0, 1 and 3 s, then the 4 s step: 3.8 s past the pod listening.
+        assert_eq!(dials.len(), 4);
+        for (i, want) in [0u64, 1000, 3000, 7000].into_iter().enumerate() {
+            let at = dials[i].duration_since(started).as_millis() as u64;
+            assert!(
+                at + 300 >= want && at <= want + 1500,
+                "dial {i} at {at} ms, the ladder says {want} ms"
+            );
+        }
+    }
+
+    /// FR-28 — only the load balancer's 502 is flat. A Mongo blip (500), an
+    /// unmounted module (503), a node that cannot be reached (504) and a refused
+    /// token (401) all keep the ladder, with the switch on.
+    #[tokio::test]
+    async fn only_a_502_is_redialled_flat() {
+        let mut runs = Vec::new();
+        for line in [
+            REFUSED_TOKEN,
+            "500 Internal Server Error",
+            "503 Service Unavailable",
+            "504 Gateway Time-out",
+        ] {
+            let (base, dials) = scripted_front(move |_| Answer::Status(line)).await;
+            let dialer = dialing_with(&base, crate::ws_connect::FlatRedial::on());
+            runs.push((line, dials, dialer));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for (line, dials, (task, _mux)) in runs {
+            task.abort();
+            assert_eq!(
+                dial_count(&dials),
+                3,
+                "{line} must climb: dials at 0, 1 and 3 s, the next at 7 s"
+            );
+        }
+    }
+
+    /// FR-28 — the allowance is real on the real loop: two flat redials, and then
+    /// the ladder from the step it stood on, not a stop and not more flat.
+    #[tokio::test]
+    async fn a_502_that_outlasts_the_allowance_climbs_the_ladder() {
+        let (base, dials) = scripted_front(|_| LB_502).await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(2, Duration::from_secs(30));
+        let (task, _mux) = dialing_with(&base, flat);
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        task.abort();
+        // Two flat waits of 0.5 to 1 s, then 1, 2 and 4 s: the fifth dial by 5 s at
+        // the latest, the sixth at 8 s at the earliest. Still flat would be 7 or
+        // more dials by now, and never flat would be 3.
+        assert_eq!(dial_count(&dials), 5);
+    }
+
+    /// FR-28 and #2221 — a server that accepts and drops earns no more flat
+    /// redials. The one allowed goes on the first 502; the accepted socket that
+    /// follows does not last, so the 502 after it takes the ladder's step.
+    #[tokio::test]
+    async fn a_socket_that_does_not_last_refills_nothing() {
+        let (base, dials) = scripted_front(|n| match n {
+            1 => Answer::Accept(Duration::ZERO),
+            _ => LB_502,
+        })
+        .await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(1, Duration::from_secs(30));
+        let (task, _mux) = dialing_with(&base, flat);
+        until_dialled(&dials, 4).await;
+        task.abort();
+        // The accept restarted the ladder at 1 s, and its close doubled it, so
+        // the 502 after it waits 2 s. Refilled, it would have waited at most 1 s.
+        assert!(
+            gap_after(&dials, 2) >= Duration::from_millis(1800),
+            "{:?}",
+            gap_after(&dials, 2)
+        );
+    }
+
+    /// FR-28 — a socket that lived past the bar gives the next outage its
+    /// redials back. The bar is the real one's job in production; here it is
+    /// 300 ms, so this does not wait out 30 s.
+    #[tokio::test]
+    async fn a_socket_that_lived_refills_the_allowance() {
+        let (base, dials) = scripted_front(|n| match n {
+            1 => Answer::Accept(Duration::from_millis(600)),
+            _ => LB_502,
+        })
+        .await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(1, Duration::from_millis(300));
+        let (task, _mux) = dialing_with(&base, flat);
+        until_dialled(&dials, 4).await;
+        task.abort();
+        // Unrefilled, this 502 would have waited the ladder's 2 s.
+        assert!(
+            gap_after(&dials, 2) <= Duration::from_millis(1500),
+            "{:?}",
+            gap_after(&dials, 2)
+        );
     }
 
     /// FR-18 AC4 — a cap is judged by what the kernel reports after the set,
@@ -821,8 +1179,8 @@ mod tests {
         }
         let buf = Buf::default();
         let writer = buf.clone();
-        // Two dispatchers, never one (`hive::view`'s tests: with one, a
-        // callsite's interest is taken once for every thread).
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
         let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing_subscriber::fmt()
             .with_target(false)

@@ -12,11 +12,11 @@
 //!
 //! Default-on uploader pushes batches every 5 s; backend gates by tenant
 //! scope (the agent JWT's `tenant_id` claim must match the route param),
-//! TTL-deletes batches older than 7 days. Indexes set in
-//! [`crate::indexes`].
+//! TTL-deletes batches older than 7 days. Indexes: the fleet module's
+//! index plan (`crates/modules/fleet/src/lib.rs`).
 //!
-//! See `crates/api/src/routes/agent_log.rs` for the route + validation;
-//! see `agents/roomlerd/src/logs_upload.rs` for the agent-side
+//! See `crates/modules/fleet/src/agent_log.rs` for the routes + validation;
+//! see `crates/agent-core/src/logs_upload.rs` for the agent-side
 //! `tracing` layer that produces these batches.
 
 use bson::{DateTime, Document, oid::ObjectId};
@@ -58,8 +58,8 @@ pub struct AgentLogBatch {
     /// Number of lines in this batch — denormalised for fast count
     /// queries without unwinding `lines`.
     pub line_count: u32,
-    /// TTL anchor (7-day expiry per the index in
-    /// [`crate::indexes::ensure_indexes`]).
+    /// TTL anchor (7-day expiry per the TTL index in the fleet module's
+    /// index plan).
     pub created_at: DateTime,
     pub lines: Vec<LogLine>,
 }
@@ -109,7 +109,7 @@ impl AgentLogBatch {
 
     /// TTL window — every batch older than this is dropped by the
     /// MongoDB background task. Kept in lockstep with the
-    /// `expireAfterSeconds` argument in [`crate::indexes`]. 7 days
+    /// `expireAfterSeconds` of the fleet module's TTL index. 7 days
     /// matches the user-facing "7-day diagnostic window" decision; see
     /// the rc.58 plan in the project handover notes.
     pub const TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
