@@ -3563,16 +3563,33 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // `agent_token`/`machine_id`, so the host rejoins on its own and the
     // server reconciles the rest. Loud, because silently running on an
     // older config must never look like a normal boot.
+    //
+    // #4058 — a live file that is not there at all takes the same recovery,
+    // and its line says what happened: missing, not truncated. That is read
+    // off the read's own error ([`not_found`]), never off an `exists()` that
+    // could race the read. A file that is there and may not be read, or does
+    // not parse, is "unreadable", as before. Both lines are ERROR: either way
+    // the host now runs on an older config.
     let prev = prev_path(path);
     match load_prev(path, &prev) {
         Ok(cfg) => {
-            tracing::error!(
-                path = %path.display(),
-                recovered_from = %prev.display(),
-                error = %format!("{err:#}"),
-                "config unreadable — RECOVERED from the previous good copy; \
-                 the live file was likely truncated by an unclean shutdown"
-            );
+            if not_found(&err) {
+                tracing::error!(
+                    path = %path.display(),
+                    recovered_from = %prev.display(),
+                    error = %format!("{err:#}"),
+                    "config missing — RESTORED from the previous good copy; \
+                     the live file was not there"
+                );
+            } else {
+                tracing::error!(
+                    path = %path.display(),
+                    recovered_from = %prev.display(),
+                    error = %format!("{err:#}"),
+                    "config unreadable — RECOVERED from the previous good copy; \
+                     the live file was likely truncated by an unclean shutdown"
+                );
+            }
             // Reinstate it as the live file so the next save has a base. The
             // keys this build does not know are the copy's to keep (#2078):
             // the live file, which a save reads them from, parses as nothing.
@@ -3780,6 +3797,18 @@ fn permission_denied(e: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// #4058 — does an error chain hold an I/O "not found", a file that is not
+/// there? Windows' `ERROR_FILE_NOT_FOUND` (2) and `ERROR_PATH_NOT_FOUND` (3)
+/// map to it too. Of [`try_load`]'s errors only its read carries an I/O
+/// error, so a file that is there and does not parse never answers yes.
+fn not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
 }
 
@@ -7501,6 +7530,119 @@ tenant_id = "tid2"
             !said.contains("do not carry over"),
             "never the damaged wording: {said}"
         );
+    }
+
+    /// [`load`]'s two recovery lines, as the log shows them (#4058).
+    const MISSING_LINE: &str =
+        "config missing — RESTORED from the previous good copy; the live file was not there";
+    const UNREADABLE_LINE: &str = "config unreadable — RECOVERED from the previous good copy; \
+                                   the live file was likely truncated by an unclean shutdown";
+
+    /// A config saved twice, so its last good copy (`.prev`) is the first
+    /// save, `machine_name = "first"`, and the live file the second.
+    fn with_a_last_good_copy() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut cfg = test_fixture();
+        cfg.machine_name = "first".into();
+        save(&path, &cfg).expect("first save");
+        cfg.machine_name = "second".into();
+        save(&path, &cfg).expect("second save: rotates the first to .prev");
+        (dir, path)
+    }
+
+    /// The one ERROR line of a capture: what [`load`] said about its recovery.
+    fn the_error_line(log: &str) -> &str {
+        let errors: Vec<&str> = log.lines().filter(|l| l.contains(" ERROR ")).collect();
+        assert_eq!(errors.len(), 1, "one ERROR line: {log}");
+        errors[0]
+    }
+
+    /// #4058 — what [`load`] reads a missing live file off: the read's own
+    /// `NotFound`, which [`try_load`] gives for a file that is not there. A
+    /// file that is there and does not load, or a refused read, is never
+    /// missing.
+    #[test]
+    fn only_a_read_that_found_no_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(not_found(&try_load(&path).expect_err("nothing there")));
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        assert!(!not_found(&try_load(&path).expect_err("does not parse")));
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        assert!(!not_found(&try_load(&path).expect_err("all NUL")));
+        let refused = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("reading config at C:\\ProgramData\\roomler\\roomler\\config.toml")
+            .unwrap_err();
+        assert!(!not_found(&refused));
+    }
+
+    /// #4058 — a live config that is not there, with its last good copy beside
+    /// it, is restored from the copy as an unreadable one is, and its line says
+    /// what happened: missing, never "unreadable" or "truncated". Found in a
+    /// lab, where a test removed a person's config and the line blamed an
+    /// unclean shutdown that never happened.
+    #[test]
+    fn a_missing_config_is_restored_from_prev_and_logged_as_missing() {
+        let (_dir, path) = with_a_last_good_copy();
+        std::fs::remove_file(&path).unwrap();
+
+        let (cap, _guard) = captured();
+        let restored = load(&path).expect("restored from .prev");
+        assert_eq!(restored.machine_name, "first");
+        assert_eq!(
+            try_load(&path)
+                .expect("reinstated as the live file")
+                .machine_name,
+            "first"
+        );
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(MISSING_LINE), "{log}");
+        assert!(!line.contains("unreadable"), "{log}");
+        assert!(!line.contains("truncated"), "{log}");
+    }
+
+    /// #4058 — a live config that is there and does not parse keeps the line it
+    /// had: unreadable, recovered from the copy. A parse error is never read
+    /// as missing.
+    #[test]
+    fn a_config_that_does_not_parse_keeps_the_unreadable_line() {
+        let (_dir, path) = with_a_last_good_copy();
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+
+        let (cap, _guard) = captured();
+        let recovered = load(&path).expect("recovered from .prev");
+        assert_eq!(recovered.machine_name, "first");
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(UNREADABLE_LINE), "{log}");
+        assert!(!line.contains("config missing"), "{log}");
+    }
+
+    /// #4058 — on Windows, a live config that is there and may not be read
+    /// (`PermissionDenied`) is unreadable too, never missing. Its entry here
+    /// refuses its data to everyone and allows the rest, so the rename that
+    /// reinstates the copy may still replace it.
+    #[cfg(windows)]
+    #[test]
+    fn a_config_whose_read_is_refused_keeps_the_unreadable_line() {
+        let (_dir, path) = with_a_last_good_copy();
+        crate::machine_tree::test_support::set_dacl(&path, "D:P(D;;0x1;;;WD)(A;;FA;;;WD)");
+        assert_eq!(
+            std::fs::read(&path)
+                .expect_err("the premise: its read is refused")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let (cap, _guard) = captured();
+        let recovered = load(&path).expect("recovered from .prev");
+        assert_eq!(recovered.machine_name, "first");
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(UNREADABLE_LINE), "{log}");
+        assert!(!line.contains("config missing"), "{log}");
     }
 
     /// #3116 — the same on a real file system: a config in a directory this
