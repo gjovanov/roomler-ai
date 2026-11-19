@@ -4271,8 +4271,8 @@ async fn media_pump_vp9_444_dc(
     // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
     // control even while saturated) and the rc.188 viewer-rate fps cap.
     // The encode-pressure/tier halves sit unused here (libvpx has its own
-    // cpu_used/quality levers). See `encode::governor` module docs — incl.
-    // the preserved rebuild divergence (`on_encoder_rebuilt_mirror_only`).
+    // cpu_used/quality levers). See `encode::governor` module docs; a rebuild
+    // re-applies the target through `on_encoder_rebuilt`, as the FFmpeg pump's (#3472).
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         send_depth,
@@ -4816,7 +4816,7 @@ async fn media_pump_vp9_444_dc(
                     // boot-time default bitrate until we push the
                     // resolution-derived quality target through.
                     last_applied_quality = 0xFF;
-                    governor.on_encoder_rebuilt_mirror_only();
+                    governor.on_encoder_rebuilt();
                     // rc.45 — encoder rebuild starts at base cpu-used
                     // (apply_screen_content_controls reads the env
                     // var). Reset our tracking so the next motion

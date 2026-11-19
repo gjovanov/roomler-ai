@@ -2411,8 +2411,8 @@ jobs:
         #
         # ⚠️ `vp9-444` is in the set ON PURPOSE, and dropping it makes this lane
         # LIE. Four of the "pre-existing warnings" were `dead_code` on
-        # `on_encoder_rebuilt_mirror_only`, `PipelineKey::Vp9Dc`,
-        # `quality_state` and `min_quality` — all of which ARE used, from call
+        # `on_encoder_rebuilt_mirror_only` (retired since, #3472), `PipelineKey::Vp9Dc`,
+        # `quality_state` and `min_quality`, every one of them used then, from call
         # sites inside `#[cfg(feature = "vp9-444")]` functions in peer.rs. Lint
         # a feature set no one ships and you get findings that are artifacts of
         # the configuration; "fixing" them by deleting would have broken every
