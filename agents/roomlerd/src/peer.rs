@@ -13384,7 +13384,10 @@ fn spawn_dir_listing(
 
 /// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
 /// or the session ends it stops and drops its answer, and it never sends on a
-/// channel that has closed.
+/// channel that has closed. The answer's send races that end too
+/// ([`or_stopped`], #1730): after a network drop a send can park for good on
+/// a channel that still reads open, and the task kept the channel and the
+/// handler for as long as the agent ran.
 async fn answer_dir_listing<S: DownloadSink>(
     dc: S,
     handler: crate::files::FilesHandler,
@@ -13409,22 +13412,22 @@ async fn answer_dir_listing<S: DownloadSink>(
                 "files: dir listed"
             );
             let parent_owned = listing.parent.clone();
-            dc.send_json(&crate::files::FilesOutgoing::DirList {
+            let msg = crate::files::FilesOutgoing::DirList {
                 req_id: &req_id,
                 path: &listing.path,
                 parent: parent_owned.as_deref(),
                 entries: &listing.entries,
-            })
-            .await;
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
         }
         Err(e) => {
             warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
-            let msg = format!("{e}");
-            dc.send_json(&crate::files::FilesOutgoing::DirError {
+            let message = format!("{e}");
+            let msg = crate::files::FilesOutgoing::DirError {
                 req_id: &req_id,
-                message: &msg,
-            })
-            .await;
+                message: &message,
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
         }
     }
 }
