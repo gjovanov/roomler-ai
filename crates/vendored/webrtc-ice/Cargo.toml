@@ -33,6 +33,13 @@
 #     allocated over TCP or TLS at local preference 32767, and after its first
 #     selection the controlled agent keeps checking the pairs its follow gate
 #     would follow. Cells: src/agent/agent_carrier_rank_test.rs.
+#   - src/candidate/mod.rs, candidate_base.rs and src/agent/agent_gather.rs
+#     (FR-148 P0): `Candidate::relay_transport`, the transport and the scheme
+#     of the TURN URL a relay candidate's allocation was made over, stamped
+#     where `gather_candidates_relay` makes the candidate (`None` on every
+#     other candidate). Read only by the agent's carrier line. Cell:
+#     src/candidate/candidate_relay_test.rs
+#     (`a_relay_candidate_names_what_carries_its_allocation`).
 #   - this Cargo.toml: the `tcp-turn-conn` path dependency below.
 
 [package]

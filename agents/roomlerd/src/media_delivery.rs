@@ -37,6 +37,23 @@
 //! old it is, and what FR-148 §4.1's model would hold beside them
 //! (`encode::pipe::PathView`). Also in shadow, also off with the switch; see
 //! `docs/rate-control.md` (§ Path numbers and their provenance).
+//!
+//! O10 writes a third, [`OPEN_LINE`], once a pump at its first media write:
+//! which way SCTP opened the session's association (the peer's INIT ACK first,
+//! or its COOKIE ECHO), read from the association's gauges without taking from
+//! them, and the windows then. Also off with the switch; see
+//! `docs/rate-control.md` (§ The open-time train).
+//!
+//! The delivery line also says whether a queue stood on the path: the
+//! classifier above cannot see one that a TCP carrier holds, since the queue
+//! of unsent chunks keeps running empty while seconds of bytes wait in the
+//! carrier (`shaped_link::tcp_shape`). SCTP's acknowledgement delay holds that
+//! wait: it is stamped when a chunk leaves that queue for the wire. The sampler takes
+//! the association's gauges (`RTCSctpTransport::gauges`) where each sample
+//! starts and closes, beside the clock: a sample whose least delay stands
+//! [`QUEUED_OVER_MS`] over the session's least is queued, when it acknowledged
+//! enough bytes for the delay to be its own ([`counts`]). Also in shadow, also
+//! off with the switch; see `docs/rate-control.md` (§ The standing queue).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -44,6 +61,7 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
+use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::pipe::{PathNumber, PathView};
 
@@ -55,6 +73,43 @@ pub const LINE_EVERY: Duration = Duration::from_secs(10);
 
 /// The line's message, which a field read greps for.
 pub const LINE: &str = "path delivery (FR-148 P0, shadow, ≈10s)";
+
+/// A sample whose least acknowledgement delay stands this far over the
+/// session's least is queued. In `shaped_link::tcp_shape`'s first runs, on a
+/// deep lossless queue (TURN over TCP's shape) every loaded second stood this
+/// far over it, 69 of 69, and on a queue that drops (TURN over UDP's) none
+/// did: 65 ms over it at most, in 80 seconds, the most of four runs.
+pub const QUEUED_OVER_MS: u64 = 250;
+
+/// The longest a receiver holds the SACK of a lone packet, ms: the vendored
+/// SCTP's `ACK_INTERVAL` (`timer/ack_timer.rs`), and the hold of Chrome's
+/// dcSCTP and of usrsctp (Firefox). See [`counts`].
+pub const DELAYED_ACK_MS: u64 = 200;
+
+/// Whether a sample's least acknowledgement delay counts: the sample
+/// acknowledged more than `max_payload × (ms / DELAYED_ACK_MS + 2)` bytes, the
+/// most that held SACKs alone acknowledge in `ms`.
+///
+/// A receiver acknowledges the second of two packets at once, and holds the
+/// SACK of a lone one for up to [`DELAYED_ACK_MS`], a wait its delay then
+/// carries. For every SACK of a sample to have been held, each packet must
+/// have come after the hold of the one before it ran out, so the SACKs left
+/// the receiver at least [`DELAYED_ACK_MS`] apart. While the way back varies
+/// by less than that, at most `ms / DELAYED_ACK_MS + 2` of them reach the agent
+/// in `ms`, and each acknowledges one packet of at most `max_payload` bytes of
+/// user data. A sample that acknowledged more had a SACK sent at once, whose
+/// delay holds no wait, so its least holds none either. A receiver that holds
+/// longer leaves fewer lone packets in a sample than this allows. `max_payload`
+/// 0 (no gauges stored yet) counts nothing.
+pub fn counts(ms: u64, bytes: u64, max_payload: u32) -> bool {
+    let lone = (ms / DELAYED_ACK_MS).saturating_add(2);
+    max_payload > 0 && bytes > u64::from(max_payload).saturating_mul(lone)
+}
+
+/// A delay in whole milliseconds, as the line writes it.
+pub fn ms_of(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// FR-148's switch, `ROOMLERD_PATH_MODEL` (D28): `off` is the release before
 /// P0 exactly (no delivery sample, no path memory, no line); `shadow` and `on`
@@ -119,12 +174,39 @@ pub enum Class {
     Stalled,
 }
 
-/// One delivery sample: its length, the bytes acknowledged in it, its class.
+/// One delivery sample: its length, the bytes acknowledged in it, its class,
+/// and what SCTP's gauges said over it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub ms: u64,
     pub bytes: u64,
     pub class: Class,
+    /// `None` when the gauges were not taken where the sample started and
+    /// where it closed.
+    pub queue: Option<QueueReading>,
+}
+
+/// What SCTP's gauges said over one sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueReading {
+    /// The least acknowledgement delay of the sample's SACKs, ms; `None` when
+    /// none gave one.
+    pub least_ms: Option<u64>,
+    /// How far that least stood over the session's least, ms; `None` when the
+    /// sample does not count ([`counts`]) or no SACK gave a delay.
+    pub standing_ms: Option<u64>,
+    /// The gauges at the sample's close.
+    pub gauges: Gauges,
+    /// Fast retransmissions and T3-rtx expiries in the sample.
+    pub loss: (u64, u64),
+}
+
+impl QueueReading {
+    /// A standing queue: the sample counts, and its least stood
+    /// [`QUEUED_OVER_MS`] or more over the session's least.
+    pub fn queued(&self) -> bool {
+        self.standing_ms.is_some_and(|s| s >= QUEUED_OVER_MS)
+    }
 }
 
 impl Sample {
@@ -139,7 +221,12 @@ impl Sample {
         } else {
             Class::Backlogged
         };
-        Self { ms, bytes, class }
+        Self {
+            ms,
+            bytes,
+            class,
+            queue: None,
+        }
     }
 
     /// The delivered rate, bit/s; `None` for a sample of no length.
@@ -164,6 +251,35 @@ pub struct LineReport {
     pub stalled_ms: u64,
     /// Bytes acknowledged over the line's samples.
     pub acked_bytes: u64,
+    /// The standing queue over the line's samples, from SCTP's gauges; `None`
+    /// when no sample of the line was read with them.
+    pub queue: Option<QueueLine>,
+}
+
+/// The standing queue over one line's samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueLine {
+    /// The least acknowledgement delay, ms: the session's least, and the
+    /// lowest and highest of the samples that count ([`counts`]). `None` when
+    /// none of the line's samples counts.
+    pub ack_ms: Option<(u64, u64, u64)>,
+    /// The lowest and highest standing over the session's least, ms, of those
+    /// samples.
+    pub standing_ms: Option<(u64, u64)>,
+    /// Of those samples, the queued ones ([`QueueReading::queued`]).
+    pub queued: u32,
+    /// The lowest and highest bytes in flight at a sample's close.
+    pub inflight: (u64, u64),
+    /// The lowest and highest congestion window at a sample's close.
+    pub cwnd: (u32, u32),
+    /// The slow start threshold at the last sample's close.
+    pub ssthresh: u32,
+    /// The lowest peer receive window at a sample's close.
+    pub rwnd_low: u32,
+    /// The most bytes waiting in SCTP's pending queue at a sample's close.
+    pub pending_high: u64,
+    /// Fast retransmissions and T3-rtx expiries over the line's samples.
+    pub loss: (u64, u64),
 }
 
 /// The samples of the line being built.
@@ -179,7 +295,49 @@ impl Fold {
         self.report.span_ms == 0 && self.report.samples == (0, 0, 0)
     }
 
+    /// One sample's gauges into the line.
+    fn add_queue(&mut self, q: &QueueReading) {
+        let g = q.gauges;
+        let line = self.report.queue.get_or_insert(QueueLine {
+            inflight: (g.inflight_bytes, g.inflight_bytes),
+            cwnd: (g.cwnd, g.cwnd),
+            rwnd_low: g.rwnd,
+            ..QueueLine::default()
+        });
+        line.inflight = (
+            line.inflight.0.min(g.inflight_bytes),
+            line.inflight.1.max(g.inflight_bytes),
+        );
+        line.cwnd = (line.cwnd.0.min(g.cwnd), line.cwnd.1.max(g.cwnd));
+        line.ssthresh = g.ssthresh;
+        line.rwnd_low = line.rwnd_low.min(g.rwnd);
+        line.pending_high = line.pending_high.max(g.pending_bytes);
+        line.loss = (
+            line.loss.0.saturating_add(q.loss.0),
+            line.loss.1.saturating_add(q.loss.1),
+        );
+        if let (Some(least), Some(standing)) = (q.least_ms, q.standing_ms) {
+            // The session's least as of the line's latest sample that counts:
+            // it only falls, until a new association starts it over.
+            let session = least.saturating_sub(standing);
+            line.ack_ms = Some(match line.ack_ms {
+                Some((_, lo, hi)) => (session, lo.min(least), hi.max(least)),
+                None => (session, least, least),
+            });
+            line.standing_ms = Some(match line.standing_ms {
+                Some((lo, hi)) => (lo.min(standing), hi.max(standing)),
+                None => (standing, standing),
+            });
+            if q.queued() {
+                line.queued = line.queued.saturating_add(1);
+            }
+        }
+    }
+
     fn add(&mut self, s: Sample) {
+        if let Some(q) = &s.queue {
+            self.add_queue(q);
+        }
         let r = &mut self.report;
         r.span_ms = r.span_ms.saturating_add(s.ms);
         r.acked_bytes = r.acked_bytes.saturating_add(s.bytes);
@@ -218,8 +376,13 @@ pub struct DeliverySampler {
     /// FR-148 P1 — the switch as this pump read it, for the pair memory.
     mode: Mode,
     clock: Option<DeliveryClock>,
-    /// The reading the next sample starts from.
-    base: Option<(Instant, Delivery)>,
+    /// The association's gauges, from the slot its clock came from.
+    gauges: Option<GaugeReader>,
+    /// The reading the next sample starts from, and the gauges taken there.
+    base: Option<(Instant, Delivery, Option<Gauges>)>,
+    /// The session's least acknowledgement delay, ms: the least of the
+    /// samples that counted ([`counts`]). A new association starts it over.
+    least_ms: Option<u64>,
     fold: Fold,
     line_since: Option<Instant>,
     /// Whose line a drop writes.
@@ -228,6 +391,8 @@ pub struct DeliverySampler {
     /// [`MODEL_LINE`] was (its own [`LINE_EVERY`]).
     view: Option<PathView>,
     model_since: Option<Instant>,
+    /// O10 — whether this pump wrote its [`OPEN_LINE`].
+    opened: bool,
 }
 
 impl DeliverySampler {
@@ -249,21 +414,24 @@ impl DeliverySampler {
             on,
             mode: if on { Mode::Shadow } else { Mode::Off },
             clock: None,
+            gauges: None,
             base: None,
+            least_ms: None,
             fold: Fold::default(),
             line_since: None,
             session: None,
             view: None,
             model_since: None,
+            opened: false,
         }
     }
 
-    /// The pump's one call, at its heartbeat: read the association's clock,
-    /// close a sample when one is due, and write the line when it is due; and
-    /// take the path numbers from `view` (step 3), writing [`MODEL_LINE`] when
-    /// that is due. Never waits: before the association exists, or while its
-    /// transport's slot is held, the clock it already has answers, or nothing
-    /// does. Off, it calls neither.
+    /// The pump's one call, at its heartbeat: read the association's clock and
+    /// its gauges, close a sample when one is due, and write the line when it
+    /// is due; and take the path numbers from `view` (step 3), writing
+    /// [`MODEL_LINE`] when that is due. Never waits: before the association
+    /// exists, or while its transport's slot is held, the clock and gauges it
+    /// already has answer, or nothing does. Off, it calls none of them.
     pub fn heartbeat(
         &mut self,
         pc: &RTCPeerConnection,
@@ -272,48 +440,84 @@ impl DeliverySampler {
     ) {
         if self.on {
             let now = Instant::now();
-            self.observe(now, session_id, || pc.sctp().delivery_clock());
+            self.observe(
+                now,
+                session_id,
+                || pc.sctp().delivery_clock(),
+                || pc.sctp().gauges(),
+            );
             self.on_view(now, session_id, view);
         }
     }
 
-    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock`. Off,
-    /// it calls nothing and returns `None`.
+    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock` and
+    /// the gauges from `gauges`. The gauges are asked for only right after the
+    /// clock came, from the same slot, so they are its association's. Off, it
+    /// calls nothing and returns `None`.
     pub fn observe(
         &mut self,
         now: Instant,
         session_id: ObjectId,
         clock: impl FnOnce() -> Option<DeliveryClock>,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
     ) -> Option<Sample> {
         if !self.on {
             return None;
         }
         self.session = Some(session_id);
-        if let Some(fresh) = clock()
-            && !self.clock.as_ref().is_some_and(|c| c.same(&fresh))
-        {
-            // A first association, or a new one: no sample spans the two.
-            self.clock = Some(fresh);
-            self.base = None;
+        if let Some(fresh) = clock() {
+            if !self.clock.as_ref().is_some_and(|c| c.same(&fresh)) {
+                // A first association, or a new one: no sample spans the two,
+                // and the gauges and the least were the old one's.
+                self.clock = Some(fresh);
+                self.base = None;
+                self.gauges = None;
+                self.least_ms = None;
+            }
+            if self.gauges.is_none() {
+                self.gauges = gauges();
+            }
         }
         let reading = self.clock.as_ref()?.read();
-        let sample = self.on_reading(now, reading);
+        // FR-148 P0: the agent's one take of the gauges. A take resets the
+        // least acknowledgement delay, so a second reader that took would split
+        // each sample's least between the two, and neither would hold it. The
+        // sampler takes here only, where a sample starts and where it closes
+        // (`on_reading_with` calls `take` there and nowhere else), beside the
+        // clock reading, so a sample's least is the least of its own SACKs.
+        // Every other reader looks without taking (`GaugeReader::peek`: FR-148
+        // O10's open line), and the train takes only in its tests.
+        let reader = self.gauges.clone();
+        let sample = self.on_reading_with(now, reading, || reader.as_ref().map(GaugeReader::take));
         if let Some(line) = self.take_line(now) {
             emit(session_id, &line);
         }
         sample
     }
 
+    /// One reading of the clock at `now`, without gauges. See
+    /// [`Self::on_reading_with`].
+    pub fn on_reading(&mut self, now: Instant, reading: Delivery) -> Option<Sample> {
+        self.on_reading_with(now, reading, || None)
+    }
+
     /// One reading of the clock at `now`. The first sets where the next sample
     /// starts; one at least [`SAMPLE_MIN`] after it closes that sample, which it
-    /// returns; one sooner changes nothing. Off, it takes nothing.
-    pub fn on_reading(&mut self, now: Instant, reading: Delivery) -> Option<Sample> {
+    /// returns; one sooner changes nothing. `take` takes the gauges, and is
+    /// called where a sample starts and where it closes, and nowhere else. Off,
+    /// it takes nothing.
+    pub fn on_reading_with(
+        &mut self,
+        now: Instant,
+        reading: Delivery,
+        take: impl FnOnce() -> Option<Gauges>,
+    ) -> Option<Sample> {
         if !self.on {
             return None;
         }
         self.line_since.get_or_insert(now);
-        let Some((since, from)) = self.base else {
-            self.base = Some((now, reading));
+        let Some((since, from, from_gauges)) = self.base else {
+            self.base = Some((now, reading, take()));
             return None;
         };
         let span = now.saturating_duration_since(since);
@@ -321,10 +525,42 @@ impl DeliverySampler {
             return None;
         }
         let ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
-        let sample = Sample::between(from, reading, ms);
+        let to_gauges = take();
+        let mut sample = Sample::between(from, reading, ms);
+        sample.queue = self.judge(&sample, from_gauges, to_gauges);
         self.fold.add(sample);
-        self.base = Some((now, reading));
+        self.base = Some((now, reading, to_gauges));
         Some(sample)
+    }
+
+    /// What the gauges taken at a sample's start and close say over it. Both
+    /// takes are needed: the least covers the SACKs since the take before, so
+    /// it is the sample's own only when its start took too.
+    fn judge(
+        &mut self,
+        s: &Sample,
+        from: Option<Gauges>,
+        to: Option<Gauges>,
+    ) -> Option<QueueReading> {
+        let (from, to) = (from?, to?);
+        let least_ms = to.ack_delay_min.map(ms_of);
+        let standing_ms = match least_ms {
+            Some(least) if counts(s.ms, s.bytes, to.max_payload) => {
+                let session = self.least_ms.map_or(least, |l| l.min(least));
+                self.least_ms = Some(session);
+                Some(least.saturating_sub(session))
+            }
+            _ => None,
+        };
+        Some(QueueReading {
+            least_ms,
+            standing_ms,
+            gauges: to,
+            loss: (
+                to.fast_retransmits.saturating_sub(from.fast_retransmits),
+                to.t3_expiries.saturating_sub(from.t3_expiries),
+            ),
+        })
     }
 
     /// The line, once [`LINE_EVERY`] has passed since the last and it holds a
@@ -336,6 +572,12 @@ impl DeliverySampler {
         }
         self.line_since = Some(now);
         Some(std::mem::take(&mut self.fold).report)
+    }
+
+    /// The samples not written yet, as the drop writes them; `None` when there
+    /// are none.
+    pub fn take_rest(&mut self) -> Option<LineReport> {
+        (!self.fold.is_empty()).then(|| std::mem::take(&mut self.fold).report)
     }
 
     /// Step 3, [`Self::heartbeat`]'s path numbers at `now`: keep `view`'s as the
@@ -362,6 +604,33 @@ impl DeliverySampler {
             }
         }
     }
+
+    /// O10 — the pump's call at each media message it hands to its send task.
+    /// The first reads the association's gauges without taking from them
+    /// (`GaugeReader::peek`: the least acknowledgement delay stays for a reader
+    /// that takes it) and writes [`OPEN_LINE`]; every later call returns at
+    /// once. Never waits: a transport whose slot is held reads as no gauges.
+    /// Off, it reads and writes nothing.
+    pub fn on_media_write(&mut self, pc: &RTCPeerConnection, session_id: ObjectId, pump: Pump) {
+        self.on_first_write(session_id, pump, || pc.sctp().gauges());
+    }
+
+    /// [`Self::on_media_write`], with the gauges from `gauges`. Returns what the
+    /// line said, the one time it writes it; `None` after that, and off.
+    pub fn on_first_write(
+        &mut self,
+        session_id: ObjectId,
+        pump: Pump,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
+    ) -> Option<OpenedBy> {
+        if !self.on || self.opened {
+            return None;
+        }
+        self.opened = true;
+        let read = gauges().map(|g| g.peek());
+        emit_open(session_id, pump, read.as_ref());
+        Some(OpenedBy::of(read.as_ref()))
+    }
 }
 
 impl Drop for DeliverySampler {
@@ -371,8 +640,8 @@ impl Drop for DeliverySampler {
         let Some(session_id) = self.session else {
             return;
         };
-        if !self.fold.is_empty() {
-            emit(session_id, &std::mem::take(&mut self.fold).report);
+        if let Some(rest) = self.take_rest() {
+            emit(session_id, &rest);
         }
         if let Some(view) = self.view.take() {
             emit_model(session_id, &view);
@@ -380,19 +649,42 @@ impl Drop for DeliverySampler {
     }
 }
 
-/// The line. Its field names are pinned by a test, since a field read greps
-/// for them.
+/// The line. Its field names and their order are pinned by a test, since a
+/// field read greps for them. The standing queue's fields follow when a
+/// sample of the line was read with SCTP's gauges, and are left out when none
+/// was.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
-    tracing::info!(
-        %session_id,
-        span_ms = line.span_ms,
-        delivery_samples = ?line.samples,
-        backlogged_bps = ?line.backlogged_bps,
-        app_limited_bps = ?line.app_limited_bps,
-        stalled_ms = line.stalled_ms,
-        acked_bytes = line.acked_bytes,
-        "{LINE}"
-    );
+    match &line.queue {
+        Some(q) => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            ack_ms = ?q.ack_ms,
+            standing_ms = ?q.standing_ms,
+            queued = q.queued,
+            inflight = ?q.inflight,
+            cwnd = ?q.cwnd,
+            ssthresh = q.ssthresh,
+            rwnd_low = q.rwnd_low,
+            pending_high = q.pending_high,
+            loss = ?q.loss,
+            "{LINE}"
+        ),
+        None => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            "{LINE}"
+        ),
+    }
 }
 
 /// FR-148 P0, step 3 — the path numbers' line, which a field read greps for.
@@ -447,11 +739,104 @@ pub fn seed_at_open(path: &Path, peer: &str) -> (Option<u32>, Option<Duration>) 
     )
 }
 
+/// FR-148 O10 — the open path's line, once a pump at its first media write,
+/// which a field read greps for.
+pub const OPEN_LINE: &str = "path open (FR-148 P0, O10)";
+
+/// The data-channel pump that writes [`OPEN_LINE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pump {
+    Vp9444Dc,
+    FfmpegDc,
+}
+
+impl Pump {
+    pub fn word(self) -> &'static str {
+        match self {
+            Pump::Vp9444Dc => "vp9-444-dc",
+            Pump::FfmpegDc => "ffmpeg-dc",
+        }
+    }
+}
+
+/// Which way a session's association opened, as its gauges read at the pump's
+/// first media write. The vendored SCTP sets the slow start threshold in three
+/// places only: where the peer's INIT ACK arrives, to the peer's window (path
+/// I), and where a fast retransmission or a T3-rtx expiry cuts it. An
+/// association its peer's COOKIE ECHO established (path C) has a threshold of
+/// 0 until its first loss. So before any loss, 0 is path C and above 0 is path
+/// I; after one, the gauges cannot tell. The peer's window is no help: any SACK
+/// sets it, on both paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenedBy {
+    /// Path C: the threshold 0, and no loss yet.
+    CookieEcho,
+    /// Path I: the threshold above 0, and no loss yet.
+    InitAck,
+    /// A fast retransmission or a T3-rtx expiry came first. Either sets the
+    /// threshold, on both paths.
+    Unknown,
+    /// No gauges: no association, or its transport's slot was held.
+    Unread,
+}
+
+impl OpenedBy {
+    /// The classification: a pure function of the gauges read at the first
+    /// write.
+    pub fn of(gauges: Option<&Gauges>) -> Self {
+        match gauges {
+            None => Self::Unread,
+            Some(g) if g.fast_retransmits > 0 || g.t3_expiries > 0 => Self::Unknown,
+            Some(g) if g.ssthresh == 0 => Self::CookieEcho,
+            Some(_) => Self::InitAck,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::CookieEcho => "cookie_echo",
+            Self::InitAck => "init_ack",
+            Self::Unknown => "unknown",
+            Self::Unread => "unread",
+        }
+    }
+}
+
+/// O10's line: the session, the pump, the open path, and the gauges it was
+/// read from; without gauges, the first three alone. No field can carry an
+/// address. The names and their order are pinned by a test.
+pub fn emit_open(session_id: ObjectId, pump: Pump, gauges: Option<&Gauges>) {
+    let open_path = OpenedBy::of(gauges).word();
+    match gauges {
+        Some(g) => tracing::info!(
+            %session_id,
+            pump = %pump.word(),
+            open_path = %open_path,
+            ssthresh = g.ssthresh,
+            rwnd = g.rwnd,
+            cwnd = g.cwnd,
+            inflight_bytes = g.inflight_bytes,
+            pending_bytes = g.pending_bytes,
+            max_payload = g.max_payload,
+            fast_retransmits = g.fast_retransmits,
+            t3_expiries = g.t3_expiries,
+            "{OPEN_LINE}"
+        ),
+        None => tracing::info!(
+            %session_id,
+            pump = %pump.word(),
+            open_path = %open_path,
+            "{OPEN_LINE}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
+    use super::shaped_link::{self, OpenPath};
     use super::*;
     use crate::encode::pipe::Basis;
 
@@ -475,7 +860,7 @@ mod tests {
 
     /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
     /// logging::init`'s file layer: time, level, message, fields; no target).
-    fn logged(f: impl FnOnce()) -> String {
+    pub(super) fn logged(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -584,6 +969,7 @@ mod tests {
                 app_limited_bps: Some(400_000),
                 stalled_ms: 2_000,
                 acked_bytes: 850_000,
+                queue: None,
             }
         );
         // The next line starts empty and comes ten seconds after this one.
@@ -660,34 +1046,65 @@ mod tests {
     fn off_takes_no_sample_and_writes_no_line() {
         let t0 = Instant::now();
         let asked = Cell::new(false);
+        let gauged = Cell::new(false);
         let out = logged(|| {
             let mut s = DeliverySampler::new(false);
             for i in 0..30u64 {
-                let sample = s.observe(at(t0, i * 2_000), sid(), || {
-                    asked.set(true);
-                    None
-                });
+                let sample = s.observe(
+                    at(t0, i * 2_000),
+                    sid(),
+                    || {
+                        asked.set(true);
+                        None
+                    },
+                    || {
+                        gauged.set(true);
+                        None
+                    },
+                );
                 assert_eq!(sample, None);
                 assert_eq!(s.on_reading(at(t0, i * 2_000), r(i * 1_000, 1, 0)), None);
+                let take = || {
+                    gauged.set(true);
+                    Some(Gauges::default())
+                };
+                assert_eq!(s.on_reading_with(at(t0, i * 2_000), r(i, 1, 0), take), None);
                 assert_eq!(s.take_line(at(t0, i * 2_000)), None);
             }
             // Its drop writes nothing either.
         });
         assert!(!asked.get(), "off asked SCTP for its clock");
+        assert!(!gauged.get(), "off asked SCTP for its gauges");
         assert!(out.is_empty(), "off wrote {out:?}");
     }
 
-    #[test]
-    fn the_line_names_its_fields() {
-        let line = LineReport {
+    /// A line as a busy session on TURN over TCP writes it: two samples
+    /// queued of the five.
+    fn busy_line() -> LineReport {
+        LineReport {
             span_ms: 10_012,
             samples: (2, 3, 0),
             backlogged_bps: Some((2_390_112, 2_401_000, 2_410_334)),
             app_limited_bps: Some(310_112),
             stalled_ms: 0,
             acked_bytes: 3_012_345,
-        };
-        let out = logged(|| emit(sid(), &line));
+            queue: Some(QueueLine {
+                ack_ms: Some((61, 64, 1_318)),
+                standing_ms: Some((3, 1_257)),
+                queued: 2,
+                inflight: (1_200, 1_048_576),
+                cwnd: (4_380, 1_052_956),
+                ssthresh: 1_048_576,
+                rwnd_low: 0,
+                pending_high: 131_072,
+                loss: (0, 1),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_line_names_its_fields() {
+        let out = logged(|| emit(sid(), &busy_line()));
         let mut rest = out.as_str();
         for want in [
             " INFO ",
@@ -699,6 +1116,16 @@ mod tests {
             "app_limited_bps=Some(310112)",
             "stalled_ms=0",
             "acked_bytes=3012345",
+            // FR-148 P0 — the standing queue, from SCTP's gauges.
+            "ack_ms=Some((61, 64, 1318))",
+            "standing_ms=Some((3, 1257))",
+            "queued=2",
+            "inflight=(1200, 1048576)",
+            "cwnd=(4380, 1052956)",
+            "ssthresh=1048576",
+            "rwnd_low=0",
+            "pending_high=131072",
+            "loss=(0, 1)",
         ] {
             let at = rest
                 .find(want)
@@ -706,7 +1133,8 @@ mod tests {
             rest = &rest[at + want.len()..];
         }
         assert_eq!(out.lines().count(), 1, "{out:?}");
-        // An idle screen's line: every sample application-limited.
+        // An idle screen's line: every sample application-limited, and none
+        // acknowledged enough bytes to count.
         let idle = LineReport {
             span_ms: 10_004,
             samples: (0, 5, 0),
@@ -714,20 +1142,309 @@ mod tests {
             app_limited_bps: Some(16_384),
             stalled_ms: 0,
             acked_bytes: 20_480,
+            queue: Some(QueueLine {
+                inflight: (0, 2_048),
+                cwnd: (4_380, 4_380),
+                ssthresh: 1_048_576,
+                rwnd_low: 1_046_528,
+                pending_high: 0,
+                ..QueueLine::default()
+            }),
         };
         let idle = logged(|| emit(sid(), &idle));
-        assert!(idle.contains("backlogged_bps=None"), "{idle:?}");
+        for want in [
+            "backlogged_bps=None",
+            "ack_ms=None",
+            "standing_ms=None",
+            "queued=0",
+        ] {
+            assert!(idle.contains(want), "{want:?} is not in {idle:?}");
+        }
+        // A line no sample of which was read with the gauges: the fields
+        // before them alone.
+        let bare = LineReport {
+            queue: None,
+            ..busy_line()
+        };
+        let bare = logged(|| emit(sid(), &bare));
+        assert!(bare.contains("acked_bytes=3012345"), "{bare:?}");
+        for gone in [
+            "ack_ms",
+            "standing_ms",
+            "queued",
+            "inflight",
+            "cwnd",
+            "ssthresh",
+            "rwnd_low",
+            "pending_high",
+            "loss",
+        ] {
+            assert!(!bare.contains(gone), "{gone:?} is in {bare:?}");
+        }
         // Its cost: at most one line a pump every LINE_EVERY, 360 a session
         // hour. A busy line has no field None.
         let per_hour = 3_600 / LINE_EVERY.as_secs();
-        for (what, l) in [("busy", &out), ("idle", &idle)] {
+        for (what, l) in [("busy", &out), ("idle", &idle), ("bare", &bare)] {
             println!(
                 "delivery line, {what}: {} bytes; {per_hour} lines and {} bytes a session hour",
                 l.len(),
                 l.len() as u64 * per_hour
             );
-            assert!(l.len() < 400, "{} bytes: {l:?}", l.len());
+            assert!(l.len() < 512, "{} bytes: {l:?}", l.len());
         }
+    }
+
+    /// Gauges as a take reads them: `least` is the least delay since the take
+    /// before, ms.
+    fn gauges(least: Option<u64>) -> Gauges {
+        Gauges {
+            max_payload: 1_200,
+            cwnd: 131_072,
+            ssthresh: 1_048_576,
+            rwnd: 1_000_000,
+            inflight_bytes: 60_000,
+            ack_delay: least.map(Duration::from_millis),
+            ack_delay_min: least.map(Duration::from_millis),
+            ..Gauges::default()
+        }
+    }
+
+    /// Feeds samples of (bytes, least ms) 2 s apart, after a reading that
+    /// starts the first, and returns what the gauges said over each.
+    fn feed(
+        s: &mut DeliverySampler,
+        t0: Instant,
+        samples: &[(u64, Option<u64>)],
+    ) -> Vec<QueueReading> {
+        assert_eq!(
+            s.on_reading_with(t0, r(0, 1, 0), || Some(gauges(None))),
+            None
+        );
+        let mut acked = 0;
+        let mut out = Vec::new();
+        for (i, &(bytes, least)) in samples.iter().enumerate() {
+            acked += bytes;
+            let now = at(t0, 2_000 * (i as u64 + 1));
+            let sample = s.on_reading_with(now, r(acked, 1, 0), || Some(gauges(least)));
+            out.push(
+                sample
+                    .and_then(|x| x.queue)
+                    .expect("a sample read with gauges"),
+            );
+        }
+        out
+    }
+
+    /// The byte rule at its edges: in a sample of `ms`, at most `ms / 200 + 2`
+    /// held SACKs, each for one packet of one DATA chunk's payload (1,200 bytes
+    /// on the vendored SCTP's 1,228-byte packets).
+    #[test]
+    fn a_sample_counts_past_what_lone_packets_could_carry() {
+        // 2 s, the FFmpeg pump's heartbeat: at most 12 packets.
+        assert!(!counts(2_000, 14_400, 1_200));
+        assert!(counts(2_000, 14_401, 1_200));
+        // 1.5 s, the shortest sample: 9.
+        assert!(!counts(1_500, 10_800, 1_200));
+        assert!(counts(1_500, 10_801, 1_200));
+        // A late heartbeat's 6 s: 32.
+        assert!(!counts(6_000, 38_400, 1_200));
+        assert!(counts(6_000, 38_401, 1_200));
+        // No gauges stored: nothing counts.
+        assert!(!counts(2_000, u64::MAX, 0));
+    }
+
+    /// Where the sampler takes the gauges: where a sample starts and where it
+    /// closes, and at no other reading.
+    #[test]
+    fn the_gauges_are_taken_where_a_sample_starts_and_closes_only() {
+        let t0 = Instant::now();
+        let takes = Cell::new(0u32);
+        let take = || {
+            takes.set(takes.get() + 1);
+            Some(gauges(Some(61)))
+        };
+        let mut s = DeliverySampler::new(true);
+        s.on_reading_with(t0, r(0, 1, 0), take);
+        s.on_reading_with(at(t0, 1_000), r(10_000, 1, 0), take);
+        assert_eq!(takes.get(), 1, "a reading sooner than SAMPLE_MIN took");
+        assert!(
+            s.on_reading_with(at(t0, 2_000), r(20_000, 1, 0), take)
+                .is_some()
+        );
+        s.on_reading_with(at(t0, 2_500), r(30_000, 1, 0), take);
+        assert!(
+            s.on_reading_with(at(t0, 3_500), r(40_000, 1, 0), take)
+                .is_some()
+        );
+        assert_eq!(takes.get(), 3);
+    }
+
+    /// A sample whose start took no gauges (none there yet) reads none: its
+    /// least would cover the SACKs before it too.
+    #[test]
+    fn a_sample_without_a_take_at_its_start_reads_no_gauges() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        s.on_reading_with(t0, r(0, 1, 0), || None);
+        let a = s
+            .on_reading_with(at(t0, 2_000), r(100_000, 1, 0), || Some(gauges(Some(61))))
+            .unwrap();
+        assert_eq!(a.queue, None, "{a:?}");
+        let b = s
+            .on_reading_with(at(t0, 4_000), r(200_000, 1, 0), || Some(gauges(Some(62))))
+            .unwrap();
+        assert_eq!(b.queue.and_then(|q| q.least_ms), Some(62), "{b:?}");
+        assert_eq!(b.queue.and_then(|q| q.standing_ms), Some(0), "{b:?}");
+    }
+
+    /// FR-148 P0 — the line folds its samples' gauges: the least and the standing
+    /// over the samples that count, the windows and the queue at each close,
+    /// the threshold last, and the losses in the line.
+    #[test]
+    fn the_line_folds_its_samples_gauges() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        let g = |inflight, cwnd, ssthresh, rwnd, pending, least: Option<u64>, fr, t3| Gauges {
+            inflight_bytes: inflight,
+            cwnd,
+            ssthresh,
+            rwnd,
+            pending_bytes: pending,
+            fast_retransmits: fr,
+            t3_expiries: t3,
+            ..gauges(least)
+        };
+        let start = g(0, 4_380, 1_048_576, 1_048_576, 0, None, 2, 1);
+        s.on_reading_with(t0, r(0, 1, 0), || Some(start));
+        let closes = [
+            (
+                200_000,
+                g(50_000, 60_000, 1_048_576, 900_000, 10_000, Some(70), 2, 1),
+            ),
+            (
+                200_000,
+                g(80_000, 90_000, 1_048_576, 700_000, 130_000, Some(64), 3, 1),
+            ),
+            (
+                150_000,
+                g(120_000, 128_000, 64_000, 800_000, 131_072, Some(500), 5, 2),
+            ),
+            // Stalled: no SACK, so no delay.
+            (0, g(120_000, 4_800, 64_000, 800_000, 131_072, None, 5, 3)),
+            // One lone packet: its delay does not count.
+            (
+                1_000,
+                g(1_000, 4_800, 64_000, 1_000_000, 0, Some(280), 5, 3),
+            ),
+        ];
+        let mut acked = 0;
+        let mut readings = Vec::new();
+        for (i, (bytes, close)) in closes.into_iter().enumerate() {
+            acked += bytes;
+            let now = at(t0, 2_000 * (i as u64 + 1));
+            let sample = s
+                .on_reading_with(now, r(acked, 1, 0), || Some(close))
+                .unwrap();
+            readings.push(sample.queue.unwrap());
+        }
+        let standing: Vec<_> = readings.iter().map(|q| q.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(0), Some(436), None, None]);
+        let line = s.take_line(at(t0, 10_000)).unwrap();
+        assert_eq!(
+            line.queue,
+            Some(QueueLine {
+                ack_ms: Some((64, 64, 500)),
+                standing_ms: Some((0, 436)),
+                queued: 1,
+                inflight: (1_000, 120_000),
+                cwnd: (4_800, 128_000),
+                ssthresh: 64_000,
+                rwnd_low: 700_000,
+                pending_high: 131_072,
+                loss: (3, 2),
+            })
+        );
+    }
+
+    /// FR-148 P0 — a queued sample stands [`QUEUED_OVER_MS`] or more over the
+    /// session's least, and one 1 ms short of it does not.
+    #[test]
+    fn a_sample_is_queued_250_ms_over_the_sessions_least() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                (200_000, Some(61)),
+                (200_000, Some(310)),
+                (200_000, Some(311)),
+            ],
+        );
+        let standing: Vec<_> = q.iter().map(|x| x.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(249), Some(250)]);
+        let queued: Vec<_> = q.iter().map(QueueReading::queued).collect();
+        assert_eq!(queued, [false, false, true]);
+    }
+
+    /// FR-148 P0 — a session that starts on a still screen, then loads, keeps the
+    /// least of a sample that counts. A small lone packet's delay carries no
+    /// full packet's serialisation, nor the second packet's that sends a SACK
+    /// at once, so it sits under what any loaded sample can read: measured
+    /// from it, every loaded sample would stand that much higher.
+    #[test]
+    fn the_session_least_comes_from_samples_that_count() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                // A still screen: a small message a second, its SACKs at once.
+                (400, Some(40)),
+                (400, Some(40)),
+                (400, Some(41)),
+                // Then loaded.
+                (200_000, Some(60)),
+                (200_000, Some(300)),
+                (200_000, Some(320)),
+            ],
+        );
+        for x in &q[..3] {
+            assert!(x.least_ms.is_some() && x.standing_ms.is_none(), "{q:?}");
+        }
+        let standing: Vec<_> = q[3..].iter().map(|x| x.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(240), Some(260)], "{q:?}");
+        assert_eq!(s.least_ms, Some(60));
+        let line = s.take_rest().unwrap().queue.unwrap();
+        assert_eq!(line.ack_ms, Some((60, 60, 320)));
+        assert_eq!(line.standing_ms, Some((0, 260)));
+        assert_eq!(
+            line.queued, 1,
+            "from the still screen's least it would be 2"
+        );
+    }
+
+    /// FR-148 P0 — why the byte rule: a browser holds a lone packet's SACK for 200
+    /// ms, so on a still screen after a loaded spell every SACK waited, and a
+    /// path's jitter adds to that. Such a sample's least stands 260 ms over
+    /// the session's and does not count; the same least with a loaded
+    /// sample's bytes is queued.
+    #[test]
+    fn a_still_screens_held_sacks_never_read_queued() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                (200_000, Some(61)),
+                (2_400, Some(321)),
+                (2_400, Some(321)),
+                (200_000, Some(321)),
+            ],
+        );
+        assert_eq!(q[0].standing_ms, Some(0));
+        assert!(!q[1].queued() && !q[2].queued(), "{q:?}");
+        assert_eq!(q[3].standing_ms, Some(260));
+        assert!(q[3].queued(), "{q:?}");
     }
 
     #[test]
@@ -927,6 +1644,244 @@ mod tests {
             seed_at_open(&missing, "198.51.100.7|relay:turn/udp"),
             (None, None)
         );
+    }
+
+    /// O10 — gauges as an association holds them before any loss: the
+    /// threshold given, the rest a session's first write.
+    fn opening(ssthresh: u32) -> Gauges {
+        Gauges {
+            max_payload: 1_188,
+            cwnd: 4_380,
+            ssthresh,
+            rwnd: 1_043_200,
+            inflight_bytes: 0,
+            pending_bytes: 2_404,
+            ..Gauges::default()
+        }
+    }
+
+    #[test]
+    fn a_threshold_of_0_with_no_loss_opened_on_the_cookie_echo() {
+        assert_eq!(OpenedBy::of(Some(&opening(0))), OpenedBy::CookieEcho);
+        // Whatever the peer's window says: a SACK sets it on both paths.
+        for rwnd in [0, 1_500, 1_048_576] {
+            let g = Gauges { rwnd, ..opening(0) };
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::CookieEcho, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_threshold_above_0_with_no_loss_opened_on_the_init_ack() {
+        for ssthresh in [1, 1_500, 131_072, 1_048_576, u32::MAX] {
+            let g = opening(ssthresh);
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::InitAck, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_loss_before_the_first_write_leaves_the_open_path_unknown() {
+        for (ssthresh, fast_retransmits, t3_expiries) in [
+            (0, 1, 0),
+            (0, 0, 1),
+            (17_520, 1, 0),
+            (4_800, 0, 2),
+            (4_800, 3, 1),
+        ] {
+            let g = Gauges {
+                fast_retransmits,
+                t3_expiries,
+                ..opening(ssthresh)
+            };
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::Unknown, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn no_gauges_is_unread() {
+        assert_eq!(OpenedBy::of(None), OpenedBy::Unread);
+        let words = [
+            OpenedBy::CookieEcho,
+            OpenedBy::InitAck,
+            OpenedBy::Unknown,
+            OpenedBy::Unread,
+        ]
+        .map(OpenedBy::word);
+        assert_eq!(words, ["cookie_echo", "init_ack", "unknown", "unread"]);
+    }
+
+    #[test]
+    fn the_open_line_names_its_fields() {
+        let out = logged(|| emit_open(sid(), Pump::FfmpegDc, Some(&opening(0))));
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            OPEN_LINE,
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "pump=ffmpeg-dc",
+            "open_path=cookie_echo",
+            "ssthresh=0",
+            "rwnd=1043200",
+            "cwnd=4380",
+            "inflight_bytes=0",
+            "pending_bytes=2404",
+            "max_payload=1188",
+            "fast_retransmits=0",
+            "t3_expiries=0",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        let init_ack = logged(|| emit_open(sid(), Pump::Vp9444Dc, Some(&opening(1_048_576))));
+        for want in ["pump=vp9-444-dc", "open_path=init_ack", "ssthresh=1048576"] {
+            assert!(init_ack.contains(want), "{want:?} is not in {init_ack:?}");
+        }
+        // Without gauges: the session, the pump and the open path alone.
+        let unread = logged(|| emit_open(sid(), Pump::Vp9444Dc, None));
+        assert!(unread.contains("open_path=unread"), "{unread:?}");
+        assert!(!unread.contains("ssthresh"), "{unread:?}");
+        // Its cost: one line a session.
+        for l in [&out, &init_ack, &unread] {
+            println!("open line: {} bytes\n{l}", l.len());
+            assert!(l.len() < 400, "{} bytes: {l:?}", l.len());
+        }
+    }
+
+    #[test]
+    fn the_open_line_comes_once_a_pump_and_off_writes_none() {
+        let asked = Cell::new(0u32);
+        let gauges = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            let first = s.on_first_write(sid(), Pump::FfmpegDc, gauges);
+            assert_eq!(first, Some(OpenedBy::Unread));
+            for _ in 0..5 {
+                assert_eq!(s.on_first_write(sid(), Pump::FfmpegDc, gauges), None);
+            }
+        });
+        assert_eq!(
+            asked.get(),
+            1,
+            "the gauges are read at the first write only"
+        );
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(out.contains(OPEN_LINE), "{out:?}");
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(false);
+            for _ in 0..5 {
+                assert_eq!(s.on_first_write(sid(), Pump::FfmpegDc, gauges), None);
+            }
+        });
+        assert_eq!(asked.get(), 1, "off read the gauges");
+        assert!(out.is_empty(), "off wrote {out:?}");
+    }
+
+    /// The number a logged line gives `name`.
+    fn field(out: &str, name: &str) -> u64 {
+        let key = format!(" {name}=");
+        let at = out
+            .find(&key)
+            .unwrap_or_else(|| panic!("no {name} in {out:?}"))
+            + key.len();
+        let digits: String = out[at..].chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} in {out:?}"))
+    }
+
+    /// O10's cells, over 4a's shaped link: an association opened by `path` on
+    /// 8 Mbit/s at 80 ms with the viewer's default window (1 MiB), a control
+    /// message written and acknowledged first, as a session's other channels
+    /// open before its video, and then the pump's first media write. Returns
+    /// what the line said, the line, and the gauges taken after it.
+    async fn the_first_write_on(path: OpenPath) -> (Option<OpenedBy>, String, Gauges) {
+        use bytes::Bytes;
+        use webrtc::sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+
+        let (a, b) =
+            shaped_link::shaped(8_000_000, Duration::from_millis(40), Duration::from_secs(1));
+        let (agent, viewer) =
+            shaped_link::pair_opened(Arc::new(a), Arc::new(b), 0, path, Arc::default()).await;
+        let control = agent
+            .open_stream(0, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        control
+            .write(&Bytes::from_static(b"control"))
+            .await
+            .unwrap();
+        let clock = agent.delivery_clock();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while clock.read().acked_bytes == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the control message was never acknowledged"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let video = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        let mut sampler = DeliverySampler::new(true);
+        let mut said = None;
+        let out = logged(|| {
+            said = sampler.on_first_write(sid(), Pump::FfmpegDc, || Some(agent.gauges()));
+        });
+        video
+            .write(&Bytes::from(vec![0x5a; 16 * 1024]))
+            .await
+            .unwrap();
+        let again = logged(|| {
+            let second = sampler.on_first_write(sid(), Pump::FfmpegDc, || Some(agent.gauges()));
+            assert_eq!(second, None);
+        });
+        assert!(again.is_empty(), "a second write wrote {again:?}");
+        let after = agent.gauges().take();
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
+        (said, out, after)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_association_its_init_ack_opened_reads_init_ack_at_the_first_write() {
+        let (said, out, after) = the_first_write_on(OpenPath::InitAck).await;
+        println!("path I: {out}");
+        assert_eq!(said, Some(OpenedBy::InitAck), "{out:?}");
+        assert!(out.contains("open_path=init_ack"), "{out:?}");
+        assert_eq!(
+            field(&out, "ssthresh"),
+            1_048_576,
+            "the viewer's window: {out:?}"
+        );
+        assert_eq!(
+            field(&out, "fast_retransmits") + field(&out, "t3_expiries"),
+            0
+        );
+        // The line peeked: the control message's least delay is still there.
+        assert!(after.ack_delay_min.is_some(), "the line took it: {after:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_association_its_peers_cookie_echo_opened_reads_cookie_echo_at_the_first_write() {
+        let (said, out, after) = the_first_write_on(OpenPath::CookieEcho).await;
+        println!("path C: {out}");
+        assert_eq!(said, Some(OpenedBy::CookieEcho), "{out:?}");
+        assert!(out.contains("open_path=cookie_echo"), "{out:?}");
+        assert_eq!(field(&out, "ssthresh"), 0, "{out:?}");
+        // The control message's SACK set the peer's window: by the first media
+        // write, path C's 0 and 0 is the threshold's 0 alone.
+        assert!(field(&out, "rwnd") > 0, "{out:?}");
+        assert_eq!(
+            field(&out, "fast_retransmits") + field(&out, "t3_expiries"),
+            0
+        );
+        assert!(after.ack_delay_min.is_some(), "the line took it: {after:?}");
     }
 }
 
@@ -1390,11 +2345,12 @@ pub(crate) mod shaped_link {
         let mut sampler = DeliverySampler::new(true);
         let mut out = Vec::new();
         let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
         let start = Instant::now();
-        assert_eq!(sampler.observe(start, sid(), clock), None);
+        assert_eq!(sampler.observe(start, sid(), clock, gauges), None);
         for i in 1..=n as u32 {
             tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
-            if let Some(s) = sampler.observe(Instant::now(), sid(), clock) {
+            if let Some(s) = sampler.observe(Instant::now(), sid(), clock, gauges) {
                 out.push(s);
             }
         }
@@ -1528,12 +2484,13 @@ pub(crate) mod shaped_link {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let mut sampler = DeliverySampler::new(true);
         let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
         let start = Instant::now();
-        assert_eq!(sampler.observe(start, sid(), clock), None);
+        assert_eq!(sampler.observe(start, sid(), clock, gauges), None);
         let mut ends = Vec::new();
         for i in 1..=3u32 {
             tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
-            let sample = sampler.observe(Instant::now(), sid(), clock);
+            let sample = sampler.observe(Instant::now(), sid(), clock, gauges);
             // The clock first, then the viewer's count, which only grows.
             let acked = agent.delivery_clock().read().acked_bytes;
             let took = taken.load(Ordering::SeqCst);
@@ -1567,21 +2524,39 @@ pub(crate) mod shaped_link {
         let (second, second_viewer) = pair(Arc::new(a2), Arc::new(b2), w).await;
         assert!(first.delivery_clock().same(&first.delivery_clock()));
         assert!(!first.delivery_clock().same(&second.delivery_clock()));
+        assert!(first.gauges().same(&first.gauges()));
+        assert!(!first.gauges().same(&second.gauges()));
         let t0 = Instant::now();
         let mut s = DeliverySampler::new(true);
-        assert_eq!(s.observe(t0, sid(), || Some(first.delivery_clock())), None);
-        let x = s.observe(at(t0, 2_000), sid(), || Some(first.delivery_clock()));
-        assert_eq!(x.map(|x| x.ms), Some(2_000));
-        // The new association's first reading starts over...
+        let (one, two) = (|| Some(first.gauges()), || Some(second.gauges()));
         assert_eq!(
-            s.observe(at(t0, 4_000), sid(), || Some(second.delivery_clock())),
+            s.observe(t0, sid(), || Some(first.delivery_clock()), one),
             None
         );
-        // ...a held slot (no fresh clock) keeps reading the one it has...
-        assert_eq!(s.observe(at(t0, 5_000), sid(), || None), None);
+        let x = s.observe(at(t0, 2_000), sid(), || Some(first.delivery_clock()), one);
+        assert_eq!(x.map(|x| x.ms), Some(2_000));
+        s.least_ms = Some(1);
+        // The new association's first reading starts over, with its own
+        // gauges and its own least...
+        assert_eq!(
+            s.observe(at(t0, 4_000), sid(), || Some(second.delivery_clock()), two),
+            None
+        );
+        assert!(s.gauges.as_ref().is_some_and(|g| g.same(&second.gauges())));
+        assert_eq!(s.least_ms, None);
+        // ...a held slot (no fresh clock) keeps reading the one it has, and
+        // asks for no gauges...
+        let asked = std::cell::Cell::new(false);
+        let held = || {
+            asked.set(true);
+            None
+        };
+        assert_eq!(s.observe(at(t0, 5_000), sid(), || None, held), None);
+        assert!(!asked.get(), "gauges asked for with no clock from the slot");
         // ...and the next sample is the new association's alone.
-        let y = s.observe(at(t0, 6_000), sid(), || None);
+        let y = s.observe(at(t0, 6_000), sid(), || None, held);
         assert_eq!(y.map(|y| y.ms), Some(2_000));
+        assert!(y.is_some_and(|y| y.queue.is_some()), "{y:?}");
         for a in [&first, &second] {
             let _ = a.close().await;
         }
@@ -1590,7 +2565,1300 @@ pub(crate) mod shaped_link {
         }
     }
 
+    /// Writes 16 KiB and waits until all of it is acknowledged and a SACK's
+    /// delay is stored, so that no SACK with a delay comes after it returns.
+    async fn delivered(
+        agent: &Association,
+        stream: &webrtc::sctp::stream::Stream,
+        total: &mut u64,
+    ) {
+        let msg = Bytes::from(vec![0x11; 16 * 1024]);
+        stream.write(&msg).await.unwrap();
+        *total += msg.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.delivery_clock().read().acked_bytes < *total
+            || agent.gauges().peek().ack_delay_min.is_none()
+        {
+            assert!(Instant::now() < deadline, "16 KiB not acknowledged in 10 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// FR-148 P0 — the sampler is the agent's one reader that takes the
+    /// gauges. A reader that only looks (`GaugeReader::peek`, FR-148 O10's open
+    /// line) leaves a sample's least to the sampler's take; a reader that took
+    /// instead would leave the sample none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peek_leaves_the_least_to_the_samplers_take() {
+        let bps = 8_000_000;
+        let (a, b) = link(bps);
+        let (agent, viewer) = pair(Arc::new(a), Arc::new(b), rwnd(bps)).await;
+        let stream = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        let mut total = 0;
+        // The sample's start: the sampler takes.
+        assert_eq!(s.observe(t0, sid(), clock, gauges), None);
+        delivered(&agent, &stream, &mut total).await;
+        let peeked = agent.gauges().peek().ack_delay_min;
+        assert!(peeked.is_some(), "no SACK gave a delay");
+        assert_eq!(
+            agent.gauges().peek().ack_delay_min,
+            peeked,
+            "a peek took the least"
+        );
+        // The sample's close: the sampler's take reads what the peeks saw.
+        let x = s.observe(at(t0, 2_000), sid(), clock, gauges).unwrap();
+        assert_eq!(x.queue.and_then(|q| q.least_ms), peeked.map(ms_of), "{x:?}");
+        // A second reader that takes leaves the next sample no least.
+        delivered(&agent, &stream, &mut total).await;
+        assert!(agent.gauges().take().ack_delay_min.is_some());
+        let y = s.observe(at(t0, 4_000), sid(), clock, gauges).unwrap();
+        assert_eq!(y.queue.map(|q| q.least_ms), Some(None), "{y:?}");
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
+    }
+
     fn at(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
+    }
+
+    /// FR-148 O11 — what the delivery classifier, SCTP's gauges and the
+    /// viewer see on the shape a TCP carrier gives SCTP (TURN over TCP 443): a
+    /// deep queue that loses nothing, because the kernel's send buffer and
+    /// TCP's own retransmissions hold what the link has not carried yet. The
+    /// control is the UDP carrier's shape: a router queue of 100 ms that drops
+    /// at its tail.
+    ///
+    /// Each cell writes 1.5 times the link's rate in frames at 30 fps, each
+    /// stamped with its write time, over the default 1 MiB windows at a 60 ms
+    /// round trip, and records 20 one-second samples: the class, SCTP's
+    /// gauges, the link's queue and what the viewer read. A second is loaded
+    /// when the link's queue never fell under 500 ms in it. The hypothesis,
+    /// asserted last in each deep cell: fewer than half the loaded seconds
+    /// read backlogged. Measured on Windows, debug build; four runs gave the
+    /// same classes, and peaks within 1 %:
+    ///
+    /// | deep cell | loaded seconds | backlogged | link queue, peak | |
+    /// |---|---|---|---|---|
+    /// | 0.4 Mbit/s, path I | 19 | 0 | 11.06 s | green |
+    /// | 2 Mbit/s, path I, skipping over 256 KiB as the VP9-444 pump does | 19 | 0 | 1.06 s | green |
+    /// | 2 Mbit/s, path I | 19 | 12 | 4.23 s | red: the peer's window binds at 8 s |
+    /// | 0.4 Mbit/s, path C | 12 | 12 | 0.92 s | red |
+    /// | 2 Mbit/s, path C, with the skip or without | 0 | 19 of all 20 | 0.37 s | red: never loaded |
+    ///
+    /// Path I's slow start runs to the peer's window, and its congestion
+    /// window grows only while chunks wait, so it stays a few KB over what is
+    /// in flight, and the queue of unsent chunks runs empty 20 to 30 times a
+    /// second: every sample is application-limited while seconds of queue
+    /// stand on the link, until the peer's window binds. The pump's skip
+    /// keeps the buffered amount near 256 KiB, so the window never binds, the
+    /// classifier never sees the queue, and the queue stands still at a
+    /// second, where the viewer's transit growth stops reading it after 3 s.
+    /// The governor's own class for a window's delivery (writes over 1.1
+    /// times what arrived) reads 2 of that cell's 19 windows, because the
+    /// skip writes what the path drains. Path C runs congestion avoidance
+    /// from the first byte (no INIT ACK sets its threshold), one MTU a round
+    /// trip, so the backlog waits in SCTP's own queue, and the classifier
+    /// reads it.
+    ///
+    /// The candidate signals over the 69 loaded seconds of the four deep cells
+    /// that had any, and the 80 seconds of the four controls (0.4 and 2
+    /// Mbit/s, paths I and C, 11 to 69 tail drops each), the least and the
+    /// most of four runs:
+    ///
+    /// | signal | deep, loaded | controls (false) |
+    /// |---|---|---|
+    /// | SCTP's acknowledgement delay over its least ≥ 250 ms | 69 | 0 (at most 65 ms) |
+    /// | in flight ≥ 3 × delivered × the least delay | 69 | 7 to 11 |
+    /// | the viewer's transit over its least ≥ 200 ms (FR-71's) | 69 | 35 to 37 |
+    /// | the stream's buffered amount over 256 KiB | 38 to 40 | 0 |
+    /// | transit growth ≥ 100 ms | 35 | 19 to 23 |
+    /// | the link loop congested | 32 | 6 to 8 |
+    /// | backlogged | 24 | 76 |
+    ///
+    /// The acknowledgement delay holds only the link's queue. The viewer's
+    /// transit also holds the wait in SCTP's own queue (128 KiB, 2.7 s at 0.4
+    /// Mbit/s), so it reads the controls' backlog as well. The deep cells
+    /// assert the first row on every loaded second and the controls assert
+    /// its absence: pins of these numbers, not fail-first.
+    ///
+    /// The stall cells hold the viewer's deliveries for 0.8 s every 3.3 s, as
+    /// a TCP receiver holds what waits behind a lost segment, and fold the
+    /// viewer's stats windows (closed as `rc-dc-worker.ts` closes them) into
+    /// a real [`Pipe`], whose floor takes every window. The window after a
+    /// stall carries the stall's bytes on top of its own. Under a writer at
+    /// 80 % of the link, path I's floor ends at 2,857 to 3,030 kbit/s in six
+    /// runs, 1.46 to 1.55 times the link's 1,954, by where the stalls fall in
+    /// the windows; path C's congestion window caps what the link carries in
+    /// a stall, and its floor ends at 2,475 to 2,505 in five runs, 1.27 to
+    /// 1.28 times (red at 20 s: it rises stall by stall, 2,090 to 2,501 over
+    /// five, as the window grows). Under the pump's skip at 1.5 times the
+    /// link, the standing queue already holds what a stall carries:
+    /// each window after a stall reads 3,363 to 3,476, and the floor ends at
+    /// 3,470 to 3,476 in three runs, 1.78 times the link, about 1 plus the
+    /// stall over the window. No capacity is taken in any stall cell. The
+    /// controls' windows can pass the link too, by SCTP's own release of what
+    /// waited behind a loss: 695 to 697 kbit/s on 0.4 Mbit/s's 390, and up to
+    /// 3,389 on 2 Mbit/s's 1,954. There the fold overstates the product's
+    /// floor: it leaves out the `Overproduced` screen, by which a window with
+    /// a blocked send is valid and its goodput damps the floor.
+    ///
+    /// `cargo test -p roomlerd --lib media_delivery::shaped_link::tcp_shape --
+    /// --skip clipboard:: --nocapture --test-threads=1 --include-ignored`
+    mod tcp_shape {
+        use tokio::time::MissedTickBehavior;
+
+        use super::*;
+        use crate::encode::goodput::{GoodputEstimator, GoodputSink};
+        use crate::encode::pipe::{Basis, Pipe};
+        use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
+
+        /// The lab slice's round trip.
+        const RTT: Duration = Duration::from_millis(60);
+        /// A queue no run fills: nothing is dropped.
+        const DEEP: Duration = Duration::from_secs(60);
+        /// The control's queue, dropping at its tail.
+        const SHALLOW: Duration = Duration::from_millis(100);
+        const SAMPLE: Duration = Duration::from_secs(1);
+        const SAMPLES: u32 = 20;
+        const FPS: u32 = 30;
+        /// How often a second's link queue is read, for its least and most.
+        const POLL: Duration = Duration::from_millis(10);
+        /// A second whose link queue never fell under this is loaded.
+        const LOADED_MS: u64 = 500;
+        /// The candidate signals' thresholds: the second's least
+        /// acknowledgement delay over the least yet; what is in flight over
+        /// what the second's delivery rate fills in that least delay.
+        const RTT_OVER_MS: u64 = 250;
+        const BDP_PCT: u64 = 300;
+        /// FR-71's transit slack (`pipe_state::TRANSIT_SLACK_MS`), and FR-59's
+        /// growth (`viewer_rate::QUEUE_GROWTH_MS`).
+        const TRANSIT_OVER_MS: u64 = 200;
+        const GROWTH_MS: i64 = 100;
+        /// The VP9-444 pump's relay watermark on `dc.buffered_amount()`: over
+        /// it, a frame is skipped and a keyframe asked for (`peer.rs`).
+        const OVERFLOW: u64 = 256 * 1024;
+        /// What one full packet carries: 1,200 bytes of payload in 1,228.
+        const PAYLOAD: u64 = 1_200;
+        const PACKET: u64 = 1_228;
+        /// The stall cells' head-of-line stalls: one this long this often, so
+        /// that they fall at different points of the viewer's ≈1 s windows.
+        /// Only a stall across a window's close lifts a window: at 4 s, one
+        /// run of two had none, and its floor ended at 1.08 times the link.
+        const STALL_EVERY: Duration = Duration::from_millis(3_300);
+        const STALL_FOR: Duration = Duration::from_millis(800);
+        /// FR-148 P0 — the still screen's message, one a second, and its
+        /// cells' length: five of the sampler's samples.
+        const SPARSE_LEN: usize = 200;
+        const SPARSE_SECONDS: u32 = 10;
+
+        /// One cell at a time: the cells are timed.
+        static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        #[derive(Debug, Clone, Copy)]
+        struct Shape {
+            bps: u64,
+            queue: Duration,
+            path: OpenPath,
+            /// The writer's offer, percent of the link's rate.
+            offer_pct: u64,
+            /// The writer skips a frame while the stream's buffered amount is
+            /// over [`OVERFLOW`], as the VP9-444 pump does on a relay.
+            skip_over: bool,
+            /// Head-of-line stalls on the agent's direction: how often, how long.
+            stalls: Option<(Duration, Duration)>,
+            /// FR-148 P0 — a still screen: one [`SPARSE_LEN`] message a second
+            /// instead of the frames.
+            sparse: bool,
+            /// The run's length, in one-second rows.
+            seconds: u32,
+        }
+
+        impl Shape {
+            fn name(&self) -> String {
+                let path = match self.path {
+                    OpenPath::InitAck => "I",
+                    OpenPath::CookieEcho => "C",
+                };
+                let queue = if self.queue >= DEEP {
+                    "deep"
+                } else {
+                    "shallow"
+                };
+                let skip = if self.skip_over {
+                    ", skip over 256 KiB"
+                } else {
+                    ""
+                };
+                let stalls = match self.stalls {
+                    Some((every, stall)) => format!(", a {stall:?} stall every {every:?}"),
+                    None => String::new(),
+                };
+                if self.sparse {
+                    return format!(
+                        "{} Mbit/s, {queue} queue, path {path}, one {SPARSE_LEN}-byte message a second",
+                        self.bps as f64 / 1e6
+                    );
+                }
+                format!(
+                    "{} Mbit/s, {queue} queue, path {path}, offer {} %{skip}{stalls}",
+                    self.bps as f64 / 1e6,
+                    self.offer_pct
+                )
+            }
+
+            /// The link's payload rate.
+            fn payload_bps(&self) -> u64 {
+                self.bps * PAYLOAD / PACKET
+            }
+
+            fn frame_len(&self) -> usize {
+                usize::try_from(self.bps * self.offer_pct / 100 / 8 / u64::from(FPS)).unwrap()
+            }
+        }
+
+        /// One message the viewer read: when it arrived and when it was
+        /// written (microseconds from the cell's start), and its length.
+        #[derive(Debug, Clone, Copy)]
+        struct Arrival {
+            at_us: u64,
+            sent_us: u64,
+            len: u64,
+        }
+
+        fn transit_ms(x: &Arrival) -> u64 {
+            x.at_us.saturating_sub(x.sent_us) / 1000
+        }
+
+        /// One second of a run, as the agent and the viewer saw it.
+        #[derive(Debug, Clone, Copy)]
+        struct Second {
+            t: u32,
+            class: Class,
+            /// What SCTP saw acknowledged, bit/s.
+            acked_bps: u64,
+            /// The least and the most a packet would have waited in the link's
+            /// queue during the second.
+            q_lo_ms: u64,
+            q_hi_ms: u64,
+            inflight: u64,
+            cwnd: u32,
+            ssthresh: u32,
+            rwnd: u32,
+            pending: u64,
+            /// Times the queue of written, unsent chunks ran empty.
+            empties: u64,
+            /// The stream's buffered amount: written, not yet acknowledged.
+            buffered: u64,
+            /// The second's least acknowledgement delay.
+            ack_min_ms: Option<u64>,
+            /// What the writer wrote and what the viewer read, bit/s.
+            sent_bps: u64,
+            rx_bps: u64,
+            /// The newest arrival's transit, write to read, and its growth
+            /// since the second before's.
+            transit_ms: Option<u64>,
+            growth_ms: Option<i64>,
+            /// The writer's blocked sends (`goodput::MIN_BLOCKED_SEND` each),
+            /// and the goodput estimate when the window qualified.
+            blocked_ms: u64,
+            goodput_bps: Option<u32>,
+            fast_rtx: u64,
+            t3: u64,
+        }
+
+        /// The candidate signals of a standing queue for one second, each
+        /// against the least seen so far, as a live reader would hold it.
+        #[derive(Debug, Clone, Copy)]
+        struct Signals {
+            bdp_pct: Option<u64>,
+            rtt_over_ms: Option<u64>,
+            transit_over_ms: Option<u64>,
+        }
+
+        fn signals_of(rows: &[Second]) -> Vec<Signals> {
+            let mut rtt_min: Option<u64> = None;
+            let mut transit_min: Option<u64> = None;
+            rows.iter()
+                .map(|r| {
+                    rtt_min = match (rtt_min, r.ack_min_ms) {
+                        (Some(m), Some(a)) => Some(m.min(a)),
+                        (m, a) => m.or(a),
+                    };
+                    transit_min = match (transit_min, r.transit_ms) {
+                        (Some(m), Some(t)) => Some(m.min(t)),
+                        (m, t) => m.or(t),
+                    };
+                    let bdp_pct = rtt_min
+                        .filter(|&m| m > 0 && r.acked_bps > 0)
+                        .map(|m| r.inflight * 100 * 8_000 / (r.acked_bps * m));
+                    Signals {
+                        bdp_pct,
+                        rtt_over_ms: r.ack_min_ms.zip(rtt_min).map(|(a, m)| a - m),
+                        transit_over_ms: r.transit_ms.zip(transit_min).map(|(t, m)| t - m),
+                    }
+                })
+                .collect()
+        }
+
+        /// One stats window of the viewer's, as `rc-dc-worker.ts` closes it:
+        /// at the first arrival a second or more after the last close, that
+        /// arrival's bytes counted in the window it closes.
+        #[derive(Debug, Clone, Copy)]
+        struct ViewerWindow {
+            end_us: u64,
+            ms: u64,
+            rx_bps: u32,
+            sent_bps: u32,
+            /// The transit queue's growth over the window (the worker's
+            /// `QueueDrift`, read at arrival), its mean transit, and that over
+            /// the least window mean yet.
+            growth_ms: i64,
+            transit_ms: u64,
+            excess_ms: u64,
+        }
+
+        fn viewer_windows(
+            arrivals: &[Arrival],
+            frames: &[(u64, u64)],
+            from_us: u64,
+        ) -> Vec<ViewerWindow> {
+            let mut out = Vec::new();
+            let mut opened: Option<(u64, u64)> = None;
+            let (mut bytes, mut transit_sum, mut n) = (0u64, 0u64, 0u64);
+            let mut floor: Option<u64> = None;
+            for x in arrivals.iter().filter(|x| x.at_us >= from_us) {
+                let Some((since, transit_before)) = opened else {
+                    opened = Some((x.at_us, transit_ms(x)));
+                    continue;
+                };
+                bytes += x.len;
+                transit_sum += transit_ms(x);
+                n += 1;
+                let elapsed = x.at_us - since;
+                if elapsed < 1_000_000 {
+                    continue;
+                }
+                let sent: u64 = frames
+                    .iter()
+                    .filter(|f| f.0 > since && f.0 <= x.at_us)
+                    .map(|f| f.1)
+                    .sum();
+                let mean = transit_sum / n;
+                let low = floor.map_or(mean, |f| f.min(mean));
+                floor = Some(low);
+                let bps = |b: u64| u32::try_from(b * 8_000_000 / elapsed).unwrap_or(u32::MAX);
+                out.push(ViewerWindow {
+                    end_us: x.at_us,
+                    ms: elapsed / 1000,
+                    rx_bps: bps(bytes),
+                    sent_bps: bps(sent),
+                    growth_ms: transit_ms(x) as i64 - transit_before as i64,
+                    transit_ms: mean,
+                    excess_ms: mean - low,
+                });
+                opened = Some((x.at_us, transit_ms(x)));
+                (bytes, transit_sum, n) = (0, 0, 0);
+            }
+            out
+        }
+
+        /// The session's path belief over a run's viewer windows, folded by
+        /// the real [`Pipe`] the way the governor folds it: every window's
+        /// arrival rate is a delivery; a valid window's goodput, and a valid,
+        /// congested and offered window's arrival rate, are capacities. Valid
+        /// is FR-79's gate cut to its transit rule: a window whose transit is
+        /// [`TRANSIT_OVER_MS`] over the least is `TransitStalled`, and the
+        /// window after one is its shadow. The sender-side screen that would
+        /// call a window `Overproduced` first is not modelled.
+        #[derive(Debug, Default, Clone, Copy)]
+        struct Belief {
+            floor: Option<u32>,
+            capacity: Option<u32>,
+            anchor: Option<u32>,
+            max_rx: u32,
+            windows: u32,
+            /// Windows whose writes ran over what arrived
+            /// ([`offered_over_arrival`]): the class the governor gives a
+            /// window's delivery, and so the shadow model's.
+            offered: u32,
+            invalid: u32,
+            congested: u32,
+            link_capacities: u32,
+            goodput_capacities: u32,
+        }
+
+        fn belief_of(windows: &[ViewerWindow], goodput: &[(u64, u32)], t0: Instant) -> Belief {
+            let mut pipe = Pipe::default();
+            let mut link = LinkLoop::new();
+            let mut offer = OfferLoop::default();
+            let mut goodput = goodput.iter().peekable();
+            let mut prev_stalled = false;
+            let mut b = Belief::default();
+            for w in windows {
+                let at = t0 + Duration::from_micros(w.end_us);
+                let stalled = w.excess_ms >= TRANSIT_OVER_MS;
+                let valid = !stalled && !prev_stalled;
+                prev_stalled = stalled;
+                b.windows += 1;
+                if !valid {
+                    b.invalid += 1;
+                }
+                while let Some(&(_, bps)) = goodput.next_if(|g| g.0 <= w.end_us) {
+                    if valid {
+                        pipe.observe_capacity(bps, Basis::Backlogged, at);
+                        b.goodput_capacities += 1;
+                    }
+                }
+                let offered = offered_over_arrival(w.sent_bps, w.rx_bps);
+                if offered {
+                    b.offered += 1;
+                }
+                let offer_held = offer.observe(offered);
+                pipe.observe_delivered_in(w.rx_bps, Basis::of_window(offered), valid, at);
+                let growth = i16::try_from(w.growth_ms.clamp(-30_000, 30_000)).unwrap();
+                if link.observe(w.rx_bps, growth).congested {
+                    b.congested += 1;
+                    if valid && offer_held {
+                        pipe.observe_capacity(w.rx_bps, Basis::Backlogged, at);
+                        b.link_capacities += 1;
+                    }
+                }
+                b.max_rx = b.max_rx.max(w.rx_bps);
+            }
+            let end = windows
+                .last()
+                .map_or(t0, |w| t0 + Duration::from_micros(w.end_us));
+            b.floor = pipe.floor_bps(end);
+            b.capacity = pipe.capacity_bps(end);
+            b.anchor = pipe.ceiling_anchor_bps(end);
+            b
+        }
+
+        /// FR-148 P0 — the gauges the sampler takes, from the harness's own
+        /// takes. The table takes every second; this holds what it took since
+        /// the sampler's last take (the least of the leasts, the latest of
+        /// the rest), so the sampler reads what a take of its own would have.
+        #[derive(Debug, Default)]
+        struct Split(Option<Gauges>);
+
+        impl Split {
+            fn push(&mut self, g: Gauges) {
+                let least = match self.0.and_then(|p| p.ack_delay_min) {
+                    Some(p) => Some(g.ack_delay_min.map_or(p, |n| n.min(p))),
+                    None => g.ack_delay_min,
+                };
+                self.0 = Some(Gauges {
+                    ack_delay_min: least,
+                    ..g
+                });
+            }
+
+            fn take(&mut self) -> Option<Gauges> {
+                self.0.take()
+            }
+        }
+
+        /// One of the sampler's samples, and the run's rows it covers.
+        #[derive(Debug, Clone)]
+        struct Covered {
+            rows: std::ops::Range<usize>,
+            sample: Sample,
+        }
+
+        impl Covered {
+            /// Every second of the sample was loaded.
+            fn loaded(&self, rows: &[Second]) -> bool {
+                !self.rows.is_empty()
+                    && rows[self.rows.clone()]
+                        .iter()
+                        .all(|s| s.q_lo_ms > LOADED_MS)
+            }
+
+            fn queued(&self) -> bool {
+                self.sample.queue.is_some_and(|q| q.queued())
+            }
+        }
+
+        #[derive(Debug)]
+        struct TcpRun {
+            shape: Shape,
+            rows: Vec<Second>,
+            windows: Vec<ViewerWindow>,
+            belief: Belief,
+            peak_queue: Duration,
+            tail_drops: u64,
+            /// FR-148 P0 — the delivery sampler's samples and lines.
+            samples: Vec<Covered>,
+            lines: Vec<LineReport>,
+        }
+
+        fn us(d: Duration) -> u64 {
+            u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+        }
+
+        fn ms(d: Duration) -> u64 {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        }
+
+        /// How long a packet sent now would wait in `c`'s queue.
+        fn queue_now(c: &ShapedConn) -> Duration {
+            c.out
+                .next_free
+                .lock()
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        }
+
+        /// When a packet due at `due` reaches the far end: when due, or at the
+        /// end of the stall it fell due in. A stall starts each `every` after
+        /// `t0` and lasts `stall`.
+        fn held_until(due: Instant, t0: Instant, every: Duration, stall: Duration) -> Instant {
+            let k = due.saturating_duration_since(t0).as_nanos() / every.as_nanos();
+            match u32::try_from(k) {
+                Ok(k @ 1..) => (t0 + every * k + stall).max(due),
+                _ => due,
+            }
+        }
+
+        /// As [`shaped`], and the viewer's end receives nothing during each
+        /// stall: what fell due in it is handed over at its end, at once and
+        /// in order, as a TCP receiver releases what waited behind a lost
+        /// segment. The link carries on at its rate meanwhile.
+        fn stalling(
+            bps: u64,
+            queue: Duration,
+            t0: Instant,
+            every: Duration,
+            stall: Duration,
+        ) -> (ShapedConn, ShapedConn) {
+            let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+            let (inbox_tx, b_inbox) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Some((due, p)) = due_rx.recv().await {
+                    let release = held_until(due, t0, every, stall);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(release)).await;
+                    if inbox_tx.send(p).is_err() {
+                        break;
+                    }
+                }
+            });
+            let a_out = Shaper {
+                bps,
+                one_way: RTT / 2,
+                queue,
+                next_free: StdMutex::new(Instant::now()),
+                due: due_tx,
+                drop_every: 0,
+                full_packets: AtomicU64::new(0),
+                peak_wait_ns: AtomicU64::new(0),
+                tail_drops: AtomicU64::new(0),
+            };
+            let (b_out, a_inbox) = direction(bps, RTT / 2, queue, 0, None);
+            let (a, b): (SocketAddr, SocketAddr) = (
+                "10.0.0.1:5000".parse().unwrap(),
+                "10.0.0.2:5000".parse().unwrap(),
+            );
+            (
+                ShapedConn {
+                    out: a_out,
+                    inbox: Mutex::new(a_inbox),
+                    local: a,
+                    remote: b,
+                },
+                ShapedConn {
+                    out: b_out,
+                    inbox: Mutex::new(b_inbox),
+                    local: b,
+                    remote: a,
+                },
+            )
+        }
+
+        /// As [`pair_opened`] with the default windows (1 MiB), and the viewer
+        /// logs when each message arrived and the write time it carries in
+        /// its first 8 bytes.
+        async fn pair_timed(
+            a: Arc<dyn Conn + Send + Sync>,
+            b: Arc<dyn Conn + Send + Sync>,
+            path: OpenPath,
+            t0: Instant,
+            log: Arc<StdMutex<Vec<Arrival>>>,
+        ) -> (Association, Arc<Association>) {
+            let config = |net_conn, name: &str| Config {
+                net_conn,
+                max_receive_buffer_size: 0,
+                max_message_size: 0,
+                name: name.to_owned(),
+            };
+            let (agent, viewer) = match path {
+                OpenPath::InitAck => {
+                    let agent = tokio::spawn(Association::client(config(a, "agent")));
+                    let viewer = Association::server(config(b, "viewer")).await;
+                    (agent.await.unwrap().unwrap(), viewer.unwrap())
+                }
+                OpenPath::CookieEcho => {
+                    let viewer = tokio::spawn(Association::client(config(b, "viewer")));
+                    let agent = Association::server(config(a, "agent")).await;
+                    (agent.unwrap(), viewer.await.unwrap().unwrap())
+                }
+            };
+            let viewer = Arc::new(viewer);
+            let reader = Arc::clone(&viewer);
+            tokio::spawn(async move {
+                while let Some(stream) = reader.accept_stream().await {
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        while let Ok(n @ 8..) = stream.read(&mut buf).await {
+                            let at_us = us(t0.elapsed());
+                            let sent_us = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                            log.lock().unwrap().push(Arrival {
+                                at_us,
+                                sent_us,
+                                len: n as u64,
+                            });
+                        }
+                    });
+                }
+            });
+            (agent, viewer)
+        }
+
+        /// A writer offering `shape`'s rate in frames at [`FPS`], each
+        /// stamped with its write time, for [`SAMPLES`] seconds of samples.
+        async fn run(shape: Shape) -> TcpRun {
+            let _turn = TURN.lock().await;
+            #[cfg(target_os = "windows")]
+            let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
+            let t0 = Instant::now();
+            let (a, b) = match shape.stalls {
+                None => shaped(shape.bps, RTT / 2, shape.queue),
+                Some((every, stall)) => stalling(shape.bps, shape.queue, t0, every, stall),
+            };
+            let a = Arc::new(a);
+            let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
+            let (agent, viewer) = pair_timed(
+                a.clone(),
+                Arc::new(b),
+                shape.path,
+                t0,
+                Arc::clone(&arrivals),
+            )
+            .await;
+            let stream = agent
+                .open_stream(1, PayloadProtocolIdentifier::Binary)
+                .await
+                .unwrap();
+            let sink = GoodputSink::new();
+            let frames: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::default();
+            let writer = {
+                let stream = Arc::clone(&stream);
+                let sink = sink.clone();
+                let frames = Arc::clone(&frames);
+                let (every, len) = if shape.sparse {
+                    (SAMPLE, SPARSE_LEN)
+                } else {
+                    (SAMPLE / FPS, shape.frame_len())
+                };
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(every);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    let mut frame = vec![0x6b_u8; len];
+                    loop {
+                        tick.tick().await;
+                        if shape.skip_over && stream.buffered_amount() as u64 > OVERFLOW {
+                            continue;
+                        }
+                        let stamp = us(t0.elapsed());
+                        frame[..8].copy_from_slice(&stamp.to_le_bytes());
+                        let began = Instant::now();
+                        if stream.write(&Bytes::copy_from_slice(&frame)).await.is_err() {
+                            break;
+                        }
+                        sink.record(len as u64, began.elapsed());
+                        frames.lock().unwrap().push((stamp, len as u64));
+                    }
+                })
+            };
+            let clock = agent.delivery_clock();
+            let gauges = agent.gauges();
+            let mut goodput = GoodputEstimator::new();
+            let mut goodput_at = Vec::new();
+            let mut rows = Vec::new();
+            let (mut seen_rx, mut seen_tx) = (0, 0);
+            let mut last_transit: Option<u64> = None;
+            let start = Instant::now();
+            let first = gauges.take();
+            let _ = sink.drain();
+            let mut prev = (start, clock.read());
+            // FR-148 P0 — the delivery sampler itself, on this run's clock and,
+            // through `Split`, on its gauges.
+            let mut sampler = DeliverySampler::new(true);
+            let mut split = Split::default();
+            let (mut samples, mut lines) = (Vec::new(), Vec::new());
+            let mut covered = 0;
+            assert_eq!(sampler.on_reading_with(start, prev.1, || Some(first)), None);
+            for i in 1..=shape.seconds {
+                let end = start + SAMPLE * i;
+                let (mut q_lo, mut q_hi) = (Duration::MAX, Duration::ZERO);
+                loop {
+                    let q = queue_now(&a);
+                    q_lo = q_lo.min(q);
+                    q_hi = q_hi.max(q);
+                    let now = Instant::now();
+                    if now >= end {
+                        break;
+                    }
+                    let next = (now + POLL).min(end);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                }
+                let now = Instant::now();
+                let d = clock.read();
+                let g = gauges.take();
+                split.push(g);
+                let sample = Sample::between(prev.1, d, ms(now - prev.0));
+                let blocked = sink.drain();
+                let blocked_ms = ms(blocked.iter().map(|s| s.elapsed).sum::<Duration>());
+                let goodput_bps = if goodput.observe_window(&blocked, now) {
+                    goodput.estimate_bps(now)
+                } else {
+                    None
+                };
+                if let Some(bps) = goodput_bps {
+                    goodput_at.push((us(now - t0), bps));
+                }
+                let (rx, newest) = {
+                    let log = arrivals.lock().unwrap();
+                    let fresh = &log[seen_rx..];
+                    seen_rx = log.len();
+                    (
+                        fresh.iter().map(|x| x.len).sum::<u64>(),
+                        fresh.last().map(transit_ms),
+                    )
+                };
+                let sent = {
+                    let log = frames.lock().unwrap();
+                    let fresh = &log[seen_tx..];
+                    seen_tx = log.len();
+                    fresh.iter().map(|f| f.1).sum::<u64>()
+                };
+                let growth_ms = newest.zip(last_transit).map(|(t, l)| t as i64 - l as i64);
+                if newest.is_some() {
+                    last_transit = newest;
+                }
+                let span = sample.ms.max(1);
+                rows.push(Second {
+                    t: i,
+                    class: sample.class,
+                    acked_bps: sample.bps().unwrap_or(0),
+                    q_lo_ms: ms(q_lo),
+                    q_hi_ms: ms(q_hi),
+                    inflight: g.inflight_bytes,
+                    cwnd: g.cwnd,
+                    ssthresh: g.ssthresh,
+                    rwnd: g.rwnd,
+                    pending: g.pending_bytes,
+                    empties: d.queue_empties.saturating_sub(prev.1.queue_empties),
+                    buffered: stream.buffered_amount() as u64,
+                    ack_min_ms: g.ack_delay_min.map(ms),
+                    sent_bps: sent * 8_000 / span,
+                    rx_bps: rx * 8_000 / span,
+                    transit_ms: newest,
+                    growth_ms,
+                    blocked_ms,
+                    goodput_bps,
+                    fast_rtx: g.fast_retransmits,
+                    t3: g.t3_expiries,
+                });
+                if let Some(sample) = sampler.on_reading_with(now, d, || split.take()) {
+                    samples.push(Covered {
+                        rows: covered..rows.len(),
+                        sample,
+                    });
+                    covered = rows.len();
+                }
+                lines.extend(sampler.take_line(now));
+                prev = (now, d);
+            }
+            lines.extend(sampler.take_rest());
+            writer.abort();
+            let peak_queue = a.peak_wait();
+            let tail_drops = a.tail_drops();
+            let arrivals = arrivals.lock().unwrap().clone();
+            let frames = frames.lock().unwrap().clone();
+            let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
+            let windows = viewer_windows(&arrivals, &frames, us(start - t0));
+            let belief = belief_of(&windows, &goodput_at, t0);
+            TcpRun {
+                shape,
+                rows,
+                windows,
+                belief,
+                peak_queue,
+                tail_drops,
+                samples,
+                lines,
+            }
+        }
+
+        fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
+            v.map_or_else(|| "-".to_owned(), |v| v.to_string())
+        }
+
+        fn kbps(bps: u64) -> u64 {
+            bps / 1000
+        }
+
+        /// (Loaded seconds a signal read on, loaded seconds, other seconds it
+        /// read on, other seconds.)
+        type Count = (usize, usize, usize, usize);
+
+        /// What each candidate signal read.
+        fn readings(r: &TcpRun) -> Vec<(&'static str, Count)> {
+            let sig = signals_of(&r.rows);
+            let mut link = LinkLoop::new();
+            let congested: Vec<bool> = r
+                .rows
+                .iter()
+                .map(|s| {
+                    let growth = s.growth_ms.unwrap_or(0).clamp(-30_000, 30_000);
+                    let rx = u32::try_from(s.rx_bps).unwrap_or(u32::MAX);
+                    link.observe(rx, i16::try_from(growth).unwrap()).congested
+                })
+                .collect();
+            type Read = fn(&Second, &Signals) -> bool;
+            let reads: [(&'static str, Read); 6] = [
+                ("backlogged (the classifier)", |s, _| {
+                    s.class == Class::Backlogged
+                }),
+                ("rtt over its least >= 250 ms", |_, g| {
+                    g.rtt_over_ms.is_some_and(|v| v >= RTT_OVER_MS)
+                }),
+                ("inflight >= 3 x delivered x least rtt", |_, g| {
+                    g.bdp_pct.is_some_and(|v| v >= BDP_PCT)
+                }),
+                ("transit over its least >= 200 ms", |_, g| {
+                    g.transit_over_ms.is_some_and(|v| v >= TRANSIT_OVER_MS)
+                }),
+                ("transit growth >= 100 ms", |s, _| {
+                    s.growth_ms.is_some_and(|v| v >= GROWTH_MS)
+                }),
+                ("buffered amount > 256 KiB", |s, _| s.buffered > OVERFLOW),
+            ];
+            let loaded: Vec<bool> = r.rows.iter().map(|s| s.q_lo_ms > LOADED_MS).collect();
+            let count = |read: &dyn Fn(usize) -> bool| {
+                let on = |want: bool| {
+                    let of = (0..r.rows.len()).filter(|&i| loaded[i] == want);
+                    let n = of.clone().count();
+                    (of.filter(|&i| read(i)).count(), n)
+                };
+                let ((a, b), (c, d)) = (on(true), on(false));
+                (a, b, c, d)
+            };
+            let mut out: Vec<_> = reads
+                .iter()
+                .map(|&(name, read)| (name, count(&|i| read(&r.rows[i], &sig[i]))))
+                .collect();
+            out.push(("the link loop: congested", count(&|i| congested[i])));
+            out
+        }
+
+        fn print_run(r: &TcpRun) {
+            let link = r.shape.payload_bps();
+            println!(
+                "== {} (payload {} kbit/s): peak queue {:?}, tail drops {}",
+                r.shape.name(),
+                kbps(link),
+                r.peak_queue,
+                r.tail_drops
+            );
+            println!(
+                " t class      acked  q_lo..q_hi ms  inflight    cwnd  ssthresh    rwnd  pending emp \
+                 buffered ackmin  sent    rx transit growth blk_ms goodput fr t3 | bdp% rtt+ tr+"
+            );
+            for (s, g) in r.rows.iter().zip(signals_of(&r.rows)) {
+                let class = format!("{:?}", s.class);
+                println!(
+                    "{:>2} {class:<10} {:>5} {:>6}..{:<6} {:>9} {:>7} {:>9} {:>7} {:>8} {:>3} {:>8} {:>6} {:>5} {:>5} {:>7} {:>6} {:>6} {:>7} {:>2} {:>2} | {:>4} {:>4} {:>4}",
+                    s.t,
+                    kbps(s.acked_bps),
+                    s.q_lo_ms,
+                    s.q_hi_ms,
+                    s.inflight,
+                    s.cwnd,
+                    s.ssthresh,
+                    s.rwnd,
+                    s.pending,
+                    s.empties,
+                    s.buffered,
+                    opt(s.ack_min_ms),
+                    kbps(s.sent_bps),
+                    kbps(s.rx_bps),
+                    opt(s.transit_ms),
+                    opt(s.growth_ms),
+                    s.blocked_ms,
+                    opt(s.goodput_bps.map(|b| b / 1000)),
+                    s.fast_rtx,
+                    s.t3,
+                    opt(g.bdp_pct),
+                    opt(g.rtt_over_ms),
+                    opt(g.transit_over_ms),
+                );
+            }
+            for (name, (a, b, c, d)) in readings(r) {
+                println!("   {name:<40} loaded {a:>2}/{b:<2} other {c:>2}/{d:<2}");
+            }
+            let b = &r.belief;
+            println!(
+                "   viewer windows {}: offered over arrival {}; max rx {} kbit/s; invalid {}, \
+                 congested {}, capacities link {} goodput {}; pipe (anchor, floor, capacity) = \
+                 ({}, {}, {}) kbit/s",
+                b.windows,
+                b.offered,
+                b.max_rx / 1000,
+                b.invalid,
+                b.congested,
+                b.link_capacities,
+                b.goodput_capacities,
+                opt(b.anchor.map(|v| v / 1000)),
+                opt(b.floor.map(|v| v / 1000)),
+                opt(b.capacity.map(|v| v / 1000)),
+            );
+            // FR-148 P0 — the delivery sampler's samples, and its lines as the
+            // daemon writes them.
+            for c in &r.samples {
+                let q = c.sample.queue;
+                let class = format!("{:?}", c.sample.class);
+                println!(
+                    "   sampler: seconds {:>2}..={:<2} {class:<10} {:>7} B in {} ms, least {} ms, standing {} ms{}{}",
+                    c.rows.start + 1,
+                    c.rows.end,
+                    c.sample.bytes,
+                    c.sample.ms,
+                    opt(q.and_then(|q| q.least_ms)),
+                    opt(q.and_then(|q| q.standing_ms)),
+                    if c.loaded(&r.rows) { ", loaded" } else { "" },
+                    if c.queued() { ", queued" } else { "" },
+                );
+            }
+            for l in &r.lines {
+                print!("   {}", super::super::tests::logged(|| emit(sid(), l)));
+            }
+        }
+
+        fn print_windows(r: &TcpRun) {
+            for w in &r.windows {
+                println!(
+                    "   window to {:>6} ms ({:>4} ms): rx {:>5} sent {:>5} kbit/s, \
+                     growth {:>5} ms, transit {:>5} ms (+{})",
+                    w.end_us / 1000,
+                    w.ms,
+                    w.rx_bps / 1000,
+                    w.sent_bps / 1000,
+                    w.growth_ms,
+                    w.transit_ms,
+                    w.excess_ms
+                );
+            }
+        }
+
+        fn shape(bps: u64, queue: Duration, path: OpenPath) -> Shape {
+            Shape {
+                bps,
+                queue,
+                path,
+                offer_pct: 150,
+                skip_over: false,
+                stalls: None,
+                sparse: false,
+                seconds: SAMPLES,
+            }
+        }
+
+        /// FR-148 P0 — the delivery sampler's queued samples: at least half of
+        /// those whose seconds were all loaded.
+        fn sampler_reads_the_queue(r: &TcpRun) {
+            let name = r.shape.name();
+            let loaded: Vec<&Covered> = r.samples.iter().filter(|c| c.loaded(&r.rows)).collect();
+            let queued = loaded.iter().filter(|c| c.queued()).count();
+            assert!(
+                !loaded.is_empty(),
+                "{name}: no sample of the sampler's was loaded"
+            );
+            assert!(
+                queued * 2 >= loaded.len(),
+                "{name}: {queued} of {} loaded samples read queued",
+                loaded.len()
+            );
+        }
+
+        /// FR-148 P0 — the delivery sampler's lines carry the gauges and read
+        /// no queued sample.
+        fn sampler_reads_no_queue(r: &TcpRun) {
+            let name = r.shape.name();
+            assert!(!r.lines.is_empty(), "{name}: no line");
+            for l in &r.lines {
+                let q = l
+                    .queue
+                    .unwrap_or_else(|| panic!("{name}: a line without gauges: {l:?}"));
+                assert_eq!(q.queued, 0, "{name}: {l:?}");
+            }
+            assert!(
+                r.samples.iter().all(|c| !c.queued()),
+                "{name}: {:?}",
+                r.samples
+            );
+        }
+
+        /// The hypothesis: on the deep, lossless queue, fewer than half the
+        /// loaded seconds read backlogged.
+        async fn deep(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            assert_eq!(
+                r.tail_drops,
+                0,
+                "{}: the deep queue drops nothing",
+                shape.name()
+            );
+            let loaded: Vec<&Second> = r.rows.iter().filter(|s| s.q_lo_ms > LOADED_MS).collect();
+            let backlogged = loaded
+                .iter()
+                .filter(|s| s.class == Class::Backlogged)
+                .count();
+            let all = r
+                .rows
+                .iter()
+                .filter(|s| s.class == Class::Backlogged)
+                .count();
+            assert!(
+                !loaded.is_empty(),
+                "{}: the link's queue never stayed over {LOADED_MS} ms for a second; \
+                 {all} of {} seconds read backlogged",
+                shape.name(),
+                r.rows.len()
+            );
+            // In the first runs SCTP's own acknowledgement delay over its
+            // least read every loaded second, the lowest 343 ms over the
+            // least. The pin is at half the loaded seconds, so that a busy
+            // runner cannot flip it (FR-148 D44); the measured numbers are
+            // in `docs/rate-control.md`.
+            let queued = r
+                .rows
+                .iter()
+                .zip(signals_of(&r.rows))
+                .filter(|(s, g)| {
+                    s.q_lo_ms > LOADED_MS && g.rtt_over_ms.is_some_and(|v| v >= RTT_OVER_MS)
+                })
+                .count();
+            assert!(
+                queued * 2 >= loaded.len(),
+                "{}: the acknowledgement delay read {queued} of {} loaded seconds",
+                shape.name(),
+                loaded.len()
+            );
+            sampler_reads_the_queue(&r);
+            // The hypothesis, last.
+            assert!(
+                backlogged * 2 < loaded.len(),
+                "{}: {backlogged} of {} loaded seconds read backlogged",
+                shape.name(),
+                loaded.len()
+            );
+        }
+
+        /// The UDP shape: the same writer over a queue that drops.
+        async fn control(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            assert!(r.tail_drops > 0, "{}: the control drops", shape.name());
+            assert!(
+                r.rows.iter().all(|s| s.q_hi_ms <= LOADED_MS),
+                "{}: the control's queue passed {LOADED_MS} ms",
+                shape.name()
+            );
+            // A pin of the first run's numbers: no false reading here.
+            let worst = signals_of(&r.rows)
+                .iter()
+                .filter_map(|g| g.rtt_over_ms)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst < RTT_OVER_MS,
+                "{}: the acknowledgement delay rose {worst} ms over its least",
+                shape.name()
+            );
+            sampler_reads_no_queue(&r);
+        }
+
+        /// FR-148 P0 — a still screen: one small message a second. Each
+        /// sample is two lone packets, whose SACKs the viewer may hold, and
+        /// none acknowledges enough bytes to count, so none is queued.
+        async fn sparse(queue: Duration) {
+            let shape = Shape {
+                sparse: true,
+                seconds: SPARSE_SECONDS,
+                ..shape(2_000_000, queue, OpenPath::InitAck)
+            };
+            let r = run(shape).await;
+            print_run(&r);
+            let name = shape.name();
+            // A still screen's message is 200 bytes a second, which never
+            // passes `counts`' byte bound, so two samples show the guard
+            // holds. The first runs took five (FR-148 D44).
+            assert!(r.samples.len() >= 2, "{name}: {:?}", r.samples);
+            for c in &r.samples {
+                let q = c
+                    .sample
+                    .queue
+                    .unwrap_or_else(|| panic!("{name}: a sample without gauges: {c:?}"));
+                assert!(
+                    !counts(c.sample.ms, c.sample.bytes, q.gauges.max_payload),
+                    "{name}: a still screen's sample counted: {c:?}"
+                );
+            }
+            assert!(
+                r.samples
+                    .iter()
+                    .any(|c| c.sample.queue.is_some_and(|q| q.least_ms.is_some())),
+                "{name}: no SACK gave a delay: {:?}",
+                r.samples
+            );
+            sampler_reads_no_queue(&r);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_still_screen_on_the_deep_queue_reads_no_queue() {
+            sparse(DEEP).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_still_screen_on_the_shallow_queue_reads_no_queue() {
+            sparse(SHALLOW).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: the peer's 1 MiB window binds at 8 s, then 12 of 19 loaded seconds read backlogged"]
+        async fn deep_2_mbps_path_i_reads_under_half_backlogged() {
+            deep(shape(2_000_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C keeps the backlog in SCTP's queue: never loaded, 19 of 20 seconds backlogged"]
+        async fn deep_2_mbps_path_c_reads_under_half_backlogged() {
+            deep(shape(2_000_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn deep_0_4_mbps_path_i_reads_under_half_backlogged() {
+            deep(shape(400_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C reads backlogged on 12 of 12 loaded seconds"]
+        async fn deep_0_4_mbps_path_c_reads_under_half_backlogged() {
+            deep(shape(400_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn deep_2_mbps_path_i_with_the_pump_skip_reads_under_half_backlogged() {
+            let shape = Shape {
+                skip_over: true,
+                ..shape(2_000_000, DEEP, OpenPath::InitAck)
+            };
+            deep(shape).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: as without the skip: never loaded, 19 of 20 seconds backlogged"]
+        async fn deep_2_mbps_path_c_with_the_pump_skip_reads_under_half_backlogged() {
+            let shape = Shape {
+                skip_over: true,
+                ..shape(2_000_000, DEEP, OpenPath::CookieEcho)
+            };
+            deep(shape).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_2_mbps_path_i_control() {
+            control(shape(2_000_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_2_mbps_path_c_control() {
+            control(shape(2_000_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_0_4_mbps_path_i_control() {
+            control(shape(400_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_0_4_mbps_path_c_control() {
+            control(shape(400_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        /// The stall cells' shape: a lossless link that stalls, under a writer
+        /// that never offers the link's rate.
+        fn stalled(path: OpenPath) -> Shape {
+            Shape {
+                offer_pct: 80,
+                stalls: Some((STALL_EVERY, STALL_FOR)),
+                ..shape(2_000_000, DEEP, path)
+            }
+        }
+
+        /// Head-of-line stalls on a lossless link: the viewer window after a
+        /// stall carries the stall's bytes too, and `Pipe`'s floor takes
+        /// every window.
+        async fn stalls(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            print_windows(&r);
+            let link = shape.payload_bps();
+            let floor = u64::from(r.belief.floor.unwrap_or(0));
+            assert!(
+                floor * 10 > link * 13,
+                "{}: floor {floor} bit/s on a link of {link}",
+                shape.name()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): it pins a defect, Pipe's floor taking the window after a stall"]
+        async fn stalls_2_mbps_path_i_lift_the_floor_over_the_link() {
+            stalls(stalled(OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C's window caps what the link carries in a stall: floor 1.27 to 1.28 x the link in 20 s"]
+        async fn stalls_2_mbps_path_c_lift_the_floor_over_the_link() {
+            stalls(stalled(OpenPath::CookieEcho)).await;
+        }
+
+        /// The lab's shape on TCP: 1.5 times the link under the pump's skip,
+        /// whose watermark holds a standing queue of about a second, and the
+        /// stalls under it. What a stall holds is already queued, so the
+        /// window after it carries the link's rate for the stall's length on
+        /// top of its own second.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): it pins a defect, Pipe's floor taking the window after a stall"]
+        async fn stalls_under_the_pump_skip_2_mbps_path_i_lift_the_floor_over_the_link() {
+            stalls(Shape {
+                offer_pct: 150,
+                skip_over: true,
+                ..stalled(OpenPath::InitAck)
+            })
+            .await;
+        }
     }
 }

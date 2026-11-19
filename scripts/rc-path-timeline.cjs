@@ -13,7 +13,8 @@
 //
 //   | Section    | Lines read (message text, by call site)                                  |
 //   |------------|--------------------------------------------------------------------------|
-//   | carrier    | `session carrier recorded (FR-102 P9c)` (session_carrier.rs),            |
+//   | carrier    | `session carrier recorded (FR-102 P9c)` (session_carrier.rs), with its   |
+//   |            | `relay_transport` (FR-148 P0: what carries the agent's TURN allocation), |
 //   |            | `per-session ICE path detected (adaptive bitrate)` (carrier_rank.rs),    |
 //   |            | `rc ICE: overlay …` (peer.rs, rc_overlay.rs),                            |
 //   |            | `rc ICE: carrier rank (FR-148 P4)` and `…, the mesh link 10 s on …`      |
@@ -22,7 +23,10 @@
 //   | rate       | `FFmpeg DC pump heartbeat (≈2s window)`, `VP9-444 DC pump heartbeat…`    |
 //   |            | (peer.rs): bytes_written and frames_sent are CUMULATIVE per pump         |
 //   | delivery   | `path delivery (FR-148 P0, shadow, ≈10s)`, `path model (…)`              |
-//   |            | (media_delivery.rs)                                                      |
+//   |            | (media_delivery.rs); a delivery line with a queued sample prints as a    |
+//   |            | `queue` event: `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low`   |
+//   | open       | `path open (FR-148 P0, O10)` (media_delivery.rs): once a pump, at its    |
+//   |            | first media write, which way SCTP opened the association (FR-148 O10)    |
 //   | memory     | `FR-148 P1 path memory: the pair's entry at the open` / `…: what the     |
 //   |            | close wrote` (media_pair_memory.rs), `FR-148 P1 rate memory: …`          |
 //   |            | (encode/rate_memory.rs)                                                  |
@@ -81,7 +85,7 @@
 //   THE ESTIMATE, a ten-hour window with eight hours of sessions, FFmpeg pump:
 //   heartbeats one per ≈2 s (14,400), delivery and model lines one each per
 //   10 s (2,880 + 2,880), capture-timing lines one per 30 s of capture (960),
-//   and a few dozen carrier, encoder and memory lines a session: about 21,200
+//   and a few dozen carrier, encoder, open and memory lines a session: about 21,200
 //   rows. A projected heartbeat is about 600 bytes of JSON and the others
 //   about 300: about 11 MB through `--rows`, and a report of a few thousand
 //   lines (minute rows by default). The documents examined are this agent's
@@ -140,6 +144,7 @@ const KINDS = [
   { k: 'rejected', re: /^ffmpeg open_as_with rejected the quality options/, src: ['encode/ffmpeg/encoder.rs', 'ffmpeg open_as_with rejected the quality options'] },
   { k: 'delivery', re: /^path delivery \(FR-148 P0/, src: ['media_delivery.rs', 'path delivery (FR-148 P0, shadow, ≈10s)'] },
   { k: 'model', re: /^path model \(FR-148 P0/, src: ['media_delivery.rs', 'path model (FR-148 P0, shadow, ≈10s)'] },
+  { k: 'open', re: /^path open \(FR-148 P0, O10\)/, src: ['media_delivery.rs', 'path open (FR-148 P0, O10)'] },
   { k: 'memOpen', re: /^FR-148 P1 path memory: the pair's entry at the open/, src: ['media_pair_memory.rs', "FR-148 P1 path memory: the pair's entry at the open"] },
   { k: 'memClose', re: /^FR-148 P1 path memory: what the close wrote/, src: ['media_pair_memory.rs', 'FR-148 P1 path memory: what the close wrote'] },
   { k: 'rateMem', re: /^FR-148 P1 rate memory/, src: ['encode/rate_memory.rs', "FR-148 P1 rate memory: the pair's entry has no measured provenance"] },
@@ -187,6 +192,7 @@ const FIELDS = [
   'window_ms',
   // carrier + ICE (session_carrier.rs, carrier_rank.rs)
   'carrier',
+  'relay_transport',
   'local_typ',
   'remote_typ',
   'relay',
@@ -219,9 +225,26 @@ const FIELDS = [
   'backlogged_bps',
   'app_limited_bps',
   'stalled_ms',
+  // the standing queue (FR-148 P0), on a delivery line that carries it; its
+  // `cwnd`, a pair there, leaves under the open line's name below
+  'standing_ms',
+  'queued',
+  'inflight',
+  'rwnd_low',
   'viewer_rx_bps',
   'model_capacity_bps',
   'model_floor_bps',
+  // open path (media_delivery.rs, FR-148 O10)
+  'pump',
+  'open_path',
+  'ssthresh',
+  'rwnd',
+  'cwnd',
+  'inflight_bytes',
+  'pending_bytes',
+  'max_payload',
+  'fast_retransmits',
+  't3_expiries',
   // rate memory (encode/rate_memory.rs) — its `peer` never leaves
   'assumed_bps',
   'age_s',
@@ -234,6 +257,16 @@ const FIELDS = [
  *  `samples_not_counted` only; #4029 adds the rest). FR-148 O7. */
 const O7_COUNTED = ['samples_counted', 'samples_counted_overproduced', 'samples_counted_clear'];
 const O7_ASIDE = ['samples_unread', 'samples_viewer_late', 'samples_under_plan', 'samples_not_counted'];
+
+/** The open line's answers, as the device row counts them (FR-148 O10):
+ *  path C, path I, a loss before the first write, no gauges. */
+const OPEN_PATHS = ['cookie_echo', 'init_ack', 'unknown', 'unread'];
+/** The open line's fields, in the order media_delivery.rs `emit_open` writes
+ *  them. Each is in FIELDS too. */
+const OPEN_FIELDS = ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'];
+/** What a `queue` event prints of a delivery line with a queued sample, as
+ *  media_delivery.rs `emit` names them (FR-148 P0). Each is in FIELDS too. */
+const QUEUE_FIELDS = ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low'];
 
 // ---------------------------------------------------------------- values
 
@@ -280,6 +313,15 @@ function text(v) {
   if (some) s = some[1].trim();
   if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') s = s.slice(1, -1);
   return s === '' ? null : s;
+}
+
+/** A Debug tuple of two integers, `(a, b)`, bare or inside `Some(…)`; null for
+ *  `None`. The delivery line's `standing_ms` has this shape. A copy of
+ *  rc-path-report.cjs `couple`, so both read the field alike. */
+function couple(v) {
+  const s = text(v);
+  const m = s && /^\(\s*(\d+)\s*,\s*(\d+)\s*\)$/.exec(s);
+  return m ? [Number(m[1]), Number(m[2])] : null;
 }
 
 /** `<bps>/<basis>/<age>ms` (media_delivery.rs `Shown`), or null. */
@@ -450,9 +492,13 @@ function finishSession(s, windowEnd) {
   const ka = { frames: 0, bytes: 0, carried: 0, missing: 0 };
   const cap = { judged: 0, at: 0, nominal: 0 };
   const enc = { opens: 0, qsv: 0, rejected: 0 };
-  const del = { windows: 0, stalled: 0, longestMs: 0, stalledMs: 0 };
+  // FR-148 P0: `carried` counts the lines with the standing queue's fields,
+  // `queued` those with a queued sample, `standingHigh` the highest standing.
+  const del = { windows: 0, stalled: 0, longestMs: 0, stalledMs: 0, carried: 0, queued: 0, standingHigh: null };
   const model = { n: 0, lastRx: null, maxRx: null, lastCap: null };
   let lastModelKey = null;
+  // FR-148 O10: the open lines, and the first one's answer.
+  const open = { n: 0, path: null, ssthresh: null, rwnd: null };
   const mem = { open: [], close: [], rate: [] };
   let carrier = null;
   let carrierAt = null;
@@ -530,7 +576,7 @@ function finishSession(s, windowEnd) {
       case 'carrier':
         carrier = text(f.carrier);
         if (carrierAt === null) carrierAt = r.t - s.first;
-        push(r.t, 'carrier', kv(f, ['carrier', 'local_typ', 'remote_typ']));
+        push(r.t, 'carrier', kv(f, ['carrier', 'relay_transport', 'local_typ', 'remote_typ']));
         break;
       case 'ice':
         push(r.t, 'ice', kv(f, ['relay', 'local_typ', 'local_proto', 'remote_typ', 'remote_proto', 'waited_ms', 'opening']));
@@ -567,6 +613,18 @@ function finishSession(s, windowEnd) {
           del.longestMs = Math.max(del.longestMs, st);
           push(r.t, 'stall', kv(f, ['span_ms', 'delivery_samples', 'backlogged_bps', 'app_limited_bps', 'stalled_ms']));
         }
+        // FR-148 P0: the standing queue, on a line that carries it (an older
+        // agent's does not). The highest standing is over every such line.
+        const queued = num(f.queued);
+        if (queued !== null) {
+          del.carried++;
+          const standing = couple(f.standing_ms);
+          if (standing) del.standingHigh = del.standingHigh === null ? standing[1] : Math.max(del.standingHigh, standing[1]);
+          if (queued >= 1) {
+            del.queued++;
+            push(r.t, 'queue', kv(f, QUEUE_FIELDS));
+          }
+        }
         break;
       }
       case 'model': {
@@ -583,6 +641,11 @@ function finishSession(s, windowEnd) {
         }
         break;
       }
+      case 'open':
+        // One a pump: the session's first is its answer.
+        if (open.n++ === 0) Object.assign(open, { path: text(f.open_path), ssthresh: num(f.ssthresh), rwnd: num(f.rwnd) });
+        push(r.t, 'open', kv(f, OPEN_FIELDS));
+        break;
       case 'memOpen':
         mem.open.push(f);
         push(r.t, 'memory', `open: ${kv(f)}`);
@@ -626,6 +689,7 @@ function finishSession(s, windowEnd) {
     enc,
     del,
     model,
+    open,
     mem,
     capTiming,
     openAtEnd: windowEnd !== null && windowEnd !== undefined && s.last >= windowEnd - OPEN_AT_END_MS,
@@ -648,12 +712,22 @@ function deviceOf(list, unattributed) {
     // Capture-timing lines outside every session count here too.
     capTiming: unattributed.capTiming || 0,
     pipes: {},
+    // FR-148 O10: sessions by their first open line's answer, and those with none.
+    openPaths: {},
+    noOpenLine: 0,
     unattributed,
   };
   for (const k of O7_COUNTED.concat(O7_ASIDE)) d.o7[k] = { sum: 0, carried: 0, missing: 0 };
+  for (const k of OPEN_PATHS) d.openPaths[k] = 0;
   for (const s of list) {
     const x = s.summary;
     for (const k of Object.keys(x.pipes)) d.pipes[k] = (d.pipes[k] || 0) + x.pipes[k];
+    if (!x.open.n) d.noOpenLine++;
+    else {
+      // An answer from a later agent counts under its own word.
+      const p = dash(x.open.path);
+      d.openPaths[p] = (d.openPaths[p] || 0) + 1;
+    }
     const c = x.carrier || 'unknown (no carrier line)';
     d.byCarrier[c] = (d.byCarrier[c] || 0) + 1;
     if (x.rankOn) {
@@ -758,9 +832,12 @@ function render(r) {
     L.push(`| heartbeats / without counters / counter resets / holes | ${x.heartbeats} / ${x.heartbeatsWithoutCounters} / ${x.resets} / ${x.holes} |`);
     L.push(`| encoder: opens / QVBR opens / rejected quality options | ${x.enc.opens} / ${x.enc.qsv} / ${x.enc.rejected} |`);
     L.push(`| delivery: windows / stalled / share / longest stall | ${x.del.windows} / ${x.del.stalled} / ${pct(x.del.stalled, x.del.windows)} / ${x.del.windows ? x.del.longestMs + ' ms' : '-'} |`);
+    L.push(`| delivery: windows with a queued sample / carrying the standing queue / highest standing | ${x.del.carried ? x.del.queued : '-'} / ${x.del.carried} / ${x.del.standingHigh === null ? '-' : x.del.standingHigh + ' ms'} |`);
     const rx = x.model.lastRx;
     const mc = x.model.lastCap;
     L.push(`| path model: lines / last viewer_rx (basis, age) / highest viewer_rx / last model_capacity (basis) | ${x.model.n} / ${rx ? `${dash(rx.bps)} (${dash(rx.basis || rx.raw)}, ${dash(rx.ageMs)} ms)` : '-'} / ${dash(x.model.maxRx)} / ${mc ? `${dash(mc.bps)} (${dash(mc.basis || mc.raw)})` : '-'} |`);
+    const op = x.open;
+    L.push(`| open path / ssthresh / rwnd at the first write | ${dash(op.path)} / ${dash(op.ssthresh)} / ${dash(op.rwnd)}${op.n > 1 ? ` (the first of ${op.n} open lines)` : ''} |`);
     L.push(`| path memory: opens / closes / rate-memory lines | ${x.mem.open.length} / ${x.mem.close.length} / ${x.mem.rate.length} |`);
     L.push(`| keepalive: heartbeats carrying it / frames / bytes | ${x.ka.carried} of ${x.heartbeats} / ${x.ka.carried ? x.ka.frames : '-'} / ${x.ka.carried ? x.ka.bytes : '-'} |`);
     L.push(`| keepalive: bytes per frame / maxrate ÷ fps ÷ 8 at the last heartbeat | ${x.ka.frames ? Math.round(x.ka.bytes / x.ka.frames) : '-'} / ${x.pad === null ? '-' : Math.round(x.pad)} |`);
@@ -783,6 +860,7 @@ function render(r) {
   }
   L.push(`| delivery windows stalled, all sessions | ${d.stalledWindows} of ${d.windows} (${pct(d.stalledWindows, d.windows)}), longest ${d.windows ? d.longestStallMs + ' ms' : '-'} |`);
   L.push(`| heartbeat windows transit-stalled, all sessions (AC22) | ${pipeCells(d.pipes).share} |`);
+  L.push(`| sessions by open path (O10) | ${Object.keys(d.openPaths).map((k) => `${k} ${d.openPaths[k]}`).join(', ')}; no open line ${d.noOpenLine} |`);
   L.push(`| path-memory closes by wrote / why | ${Object.keys(d.closesBy).map((k) => `${k}: ${d.closesBy[k]}`).join('; ') || '-'} |`);
   for (const k of O7_COUNTED.concat(O7_ASIDE)) {
     const v = d.o7[k];
@@ -1127,6 +1205,13 @@ function selfTest() {
     }
     const pm = fs.readFileSync(path.join(src, 'media_pair_memory.rs'), 'utf8');
     for (const k of O7_COUNTED.concat(O7_ASIDE, ['taken', 'taken_why', 'wrote', 'why'])) check(`source: close/open field ${k}`, pm.includes(`"${k}"`));
+    const md = fs.readFileSync(path.join(src, 'media_delivery.rs'), 'utf8');
+    for (const k of OPEN_FIELDS) check(`source: open line field ${k}`, md.includes(`${k} = `));
+    for (const k of OPEN_PATHS) check(`source: open line answer ${k}`, md.includes(`"${k}"`));
+    // FR-148 P0: the delivery line's standing-queue fields, as `emit` writes them.
+    for (const k of QUEUE_FIELDS) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??q\\.${k},`).test(md));
+    const sc = fs.readFileSync(path.join(src, 'session_carrier.rs'), 'utf8');
+    check('source: carrier line field relay_transport', /\brelay_transport = relay\.as_str\(\),/.test(sc));
   } catch (e) {
     check('source files readable', false, e.message);
   }
@@ -1146,6 +1231,15 @@ function selfTest() {
   rows.push({ t: at(2.6), m: 'ffmpeg open_as_with rejected the quality options — retrying with encoder defaults', f: { encoder: 'hevc_nvenc', open_err: 'Operation not permitted' } });
   rows.push({ t: at(3), m: 'FR-148: the QSV encoder opened at QVBR, its target under its cap', f: { encoder: 'hevc_qsv', rate_control: 'qvbr', fallback: false, bit_rate_bps: 2700000, maxrate_bps: 3000000 } });
   rows.push({ t: at(3), m: 'ffmpeg encoder opened (constant-quality + maxrate cap)', f: { encoder: 'hevc_qsv', width: 1920, height: 1080, fps: 30, cq: 22, maxrate_bps: 3000000, input: 'cpu' } });
+  // FR-148 O10: the first write opened on the peer's COOKIE ECHO; the reopen's
+  // pump writes a second open line, after a loss, which is not the answer.
+  const openFx = (sec, sid, pump, open_path, ssthresh, rwnd, o) => ({
+    t: at(sec),
+    m: 'path open (FR-148 P0, O10)',
+    f: Object.assign({ session_id: sid, pump, open_path, ssthresh, rwnd, cwnd: 4380, inflight_bytes: 0, pending_bytes: 2404, max_payload: 1188, fast_retransmits: 0, t3_expiries: 0 }, o),
+  });
+  rows.push(openFx(3.5, FX.s1, 'ffmpeg-dc', 'cookie_echo', 0, 1043200));
+  rows.push(openFx(51, FX.s1, 'ffmpeg-dc', 'unknown', 17520, 1040800, { fast_retransmits: 2 }));
   // Heartbeats every 2 s from 4 s to 100 s: 250 kB/s cumulative = 2 Mbit/s, 25 fps.
   for (let sec = 4, i = 0; sec <= 100; sec += 2, i++) {
     const o = { bytes_written: 500000 * i, frames_sent: 50 * i };
@@ -1182,6 +1276,7 @@ function selfTest() {
   // Session 2, back to back, with the OLD (0.4.225) close; open at the window end.
   rows.push({ t: at(104), m: 'rc ICE: carrier rank (FR-148 P4)', f: { session: FX.s2, carrier_rank: 'prio', link: 'direct' } });
   rows.push({ t: at(105), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: FX.s2, carrier: 'direct', local_typ: 'Host', remote_typ: 'Srflx' } });
+  rows.push(openFx(105.5, FX.s2, 'vp9-444-dc', 'init_ack', 1048576, 1046020, { pending_bytes: 0 }));
   for (let sec = 106, i = 0; sec <= 200; sec += 2, i++) rows.push(hbRow(sec, FX.s2, { bytes_written: 1000000 * i, frames_sent: 60 * i, target_bps: 6000000, maxrate_bps: 'Some(6000000)' }));
   rows.push({ t: at(150), m: 'FR-148 P1 path memory: what the close wrote', f: { session_id: FX.s2 }, fm: { session_id: FX.s2, key_id: 'f148f148a002', wrote: 'nothing', why: 'not_constrained', samples_not_counted: 2, record_ended: false, frozen: false } });
   // Out of order: reverse the whole set.
@@ -1217,7 +1312,18 @@ function selfTest() {
   check('AC13: 900 bytes a keepalive beside maxrate ÷ fps ÷ 8', s1.summary.ka.bytes / s1.summary.ka.frames === 900 && Math.round(s1.summary.pad) === 8333);
   check('O7: new close summed, old close counted as without', r.device.o7.samples_viewer_late.sum === 3 && r.device.o7.samples_viewer_late.missing === 1 && r.device.o7.samples_not_counted.sum === 3 && r.device.o7.samples_not_counted.missing === 0);
   check('closes by wrote/why, unknown why kept', r.device.closesBy['wrote=floor why=a_reason_from_the_future'] === 1 && r.device.closesBy['wrote=nothing why=not_constrained'] === 1);
+  check(
+    "open: a session's first open line is its answer",
+    s1.summary.open.n === 2 && s1.summary.open.path === 'cookie_echo' && s1.summary.open.ssthresh === 0 && s1.summary.open.rwnd === 1043200 && s2.summary.open.n === 1 && s2.summary.open.path === 'init_ack',
+    JSON.stringify([s1.summary.open, s2.summary.open]),
+  );
   const out = render(r);
+  check('open: the line among the session\'s lines, every field in order', /^  07:00:03\.500  open     pump=ffmpeg-dc open_path=cookie_echo ssthresh=0 rwnd=1043200 cwnd=4380 inflight_bytes=0 pending_bytes=2404 max_payload=1188 fast_retransmits=0 t3_expiries=0$/m.test(out));
+  check(
+    'open: the session rows',
+    /^\| open path \/ ssthresh \/ rwnd at the first write \| cookie_echo \/ 0 \/ 1043200 \(the first of 2 open lines\) \|$/m.test(out) && /^\| open path \/ ssthresh \/ rwnd at the first write \| init_ack \/ 1048576 \/ 1046020 \|$/m.test(out),
+  );
+  check('open: the device row', /^\| sessions by open path \(O10\) \| cookie_echo 1, init_ack 1, unknown 0, unread 0; no open line 0 \|$/m.test(out), (out.match(/^\| sessions by open path.*$/m) || [''])[0]);
   check('unknown field printed as it is', /brand_new_field=x42/.test(out));
   check('taken and taken_why printed', /taken=today/.test(out) && /taken_why=shadow_mode/.test(out));
   check('no undefined or NaN anywhere', !/undefined|NaN/.test(out), (out.match(/.{0,40}(undefined|NaN).{0,40}/) || [''])[0]);
@@ -1232,6 +1338,62 @@ function selfTest() {
   );
   check('an all-digit session id keeps every digit', lone.sessions.length === 1 && lone.sessions[0].sid === digits, lone.sessions[0] && lone.sessions[0].sid);
   check('a capture-timing line in no session counts in the device total', lone.device.capTiming === 1 && lone.device.unattributed.capTiming === 1);
+  // FR-148 O10: a session for each answer, and one with no open line.
+  const oid = (x) => `f1480000000000000000${x}`;
+  const four = render(
+    fold(
+      [
+        openFx(10, oid('c0e1'), 'ffmpeg-dc', 'cookie_echo', 0, 1043200),
+        openFx(20, oid('c0e2'), 'vp9-444-dc', 'init_ack', 1048576, 1046020),
+        openFx(30, oid('c0e3'), 'ffmpeg-dc', 'unknown', 17520, 1040800, { t3_expiries: 1 }),
+        { t: at(40), m: 'path open (FR-148 P0, O10)', f: { session_id: oid('c0e4'), pump: 'ffmpeg-dc', open_path: 'unread' } },
+        { t: at(50), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: oid('c0e5'), carrier: 'direct' } },
+      ],
+      { to: at(600) },
+    ),
+  );
+  check('open: the device row counts each answer, and the sessions with no open line', /^\| sessions by open path \(O10\) \| cookie_echo 1, init_ack 1, unknown 1, unread 1; no open line 1 \|$/m.test(four), (four.match(/^\| sessions by open path.*$/m) || [''])[0]);
+  check(
+    'open: an unread line prints what it carries, and the summary dashes the rest',
+    /^  07:00:40\.000  open     pump=ffmpeg-dc open_path=unread$/m.test(four) &&
+      /^\| open path \/ ssthresh \/ rwnd at the first write \| unread \/ - \/ - \|$/m.test(four) &&
+      /^\| open path \/ ssthresh \/ rwnd at the first write \| - \/ - \/ - \|$/m.test(four),
+  );
+  // FR-148 P0: the relay transport and the standing queue. A session on TURN
+  // over TCP: a delivery line with two queued samples, one with none. And an
+  // older agent's session, whose delivery line carries no queue fields.
+  const sq = fold(
+    [
+      { t: at(10), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: oid('5a01'), carrier: 'turn', relay_transport: 'tcp', local_typ: 'Relay', remote_typ: 'Relay' } },
+      {
+        t: at(20),
+        m: 'path delivery (FR-148 P0, shadow, ≈10s)',
+        f: { session_id: oid('5a01'), span_ms: 9994, delivery_samples: '(0, 5, 0)', backlogged_bps: 'None', app_limited_bps: 'Some(391566)', stalled_ms: 0, standing_ms: 'Some((40, 610))', queued: 2, inflight: '(327500, 540000)', cwnd: '(332780, 544380)', rwnd_low: 508576 },
+      },
+      {
+        t: at(30),
+        m: 'path delivery (FR-148 P0, shadow, ≈10s)',
+        f: { session_id: oid('5a01'), span_ms: 10002, delivery_samples: '(0, 5, 0)', backlogged_bps: 'None', app_limited_bps: 'Some(52000)', stalled_ms: 0, standing_ms: 'Some((0, 19))', queued: 0, inflight: '(0, 2400)', cwnd: '(544380, 544380)', rwnd_low: 1046020 },
+      },
+      { t: at(40), m: 'path delivery (FR-148 P0, shadow, ≈10s)', f: { session_id: oid('5a02'), span_ms: 10000, delivery_samples: '(5, 0, 0)', backlogged_bps: 'Some((1, 2, 3))', app_limited_bps: 'None', stalled_ms: 0 } },
+    ],
+    { to: at(600) },
+  );
+  const sqOut = render(sq);
+  check('relay_transport: the carrier line prints it after the carrier', /^  07:00:10\.000  carrier  carrier=turn relay_transport=tcp local_typ=Relay remote_typ=Relay$/m.test(sqOut), (sqOut.match(/^.*  carrier  .*$/m) || [''])[0]);
+  check(
+    'queue: a delivery line with a queued sample is a queue row, with the fields it carries',
+    /^  07:00:20\.000  queue    queued=2 standing_ms=\(40, 610\) inflight=\(327500, 540000\) cwnd=\(332780, 544380\) rwnd_low=508576$/m.test(sqOut),
+    (sqOut.match(/^.*  queue  .*$/m) || [''])[0],
+  );
+  check('queue: a line with none queued, or none of the fields, is no row', (sqOut.match(/^ {2}\S+ {2}queue /gm) || []).length === 1);
+  const sd = sq.sessions.map((x) => x.summary.del);
+  check('queue: the session counts its queued windows, the lines carrying the fields, and the highest standing', sd[0].queued === 1 && sd[0].carried === 2 && sd[0].standingHigh === 610 && sd[1].queued === 0 && sd[1].carried === 0 && sd[1].standingHigh === null, JSON.stringify(sd));
+  check(
+    "queue: the session row, and an older agent's session reads - where it carries nothing",
+    /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| 1 \/ 2 \/ 610 ms \|$/m.test(sqOut) &&
+      /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| - \/ 0 \/ - \|$/m.test(sqOut),
+  );
   // 3. Masking: a full id and an address in a field print neither.
   const leak = fold(
     [
@@ -1278,6 +1440,14 @@ function selfTest() {
     'viewers leaves only as a number, every other named field as stored',
     JSON.stringify(fv.viewers) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.viewers' }, '$lines.fields.viewers', '$$REMOVE'] }) && FIELDS.every((k) => k === 'viewers' || fv[k] === '$lines.fields.' + k),
     JSON.stringify(fv.viewers),
+  );
+  check(
+    "open: the query's filter keeps the line, and its fields leave as stored",
+    new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && OPEN_FIELDS.every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
+  );
+  check(
+    "queue and relay transport: the delivery line's queue fields and the carrier line's relay_transport leave as stored",
+    QUEUE_FIELDS.concat(['relay_transport']).every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
   );
   // 6. --rows: one read's rows, masked as the report masks them. A third
   //    session whose id ends as session 1's does, its key as session 1's key,

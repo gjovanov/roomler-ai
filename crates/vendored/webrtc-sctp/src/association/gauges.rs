@@ -175,9 +175,17 @@ impl GaugeReader {
     /// The gauges now, lock-free. The least acknowledgement delay is the
     /// reader's to take: this take resets it, so it covers the SACKs since the
     /// previous take, and a second reader of the same association would take
-    /// from the first.
+    /// from the first. A reader that only looks uses [`GaugeReader::peek`].
     pub fn take(&self) -> Gauges {
         self.0.read(true)
+    }
+
+    /// roomler (FR-148 O10): the gauges now, lock-free, as [`GaugeReader::take`]
+    /// reads them, but resetting nothing: the least acknowledgement delay stays
+    /// for the next take, so a reader that only looks takes nothing from the
+    /// one that takes.
+    pub fn peek(&self) -> Gauges {
+        self.0.read(false)
     }
 
     /// Whether `self` and `other` read the same association.

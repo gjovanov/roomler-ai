@@ -642,8 +642,8 @@ impl Association {
     /// roomler (FR-148 P0): the congestion window, the slow start threshold,
     /// the peer's receive window, what is in flight and what waits, the loss
     /// events and the acknowledgement delay, read without this association's
-    /// lock (`gauges::GaugeReader::take`). The association stores them and
-    /// never reads them back.
+    /// lock (`gauges::GaugeReader::take`, or `peek` to reset nothing). The
+    /// association stores them and never reads them back.
     pub fn gauges(&self) -> gauges::GaugeReader {
         self.gauges.clone()
     }

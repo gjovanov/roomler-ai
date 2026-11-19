@@ -98,6 +98,12 @@
 #     holds its tests (one scripted exchange run with and without a reader,
 #     compared packet by packet; the acknowledgement delay; a clock gone
 #     backwards).
+#   - src/association/gauges.rs and src/association/mod.rs (FR-148 O10):
+#     `GaugeReader::peek`, the gauges read as `take` reads them but resetting
+#     nothing, so the agent's open-path line, which only looks, leaves the
+#     least acknowledgement delay to the reader that takes it.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its test (a peek between two SACKs, then a take).
 
 [package]
 edition = "2021"
