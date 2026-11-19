@@ -404,7 +404,7 @@ home, and uploads on its own row.
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C3 on the first release with #4063 (its lab cells are written for 0.4.228): the session processes' panels, read before anything is built | read only | not started; waits for #4063's release |
-| P1 | one row: the frames and the word on the delegation channel; the root daemon's session-panel ask in `show_prompt` (async, `PANEL_WITHIN`), after its read of `/dev/console`'s owner; the worker's handling, with its click through the app's road; the take-down; the logs; the switch; the tests above | `ROOMLERD_SESSION_PANEL=0` on the root daemon: master's chain with #4063's gate | not started; after #4063 merges |
+| P1 | one row: the frames and the word on the delegation channel; the root daemon's session-panel ask in `show_prompt` (async, `PANEL_WITHIN`), after its read of `/dev/console`'s owner; the worker's handling, with its click through the app's road; the take-down; the logs; the switch; the tests above | `ROOMLERD_SESSION_PANEL=0` on the root daemon: master's chain with #4063's gate | not started; after P0's read |
 | P2 | two rows, by D1: the per-user half's offer and its verbs on the person socket, or the app's word | the same switch on the root half; the verbs are additive, and an older root half refuses them | not started; waits for D1 |
 | P3 | the root daemon's own panel, by D2 | kept: nothing to switch. Removed: `ROOMLERD_ROOT_PANEL=1` restores it for one release | waits for D2, after P4's one-row read |
 | P4 | the field read: C4–C10 (C4b among them) with P1's candidate, C11–C16 with P2's, C17 and C18 with P3's, then C4–C8 and C11–C14 on a released build | read only | not started |
