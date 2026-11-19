@@ -1147,13 +1147,27 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 ///     cycle forever.
 ///   * `RESTART_REQUESTED_EXIT_CODE` (FR-84 D3) — a person asked for the
 ///     restart; the worker went through its graceful shutdown first.
+///   * `daemon_error::NO_ENROLLMENT_EXIT_CODE` (#4028) — the worker's account
+///     has no enrollment on this device: its state, not a crash. The worker
+///     records none either (#4023), and the backoff is an exit 1's.
 pub fn should_record_supervisor_crash(code: u32) -> bool {
     code != 0
         && code != crate::watchdog::STALL_EXIT_CODE as u32
         && code != crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
         && code != crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32
         && code != crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32
+        && code != crate::daemon_error::NO_ENROLLMENT_EXIT_CODE as u32
         && code != SESSION_TEARDOWN_EXIT_CODE
+}
+
+/// Phase 1B (Task 9), #4028 — the crash record of a worker's exit `code`, handed
+/// to `record`: `worker exit code {code}` for a code
+/// [`should_record_supervisor_crash`] records, and nothing for any other. The
+/// reap hands it the crash recorder.
+pub fn record_worker_exit_code(code: u32, record: impl FnOnce(&str)) {
+    if should_record_supervisor_crash(code) {
+        record(&format!("worker exit code {code}"));
+    }
 }
 
 /// Compute the next backoff duration given how many consecutive
@@ -1723,21 +1737,21 @@ pub fn run(
 
                             // Phase 1B (Task 9): record a crash
                             // sidecar so the next worker uploads it
-                            // to roomler.ai. The predicate explicitly
-                            // excludes STALL_EXIT_CODE — the watchdog
-                            // already recorded that case before
-                            // forcing exit; double-recording would
-                            // inflate fleet crash metrics (B2 from
-                            // the plan critique). Locked by
-                            // `should_record_supervisor_crash_*`
-                            // tests in this module.
-                            if should_record_supervisor_crash(code) {
+                            // to roomler.ai. The predicate leaves out
+                            // STALL_EXIT_CODE (the watchdog recorded
+                            // it before forcing exit; B2 from the plan
+                            // critique), #4028's no-enrollment code,
+                            // and the others it names. Locked by the
+                            // `should_record_supervisor_crash_*` and
+                            // `record_worker_exit_code` tests in this
+                            // module.
+                            record_worker_exit_code(code, |summary| {
                                 crate::crash_recorder::record(
                                     crate::crash_recorder::Reason::SupervisorDetected,
-                                    &format!("worker exit code {code}"),
+                                    summary,
                                     crate::crash_recorder::WriterContext::Supervisor,
-                                );
-                            }
+                                )
+                            });
                         }
                     }
                     current = None;
@@ -4081,5 +4095,141 @@ mod tests {
             "the control: a spawn with no handle list must be seen holding the decoy"
         );
         assert!(!bounded, "the command holds a pipe end it was not given");
+    }
+
+    // ─── #4028: a worker with no enrollment ─────────────────────────────────
+
+    const NO_ENROLLMENT: u32 = crate::daemon_error::NO_ENROLLMENT_EXIT_CODE as u32;
+
+    /// What the reap's call site hands the crash recorder for `code`.
+    fn recorded_for(code: u32) -> Vec<String> {
+        let mut written = Vec::new();
+        record_worker_exit_code(code, |summary| written.push(summary.to_owned()));
+        written
+    }
+
+    /// The field record: a second account with no enrollment signed in on a
+    /// per-Machine device, and the service wrote `worker exit code 1` for each of
+    /// its worker's exits. Its worker now exits with its own code, and the host
+    /// records nothing for it, through the predicate and through the call site.
+    #[test]
+    fn a_worker_with_no_enrollment_gets_no_crash_record_from_the_host() {
+        assert!(!should_record_supervisor_crash(NO_ENROLLMENT));
+        assert!(recorded_for(NO_ENROLLMENT).is_empty());
+        // The control: the exit it made before, 1, is recorded as it always was,
+        // with the same words.
+        assert_eq!(recorded_for(1), ["worker exit code 1"]);
+    }
+
+    /// The backoff is an exit 1's: the same arm and the same delays at every
+    /// rung of the ladder, the same uptime rule, the same alarm, and the next
+    /// worker is told the same of this end (nothing).
+    #[test]
+    fn a_worker_with_no_enrollment_backs_off_exactly_as_an_exit_1() {
+        for prior in (0..=12).chain([RESPAWN_ALARM_THRESHOLD, u32::MAX - 1, u32::MAX]) {
+            assert_eq!(
+                decide_exit_reaction(NO_ENROLLMENT, prior),
+                decide_exit_reaction(1, prior),
+                "with {prior} failures behind it"
+            );
+        }
+        // The ladder a doomed worker climbs, exit after exit in ~400 ms.
+        let climb = |code: u32| {
+            let mut failures = 0;
+            let mut backoffs = Vec::new();
+            for _ in 0..8 {
+                let prior = if reap_resets_counter(Duration::from_millis(400)) {
+                    0
+                } else {
+                    failures
+                };
+                let (reaction, next) = decide_exit_reaction(code, prior);
+                failures = next;
+                if let ExitReaction::Backoff(d) = reaction {
+                    backoffs.push(d.as_secs());
+                }
+            }
+            (backoffs, failures)
+        };
+        assert_eq!(climb(NO_ENROLLMENT), (vec![2, 4, 8, 16, 32, 60, 60, 60], 8));
+        assert_eq!(climb(NO_ENROLLMENT), climb(1));
+        // A run past the healthy threshold starts a fresh ladder, as for 1.
+        let prior = if reap_resets_counter(Duration::from_secs(600)) {
+            0
+        } else {
+            5
+        };
+        assert_eq!(
+            decide_exit_reaction(NO_ENROLLMENT, prior),
+            (ExitReaction::Backoff(Duration::from_secs(2)), 1)
+        );
+        // The next worker is told nothing of this end, as of an exit 1's.
+        assert_eq!(worker_end_is_no_crash(NO_ENROLLMENT), None);
+        assert_eq!(worker_end_is_no_crash(1), None);
+        // Only AGENT_DELETED takes the alarm's fast path; this code takes the
+        // count, as 1 does.
+        assert_ne!(
+            NO_ENROLLMENT,
+            crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+        );
+    }
+
+    /// Every other non-zero code records as before: each code up to 1024 but
+    /// the ones the host names, and every Windows status a worker can die with.
+    #[test]
+    fn every_other_non_zero_code_still_gets_its_record() {
+        let named = [
+            crate::watchdog::STALL_EXIT_CODE as u32,
+            crate::watchdog::AGENT_DELETED_EXIT_CODE as u32,
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32,
+            crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32,
+            NO_ENROLLMENT,
+        ];
+        assert_eq!(named, [2, 7, 8, 9, 78]);
+        for code in 1..=1024 {
+            let records = !named.contains(&code);
+            assert_eq!(should_record_supervisor_crash(code), records, "code {code}");
+            let want = if records {
+                vec![format!("worker exit code {code}")]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(recorded_for(code), want, "code {code}");
+        }
+        for status in [
+            0xC000_0005, // access violation
+            0xC000_00FD, // stack overflow
+            0xC000_0409, // fast fail: a Rust abort
+            0xC000_013A, // Ctrl+C
+            0x8000_0003, // breakpoint
+            0xE06D_7363, // a C++ exception
+            u32::MAX,
+        ] {
+            assert!(should_record_supervisor_crash(status), "{status:#x}");
+            assert_eq!(recorded_for(status), [format!("worker exit code {status}")]);
+        }
+        assert!(recorded_for(0).is_empty());
+        assert!(recorded_for(SESSION_TEARDOWN_EXIT_CODE).is_empty());
+    }
+
+    /// The code shadows nothing the host names, so no arm absorbs another.
+    #[test]
+    fn the_no_enrollment_code_is_none_of_the_codes_the_host_names() {
+        for other in [
+            0,
+            1,
+            crate::watchdog::STALL_EXIT_CODE as u32,
+            crate::watchdog::AGENT_DELETED_EXIT_CODE as u32,
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32,
+            crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32,
+            SESSION_TEARDOWN_EXIT_CODE,
+        ] {
+            assert_ne!(NO_ENROLLMENT, other);
+        }
+        // Neither the clean arm nor the Stop arm: the generic one.
+        assert!(matches!(
+            decide_exit_reaction(NO_ENROLLMENT, 0),
+            (ExitReaction::Backoff(_), 1)
+        ));
     }
 }

@@ -1406,7 +1406,7 @@ pub fn main() -> Result<()> {
     // out, before the process ends. A process that began no step skips it.
     let (error, exit_code) = step_outcome(&res);
     logging::end_step(error.as_deref(), exit_code);
-    res
+    roomlerd::daemon_error::leave(res)
 }
 
 /// #3230 — the log role of the command this process runs, which decides where
@@ -1470,7 +1470,7 @@ fn step_outcome(res: &Result<()>) -> (Option<String>, i32) {
         Ok(()) => (None, 0),
         Err(e) => (
             Some(roomlerd::error_chain::error_chain(e.as_ref())),
-            EXIT_CODE_OF_AN_ERR,
+            roomlerd::daemon_error::exit_code(e).unwrap_or(EXIT_CODE_OF_AN_ERR),
         ),
     }
 }
@@ -2300,7 +2300,7 @@ fn exit_for_requested_restart() {
 /// recorder — that reads the WORKER's rolling log, which is the
 /// useful artifact for diagnosis. #4023: an exit for the device's
 /// state, no config to run, records nothing here
-/// (`daemon_error::record_worker_exit`); the service's own record stays, #4028.
+/// (`daemon_error::record_worker_exit`), nor in the service (#4028, `exit_code`).
 #[cfg(target_os = "windows")]
 fn record_worker_exit_failure(err: &anyhow::Error) {
     use roomlerd::crash_recorder::{self, Reason, WriterContext};
@@ -3912,10 +3912,10 @@ async fn run_cmd(
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
     if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault: a type of its own, so the
-        // Windows worker's exit for it records no crash, told apart by type and
-        // never by its words (`record_worker_exit_failure`). The words stay.
-        return Err(roomlerd::daemon_error::NoConfig::at(config_path).into());
+        // #4023 — the device's state, not a fault, told apart by type and never by
+        // its words: a Windows worker records no crash for it, and (#4028) the
+        // service host's worker exits with its own code, so the host records none.
+        return Err(roomlerd::daemon_error::NoConfig::of_run(config_path, supervisor_flag).into());
     }
     // Take the single-instance lock before doing anything else. If
     // another agent is already attached to this config (typically the
@@ -9036,5 +9036,76 @@ mod smoke_ffmpeg_tests {
     #[tokio::test]
     async fn hardware_h264_names_each_candidate_it_tried() {
         fails_naming_what_it_tried("h264", VideoCodec::H264).await;
+    }
+}
+
+/// #4028 — a `run` with no config, from its first check to the code `main` ends
+/// with. `run_cmd` returns at that check, before it takes a lock or writes
+/// anything, so the real function runs here, on a path that does not exist.
+#[cfg(test)]
+mod no_enrollment_exit_tests {
+    use super::*;
+
+    /// `run_cmd` on a missing config, started as `run --supervisor <supervisor>`.
+    /// Its future is the whole daemon's, so it runs on a thread with room for it.
+    fn run_with_no_config(supervisor: Option<&'static str>) -> (PathBuf, Result<()>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("config.toml");
+        let path = missing.clone();
+        let res = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(Box::pin(run_cmd(
+                        &path, None, false, false, supervisor, None, None,
+                    )))
+                    .map(|_| ())
+            })
+            .expect("thread")
+            .join()
+            .expect("run_cmd panicked");
+        (missing, res)
+    }
+
+    /// The worker the Windows service host started (`run --supervisor scm`)
+    /// ends with its own code. The per-user Task's worker, a bare `run`, and
+    /// every platform but Windows end with 1, as they always have, saying the
+    /// same words; and an error of any other kind ends with 1 too.
+    #[test]
+    fn only_the_service_hosts_worker_with_no_config_ends_with_its_own_code() {
+        let service = if cfg!(windows) {
+            roomlerd::daemon_error::NO_ENROLLMENT_EXIT_CODE
+        } else {
+            EXIT_CODE_OF_AN_ERR
+        };
+        for (supervisor, want) in [
+            (Some("scm"), service),
+            (Some("task"), EXIT_CODE_OF_AN_ERR),
+            (None, EXIT_CODE_OF_AN_ERR),
+        ] {
+            let (missing, res) = run_with_no_config(supervisor);
+            let (words, code) = step_outcome(&res);
+            assert_eq!(code, want, "{supervisor:?}");
+            assert_eq!(
+                words,
+                Some(format!(
+                    "no config found at {}. Run `roomlerd enroll` first.",
+                    missing.display()
+                )),
+                "{supervisor:?}"
+            );
+            let err = res.expect_err("no config");
+            assert!(
+                err.downcast_ref::<roomlerd::daemon_error::NoConfig>()
+                    .is_some(),
+                "{err:#}"
+            );
+        }
+        let fault: Result<()> =
+            Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock"));
+        assert_eq!(step_outcome(&fault).1, EXIT_CODE_OF_AN_ERR);
     }
 }
