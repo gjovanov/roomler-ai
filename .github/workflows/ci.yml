@@ -1744,7 +1744,8 @@ jobs:
       # on Linux and Windows (rust-unit, and the Windows job's #3940 step);
       # only these run here.
       - name: cargo test the companion's enrollment status on a real Mac (#4020)
-        run: cargo test -p roomler-desktop --bins -- commands::tests::enrollment::
+        run: |
+          cargo test -p roomler-desktop --bins -- commands::tests::enrollment::
 
       # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
       # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
