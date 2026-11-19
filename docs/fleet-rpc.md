@@ -102,7 +102,8 @@ at this device — it has no prompt surface (…); answer with `roomlerd consent
 there, start the desktop app, or set this device's execution policy to auto".
 One a surface showed, which nobody answered, ends "the operator at this device
 did not approve the command (Timeout)", as before. The chain and its log line
-are in [remote-control.md](remote-control.md), "Prompt surfaces".
+are in [remote-control.md §11.2](remote-control.md#112-consent), its "Prompt
+surfaces" paragraph.
 
 ## The four gates
 

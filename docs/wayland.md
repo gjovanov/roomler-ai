@@ -152,7 +152,7 @@ Where neither a panel nor the companion can show the question, the daemon posts
 it as the desktop's own notification (P6f), from inside the person's session, at
 critical urgency. Approve and Deny answer it; closing it is a Deny; a click on its
 body brings it back; and it leaves the screen when the question ends any other
-way ([`remote-control.md`](remote-control.md), "Prompt surfaces").
+way ([`remote-control.md`](remote-control.md#112-consent) §11.2, "Prompt surfaces").
 `ROOMLERD_NOTIFY_CONSENT=0` switches it off.
 
 ⚠️ **The desktop's own stop control did not end a session** on 0.4.135. The
