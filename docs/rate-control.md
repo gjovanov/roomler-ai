@@ -1391,7 +1391,7 @@ bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehea
 node scripts/rc-shadow-report.cjs rows.ndjson                        # a read's --rows output, offline: the same verdict
 ```
 
-FR-148's path report reads the same `agent_logs` per session: what it opened at beside what its pair had carried, the plan beside the encoder, what the path carried while bytes waited, a change of path, and whether the picture left the slow-link profile (`bash scripts/rc-path-report.sh --mars --yes`, [production-mongo-reads.md](production-mongo-reads.md) §8).
+FR-148's path report reads the same `agent_logs` per session: what it opened at beside what its pair had carried, the plan beside the encoder, what the path carried while bytes waited, a change of path, and whether the picture left the slow-link profile (`bash scripts/rc-path-report.sh --mars --yes`, [production-mongo-reads.md](production-mongo-reads.md) §8). One device's window reads line by line with `--timeline` (§8a there).
 
 ⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
 release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a window

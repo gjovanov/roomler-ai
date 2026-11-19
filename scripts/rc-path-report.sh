@@ -34,7 +34,11 @@
 #
 # OPTIONS
 #
-#   --since ISO --until ISO      the window (default: the last 7 days; at most 8)
+#   --since ISO --until ISO      the window (default: the last 7 days; at most 8).
+#                                ISO is YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS[.sss]]
+#                                with Z or +HH:MM: a time without a zone is
+#                                refused, as JavaScript would read it in the
+#                                zone of the machine that runs the read
 #   --tenant HEX                 one org only (default: every org)
 #   --agent HEX                  one agent only; repeat for more (default: all)
 #   --label HEX=NAME             print an agent whose id ends with HEX as NAME;
@@ -46,6 +50,17 @@
 #   --explain                    print the plan of one day's query (the index it
 #                                uses, and whether a blocking SORT stage appears)
 #                                instead of reading
+#   --timeline                   ONE device's window line by line, every session
+#                                in time order (rc-path-timeline.cjs). Needs
+#                                --tenant, ONE --agent and --from/--to, at most
+#                                24 h apart (split a longer day). --rows and
+#                                --explain work as above; --json does not.
+#   --from ISO --to ISO          the same as --since and --until
+#   --limit N                    --timeline only: stop after N rows (default
+#                                60,000, at most 200,000) and print TRUNCATED
+#
+# Every option but --agent and --label takes one value, and one given twice is
+# refused before the target is looked at (--timeline takes ONE --agent too).
 #
 # A production read (--kubectl / --mars) is refused without --yes: it is a
 # bounded read of the live database, and still the operator's to start. The
@@ -77,6 +92,11 @@ hostpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else p
 
 HEX24='^[0-9a-fA-F]{24}$'
 LABEL='^[0-9a-fA-F]{1,24}=[A-Za-z0-9._-]{1,32}$'
+# A window end: the same pattern as ISO_TIME in rc-path-timeline.cjs (its
+# self-test compares the two), so a value this takes the read takes too.
+ISO='^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]{1,3})?)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9]))?$'
+# --limit's bound: MAX_LIMIT in rc-path-timeline.cjs (its self-test compares them).
+LIMIT_MAX=200000
 
 TARGET=""
 CONTAINER=""
@@ -86,6 +106,13 @@ AGENTS=""
 LABELS=""
 PASS=()      # options handed on unchanged to the --kubectl run on mars
 ENVS=()      # RC_PATH_* for the mongosh run
+TIMELINE=0
+NTENANT=0
+NAGENTS=0
+NSINCE=0
+NUNTIL=0
+NLIMIT=0
+JSON=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -94,26 +121,52 @@ while [ $# -gt 0 ]; do
     --mars)    TARGET=mars; shift ;;
     --seed)    SEED="${2:?--seed needs a file}"; shift 2 ;;
     --yes)     YES=1; shift ;;
-    --since)   ENVS+=("RC_PATH_SINCE=${2:?}"); PASS+=("$1" "$2"); shift 2 ;;
-    --until)   ENVS+=("RC_PATH_UNTIL=${2:?}"); PASS+=("$1" "$2"); shift 2 ;;
+    --since|--from)
+      [ "$NSINCE" = 0 ] || die "the window's start is given twice: --from and --since are one flag"
+      [[ "${2:-}" =~ $ISO ]] || die "$1 takes YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS[.sss]] with Z or +HH:MM"
+      ENVS+=("RC_PATH_SINCE=$2"); PASS+=("$1" "$2"); NSINCE=1; shift 2 ;;
+    --until|--to)
+      [ "$NUNTIL" = 0 ] || die "the window's end is given twice: --to and --until are one flag"
+      [[ "${2:-}" =~ $ISO ]] || die "$1 takes YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS[.sss]] with Z or +HH:MM"
+      ENVS+=("RC_PATH_UNTIL=$2"); PASS+=("$1" "$2"); NUNTIL=1; shift 2 ;;
     --tenant)
+      [ "$NTENANT" = 0 ] || die "--tenant is given twice"
       [[ "${2:-}" =~ $HEX24 ]] || die "--tenant takes a 24-hex tenant id"
-      ENVS+=("RC_PATH_TENANT=$2"); PASS+=("$1" "$2"); shift 2 ;;
+      ENVS+=("RC_PATH_TENANT=$2"); PASS+=("$1" "$2"); NTENANT=1; shift 2 ;;
     --agent)
       [[ "${2:-}" =~ $HEX24 ]] || die "--agent takes a 24-hex agent id"
-      AGENTS="${AGENTS:+$AGENTS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
+      AGENTS="${AGENTS:+$AGENTS,}$2"; PASS+=("$1" "$2"); NAGENTS=$((NAGENTS + 1)); shift 2 ;;
     --label)
       [[ "${2:-}" =~ $LABEL ]] || die "--label takes HEX=NAME (HEX up to 24 hex digits; NAME letters, digits, '.', '_' or '-')"
       LABELS="${LABELS:+$LABELS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
-    --json)    ENVS+=("RC_PATH_JSON=1"); PASS+=("$1"); shift ;;
+    --json)    ENVS+=("RC_PATH_JSON=1"); PASS+=("$1"); JSON=1; shift ;;
     --rows)    ENVS+=("RC_PATH_EMIT=rows"); PASS+=("$1"); shift ;;
     --explain) ENVS+=("RC_PATH_EXPLAIN=1"); PASS+=("$1"); shift ;;
-    -h|--help) sed -n '2,53p' "$0"; exit 0 ;;
+    --timeline) TIMELINE=1; PASS+=("$1"); shift ;;
+    --limit)
+      [ "$NLIMIT" = 0 ] || die "--limit is given twice"
+      [[ "${2:-}" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$2" -le "$LIMIT_MAX" ] || die "--limit takes a row count, 1 to $LIMIT_MAX"
+      ENVS+=("RC_PATH_LIMIT=$2"); PASS+=("$1" "$2"); NLIMIT=1; shift 2 ;;
+    -h|--help) sed -n '2,68p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1 (--help)" ;;
   esac
 done
 [ -z "$AGENTS" ] || ENVS+=("RC_PATH_AGENTS=$AGENTS")
 [ -z "$LABELS" ] || ENVS+=("RC_PATH_LABELS=$LABELS")
+if [ "$TIMELINE" = 1 ]; then
+  # One device, one window: the read rc-path-timeline.cjs is bounded for.
+  JS="$HERE/rc-path-timeline.cjs"
+  [ "$NAGENTS" -le 1 ] || die "--agent is given twice: --timeline reads one device"
+  [ "$NTENANT" = 1 ] && [ "$NAGENTS" = 1 ] || die "--timeline reads one device: --tenant HEX and ONE --agent HEX"
+  [ "$NSINCE" = 1 ] && [ "$NUNTIL" = 1 ] || die "--timeline needs the window: --from ISO --to ISO"
+  [ "$JSON" = 0 ] || die "--json is not available with --timeline"
+fi
+# Every value bound for the remote command line (--mars) was checked above
+# against a pattern of plain characters, so `printf %q` hands it on unchanged
+# and the shell on the far side reads each as one word.
+for v in "${PASS[@]+"${PASS[@]}"}"; do
+  case "$v" in *[!A-Za-z0-9._:+=-]*) die "a value for the remote command line is not plain: $v" ;; esac
+done
 
 [ -n "$TARGET" ] || die "pick a target: --docker NAME, --kubectl --yes or --mars --yes (--help)"
 [ -f "$JS" ] || die "missing $JS"
@@ -173,7 +226,7 @@ case "$TARGET" in
     OPTS=""
     [ "${#PASS[@]}" = 0 ] || OPTS="$(printf '%q ' "${PASS[@]}")"
     rc=0
-    tar -C "$HERE" -cf - rc-path-report.cjs rc-path-report.sh prod-mongo-read.sh |
+    tar -C "$HERE" -cf - rc-path-report.cjs rc-path-timeline.cjs rc-path-report.sh prod-mongo-read.sh |
       roomler ssh mars -- "D=\$(mktemp -d ~/fr148-path.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/rc-path-report.sh\" --kubectl --yes $OPTS; rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
     exit "$rc"
     ;;

@@ -3307,7 +3307,10 @@ function selfTest() {
     const memoryRs = src('encode/rate_memory.rs');
     const profileRs = src('encode/rate_profile.rs');
     const peerRs = src('peer.rs');
-    const agentSrc = [peerRs, src('signaling.rs'), src('session_carrier.rs'), deliveryRs, memoryRs].join('\n');
+    // The ICE line left peer.rs for carrier_rank.rs (#4013); the seed and write
+    // lines and the memory's key left it for media_pair_memory.rs (#4014).
+    const pairRs = src('media_pair_memory.rs');
+    const agentSrc = [peerRs, src('signaling.rs'), src('session_carrier.rs'), src('carrier_rank.rs'), deliveryRs, memoryRs, pairRs].join('\n');
     // The delivery line: its message, its field types and the `?Debug` forms the
     // parsers read, and the strings the daemon's own test pins, read back here.
     const lineConst = /pub const LINE: &str = "([^"]+)";/.exec(deliveryRs);
@@ -3356,7 +3359,14 @@ function selfTest() {
     );
     const nominal = /fn relay_max_bps\(\) -> u32 \{[\s\S]*?\.unwrap_or\(([\d_]+)\)/.exec(modRs);
     ok(nominal && Number(nominal[1].replace(/_/g, '')) === RELAY_NOMINAL_BPS, 'RELAY_NOMINAL_BPS matches relay_max_bps in mod.rs', nominal && nominal[1]);
-    ok(/let rate_peer_key = if constrained && rate_hi_bps > 0 \{/.test(peerRs), 'the memory is read only by a pump that starts constrained, where the count without an entry is judged');
+    // The pump hands its own `constrained` and `rate_hi_bps` to the memory's
+    // open, whose key, and so its seed, needs both.
+    ok(
+      /media_pair_memory::open\(\s*&pc,\s*session_id,\s*codec_label,\s*delivery\.mode\(\),\s*constrained,\s*rate_hi_bps,/.test(peerRs) &&
+        /pub async fn open<F, Fut>\(\s*pc: &RTCPeerConnection,\s*session_id: ObjectId,\s*codec_label: &'static str,\s*mode: Mode,\s*constrained: bool,\s*hi_bps: u32,/.test(pairRs) &&
+        /let peer_key = if constrained && hi_bps > 0 \{/.test(pairRs),
+      'the memory is read only by a pump that starts constrained, where the count without an entry is judged',
+    );
     const m1 = /pub const AGE_SLACK_MS: u16 = (\d+);/.exec(ratectl);
     ok(m1 && Number(m1[1]) === AGE_SLACK_MS, 'AGE_SLACK_MS matches ratectl.rs', m1 && m1[1]);
     const up = /const ALPHA_UP: f64 = ([\d.]+);/.exec(goodput);
