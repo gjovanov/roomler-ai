@@ -181,7 +181,7 @@ flowchart TB
     `/dev/null`), so nothing it starts inherits it and no grandchild can hold the lifeline open, the #3080 class
     (inferred design). Root also waits on the worker's pid, so EOF is not its only sign of a death.
   - Tests that hold it (P1): both ends read `FD_CLOEXEC`; a sweeping child started while the pair is live has
-    neither end open, the shape of `child.rs:648-683`; a stand-in for the worker started by the real builder has one
+    neither end open, the shape of `child.rs:731-766`; a stand-in for the worker started by the real builder has one
     socket, on descriptor 0, with the worker end's inode; after the worker's move, a child it starts has no socket;
     killing the worker gives root's end an EOF.
 

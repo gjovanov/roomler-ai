@@ -2,7 +2,12 @@
 // Copyright (C) 2026 G ROX EOOD
 //! FR-43 P3c — `sudo roomlerd one-row`: a person's one command that makes a
 //! two-row Mac one row (`docs/fr/FR-43-macos-single-enrollment.md`, "P3c — a
-//! person's one command").
+//! person's one command"). FR-147 P1 — root's side of it
+//! (`docs/fr/FR-147-root-out-of-homes-macos.md`): a root step of ours changes
+//! nothing inside a person's home. What changes there is done by that person's
+//! own process, `roomlerd one-row-home <verb>` ([`crate::one_row_home`]), which
+//! root starts with the person's uid and gid alone, and root keeps its records
+//! in its own tree, [`RECORDS`].
 //!
 //! A two-row Mac has a root half (`com.roomler.daemon`, on [`ROOT_CONFIG`]) and
 //! a per-user half, each with an enrollment of its own. The command takes every
@@ -14,26 +19,36 @@
 //! `macos_one_row`), and its worker, holding no enrollment, serves every org's
 //! sessions (P3a, P3b).
 //!
-//! | Step | What it does | If it fails |
-//! |---|---|---|
-//! | Read | root, macOS, the root half enrolled and connected, a person at the console; every person's file under `/Users` | stops; nothing has changed |
-//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | |
-//! | Keep | each file it writes copied to `*.pre-one-row`, mode 600, owned as the original | puts back what it did, and stops |
-//! | LaunchAgent | booted out, and its plist moved aside, as `postinstall`'s guard does | the same |
-//! | Root's file | both switches on, moved enrollments appended to `[[orgs]]` | the same |
-//! | People's files | identity blanked, `[[orgs]]` emptied, every other key kept | the same |
-//! | Restart | `launchctl kickstart -k`, which ends live sessions | puts everything back, and restarts |
-//! | Verify | within 60 s: connected, the worker attached, `screen-capture` | the same, and says what it saw |
-//! | Report | each retired row, and where a person deletes it | |
+//! | Step | Root | The person's process | If it fails |
+//! |---|---|---|---|
+//! | Read | root, macOS, the root half enrolled and connected, a person at the console; lists `/Users`, `stat`s each entry, reads each owner's account and UUID | `read`, one per uid, in uid order, 30 s each: owners, modes and kinds, the config's and the plist's bytes, any old copy's name | stops; nothing has changed. R1 to R5 refuse here |
+//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | | |
+//! | Keep | root's kept copy, `root.json`, then one folder per uid under [`RECORDS`], its `record.json` last | | puts back what it did, and stops |
+//! | LaunchAgent | booted out by label | | the same |
+//! | Root's file | both switches on, moved enrollments appended to `[[orgs]]` | | the same |
+//! | People's files | | `convert`, over the bytes root kept: identity blanked, `[[orgs]]` emptied, every other key kept; the plist removed | `put-back` for every person started, answered or not |
+//! | Restart | `launchctl kickstart -k`, which ends live sessions | | puts everything back, and restarts |
+//! | Verify | within 60 s: connected, the worker attached, `screen-capture` | | the same, and says what it saw |
+//! | Report | each retired row, and where a person deletes it | | |
+//!
+//! Root's records go only after a restart answered, so a stop part-way leaves
+//! what the next `--revert` reads. `--revert` puts root's file back first, then
+//! each person in uid order, through `put-back` from the records, or
+//! `put-back-legacy` on a Mac an older release converted. One who fails is
+//! named and keeps their record, the others go on, and it exits 1; when nobody's
+//! `read` answers and nothing else is left, it exits 1 before it asks and
+//! restarts nothing.
 //!
 //! The command cannot delete a row: a device holds no user credential, and
 //! `POST /api/agent/self/unenroll` refuses a permanent row on purpose. A row it
 //! retires reads offline until a person deletes it, and until then `--revert`
 //! puts the two rows back.
 //!
-//! The planner and both file transforms are pure, and every effect goes through
-//! [`Host`], so the sequence and its undo run in tests on every platform. Only
-//! the macOS host touches a real Mac.
+//! The planner, the refusals' lines and the spawn and bootstrap plans are pure,
+//! and every effect goes through [`Host`], whose effects name no path in a home:
+//! a person's take `(account, verb, stdin)`, root's a [`RootFile`]. So the
+//! sequence, its undo and the revert run in tests on every platform. Only the
+//! macOS host touches a real Mac.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

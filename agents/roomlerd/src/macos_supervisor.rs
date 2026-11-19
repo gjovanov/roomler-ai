@@ -1019,12 +1019,10 @@ pub struct KeptCopy {
     pub stat: Option<(u32, u32)>,
 }
 
-/// #3802 — the copies an older conversion kept in the person's folder: the
-/// LaunchAgent plist it moved there, and the copy of the person's config it
-/// kept beside their config. Names, inside that folder. FR-147: root reads
-/// nothing in a home; the person's own `one-row-home put-back-legacy` renames
-/// these back (`one_row_home::Places`), and `sudo roomlerd one-row --revert`
-/// starts it where that person's `read` reports them.
+/// #3802 — the copies an older conversion kept in the person's folder: the LaunchAgent plist
+/// it moved there and its copy of the person's config. Names, inside that folder. FR-147:
+/// root reads nothing in a home; `sudo roomlerd one-row --revert` starts the person's own
+/// `one-row-home put-back-legacy`, which renames these back (`one_row_home::Places`).
 pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
     use crate::one_row::{AGENT_PLIST, kept_path};
     [
