@@ -5231,6 +5231,7 @@ async fn media_pump_vp9_444_dc(
                 encoded_dims_packed,
             );
             let wire_len = wire.len() as u64;
+            delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::Vp9444Dc); // FR-148 O10
             match send_tx.try_send(wire) {
                 Ok(()) => {
                     handed_bytes += wire_len;
@@ -9910,6 +9911,7 @@ async fn media_pump_ffmpeg_dc(
                 encoded_dims_packed,
             );
             let wire_len = wire.len();
+            delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::FfmpegDc); // FR-148 O10
             match send_tx.try_send((
                 send_epoch.load(std::sync::atomic::Ordering::Relaxed),
                 std::time::Instant::now(),

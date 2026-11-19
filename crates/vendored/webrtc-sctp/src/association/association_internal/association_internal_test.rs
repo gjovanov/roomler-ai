@@ -1164,6 +1164,42 @@ async fn test_gauges_ack_delay_is_the_newest_chunk_sent_once() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_gauges_a_peek_leaves_the_least_delay_to_the_next_take() -> Result<()> {
+    let ms = Duration::from_millis;
+    // 10's SACK came 300 ms after its send, 11's 900 ms after (a delayed
+    // acknowledgement): the least of the two is 10's.
+    let chunks = [(10, 1, ms(300)), (11, 1, ms(900))];
+    let mut a = ack_delay_association(&chunks);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[])).await?;
+    let peeked = gauges.peek();
+    let least = peeked.ack_delay_min.expect("a least delay");
+    assert!(least >= ms(300) && least < ms(900), "{least:?}");
+    assert_eq!(gauges.peek(), peeked, "a second peek reads the same");
+
+    a.handle_sack(&sack(11, &[])).await?;
+    let taken = gauges.take();
+    assert!(taken.ack_delay.expect("a delay") >= ms(900), "{taken:?}");
+    assert_eq!(
+        taken.ack_delay_min,
+        Some(least),
+        "the take's least still covers the SACK before the peek"
+    );
+    assert_eq!(gauges.peek().ack_delay_min, None, "the take reset it");
+
+    // A take where the peek was leaves the next take the later SACK alone.
+    let mut a = ack_delay_association(&chunks);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[])).await?;
+    assert_eq!(gauges.take().ack_delay_min.map(|d| d < ms(900)), Some(true));
+    a.handle_sack(&sack(11, &[])).await?;
+    let least = gauges.take().ack_delay_min.expect("a least delay");
+    assert!(least >= ms(900), "{least:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_gauges_a_clock_gone_backwards_stores_nothing() -> Result<()> {
     let ms = Duration::from_millis;
     let mut a = ack_delay_association(&[(10, 1, ms(50))]);

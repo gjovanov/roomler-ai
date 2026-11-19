@@ -1087,7 +1087,13 @@ impl Agent {
 
                 let candidate: Arc<dyn Candidate + Send + Sync> =
                     match relay_config.new_candidate_relay() {
-                        Ok(candidate) => Arc::new(candidate),
+                        Ok(mut candidate) => {
+                            // roomler (FR-148 P0): what carries this allocation, for
+                            // the agent's carrier line. Both arms of the match above
+                            // that allocate come here, each with its URL's pair.
+                            candidate.relay_transport = Some((transport_proto, transport_scheme));
+                            Arc::new(candidate)
+                        }
                         Err(err) => {
                             let _ = relay_conn.close().await;
                             let _ = client.close().await;
