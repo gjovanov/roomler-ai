@@ -36,7 +36,7 @@ use roomler_ai_remote_control::models::SessionPhase;
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::cluster::metrics::{RC_SLOT_CLAIM_FAILED_TOTAL, RC_SLOT_FULL_TOTAL, bump};
 use roomler_core::cluster::session_slots::{
-    Lease, SLOT_KEEP_PAST_RESUME_MS, SlotClaim, SlotHolder, SlotScope,
+    Lease, SLOT_KEEP_PAST_RESUME_MS, SessionSlots, SlotClaim, SlotHolder, SlotScope,
 };
 use tracing::{debug, warn};
 
@@ -182,7 +182,7 @@ pub async fn claim_for(
     };
     let pod = state.pod.pod_id.clone();
     PENDING.insert(session);
-    let mut retried = false;
+    let (mut retried, mut undropped) = (false, Vec::new());
     loop {
         match slots.claim(scope, session, user, device, cap, &pod).await {
             Ok(SlotClaim::Claimed | SlotClaim::Renewed) => {
@@ -198,15 +198,15 @@ pub async fn claim_for(
                 if !retried {
                     let stale = stale_holders(state, scope, &holders, &pod).await;
                     if !stale.is_empty() {
-                        for id in &stale {
-                            warn!(?scope, session = %id, "session slot: dropping a stale lease this pod no longer holds");
-                            if let Err(e) = slots.release(scope, *id).await {
-                                warn!(%e, "session slot: the stale lease was not dropped");
-                            }
-                        }
+                        undropped = drop_stale(slots, scope, &stale).await;
                         retried = true;
                         continue;
                     }
+                }
+                if full_but_stale(&holders, &undropped, cap) {
+                    // #3840: full only by leases Redis did not let go.
+                    PENDING.remove(&session);
+                    return stale_fallback(scope, &undropped);
                 }
                 PENDING.remove(&session);
                 bump(&RC_SLOT_FULL_TOTAL);
@@ -286,7 +286,94 @@ pub async fn keep(
     let until = resume_by
         .timestamp_millis()
         .saturating_add(SLOT_KEEP_PAST_RESUME_MS);
-    if let Err(e) = slots.keep(SlotScope::Org(tenant_id), session, until).await {
-        warn!(%session, %e, "session slot: a detached session's lease was not kept; it lapses at its own expiry");
+    // #3840: tried again while Redis does not answer it and the lease can
+    // still exist (`keep_retrying`), off this claim's path, as the hub's is.
+    let (slots, scope) = (slots.clone(), SlotScope::Org(tenant_id));
+    tokio::spawn(async move {
+        if let Err(e) = slots.keep_retrying(scope, session, until).await {
+            warn!(%session, %e, "session slot: a detached session's lease was not kept; it lapses at its own expiry");
+        }
+    });
+}
+
+/// #3840 — drop the stale leases a full set showed ([`stale_holders`]), and
+/// answer the ones Redis did not let go.
+async fn drop_stale(slots: &SessionSlots, scope: SlotScope, stale: &[ObjectId]) -> Vec<ObjectId> {
+    let mut undropped = Vec::new();
+    for id in stale {
+        warn!(?scope, session = %id, "session slot: dropping a stale lease this pod no longer holds");
+        if let Err(e) = slots.release(scope, *id).await {
+            warn!(%e, "session slot: the stale lease was not dropped");
+            undropped.push(*id);
+        }
+    }
+    undropped
+}
+
+/// #3840 — whether a set the claim found full again has room once the stale
+/// leases Redis did not let go are left out. Then it is full only by leases
+/// no session holds, and the claim decides as when Redis cannot answer it
+/// ([`stale_fallback`]): never a refusal that a Redis that is down would not
+/// make. A set full of live holders still refuses.
+fn full_but_stale(holders: &[SlotHolder], undropped: &[ObjectId], cap: u32) -> bool {
+    !undropped.is_empty()
+        && holders
+            .iter()
+            .filter(|h| !undropped.iter().any(|id| id.to_hex() == h.session))
+            .count()
+            < cap as usize
+}
+
+/// The claim's answer when [`full_but_stale`]: as when the claim itself
+/// fails, and counted the same, so the session proceeds uncounted, as before
+/// P3b.
+fn stale_fallback(scope: SlotScope, undropped: &[ObjectId]) -> SlotDecision {
+    bump(&RC_SLOT_CLAIM_FAILED_TOTAL);
+    warn!(
+        ?scope,
+        undropped = undropped.len(),
+        "session slot: full only by stale leases Redis did not let go; deciding as before P3b"
+    );
+    SlotDecision::Fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holder(session: ObjectId) -> SlotHolder {
+        SlotHolder {
+            session: session.to_hex(),
+            user: String::new(),
+            device: String::new(),
+            pod: "pod-a".into(),
+        }
+    }
+
+    /// #3840 — a set full only because a stale lease could not be dropped
+    /// (Redis did not answer its release) has room: the claim falls back as
+    /// a failed claim does, and is never refused for it.
+    #[test]
+    fn a_set_full_only_by_a_stale_lease_redis_kept_falls_back() {
+        let (live, stale) = (ObjectId::new(), ObjectId::new());
+        assert!(full_but_stale(&[holder(live), holder(stale)], &[stale], 2));
+        assert!(
+            full_but_stale(&[holder(stale)], &[stale], 1),
+            "a cap of one, held by the stale lease"
+        );
+    }
+
+    /// A set full of live holders still refuses, and so does a full set whose
+    /// stale leases were all dropped (today's refusal).
+    #[test]
+    fn a_set_full_of_live_holders_still_refuses() {
+        let (a, b, stale) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        assert!(!full_but_stale(
+            &[holder(a), holder(b), holder(stale)],
+            &[stale],
+            2
+        ));
+        assert!(!full_but_stale(&[holder(a), holder(b)], &[], 2));
+        assert!(!full_but_stale(&[holder(a)], &[], 1));
     }
 }

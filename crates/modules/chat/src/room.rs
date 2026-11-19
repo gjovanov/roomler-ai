@@ -335,10 +335,10 @@ pub async fn update(
 /// another pod serves, costs a directory read, a bus request whose reply
 /// waits at most 2 s (`cluster::bus::RPC_DEADLINE`), a second read and a
 /// release, and one write of the call's stats record: well inside 5 s. A
-/// Redis or Mongo node lost without a reset hangs a read without end; the
-/// delete answers anyway, the teardown runs on in its own task, and the pod
-/// serving the call ends it on its own once it finds the room's document
-/// gone.
+/// Mongo node lost without a reset hangs a read without end, and a Redis one
+/// costs each step its 3 s bound (#3840); the delete answers anyway, the
+/// teardown runs on in its own task, and the pod serving the call ends it on
+/// its own once it finds the room's document gone.
 pub const ROOM_REMOVED_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub async fn delete(

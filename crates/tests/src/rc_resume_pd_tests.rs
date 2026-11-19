@@ -40,13 +40,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
-use redis::aio::ConnectionManager;
 use roomler_ai_mod_fleet::hub::{OrgPolicy, ResumeHello};
 use roomler_ai_remote_control::models::{ConsentMode, OsKind, RcOverlayMode};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::{ExternalGrant, ServerMsg};
 use roomler_ai_services::dao::rc_resume_scope::ResumeScopeKind;
 use roomler_core::cluster::session_slots::{Lease, SlotClaim, SlotScope};
+use roomler_core::ws::redis_conn::RedisConnection;
 use tokio::sync::mpsc;
 
 use crate::fixtures::test_app::TestApp;
@@ -77,7 +77,7 @@ fn resume_by_ms(r: &Document) -> i64 {
 
 /// `sid`'s score in the payer's set `set` (its lease's expiry, ms), when the
 /// set holds it.
-async fn score(conn: &mut ConnectionManager, set: &str, sid: ObjectId) -> Option<i64> {
+async fn score(conn: &mut RedisConnection, set: &str, sid: ObjectId) -> Option<i64> {
     let s: Option<String> = redis::cmd("ZSCORE")
         .arg(set)
         .arg(sid.to_hex())
@@ -88,7 +88,7 @@ async fn score(conn: &mut ConnectionManager, set: &str, sid: ObjectId) -> Option
 }
 
 /// A key's time to live, in ms (-2: no key, -1: no expiry).
-async fn pttl(conn: &mut ConnectionManager, key: &str) -> i64 {
+async fn pttl(conn: &mut RedisConnection, key: &str) -> i64 {
     redis::cmd("PTTL").arg(key).query_async(conn).await.unwrap()
 }
 

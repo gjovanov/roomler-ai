@@ -64,7 +64,7 @@ and the policy switch is useful either way.
 | `GET /api/tenant/{tenant_id}/rc-session-policy` for any member; `PUT` with `MANAGE_TENANT`. The `PUT` is partial: a feature the body does not name keeps its value, and each named one is its own dotted `$set` (`crates/services/src/dao/tenant.rs:244`), so two admins cannot lose each other's change. Values are read strictly (`maybe` is a 400, not a silent `off`), and an unknown key is refused | `crates/modules/remote/src/session_policy.rs:85`, `:104` |
 | The authz gate reads the policy from the tenant row it already loads. A row it could not read is `OrgPolicy::Unavailable` (`crates/modules/fleet/src/hub.rs:561`), never "unrestricted" | `crates/modules/remote/src/controller.rs:803` |
 | The hub strips what the policy refuses before `rc:request` is built, after the legacy-grant `FILES` grandfathering. It names each refusal in `rc:session.created` (`features_refused`, feature → reason) and in the session's `session_requested` audit row (`features_stripped`). It forwards the policy to the agent in `rc:request.session_policy`, absent when it restricts nothing, so an org that sets nothing sends the same frame as before | `crates/modules/fleet/src/hub.rs:604` (`feature_grant`), called at `:1807` |
-| The cross-pod relay carries it to the owner pod's hub | `crates/modules/remote/src/relay.rs:536`, `:553` |
+| The cross-pod relay carries it to the owner pod's hub | `crates/modules/remote/src/relay.rs:561`, `:578` |
 
 **What `ask` means.** A feature set to `ask` survives only a session that the person at the device
 approves, on a prompt that names the feature. That is the `prompt` consent mode, on an agent that
