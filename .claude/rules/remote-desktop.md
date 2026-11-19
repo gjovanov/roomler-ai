@@ -111,12 +111,24 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   `granted:false` — "nobody was at the machine" reaching the controller as "a human
   refused you"; the hub waits 5 s **longer** than the window it announces, because
   with equal timers its own fallback fired ~130 ms before the agent's reasoned
-  verdict. ⚠️ A server directive must never override a device's
+  verdict. ⚠️ So an RC prompt's window runs from the request, its surfaces beside it
+  (#4000): never make it wait for them again. On a Linux root daemon they take up to
+  11 s, and the hub's timer then answers a bare timeout first. ⚠️ A server directive must never override a device's
   `auto_grant_session=false` — `consent::strictest_of` makes the local setting a
   floor. ⚠️ The folder whose files can answer a prompt is the daemon's own
   (`ConsentBroker::for_daemon`, #3939) or there is none: then the file channel is off
   and the broker's books hold the markers and the answers. Never add a stand-in folder
   (one below the temporary folder, or that folder itself, was removed by #3939).
+  ⚠️ On a **Mac** the tray's socket is never the asking root daemon's: on one row it
+  is the screen worker's, on two rows the per-user half's. Each lists and decides the
+  root's questions over the root's person socket (`consent_relay`, #3864, #3967). The
+  root counts the tray only while that road is open and the person socket answers
+  within 1 s. On one row the road is a worker that said `relay-consent`, matched by
+  equality. On two rows it is a per-user half that said `consent_relaying` over the
+  person socket: taken from that socket's own person only, never root, and held only
+  for that connection's life. A closed road keeps the floor (`no_prompt_surface` at
+  the window's end), never an answer at once. Write nothing into the person's home
+  for this: the announcement lives in the root's memory.
 <!-- RETIRED-NAME-ANCHOR: the env-var spelling on the line below carries a
      retired product name deliberately — it is what the daemon actually reads,
      so renaming it would silently disable every virtual-desktop host. FR-27. -->

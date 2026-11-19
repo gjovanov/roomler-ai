@@ -227,13 +227,20 @@ pub const KEEP_DELEGATED: &str = "keep-delegated";
 /// FR-138 P2b — the words this worker says in its caps frame: it keeps a
 /// delegated session's peer through the daemon's control-socket loss, on the
 /// daemon's orders ([`KEEP_DELEGATED`]).
-pub fn worker_features() -> Vec<String> {
-    vec![KEEP_DELEGATED.to_string()]
+///
+/// #3864 — `relays_consent`: a worker with no enrollment (a one-row Mac's)
+/// lists and decides the root half's consent questions for its person's app.
+pub fn worker_features(relays_consent: bool) -> Vec<String> {
+    let mut words = vec![KEEP_DELEGATED.to_string()];
+    if relays_consent {
+        words.push(crate::consent_relay::RELAY_CONSENT.to_string());
+    }
+    words
 }
 
 /// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
 /// added here too, or the daemon never hears it.
-const WORKER_FEATURE_WORDS: [&str; 1] = [KEEP_DELEGATED];
+const WORKER_FEATURE_WORDS: [&str; 2] = [KEEP_DELEGATED, crate::consent_relay::RELAY_CONSENT];
 
 /// FR-138 P2b — what the daemon keeps of its worker's feature words, as
 /// [`worker_words`] keeps its capability words (#3706): the words this build
@@ -986,6 +993,9 @@ struct Inner {
     /// The socket path currently bound, so [`DelegateHost::revoke`] can unlink
     /// it. `None` = not listening.
     listening: Mutex<Option<std::path::PathBuf>>,
+    /// #3864 — the account the worker was started for ([`DelegateHost::open_for`]),
+    /// whose person socket its relay asks. `None` once revoked.
+    worker_uid: Mutex<Option<u32>>,
     /// The attached worker's capabilities, when it has sent them.
     ///
     /// Cleared when the channel closes — a row that keeps claiming a capture
@@ -1164,6 +1174,7 @@ impl DelegateHost {
     #[cfg(unix)]
     pub fn open_for(&self, uid: u32) -> String {
         let secret = self.mint();
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
         if let Err(e) = self.listen(uid) {
             tracing::warn!(uid, error = %e, "delegation: could not open the worker socket");
         }
@@ -1266,8 +1277,15 @@ impl DelegateHost {
     }
 
     /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]).
+    ///
+    /// #3864 — its consent questions reach its person's app only through this
+    /// host's worker, so the companion's verdict asks this host about that
+    /// road ([`crate::consent_relay::register`]). Not from a test, whose hosts
+    /// must not stand for the process.
     pub fn set_one_row(&self) {
         self.inner.one_row.store(true, Ordering::Release);
+        #[cfg(not(test))]
+        crate::consent_relay::register(self);
     }
 
     fn one_row(&self) -> bool {
@@ -1625,6 +1643,8 @@ impl DelegateHost {
     /// caller can forget at one of the four places a worker can stop.
     pub fn revoke(&self) {
         *self.inner.secret.lock().expect("secret mutex") = None;
+        // #3864 — and whose account it ran for: no worker, no road.
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = None;
         // FR-85 P1e-mac — and what that worker was handed. The next worker is
         // a new one (another console user, after a switch), and it must not
         // report on sessions it never had. A transient channel drop does not
@@ -1926,6 +1946,24 @@ impl DelegateHost {
             .expect("worker features mutex")
             .iter()
             .any(|w| w == KEEP_DELEGATED)
+    }
+
+    /// #3864 — whether the attached worker lists and decides this daemon's
+    /// consent questions for its person's app: it said
+    /// [`crate::consent_relay::RELAY_CONSENT`], matched by equality, on the
+    /// channel it holds now. No worker, or one that did not say it: `false`.
+    pub fn relays_consent(&self) -> bool {
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == crate::consent_relay::RELAY_CONSENT)
+    }
+
+    /// #3864 — the account the worker was started for, until it is revoked.
+    pub fn worker_uid(&self) -> Option<u32> {
+        *self.inner.worker_uid.lock().expect("worker uid mutex")
     }
 
     /// FR-138 P2b — whether `session`'s params crossed `keepable`.
@@ -2893,9 +2931,8 @@ mod tests {
     /// session; and this build's worker says the word.
     #[tokio::test]
     async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
-        assert_eq!(
-            worker_features(),
-            vec![KEEP_DELEGATED.to_string()],
+        assert!(
+            worker_features(false).contains(&KEEP_DELEGATED.to_string()),
             "this build's worker says it"
         );
         assert!(
@@ -2941,6 +2978,64 @@ mod tests {
         drop(lines);
         task.await.unwrap();
         assert!(!host.worker_keeps(), "gone with its channel");
+    }
+
+    /// #3864 — a worker with no enrollment (a one-row Mac's) says
+    /// `relay-consent`, and the daemon keeps the word: the road its questions
+    /// take to the person's app is open only through such a worker. A worker
+    /// with an enrollment (a two-row Mac's supervised half) does not say it,
+    /// an older worker says nothing, a near miss is not the word, and the
+    /// word goes with its channel. The account the worker was started for is
+    /// kept until it is revoked.
+    ///
+    /// Red before #3864: no worker said the word, and the daemon dropped it
+    /// as unknown.
+    #[tokio::test]
+    async fn a_one_row_worker_says_relay_consent_and_the_daemon_keeps_it() {
+        use crate::consent_relay::RELAY_CONSENT;
+        assert!(
+            worker_features(true).contains(&RELAY_CONSENT.to_string()),
+            "a worker with no enrollment says it"
+        );
+        assert!(
+            !worker_features(false).contains(&RELAY_CONSENT.to_string()),
+            "a worker with an enrollment does not"
+        );
+
+        let host = DelegateHost::new();
+        assert!(!host.relays_consent(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        for (features, relays, what) in [
+            (worker_features(true), true, "a one-row worker"),
+            (worker_features(false), false, "a two-row worker"),
+            (Vec::new(), false, "an older worker"),
+            (
+                vec!["relay-consent-v2".into(), "RELAY-CONSENT".into()],
+                false,
+                "a near miss",
+            ),
+            (worker_features(true), true, "a one-row worker again"),
+        ] {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(&mut cwr, &frame).await.unwrap();
+            // The daemon reads in order: its Pong means the caps were read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+            assert_eq!(host.relays_consent(), relays, "{what}");
+        }
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.relays_consent(), "gone with its channel");
+
+        assert_eq!(host.worker_uid(), None, "never started for anyone");
+        *host.inner.worker_uid.lock().expect("worker uid mutex") = Some(501);
+        assert_eq!(host.worker_uid(), Some(501));
+        host.revoke();
+        assert_eq!(host.worker_uid(), None, "gone with the worker");
     }
 
     /// FR-138 P2b (review HIGH-2) — the channel ends on an I/O error, its
@@ -3758,6 +3853,21 @@ mod params_tests {
         });
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
             .expect("serialises");
+        match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
+            DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
+            other => panic!("expected SessionParams, got {other:?}"),
+        }
+        // FR-148 P4 — in rank mode an `on` session's switch and blocks cross
+        // too: the worker ranks on the daemon's blocks.
+        p.rc_overlay = Some(crate::rc_overlay::RcOverlay::resolve_ranked(
+            true,
+            None,
+            crate::rc_overlay::RankMode::Prio,
+            vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+        ));
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
+            .expect("serialises");
+        assert!(wire.contains(r#""carrier_rank":"prio""#), "{wire}");
         match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
             DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
             other => panic!("expected SessionParams, got {other:?}"),

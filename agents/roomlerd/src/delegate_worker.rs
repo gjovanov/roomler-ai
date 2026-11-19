@@ -423,7 +423,9 @@ async fn attach_once(
             &mut wr,
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
-                features: crate::delegate::worker_features(),
+                // #3864 — a worker with no enrollment relays the root half's
+                // consent questions to its person's app.
+                features: crate::delegate::worker_features(person.is_some()),
             },
         )
         .await?;
@@ -604,7 +606,9 @@ async fn attach_once(
                     &mut wr,
                     &DelegateFrame::WorkerCaps {
                         caps: Box::new(caps),
-                        features: crate::delegate::worker_features(),
+                        // #3864 — the same words as the first frame: the
+                        // daemon keeps the words of the newest frame only.
+                        features: crate::delegate::worker_features(person.is_some()),
                     },
                 )
                 .await?;

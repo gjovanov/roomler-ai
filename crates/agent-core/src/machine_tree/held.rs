@@ -19,6 +19,7 @@
 //! | [`HeldPath::base`] | the base opened as itself (a reparse point refused); its final path must be the base's long name, or [`Why::Elsewhere`] |
 //! | [`HeldPath::open_dir`], [`HeldPath::walk`] | each name opened below the handle above it (`NtCreateFile` with `RootDirectory`, `FILE_OPEN_REPARSE_POINT`), a link refused, the final path checked; `Ok(None)` when a name is not there. Makes nothing |
 //! | [`HeldPath::sealed_dir`], [`HeldPath::walk_sealed`] | as `walk`, and a folder that is not there is made with the seal's descriptor in its `OBJECT_ATTRIBUTES`; the last name gets the leaf policy |
+//! | [`HeldPath::open_or_make_dir`] | one name, opened as it is (a link refused) or made with the seal's descriptor when it is not there; no leaf policy, for a folder another's repair keeps (#3956: the machine config's `peer-auth`) |
 //! | [`HeldPath::machine`] | `base(machine_program_data())`, then down the names of a machine-tree folder; the machine folder and its parent are only opened (made sealed when absent) |
 //! | [`HeldPath::write_file`] | a fresh temp file (`FILE_CREATE`), written and flushed, renamed onto the name relative to the held folder; on failure the temp is deleted by handle |
 //! | [`HeldPath::append_file`] | for logs: a file there must be a plain file of one link owned by SYSTEM or Administrators, else it is deleted by handle and made again |
@@ -443,6 +444,19 @@ impl HeldPath {
         Ok(held.ready())
     }
 
+    /// The folder `name` below this one, opened as it is when it is there (a
+    /// link refused, its final path checked), and made with `seal`'s
+    /// descriptor in its `OBJECT_ATTRIBUTES` when it is not. No leaf policy:
+    /// a folder whose repair is another's is never re-sealed or moved here,
+    /// as [`HeldPath::machine`] keeps the machine folder and its parent
+    /// (#3956: the machine config's `peer-auth`, FR-94's to repair).
+    pub fn open_or_make_dir(&self, name: &str, seal: Seal) -> Result<Self, Refusal> {
+        let held = self
+            .step(name, Step::Make(seal))?
+            .ok_or_else(|| absent(self, name))?;
+        Ok(held.ready())
+    }
+
     /// Down `names`, each made with `seal` when it is not there; only the last
     /// gets the leaf policy.
     pub fn walk_sealed(&self, names: &[&str], seal: Seal) -> Result<Self, Refusal> {
@@ -586,6 +600,34 @@ impl HeldPath {
         win::read_to_end(&file, &path, max_len)
             .map(Some)
             .map_err(|e| self.refuse_at(name, Why::Io(std::io::Error::other(e))))
+    }
+
+    /// #3799 — the last `max_len` bytes of the file `name`, read below this
+    /// folder as [`HeldPath::read_file`] reads it: never through a link, never
+    /// a folder, never a file with more than one name. Nothing before them is
+    /// read, however long the file. The flag says the bytes start at the
+    /// file's start. `Ok(None)`: it is not there.
+    pub fn read_file_tail(
+        &self,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<(Vec<u8>, bool)>, Refusal> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let path = self.path().join(name);
+        let file = match win::open_below(self.handle(), name, &path, false) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(self.refuse_at(name, why_of_text(&e))),
+        };
+        if links_of(&file).map_err(|e| self.refuse_at(name, Why::Io(e)))? > 1 {
+            return Err(self.refuse_at(name, Why::TooManyLinks));
+        }
+        let io = |e| self.refuse_at(name, Why::Io(e));
+        let from = file.metadata().map_err(io)?.len().saturating_sub(max_len);
+        (&file).seek(SeekFrom::Start(from)).map_err(io)?;
+        let mut bytes = Vec::new();
+        (&file).take(max_len).read_to_end(&mut bytes).map_err(io)?;
+        Ok(Some((bytes, from == 0)))
     }
 
     /// The entries of this folder, read through its handle

@@ -12,6 +12,16 @@
  * before FR-27 exec and SSH prompts reached no UI at all, so there was nothing
  * to get wrong. An ABSENT kind means a pre-FR-27 daemon, which only ever wrote
  * remote-control prompts — hence `rc` as the fallback, not "unknown".
+ *
+ * #3873 — a click is acted on, or the person reads why not, and the app's log
+ * has it either way. Every Approve and Deny goes to the app, which logs it
+ * when it arrives and again with its outcome: nothing returns before the
+ * send. The buttons are off only while no question is shown, an answer is on
+ * its way, or this window answered the question, and the status line says
+ * which. It is an element of its own: the countdown repaints every second.
+ *
+ * #3987 — each click also says how long its question has been shown. The app
+ * holds back a click within a second of a new question coming up.
  */
 ;(function () {
   const invoke = (name, payload) => window.__TAURI__.core.invoke(name, payload || {})
@@ -37,17 +47,42 @@
     },
   }
 
+  // #3873 — how long the page waits for the app's reply to a click. Above the
+  // app's own 10 s on the daemon's answer (`CONSENT_ANSWER_WITHIN` in
+  // commands.rs), so it fires only when the app itself never answers; the
+  // buttons then come back instead of staying off.
+  const PAGE_LIMIT_MS = 15000
+
   const $ = (id) => document.getElementById(id)
-  let active = null // session id currently rendered
+  let active = null // session id of the question shown, null = none
   let expiresAt = 0 // unix ms, 0 = unknown
-  let busy = false
+  let sending = false // an answer is on its way
+  let answered = null // the question this window answered
+  let shownAt = 0 // #3987: performance.now() when the question shown came up
+
+  function setStatus(text) {
+    const el = $('p-status')
+    el.textContent = text
+    el.hidden = text === ''
+  }
+
+  // The buttons work while a question is shown that this window has not
+  // answered and no answer is on its way. Off, the status line says why.
+  function paintButtons() {
+    const off = !active || sending || answered === active
+    $('p-approve').disabled = off
+    $('p-deny').disabled = off
+  }
 
   function render(pc) {
     active = pc.session_id
+    answered = null
+    shownAt = performance.now()
     const kind = KINDS[pc.kind] || KINDS.rc
     $('p-title').textContent = kind.title
     $('p-verb').textContent = kind.verb
     $('p-who').textContent = pc.controller_name || 'A remote operator'
+    $('p-lead').hidden = false
 
     const org = (pc.org || '').trim()
     $('p-org').textContent = org
@@ -67,7 +102,24 @@
     // list must not restart the countdown, and this window can be created
     // partway through a prompt's life.
     expiresAt = typeof pc.expires_at_ms === 'number' && pc.expires_at_ms > 0 ? pc.expires_at_ms : 0
+    setStatus('')
     paintCountdown()
+    paintButtons()
+  }
+
+  // #3873 — nothing is waiting: the question goes, so nothing on screen looks
+  // as if it could still be answered.
+  function clear() {
+    active = null
+    answered = null
+    expiresAt = 0
+    $('p-lead').hidden = true
+    $('p-org-row').hidden = true
+    $('p-detail-row').hidden = true
+    $('p-perms-row').hidden = true
+    setStatus('No question is waiting.')
+    paintCountdown()
+    paintButtons()
   }
 
   function paintCountdown() {
@@ -84,35 +136,61 @@
   }
 
   async function decide(approve) {
-    if (!active || busy) return
-    busy = true
-    $('p-countdown').textContent = approve ? 'Approving…' : 'Denying…'
+    // #3873 — the click is sent before anything else can stop it: one with no
+    // question shown goes too, and the app logs it. Before #3873 this left
+    // early, without a word, while an earlier answer was "on its way", and an
+    // answer that never came back kept it so for good: on a Linux system
+    // install the second of two clicks on a question this window showed left
+    // no line anywhere.
+    const session = active
+    sending = true
+    paintButtons()
+    setStatus(approve ? 'Approving…' : 'Denying…')
+    let timer = null
+    const limit = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`No answer from the app within ${PAGE_LIMIT_MS / 1000} s. Try again.`)),
+        PAGE_LIMIT_MS
+      )
+    })
     try {
-      await invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session: active })
-      active = null
+      await Promise.race([
+        invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session, shown: Math.round(performance.now() - shownAt) }),
+        limit,
+      ])
+      answered = session
+      setStatus(approve ? 'Approved.' : 'Denied.')
     } catch (e) {
-      $('p-countdown').textContent = 'Failed: ' + e
+      // The app's words: the daemon's own refusal, or why it was not asked.
+      setStatus(String(e && e.message ? e.message : e))
     } finally {
-      busy = false
+      clearTimeout(timer)
+      sending = false
+      paintButtons()
     }
   }
 
   async function poll() {
-    let pending = []
+    // An answer on its way decides what shows next.
+    if (sending) return
+    let pending
     try {
       pending = await invoke('cmd_get_pending_consents')
     } catch (_) {
-      return // backend not ready — stay quiet, the window is about to hide
+      // #3873 — a read that failed keeps the question shown: the daemon may
+      // still be asking it, and a click on it reaches the app, which logs
+      // what becomes of it. The app logs the failed read too.
+      return
     }
+    if (sending || !Array.isArray(pending)) return
     // FR-27 — skip anything the DAEMON is already showing natively. The marker
     // is written either way (it is also what `roomler consent --list` reads),
     // so without this filter a Windows/X11/macOS host would get two Approve
     // buttons for one decision — which is how someone approves the wrong
     // thing. Absent `surface` = a pre-FR-27 daemon, where nothing was native.
-    if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
-    if (!Array.isArray(pending) || pending.length === 0) {
-      active = null
-      expiresAt = 0
+    pending = pending.filter((p) => p.surface !== 'native')
+    if (pending.length === 0) {
+      clear()
       return
     }
     // Keep showing the current one while it is still pending; otherwise take
@@ -123,12 +201,14 @@
   $('p-approve').addEventListener('click', () => decide(true))
   $('p-deny').addEventListener('click', () => decide(false))
   // Escape denies. A prompt you cannot dismiss with the obvious key is a
-  // prompt people learn to click through.
+  // prompt people learn to click through. It is the Deny button's key, so it
+  // acts exactly while that button does (#3873).
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') decide(false)
+    if (e.key === 'Escape' && !$('p-deny').disabled) decide(false)
   })
 
   setInterval(poll, 750)
   setInterval(paintCountdown, 1000)
+  paintButtons()
   poll()
 })()

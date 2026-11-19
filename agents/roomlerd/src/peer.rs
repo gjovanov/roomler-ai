@@ -256,6 +256,10 @@ pub struct AgentPeer {
     /// connected, and the overlay that draws the curtain). Set once by
     /// [`Self::set_privacy_ctx`] before the offer is answered.
     privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>>,
+    /// FR-148 P1 — what the pair memory's key needs from this session's viewer:
+    /// the controlling user ([`Self::set_pair_user`]) and its server-reflexive
+    /// candidates, as they are trickled. The FFmpeg pump finds it by session.
+    pair_facts: Arc<crate::media_pair_memory::PairFacts>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -489,6 +493,8 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
+        // FR-148 P4 — the carrier rank, when its switch is on (`rc_overlay`).
+        rc_overlay.rank_ice(&mut setting);
         // FR-101 P1 — GCM-only DTLS, with its switch back, and the SRTP/SRTCP
         // replay windows pinned at 64 (webrtc-srtp's session default too).
         let transport = crate::rc_transport::Policy::from_env();
@@ -883,6 +889,7 @@ impl AgentPeer {
         {
             let tx = outbound.clone();
             let tally = Arc::new(GatherTally::default());
+            let rank = rc_overlay.carrier_rank;
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let tx = tx.clone();
                 let tally = tally.clone();
@@ -893,23 +900,10 @@ impl AgentPeer {
                         return;
                     };
                     tally.note(c.typ);
-                    info!(
-                        %session_id,
-                        typ = %c.typ,
-                        protocol = %c.protocol,
-                        address = %c.address,
-                        port = c.port,
-                        related = %format_args!("{}:{}", c.related_address, c.related_port),
-                        "ICE: gathered local candidate"
-                    );
-                    let json = match c.to_json() {
-                        Ok(j) => j,
-                        Err(e) => {
-                            warn!(%e, "failed to serialize ICE candidate");
-                            return;
-                        }
-                    };
-                    let Ok(candidate) = serde_json::to_value(&json) else {
+                    // The line, and its payload (FR-148 P4: under switch `1`
+                    // a ranked-last line ends with ` network-cost 999`).
+                    let Some(candidate) = crate::carrier_rank::gathered(session_id, &c, rank)
+                    else {
                         return;
                     };
                     let _ = tx
@@ -1215,6 +1209,9 @@ impl AgentPeer {
         let privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>> =
             Arc::new(std::sync::OnceLock::new());
         let privacy_ctx_for_callback = privacy_ctx.clone();
+        // FR-148 P1 — registered before the pump is spawned, which finds it by
+        // the session's id.
+        let pair_facts = crate::media_pair_memory::PairFacts::register(session_id);
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -1701,6 +1698,7 @@ impl AgentPeer {
             #[cfg(feature = "recording")]
             record_ctx,
             privacy_ctx,
+            pair_facts,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -1760,6 +1758,13 @@ impl AgentPeer {
     /// every request as `unavailable`.
     pub fn set_privacy_ctx(&self, ctx: crate::privacy::PrivacyCtx) {
         let _ = self.privacy_ctx.set(ctx);
+    }
+
+    /// FR-148 P1 — the controlling user, for the pair memory's key. Call
+    /// before [`Self::handle_offer`]; a pump that opens without it keeps no
+    /// path memory (`no_user`).
+    pub fn set_pair_user(&self, user: bson::oid::ObjectId) {
+        self.pair_facts.set_user(user);
     }
 
     /// Wave 2 — a telemetry sample for `rc:session.stats`.
@@ -1858,6 +1863,9 @@ impl AgentPeer {
             other => serde_json::from_value(other)
                 .map_err(|e| anyhow!("bad ICE candidate shape: {e}"))?,
         };
+        // FR-148 P1 — the viewer's server-reflexive addresses name its network
+        // in the pair memory's key.
+        self.pair_facts.note_candidate(&init.candidate);
         // #1882 — a candidate on a mesh address is an overlay pair waiting to
         // happen even though this side offered no overlay candidate: the
         // srflx and relay sockets are bound to `0.0.0.0`, so a check to it
@@ -2030,6 +2038,8 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move.
+            let (pair, opening) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             let local = pair.local();
             let remote = pair.remote();
             // Loopback-TURN corp-relay (Phase 3): a relay candidate at a
@@ -2040,21 +2050,7 @@ async fn detect_constrained_transport(
                 && !crate::encode::relay_addr_is_fast_local(&local.address))
                 || (remote.typ == RTCIceCandidateType::Relay
                     && !crate::encode::relay_addr_is_fast_local(&remote.address));
-            // Relay-escape — log the ADDRESSES, not just the types: a
-            // "direct" Srflx↔Prflx pair whose remote is the router's WAN IP
-            // is a NAT hairpin, while a 192.168.x remote is the true LAN
-            // path. Types alone couldn't tell them apart in the field.
-            info!(
-                %session_id,
-                relay,
-                local_typ = ?local.typ,
-                local_proto = ?local.protocol,
-                local_addr = %format!("{}:{}", local.address, local.port),
-                remote_typ = ?remote.typ,
-                remote_proto = ?remote.protocol,
-                remote_addr = %format!("{}:{}", remote.address, remote.port),
-                "per-session ICE path detected (adaptive bitrate)"
-            );
+            crate::carrier_rank::path_detected(session_id, relay, local, remote, opening);
             return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2078,92 +2074,13 @@ async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — the rest of the opening's wait, shared with detect.
+            let (pair, _) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             return Some(pair.remote().address.clone());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
-}
-
-/// FR-79 V2 — the carrier under an overlay pair, as the memory key's second
-/// half. Asks the same LocalAPI the constrained-transport probe asks; a
-/// non-overlay remote (a TURN server's own address, say) is already its own
-/// key, and anything unknown or mid-churn returns `None`, which leaves the
-/// bare-address key this had before.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-async fn overlay_carrier_tag(remote_addr: &str) -> Option<String> {
-    if !addr_is_overlay_range(remote_addr) {
-        return None;
-    }
-    let query = async {
-        let mut client = tunnel_core::localapi::connect().await.ok()?;
-        let peers = client.peers().await.ok()?;
-        peers.into_iter().find(|p| {
-            p.overlay_ip.as_deref() == Some(remote_addr)
-                || p.overlay_ip6.as_deref() == Some(remote_addr)
-        })
-    };
-    let peer = tokio::time::timeout(Duration::from_millis(400), query)
-        .await
-        .ok()??;
-    let connection = format!("{:?}", peer.connection).to_lowercase();
-    crate::encode::rate_memory::carrier_tag(
-        &connection,
-        peer.relay_kind.as_deref(),
-        peer.relay_transport.as_deref(),
-    )
-}
-
-/// FR-35 P2 — persists the session's stable rate for its peer when the pump
-/// ends, whichever way it ends. The pump stores the governor's current stable
-/// rate into `stable` once per viewer window; `0` = nothing worth keeping.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-struct RateMemoryGuard {
-    path: Option<std::path::PathBuf>,
-    peer: Option<String>,
-    stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// FR-79 V4 — what the OPENER measured about this carrier, when its burst
-    /// queued enough for the estimator to say anything. Second-choice
-    /// evidence: the session belief above is the whole session's answer.
-    opener_measured: std::sync::Arc<std::sync::atomic::AtomicU32>,
-}
-
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-impl Drop for RateMemoryGuard {
-    fn drop(&mut self) {
-        let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
-            return;
-        };
-        // FR-79 V4 — a session writes what it MEASURED about this carrier, or
-        // nothing at all. The belief the validity gate accepted is the
-        // session's own answer; the opener's measurement stands in for a
-        // session too short to have produced one. With neither, the entry
-        // keeps its value AND its age, because refreshing a timestamp on no
-        // evidence would keep a stale number alive past its TTL.
-        let evidence = [
-            self.stable.load(std::sync::atomic::Ordering::Relaxed),
-            self.opener_measured
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ]
-        .into_iter()
-        .find(|v| *v > 0);
-        let mut mem = crate::encode::rate_memory::RateMemory::load(path);
-        let kept = mem.record_session(peer, evidence, crate::encode::rate_memory::now_unix());
-        if kept == 0 {
-            return;
-        }
-        match mem.save(path) {
-            Ok(()) => info!(
-                peer,
-                evidence_bps = ?evidence,
-                kept_bps = kept,
-                "FR-79 V4 rate memory: the carrier's measured rate remembered for the pair"
-            ),
-            Err(e) => {
-                warn!(peer, %e, "FR-35 rate memory: could not persist (memory stays off for this pair)")
-            }
-        }
-    }
 }
 
 /// Relay-escape — mid-session re-read of the selected ICE pair. The DC
@@ -4058,6 +3975,7 @@ async fn media_pump_vp9_444_dc(
     let mut media_window = media_paths
         .is_new(crate::media_paths::MediaPath::Stats)
         .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
     let pump_started = std::time::Instant::now();
     let mut first_frame_noted = false;
 
@@ -4157,7 +4075,7 @@ async fn media_pump_vp9_444_dc(
         DC_BUFFERED_HIGH_BYTES
     };
     if constrained_transport {
-        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay-TCP) transport — clamping bitrate + tightening backpressure");
+        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay) transport — clamping bitrate + tightening backpressure");
     }
     // Relay-escape — re-check the selected pair periodically (see the loop).
     let mut last_transport_check = std::time::Instant::now();
@@ -5427,12 +5345,17 @@ async fn media_pump_vp9_444_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — see the FFmpeg pump's heartbeat.
+                pipe_measured = ?governor
+                    .measured_bps(std::time::Instant::now(), constrained_transport),
+                readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -5458,6 +5381,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -6305,7 +6229,7 @@ async fn end_stopped_at_screen(
     );
     if let Some(p) = pipeline {
         for f in &followers {
-            if !rc_sessions.disconnect(f) {
+            if !rc_sessions.disconnect(f, crate::rc_sessions::Via::ShareStop) {
                 warn!(%session_id, follower = %f, "capture stopped at the screen: a follower's session could not be ended");
             }
         }
@@ -6319,7 +6243,7 @@ async fn end_stopped_at_screen(
     let mut ended = false;
     loop {
         if !ended {
-            ended = rc_sessions.disconnect(&session_id);
+            ended = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::ShareStop);
             if !ended && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "capture stopped at the screen: the session's Disconnect could not be queued yet");
             }
@@ -6363,7 +6287,7 @@ async fn end_no_video(
     let mut asked = false;
     loop {
         if !asked {
-            asked = rc_sessions.disconnect(&session_id);
+            asked = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::NoVideo);
             if !asked && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "no encoder: the session's end could not be queued yet");
             }
@@ -6607,6 +6531,7 @@ async fn media_pump_ffmpeg_dc(
     let mut media_window = media_paths
         .is_new(crate::media_paths::MediaPath::Stats)
         .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
     let pump_started = std::time::Instant::now();
     let mut first_frame_noted = false;
 
@@ -6678,69 +6603,21 @@ async fn media_pump_ffmpeg_dc(
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
-    // FR-35 P2 — per-peer rate memory: the pair's remembered stable rate
-    // seeds the opening ceiling (85 % of it), so the opening keyframe is
-    // sized by what the pair proved, not by the fleet constant. Keyed by the
-    // nominated pair's remote address (the viewer host).
+    // FR-35 P2 / FR-148 P1 — the pair memories (`media_pair_memory`): today's
+    // seeds the opening as before, unless the switch is `on` and the path
+    // model's entry decides it (`plan`); both are written when the pump ends.
     let rate_hi_bps = crate::encode::relay_max_hi_bps();
-    let rate_peer_key = if constrained && rate_hi_bps > 0 {
-        // The pair may not be nominated yet at pump start (the 0.4.27 field
-        // run's first packet came 4 s in): no key then means no seed AND no
-        // write-back, i.e. the memory silently off for the session. Poll
-        // briefly; the pump has nothing to send before the DC opens anyway.
-        let mut key = None;
-        for _ in 0..20 {
-            key = nominated_remote_ip(&pc).await;
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if key.is_none() {
-            info!(
-                %session_id,
-                "FR-35 rate memory: no nominated pair within 4 s of pump start — memory off for this session"
-            );
-        }
-        // FR-79 V2 — the carrier is half the key: one overlay address can be
-        // carried by a direct path, a UDP relay or DERP over TLS on different
-        // days, with four times the capacity between the ends of that range.
-        match key {
-            Some(addr) => {
-                let tag = overlay_carrier_tag(&addr).await;
-                Some(crate::encode::rate_memory::memory_key(
-                    &addr,
-                    tag.as_deref(),
-                ))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let rate_memory_path = crate::encode::rate_memory::default_path();
-    let rate_seed = match (&rate_peer_key, &rate_memory_path) {
-        (Some(peer), Some(path)) => crate::encode::rate_memory::RateMemory::load(path)
-            .seed_for(peer, crate::encode::rate_memory::now_unix()),
-        _ => None,
-    };
-    if let Some(seed) = rate_seed {
-        info!(
-            %session_id,
-            codec_label,
-            peer = rate_peer_key.as_deref().unwrap_or("-"),
-            seed_bps = seed,
-            hi_bps = rate_hi_bps,
-            "FR-35 rate memory: opening ceiling seeded from the pair's remembered stable rate"
-        );
-    }
-    let rate_memory_guard = RateMemoryGuard {
-        path: rate_memory_path,
-        peer: rate_peer_key,
-        stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-
-        opener_measured: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-    };
+    let mut pair_memory = crate::media_pair_memory::open(
+        &pc,
+        session_id,
+        codec_label,
+        delivery.mode(),
+        constrained,
+        rate_hi_bps,
+        || nominated_remote_ip(&pc),
+    )
+    .await;
+    let (rate_seed, seed_age) = (pair_memory.seed(), pair_memory.seed_age());
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
     // encoder AND reopens the capturer at the new profile fps — pre-P3 a
@@ -7312,13 +7189,13 @@ async fn media_pump_ffmpeg_dc(
     // emits continuous bitrate targets; `FfmpegEncoder::set_bitrate`
     // coarsens them to a ladder and applies in-place (NVENC reconfigure)
     // or as a debounced QSV/AMF rebuild whose first frame is an IDR.
-    let mut governor = crate::encode::governor::RateGovernor::new(
+    let mut governor = crate::encode::governor::RateGovernor::new_with(
         target_fps,
         ffmpeg_send_depth,
         crate::encode::governor::GovernorFlags::from_env(),
         // FR-35 — the constrained ceiling learns the pair (0 = off).
         rate_hi_bps,
-        rate_seed,
+        &pair_memory.plan(),
         std::time::Instant::now(),
     );
     if let Some(seed_bps) = governor.open_seed_bps() {
@@ -7330,6 +7207,9 @@ async fn media_pump_ffmpeg_dc(
              remembered rate, floor relief seeded from it, refine lift held while the profile is on"
         );
     }
+    // FR-148 P1 — the path model's entry, and its open line.
+    let dial = priority.load(std::sync::atomic::Ordering::Relaxed);
+    pair_memory.at_open(&mut governor, dial, slow_link_profile.is_some());
     // FR-70 M3a — the PLAN, in SHADOW (`encode::plan`). At the top of every
     // pass the pump computes the plan ONCE from the facts it has at that
     // instant and compares it, field by field, against the inline values it
@@ -8867,7 +8747,7 @@ async fn media_pump_ffmpeg_dc(
                 let bps = crate::encode::policy::replacement_open_bps(
                     target_ceiling,
                     governor.applied_bps(),
-                    governor.open_seed_bps(),
+                    governor.open_at_bps(),
                 );
                 // FR-65 — a round trip to the encoder thread: `enc_cmd`.
                 let t = watch.start();
@@ -9091,7 +8971,7 @@ async fn media_pump_ffmpeg_dc(
                 // one frame later, and an encoder opened at the ceiling
                 // would be rebuilt right there (a second blocking QSV open
                 // before the first frame).
-                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
+                0 => governor.open_at_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
             // FR-65 — the open is BLOCKING (0.62-0.73 s measured on Iris Xe at
@@ -9456,28 +9336,7 @@ async fn media_pump_ffmpeg_dc(
                     "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
                 );
             }
-            // FR-35 P3b — the memory wants the rate the pipe actually CARRIED,
-            // not just the learner's above-nominal ceiling. On a short/frozen
-            // session the learner never rises, so `stable_bps()` is None; fall
-            // back to the AIMD's live applied rate so a session whose seed was
-            // too hot (the grace was cut short, the AIMD then cut) records the
-            // converged rate as a decrease and the pair stops re-seeding hot.
-            // FR-70 P1 — between the learner's stable rate and the applied-
-            // rate fallback sits what the session actually KNOWS about the
-            // pipe: a live measurement, or the prior as it has decayed. The
-            // applied rate at the last window is wherever the last decrease
-            // left it, which on a lumpy relay drifts the memory DOWN across
-            // sessions (200 kbps was an attractor, not a stale day).
-            rate_memory_guard.stable.store(
-                governor
-                    .stable_bps()
-                    .or_else(|| governor.pipe_bps(std::time::Instant::now(), constrained))
-                    // FR-79 V4 — evidence only: the applied rate used to stand in
-                    // here when nothing measured, which is the memory learning
-                    // from itself.
-                    .unwrap_or(0),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            pair_memory.window(&governor, constrained);
         }
         if let Some(vw) = viewer_window
             && (vw.changed
@@ -9568,9 +9427,7 @@ async fn media_pump_ffmpeg_dc(
             // 2026-09-08 — every opener there had a 0 ms worst wait).
             let target = measured.unwrap_or(0).min(rate_hi_bps.max(1));
             if constrained {
-                rate_memory_guard
-                    .opener_measured
-                    .store(target, std::sync::atomic::Ordering::Relaxed);
+                pair_memory.opener_measured(target);
                 info!(
                     %session_id,
                     codec_label,
@@ -10361,12 +10218,21 @@ async fn media_pump_ffmpeg_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — what a stall is judged against: a live reading, never
+                // the prior's stand-in. None = no claim to contradict, so a stall
+                // cuts nothing. `readings_refuted` counts the deliveries that took
+                // out what stood below them; `goodput_bps` reads None after one.
+                // `link_unoffered` counts congested windows the sender was not
+                // feeding: a link loop gone quiet with this climbing is the rule.
+                pipe_measured = ?governor.measured_bps(std::time::Instant::now(), constrained),
+                readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow
@@ -10487,6 +10353,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block
@@ -12718,11 +12585,11 @@ async fn finish_rich_write(
             "id": id,
             "bytes": bytes,
         }),
-        Err(message) => {
-            warn!(%session_id, id, ?message, "clipboard: rich write failed");
+        Err(reason) => {
+            warn!(%session_id, id, ?reason, "clipboard: rich write failed");
             serde_json::json!({
                 "t": "clipboard:error",
-                "message": message,
+                "message": reason,
                 "id": id,
             })
         }
@@ -16836,7 +16703,7 @@ pub(crate) mod folder_download_as_the_person_tests {
 #[cfg(test)]
 mod stopped_at_screen_tests {
     use super::*;
-    use crate::rc_sessions::RcSessionRegistry;
+    use crate::rc_sessions::{RcSessionRegistry, Via};
     use bson::oid::ObjectId;
 
     fn listed(reg: &RcSessionRegistry, session: ObjectId, kill: crate::rc_sessions::KillSender) {
@@ -16866,7 +16733,7 @@ mod stopped_at_screen_tests {
             no_video.load(std::sync::atomic::Ordering::Relaxed),
             "the loop can name the end"
         );
-        assert_eq!(killed.try_recv().ok(), Some(sid), "the session's end");
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo))); // the session's end
         assert!(killed.try_recv().is_err(), "asked once, not every second");
     }
 
@@ -16888,7 +16755,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo)));
         assert!(!pump.is_finished(), "only the teardown ends the pump");
         pump.abort();
     }
@@ -16933,7 +16800,7 @@ mod stopped_at_screen_tests {
         );
         assert_eq!(
             killed.try_recv().ok(),
-            Some(sid),
+            Some((sid, Via::ShareStop)),
             "the session's Disconnect"
         );
         assert!(killed.try_recv().is_err(), "asked once, not every second");
@@ -16954,7 +16821,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::ShareStop)));
         pump.abort();
     }
 
@@ -16991,12 +16858,12 @@ mod stopped_at_screen_tests {
         tokio::select! {
             _ = end_stopped_at_screen(owner, &reg, Some(&pipeline)) => unreachable!("it never returns"),
             () = async {
-                assert_eq!(killed.recv().await, Some(follower), "the follower first");
+                assert_eq!(killed.recv().await, Some((follower, Via::ShareStop)), "the follower first");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 assert!(killed.try_recv().is_err(), "the owner waits while its follower is still on");
                 // The follower's own teardown aborts its task, which drops its guard.
                 drop(guard);
-                assert_eq!(killed.recv().await, Some(owner), "then the owner");
+                assert_eq!(killed.recv().await, Some((owner, Via::ShareStop)), "then the owner");
             } => {}
         }
     }

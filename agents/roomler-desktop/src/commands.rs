@@ -331,10 +331,19 @@ impl DeviceView {
 /// absent, and this returns `available:false` + a `reason` so the SPA renders a
 /// clean "device service not running" state instead of a rejected promise. On
 /// success it issues `status` then `peers` on ONE connection.
+///
+/// #4020 — through [`connect_service`], so a stopped service on a Linux system
+/// install or a Mac reads `daemon_unreachable`, not `connect_error`.
 #[tauri::command]
 pub async fn cmd_device_view() -> DeviceView {
+    device_view(connect_service().await).await
+}
+
+/// [`cmd_device_view`] after its connect: `connected` is the connect's
+/// result.
+async fn device_view(connected: std::io::Result<localapi::Client>) -> DeviceView {
     const SURFACE: &str = "device_view";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => {
             let reason = if e.kind() == std::io::ErrorKind::NotFound {
@@ -392,7 +401,7 @@ pub async fn cmd_ping(
     timeout_ms: Option<u64>,
     prefer_v6: Option<bool>,
 ) -> Result<PingResult, String> {
-    let mut client = localapi::connect().await.map_err(|e| {
+    let mut client = connect_service().await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "device service not running".to_string()
         } else {
@@ -457,6 +466,26 @@ pub async fn cmd_enroll(
     Ok(status_report())
 }
 
+/// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
+/// no enrollment, or is not there: the device service holds it. A one-row
+/// Mac's person has a file with no enrollment in it, which the screen worker
+/// writes at its first start; a Windows background-service install's person
+/// has no file, and the machine-wide one only administrators read.
+fn enrollment_elsewhere() -> String {
+    if cfg!(target_os = "macos") {
+        "The root daemon holds this Mac's enrollment. Refresh it with \
+         `sudo roomlerd re-enroll --token <token>`."
+    } else if cfg!(windows) {
+        "The device service holds this device's enrollment, in its machine-wide \
+         configuration. Refresh it from an elevated shell with \
+         `roomlerd re-enroll --token <token>`."
+    } else {
+        "The device service holds this device's enrollment, in its system \
+         configuration. Refresh it with `sudo roomlerd re-enroll --token <token>`."
+    }
+    .to_string()
+}
+
 /// Refresh the token using an existing config. Mirrors the CLI's
 /// `re-enroll --token` subcommand. Targets the config the daemon
 /// actually reads (machine-global first) — writing the per-user copy
@@ -474,15 +503,11 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         .unwrap_or(false);
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-    // FR-43 P3a — this file has nothing to refresh.
-    if !existing.has_primary_enrollment() {
-        return Err(
-            "The root daemon holds this Mac's enrollment. Refresh it with \
-             `sudo roomlerd re-enroll --token <token>`."
-                .to_string(),
-        );
-    }
+    // FR-43 P3a — this file has nothing to refresh. #3996 — nor has a file
+    // that is not there: the device service holds the enrollment.
+    let Some(existing) = load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment) else {
+        return Err(enrollment_elsewhere());
+    };
     let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
@@ -520,7 +545,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
 /// human detail ("archived … -> …"); Err carries why nothing was done.
 #[tauri::command]
 pub async fn cmd_config_cleanup() -> Result<String, String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("daemon unreachable: {e}"))?;
     match client.config_cleanup_stale().await {
@@ -600,14 +625,32 @@ pub async fn cmd_config_entries() -> Result<ConfigListing, String> {
     tokio::task::spawn_blocking(|| {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(ConfigListing {
-            entries: roomler_node_core::config_surface::entries(&cfg),
-            machine_merged: false,
-        })
+        entries_from_file(&path)
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
+}
+
+/// The configuration page's rows from the file at `path`, when no device
+/// service answered the listing. #3996 — no file there is said so, with
+/// nothing in the log: the Welcome reads this listing as it opens, and a
+/// start with no service answering logged "the host must be re-enrolled"
+/// for a one-row Mac's person or a host not enrolled yet.
+fn entries_from_file(path: &PathBuf) -> Result<ConfigListing, String> {
+    let cfg = load_if_there(path)?.ok_or_else(|| no_config_here(path))?;
+    Ok(ConfigListing {
+        entries: roomler_node_core::config_surface::entries(&cfg),
+        machine_merged: false,
+    })
+}
+
+/// #3996 — what a page reads when no device service answered and no config
+/// file is there to fall back on.
+fn no_config_here(path: &Path) -> String {
+    format!(
+        "There is no configuration file at {} yet, and the device service did not answer.",
+        path.display()
+    )
 }
 
 /// #2871 — is `key` the root half's on a two-half Mac
@@ -898,7 +941,7 @@ fn config_set_blocking(
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     roomler_node_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     roomler_node_core::config_surface::entry_for(&cfg, &key)
@@ -1314,9 +1357,19 @@ const ENCODER_CAPS_SURFACE: &str = "encoder_caps";
 /// FR-84 D4 — what this device can encode, from the daemon's CACHED probe
 /// (the verb never starts one). The card polls this only while the answer
 /// is `not_probed`, and re-reads it when the daemon comes back or changes.
+///
+/// #4020 — through [`connect_service`]: a stopped service on a Linux system
+/// install or a Mac is `daemon_unreachable`, which the card words "Offline",
+/// not the system socket's `PermissionDenied` under its `Error` chip.
 #[tauri::command]
 pub async fn cmd_encoder_caps() -> EncoderCapsView {
-    let mut client = match localapi::connect().await {
+    encoder_caps_from(connect_service().await).await
+}
+
+/// [`cmd_encoder_caps`] after its connect: `connected` is the connect's
+/// result.
+async fn encoder_caps_from(connected: std::io::Result<localapi::Client>) -> EncoderCapsView {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return EncoderCapsView::unavailable("daemon_unreachable".into());
@@ -1441,10 +1494,19 @@ fn own_home() -> Option<String> {
 
 /// FR-84 D4 — the card's data: the daemon's effective folder (status) and
 /// the configured value (its config surface), on ONE connection.
+///
+/// #4020 — through [`connect_service`], as [`cmd_encoder_caps`]: a stopped
+/// service reads "Offline" on the card, on every OS.
 #[tauri::command]
 pub async fn cmd_files_dir_view() -> FilesDirView {
+    files_dir_view_from(connect_service().await).await
+}
+
+/// [`cmd_files_dir_view`] after its connect: `connected` is the connect's
+/// result.
+async fn files_dir_view_from(connected: std::io::Result<localapi::Client>) -> FilesDirView {
     const SURFACE: &str = "files_dir";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return FilesDirView::unavailable("daemon_unreachable".into());
@@ -1520,7 +1582,7 @@ fn files_dir_value_for(picked: &Path, home: Option<&str>) -> String {
 /// write, as whom, into which profile; its refusal is the answer, shown in
 /// its own words — never a cue to write the file directly.
 async fn set_files_dir_via_daemon(value: Option<&str>) -> Result<localapi::ConfigEntry, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .config_set("files_dir", value)
         .await
@@ -1601,7 +1663,7 @@ pub async fn cmd_files_dir_default() -> Result<localapi::ConfigEntry, String> {
 /// <file>` / `open <file>` would launch a file rather than show it.
 #[tauri::command]
 pub async fn cmd_open_files_dir() -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let status = client
         .status()
         .await
@@ -1832,18 +1894,32 @@ fn no_handler_message(scheme: &str) -> String {
 pub fn server_origin_blocking() -> Result<String, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
+    server_origin_from(&path, daemon_node_status_blocking)
+}
+
+/// [`server_origin_blocking`] for the config at `path`, asking the daemon
+/// (`daemon`) when that file holds no enrollment. #3996 — or is not there. A
+/// one-row Mac's screen worker (`run --supervised --unenrolled`) writes the
+/// person's `config.toml` at its first start, with no enrollment in it, so
+/// the file is missing only in the install's first seconds or on a device not
+/// enrolled yet. Until #3996 a missing file ended here as "not enrolled", with
+/// `config::load`'s "must be re-enrolled" in the log, and the daemon was never
+/// asked.
+fn server_origin_from(
+    path: &PathBuf,
+    daemon: impl FnOnce() -> Option<NodeStatus>,
+) -> Result<String, String> {
     let not_enrolled = || "This device isn't enrolled yet — no server to open.".to_string();
-    let cfg = config::load(&path).map_err(|_| not_enrolled())?;
+    let cfg = load_if_there(path).map_err(|_| not_enrolled())?;
     // FR-43 P3a — on a one-row Mac the server is in the root daemon's enrollment,
     // not in the person's file.
-    let server = if cfg.has_primary_enrollment() {
-        cfg.server_url
-    } else {
-        daemon_node_status_blocking()
+    let server = match cfg.filter(AgentConfig::has_primary_enrollment) {
+        Some(cfg) => cfg.server_url,
+        None => daemon()
             .as_ref()
             .and_then(daemon_identity)
             .and_then(|id| id.server_url)
-            .ok_or_else(not_enrolled)?
+            .ok_or_else(not_enrolled)?,
     };
     let server = server.trim().trim_end_matches('/').to_string();
     if !server.starts_with("https://") && !server.starts_with("http://") {
@@ -1890,13 +1966,15 @@ pub async fn cmd_open_remote(
     let url = tokio::task::spawn_blocking(move || {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let (server, tid) = if cfg.has_primary_enrollment() {
-            remote_target(&cfg, org.as_deref())?
-        } else {
-            let status = daemon_node_status_blocking()
-                .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
-            daemon_remote_target(&status, org.as_deref())?
+        // #3996 — no file is a file with no enrollment: ask the daemon.
+        let (server, tid) = match load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment)
+        {
+            Some(cfg) => remote_target(&cfg, org.as_deref())?,
+            None => {
+                let status = daemon_node_status_blocking()
+                    .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
+                daemon_remote_target(&status, org.as_deref())?
+            }
         };
         Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
@@ -2055,7 +2133,7 @@ fn set_device_name_blocking(name: String) -> Result<StatusReport, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     cfg.machine_name = trimmed;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
@@ -2229,7 +2307,7 @@ pub struct RestartReport {
 /// not be asked at all.
 #[tauri::command]
 pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let answer = client
         .restart_daemon(&reason)
         .await
@@ -2541,48 +2619,227 @@ pub async fn cmd_open_config_dir() -> Result<(), String> {
 /// owns the profile-correct sentinel dir, so this works even when the agent runs
 /// as SYSTEM — where the tray writing the sentinel itself would land in the
 /// wrong profile and the agent would never see it.
+///
+/// #3873 — `session` is the question the page shows, `None` when it shows
+/// none: that click is logged too ([`answer_click`]). #3987 — `shown` is how
+/// long, in ms, the page has shown that question.
 #[tauri::command]
-pub async fn cmd_consent_approve(session: String) -> Result<String, String> {
-    consent_decide(&session, true).await
+pub async fn cmd_consent_approve(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), true, shown).await
 }
 
 /// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub async fn cmd_consent_deny(session: String) -> Result<String, String> {
-    consent_decide(&session, false).await
+pub async fn cmd_consent_deny(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), false, shown).await
 }
 
 /// Send an Approve/Deny decision to the daemon over the LocalAPI.
-async fn consent_decide(session: &str, allow: bool) -> Result<String, String> {
-    let mut client = localapi::connect()
-        .await
-        .map_err(|e| format!("Device service unreachable: {e}"))?;
-    let ok = client
-        .consent_decide(session, allow)
-        .await
-        .map_err(|e| format!("LocalAPI error: {e}"))?;
-    if ok {
-        Ok(if allow {
-            "approved".into()
-        } else {
-            "denied".into()
-        })
-    } else {
-        Err("The device service rejected the decision (unknown or invalid session).".into())
+async fn consent_decide(
+    session: Option<&str>,
+    allow: bool,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    // #3987 — how long the click's question has been in front of the person.
+    let in_front = crate::panels::in_front_for(
+        crate::panels::consent_raised_ago(std::time::Instant::now()),
+        shown_for(shown),
+    );
+    answer_click(
+        session,
+        allow,
+        in_front,
+        CONSENT_ANSWER_WITHIN,
+        |session, allow| async move {
+            let mut client = connect_service().await.map_err(AskError::Connect)?;
+            client
+                .consent_decide(&session, allow)
+                .await
+                .map_err(AskError::Request)
+        },
+    )
+    .await
+}
+
+/// #3873 — how long a click's answer may take, from the connect to the
+/// daemon's reply: above the daemon's own bounds on an answer, who is at the
+/// seat (1.5 s, `files::SEAT_LOOKUP_WAIT`) and a one-row Mac's relay to its
+/// root half (5 s, `consent_relay::DECIDE_WITHIN`). Until #3873 nothing
+/// bounded it: an answer that never came kept the page "sending" for good,
+/// and it dropped every later click on the question without a word.
+const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
+/// #3873 — what the page shows for a click with no question on it.
+const NO_QUESTION: &str = "No question is waiting for an answer here, so nothing was sent.";
+
+/// #3987 — the page's `shown`, in ms, as a time. Anything but a finite
+/// number at or above zero is not known.
+fn shown_for(ms: Option<f64>) -> Option<Duration> {
+    ms.filter(|m| m.is_finite() && *m >= 0.0)
+        .and_then(|m| Duration::try_from_secs_f64(m / 1000.0).ok())
+}
+
+/// #3873 — the consent read's name in the refresh ledger.
+const CONSENT_PENDING_SURFACE: &str = "consent_pending";
+
+/// Why a click's answer did not come back from the daemon.
+#[derive(Debug)]
+enum AskError {
+    /// The LocalAPI endpoint could not be reached.
+    Connect(std::io::Error),
+    /// Reached, and the request failed: the daemon's own refusal
+    /// (`localapi error: …`), or the connection.
+    Request(std::io::Error),
+}
+
+/// #3873 — one click on Approve or Deny, from the page to the daemon: in the
+/// log when it arrives and again with its outcome, and given `within` for the
+/// daemon's answer. `ask` is the round trip ([`consent_decide`]'s LocalAPI
+/// call). Returns what the page shows: `approved` / `denied`, or the reason.
+/// #3987 — `in_front` is how long the click's question has been in front of
+/// the person ([`crate::panels::in_front_for`]).
+///
+/// Until #3873 no step of a click logged anything and none had a bound: on a
+/// Linux system install two clicks on a question the prompt window showed
+/// left no line in this app's log or the daemon's, and the question timed
+/// out (0.4.221 release lab).
+async fn answer_click<F, Fut>(
+    session: Option<&str>,
+    allow: bool,
+    in_front: Option<Duration>,
+    within: Duration,
+    ask: F,
+) -> Result<String, String>
+where
+    F: FnOnce(String, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, AskError>>,
+{
+    let verb = if allow { "Approve" } else { "Deny" };
+    let Some(session) = session.filter(|s| !s.is_empty()) else {
+        tracing::warn!(
+            verb,
+            "consent: a click with no question on the page; nothing was sent"
+        );
+        return Err(NO_QUESTION.into());
+    };
+    // #3987 — a click this soon after its question came to the front may
+    // have been aimed at what was under the pointer before it: in the log
+    // with why, and never sent. The page shows why, and the next click goes.
+    if !crate::panels::click_armed(in_front) {
+        let after = in_front.unwrap_or_default();
+        tracing::warn!(
+            verb,
+            session,
+            ?after,
+            arming = ?crate::panels::CONSENT_ARMING,
+            "consent: a click arrived too soon after the question came to the front; nothing was sent"
+        );
+        return Err(format!(
+            "Nothing was sent: this click came {:.1} s after the question came up, too soon to \
+             be sure it was meant for it. Click again to answer.",
+            after.as_secs_f64()
+        ));
     }
+    tracing::info!(
+        verb,
+        session,
+        "consent: a click arrived; asking the device service"
+    );
+    let (shown, why) = match tokio::time::timeout(within, ask(session.to_string(), allow)).await {
+        Ok(Ok(true)) => {
+            tracing::info!(verb, session, "consent: the device service took the answer");
+            return Ok(if allow { "approved" } else { "denied" }.into());
+        }
+        Ok(Ok(false)) => (
+            "The device service did not take the answer: this question is no longer waiting for \
+             one (answered, withdrawn or expired)."
+                .to_string(),
+            "the device service has no such question waiting (answered, withdrawn or expired)"
+                .to_string(),
+        ),
+        // #3998 — no service at all, said plainly.
+        Ok(Err(AskError::Connect(e))) if crate::tray::no_service(&e) => (
+            "Could not reach the device service: it is not running.".to_string(),
+            describe_io("connect", &e),
+        ),
+        Ok(Err(AskError::Connect(e))) => (
+            format!("Could not reach the device service: {e}"),
+            describe_io("connect", &e),
+        ),
+        Ok(Err(AskError::Request(e))) => match e.to_string().strip_prefix("localapi error: ") {
+            // The daemon's own refusal: its words, as they are (#3845's seat
+            // check, a one-row Mac's relay, an id it does not know).
+            Some(words) => (words.to_string(), words.to_string()),
+            None => (
+                format!("No answer from the device service: {e}"),
+                describe_io("consent_decide", &e),
+            ),
+        },
+        Err(_) => {
+            tracing::warn!(
+                verb,
+                session,
+                ?within,
+                "consent: no answer from the device service in time; the click is not taken"
+            );
+            return Err(format!(
+                "No answer from the device service within {within:?}. Try again."
+            ));
+        }
+    };
+    tracing::warn!(verb, session, reason = %why, "consent: the answer was not taken");
+    Err(shown)
 }
 
 /// List consent requests currently awaiting a decision — asked of the daemon
-/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The SPA
-/// polls this to render the Approve/Deny modal. NEVER errors — the modal must
-/// stay quiet when the daemon is down or nothing is pending. `ConsentRequest`
+/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The
+/// prompt window and the main window's fallback modal poll this. `ConsentRequest`
 /// serialises to the same `{session_id, controller_name, permissions,
-/// timeout_secs}` shape the SPA already consumes.
+/// timeout_secs}` shape the pages already consume.
+///
+/// #3873 — a read that fails is an `Err`, not an empty list
+/// ([`pending_answer`]): both pages stay quiet on it and keep what they show.
 #[tauri::command]
-pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
-    match localapi::connect().await {
-        Ok(mut c) => c.consent_pending().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c
+            .consent_pending()
+            .await
+            .map_err(|e| ("consent_pending", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    pending_answer(read)
+}
+
+/// #3873 — what the pages get for their read of the questions: the list, or,
+/// for a read that failed, an error. An empty list clears the question a
+/// page shows; a failed read keeps it, since the daemon may still be asking
+/// it, and a click on it reaches [`answer_click`], which logs what becomes of
+/// it. Until #3873 a failed read was an empty list: the prompt window let go
+/// of the question while it stayed on screen, and dropped a click on it. The
+/// failure is in the log through the refresh ledger, once a streak; a daemon
+/// that is not running is quiet, as on every other surface.
+fn pending_answer(
+    read: Result<Vec<ConsentRequest>, (&'static str, std::io::Error)>,
+) -> Result<Vec<ConsentRequest>, String> {
+    match read {
+        Ok(list) => {
+            refresh_ok(CONSENT_PENDING_SURFACE);
+            Ok(list)
+        }
+        Err((stage, e)) if stage == "connect" && e.kind() == std::io::ErrorKind::NotFound => {
+            Err(describe_io(stage, &e))
+        }
+        Err((stage, e)) => Err(refresh_failed(
+            CONSENT_PENDING_SURFACE,
+            describe_io(stage, &e),
+        )),
     }
 }
 
@@ -2597,14 +2854,65 @@ pub fn cmd_consent_modal_needed() -> bool {
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
 ///
-/// Never errors, for the same reason as [`cmd_get_pending_consents`]: an empty
-/// list and a daemon-down are the same *render* (no banner), and the Overview
-/// already surfaces daemon-down properly.
+/// #3998 — a read that fails is an `Err`, not an empty list
+/// ([`sessions_answer`]): the banner keeps its words on it, and the session
+/// watch in `main.rs` decides whether the banner stays up.
 #[tauri::command]
-pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
+pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c.rc_sessions().await.map_err(|e| ("rc_sessions", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    sessions_answer(read)
+}
+
+/// #3998 — what the banner page gets for its read of the sessions: the list,
+/// or, for a read that failed, why. Until #3998 a failed read was an empty
+/// list, and the banner said "Being viewed" with no name and offered a
+/// Disconnect that ended nothing.
+fn sessions_answer(
+    read: Result<Vec<roomler_localapi::RcSessionInfo>, (&'static str, std::io::Error)>,
+) -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    read.map_err(|(stage, e)| describe_io(stage, &e))
+}
+
+/// #3998 — [`localapi::connect`] for the consent prompt, the session banner
+/// and the tray's red: a connect that failed while this person's own
+/// endpoint is gone comes back as no service ([`proven`]).
+///
+/// #4020 — and for every other connect of this app whose error is read: a
+/// read that tells "not running" apart from another failure (the Overview's
+/// encoders and files cards, the device view, the Routes, Recordings and
+/// Devices pages), and an action whose error is shown as text, which keeps
+/// its words. Until #4020 those used the plain connect, so on a Linux system
+/// install or a Mac with the service stopped the Overview's cards said
+/// `Error` with the system socket's `PermissionDenied` (the 0.4.225 lab). A
+/// connect whose error nothing reads stays plain: a best-effort read with a
+/// fallback of its own, where the proof would probe the person's own
+/// endpoint for nothing. The test `only_a_connect_nobody_reads_stays_plain`
+/// holds that list.
+pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
-        Ok(mut c) => c.rc_sessions().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(client) => Ok(client),
+        Err(e) => Err(proven(e, localapi::own_endpoint_gone().await)),
+    }
+}
+
+/// #3998 — a failed connect's error, or, when this person's own endpoint is
+/// gone (`own_endpoint_gone`), `NotFound`: no device service is there for
+/// them, which the tray reads as an answer ([`crate::tray::no_service`]).
+/// On a Linux system install and on a Mac, `connect`'s error is its last
+/// endpoint's, the system socket in a folder only root may enter, so a
+/// stopped daemon read there as `PermissionDenied` (os error 13), the words
+/// a click's status line showed in the 0.4.224 Linux lab.
+pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Error {
+    if own_endpoint_gone && !crate::tray::no_service(&e) {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the device service is not running: this account's own LocalAPI endpoint is gone",
+        )
+    } else {
+        e
     }
 }
 
@@ -2613,7 +2921,7 @@ pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
 /// overlay's own button does.
 #[tauri::command]
 pub async fn cmd_rc_disconnect(session: String) -> Result<(), String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("Device service unreachable: {e}"))?;
     let ok = client
@@ -2663,7 +2971,7 @@ impl TunnelsView {
 #[tauri::command]
 pub async fn cmd_tunnels_view() -> TunnelsView {
     const SURFACE: &str = "tunnels";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return TunnelsView::unavailable(refresh_failed(SURFACE, describe_io("connect", &e)));
@@ -2702,7 +3010,7 @@ pub async fn cmd_tunnels_view() -> TunnelsView {
 pub async fn cmd_route_update(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_update(route)
         .await
@@ -2727,7 +3035,7 @@ fn explain_route_edit_error(message: &str) -> String {
 pub async fn cmd_route_add(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_add(route).await.map_err(|e| e.to_string())
 }
 
@@ -2735,14 +3043,14 @@ pub async fn cmd_route_add(
 /// daemon config). `Ok(false)` when the id was unknown.
 #[tauri::command]
 pub async fn cmd_route_remove(id: String) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_remove(&id).await.map_err(|e| e.to_string())
 }
 
 /// Enable/disable a declared route (enabling clears a terminal `failed`).
 #[tauri::command]
 pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_set_enabled(&id, enabled)
         .await
@@ -2751,6 +3059,8 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
 
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
+/// #4020 — its callers connect through [`connect_service`], so a stopped
+/// service is `NotFound` here on a Linux system install and a Mac too.
 pub(crate) fn daemon_unreachable(e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         "device service not running".to_string()
@@ -2854,7 +3164,7 @@ pub(crate) fn explain_recording_error(message: &str) -> String {
 #[tauri::command]
 pub async fn cmd_recordings_view() -> RecordingsView {
     const SURFACE: &str = "recordings";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return RecordingsView::unavailable(refresh_failed(
@@ -2955,7 +3265,7 @@ pub async fn cmd_record_start(
     system_audio: Option<bool>,
     microphone: Option<bool>,
 ) -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_start(localapi::RecordStartOpts {
             fps,
@@ -2971,7 +3281,7 @@ pub async fn cmd_record_start(
 /// Stop the recording. Resolves once the file is final.
 #[tauri::command]
 pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_stop()
         .await
@@ -2981,7 +3291,7 @@ pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
 /// Delete a recording (and its sidecar) by file name.
 #[tauri::command]
 pub async fn cmd_recording_delete(name: String) -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .recording_delete(&name)
         .await
@@ -3011,7 +3321,7 @@ pub async fn cmd_recording_open(name: Option<String>, reveal: bool) -> Result<()
     if let Some(n) = &name {
         check_recording_name(n)?;
     }
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let listing = client
         .recordings_list()
         .await
@@ -3155,7 +3465,7 @@ pub async fn cmd_devices(
     dir: Option<String>,
 ) -> Result<localapi::DevicesPage, String> {
     const SURFACE: &str = "devices";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     let query = localapi::DevicesQuery {
@@ -3179,7 +3489,7 @@ pub async fn cmd_devices(
 #[tauri::command]
 pub async fn cmd_mesh(org: Option<String>) -> Result<localapi::MeshView, String> {
     const SURFACE: &str = "mesh";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     match client.mesh(org.as_deref().unwrap_or("")).await {
@@ -3337,10 +3647,30 @@ fn refresh_ok(surface: &'static str) {
 /// enrolled.
 fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
     let path = active_config_path(is_scm).ok()?;
+    load_if_there(&path).ok().flatten()
+}
+
+/// #3996 — the config at `path`, for a caller to whom no file there is a
+/// normal state. The companion never runs on a config (the device service
+/// does), so that is every read it makes. A one-row Mac's person has none in
+/// the install's first seconds, until the screen worker writes one with no
+/// enrollment in it at its first start: the root daemon holds the enrollment
+/// (FR-43). A host that is not enrolled yet has none, and the person at a
+/// Windows background-service install cannot see the machine-wide one.
+///
+/// No file is `Ok(None)`, with nothing logged. A file that is there goes
+/// through [`config::load`], so a broken one still logs its ERROR and is
+/// recovered from its `.prev`; [`config::read_if_present`] would hide it
+/// (FR-66). Until #3996 most of these reads went straight to `config::load`,
+/// and a start with no device service answering logged "the host must be
+/// re-enrolled" about a healthy one-row Mac.
+fn load_if_there(path: &PathBuf) -> Result<Option<AgentConfig>, String> {
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    config::load(&path).ok()
+    config::load(path)
+        .map(Some)
+        .map_err(|e| format!("Loading config: {e}"))
 }
 
 /// A `Command` that never flashes a console window on Windows. The tray is a GUI
@@ -3749,6 +4079,74 @@ mod tests {
         );
         assert_eq!(r.agent_id.as_deref(), Some("from-file"));
         assert_eq!(r.server_url.as_deref(), Some("https://file.example"));
+    }
+
+    /// #3996 — a start while no device service answers, on a host whose
+    /// person holds no config (a one-row Mac, or one not enrolled yet), logs
+    /// no ERROR and no "must be re-enrolled". The Welcome reads the
+    /// configuration listing as it opens, and with no service answering the
+    /// listing falls back to the file. Open Roomler falls back to the daemon,
+    /// which a missing file no longer keeps it from asking. On 0.4.224 each
+    /// start of a one-row Mac's script install logged the ERROR.
+    #[test]
+    fn a_start_with_no_config_and_no_service_logs_no_error() {
+        // A second live dispatcher, so that no other test thread's visit
+        // caches `config::load`'s callsites as never logged (see
+        // `first_run::tests::a_reopen_logs_what_it_shows`).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        let no_service = server_origin_from(&path, || None);
+        let one_row = server_origin_from(&path, || {
+            Some(daemon_status(
+                "6ab7a24f352abff7547c5062",
+                Some("6a975e17971e2d55ddcdedb2"),
+            ))
+        });
+        drop(guard);
+        let shown = listing.expect_err("no file and no service: nothing to list");
+        assert!(
+            shown.starts_with("There is no configuration file at"),
+            "{shown}"
+        );
+        assert_eq!(
+            no_service,
+            Err("This device isn't enrolled yet — no server to open.".to_string())
+        );
+        assert_eq!(
+            one_row.as_deref(),
+            Ok("https://roomler.ai"),
+            "a one-row Mac's server is its root daemon's"
+        );
+        let text = log.text();
+        assert!(
+            !text.contains("ERROR") && !text.contains("re-enrolled"),
+            "{text}"
+        );
+    }
+
+    /// #3996 — a config that IS there and is broken still logs its ERROR:
+    /// that line is what a really broken config writes, and a missing file
+    /// must not be read the same way, nor hide it.
+    #[test]
+    fn a_broken_config_still_logs_its_error() {
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        // All NUL, as an unclean shutdown once left one (`config::load`).
+        std::fs::write(&path, [0u8; 64]).expect("the broken file");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        drop(guard);
+        let shown = listing.expect_err("a broken file lists nothing");
+        assert!(shown.starts_with("Loading config: "), "{shown}");
+        let text = log.text();
+        assert!(
+            text.contains("ERROR") && text.contains("the host must be re-enrolled"),
+            "{text}"
+        );
     }
 
     // #1681 — stdout as `roomlerd service status [--as-service]` really prints
@@ -4901,6 +5299,730 @@ mod tests {
         assert_eq!(
             no_handler_message("mailto"),
             "Nothing on this computer opens mailto: links."
+        );
+    }
+
+    // ─── #3873 — a click on the consent prompt is acted on, or logged ────
+
+    /// A session the daemon could be asking about.
+    const SESSION: &str = "0123456789abcdef01234567";
+
+    /// The lines the code under test logs, as the desktop log writes them.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+        }
+    }
+
+    /// This thread's log lines while the guard lives. The tests below are
+    /// `#[tokio::test]`s, on the current thread, so a click's lines land here.
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let out = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (out, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// #3873 — a click whose answer never comes back ends at the bound, with
+    /// its reason on the page and in the log. On 0.4.221 nothing bounded it:
+    /// the page stayed "sending" for good, and its next click, 3 min later,
+    /// was dropped without a line anywhere.
+    #[tokio::test]
+    async fn a_click_whose_answer_never_comes_ends_at_the_bound() {
+        let (log, _guard) = capture();
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer_click(
+                Some(SESSION),
+                true,
+                None,
+                Duration::from_millis(50),
+                |_, _| std::future::pending::<Result<bool, AskError>>(),
+            ),
+        )
+        .await
+        .expect("5 s on, the click still waited for its answer: nothing bounds it");
+        let shown = answered.expect_err("no answer is not an approval");
+        assert!(
+            shown.starts_with("No answer from the device service within"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(text.contains("consent: a click arrived"), "{text}");
+        assert!(
+            text.contains("WARN") && text.contains("consent: no answer from the device service"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+    }
+
+    /// #3873 — every click is in the log when it arrives and again with its
+    /// outcome, and the page gets the daemon's own words where it gave some.
+    #[tokio::test]
+    async fn every_click_is_logged_when_it_arrives_and_with_its_outcome() {
+        let within = Duration::from_secs(5);
+
+        let (log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            within,
+            |session, allow| async move {
+                assert_eq!((session.as_str(), allow), (SESSION, true));
+                Ok(true)
+            },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Approve"),
+            "{text}"
+        );
+        assert!(
+            text.contains("consent: the device service took the answer"),
+            "{text}"
+        );
+
+        // Refused by the daemon, in its own words (#3845's seat check).
+        let words = "The answer was not taken: only the person signed in at this device's own \
+                     screen answers a request to see or control it, and that is not this account \
+                     right now (the seat changed since this connection opened).";
+        let (log, guard) = capture();
+        let refused = answer_click(Some(SESSION), false, None, within, |_, _| async move {
+            Err(AskError::Request(std::io::Error::other(format!(
+                "localapi error: {words}"
+            ))))
+        })
+        .await;
+        drop(guard);
+        assert_eq!(
+            refused,
+            Err(words.to_string()),
+            "the page shows the daemon's words"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Deny"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WARN") && text.contains("consent: the answer was not taken"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the seat changed"),
+            "the daemon's words are in the log: {text}"
+        );
+
+        // No such question any more: answered, withdrawn or expired.
+        let (log, guard) = capture();
+        let gone = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Ok(false)
+        })
+        .await;
+        drop(guard);
+        let shown = gone.expect_err("not taken");
+        assert!(shown.contains("no longer waiting"), "{shown}");
+        let text = log.text();
+        assert!(text.contains("consent: the answer was not taken"), "{text}");
+
+        // The device service could not be reached.
+        let (log, guard) = capture();
+        let unreachable = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Err(AskError::Connect(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        })
+        .await;
+        drop(guard);
+        let shown = unreachable.expect_err("not sent");
+        assert!(
+            shown.starts_with("Could not reach the device service"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: the answer was not taken") && text.contains("connect: "),
+            "{text}"
+        );
+    }
+
+    /// #3873 — a click with no question on the page reaches the app and is
+    /// logged; nothing goes to the daemon.
+    #[tokio::test]
+    async fn a_click_with_no_question_is_logged_and_sends_nothing() {
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, _guard) = capture();
+        let shown = answer_click(None, true, None, Duration::from_secs(5), |_, _| {
+            sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(true) }
+        })
+        .await
+        .expect_err("a click with no question is not an approval");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert_eq!(shown, NO_QUESTION);
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click with no question on the page"),
+            "{text}"
+        );
+    }
+
+    /// #3987 — a click that comes too soon after its question came to the
+    /// front (the app showed or raised the prompt, or the page put a new
+    /// question under the pointer) is logged with why and never sent, and
+    /// the page shows the reason. Escape, the Deny button's key, is held
+    /// back the same way. Once the question has been up for the arming
+    /// time, the click goes.
+    #[tokio::test]
+    async fn a_click_too_soon_after_the_question_came_up_is_logged_and_not_sent() {
+        let within = Duration::from_secs(5);
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            Some(Duration::from_millis(300)),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        let shown = shown.expect_err("a click 0.3 s after the question came up approves nothing");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert!(
+            shown.starts_with("Nothing was sent") && shown.contains("0.3 s"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click arrived too soon"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+
+        let (_log, guard) = capture();
+        let escape = answer_click(
+            Some(SESSION),
+            false,
+            Some(Duration::ZERO),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        assert!(
+            escape.is_err(),
+            "a Deny as the question comes up is held back too"
+        );
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            Some(crate::panels::CONSENT_ARMING),
+            within,
+            |_, _| async { Ok(true) },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+    }
+
+    /// #3987 — the page's `shown` is a time only when it is a finite number
+    /// at or above zero; anything else is not known, and the app's own show
+    /// or raise of the window then decides alone.
+    #[test]
+    fn the_pages_shown_time_is_read_only_when_it_is_a_time() {
+        assert_eq!(shown_for(Some(300.0)), Some(Duration::from_millis(300)));
+        assert_eq!(shown_for(Some(0.0)), Some(Duration::ZERO));
+        assert_eq!(shown_for(None), None);
+        assert_eq!(shown_for(Some(-5.0)), None);
+        assert_eq!(shown_for(Some(f64::NAN)), None);
+        assert_eq!(shown_for(Some(f64::INFINITY)), None);
+        assert_eq!(shown_for(Some(f64::MAX)), None, "too large for a time");
+    }
+
+    /// The refresh ledger's count for the page's read of the questions.
+    fn consent_pending_failures() -> u32 {
+        REFRESH_LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaks
+            .get(CONSENT_PENDING_SURFACE)
+            .map_or(0, |s| s.failures)
+    }
+
+    /// #3873 — the page's read of the questions. An empty list clears the
+    /// question the page shows; a read that FAILED is an error the page keeps
+    /// its question on, and it is in the log. On 0.4.221 a failed read was an
+    /// empty list: the page let go of the question while it stayed on screen,
+    /// and a click on it was dropped. A daemon that is not running is quiet,
+    /// as on every other surface.
+    #[test]
+    fn a_failed_read_of_the_questions_is_an_error_and_in_the_log() {
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let before = consent_pending_failures();
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = pending_answer(Err(("consent_pending", closed)))
+            .expect_err("a failed read is not 'no question'");
+        assert!(shown.starts_with("consent_pending: "), "{shown}");
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "in the refresh ledger"
+        );
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(pending_answer(Err(("connect", gone))).is_err());
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "a daemon that is not running is not a failure"
+        );
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        assert_eq!(
+            consent_pending_failures(),
+            0,
+            "a read that worked ends the streak"
+        );
+    }
+
+    /// The text of the function `head` starts in a page's script, to its
+    /// closing brace at the IIFE's indentation (two spaces). Line ends are
+    /// `\n` whatever the checkout wrote.
+    fn js_function(src: &str, head: &str) -> String {
+        let src = src.replace("\r\n", "\n");
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("no `{head}` in the page"));
+        let end = src[start..]
+            .find("\n  }\n")
+            .unwrap_or_else(|| panic!("`{head}` has no end"));
+        src[start..start + end].to_string()
+    }
+
+    /// A page's own limit on an answer (`PAGE_LIMIT_MS`), in milliseconds.
+    fn page_limit_ms(js: &str) -> u64 {
+        const DECL: &str = "const PAGE_LIMIT_MS = ";
+        let at = js.find(DECL).expect("the page has no limit of its own");
+        js[at + DECL.len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("PAGE_LIMIT_MS is a number")
+    }
+
+    /// #3873 — the prompt window sends every Approve and Deny to the app,
+    /// which logs it, and never drops one without a word: nothing returns
+    /// before it sends; its buttons are off only while there is no question,
+    /// an answer is on its way or this window answered it; and the status
+    /// line, its own element, says which. On 0.4.221 `decide()` returned
+    /// silently while `busy`, and its "Approving…" and "Failed: …" went into
+    /// the countdown, which repaints every second.
+    #[test]
+    fn the_prompt_sends_every_click_and_says_why_its_buttons_are_off() {
+        let html = include_str!("front/panel-consent.html");
+        let js = include_str!("front/panel-consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            html.contains(r#"id="p-status""#),
+            "no status line of its own"
+        );
+        assert!(
+            !decide.contains("p-countdown"),
+            "decide() writes into the countdown: {decide}"
+        );
+        assert!(decide.contains("setStatus("), "{decide}");
+        let paint = js_function(js, "function paintButtons(");
+        assert!(
+            paint.contains("!active || sending || answered === active"),
+            "{paint}"
+        );
+        assert!(
+            js.contains("e.key === 'Escape' && !$('p-deny').disabled"),
+            "Escape acts as the Deny button does"
+        );
+        // The page's own limit covers the app's: it fires only when the app
+        // itself never answers.
+        assert!(decide.contains("PAGE_LIMIT_MS"), "{decide}");
+        assert!(Duration::from_millis(page_limit_ms(js)) > CONSENT_ANSWER_WITHIN);
+    }
+
+    /// #3873 — the prompt keeps the question it shows when a read of the
+    /// questions fails, and clears it on an empty list only.
+    #[test]
+    fn the_prompt_keeps_its_question_on_a_failed_read() {
+        let js = include_str!("front/panel-consent.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("clear(") && !block.contains("active = null"),
+            "a failed read lets go of the question: {block}"
+        );
+        assert!(
+            poll.contains("pending.length === 0") && poll.contains("clear()"),
+            "{poll}"
+        );
+    }
+
+    /// #3873 — the main window's fallback modal sends every click too, with
+    /// the same limit of its own.
+    #[test]
+    fn the_fallback_modal_sends_every_click_too() {
+        let js = include_str!("front/consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            decide.contains("paintButtons()") && decide.contains("PAGE_LIMIT_MS"),
+            "{decide}"
+        );
+        assert_eq!(
+            page_limit_ms(js),
+            page_limit_ms(include_str!("front/panel-consent.js"))
+        );
+    }
+
+    /// #3987 — each page tells the app, with every click, how long the
+    /// question under the pointer has been shown, and that time starts again
+    /// only when the question changes: it is set where a new question is
+    /// put up and nowhere else, which happens only once the question shown
+    /// is gone. The app raises the prompt only for a question it has not
+    /// seen. A poll that changes nothing arms nothing again, or a person
+    /// could never click.
+    #[test]
+    fn a_poll_that_changes_nothing_does_not_arm_the_question_again() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        for (page, js, put_up, guard) in [
+            (
+                "panel-consent.js",
+                include_str!("front/panel-consent.js"),
+                "function render(",
+                "if(!active||!pending.some((p)=>p.session_id===active))render(pending[0])",
+            ),
+            (
+                "consent.js",
+                include_str!("front/consent.js"),
+                "function show(",
+                "if(!activeSession||!pending.some((p)=>p.session_id===activeSession)){show(pending[0])}",
+            ),
+        ] {
+            assert_eq!(
+                js.matches("shownAt = performance.now()").count(),
+                1,
+                "{page}: the time a question is shown is set in one place"
+            );
+            let body = js_function(js, put_up);
+            assert!(
+                body.contains("shownAt = performance.now()"),
+                "{page}: {body}"
+            );
+            let call = put_up.trim_start_matches("function ");
+            assert_eq!(
+                js.matches(call).count(),
+                2,
+                "{page}: `{call}` is defined and called once"
+            );
+            let poll = js_function(js, "async function poll(");
+            assert!(flat(&poll).contains(guard), "{page}: {poll}");
+            let decide = js_function(js, "async function decide(");
+            assert!(
+                flat(&decide).contains("{session,shown:Math.round(performance.now()-shownAt)}"),
+                "{page}: {decide}"
+            );
+        }
+        let main = flat(include_str!("main.rs"));
+        assert!(
+            main.contains("letshow_prompt=self.questions.difference(&seen).next().is_some();")
+                && main.contains("ifchange.show_prompt{panels::show_consent(&app);"),
+            "the app raises the prompt only for a question it has not seen"
+        );
+    }
+
+    /// #3998 — a click while the device service is stopped says so. In the
+    /// 0.4.224 Linux lab, `systemctl stop roomlerd` with a question up and
+    /// an Approve gave "Could not reach the device service: Permission denied
+    /// (os error 13)": the system socket's words, the last endpoint tried,
+    /// while the person's own endpoint was gone.
+    #[tokio::test]
+    async fn a_click_with_the_service_stopped_says_it_is_not_running() {
+        let (log, _guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            Duration::from_secs(5),
+            |_, _| async {
+                Err(AskError::Connect(proven(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ),
+                    true,
+                )))
+            },
+        )
+        .await
+        .expect_err("nothing was sent");
+        assert_eq!(
+            shown,
+            "Could not reach the device service: it is not running."
+        );
+        let text = log.text();
+        assert!(
+            text.contains("device service not running") && !text.contains("Permission denied"),
+            "{text}"
+        );
+    }
+
+    /// #3998 — the banner page's read of the sessions: a list, or, for a
+    /// read that failed, an error the page keeps its words on. Until #3998
+    /// a failed read was an empty list, and the banner read "Being viewed"
+    /// with no name and a Disconnect that ended nothing.
+    #[test]
+    fn a_failed_read_of_the_sessions_is_an_error() {
+        let live = vec![roomler_localapi::RcSessionInfo {
+            session_id: SESSION.into(),
+            ..Default::default()
+        }];
+        assert_eq!(sessions_answer(Ok(live.clone())), Ok(live));
+        assert_eq!(sessions_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = sessions_answer(Err(("rc_sessions", closed)))
+            .expect_err("a failed read is not 'no session'");
+        assert!(shown.starts_with("rc_sessions: "), "{shown}");
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(sessions_answer(Err(("connect", gone))).is_err());
+    }
+
+    /// #3998 — the banner keeps its words when a read of the sessions fails,
+    /// and paints only an answer.
+    #[test]
+    fn the_banner_keeps_its_words_on_a_failed_read() {
+        let js = include_str!("front/panel-viewing.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("sessions =") && !block.contains("paint("),
+            "a failed read changes the banner's words: {block}"
+        );
+        assert!(poll.contains("paint()"), "{poll}");
+    }
+
+    /// #4019 — a refresh that fails or recovers moves no row of the device
+    /// list. The stale-data line (`dv-grid-error`, "Showing data from 1 min
+    /// ago — …") and the status line (`dv-grid-status`) sat in the flow right
+    /// above the table, so showing one moved every row down by its height
+    /// while a person aimed at one: in the 0.4.225 lab two "View screen"
+    /// clicks landed on row padding. Both now sit in one slot above the
+    /// table whose height is fixed, shown or not, and the page shows and
+    /// hides the lines in it, never the slot.
+    #[test]
+    fn a_note_above_the_device_list_moves_no_row() {
+        let html = include_str!("front/index.html").replace("\r\n", "\n");
+        let css = include_str!("front/styles.css").replace("\r\n", "\n");
+        let js = include_str!("front/devices.js").replace("\r\n", "\n");
+        // The slot, never `hidden`, holds both lines, above the table.
+        let open = html
+            .find(r#"<div id="dv-notes" class="dv-notes">"#)
+            .expect("the list's notes have no slot");
+        let close = open + html[open..].find("</div>").expect("the slot's end");
+        let slot = &html[open..close];
+        for line in [r#"<p id="dv-grid-status""#, r#"<p id="dv-grid-error""#] {
+            assert_eq!(html.matches(line).count(), 1, "{line}");
+            assert!(slot.contains(line), "{line} is not in the slot: {slot}");
+        }
+        assert!(
+            close
+                < html
+                    .find(r#"<table id="dv-grid""#)
+                    .expect("the device list"),
+            "the slot is not above the list"
+        );
+        // Its height is fixed, and what does not fit in it is cut.
+        let start = css.find("\n.dv-notes {").expect("no rule for the slot");
+        let rule = &css[start..start + css[start..].find('}').expect("the rule's end")];
+        for decl in ["height: 32px;", "overflow: hidden;"] {
+            assert!(rule.contains(decl), "{decl}: {rule}");
+        }
+        assert!(
+            !rule.contains("min-height") && !rule.contains("max-height"),
+            "{rule}"
+        );
+        // The page shows and hides the lines, never the slot.
+        assert_eq!(js.matches("$('dv-notes')").count(), 1, "{js}");
+        assert!(js.contains("$('dv-notes').classList.toggle('both', !!note && !!warn);"));
+    }
+
+    /// #4020 — with the device service stopped on a Linux system install or
+    /// a Mac, a connect fails with the system socket's `PermissionDenied`
+    /// while the person's own endpoint is gone, and the Overview read that as
+    /// a failure: an `Error` chip and "Could not read …" on its encoders and
+    /// files cards (0.4.225 lab). Through `connect_service` ([`proven`]) it is
+    /// no service: the device view and both cards answer
+    /// `daemon_unreachable`, which the cards word "Offline". Where the own
+    /// endpoint is there, the same error stays a failure in its own words.
+    #[tokio::test]
+    async fn a_stopped_service_reads_not_running_on_the_overview() {
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )
+        };
+        let stopped = || -> std::io::Result<localapi::Client> { Err(proven(denied(), true)) };
+        let view = device_view(stopped()).await;
+        assert!(!view.available);
+        assert_eq!(view.reason.as_deref(), Some("daemon_unreachable"));
+        let caps = encoder_caps_from(stopped()).await;
+        assert!(!caps.available);
+        assert_eq!(caps.reason.as_deref(), Some("daemon_unreachable"));
+        let files = files_dir_view_from(stopped()).await;
+        assert!(!files.available);
+        assert_eq!(files.reason.as_deref(), Some("daemon_unreachable"));
+        // The own endpoint is there. (Not the encoders card: its failures
+        // count in the refresh ledger, which
+        // `a_person_socket_refusal_is_root_only_and_no_answer_stays_a_failure`
+        // counts while the tests run in parallel.)
+        let there = || -> std::io::Result<localapi::Client> { Err(proven(denied(), false)) };
+        let view = device_view(there()).await;
+        assert_eq!(view.reason.as_deref(), Some("connect_error"));
+        let reason = files_dir_view_from(there()).await.reason.unwrap();
+        assert!(
+            reason.starts_with("connect: Permission denied")
+                && reason.ends_with("[PermissionDenied]"),
+            "{reason}"
+        );
+    }
+
+    /// #4020 — every connect of this app whose error is read goes through
+    /// `connect_service`, so a stopped service reads "not running" on every
+    /// OS and every page. A connect stays plain only where nothing reads its
+    /// error, each listed here with what a failed one leads to.
+    #[test]
+    fn only_a_connect_nobody_reads_stays_plain() {
+        // Each with what a failed connect leads to.
+        const PLAIN: &[(&str, &str)] = &[
+            ("commands.rs", "connect_service"),     // the proof itself
+            ("commands.rs", "daemon_node_status"),  // no answer: the file's word stands
+            ("commands.rs", "cmd_config_entries"),  // the root half on a Mac, else the file
+            ("commands.rs", "cmd_config_set"),      // the root half on a Mac, else the file
+            ("commands.rs", "cmd_pick_files_dir"),  // the picker opens with no start folder
+            ("commands.rs", "cmd_tail_log"),        // the log file, read directly
+            ("commands.rs", "cmd_set_device_name"), // the file, written directly
+            ("tray.rs", "spawn_keep_busy_watch"),   // the item reads off, disabled
+            ("first_run.rs", "daemon_has_something_to_show"), // the tour, as always
+            ("first_run.rs", "device_autostart_switch"), // the switch counts as on
+        ];
+        let call = concat!("localapi::", "connect()");
+        let mut plain: Vec<(&str, String)> = Vec::new();
+        for (file, src) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("desktop_log.rs", include_str!("desktop_log.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+            ("first_run.rs", include_str!("first_run.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("panels.rs", include_str!("panels.rs")),
+            ("pin.rs", include_str!("pin.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let code = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or("");
+            // The function each line is in: the last `fn` line above it.
+            let mut within = String::new();
+            for line in code.lines().map(str::trim_start) {
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some((head, rest)) = line.split_once("fn ")
+                    && head
+                        .split_whitespace()
+                        .all(|w| w.starts_with("pub") || matches!(w, "async" | "const" | "unsafe"))
+                {
+                    within = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if line.contains(call) {
+                    plain.push((file, within.clone()));
+                }
+            }
+        }
+        plain.sort();
+        plain.dedup();
+        let mut want: Vec<(&str, String)> = PLAIN
+            .iter()
+            .map(|(file, within)| (*file, within.to_string()))
+            .collect();
+        want.sort();
+        assert_eq!(
+            plain, want,
+            "a plain connect whose error is read: it goes through connect_service (#4020)"
         );
     }
 }

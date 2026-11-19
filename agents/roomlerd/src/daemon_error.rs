@@ -11,8 +11,13 @@
 //! write: its error (the path, the owner, the OS error) reached no file.
 //! [`say`] also writes what std would have written, on the stderr a supervised
 //! worker inherits from the root daemon.
+//!
+//! #4023 — and the one end that is a state of the device, not a fault: `run`
+//! with no config to run ([`NoConfig`]). A Windows worker that ends with it
+//! writes no crash record ([`record_worker_exit`]).
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// The daemon thread's last words before `exit(1)`: the error on stderr, as std
 /// prints it for the other `main` ([`write_to`]), and through tracing, as before.
@@ -30,6 +35,55 @@ pub fn write_to(mut out: impl Write, error: &anyhow::Error) {
     // `exit(1)`: the main thread stays in AppKit, and no supervisor ever sees the process end.
     let _ = writeln!(out, "Error: {error:?}");
     let _ = out.flush();
+}
+
+/// #4023 — `run` found no config at the path it resolved: this account has no
+/// enrollment on this device yet. A state of the device, which `roomlerd
+/// enroll` ends, and not a fault. A type of its own, so that a worker's exit
+/// for it is told apart by type, never by its words ([`record_worker_exit`]).
+/// Its words are the ones `run` has always said.
+#[derive(Debug)]
+pub struct NoConfig {
+    path: PathBuf,
+}
+
+impl NoConfig {
+    /// No config at `path`.
+    pub fn at(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl std::fmt::Display for NoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no config found at {}. Run `roomlerd enroll` first.",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for NoConfig {}
+
+/// #4023 — a worker's crash record for the error its `run` ended with. `record`
+/// writes it, with the summary it always had (`worker exit: ` and the whole
+/// chain), for every error but [`NoConfig`], even under a context. That one is
+/// the device's state and not a crash: one line says why, and nothing is
+/// recorded. The exit code is the caller's and stays what it was. On Windows
+/// `record` is the crash recorder (`app.rs`, `record_worker_exit_failure`).
+pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
+    if let Some(no_config) = err.downcast_ref::<NoConfig>() {
+        tracing::info!(
+            config = %no_config.path.display(),
+            "worker exit: no config to run, so this account has no enrollment on this device \
+             yet. That is the device's state, not a crash: no crash record is written"
+        );
+        return;
+    }
+    record(&format!("worker exit: {err:#}"));
 }
 
 #[cfg(test)]
@@ -108,6 +162,88 @@ mod tests {
         assert!(
             zero.is_ok(),
             "a write that took nothing panicked: the daemon thread would never reach exit(1)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_exit_tests {
+    use super::{NoConfig, record_worker_exit};
+    use std::path::Path;
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// #4023 — `run`'s words for a device with no config are the ones it has
+    /// always said: only the type is new.
+    #[test]
+    fn no_config_says_what_run_always_said() {
+        let path = Path::new("/home/p/.config/roomler/config.toml");
+        let err = anyhow::Error::from(NoConfig::at(path));
+        assert_eq!(
+            err.to_string(),
+            "no config found at /home/p/.config/roomler/config.toml. Run `roomlerd enroll` first."
+        );
+    }
+
+    /// #4023 — the field record: a person's worker on an attended per-Machine
+    /// device started with no enrollment, and its exit was recorded as a crash.
+    /// A worker that ends with no config writes no crash record, under a
+    /// context too, and one line says why. Every other error still writes its
+    /// record with the summary it always had, one that only says the same words
+    /// included: the type decides, never the text.
+    #[test]
+    fn a_worker_with_no_config_records_no_crash_and_any_other_error_still_does() {
+        let path = Path::new("/home/p/.config/roomler/config.toml");
+        let mut written: Vec<String> = Vec::new();
+
+        let no_config = anyhow::Error::from(NoConfig::at(path));
+        let log = logged(|| record_worker_exit(&no_config, |s| written.push(s.to_owned())));
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("no crash record is written"), "{log}");
+        assert!(log.contains(&path.display().to_string()), "{log}");
+
+        let under_a_context =
+            anyhow::Error::from(NoConfig::at(path)).context("starting the worker");
+        record_worker_exit(&under_a_context, |s| written.push(s.to_owned()));
+        assert!(written.is_empty(), "{written:?}");
+
+        let fault = anyhow::anyhow!("access denied").context("acquiring single-instance lock");
+        record_worker_exit(&fault, |s| written.push(s.to_owned()));
+        let same_words = anyhow::anyhow!("{}", NoConfig::at(path));
+        record_worker_exit(&same_words, |s| written.push(s.to_owned()));
+        assert_eq!(
+            written,
+            [
+                "worker exit: acquiring single-instance lock: access denied".to_string(),
+                format!("worker exit: {}", NoConfig::at(path)),
+            ]
         );
     }
 }

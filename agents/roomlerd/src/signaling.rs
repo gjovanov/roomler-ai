@@ -29,7 +29,7 @@ use crate::error_chain::error_chain;
 use crate::indicator::ViewerIndicator;
 use crate::notify;
 use crate::peer::AgentPeer;
-use crate::session_table::{ConnExit, SessionTable};
+use crate::session_table::{ConnExit, SessionTable, TablePeer};
 use crate::tunnel::quic_setup::{Begin, QuicSetupError, Settled};
 use crate::watchdog;
 use tunnel_core::localapi::OverlayView;
@@ -268,7 +268,7 @@ fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
 /// encoder (#3245). All end alike: said first, closed after the grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEnd {
-    HostDisconnect,
+    HostDisconnect(crate::rc_sessions::Via),
     Idle,
     NoVideo,
 }
@@ -276,7 +276,7 @@ enum DeviceEnd {
 impl DeviceEnd {
     fn terminate(self, session_id: bson::oid::ObjectId) -> ClientMsg {
         match self {
-            Self::HostDisconnect => host_disconnect_terminate(session_id),
+            Self::HostDisconnect(_) => host_disconnect_terminate(session_id),
             Self::Idle => idle_terminate(session_id),
             Self::NoVideo => crate::peer::no_video_terminate(session_id),
         }
@@ -284,7 +284,7 @@ impl DeviceEnd {
 
     fn label(self) -> &'static str {
         match self {
-            Self::HostDisconnect => "host_disconnect",
+            Self::HostDisconnect(_) => "host_disconnect",
             Self::Idle => "idle_timeout",
             Self::NoVideo => "no_video",
         }
@@ -294,11 +294,11 @@ impl DeviceEnd {
 /// The next session the device ends, from either channel. Both `recv`s are
 /// cancel-safe, so losing the outer `select!` drops no hand-back.
 async fn device_end(
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Option<(bson::oid::ObjectId, DeviceEnd)> {
     tokio::select! {
-        Some(sid) = kill_rx.recv() => Some((sid, DeviceEnd::HostDisconnect)),
+        Some((sid, via)) = kill_rx.recv() => Some((sid, DeviceEnd::HostDisconnect(via))),
         Some(sid) = idle_rx.recv() => Some((sid, DeviceEnd::Idle)),
         else => None,
     }
@@ -329,15 +329,15 @@ pub(crate) async fn close_within_budget(
     }
 }
 
-/// FR-27 — how long to wait for `companion::ensure_running` before deciding
-/// this host has no on-screen prompt surface.
-///
-/// Bounded because the probe shells out (`launchctl`, `loginctl`,
-/// `systemd-run`, `tasklist`) and the attended prompt is already counting down
-/// against a 30 s window the controller shares: spending a large slice of it
-/// waiting on a wedged helper would turn a slow answer into no answer. A
-/// timeout is treated as "no surface", which is the same thing the operator
-/// experiences.
+/// FR-27 — how long to wait for the tray's start before deciding this host has
+/// no on-screen prompt surface. #3983: the road to the tray is asked after it,
+/// not inside it (`companion::up_for_a_question`, which asserts that both stay
+/// under `CONSENT_VERDICT_GRACE`, `crates/remote_control/src/consent.rs:149`).
+/// Bounded because the probe shells out (`launchctl`, `loginctl`, `systemd-run`,
+/// `tasklist`) and the attended prompt is already counting down against a 30 s
+/// window the controller shares: a large slice of it spent on a wedged helper
+/// would turn a slow answer into no answer. A timeout is treated as "no
+/// surface", which is the same thing the operator experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
@@ -1053,7 +1053,7 @@ pub async fn run(
     // reconnects. A `kill_tx` clone is retained below for the whole loop
     // so the channel never fully closes — a closed receiver would busy-
     // spin the select! — even when the overlay is disabled.
-    let (kill_tx, mut kill_rx) = mpsc::channel::<bson::oid::ObjectId>(4);
+    let (kill_tx, mut kill_rx) = mpsc::channel::<crate::rc_sessions::KillOrder>(4);
     // #1754 — where a tunnel peer reports that its client is gone, so the
     // loop reaps it without waiting for a `rc:tunnel.terminate` that an
     // older client, a crashed one or a dead network never sends. Same
@@ -1478,7 +1478,7 @@ pub async fn run(
                 recent_replacements.push(now);
                 let displacements = recent_replacements.len();
                 warn!(
-                    %message,
+                    reason = %message,
                     count = displacements,
                     "server signalled this connection was replaced; staggering reconnect to break the duel"
                 );
@@ -1619,7 +1619,7 @@ pub async fn run(
                         // FR-138 P2b (B4) — and the worker's delegated side.
                         event = next_side(&mut side) => serve_side(&mut side, event).await,
                         Some((sid, end)) = device_end(&mut kill_rx, &mut idle_rx), if kept => {
-                            end_in_gap(&mut table, &mut side, sid, end, &indicator);
+                            end_in_gap(&mut table, &mut side, sid, end, &indicator).await;
                         },
                     }
                 }
@@ -1789,7 +1789,7 @@ async fn connect_once(
     delegation: &mut crate::delegate::Delegation,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     // FR-27 — Approve/Deny from a NATIVE consent panel.
     consent_rx: &mut mpsc::Receiver<(String, bool)>,
     // #1754 — the tunnel-peer reap channel: the sender every new tunnel
@@ -2984,17 +2984,11 @@ async fn connect_once(
                 // its end, and the audit's last sample before it, go up the
                 // channel through that table, which never waits (F3). The road
                 // comes from the table, never from the peer's sender, which is
-                // its link's.
+                // its link's. #4010 — logged as every device end is.
                 if let Some(s) = side.as_mut()
                     && s.table.holds(&sid)
                 {
-                    let end = if s.table.no_video(&sid) { DeviceEnd::NoVideo } else { end };
-                    if let Some(peer) = s.table.get(&sid)
-                        && let Some(stats) = final_session_stats(sid, peer).await
-                    {
-                        s.table.queue_end(stats);
-                    }
-                    s.table.end_by_device(sid, end.terminate(sid), end.label(), host_disconnect_grace());
+                    end_delegated_by_device(&mut s.table, sid, end, true).await;
                     pending_codecs.remove(&sid);
                     pending_transports.remove(&sid);
                     pending_audio.remove(&sid);
@@ -3016,8 +3010,8 @@ async fn connect_once(
                     debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
                     continue;
                 }
-                // Viewee clicked "Disconnect" in the on-screen overlay: the
-                // Windows badge, or the companion banner over LocalAPI. Or
+                // The person at the device ended the session, and the line
+                // names what asked (`rc_sessions::Via`, #4001). Or
                 // (P4b-2) the session sat idle past its limit: the same end,
                 // said the same way, under its own reason.
                 //
@@ -3031,15 +3025,7 @@ async fn connect_once(
                 // is why the audit used to say `controller_hangup` (the P10
                 // field log). The peer closes after a short grace, in a task
                 // of its own, so this loop is never held.
-                match end {
-                    DeviceEnd::HostDisconnect => {
-                        info!(session_id = %sid, "viewee requested disconnect via overlay badge")
-                    }
-                    DeviceEnd::Idle => {
-                        info!(session_id = %sid, "idle limit reached — ending the session")
-                    }
-                    DeviceEnd::NoVideo => {}
-                }
+                log_device_end(sid, end);
                 // FR-138 — a session the last connection kept, its claim not
                 // answered yet: it ends as in a gap, and its end goes out here.
                 if peers.end_kept_by_device(sid, end.terminate(sid), end.label(), host_disconnect_grace()) {
@@ -3099,7 +3085,7 @@ async fn connect_once(
                 // reads; the others name their reason.
                 let grace_ms = grace.as_millis() as u64;
                 match end {
-                    DeviceEnd::HostDisconnect => info!(
+                    DeviceEnd::HostDisconnect(_) => info!(
                         session_id = %sid,
                         reason = end.label(),
                         grace_ms,
@@ -4421,10 +4407,10 @@ async fn handle_server_msg(
             // loop reads finds the prompt whether or not the task has been
             // polled yet. (A spawned task has no ordering guarantee against
             // the loop that spawned it.) Armed after the show, an answer given
-            // while the surfaces went up was refused. The window still runs
-            // from the show: the prompt starts its clock at its first look, in
-            // the task. Owner-side consent asks nobody here, and auto-grant
-            // arms nothing: its answer is ready at once.
+            // while the surfaces went up was refused. The prompt starts its
+            // clock at its first look, in the task, which looks at once since
+            // #4000: the window runs from the request. Owner-side consent asks
+            // nobody here, and auto-grant arms nothing: its answer is ready at once.
             let prompt = (!owner_side_consent)
                 .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             // #3857, #3888 — what the consent task below finishes for a
@@ -4540,13 +4526,13 @@ async fn handle_server_msg(
                     // means we could not confirm a surface, which is the same
                     // answer as not having one.
                     //
-                    // #3888 — STARTED here, and its verdict waited for by the
-                    // consent task below, before the prompt's window starts,
-                    // as the notification's is (#3857). The start asks other
-                    // processes (logind, the process list, launchd), and this
-                    // loop reads its next frame meanwhile. FR-93 P6f's
-                    // notification, where the companion cannot show the
-                    // question, goes up from there once the verdict is in.
+                    // #3888 — STARTED here; the consent task's surfaces read its
+                    // verdict, then put up FR-93 P6f's notification where the
+                    // companion cannot show the question (#3857), beside the
+                    // prompt's window, which since #4000 waits for neither. The
+                    // start asks logind, the process list or launchd; we read on.
+                    // #4000 — the window's end: a marker rewritten later keeps it.
+                    let ends = view.expires_at;
                     behind = Some((crate::companion::start_for_prompt().await, view));
                     // The marker says so once a notification is up.
                     mark_up = marker.then(|| {
@@ -4564,10 +4550,10 @@ async fn handle_server_msg(
                                 permissions,
                                 detail,
                                 org,
-                                timeout: host_window,
+                                timeout: ends.saturating_duration_since(std::time::Instant::now()),
                                 surface: crate::consent::PromptSurface::Notification,
                             };
-                            if let Err(e) = broker.write_prompt(&hex, &shown) {
+                            if let Err(e) = broker.write_prompt_while_asking(&hex, &shown) {
                                 tracing::warn!(session = %hex, %e, "could not mark the consent prompt as shown by a notification");
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -4615,90 +4601,29 @@ async fn handle_server_msg(
                 }
             }
             if let Some(prompt) = prompt {
-                let outbound = outbound_tx.clone();
-                let ind = indicator.clone();
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
-                let broker = consent_broker.clone();
-                tokio::spawn(async move {
-                    // #3857, #3888 — the companion's start the loop started,
-                    // and the notification where the companion cannot show
-                    // the question: their verdicts, here, before the prompt's
-                    // clock starts at its first look below, as when the loop
-                    // waited for them. A socket that closes first drops the
-                    // notification (`notification_shown`), and a `Terminate`
-                    // takes it down from the loop, or here once the start's
-                    // verdict is in (`rc_surfaces_up`).
-                    let have_surface = match surfaces {
-                        Some(surfaces) => {
-                            rc_surfaces_up(
-                                surfaces,
-                                &ind,
-                                || broker.is_asking(&session_hex),
-                                &session_hex,
-                                &outbound,
-                            )
-                            .await
-                        }
-                        // No question is asked on this host: an auto-grant,
-                        // whose answer is ready at once.
-                        None => true,
-                    };
-                    let decision =
-                        await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
-                    // FR-27 — take the native panel down however the question
-                    // was answered: the click here, the CLI, the companion,
-                    // the window simply expiring, or the session ending first.
-                    // This is the ONE place every one of those paths
-                    // converges, so it is the only place that cannot miss one
-                    // — a panel still on screen for a resolved session is its
-                    // own bug, and a stale Approve button is a dangerous one.
-                    ind.hide_prompt(&session_hex);
-                    let Some(mut reply) = consent_reply(decision, have_surface) else {
-                        // #1632 — the session was terminated while the
-                        // question stood. The server forgot it when it sent
-                        // the Terminate; there is nobody to answer to. (An
-                        // external binding ended with that Terminate, ahead
-                        // of the delegation gate.)
-                        tracing::info!(
-                            session = %session_hex,
-                            ?decision,
-                            ?effective_mode,
-                            "consent prompt withdrawn — the session ended before an answer; no rc:consent sent"
-                        );
-                        return;
-                    };
-                    // FR-52 P4 — an external grant is recorded BEFORE it leaves:
-                    // the offer it unlocks must never overtake it to
-                    // `check_offer`. A binding that ended while the question
-                    // stood cannot be granted any more; anything but a grant
-                    // ends the binding here.
-                    if let Some(cfg) = &external_cfg {
-                        if reply.granted {
-                            reply.granted = crate::extauth::grant_consent(cfg, session_id);
-                        } else {
-                            crate::extauth::end_session(cfg, session_id);
-                        }
-                    }
-                    tracing::info!(
-                        session = %session_hex,
-                        ?decision,
-                        ?effective_mode,
-                        granted = reply.granted,
-                        reason = reply.reason.map(|r| r.wire()),
-                        "consent decision → sending rc:consent"
-                    );
-                    if let Err(e) = outbound
-                        .send(ClientMsg::Consent {
-                            session_id,
-                            granted: reply.granted,
-                            reason: reply.reason.map(|r| r.wire().to_string()),
-                        })
-                        .await
-                    {
-                        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
-                    }
-                });
+                // #4016 — whether a surface was asked at all: an auto-grant
+                // asks none, and its answer is ready at once.
+                let surfaces_asked = surfaces.is_some();
+                let surfaces_up = rc_surfaces_verdict(
+                    surfaces,
+                    indicator.clone(),
+                    consent_broker.clone(),
+                    session_hex.clone(),
+                    outbound_tx.clone(),
+                );
+                tokio::spawn(rc_consent_task(
+                    prompt,
+                    surfaces_up,
+                    surfaces_asked,
+                    indicator.clone(),
+                    outbound_tx.clone(),
+                    session_id,
+                    session_hex,
+                    external_cfg,
+                    effective_mode,
+                ));
             } else {
                 info!(
                     %session_id, ?consent_mode,
@@ -4820,7 +4745,7 @@ async fn handle_server_msg(
             // process that builds the peer (a delegated GUI worker runs this
             // handler too): one LocalAPI lookup, bounded at 400 ms. The peer
             // then sees a plain on/off, filtered exactly as ever.
-            let rc_overlay = rc_overlay.decide(session_id).await;
+            let rc_overlay = rc_overlay.decide(session_id, &ice_servers).await;
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
@@ -4945,6 +4870,11 @@ async fn handle_server_msg(
             // companion are THIS process's — the person's own, in their GUI
             // session. Only a daemon older than P1e-mac sends none, and the
             // channel then refuses `unavailable`.
+            // FR-148 P1 — the controlling user names the pair memory's key, set
+            // before the answer as the contexts below are.
+            if let Some(meta) = record_meta {
+                peer.set_pair_user(meta.controller_user_id);
+            }
             #[cfg(feature = "recording")]
             if let Some(meta) = record_meta {
                 peer.set_record_ctx(crate::recording::remote::SessionCtx {
@@ -5224,7 +5154,7 @@ async fn handle_server_msg(
             message,
             open_nonce: _,
         } => {
-            warn!(?session_id, %code, %message, "server-side rc error");
+            warn!(?session_id, %code, reason = %message, "server-side rc error");
         }
 
         // rc.53: server has decided this WS is over. Tear down every
@@ -5248,14 +5178,14 @@ async fn handle_server_msg(
             if ctx.is_primary {
                 tracing::error!(
                     ?reason,
-                    %message,
+                    detail = %message,
                     "server-side rc:goodbye received — stopping current session loop"
                 );
             } else {
                 tracing::debug!(
                     org = %ctx.label,
                     ?reason,
-                    %message,
+                    detail = %message,
                     "server-side rc:goodbye received — stopping this org's session loop"
                 );
             }
@@ -6043,6 +5973,11 @@ async fn handle_server_msg(
             // ⚠️ The command is redacted BEFORE it goes anywhere near a marker
             // file that a GUI will render — same redactor that scrubs exec
             // output leaving the host, for the same reason.
+            //
+            // #3982 — whether a surface showed the question: sent by what puts
+            // it up, and read by its answer at the window's end
+            // ([`shown_by_now`]). An auto-granted command asks nobody.
+            let (surface_tx, surface) = tokio::sync::oneshot::channel();
             if matches!(consent_mode, crate::consent::Mode::Prompt { .. }) {
                 let shown = crate::exec::redactor().apply(&command);
                 let detail: String = shown.chars().take(512).collect();
@@ -6082,22 +6017,28 @@ async fn handle_server_msg(
                         crate::consent::PromptSurface::Companion
                     },
                 };
-                if let Err(e) = consent_broker.write_prompt(&request_id, &prompt) {
-                    tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
-                }
-                if !native {
+                let marker = match consent_broker.write_prompt(&request_id, &prompt) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
+                        false
+                    }
+                };
+                if native {
+                    info!(%request_id, native, "consent prompt surface (exec)");
+                    let _ = surface_tx.send(true);
+                } else {
                     // FR-93 P6f — and where the companion cannot show it, a
                     // desktop notification. In the background, as the
                     // companion's start always was here: the command waits on
-                    // the broker below, not on its surfaces. The marker is not
-                    // rewritten for it, because by the time the notification
+                    // the broker below, not on its surfaces, and its answer
+                    // reads what they came to (#3982). The marker is not
+                    // rewritten for the notification, because by the time it
                     // is up the question may be over, and a marker written
                     // then would outlive it.
                     let ind = indicator.clone();
                     tokio::spawn(async move {
-                        if !crate::companion::ensure_running().await {
-                            ind.show_notification_prompt(view).await;
-                        }
+                        let _ = surface_tx.send(exec_surfaces_up(marker, &ind, view).await);
                     });
                 }
             }
@@ -6133,11 +6074,11 @@ async fn handle_server_msg(
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
                 let outcome = if !decision.granted() {
-                    warn!(%request_id, ?caller, ?decision, "rc:rpc.exec denied at the device");
+                    // #3982 — what the surfaces came to, never waited for.
+                    let have_surface = shown_by_now(surface);
+                    warn!(%request_id, ?caller, ?decision, have_surface, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
-                        error: Some(format!(
-                            "the operator at this device did not approve the command ({decision:?})"
-                        )),
+                        error: Some(exec_refusal(decision, have_surface)),
                         ..Default::default()
                     }
                 } else if via_service {
@@ -7304,7 +7245,7 @@ async fn serving_kept<F: std::future::Future>(
     // roll drops the worker's own socket too, and the daemon's orders and the
     // deadlines are served while it redials.
     side: &mut Option<DelegatedSide>,
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
     indicator: &ViewerIndicator,
 ) -> F::Output {
@@ -7316,7 +7257,7 @@ async fn serving_kept<F: std::future::Future>(
             event = table.next_event() => table.serve(event).await,
             event = next_side(side) => serve_side(side, event).await,
             Some((sid, end)) = device_end(kill_rx, idle_rx), if kept => {
-                end_in_gap(table, side, sid, end, indicator);
+                end_in_gap(table, side, sid, end, indicator).await;
             }
         }
     }
@@ -7465,14 +7406,66 @@ fn side_holds_any(side: &Option<DelegatedSide>) -> bool {
     side.as_ref().is_some_and(|s| s.table.len() > 0)
 }
 
+/// #4010 — the line every end the device makes logs, once, whatever road ends
+/// the session: the WS loop's device-end arm, a session of a GUI worker's
+/// delegated table ([`end_delegated_by_device`]), and an end while no
+/// connection is up ([`end_in_gap`]). Each logs it before it ends anything, the
+/// arm's order (FR-27 P10). The person's end names what asked
+/// ([`crate::rc_sessions::log_host_ended`], #4001), and the idle limit's says
+/// so. A pump with no encoder logs nothing here: the lines that end it say
+/// `no_video`.
+fn log_device_end(session_id: bson::oid::ObjectId, end: DeviceEnd) {
+    match end {
+        DeviceEnd::HostDisconnect(via) => crate::rc_sessions::log_host_ended(session_id, via),
+        DeviceEnd::Idle => {
+            info!(session_id = %session_id, "idle limit reached — ending the session")
+        }
+        DeviceEnd::NoVideo => {}
+    }
+}
+
+/// FR-138 P2b (B7) — the device ends a session of a GUI worker's delegated
+/// table: logged ([`log_device_end`]), then ended through that table, up the
+/// channel, which never waits (F3). A pump with no encoder ends it as
+/// `no_video` (L10). With `last_sample` the audit's last sample goes up first,
+/// as the WS loop's device-end arm sends it; [`end_in_gap`] sends none. Those
+/// two roads end such a session here.
+async fn end_delegated_by_device<P: TablePeer>(
+    table: &mut SessionTable<P>,
+    sid: bson::oid::ObjectId,
+    end: DeviceEnd,
+    last_sample: bool,
+) {
+    let end = if table.no_video(&sid) {
+        DeviceEnd::NoVideo
+    } else {
+        end
+    };
+    log_device_end(sid, end);
+    if last_sample
+        && let Some(peer) = table.get(&sid)
+        && let Some(stats) = peer.final_stats(sid).await
+    {
+        table.queue_end(stats);
+    }
+    table.end_by_device(
+        sid,
+        end.terminate(sid),
+        end.label(),
+        host_disconnect_grace(),
+    );
+}
+
 /// FR-138 — the person at the device ended a session while no connection is
 /// up. A kept one stops serving at once, says `rc:ended` on its control
 /// channel, closes after the grace, and its `rc:terminate` waits for the next
 /// connection. One the table does not hold is said on the next connection, as
 /// it would have been read off this channel there. FR-138 P2b (B7) — one of a
 /// GUI worker's delegated table ends through that table, up the channel.
-fn end_in_gap(
-    table: &mut SessionTable,
+/// #4010 — each is logged as the WS loop's arm logs it ([`log_device_end`]).
+/// With no connection up the table attaches nothing, so what it holds is kept.
+async fn end_in_gap<P: TablePeer>(
+    table: &mut SessionTable<P>,
     side: &mut Option<DelegatedSide>,
     sid: bson::oid::ObjectId,
     end: DeviceEnd,
@@ -7481,17 +7474,7 @@ fn end_in_gap(
     if let Some(s) = side.as_mut()
         && s.table.holds(&sid)
     {
-        let end = if s.table.no_video(&sid) {
-            DeviceEnd::NoVideo
-        } else {
-            end
-        };
-        s.table.end_by_device(
-            sid,
-            end.terminate(sid),
-            end.label(),
-            host_disconnect_grace(),
-        );
+        end_delegated_by_device(&mut s.table, sid, end, false).await;
         return;
     }
     // #3245 — a kept session's pump with no encoder asks through the kill
@@ -7501,35 +7484,39 @@ fn end_in_gap(
     } else {
         end
     };
-    if table.end_kept_by_device(
+    // As in the WS loop's arm: an idle hand-back for a session no longer held
+    // has nothing to end, and logs no end.
+    if end == DeviceEnd::Idle && !table.holds(&sid) {
+        debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
+        return;
+    }
+    log_device_end(sid, end);
+    let kept = table.end_kept_by_device(
         sid,
         end.terminate(sid),
         end.label(),
         host_disconnect_grace(),
-    ) {
+    );
+    // An idle end is a kept session's, or nothing's: the next connection has
+    // no idle limit to say.
+    if kept || end == DeviceEnd::Idle {
         return;
     }
-    match end {
-        DeviceEnd::Idle => {
-            debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
-        }
-        DeviceEnd::HostDisconnect | DeviceEnd::NoVideo => {
-            info!(
-                session_id = %sid,
-                reason = end.label(),
-                "device end for a session this loop does not hold; the next connection says it"
-            );
-            #[cfg(feature = "recording")]
-            crate::recording::remote::host_ended(sid);
-            table.queue_end(end.terminate(sid));
-            indicator.hide_session(sid.to_hex());
-        }
-    }
+    info!(
+        session_id = %sid,
+        reason = end.label(),
+        "device end for a session this loop does not hold; the next connection says it"
+    );
+    #[cfg(feature = "recording")]
+    crate::recording::remote::host_ended(sid);
+    table.queue_end(end.terminate(sid));
+    indicator.hide_session(sid.to_hex());
 }
 
 /// #3857, #3888 — what the WS loop hands an RC prompt's consent task: what
-/// shows the question, and what is still on its way. The consent task waits
-/// for the rest ([`rc_surfaces_up`]) before the prompt's window starts.
+/// shows the question, and what is still on its way. The rest goes up
+/// ([`rc_surfaces_up`]) beside the prompt's window, which since #4000 does not
+/// wait for it.
 pub(crate) struct RcSurfaces {
     /// The daemon's own panel is up.
     pub(crate) native: bool,
@@ -7543,19 +7530,21 @@ pub(crate) struct RcSurfaces {
     pub(crate) mark_up: Option<Box<dyn FnOnce() + Send>>,
 }
 
-/// #3888 — the consent task's wait for what the loop started for an RC
-/// prompt ([`RcSurfaces`]), before the prompt's window starts: the
-/// companion's verdict, then FR-93 P6f's notification where the companion
-/// cannot show the question ([`notification_for_rc`], [`notification_shown`]).
-/// Whether a person can be asked: [`consent_reply`]'s `have_surface`, so a
-/// start that failed or ran out of its budget is still `no_prompt_surface`,
-/// never a timeout. Logs the prompt's surfaces.
+/// #3888 — what the loop started for an RC prompt ([`RcSurfaces`]), going
+/// up: the companion's verdict, then FR-93 P6f's notification where the
+/// companion cannot show the question ([`notification_for_rc`],
+/// [`notification_shown`]). Whether a person can be asked: [`consent_reply`]'s
+/// `have_surface`, so a start that failed or ran out of its budget is still
+/// `no_prompt_surface`, never a timeout. Logs the prompt's surfaces. Since
+/// #4000 it runs on a task of its own beside the prompt's window, and the
+/// consent task reads its verdict when the question ends (`rc_shown_by_now`).
 ///
 /// `still_asked` is whether the question is still on the consent broker's
 /// books. A `Terminate` the loop read while the start ran withdrew it, and
 /// found no notification to take down: none is started for it, nor for a
 /// question whose control socket closed meanwhile (#2416), and one started as
-/// it was withdrawn is taken down here.
+/// it was withdrawn is taken down here. A question that ended before the
+/// verdict says so in its line (#4016).
 pub(crate) async fn rc_surfaces_up(
     surfaces: RcSurfaces,
     indicator: &ViewerIndicator,
@@ -7595,10 +7584,20 @@ pub(crate) async fn rc_surfaces_up(
     // Without a panel, a marker that did not land leaves the companion
     // nothing to show.
     let have_surface = native || (marker && companion == Some(true)) || notified;
-    info!(
-        session = %session_hex, native, ?companion, notified, have_surface,
-        "consent prompt surface"
-    );
+    // #4016 — a question that ended while its surfaces went up (answered,
+    // withdrawn, out of time, or its socket closed) is said to have ended:
+    // what they came to never reads as the give-up of a live question.
+    if still_asked() && !outbound.is_closed() {
+        info!(
+            session = %session_hex, native, ?companion, notified, have_surface,
+            "consent prompt surface"
+        );
+    } else {
+        info!(
+            session = %session_hex, native, ?companion, notified, have_surface,
+            "consent prompt surface, after its question had ended (#4016)"
+        );
+    }
     have_surface
 }
 
@@ -7644,6 +7643,199 @@ pub(crate) async fn notification_shown(
             false
         }
         shown = notifying.shown() => shown,
+    }
+}
+
+/// #4000 — an RC prompt's surfaces as its consent task reads them: whether
+/// one showed the question ([`rc_surfaces_up`]), or `true` where none is asked
+/// (an auto-grant, whose answer is ready at once). It owns what it reads, so it
+/// can run on a task of its own.
+async fn rc_surfaces_verdict(
+    surfaces: Option<RcSurfaces>,
+    indicator: ViewerIndicator,
+    broker: crate::consent::ConsentBroker,
+    session_hex: String,
+    outbound: mpsc::Sender<ClientMsg>,
+) -> bool {
+    let Some(surfaces) = surfaces else {
+        return true;
+    };
+    rc_surfaces_up(
+        surfaces,
+        &indicator,
+        || broker.is_asking(&session_hex),
+        &session_hex,
+        &outbound,
+    )
+    .await
+}
+
+/// An RC prompt's consent task, which the WS loop spawns: the person's
+/// decision, whether a surface showed the question (`surfaces_up`,
+/// [`rc_surfaces_verdict`]), and the `rc:consent` that says so.
+///
+/// #4000 — the prompt's window runs from the request, and the surfaces go up
+/// beside it on a task of their own: the companion's start the loop started,
+/// then #3857's notification where the companion cannot show the question.
+/// Until #4000 this task waited for them before its first look at the prompt
+/// started the window (#3888), up to 11 s on a Linux root daemon. Every
+/// surface already counted down from the request (`PromptView::expires_at`,
+/// the marker's `expires_at_ms`), so those seconds were shown to nobody, and
+/// the verdict left after the hub's own timer (`CONSENT_VERDICT_GRACE` past
+/// the window it announced), which then answered a bare timeout. An answer
+/// given while the surfaces go up now decides at once, and the WS loop still
+/// waits for none of it. `surfaces_asked`: whether any surface was asked
+/// (#4016), which an auto-grant's question is not.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rc_consent_task(
+    prompt: impl std::future::Future<Output = crate::consent::Decision>,
+    surfaces_up: impl std::future::Future<Output = bool> + Send + 'static,
+    surfaces_asked: bool,
+    ind: ViewerIndicator,
+    outbound: mpsc::Sender<ClientMsg>,
+    session_id: bson::oid::ObjectId,
+    session_hex: String,
+    external_cfg: Option<crate::remote_config::RemoteConfigServices>,
+    effective_mode: crate::consent::Mode,
+) {
+    let (shown_tx, shown) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = shown_tx.send(surfaces_up.await);
+    });
+    let decision = await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
+    // What the surfaces came to when the question ended: read before anything
+    // here takes them down, and never waited for.
+    let have_surface = rc_shown_by_now(shown, &session_hex, decision, surfaces_asked);
+    // FR-27 — take the native panel down however the question was answered:
+    // the click here, the CLI, the companion, the window simply expiring, or
+    // the session ending first. This is the ONE place every one of those
+    // paths converges, so it is the only place that cannot miss one — a panel
+    // still on screen for a resolved session is its own bug, and a stale
+    // Approve button is a dangerous one.
+    ind.hide_prompt(&session_hex);
+    let Some(mut reply) = consent_reply(decision, have_surface) else {
+        // #1632 — the session was terminated while the question stood. The
+        // server forgot it when it sent the Terminate; there is nobody to
+        // answer to. (An external binding ended with that Terminate, ahead of
+        // the delegation gate.)
+        tracing::info!(
+            session = %session_hex,
+            ?decision,
+            ?effective_mode,
+            "consent prompt withdrawn — the session ended before an answer; no rc:consent sent"
+        );
+        return;
+    };
+    // FR-52 P4 — an external grant is recorded BEFORE it leaves: the offer it
+    // unlocks must never overtake it to `check_offer`. A binding that ended
+    // while the question stood cannot be granted any more; anything but a
+    // grant ends the binding here.
+    if let Some(cfg) = &external_cfg {
+        if reply.granted {
+            reply.granted = crate::extauth::grant_consent(cfg, session_id);
+        } else {
+            crate::extauth::end_session(cfg, session_id);
+        }
+    }
+    tracing::info!(
+        session = %session_hex,
+        ?decision,
+        ?effective_mode,
+        granted = reply.granted,
+        reason = reply.reason.map(|r| r.wire()),
+        "consent decision → sending rc:consent"
+    );
+    if let Err(e) = outbound
+        .send(ClientMsg::Consent {
+            session_id,
+            granted: reply.granted,
+            reason: reply.reason.map(|r| r.wire().to_string()),
+        })
+        .await
+    {
+        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+    }
+}
+
+/// #3982 — the surfaces of an exec question that no native panel showed, in
+/// SSH's order: the desktop companion, started if it is not running
+/// ([`crate::companion::ensure_running`]), which shows the question when it
+/// is up and the marker landed; else FR-93 P6f's desktop notification.
+/// Whether either showed it, which the command's answer reads at the
+/// window's end ([`shown_by_now`], [`exec_refusal`]). Run on a task of its
+/// own: the command waits on the broker alone, never on this. Logs the
+/// question's surfaces, as an SSH or a remote-control question's are.
+pub(crate) async fn exec_surfaces_up(
+    marker: bool,
+    indicator: &ViewerIndicator,
+    view: crate::indicator::PromptView,
+) -> bool {
+    let request_id = view.session_hex.clone();
+    let companion = crate::companion::ensure_running().await;
+    // A companion that is up with the marker to read IS a surface. One with
+    // no marker has nothing to show, so the notification is asked for then
+    // too, as for SSH.
+    let notified = !(companion && marker) && indicator.show_notification_prompt(view).await;
+    let have_surface = (companion && marker) || notified;
+    info!(
+        %request_id, native = false, companion, marker, notified, have_surface,
+        "consent prompt surface (exec)"
+    );
+    have_surface
+}
+
+/// #3982 — whether a surface showed an exec question, read when its window
+/// ends and never waited for: [`exec_surfaces_up`]'s verdict, which comes
+/// within seconds of a 30 s window's start. `true` while it is not known yet,
+/// or when nothing will send one (an auto-granted command asks nobody; a task
+/// that ended without one): only a known "nothing showed it" changes the
+/// command's words.
+pub(crate) fn shown_by_now(mut verdict: tokio::sync::oneshot::Receiver<bool>) -> bool {
+    verdict.try_recv().unwrap_or(true)
+}
+
+/// #4000 — [`shown_by_now`] for an RC question, read when it ends: what its
+/// surfaces came to, never waited for. Not known yet (still going up, or a
+/// task that ended with no verdict) counts as shown, so the question reads as
+/// the person's `timeout` and not `no_prompt_surface`. That takes surfaces
+/// slower than the window, which a 30 s or 300 s window and a chain of 11 s at
+/// most never are, and is logged so the field can see it. #4016 — only where a
+/// surface was `asked`: an auto-grant asks none, and its answer is ready before
+/// the task that sends the verdict has run.
+fn rc_shown_by_now(
+    mut verdict: tokio::sync::oneshot::Receiver<bool>,
+    session_hex: &str,
+    decision: crate::consent::Decision,
+    asked: bool,
+) -> bool {
+    match verdict.try_recv() {
+        Ok(shown) => shown,
+        Err(_) => {
+            if asked {
+                info!(
+                    session = %session_hex,
+                    ?decision,
+                    "consent prompt surface not known when the question ended: the surfaces were still going up, counted as shown (#4000)"
+                );
+            }
+            true
+        }
+    }
+}
+
+/// #3982 — what an exec command's caller reads when the person at the
+/// device did not approve it. A window that ran out with no surface to show
+/// the question says so, in SSH's words naming the execution policy
+/// ([`crate::consent::nobody_could_be_asked`]): the caller then answers it
+/// with `roomlerd consent` there, or changes the device's policy, instead of
+/// reading it as a person who said nothing. Every other refusal reads as
+/// before.
+pub(crate) fn exec_refusal(decision: crate::consent::Decision, have_surface: bool) -> String {
+    match decision {
+        crate::consent::Decision::Timeout if !have_surface => {
+            crate::consent::nobody_could_be_asked("execution")
+        }
+        _ => format!("the operator at this device did not approve the command ({decision:?})"),
     }
 }
 
@@ -8120,11 +8312,12 @@ mod tests {
         assert!(json.contains(r#""t":"rc:terminate""#), "{json}");
         assert!(json.contains(r#""reason":"idle_timeout""#), "{json}");
         assert!(json.contains(r#""limit":"idle""#), "{json}");
-        let json = serde_json::to_string(&DeviceEnd::HostDisconnect.terminate(sid)).unwrap();
+        let host = DeviceEnd::HostDisconnect(crate::rc_sessions::Via::LocalApi);
+        let json = serde_json::to_string(&host.terminate(sid)).unwrap();
         assert!(json.contains(r#""reason":"host_disconnect""#), "{json}");
         assert!(!json.contains("limit"), "{json}");
         assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
-        assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+        assert_eq!(host.label(), "host_disconnect");
         assert_eq!(DeviceEnd::NoVideo.label(), "no_video");
     }
 
@@ -8132,6 +8325,7 @@ mod tests {
     /// reason: the overlay's Disconnect and an idle watcher's hand-back.
     #[tokio::test]
     async fn either_channel_ends_a_session() {
+        use crate::rc_sessions::Via;
         let (kill_tx, mut kill_rx) = mpsc::channel(1);
         let (idle_tx, mut idle_rx) = mpsc::channel(1);
         let (a, b) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
@@ -8140,11 +8334,298 @@ mod tests {
             device_end(&mut kill_rx, &mut idle_rx).await,
             Some((a, DeviceEnd::Idle))
         );
-        kill_tx.send(b).await.unwrap();
+        kill_tx.send((b, Via::OverlayBadge)).await.unwrap();
         assert_eq!(
             device_end(&mut kill_rx, &mut idle_rx).await,
-            Some((b, DeviceEnd::HostDisconnect))
+            Some((b, DeviceEnd::HostDisconnect(Via::OverlayBadge)))
         );
+    }
+
+    /// #4010, #4016 — the lines logged on this thread while it lives, as the
+    /// daemon's log file writes them. A `#[tokio::test]` polls every task it
+    /// spawns on this thread, so their lines land here too. Two dispatchers,
+    /// never one: with one, a callsite's interest is taken once for every
+    /// thread.
+    struct Logged {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        _default: tracing::subscriber::DefaultGuard,
+        _second: tracing::Dispatch,
+    }
+
+    #[derive(Clone)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        fn start() -> Self {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = LogBuf(buf.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_target(false)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            Self {
+                buf,
+                _default: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            }
+        }
+
+        /// The lines logged so far that contain `needle`, in order.
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.buf.lock().unwrap())
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Where the first line that contains every one of `needles` is.
+        fn first(&self, needles: &[&str]) -> usize {
+            String::from_utf8_lossy(&self.buf.lock().unwrap())
+                .lines()
+                .position(|l| needles.iter().all(|n| l.contains(n)))
+                .unwrap_or_else(|| panic!("no line with {needles:?}"))
+        }
+    }
+
+    const HOST_ENDED: &str = "the person at the device ended the session";
+    const IDLE_ENDED: &str = "idle limit reached — ending the session";
+
+    /// #4010 — a peer for the tables a device end goes through: it closes and
+    /// says nothing, and its pump has an encoder unless told otherwise.
+    #[derive(Clone, Default)]
+    struct EndsPeer {
+        no_video: Arc<AtomicBool>,
+    }
+
+    impl TablePeer for EndsPeer {
+        async fn close(&self) {}
+        fn stop_serving(&self) {}
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn say_on_control(&self, _text: String) {}
+        fn is_dead(&self) -> bool {
+            false
+        }
+        fn no_video(&self) -> bool {
+            self.no_video.load(Ordering::SeqCst)
+        }
+    }
+
+    /// No banner, no recording and no lock behind a test's sessions.
+    fn no_real_end() -> crate::session_table::EndHook {
+        Arc::new(|_: bson::oid::ObjectId, _: crate::session_table::RealEnd| {})
+    }
+
+    /// A session put on `table`, attached, on a link that can keep it.
+    async fn attach_one(
+        table: &mut SessionTable<EndsPeer>,
+        tx: &mpsc::Sender<ClientMsg>,
+    ) -> (bson::oid::ObjectId, EndsPeer) {
+        let id = bson::oid::ObjectId::new();
+        let peer = EndsPeer::default();
+        let link = table.link(id, tx);
+        table.insert(id, peer.clone(), Some(link)).await;
+        (id, peer)
+    }
+
+    /// #4010 — the one line a device end logs: the person's names what asked,
+    /// the idle limit's says so, and a pump with no encoder logs nothing here.
+    /// Every road logs through it. The WS loop's arm logs a direct session's
+    /// end once, before a kept session's end, which logs no second one, and a
+    /// delegated session's through the function that ends it; nothing else
+    /// logs the person's line. The arm needs a live socket, so it is read as
+    /// source.
+    #[test]
+    fn a_device_end_is_logged_once_through_one_function() {
+        use crate::rc_sessions::Via;
+        let sid = bson::oid::ObjectId::new();
+        for (end, want) in [
+            (DeviceEnd::HostDisconnect(Via::ShareStop), Some(HOST_ENDED)),
+            (DeviceEnd::Idle, Some(IDLE_ENDED)),
+            (DeviceEnd::NoVideo, None),
+        ] {
+            let logs = Logged::start();
+            log_device_end(sid, end);
+            let all = logs.lines_with("");
+            match want {
+                Some(text) => {
+                    assert_eq!(all.len(), 1, "{end:?}: {all:?}");
+                    assert!(all[0].contains(text), "{end:?}: {all:?}");
+                    assert!(all[0].contains(&format!("session_id={sid}")), "{all:?}");
+                }
+                None => assert!(all.is_empty(), "{end:?}: {all:?}"),
+            }
+        }
+        let code: String = include_str!("signaling.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            code.matches("crate::rc_sessions::log_host_ended(").count(),
+            1,
+            "the person's line is logged in one place"
+        );
+        let arm = code
+            .split("Some((sid,end))=device_end(kill_rx,idle_rx)=>{")
+            .nth(1)
+            .expect("the WS loop's device-end arm");
+        let before_kept = arm
+            .split("peers.end_kept_by_device(")
+            .next()
+            .expect("the arm ends a kept session");
+        assert_eq!(
+            before_kept.matches("log_device_end(sid,end);").count(),
+            1,
+            "a direct session's end is logged once, before a kept one's end"
+        );
+        assert_eq!(
+            before_kept
+                .matches("end_delegated_by_device(&muts.table,sid,end,true).await;")
+                .count(),
+            1,
+            "a delegated session's, by the function that ends it"
+        );
+    }
+
+    /// #4010 — a session of a GUI worker's delegated table that the device ends
+    /// logs its end once, before the table ends it, as a direct session's is:
+    /// the person's names what asked, and the idle limit's says so. A pump with
+    /// no encoder logs what it did before, the table's line alone. Both roads
+    /// that end such a session call this: the WS loop's device-end arm, and
+    /// `end_in_gap` while no connection is up.
+    ///
+    /// Red before #4010: the arm's delegated branch moved on before the line,
+    /// and the gap returned before it.
+    #[tokio::test(start_paused = true)]
+    async fn a_delegated_session_the_device_ends_logs_its_end_once() {
+        use crate::rc_sessions::Via;
+        let logs = Logged::start();
+        let (tx, _channel) = mpsc::channel(64);
+        let mut table = SessionTable::for_worker(8, no_real_end(), &tx);
+        let (attached, _) = attach_one(&mut table, &tx).await;
+        let (kept, _) = attach_one(&mut table, &tx).await;
+        let (blind, blind_peer) = attach_one(&mut table, &tx).await;
+        table
+            .detach_named(&[kept], ConnExit::ReadError, Duration::from_secs(60))
+            .await;
+        blind_peer.no_video.store(true, Ordering::SeqCst);
+
+        let by_the_person = DeviceEnd::HostDisconnect(Via::Notification);
+        end_delegated_by_device(&mut table, attached, by_the_person, true).await;
+        end_delegated_by_device(&mut table, kept, DeviceEnd::Idle, false).await;
+        let asked_by_the_pump = DeviceEnd::HostDisconnect(Via::NoVideo);
+        end_delegated_by_device(&mut table, blind, asked_by_the_pump, true).await;
+
+        let host_ended = logs.lines_with(HOST_ENDED);
+        assert_eq!(host_ended.len(), 1, "{host_ended:?}");
+        assert!(
+            host_ended[0].contains(&format!("session_id={attached}"))
+                && host_ended[0].contains(r#"via="being_viewed_notification""#),
+            "{host_ended:?}"
+        );
+        let idle = logs.lines_with(IDLE_ENDED);
+        assert_eq!(idle.len(), 1, "{idle:?}");
+        assert!(idle[0].contains(&format!("session_id={kept}")), "{idle:?}");
+        assert!(
+            logs.first(&[HOST_ENDED])
+                < logs.first(&["rc session closed (delegated): ended at the device"]),
+            "logged before the table ends it"
+        );
+        assert!(
+            logs.first(&[IDLE_ENDED]) < logs.first(&["ended at the device while kept"]),
+            "logged before the table ends it"
+        );
+        let blind_lines = logs.lines_with(&blind.to_hex());
+        assert_eq!(
+            blind_lines.len(),
+            1,
+            "the table's line alone: {blind_lines:?}"
+        );
+        assert!(
+            blind_lines[0].contains(r#"why="no_video""#),
+            "{blind_lines:?}"
+        );
+        assert_eq!(table.len(), 0, "each one ended");
+    }
+
+    /// #4010 — an end at the device while no connection is up logs once,
+    /// before it ends anything: a kept session's, and one the table does not
+    /// hold, which the next connection says. An idle hand-back for a session no
+    /// longer held ends nothing and logs no end, as in the WS loop's arm.
+    ///
+    /// Red before #4010: no end in the gap logged the person's line.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_at_the_device_in_a_gap_logs_once() {
+        use crate::rc_sessions::Via;
+        let logs = Logged::start();
+        let mut table = SessionTable::new(8, no_real_end());
+        let (tx, _conn) = mpsc::channel(64);
+        assert!(table.begin_connection(true).await.is_empty());
+        table.connected(&tx);
+        table.set_window(60);
+        let (kept, _) = attach_one(&mut table, &tx).await;
+        table.end_connection(ConnExit::ReadError).await;
+        assert_eq!(table.kept_ids(), vec![kept], "kept through the gap");
+        let indicator = ViewerIndicator::disabled();
+        let (gone, idle_gone) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+
+        let by_the_banner = DeviceEnd::HostDisconnect(Via::LocalApi);
+        end_in_gap(&mut table, &mut None, kept, by_the_banner, &indicator).await;
+        let by_the_badge = DeviceEnd::HostDisconnect(Via::OverlayBadge);
+        end_in_gap(&mut table, &mut None, gone, by_the_badge, &indicator).await;
+        end_in_gap(
+            &mut table,
+            &mut None,
+            idle_gone,
+            DeviceEnd::Idle,
+            &indicator,
+        )
+        .await;
+
+        let host_ended = logs.lines_with(HOST_ENDED);
+        assert_eq!(host_ended.len(), 2, "{host_ended:?}");
+        assert!(
+            host_ended[0].contains(&format!("session_id={kept}"))
+                && host_ended[0].contains(r#"via="localapi""#),
+            "{host_ended:?}"
+        );
+        assert!(
+            host_ended[1].contains(&format!("session_id={gone}"))
+                && host_ended[1].contains(r#"via="overlay_badge""#),
+            "{host_ended:?}"
+        );
+        assert!(
+            logs.first(&[HOST_ENDED]) < logs.first(&["ended at the device while kept"]),
+            "logged before the table ends it"
+        );
+        let gone_id = format!("session_id={gone}");
+        assert!(
+            logs.first(&[HOST_ENDED, &gone_id])
+                < logs.first(&["device end for a session this loop does not hold"]),
+            "logged before its end is queued"
+        );
+        assert!(
+            logs.lines_with(IDLE_ENDED).is_empty(),
+            "an idle hand-back with nothing to end logs no end"
+        );
+        assert!(table.kept_ids().is_empty(), "the kept one ended");
     }
 
     /// The grace is a field knob with a kill switch (`0`), never longer than
@@ -8356,6 +8837,396 @@ mod tests {
         )
         .await;
         assert!(waited.is_err(), "still standing after ten minutes");
+    }
+
+    /// #4000 — the `rc:consent` an RC prompt's task sends, as the hub reads it.
+    async fn said_to_the_hub(
+        hub: &mut mpsc::Receiver<ClientMsg>,
+        by: Duration,
+    ) -> (bool, Option<String>) {
+        match tokio::time::timeout(by, hub.recv()).await {
+            Ok(Some(ClientMsg::Consent {
+                granted, reason, ..
+            })) => (granted, reason),
+            Ok(other) => panic!("not an rc:consent: {other:?}"),
+            Err(_) => panic!("no rc:consent within {by:?}"),
+        }
+    }
+
+    /// #4000 — an RC prompt's verdict leaves when its window ends, however long
+    /// the surfaces take to go up, so it reaches the hub before the hub's own
+    /// timer, which runs `CONSENT_VERDICT_GRACE` past the window it announced.
+    /// The surfaces are held to their worst case per OS: the tray's start
+    /// (Windows, 3 s), the start and then the road to the tray (a Mac's root
+    /// daemon, 4 s), the start and then the notification's session walk, a
+    /// root's account lookup and the show (a Linux root daemon, 3 + 1.5 + 1.5 +
+    /// 5 = 11 s: `SESSION_WALK_WAIT`, `ACCOUNT_LOOKUP_WAIT`, `SHOW_BUDGET`).
+    /// Nothing showed the question, so the verdict says nobody could be asked.
+    /// The broker's prompt starts its clock at its first look; this one at its
+    /// first poll, on the test's clock.
+    ///
+    /// Red before #4000: the window started once the surfaces had answered, so a
+    /// Linux root daemon's verdict left 11 s past the window, after the hub's
+    /// timer, which then answered a bare timeout.
+    #[tokio::test(start_paused = true)]
+    async fn an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take() {
+        use roomler_ai_remote_control::consent::{CONSENT_VERDICT_GRACE, ConsentDenyReason};
+        let window = Duration::from_secs(300);
+        let notification = Duration::from_millis(1500 + 1500 + 5000);
+        // The hosts whose verdict the hub's timer beat, and the ones whose
+        // verdict left later than the window's end.
+        let (mut beaten, mut late) = (Vec::new(), Vec::new());
+        for (os, held) in [
+            ("Windows", COMPANION_START_BUDGET),
+            (
+                "a Mac's root daemon",
+                COMPANION_START_BUDGET + crate::consent_relay::RELAY_WITHIN,
+            ),
+            ("a Linux root daemon", COMPANION_START_BUDGET + notification),
+        ] {
+            let id = bson::oid::ObjectId::new();
+            let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+            let asked = tokio::time::Instant::now();
+            tokio::spawn(rc_consent_task(
+                async move {
+                    tokio::time::sleep(window).await;
+                    crate::consent::Decision::Timeout
+                },
+                async move {
+                    tokio::time::sleep(held).await;
+                    false
+                },
+                true,
+                ViewerIndicator::disabled(),
+                outbound,
+                id,
+                id.to_hex(),
+                None,
+                crate::consent::Mode::Prompt { timeout: window },
+            ));
+            let hubs_timer = window + CONSENT_VERDICT_GRACE;
+            let Ok(said) = tokio::time::timeout(hubs_timer, hub.recv()).await else {
+                beaten.push(os);
+                continue;
+            };
+            let (granted, reason) = match said {
+                Some(ClientMsg::Consent {
+                    granted, reason, ..
+                }) => (granted, reason),
+                other => panic!("{os}: not an rc:consent: {other:?}"),
+            };
+            assert!(!granted, "{os}");
+            assert_eq!(
+                reason.as_deref(),
+                Some(ConsentDenyReason::NoPromptSurface.wire()),
+                "{os}: the surfaces had answered by then"
+            );
+            let took = asked.elapsed();
+            if took >= window + Duration::from_millis(500) {
+                late.push((os, took));
+            }
+        }
+        assert!(
+            beaten.is_empty(),
+            "the hub's timer answered before the agent's verdict for {beaten:?}"
+        );
+        assert!(
+            late.is_empty(),
+            "the verdict left after the {window:?} window that runs from the request: {late:?}"
+        );
+    }
+
+    /// #4000 — surfaces that are still going up when the window ends do not
+    /// hold the verdict: it leaves then, and counts the question as shown
+    /// (`timeout`, exec's rule), since a surface may yet have shown it.
+    #[tokio::test(start_paused = true)]
+    async fn surfaces_still_going_up_at_the_windows_end_count_as_shown() {
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let window = Duration::from_secs(2);
+        let id = bson::oid::ObjectId::new();
+        let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+        let asked = tokio::time::Instant::now();
+        tokio::spawn(rc_consent_task(
+            async move {
+                tokio::time::sleep(window).await;
+                crate::consent::Decision::Timeout
+            },
+            async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                false
+            },
+            true,
+            ViewerIndicator::disabled(),
+            outbound,
+            id,
+            id.to_hex(),
+            None,
+            crate::consent::Mode::Prompt { timeout: window },
+        ));
+        let (granted, reason) = said_to_the_hub(&mut hub, window + Duration::from_secs(1)).await;
+        assert!(!granted);
+        assert_eq!(
+            reason.as_deref(),
+            Some(ConsentDenyReason::HostTimeout.wire())
+        );
+        assert!(asked.elapsed() < window + Duration::from_millis(500));
+    }
+
+    /// #4000 — an answer given while the surfaces are still going up decides
+    /// at once. Every surface answers through the broker's `record_decision`:
+    /// the native panel and the notification through the loop's consent arm
+    /// (`consent_rx`), the tray and `roomlerd consent` over the LocalAPI
+    /// (`consent_decide`, `localapi_state.rs`). The surfaces are held to a
+    /// Linux root daemon's worst case, 11 s, and the answer comes at 1 s.
+    ///
+    /// Red before #4000: the prompt took its first look once the surfaces had
+    /// answered, so the answer waited for them.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_given_while_the_surfaces_go_up_decides_at_once() {
+        for allow in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mode = crate::consent::Mode::Prompt {
+                timeout: Duration::from_secs(300),
+            };
+            let broker =
+                crate::consent::ConsentBroker::new(mode, dir.path().to_path_buf()).unwrap();
+            let id = bson::oid::ObjectId::new();
+            let hex = id.to_hex();
+            let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+            tokio::spawn(rc_consent_task(
+                broker.request_with_mode(&hex, mode),
+                async {
+                    tokio::time::sleep(Duration::from_secs(11)).await;
+                    false
+                },
+                true,
+                ViewerIndicator::disabled(),
+                outbound,
+                id,
+                hex.clone(),
+                None,
+                mode,
+            ));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                broker.record_decision(&hex, allow),
+                "the question takes the answer"
+            );
+            let (granted, reason) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+            assert_eq!(granted, allow);
+            assert_eq!(reason, None, "an answer carries no reason");
+        }
+    }
+
+    /// #4000's line for a question whose surfaces were still going up.
+    const STILL_GOING_UP: &str = "the surfaces were still going up";
+    const DECISION_SENT: &str = "consent decision → sending rc:consent";
+
+    /// #4016 — a question that asked no surface (an auto-grant, its answer
+    /// ready at once) logs no "still going up" line, and is granted as before.
+    /// The WS loop's own call, read the way the daemon reads it: before the
+    /// task that sends the surfaces' verdict has run.
+    ///
+    /// Red before #4016: every auto-granted session logged that its surfaces
+    /// were still going up.
+    #[tokio::test]
+    async fn an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before() {
+        use crate::consent::{ConsentBroker, Mode};
+        let logs = Logged::start();
+        let dir = tempfile::tempdir().unwrap();
+        let broker = ConsentBroker::new(Mode::AutoGrant, dir.path().to_path_buf()).unwrap();
+        let id = bson::oid::ObjectId::new();
+        let hex = id.to_hex();
+        let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+        let surfaces: Option<RcSurfaces> = None;
+        let surfaces_asked = surfaces.is_some();
+        let surfaces_up = rc_surfaces_verdict(
+            surfaces,
+            ViewerIndicator::disabled(),
+            broker.clone(),
+            hex.clone(),
+            outbound.clone(),
+        );
+        rc_consent_task(
+            broker.request_with_mode(&hex, Mode::AutoGrant),
+            surfaces_up,
+            surfaces_asked,
+            ViewerIndicator::disabled(),
+            outbound,
+            id,
+            hex,
+            None,
+            Mode::AutoGrant,
+        )
+        .await;
+        let (granted, reason) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+        assert!(granted, "granted as before");
+        assert_eq!(reason, None);
+        assert_eq!(
+            logs.lines_with(DECISION_SENT).len(),
+            1,
+            "the task's own lines are read"
+        );
+        assert!(
+            logs.lines_with(STILL_GOING_UP).is_empty(),
+            "nothing was going up: {:?}",
+            logs.lines_with(STILL_GOING_UP)
+        );
+    }
+
+    /// #4016 — #4000's line stays where it means something: a question that
+    /// asked its surfaces and was decided while they were still going up logs
+    /// it once (here an answer at once, the surfaces held 11 s). One whose
+    /// surfaces' verdict came first logs none, and keeps what the verdict said:
+    /// nothing showed it, so the window's end is `no_prompt_surface`.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were() {
+        use crate::consent::{Decision, Mode};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let window = Duration::from_secs(2);
+        let mode = Mode::Prompt { timeout: window };
+
+        let logs = Logged::start();
+        let id = bson::oid::ObjectId::new();
+        let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+        rc_consent_task(
+            async { Decision::Granted },
+            async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                false
+            },
+            true,
+            ViewerIndicator::disabled(),
+            outbound,
+            id,
+            id.to_hex(),
+            None,
+            mode,
+        )
+        .await;
+        let (granted, reason) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+        assert!(granted && reason.is_none(), "{granted} {reason:?}");
+        let going_up = logs.lines_with(STILL_GOING_UP);
+        assert_eq!(going_up.len(), 1, "{going_up:?}");
+        assert!(going_up[0].contains(&id.to_hex()), "{going_up:?}");
+        drop(logs);
+
+        let logs = Logged::start();
+        let id = bson::oid::ObjectId::new();
+        let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+        rc_consent_task(
+            async move {
+                tokio::time::sleep(window).await;
+                Decision::Timeout
+            },
+            async { false },
+            true,
+            ViewerIndicator::disabled(),
+            outbound,
+            id,
+            id.to_hex(),
+            None,
+            mode,
+        )
+        .await;
+        let (granted, reason) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+        assert!(!granted);
+        assert_eq!(
+            reason.as_deref(),
+            Some(ConsentDenyReason::NoPromptSurface.wire()),
+            "the verdict that came first is kept"
+        );
+        assert_eq!(logs.lines_with(DECISION_SENT).len(), 1);
+        assert!(
+            logs.lines_with(STILL_GOING_UP).is_empty(),
+            "{:?}",
+            logs.lines_with(STILL_GOING_UP)
+        );
+    }
+
+    /// #4016 — a question answered while its surfaces were still going up: the
+    /// line their late verdict logs says its question had ended, and no line
+    /// reads as the give-up of a live one. The 0.4.225 lab's case: the answer
+    /// 1.3 s on (`roomlerd consent --approve`), the surfaces' verdict at 5 s
+    /// (the notification's give-up). The control: a verdict that comes while
+    /// its question still stands logs the plain line, as before.
+    ///
+    /// Red before #4016: the late verdict logged the plain line, as for a
+    /// question still asked.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_that_ended_before_its_surfaces_says_so_in_their_line() {
+        use crate::consent::{ConsentBroker, Mode};
+        const PLAIN: &str = "consent prompt surface session=";
+        const ENDED: &str = "consent prompt surface, after its question had ended";
+        let mode = Mode::Prompt {
+            timeout: Duration::from_secs(300),
+        };
+        for (answer_at, verdict_at, ended) in [
+            (Duration::from_millis(1300), Duration::from_secs(5), true),
+            (Duration::from_secs(2), Duration::from_secs(1), false),
+        ] {
+            let logs = Logged::start();
+            let dir = tempfile::tempdir().unwrap();
+            let broker = ConsentBroker::new(mode, dir.path().to_path_buf()).unwrap();
+            let id = bson::oid::ObjectId::new();
+            let hex = id.to_hex();
+            let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+            // Nothing showed it: no panel, and no tray to read the marker.
+            let surfaces = RcSurfaces {
+                native: false,
+                marker: true,
+                behind: None,
+                mark_up: None,
+            };
+            let verdict = rc_surfaces_verdict(
+                Some(surfaces),
+                ViewerIndicator::disabled(),
+                broker.clone(),
+                hex.clone(),
+                outbound.clone(),
+            );
+            let task = tokio::spawn(rc_consent_task(
+                broker.request_with_mode(&hex, mode),
+                async move {
+                    tokio::time::sleep(verdict_at).await;
+                    verdict.await
+                },
+                true,
+                ViewerIndicator::disabled(),
+                outbound,
+                id,
+                hex.clone(),
+                None,
+                mode,
+            ));
+            tokio::time::sleep(answer_at).await;
+            assert!(
+                broker.record_decision(&hex, true),
+                "the question takes the answer"
+            );
+            let (granted, _) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+            assert!(granted, "the session is right either way");
+            task.await.unwrap();
+            // Past the late verdict.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mine = |needle: &str| -> Vec<String> {
+                logs.lines_with(needle)
+                    .into_iter()
+                    .filter(|l| l.contains(&hex))
+                    .collect()
+            };
+            let (plain, late) = (mine(PLAIN), mine(ENDED));
+            if ended {
+                assert_eq!(late.len(), 1, "{late:?}");
+                assert!(
+                    plain.is_empty(),
+                    "a line reads as a live question's: {plain:?}"
+                );
+            } else {
+                assert_eq!(plain.len(), 1, "{plain:?}");
+                assert!(late.is_empty(), "{late:?}");
+            }
+        }
     }
 
     /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:
@@ -8908,7 +9779,7 @@ mod notification_off_the_loop_tests {
     struct Indicator {
         ind: ViewerIndicator,
         _answers: mpsc::Receiver<(String, bool)>,
-        _disconnects: mpsc::Receiver<bson::oid::ObjectId>,
+        _disconnects: mpsc::Receiver<crate::rc_sessions::KillOrder>,
     }
 
     fn indicator() -> Indicator {
@@ -9186,5 +10057,63 @@ mod notification_off_the_loop_tests {
             Some(Err("no graphical session".to_string())),
             "no marker for the companion to read: a notification"
         );
+    }
+}
+
+/// #3982 — what an exec command's caller reads when the person at the device
+/// did not approve it ([`exec_refusal`]), and when it reads what the
+/// question's surfaces came to ([`shown_by_now`]).
+#[cfg(test)]
+mod exec_answer_tests {
+    use super::{exec_refusal, shown_by_now};
+    use crate::consent::Decision;
+
+    /// The verdict is read when the window ends, never waited for. One that
+    /// came says what it says. One not known yet, or one nothing will send
+    /// (an auto-granted command; a task that ended without one), reads as a
+    /// surface, so the words stay "did not approve the command".
+    #[test]
+    fn a_verdict_not_known_by_the_windows_end_keeps_todays_words() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(false).unwrap();
+        assert!(!shown_by_now(rx), "nothing showed it");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(true).unwrap();
+        assert!(shown_by_now(rx), "a surface showed it");
+        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        assert!(shown_by_now(rx), "not known yet");
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(tx);
+        assert!(shown_by_now(rx), "nothing will say");
+    }
+
+    /// A window that ran out with no surface to show the question says that
+    /// nobody could be asked, in SSH's words naming the execution policy. One
+    /// a surface showed is the person's timeout, as before. An answer, and a
+    /// question withdrawn, read as they always did, surface or not.
+    ///
+    /// Red before #3982: every refusal read "did not approve the command".
+    #[test]
+    fn only_a_window_no_surface_showed_says_nobody_could_be_asked() {
+        assert_eq!(
+            exec_refusal(Decision::Timeout, false),
+            crate::consent::nobody_could_be_asked("execution")
+        );
+        assert_eq!(
+            exec_refusal(Decision::Timeout, true),
+            "the operator at this device did not approve the command (Timeout)"
+        );
+        for have_surface in [true, false] {
+            assert_eq!(
+                exec_refusal(Decision::Denied, have_surface),
+                "the operator at this device did not approve the command (Denied)",
+                "denied (surface={have_surface})"
+            );
+            assert_eq!(
+                exec_refusal(Decision::Cancelled, have_surface),
+                "the operator at this device did not approve the command (Cancelled)",
+                "withdrawn (surface={have_surface})"
+            );
+        }
     }
 }

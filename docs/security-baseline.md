@@ -508,7 +508,13 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   call with them: `chat`'s room delete calls the hook's `room_removed` once the room is
   gone, and the pod serving the call ends it for everyone in it. That pod also ends it on its own when it
   finds the room's document gone in two reconcile reads in a row, so a lost word cannot
-  keep the call alive. `docs/real-time.md` has the flow.
+  keep the call alive. The same holds for one seat: the pod serving a call checks its own
+  seats every 10 s (`crates/modules/conference/src/seat_check.rs`), and a seat whose
+  admission (the org membership, and the room membership where the room's visibility wants
+  one) reads as gone in two complete reads in a row ends there, within 30 s, so a withdrawal
+  that did not reach that pod cannot keep it. ⚠️ The check re-reads the room guard's own
+  rule, never a second copy: wherever the guard admits, it keeps the seat, and a failed or
+  late read keeps every seat. `docs/real-time.md` has the flow.
 - **A room membership ends with the org membership.** Every room fan-out (messages,
   edits, reactions, pins, typing, mentions) reaches the people holding a row in
   `room_members`, so the same hook, run after the org membership row is gone, drops the
@@ -586,7 +592,10 @@ would receive the token); an elevated Setup or `roomlerd enroll --machine-global
 writes a fresh one that keeps no `.prev` and no unknown key of the old. A wrong
 answer only ever stops a device: a deny is never credited, and a domain account
 that is an administrator only through a domain group reads as no administrator,
-because an answer that needed a domain controller would flap SYSTEM mode.
+because an answer that needed a domain controller would flap SYSTEM mode. What
+the daemon writes there itself, its device keys and browser keys in `peer-auth\`,
+comes out as the repair leaves it (#3956, the sites table below), so a repair
+changes something only where an entry drifted, and its log line says so.
 
 The SYSTEM service's FR-94 anchor is no file: it is read only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create, below a parent no other account may change, neither of them a registry link (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)). A writer makes a key that fails that check again rather than sealing it where it stands, so a handle opened while it was loose reaches nothing.
 
@@ -604,7 +613,7 @@ removal deletes, by handle, what the same walk opened.
 Why: a check made by path and an act made by path are two lookups of the same name, and
 the name can change in between; a walk by handle looks each name up once, and every act
 goes through the handle that was checked. One helper carries the rule,
-`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:341`), so a new
+`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:342`), so a new
 SYSTEM writer gets it by calling the helper rather than by re-deriving it
 ([FR-145](fr/FR-145-machine-tree-by-handle.md)). `OBJ_DONT_REPARSE` goes on every
 relative open as a second lock where the build honours it, and nothing relies on it
@@ -658,18 +667,21 @@ The sites on it since P1:
 
 | Site | By handle | Code |
 |---|---|---|
-| A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
-| Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:652`, `crates/agent-core/src/crash_recorder.rs:539` |
-| The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:750` |
+| A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:401` |
+| Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:654`, `crates/agent-core/src/crash_recorder.rs:541` |
+| The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:752` |
+| #3799 — the service's sweep of `crashes`: a record a person's worker sent and may not delete | `crashes` reached `below` `ProgramData` and listed with `entries`; each profile's ledger read with `read_file_tail`, its last 1 MiB, after `base` and `walk` from the profile the system records for the SID (`ProfileList`), never through a link and never a file of two names. A record goes, by `remove_file`, only when a ledger line equals the signature SYSTEM made from its own listing of a plain `<digits>-<digits>.json` file: no line names what is removed, and nothing is sent | `crates/agent-core/src/crash_recorder.rs:936`, `crates/agent-core/src/machine_tree/held.rs:610`, `agents/roomlerd/src/win_service/supervisor/crash_sweep.rs:220` |
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
 | #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
+| The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
 machine folder, with a test that fails on a new path-based one; until then those sites
 write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
-sends the crash recorder back to its writes by path, with one WARN naming the switch
+sends the crash recorder and the machine config's key files back to their writes by
+path, each with one WARN naming the switch
 (`crates/agent-core/src/machine_tree.rs:377`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
 
@@ -730,7 +742,7 @@ check still builds no path from it. The viewer's own ids
 A viewer chooses every string it sends on a session's data channels, the
 channel's own name included, and the daemon's log writes one event a line. So
 on every channel the session's peer routes (`on_data_channel`,
-`agents/roomlerd/src/peer.rs:1219`: input, control, cursor, clipboard, files,
+`agents/roomlerd/src/peer.rs:1216`: input, control, cursor, clipboard, files,
 record, privacy, video-bytes, and a channel of any other name), a string the
 viewer sent, and a reason or an error built from one, is logged with Debug
 escaping (`?`), so a line break or another control character in it stays inside
@@ -742,8 +754,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11579`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10916`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11446`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10783`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -1105,7 +1117,7 @@ the daemon shows, below), and a consent answer
 (`ConsentDecide`, an approval or a denial) and a Disconnect (`RcDisconnect`) require the
 person at the screen the daemon shows, `SYSTEM` or an elevated administrator
 (`peer_may_decide_for_the_screen`,
-[`lib.rs:2641`](../crates/localapi/src/lib.rs#L2641)). An approval lets someone see and
+[`lib.rs:2654`](../crates/localapi/src/lib.rs#L2654)). An approval lets someone see and
 control the screen, and the pipe admits every interactive user, so the ACL alone does not
 say whose screen a caller is at. The peer is what the OS read at accept: the client's
 session, and its account and elevation from its token. `SYSTEM` is named by its SID
@@ -1115,10 +1127,10 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   signed in, over RDP too. The person at the console is then someone else and is refused.
   A daemon in session 0 takes the console session; with neither known, only `SYSTEM` and
   an elevated administrator are taken (`screen_session`,
-  [`lib.rs:2614`](../crates/localapi/src/lib.rs#L2614)).
+  [`lib.rs:2627`](../crates/localapi/src/lib.rs#L2627)).
 - **Fail closed**: a peer whose session and account the pipe could not read is refused,
   in words, with a warn line, and nothing reaches the daemon (`not_the_screens_person`,
-  [`lib.rs:3785`](../crates/localapi/src/lib.rs#L3785)).
+  [`lib.rs:3891`](../crates/localapi/src/lib.rs#L3891)).
 - **On Unix nothing changes**: the daemon's own account or root are taken, who its
   owner-only socket admits. The person socket keeps its own seat check (below).
 - The tray's Approve, Deny and Disconnect and `roomlerd consent` run as the person in their
@@ -1127,8 +1139,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 - **The console person's gates follow the same screen.** A console person's `ConfigSet`
   key (`CONSOLE_PERSON_KEYS`), the recording verbs, keep busy on and the external-access
   password's set and clear take, on Windows, a peer in the screen's session
-  (`peer_is_console_user`, [`lib.rs:2539`](../crates/localapi/src/lib.rs#L2539);
-  `peer_may_start_keep_busy`, [`lib.rs:2483`](../crates/localapi/src/lib.rs#L2483)).
+  (`peer_is_console_user`, [`lib.rs:2552`](../crates/localapi/src/lib.rs#L2552);
+  `peer_may_start_keep_busy`, [`lib.rs:2496`](../crates/localapi/src/lib.rs#L2496)).
   Nothing else about them changed: keep busy on still takes only a person's account
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
@@ -1138,30 +1150,30 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:5247`](../crates/localapi/src/lib.rs#L5247)), and
+through `localapi::connect()` ([`lib.rs:5406`](../crates/localapi/src/lib.rs#L5406)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4679`](../crates/localapi/src/lib.rs#L4679) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5273`](../crates/localapi/src/lib.rs#L5273) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5522`](../crates/localapi/src/lib.rs#L5522) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5554`](../crates/localapi/src/lib.rs#L5554) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4838`](../crates/localapi/src/lib.rs#L4838) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5432`](../crates/localapi/src/lib.rs#L5432) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5681`](../crates/localapi/src/lib.rs#L5681) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5713`](../crates/localapi/src/lib.rs#L5713) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
-  anyone else ([`lib.rs:4653`](../crates/localapi/src/lib.rs#L4653)
+  anyone else ([`lib.rs:4812`](../crates/localapi/src/lib.rs#L4812)
   `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
   macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
   with no such directory (root under `sudo`, a cron job, a system service) has no
   per-user candidate and goes straight to the system socket.
 - **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
   alone. A per-user daemon serves its own per-user socket, and with no private directory
-  it serves none and logs why ([`lib.rs:4693`](../crates/localapi/src/lib.rs#L4693)
+  it serves none and logs why ([`lib.rs:4852`](../crates/localapi/src/lib.rs#L4852)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
   ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:5534`](../crates/localapi/src/lib.rs#L5534)). It works
+  never act as it ([`lib.rs:5693`](../crates/localapi/src/lib.rs#L5693)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1175,7 +1187,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:4072` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:4654` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
@@ -1195,11 +1207,16 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3365`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3463`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
   administrator's command (`not_on_the_person_socket_for_key`, `:3708`).
+  Since #3967 it also takes `ConsentRelaying`, from its own person only and never
+  from root: a two-row Mac's per-user half saying it lists the root half's consent
+  questions. It reads nothing and grants nothing. The root half keeps it in memory
+  for that connection's life, and it decides only whether that person's app counts
+  as the questions' surface ([desktop-companion.md](desktop-companion.md) §10.8.1).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote
@@ -1258,7 +1275,7 @@ for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and l
 install pending a separate policy call. The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
-  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2582`, by
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2595`, by
   `person_peer_ok`, `:4903`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
@@ -1284,7 +1301,7 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
-An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4130`),
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4272`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
@@ -1296,9 +1313,9 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2844`). Two tests lock it:
-`secrets_and_identity_are_not_exposed` (`:4748`) and
-`no_external_credential_key_is_editable_through_the_config_surface` (`:5339`).
+(`crates/agent-core/src/config_surface.rs:2913`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:4767`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5384`).
 
 #3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
 daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,

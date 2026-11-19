@@ -14,7 +14,23 @@
   const invoke = (name, payload) => window.__TAURI__.core.invoke(name, payload || {})
 
   let activeSession = null // session id currently shown in the modal
-  let busy = false // an approve/deny call is in flight
+  let sending = false // an answer is on its way
+  let answered = null // the question this modal answered: not shown again
+  let shownAt = 0 // #3987: performance.now() when the question shown came up
+
+  // #3873 — how long the modal waits for the app's reply to a click: the
+  // prompt window's limit (panel-consent.js), above the app's own 10 s.
+  const PAGE_LIMIT_MS = 15000
+
+  // #3873 — the buttons are off while an answer is on its way, and the hint
+  // says so; otherwise a click always reaches the app, which logs it.
+  function paintButtons() {
+    const off = !activeSession || sending
+    const approve = document.getElementById('consent-approve')
+    const deny = document.getElementById('consent-deny')
+    if (approve) approve.disabled = off
+    if (deny) deny.disabled = off
+  }
 
   function ensureModal() {
     let el = document.getElementById('consent-modal')
@@ -52,17 +68,37 @@
   }
 
   async function decide(approve) {
-    if (!activeSession || busy) return
-    busy = true
+    // #3873 — the click is sent before anything else can stop it, as in the
+    // prompt window (panel-consent.js): the app logs it when it arrives and
+    // again with its outcome.
+    const session = activeSession
+    sending = true
+    paintButtons()
     const hint = document.getElementById('consent-hint')
     if (hint) hint.textContent = approve ? 'Approving…' : 'Denying…'
+    let timer = null
+    const limit = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`No answer from the app within ${PAGE_LIMIT_MS / 1000} s. Try again.`)),
+        PAGE_LIMIT_MS
+      )
+    })
     try {
-      await invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session: activeSession })
+      // #3987 — with how long the question has been shown: the app holds
+      // back a click within a second of a new question coming up.
+      await Promise.race([
+        invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session, shown: Math.round(performance.now() - shownAt) }),
+        limit,
+      ])
+      answered = session
       hide()
     } catch (e) {
-      if (hint) hint.textContent = 'Failed: ' + e
+      // The app's words: the daemon's own refusal, or why it was not asked.
+      if (hint) hint.textContent = String(e && e.message ? e.message : e)
     } finally {
-      busy = false
+      clearTimeout(timer)
+      sending = false
+      paintButtons()
     }
   }
 
@@ -91,6 +127,7 @@
   function show(pc) {
     const el = ensureModal()
     activeSession = pc.session_id
+    shownAt = performance.now()
     const kind = KINDS[pc.kind] || KINDS.rc
     document.getElementById('consent-title').textContent = kind.title
     document.getElementById('consent-verb').textContent = kind.verb
@@ -115,6 +152,7 @@
     document.getElementById('consent-perms').textContent = pc.permissions || '—'
     document.getElementById('consent-hint').textContent = ''
     el.hidden = false
+    paintButtons()
   }
 
   function hide() {
@@ -128,12 +166,17 @@
     try {
       pending = await invoke('cmd_get_pending_consents')
     } catch (_) {
-      return // backend not ready / dir absent — stay quiet
+      // Backend not ready, or the read failed (#3873: the app logs that):
+      // stay quiet and keep what is shown.
+      return
     }
     // FR-27 — skip anything the daemon already shows natively; see
     // panel-consent.js. Two Approve buttons for one decision is how someone
-    // approves the wrong thing.
-    if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
+    // approves the wrong thing. #3873 — and the question this modal answered,
+    // which the daemon lists until it takes the answer.
+    if (Array.isArray(pending)) {
+      pending = pending.filter((p) => p.surface !== 'native' && p.session_id !== answered)
+    }
     // #2815 - the small prompt window (panel-consent.html) asks these. This
     // modal is its fallback, for when that window could not be created:
     // rendering both put each question up twice. An answer we cannot get
@@ -149,7 +192,7 @@
       if (!activeSession || !pending.some((p) => p.session_id === activeSession)) {
         show(pending[0])
       }
-    } else if (activeSession && !busy) {
+    } else if (activeSession && !sending) {
       hide() // resolved (e.g. via CLI, or timed out) — dismiss the modal
     }
   }

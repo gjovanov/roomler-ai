@@ -1206,6 +1206,19 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
+    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio` or
+    /// `1`. With it on, a remote-desktop session whose mesh link to the
+    /// viewer is not direct ranks its mesh candidates below every relay; `1`
+    /// also marks them ` network-cost 999`. Env `ROOMLERD_RC_CARRIER_RANK`,
+    /// read once per session. Local only. Temporary: FR-148 P5 deletes it.
+    #[serde(default)]
+    pub rc_carrier_rank: Option<String>,
+    /// FR-148 P1 — the path model's switch: `off`, `shadow` (unset; the
+    /// default) or `on`. `on` lets the path model's entry decide the opening
+    /// of a constrained remote-desktop session (D25, D26). Env
+    /// `ROOMLERD_PATH_MODEL`, read once per session. Local only.
+    #[serde(default)]
+    pub path_model: Option<String>,
     /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
     /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
     /// in the config surface.
@@ -1278,6 +1291,15 @@ pub struct AgentConfig {
     /// pause loses no frames. `false` = rate control only.
     #[serde(default)]
     pub queue_drain: Option<bool>,
+    /// FR-79 V5b — only a measurement is evidence about the rate
+    /// (`ROOMLERD_MEASURED_EVIDENCE`). Built-in default: on. A transit stall is
+    /// judged against a live reading and never the prior's stand-in, a later
+    /// delivery at twice a reading takes the reading out, a hold reaches the
+    /// pair memory only if a valid window carried it, the memory records a
+    /// reading or nothing, and a growing viewer queue counts only while the
+    /// sender offered more than arrived. `false` = V5a's rules.
+    #[serde(default)]
+    pub measured_evidence: Option<bool>,
     /// FR-59 P5 — a constrained session whose pair the rate memory
     /// remembers as SLOW opens with fewer pixels and fewer frames
     /// (`ROOMLERD_SLOW_LINK_PROFILE`). Built-in default: on. The bitrate
@@ -1521,6 +1543,14 @@ pub struct AgentConfig {
     /// `fps_deny`.
     #[serde(default)]
     pub nvenc_split: Option<String>,
+    /// FR-148 P2 (FR-62 A5) — the rate control an HEVC or H.264 QSV encoder
+    /// opens in: `cbr` (unset; constant bitrate, as before) or `qvbr` (the
+    /// target at 0.9 × the cap, under the cap, at the open's quality; a driver
+    /// that refuses it opens as `cbr`). Env `ROOMLERD_QSV_RATE_MODE`, read at
+    /// every encoder open. Local only: turning new encoder code on stays the
+    /// device's decision, or a release's. Temporary: FR-148 P5 deletes it.
+    #[serde(default)]
+    pub qsv_rate_mode: Option<String>,
     /// FR-77 P4 — pin the VAAPI render node (`ROOMLERD_VAAPI_DEVICE`,
     /// e.g. `/dev/dri/renderD129`). Unset = the first node libva opens, in
     /// order `/dev/dri/renderD128`…`renderD135`. Read once per process at
@@ -2978,6 +3008,8 @@ pub fn test_fixture() -> AgentConfig {
         measured_ceiling: None,
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
+        rc_carrier_rank: None,
+        path_model: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -2990,6 +3022,7 @@ pub fn test_fixture() -> AgentConfig {
         seed_contradiction: None,
         viewer_rate_clamp: None,
         queue_drain: None,
+        measured_evidence: None,
         slow_link_profile: None,
         slow_link_profile_bps: None,
         bg_rebuild: None,
@@ -3021,6 +3054,7 @@ pub fn test_fixture() -> AgentConfig {
         rc_media_legacy: None,
         rc_media_canary: None,
         nvenc_split: None,
+        qsv_rate_mode: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
@@ -3143,7 +3177,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 96] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 97] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3159,6 +3193,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 96]
         ("SEED_CONTRADICTION", cfg.seed_contradiction),
         ("VIEWER_RATE_CLAMP", cfg.viewer_rate_clamp),
         ("QUEUE_DRAIN", cfg.queue_drain),
+        ("MEASURED_EVIDENCE", cfg.measured_evidence),
         ("SLOW_LINK_PROFILE", cfg.slow_link_profile),
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
@@ -3401,6 +3436,19 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // every encoder open.
     if let Some(v) = &cfg.nvenc_split {
         fallbacks.insert("NVENC_SPLIT".to_string(), v.clone());
+    }
+    // FR-148 P2 — QSV's rate control, read at every encoder open, the probe
+    // child's included.
+    if let Some(v) = &cfg.qsv_rate_mode {
+        fallbacks.insert("QSV_RATE_MODE".to_string(), v.clone());
+    }
+    // FR-148 P4 — the carrier rank, read once per session.
+    if let Some(v) = &cfg.rc_carrier_rank {
+        fallbacks.insert("RC_CARRIER_RANK".to_string(), v.clone());
+    }
+    // FR-148 P1 — the path model's switch, read once per session.
+    if let Some(v) = &cfg.path_model {
+        fallbacks.insert("PATH_MODEL".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -4804,6 +4852,9 @@ mod tests {
         cfg.zero_copy = Some(true);
         cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
+        cfg.qsv_rate_mode = Some("qvbr".into());
+        cfg.rc_carrier_rank = Some("prio".into());
+        cfg.path_model = Some("on".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -4813,6 +4864,9 @@ mod tests {
         assert_eq!(get("COLOR_DESCRIPTION"), Some("0"));
         assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
+        assert_eq!(get("QSV_RATE_MODE"), Some("qvbr"));
+        assert_eq!(get("RC_CARRIER_RANK"), Some("prio"));
+        assert_eq!(get("PATH_MODEL"), Some("on"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

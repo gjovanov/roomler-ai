@@ -309,8 +309,14 @@
               </button>
               <button type="button" id="dv-refresh" class="sm">Refresh</button>
             </div>
-            <p id="dv-grid-status" class="muted small dv-note" hidden></p>
-            <p id="dv-grid-error" class="banner banner-warn small" hidden></p>
+            <!-- #4019 — the list's two notes share ONE slot of fixed height
+                 (styles.css `.dv-notes`), there whether a note shows or not:
+                 a refresh that fails or recovers moves no row under the
+                 pointer. devices.js shows and hides the notes, never the slot. -->
+            <div id="dv-notes" class="dv-notes">
+              <p id="dv-grid-status" class="muted small dv-note" hidden></p>
+              <p id="dv-grid-error" class="dv-stale small" hidden></p>
+            </div>
             <div class="tbl-wrap">
               <table id="dv-grid" class="tbl dv-grid">
                 <thead></thead>

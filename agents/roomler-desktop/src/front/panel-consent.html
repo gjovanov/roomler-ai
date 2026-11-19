@@ -81,18 +81,31 @@
         color: var(--muted);
         margin-right: auto;
       }
+      /* #3873 — what became of a click, on a line of its own: the countdown
+         repaints every second, and an answer's words must stay until the
+         next click or the next question. */
+      #p-status {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.35;
+        max-height: 4.1em;
+        overflow-y: auto;
+        overflow-wrap: anywhere;
+      }
     </style>
   </head>
   <body>
     <h1 class="p-title" id="p-title">Remote control request</h1>
-    <p class="p-lead"><strong id="p-who"></strong> <span id="p-verb"></span>.</p>
+    <p class="p-lead" id="p-lead"><strong id="p-who"></strong> <span id="p-verb"></span>.</p>
     <p class="p-meta" id="p-org-row" hidden>On behalf of <strong id="p-org"></strong></p>
     <p class="p-detail" id="p-detail-row" hidden><span id="p-detail"></span></p>
     <p class="p-meta" id="p-perms-row">Permissions: <span id="p-perms" class="mono"></span></p>
+    <p id="p-status" role="status">Reading the question…</p>
     <div class="p-actions">
       <span id="p-countdown"></span>
-      <button type="button" id="p-deny" class="consent-btn consent-deny">Deny</button>
-      <button type="button" id="p-approve" class="consent-btn consent-approve">Approve</button>
+      <!-- #3873 — off until a question is shown: panel-consent.js turns them on. -->
+      <button type="button" id="p-deny" class="consent-btn consent-deny" disabled>Deny</button>
+      <button type="button" id="p-approve" class="consent-btn consent-approve" disabled>Approve</button>
     </div>
     <script src="panel-consent.js"></script>
   </body>

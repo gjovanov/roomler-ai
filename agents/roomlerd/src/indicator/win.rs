@@ -754,7 +754,9 @@ unsafe fn kill_current_session(p: *mut PumpState) {
         if let Some(hex) = hex
             && let Ok(oid) = ObjectId::parse_str(&hex)
         {
-            let _ = (*p).kill_tx.try_send(oid);
+            let _ = (*p)
+                .kill_tx
+                .try_send((oid, crate::rc_sessions::Via::OverlayBadge));
         }
         hide_badge(p);
     }

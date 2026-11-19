@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) + P3b (grace-until-drained, measured growth, stable==0 write-back) + P3c (stuck detector so a hot seed cannot freeze the opener, + applied_bps self-correction) shipped 0.4.27 → 0.4.30 (#986/#988/#996/#1001/#1004). Field: IDR pulses gone; opener sharp from frame 1 with a healthy seed; no spurious freeze on a fast path (maxGap <130 ms at the 8 M ceiling). REMAINING: the stuck detector needs a path that cannot carry the seed to exercise — handed to the operator as a neo16→overlay A/B (100.65.4.2 reseeded to the 7 M froze-value).** (2026-08-30). Tracking issue: `FR-35` (#922).
+Status: **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). The learner and the per-pair memory stay live until FR-148 P5 deletes them. The open criteria moved to FR-148 P3, and the decision against an active probe ("Not done, deliberately", below) is reversed by FR-148 D2. FR-148 §12 maps each open criterion. At the close: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) + P3b (grace-until-drained, measured growth, stable==0 write-back) + P3c (stuck detector so a hot seed cannot freeze the opener, + applied_bps self-correction) shipped 0.4.27 → 0.4.30 (#986/#988/#996/#1001/#1004). Field: IDR pulses gone; opener sharp from frame 1 with a healthy seed; no spurious freeze on a fast path (maxGap <130 ms at the 8 M ceiling). REMAINING: the stuck detector needs a path that cannot carry the seed to exercise — handed to the operator as a neo16→overlay A/B (100.65.4.2 reseeded to the 7 M froze-value).** (2026-08-30). Tracking issue: `FR-35` (#922).
 
 **Re-read on the current code (2026-10-27/28 sessions on agent 0.4.177, 0.4.178 and 0.4.181;
 the FR-35 surface — `ceiling_learn.rs`, `rate_memory.rs`, `governor.rs`, `goodput.rs`,
@@ -71,10 +71,10 @@ measured-rate line (#678: a sender cannot see capacity it is not using). Operato
 
 ## What is in force today
 
-- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:508`, env `RELAY_MAX_KBPS`),
+- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:523`, env `RELAY_MAX_KBPS`),
   applied as the encoder's `maxrate` cap on every constrained session
   (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3309`), opened at 85 % =
-  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:264-283`); the send-queue budget derives
+  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:274-298`); the send-queue budget derives
   from the same constant (`peer.rs:4904`).
 - The AIMD (`encode/aimd.rs`) climbs additively (+ceiling/16 ≥ 150 kbps per 5 s of quiet) but
   **never above that ceiling**; it decreases ×0.85 on a full send channel, on a send-wait stall
@@ -126,7 +126,7 @@ memory) and `relay_max_hi_kbps` (config-surface + env). Direct sessions are unto
 startup bandwidth probe (measures burst capacity, which this measurement shows is *not* the
 sustainable rate — 18 Mbps instantaneous vs ~8 sustained — and costs bytes on exactly the thin
 links); the goodput estimator as the learning input (its down-fast EWMA crashed on relay
-lumpiness, governor.rs:256-262 — the AIMD's own stable target is the robust signal).
+lumpiness, governor.rs:266-272 — the AIMD's own stable target is the robust signal).
 
 ## Acceptance criteria
 
@@ -162,7 +162,7 @@ shipped defaults:
       session's 95 heartbeats: send wait max 0.787 ms, age p99 195 ms, `send_stalls=0`, no
       backpressure skip. The FR-18 numbers (0.4.10, CORPLAP-3 relay): `send_wait` p99 200 ms / max
       1,778 ms, viewer age max 2,185 ms. The learner stepped eight times, 3.00 → 4.87 M, under `hi`
-      8 M, and bounded by construction (`ceiling_learn.rs:237`, `.min(hi)`). The load was the
+      8 M, and bounded by construction (`ceiling_learn.rs:268`, `.min(hi)`). The load was the
       screen's, not the pipe's: QP sat at 15 in all but two of the drag's heartbeats and the ceiling
       climbed past the load, so the drag did not push this pair to its limit. Without a drag the week's 24 sessions
       had one heartbeat near a second (824.7 ms) and one past FR-18's age max, 3,364 ms (2026-10-30

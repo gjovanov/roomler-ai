@@ -2298,9 +2298,9 @@ fn exit_for_requested_restart() {
 ///
 /// The log_tail attached comes from `read_log_tail()` inside the
 /// recorder — that reads the WORKER's rolling log, which is the
-/// useful artifact for diagnosis (vs. the supervisor's later
-/// SupervisorDetected record which carries supervisor noise + is
-/// suppressed by the 30 s rate-limit).
+/// useful artifact for diagnosis. #4023: an exit for the device's
+/// state, no config to run, records nothing here
+/// (`daemon_error::record_worker_exit`); the service's own record stays, #4028.
 #[cfg(target_os = "windows")]
 fn record_worker_exit_failure(err: &anyhow::Error) {
     use roomlerd::crash_recorder::{self, Reason, WriterContext};
@@ -2319,8 +2319,8 @@ fn record_worker_exit_failure(err: &anyhow::Error) {
     #[cfg(not(feature = "system-context"))]
     let ctx = WriterContext::Worker;
 
-    let summary = format!("worker exit: {err:#}");
-    crash_recorder::record(Reason::SupervisorDetected, &summary, ctx);
+    let record = |summary: &str| crash_recorder::record(Reason::SupervisorDetected, summary, ctx);
+    roomlerd::daemon_error::record_worker_exit(err, record);
 }
 
 /// Remove cross-flavour MSI install leftovers. Invoked by the WiX
@@ -3912,10 +3912,10 @@ async fn run_cmd(
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
     if !config_path.exists() && !unenrolled {
-        bail!(
-            "no config found at {}. Run `roomlerd enroll` first.",
-            config_path.display()
-        );
+        // #4023 — the device's state, not a fault: a type of its own, so the
+        // Windows worker's exit for it records no crash, told apart by type and
+        // never by its words (`record_worker_exit_failure`). The words stay.
+        return Err(roomlerd::daemon_error::NoConfig::at(config_path).into());
     }
     // Take the single-instance lock before doing anything else. If
     // another agent is already attached to this config (typically the

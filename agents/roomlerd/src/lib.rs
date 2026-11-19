@@ -39,12 +39,19 @@ pub mod audio;
 /// FR-97 P3c — what "computer audio" may open, and why it opened nothing.
 pub mod audio_source;
 pub mod capture;
+/// FR-148 P4 — the carrier rank inside a session: the candidate lines and
+/// the opening's wait for the move off a ranked-last pair.
+pub mod carrier_rank;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
 pub mod clock;
 pub mod code_signature;
 pub mod companion;
 pub mod consent;
+/// #3864 — a one-row Mac's consent questions reach the menu-bar app: the
+/// worker lists and decides the root half's, and the root counts the app only
+/// while that road is open.
+pub mod consent_relay;
 pub mod crash_uploader;
 pub mod delegate;
 #[cfg(unix)]
@@ -126,6 +133,12 @@ pub mod macos_quit;
 pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+/// FR-148 P0 — delivery samples from SCTP's acknowledgement clock, each
+/// backlogged, application-limited or stalled, and their line. In shadow.
+pub mod media_delivery;
+/// FR-148 P1 — the FFmpeg data-channel pump's pair memories: today's rate
+/// memory as before, and the path model's own file, its key and its two lines.
+pub mod media_pair_memory;
 /// FR-135 §7.1 — which media path a session runs, old or new, from
 /// `rc_media_legacy` and `rc_media_canary`, decided once at its open.
 pub mod media_paths;

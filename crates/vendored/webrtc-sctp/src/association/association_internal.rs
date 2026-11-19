@@ -330,6 +330,12 @@ impl AssociationInternal {
         let _ = self.awake_write_loop_ch.try_send(());
     }
 
+    /// roomler (FR-148): the acknowledgement clock, which `Association` keeps
+    /// to read without this struct's lock.
+    pub(crate) fn delivery_clock(&self) -> super::delivery::DeliveryClock {
+        self.pending_queue.delivery_clock()
+    }
+
     /// unregister_stream un-registers a stream from the association
     /// The caller should hold the association write lock.
     fn unregister_stream(&mut self, stream_identifier: u16) {
@@ -1108,8 +1114,13 @@ impl AssociationInternal {
     async fn process_selective_ack(
         &mut self,
         d: &ChunkSelectiveAck,
-    ) -> Result<(HashMap<u16, i64>, u32)> {
+    ) -> Result<(HashMap<u16, i64>, u32, u64)> {
         let mut bytes_acked_per_stream = HashMap::new();
+        // roomler (FR-148): the bytes the peer received, for the
+        // acknowledgement clock. `bytes_acked_per_stream` releases the
+        // streams' buffers and moves the congestion window, as it did.
+        let mut delivered: u64 = 0;
+        let loss_mark = self.pending_queue.delivery().loss_mark();
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1138,6 +1149,16 @@ impl AssociationInternal {
                         *amount += n_bytes_acked;
                     } else {
                         bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
+                    }
+
+                    // roomler (FR-148): only an abandoned chunk can be passed
+                    // by a FORWARD TSN that the peer never had, and the clock
+                    // leaves one out when a SACK reported it missing or T3-rtx
+                    // expired while it was out (`DeliveryCounters::loss_mark`).
+                    // One lost with no such evidence still counts: a
+                    // cumulative point cannot say which skipped chunks arrived.
+                    if !(c.abandoned() && loss_mark.is_some_and(|m| sna32lt(c.tsn, m))) {
+                        delivered += c.user_data.len() as u64;
                     }
 
                     // RFC 4960 sec 6.3.1.  RTO Calculation
@@ -1203,6 +1224,8 @@ impl AssociationInternal {
                         } else {
                             bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
                         }
+                        // roomler (FR-148): a gap block says the peer holds it.
+                        delivered += u64::try_from(n_bytes_acked).unwrap_or(0);
 
                         log::trace!("[{}] tsn={} has been sacked", self.name, c.tsn);
 
@@ -1232,7 +1255,21 @@ impl AssociationInternal {
             }
         }
 
-        Ok((bytes_acked_per_stream, htna))
+        // roomler (FR-148): what this SACK reports missing, for the SACKs after
+        // it: every chunk still outstanding below its highest newly acknowledged
+        // TSN is in a gap. A mark the cumulative point has reached covers
+        // nothing that is still outstanding.
+        let next = d.cumulative_tsn_ack.wrapping_add(1);
+        let mark = loss_mark.filter(|m| sna32gt(*m, next));
+        self.pending_queue
+            .delivery()
+            .set_loss_mark(if sna32gt(htna, next) {
+                Some(mark.filter(|m| sna32gt(*m, htna)).unwrap_or(htna))
+            } else {
+                mark
+            });
+
+        Ok((bytes_acked_per_stream, htna, delivered))
     }
 
     async fn on_cumulative_tsn_ack_point_advanced(&mut self, total_bytes_acked: i64) {
@@ -1419,12 +1456,16 @@ impl AssociationInternal {
         }
 
         // Process selective ack
-        let (bytes_acked_per_stream, htna) = self.process_selective_ack(d).await?;
+        let (bytes_acked_per_stream, htna, delivered) = self.process_selective_ack(d).await?;
 
         let mut total_bytes_acked = 0;
         for n_bytes_acked in bytes_acked_per_stream.values() {
             total_bytes_acked += *n_bytes_acked;
         }
+        // roomler (FR-148): the acknowledgement clock, for a reader beside the
+        // association (`Association::delivery_clock`): the bytes the peer
+        // received, which `process_selective_ack` counts beside the sum above.
+        self.pending_queue.delivery().on_acked(delivered);
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
@@ -2338,6 +2379,12 @@ impl RtxTimerObserver for AssociationInternal {
 
             RtxTimerId::T3RTX => {
                 self.stats.inc_t3timeouts();
+                // roomler (FR-148): every chunk out now may be lost, so the
+                // acknowledgement clock leaves out an abandoned one that the
+                // cumulative point passes later (`DeliveryCounters::loss_mark`).
+                self.pending_queue
+                    .delivery()
+                    .set_loss_mark(Some(self.my_next_tsn));
 
                 // RFC 4960 sec 6.3.3
                 //  E1)  For the destination address for which the timer expires, adjust

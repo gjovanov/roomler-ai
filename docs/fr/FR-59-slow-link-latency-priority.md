@@ -1,6 +1,6 @@
 # FR-59 — Slow-link latency priority: make delay the controlled variable
 
-**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1 and AC3 met on the 2026-11-02 read, AC2 and AC5 partial, AC4 moved to FR-63; **AC6 unit-verified 2026-10-29** ·
+**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). P1 to P4 and P7 (the viewer's reorder buffer) stay live. P5, P6 and P8 go in FR-148: the slow-link profile becomes a live plan field in its P2. AC2 and AC5 are read in its P3. FR-148 §12 maps each open criterion. At the close: P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1 and AC3 met on the 2026-11-02 read, AC2 and AC5 partial, AC4 moved to FR-63; **AC6 unit-verified 2026-10-29** ·
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
@@ -41,13 +41,13 @@ therefore **increased**.
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
    (`agents/roomlerd/src/encode/mod.rs:229`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
+   (`:215`) returns exactly it, and `governor.rs:353` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:324` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps
@@ -207,7 +207,7 @@ The plumbing is one shape for all of them:
 
 ```mermaid
 flowchart LR
-  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3156–3161 → ROOMLERD_*"]
+  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3165–3170 → ROOMLERD_*"]
   bridge --> rd["readers<br/>encode/mod.rs:319–450<br/>on unless the value is \"0\""]
   rd --> gf["GovernorFlags::from_env<br/>governor.rs:171"]
   rd --> pk["PlanKnobs::from_env<br/>plan.rs:187 (P2)"]
@@ -227,7 +227,7 @@ flowchart LR
 | **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`170d18473^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
 | **T1** | none — a parse fix | `crates/vendored/webrtc-sctp` | not a switch; the vendored parser's own tests plus the CI drift gate (`ci.yml:273`, `scripts/revendor-webrtc-sctp.sh --check`) |
 
-`config_surface.rs:4315` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
+`config_surface.rs:4334` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
 editable through the config surface, not only by env.
 
 **Fail-first.** A unit test is evidence only if it fails without the thing it protects, so each

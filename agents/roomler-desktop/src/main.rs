@@ -43,7 +43,7 @@ mod panels;
 mod pin;
 mod tray;
 
-use tauri::Manager;
+use tauri::{AppHandle, Manager, Runtime};
 
 fn main() {
     // #2286 — FIRST, before GTK starts and before any thread exists: on GNOME
@@ -115,27 +115,14 @@ fn main() {
             // the Overview once it is done); `--view=<name>` routes there.
             // #3887 — nor does the daemon's start for a prompt, and a
             // person's start shows the tour such a start held back.
+            // #3941 — on macOS, opening the app again starts no second
+            // process: it is a reopen (`reopen`), shown by the same code.
             let launch = first_run::parse_launch_args(&args);
             let done = roomler_node_core::desktop_state::load().first_run_done;
             let held = first_run::tour_held();
             let decision = first_run::decide_second_instance(&launch, done, held);
             tracing::info!(?launch, tour_held = held, ?decision, "a second launch");
-            let view = match decision {
-                first_run::SecondLaunch::Ignore => return,
-                first_run::SecondLaunch::Show => None,
-                first_run::SecondLaunch::ShowView(view) => Some(view),
-            };
-            if let Some(window) = app.get_webview_window("main") {
-                // The name is whitelisted to ascii-alphanumeric by the parser
-                // before it goes near eval; the router maps anything unknown
-                // to Overview.
-                if let Some(view) = view {
-                    first_run::showing(&view);
-                    let _ = window.eval(format!("window.location.hash = '#/{view}'"));
-                }
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app, decision);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -257,8 +244,67 @@ fn main() {
             tauri::async_runtime::spawn(consent_watch_loop(handle));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running roomler-desktop");
+        .build(tauri::generate_context!())
+        .expect("error while running roomler-desktop")
+        .run(|app, event| {
+            // #3941 — `.run(context)` was this with a callback that did
+            // nothing. The one event acted on here is macOS's reopen; every
+            // other one (an exit request, the tray's, a window's) is handled
+            // where it was, before this callback runs.
+            if let Some(has_visible_windows) = reopened(&event) {
+                reopen(app, has_visible_windows);
+            }
+        });
+}
+
+/// Show the main window as a person's opening of the running companion
+/// decided: a second launch forwarded on Windows and Linux and a reopen on
+/// macOS (#3941) share it ([`first_run::open_window`]). The window exists
+/// from the start and is only ever hidden.
+fn show_main_window<R: Runtime>(app: &AppHandle<R>, decision: first_run::SecondLaunch) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    first_run::open_window(
+        decision,
+        // The name is whitelisted to ascii-alphanumeric by the parser before
+        // it goes near eval; the router maps anything unknown to Overview.
+        |view| {
+            let _ = window.eval(format!("window.location.hash = '#/{view}'"));
+        },
+        || {
+            let _ = window.show();
+            let _ = window.set_focus();
+        },
+    );
+}
+
+/// #3941 — `Some(has_visible_windows)` when `event` is macOS's reopen: the
+/// running app opened again from Finder, Launchpad, Spotlight or `open -a`.
+/// The only macOS code on this path; no other platform has a reopen.
+fn reopened(event: &tauri::RunEvent) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Reopen {
+        has_visible_windows,
+        ..
+    } = event
+    {
+        return Some(*has_visible_windows);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = event;
+    None
+}
+
+/// #3941 — a reopen: a person's own start with no argument, decided as a
+/// second launch with none ([`first_run::decide_reopen`]), logged once, and
+/// shown by the second launch's own code.
+fn reopen<R: Runtime>(app: &AppHandle<R>, has_visible_windows: bool) {
+    let done = roomler_node_core::desktop_state::load().first_run_done;
+    let held = first_run::tour_held();
+    let decision = first_run::decide_reopen(done, held);
+    first_run::log_reopen(&decision, done, held, has_visible_windows);
+    show_main_window(app, decision);
 }
 
 /// Ask the daemon (over the LocalAPI) which sessions await consent; when a NEW
@@ -269,67 +315,213 @@ fn main() {
 /// Tauri's async runtime; a 750 ms poll over the local pipe is cheap. The SPA
 /// does the actual render/approve/deny via `cmd_get_pending_consents` + the
 /// approve/deny commands; this loop's only job is "bring the window forward when
-/// something new needs a decision."
+/// something new needs a decision." #3998 — and to change nothing on a poll
+/// that failed ([`SessionWatch`]).
 async fn consent_watch_loop(app: tauri::AppHandle) {
-    use std::collections::HashSet;
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut banner_up = false;
+    let mut watch = SessionWatch::default();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        let (pending, live) = match roomler_localapi::connect().await {
-            Ok(mut c) => {
-                let pending: HashSet<String> = c
-                    .consent_pending()
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    // FR-27 — ignore anything the DAEMON is already showing
-                    // natively. It still writes a marker for those (that list
-                    // is also what `roomlerd consent --list` reads), so without
-                    // this filter a host with a native overlay would get two
-                    // Approve buttons for one decision.
-                    .filter(|p| p.surface != "native")
-                    .map(|p| p.session_id)
-                    .collect();
-                let live = c.rc_sessions().await;
-                // FR-85 — the tray turns red with the banner, from this same
-                // answer; a failed poll leaves it as the last answer said.
-                tray::sessions_answered(&app, live.as_deref().ok());
-                (pending, live.unwrap_or_default())
-            }
-            // Daemon down / pipe absent ⇒ nothing pending, nothing live.
-            Err(e) => {
-                // FR-85 — for the tray, no service at all is an answer:
-                // nothing records without it (a busy pipe is not).
-                if tray::no_service(&e) {
-                    tray::sessions_answered(&app, Some(&[]));
-                }
-                (HashSet::new(), Vec::new())
-            }
-        };
-
+        let reply = read_within(WATCH_READ_WITHIN, read_service()).await;
+        // FR-85 — the tray turns red with the banner, from this same answer;
+        // a failed poll leaves it as the last answer said.
+        tray::sessions_answered(&app, tray_answer(&reply));
+        let change = watch.poll(reply, std::time::Instant::now(), panels::banner_enabled());
         // FR-27 — a newly-appeared prompt opens the small always-on-top CONSENT
         // window, not the whole 1100×740 app. The old behaviour showed the
         // entire SPA over whatever the person was doing, to ask one yes/no.
-        if pending.difference(&seen).next().is_some() {
+        if change.show_prompt {
             panels::show_consent(&app);
-        } else if pending.is_empty() {
+        } else if change.hide_prompt {
             panels::hide(&app, panels::CONSENT);
         }
-        seen = pending;
-
         // FR-27 — the "Being viewed by …" banner. Windows has a native,
         // capture-excluded overlay for this and keeps it; everywhere else this
         // is the only such indicator there has ever been.
-        let want_banner = wants_banner(&live) && panels::banner_enabled();
-        if want_banner != banner_up {
-            if want_banner {
-                panels::show_banner(&app);
-            } else {
-                panels::hide(&app, panels::VIEWING);
+        match change.banner {
+            Some(true) => panels::show_banner(&app),
+            Some(false) => panels::hide(&app, panels::VIEWING),
+            None => {}
+        }
+    }
+}
+
+/// #3998 — one poll of the device service, as the watch reads it: the
+/// connect, then each list on that connection. `Err` at the top is a connect
+/// that failed, or a poll that took longer than [`WATCH_READ_WITHIN`].
+type WatchReply = std::io::Result<(
+    std::io::Result<Vec<roomler_localapi::ConsentRequest>>,
+    std::io::Result<Vec<roomler_localapi::RcSessionInfo>>,
+)>;
+
+/// #3998 — how long one poll may take, the connect and both lists: above
+/// every bound the device service keeps on its answers to them (a Mac's
+/// relay to its root half, 1 s) and above the pipe's busy ladder (315 ms). A
+/// poll that takes longer is a failed one. Until #3998 nothing bounded it, so
+/// a read that never ended stopped the watch with whatever it showed.
+const WATCH_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #3998 — how long reads that all fail keep the prompt's questions on the
+/// screen. A question the service cannot decide does not linger: past this,
+/// the failure counts as an answer of none. The banner has no such bound.
+const QUESTIONS_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One poll's read, on one connection.
+async fn read_service() -> WatchReply {
+    let mut c = commands::connect_service().await?;
+    let pending = c.consent_pending().await;
+    let live = c.rc_sessions().await;
+    Ok((pending, live))
+}
+
+/// #3998 — `read`, or a failed poll once `within` has passed.
+async fn read_within(
+    within: std::time::Duration,
+    read: impl std::future::Future<Output = WatchReply>,
+) -> WatchReply {
+    tokio::time::timeout(within, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer from the device service within {within:?}"),
+            ))
+        })
+}
+
+/// FR-85 — what the tray's red takes from a poll ([`tray::sessions_answered`]):
+/// the sessions an answer listed, none when no service is there at all
+/// (nothing records without it; a busy pipe is not that), and `None` when
+/// the poll failed. #3998 — the same answer the banner takes, and the same
+/// proof of no service ([`commands::connect_service`]).
+fn tray_answer(reply: &WatchReply) -> Option<&[roomler_localapi::RcSessionInfo]> {
+    match reply {
+        Ok((_, live)) => live.as_deref().ok(),
+        Err(e) if tray::no_service(e) => Some(&[]),
+        Err(_) => None,
+    }
+}
+
+/// FR-27 — the questions the prompt asks: all but the ones the DAEMON already
+/// shows natively. It still writes a marker for those (that list is also what
+/// `roomlerd consent --list` reads), so without this filter a host with a
+/// native overlay would get two Approve buttons for one decision.
+fn on_the_prompt(list: Vec<roomler_localapi::ConsentRequest>) -> std::collections::HashSet<String> {
+    list.into_iter()
+        .filter(|p| p.surface != "native")
+        .map(|p| p.session_id)
+        .collect()
+}
+
+/// #3998 — what one poll changes on the screen.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScreenChange {
+    /// Bring the prompt up: a question it has not shown.
+    show_prompt: bool,
+    /// Take the prompt down: no question.
+    hide_prompt: bool,
+    /// The banner goes up (`Some(true)`) or down (`Some(false)`).
+    banner: Option<bool>,
+}
+
+/// #3998 — what the watch shows, kept between polls: the device service's
+/// last answer, list by list.
+///
+/// - A list the service answered is what the screen shows: the prompt for its
+///   questions, the banner for its sessions.
+/// - A read that failed (a busy pipe, a broken reply, a poll past
+///   [`WATCH_READ_WITHIN`]) changes nothing. The prompt keeps its questions
+///   and its place, for [`QUESTIONS_KEPT_FOR`] of failures at most: a
+///   question the service cannot decide does not linger. The banner keeps
+///   what it shows for as long as no answer comes, and so does the tray's
+///   red: a privacy indicator never comes down on a timer.
+/// - Proven no service is an answer, at once: a service that is not there
+///   asks nothing and holds no session ([`commands::connect_service`]).
+///
+/// Until #3998 every failure read as an empty answer: one failed read took
+/// the person's question and the session banner down, and the next good one
+/// put the question up again, placed and armed again (#3987).
+#[derive(Default)]
+struct SessionWatch {
+    /// The questions the prompt shows.
+    questions: std::collections::HashSet<String>,
+    /// Since when every read of the questions has failed.
+    questions_failing_since: Option<std::time::Instant>,
+    /// The live sessions the banner is for.
+    sessions: Vec<roomler_localapi::RcSessionInfo>,
+    /// Whether the banner is up.
+    banner_up: bool,
+    /// Whether the last poll failed: a run of failures is logged once.
+    failing: bool,
+}
+
+impl SessionWatch {
+    /// One poll: what it changes on the screen.
+    fn poll(
+        &mut self,
+        reply: WatchReply,
+        now: std::time::Instant,
+        banner_enabled: bool,
+    ) -> ScreenChange {
+        let (questions, sessions, failure) = match reply {
+            Ok((pending, live)) => {
+                let failure = match (&pending, &live) {
+                    (Err(e), _) => Some(format!("consent_pending: {e}")),
+                    (_, Err(e)) => Some(format!("rc_sessions: {e}")),
+                    _ => None,
+                };
+                (pending.ok().map(on_the_prompt), live.ok(), failure)
             }
-            banner_up = want_banner;
+            Err(e) if tray::no_service(&e) => (Some(Default::default()), Some(Vec::new()), None),
+            Err(e) => (None, None, Some(format!("connect: {e}"))),
+        };
+        let seen = self.questions.clone();
+        match questions {
+            Some(questions) => {
+                self.questions = questions;
+                self.questions_failing_since = None;
+            }
+            None => {
+                let since = *self.questions_failing_since.get_or_insert(now);
+                if !self.questions.is_empty()
+                    && now.saturating_duration_since(since) >= QUESTIONS_KEPT_FOR
+                {
+                    tracing::warn!(
+                        after = ?QUESTIONS_KEPT_FOR,
+                        "session watch: the device service has not answered for its questions; \
+                         the prompt comes down, and the banner stays until it answers"
+                    );
+                    self.questions.clear();
+                }
+            }
+        }
+        if let Some(sessions) = sessions {
+            self.sessions = sessions;
+        }
+        match failure {
+            Some(reason) if !self.failing => {
+                self.failing = true;
+                if !self.questions.is_empty() || self.banner_up {
+                    tracing::info!(
+                        %reason,
+                        questions = self.questions.len(),
+                        banner = self.banner_up,
+                        "session watch: a read of the device service failed; the screen keeps \
+                         what its last answer said"
+                    );
+                }
+            }
+            Some(_) => {}
+            None => self.failing = false,
+        }
+        let show_prompt = self.questions.difference(&seen).next().is_some();
+        let hide_prompt = !show_prompt && self.questions.is_empty();
+        let want = wants_banner(&self.sessions) && banner_enabled;
+        let banner = (want != self.banner_up).then_some(want);
+        self.banner_up = want;
+        ScreenChange {
+            show_prompt,
+            hide_prompt,
+            banner,
         }
     }
 }
@@ -368,5 +560,291 @@ mod tests {
             wants_banner(&[session(true), session(false)]),
             "one session that sees the screen is enough"
         );
+    }
+
+    use std::io::{Error, ErrorKind};
+    use std::time::{Duration, Instant};
+
+    use roomler_localapi::{ConsentRequest, RcSessionInfo};
+
+    /// The watch's tick.
+    const POLL: Duration = Duration::from_millis(750);
+
+    const NOTHING: ScreenChange = ScreenChange {
+        show_prompt: false,
+        hide_prompt: false,
+        banner: None,
+    };
+    const BOTH_UP: ScreenChange = ScreenChange {
+        show_prompt: true,
+        hide_prompt: false,
+        banner: Some(true),
+    };
+    const BOTH_DOWN: ScreenChange = ScreenChange {
+        show_prompt: false,
+        hide_prompt: true,
+        banner: Some(false),
+    };
+
+    fn question() -> ConsentRequest {
+        ConsentRequest {
+            session_id: "66f0c0ffee0000000000abcd".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW | INPUT".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: "companion".into(),
+            org: String::new(),
+        }
+    }
+
+    fn viewer(recording: bool) -> RcSessionInfo {
+        RcSessionInfo {
+            session_id: "66f0c0ffee0000000000dcba".into(),
+            controller_name: "Alice".into(),
+            recording,
+            ..Default::default()
+        }
+    }
+
+    // The stand-in device service: what one poll of it reads.
+
+    type StandIn = fn() -> WatchReply;
+
+    /// A question waits, and a session sees the screen.
+    fn asking_and_viewed() -> WatchReply {
+        Ok((Ok(vec![question()]), Ok(vec![viewer(false)])))
+    }
+
+    /// The same, and the session records.
+    fn asking_and_recorded() -> WatchReply {
+        Ok((Ok(vec![question()]), Ok(vec![viewer(true)])))
+    }
+
+    /// The connect failed, with the service there: every pipe instance
+    /// busy past the client's ladder.
+    fn busy() -> WatchReply {
+        Err(Error::new(
+            ErrorKind::TimedOut,
+            "all pipe instances are busy",
+        ))
+    }
+
+    /// The questions' read failed.
+    fn questions_failed() -> WatchReply {
+        Ok((
+            Err(Error::other(
+                "localapi: connection closed before a response",
+            )),
+            Ok(vec![viewer(false)]),
+        ))
+    }
+
+    /// The sessions' read failed.
+    fn sessions_failed() -> WatchReply {
+        Ok((
+            Ok(vec![question()]),
+            Err(Error::other(
+                "localapi: connection closed before a response",
+            )),
+        ))
+    }
+
+    /// #3998 — a read that fails between two good ones changes nothing on
+    /// the screen, wherever it fails: the prompt is neither hidden nor shown
+    /// (placed and armed) again, and the banner stays up. Until #3998 each
+    /// of these read as an empty answer: the prompt and the banner went down
+    /// and came back.
+    #[test]
+    fn a_failed_read_between_two_good_ones_changes_nothing_on_the_screen() {
+        let failures: [(&str, StandIn); 3] = [
+            ("the connect", busy),
+            ("the questions' read", questions_failed),
+            ("the sessions' read", sessions_failed),
+        ];
+        for (place, failed) in failures {
+            let mut watch = SessionWatch::default();
+            let t0 = Instant::now();
+            assert_eq!(watch.poll(asking_and_viewed(), t0, true), BOTH_UP);
+            assert_eq!(
+                watch.poll(failed(), t0 + POLL, true),
+                NOTHING,
+                "a failure at {place} changed the screen"
+            );
+            assert_eq!(
+                watch.poll(asking_and_viewed(), t0 + POLL * 2, true),
+                NOTHING,
+                "the good read after a failure at {place} showed something again"
+            );
+        }
+    }
+
+    /// #3998 — a long run of failed reads during a live session, as in a
+    /// LocalAPI stall (#3822). The banner and the tray's red stay up for as
+    /// long as no read answers: a privacy indicator never comes down on a
+    /// timer. The prompt goes once its questions have gone unanswered for
+    /// `QUESTIONS_KEPT_FOR`: a question the service cannot decide does not
+    /// linger. An answer then decides both.
+    #[test]
+    fn a_long_run_of_failed_reads_keeps_the_banner_and_the_red_and_ends_the_prompt() {
+        let mut watch = SessionWatch::default();
+        let t0 = Instant::now();
+        let first = asking_and_recorded();
+        let mut red = tray::remote_marked(tray_answer(&first), false);
+        assert_eq!(watch.poll(first, t0, true), BOTH_UP);
+        assert!(red, "a controller records");
+
+        let start = t0 + POLL;
+        let mut now = start;
+        while now < start + QUESTIONS_KEPT_FOR {
+            let failed = busy();
+            red = tray::remote_marked(tray_answer(&failed), red);
+            assert_eq!(
+                watch.poll(failed, now, true),
+                NOTHING,
+                "{:?} into the failures",
+                now - start
+            );
+            assert!(red, "the red came down {:?} into the failures", now - start);
+            now += POLL;
+        }
+        let prompt_down = ScreenChange {
+            hide_prompt: true,
+            ..NOTHING
+        };
+        assert_eq!(
+            watch.poll(busy(), start + QUESTIONS_KEPT_FOR, true),
+            prompt_down,
+            "the prompt outlived {QUESTIONS_KEPT_FOR:?} of failed reads"
+        );
+        // Five minutes on, still no answer: the banner and the red stay.
+        let failed = busy();
+        red = tray::remote_marked(tray_answer(&failed), red);
+        assert_eq!(
+            watch.poll(failed, start + Duration::from_secs(300), true),
+            prompt_down
+        );
+        assert!(red);
+
+        // The service answers: the session ended, and both come down.
+        let ended: WatchReply = Ok((Ok(Vec::new()), Ok(Vec::new())));
+        red = tray::remote_marked(tray_answer(&ended), red);
+        assert_eq!(
+            watch.poll(ended, start + Duration::from_secs(301), true),
+            BOTH_DOWN
+        );
+        assert!(!red);
+    }
+
+    /// #3998 — proven no service is an answer, at once, as for the tray: a
+    /// service that is not there asks nothing and holds no session. The
+    /// prompt, the banner and the red come down; a service that lists the
+    /// question again shows it again.
+    #[test]
+    fn proven_no_service_takes_the_prompt_the_banner_and_the_red_down_at_once() {
+        let gone: [StandIn; 2] = [
+            || Err(Error::from(ErrorKind::NotFound)),
+            || Err(Error::from(ErrorKind::ConnectionRefused)),
+        ];
+        for gone in gone {
+            let mut watch = SessionWatch::default();
+            let t0 = Instant::now();
+            assert_eq!(watch.poll(asking_and_recorded(), t0, true), BOTH_UP);
+            let reply = gone();
+            assert!(!tray::remote_marked(tray_answer(&reply), true));
+            assert_eq!(watch.poll(reply, t0 + POLL, true), BOTH_DOWN);
+            assert_eq!(
+                watch.poll(asking_and_viewed(), t0 + POLL * 2, true),
+                BOTH_UP
+            );
+        }
+    }
+
+    /// #3998 — on a Linux system install and on a Mac, a stopped daemon
+    /// reads as `PermissionDenied`: the person's own endpoint is gone, and
+    /// the last one `connect` tries, the system socket, sits in a folder
+    /// only root may enter. The own endpoint decides: gone or refused is no
+    /// service, and the prompt, the banner and the red come down at once
+    /// (the 0.4.224 Linux lab: `systemctl stop roomlerd` with a question
+    /// up). Where the own endpoint is there, the same error is a failed
+    /// read.
+    #[test]
+    fn a_person_whose_own_endpoint_is_gone_has_no_service() {
+        let denied = || {
+            Error::new(
+                ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )
+        };
+        let proven = commands::proven(denied(), true);
+        assert!(tray::no_service(&proven), "{proven:?}");
+        let mut watch = SessionWatch::default();
+        let t0 = Instant::now();
+        assert_eq!(watch.poll(asking_and_recorded(), t0, true), BOTH_UP);
+        let reply: WatchReply = Err(proven);
+        assert!(
+            !tray::remote_marked(tray_answer(&reply), true),
+            "the red outlived the service"
+        );
+        assert_eq!(watch.poll(reply, t0 + POLL, true), BOTH_DOWN);
+
+        let there = commands::proven(denied(), false);
+        assert!(!tray::no_service(&there), "{there:?}");
+        let mut watch = SessionWatch::default();
+        assert_eq!(watch.poll(asking_and_viewed(), t0, true), BOTH_UP);
+        assert_eq!(watch.poll(Err(there), t0 + POLL, true), NOTHING);
+    }
+
+    /// #3998 — each list is its own answer: a question answered elsewhere
+    /// takes the prompt down while the sessions' read fails, and the banner
+    /// stays; a session that ended takes the banner down while the
+    /// questions' read fails, and the prompt stays.
+    #[test]
+    fn each_list_is_its_own_answer() {
+        let t0 = Instant::now();
+        let mut watch = SessionWatch::default();
+        assert_eq!(watch.poll(asking_and_viewed(), t0, true), BOTH_UP);
+        let answered: WatchReply = Ok((Ok(Vec::new()), Err(Error::other("closed"))));
+        assert_eq!(
+            watch.poll(answered, t0 + POLL, true),
+            ScreenChange {
+                hide_prompt: true,
+                ..NOTHING
+            }
+        );
+
+        let mut watch = SessionWatch::default();
+        assert_eq!(watch.poll(asking_and_viewed(), t0, true), BOTH_UP);
+        let ended: WatchReply = Ok((Err(Error::other("closed")), Ok(Vec::new())));
+        assert_eq!(
+            watch.poll(ended, t0 + POLL, true),
+            ScreenChange {
+                banner: Some(false),
+                ..NOTHING
+            }
+        );
+    }
+
+    /// #3998 — a poll whose read never ends is a failed one once
+    /// `WATCH_READ_WITHIN` has passed, so the rules above hold for a stalled
+    /// service too. Until #3998 nothing bounded it, and a read that never
+    /// ended stopped the watch with whatever it showed.
+    #[tokio::test]
+    async fn a_read_that_never_ends_is_a_failed_one() {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_within(Duration::from_millis(50), std::future::pending()),
+        )
+        .await
+        .expect("nothing bounds the read");
+        let e = reply.expect_err("no answer is not an answer");
+        assert_eq!(e.kind(), ErrorKind::TimedOut);
+        assert!(
+            !tray::no_service(&e),
+            "a stalled service is not a missing one"
+        );
+        assert!(WATCH_READ_WITHIN < QUESTIONS_KEPT_FOR);
     }
 }

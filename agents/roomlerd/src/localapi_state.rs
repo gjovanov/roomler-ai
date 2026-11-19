@@ -173,6 +173,23 @@ pub struct DaemonState {
     /// control plane behind them ([`crate::unenrolled`]). The root half holds
     /// the machine's server and its host roles.
     no_enrollment: bool,
+    /// #3864 — where such a worker asks the root half for the consent
+    /// questions the root half asks, and sends their answers: the root
+    /// daemon's person socket, with #4011's kept list ([`crate::consent_relay::Relay`]).
+    root_half: crate::consent_relay::Relay,
+    /// #3967 — this process runs as a person on a Mac: a per-user half,
+    /// beside a root half when the Mac has two rows (or a one-row Mac's
+    /// worker, with [`Self::no_enrollment`]). It lists the root half's
+    /// questions to its person's app too, and, holding an enrollment, tells
+    /// the root half so ([`crate::consent_relay::keep_telling`]). Read from the
+    /// process, never in a test, which says it with
+    /// [`Self::with_macs_per_user_half`].
+    macs_per_user_half: bool,
+    /// #3967 — on a Mac's root half, the announcements its person socket
+    /// takes ([`crate::consent_relay::announcements`]), which its verdict
+    /// reads at every prompt. `None` on every other daemon, which refuses
+    /// one.
+    announcements: Option<Arc<crate::consent_relay::Announcements>>,
     /// FR-27 — live remote-control sessions, written by every signalling
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
@@ -553,12 +570,17 @@ impl DaemonState {
         tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
         rtt_cache: RttCache,
     ) -> Self {
+        let privileged = process_is_privileged();
+        // #3967 — which half of a Mac this process is, from the process
+        // itself, so the daemon's own `run` needs no new switch. Never in a
+        // test: a test on a Mac must not reach that Mac's real root daemon.
+        let on_a_mac = cfg!(target_os = "macos") && !cfg!(test);
         Self {
             node_id,
             name: Mutex::new(name),
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode,
-            privileged: process_is_privileged(),
+            privileged,
             tenant_id,
             connected,
             overlay,
@@ -575,6 +597,9 @@ impl DaemonState {
             self_view: None,
             ephemeral: false,
             no_enrollment: false,
+            root_half: crate::consent_relay::Relay::to_the_root_half(),
+            macs_per_user_half: on_a_mac && !privileged,
+            announcements: (on_a_mac && privileged).then(crate::consent_relay::announcements),
             #[cfg(feature = "recording")]
             recorder: None,
             restart: None,
@@ -649,6 +674,42 @@ impl DaemonState {
     pub fn with_no_enrollment(mut self, no_enrollment: bool) -> Self {
         self.no_enrollment = no_enrollment;
         self
+    }
+
+    /// #3864 — a test's root half in place of the root daemon's person
+    /// socket ([`Self::root_half`], the field).
+    #[cfg(test)]
+    pub(crate) fn with_root_half(mut self, root: Arc<dyn crate::consent_relay::RootHalf>) -> Self {
+        self.root_half = crate::consent_relay::Relay::new(root);
+        self
+    }
+
+    /// #3967 — a test's daemon, as a Mac's per-user half or not
+    /// ([`Self::macs_per_user_half`], the field).
+    #[cfg(test)]
+    pub(crate) fn with_macs_per_user_half(mut self, yes: bool) -> Self {
+        self.macs_per_user_half = yes;
+        self
+    }
+
+    /// #3967 — a test's daemon, as a Mac's root half taking announcements
+    /// into `book` ([`Self::announcements`], the field).
+    #[cfg(test)]
+    pub(crate) fn with_announcements(
+        mut self,
+        book: Arc<crate::consent_relay::Announcements>,
+    ) -> Self {
+        self.announcements = Some(book);
+        self
+    }
+
+    /// #3864, #3967 — whether this daemon lists the root half's consent
+    /// questions beside its own and sends it the answers to them: a one-row
+    /// Mac's worker, or any Mac daemon that runs as a person (a two-row
+    /// Mac's per-user half). A Mac with no root half answers nothing on its
+    /// person socket's path, so its own list stands, at once.
+    fn relays_the_root_half(&self) -> bool {
+        self.no_enrollment || self.macs_per_user_half
     }
 
     /// FR-43 P3a — the answer to a verb only the root half can serve, on a
@@ -1163,7 +1224,7 @@ impl LocalApiState for DaemonState {
             return false;
         };
         match &self.rc_sessions {
-            Some(reg) => reg.disconnect(&oid),
+            Some(reg) => reg.disconnect(&oid, crate::rc_sessions::Via::LocalApi),
             None => false,
         }
     }
@@ -2158,6 +2219,52 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// #3864 — on a one-row Mac's worker, the questions its person's app
+    /// lists are this process's own and the root half's: the root daemon asks
+    /// that Mac's questions on its own broker, and the app reaches this
+    /// worker's socket ([`crate::consent_relay::Relay::listed`], over the root
+    /// half's person socket). #3967 — on a two-row Mac's per-user half too,
+    /// whose root half asks its own row's questions
+    /// ([`Self::relays_the_root_half`]). Everywhere else, this daemon's own.
+    async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+        let own = self.consent_pending();
+        if !self.relays_the_root_half() {
+            return own;
+        }
+        self.root_half.listed(own).await
+    }
+
+    /// #3864 — and an answer to a question its own broker is not asking goes
+    /// to the root half, whose person socket asks the seat again before it
+    /// takes it ([`crate::consent_relay::decided`]). Its own questions, a
+    /// malformed id, and every other daemon decide here as before.
+    async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+        if !self.relays_the_root_half()
+            || !is_hex_object_id(session_id)
+            || self.consent.is_asking(session_id)
+        {
+            return Response::ConsentDecided {
+                ok: self.consent_decide(session_id, allow),
+            };
+        }
+        self.root_half.decided(session_id, allow).await
+    }
+
+    /// #3967 — a two-row Mac's root half takes its console person's
+    /// `consent_relaying` here, for as long as that connection stays open
+    /// ([`crate::consent_relay::Announcements`]). Every other daemon refuses
+    /// it.
+    fn consent_relaying(&self, uid: u32) -> Option<tunnel_core::localapi::HeldForTheConnection> {
+        self.announcements.as_ref().map(|book| book.announce(uid))
+    }
+
+    /// #3967 — a Mac's per-user half that holds an enrollment, which is a
+    /// two-row Mac's, tells its root half it relays (`person_socket::run`). A
+    /// one-row Mac's worker does not: its channel says so (`relay-consent`).
+    fn announces_consent_relay(&self) -> bool {
+        self.macs_per_user_half && !self.no_enrollment
+    }
+
     /// #2871 (review) — is `uid` the person at this device's seat right now
     /// ([`crate::person_socket::at_the_seat_now`])? The person socket asks
     /// before it applies a config change. Only Linux and macOS serve one.
@@ -2725,6 +2832,953 @@ mod tests {
                 "{session}: a decided question is still listed"
             );
         }
+    }
+
+    /// #3864 — a one-row Mac, stood in. The root half: the root daemon's
+    /// state behind its person socket, served for `person` as that socket
+    /// serves (`Scope::Person`), with `person` at the seat (a Mac's look at
+    /// `/dev/console`). Everything but the seat is the root daemon's own.
+    struct SeatedRoot {
+        root: DaemonState,
+        person: u32,
+    }
+
+    #[async_trait]
+    impl LocalApiState for SeatedRoot {
+        fn status(&self) -> NodeStatus {
+            self.root.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            self.root.peers()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            self.root.flows()
+        }
+        fn consent_pending(&self) -> Vec<ConsentRequest> {
+            self.root.consent_pending()
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            self.root.consent_decide(session_id, allow)
+        }
+        async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+            self.root.consent_pending_view().await
+        }
+        async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+            self.root.consent_decide_view(session_id, allow).await
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> tunnel_core::localapi::AtTheSeat {
+            if uid == self.person {
+                tunnel_core::localapi::AtTheSeat::Yes
+            } else {
+                tunnel_core::localapi::AtTheSeat::No
+            }
+        }
+    }
+
+    /// One request over a connection `state` serves for `peer` under `scope`,
+    /// as the LocalAPI listeners serve it, and its answer.
+    async fn round_trip(
+        state: Arc<dyn LocalApiState>,
+        peer: tunnel_core::localapi::ClientPeer,
+        scope: tunnel_core::localapi::Scope,
+        req: &tunnel_core::localapi::Request,
+    ) -> Option<Response> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(async move {
+            tunnel_core::localapi::serve_connection_scoped(server, &*state, peer, scope).await
+        });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut line = serde_json::to_string(req).ok()?;
+        line.push('\n');
+        wr.write_all(line.as_bytes()).await.ok()?;
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        let answer = lines.next_line().await.ok()??;
+        drop(wr);
+        drop(lines);
+        let _ = served.await;
+        serde_json::from_str(&answer).ok()
+    }
+
+    /// The worker's road to the root half, stood in: the root daemon's
+    /// person socket for `person`, asked as the worker asks it, as `person`.
+    struct ServedRootHalf {
+        root: Arc<SeatedRoot>,
+    }
+
+    #[async_trait]
+    impl crate::consent_relay::RootHalf for ServedRootHalf {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
+            let person = self.root.person;
+            let peer = tunnel_core::localapi::ClientPeer {
+                uid: Some(person),
+                gid: Some(20),
+                ..tunnel_core::localapi::ClientPeer::UNKNOWN
+            };
+            let scope = tunnel_core::localapi::Scope::Person { owner_uid: person };
+            match round_trip(self.root.clone(), peer, scope, req).await {
+                Some(answer) => crate::consent_relay::RootReply::Answer(Box::new(answer)),
+                None => crate::consent_relay::RootReply::NoAnswer(
+                    "the connection ended with no answer".into(),
+                ),
+            }
+        }
+    }
+
+    /// The person's app, as the worker's own endpoint admits it: on Unix its
+    /// own account (the socket is 0600 and theirs); on Windows, where a peer
+    /// has no uid, an elevated caller, which every OS admits there.
+    fn the_app() -> tunnel_core::localapi::ClientPeer {
+        #[cfg(unix)]
+        {
+            tunnel_core::localapi::ClientPeer {
+                // SAFETY: geteuid never fails.
+                uid: Some(unsafe { libc::geteuid() }),
+                ..tunnel_core::localapi::ClientPeer::UNKNOWN
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tunnel_core::localapi::ClientPeer {
+                elevated: Some(true),
+                ..tunnel_core::localapi::ClientPeer::UNKNOWN
+            }
+        }
+    }
+
+    /// What the app hears from the worker's own endpoint for `req`.
+    async fn the_app_asks(
+        worker: &Arc<DaemonState>,
+        req: tunnel_core::localapi::Request,
+    ) -> Response {
+        round_trip(
+            worker.clone(),
+            the_app(),
+            tunnel_core::localapi::Scope::Full,
+            &req,
+        )
+        .await
+        .expect("the worker answers")
+    }
+
+    /// The questions the app lists, by id.
+    async fn listed_to_the_app(worker: &Arc<DaemonState>) -> Vec<String> {
+        match the_app_asks(worker, tunnel_core::localapi::Request::ConsentPending).await {
+            Response::ConsentPending(list) => list.into_iter().map(|q| q.session_id).collect(),
+            other => panic!("a list, not {other:?}"),
+        }
+    }
+
+    /// A daemon's state over `broker`, as each half of a one-row Mac builds
+    /// it.
+    fn half(broker: crate::consent::ConsentBroker) -> DaemonState {
+        let (_tx, rx) = watch::channel(view());
+        DaemonState::new(
+            String::new(),
+            "mac".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            broker,
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+    }
+
+    /// A question the companion is to show, on `broker`.
+    fn ask_on(
+        broker: &crate::consent::ConsentBroker,
+        id: &str,
+        window: Duration,
+    ) -> impl std::future::Future<Output = crate::consent::Decision> + Send + use<> {
+        let asking = broker.request_with_mode(id, crate::consent::Mode::Prompt { timeout: window });
+        let question = crate::consent::PendingPrompt {
+            kind: crate::consent::PromptKind::RemoteControl,
+            asked_by: "viewer 2",
+            permissions: "VIEW|INPUT".into(),
+            detail: String::new(),
+            org: String::new(),
+            timeout: window,
+            surface: crate::consent::PromptSurface::Companion,
+        };
+        broker
+            .write_prompt(id, &question)
+            .expect("the question is marked");
+        asking
+    }
+
+    /// A one-row Mac's two halves, each with a broker over a folder of its
+    /// own, as the root daemon's is in root's home and the worker's in the
+    /// person's: the root half behind its person socket for `person`, and the
+    /// worker, with no enrollment unless `enrolled`, asking that socket.
+    fn one_row_mac(
+        dirs: &tempfile::TempDir,
+        window: Duration,
+        enrolled: bool,
+    ) -> (
+        crate::consent::ConsentBroker,
+        crate::consent::ConsentBroker,
+        Arc<DaemonState>,
+    ) {
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let root_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("root")).unwrap();
+        let worker_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let root = Arc::new(SeatedRoot {
+            root: half(root_broker.clone()),
+            person: 501,
+        });
+        let worker = half(worker_broker.clone())
+            .with_no_enrollment(!enrolled)
+            .with_root_half(Arc::new(ServedRootHalf { root }));
+        (root_broker, worker_broker, Arc::new(worker))
+    }
+
+    /// #3864 — on a one-row Mac the app reaches the worker's socket, and a
+    /// question the ROOT half asks (the one its native panel could not show)
+    /// is listed there and answered from there: an approval and a denial each
+    /// reach the root half's broker, which decides, and the question is then
+    /// listed no more. Nothing is written anywhere but each half's own
+    /// folder.
+    ///
+    /// Red before #3864: the worker listed only its own broker's questions, so
+    /// the app had nothing to show, and its answer reached a broker that was
+    /// not asking.
+    #[tokio::test]
+    async fn a_one_row_workers_app_lists_and_decides_the_root_halfs_questions() {
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, _worker_broker, worker) = one_row_mac(&dirs, window, false);
+        for (id, allow, decided) in [
+            (
+                "386400000000000000000a01",
+                true,
+                crate::consent::Decision::Granted,
+            ),
+            (
+                "386400000000000000000a02",
+                false,
+                crate::consent::Decision::Denied,
+            ),
+        ] {
+            let asking = ask_on(&root_broker, id, window);
+            assert!(
+                listed_to_the_app(&worker).await.iter().any(|q| q == id),
+                "{id}: the root half's question is not listed to the app"
+            );
+            let answer = the_app_asks(
+                &worker,
+                tunnel_core::localapi::Request::ConsentDecide {
+                    session_id: id.into(),
+                    allow,
+                },
+            )
+            .await;
+            assert_eq!(answer, Response::ConsentDecided { ok: true }, "{id}");
+            let decision = tokio::time::timeout(Duration::from_secs(3), asking)
+                .await
+                .expect("an answered question ends promptly");
+            assert_eq!(decision, decided, "{id}");
+            assert!(
+                !listed_to_the_app(&worker).await.iter().any(|q| q == id),
+                "{id}: a decided question is still listed"
+            );
+        }
+    }
+
+    /// #3967 — a question `broker` asks of the companion, of `kind`: the root
+    /// half's exec or SSH question, or the per-user half's own.
+    fn ask_kind_on(
+        broker: &crate::consent::ConsentBroker,
+        id: &str,
+        window: Duration,
+        kind: crate::consent::PromptKind,
+    ) -> impl std::future::Future<Output = crate::consent::Decision> + Send + use<> {
+        let asking = broker.request_with_mode(id, crate::consent::Mode::Prompt { timeout: window });
+        let question = crate::consent::PendingPrompt {
+            kind,
+            asked_by: "viewer 2",
+            permissions: String::new(),
+            detail: "uptime".into(),
+            org: String::new(),
+            timeout: window,
+            surface: crate::consent::PromptSurface::Companion,
+        };
+        broker
+            .write_prompt(id, &question)
+            .expect("the question is marked");
+        asking
+    }
+
+    /// #3967 — the root half's person sockets as a Mac serves them: one, for
+    /// the person at the console (`root.person`). Asked as `uid`, the way that
+    /// account's per-user half asks it (`machine_answer`): for any other
+    /// account there is no socket at its path, and the listener drops a
+    /// connection from anyone but its person (`localapi::person_peer_ok`).
+    struct PersonSocketFor {
+        root: Arc<SeatedRoot>,
+        uid: u32,
+    }
+
+    #[async_trait]
+    impl crate::consent_relay::RootHalf for PersonSocketFor {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
+            if self.uid != self.root.person {
+                return crate::consent_relay::RootReply::Gone;
+            }
+            let served = ServedRootHalf {
+                root: self.root.clone(),
+            };
+            crate::consent_relay::RootHalf::ask(&served, req).await
+        }
+    }
+
+    /// #3967 — a two-row Mac's halves, each with a broker over a folder of
+    /// its own: the root half behind its person socket for the person at the
+    /// console (uid 501), asking its own row's questions, and that person's
+    /// per-user half, which holds an enrollment, asks its own row's, and
+    /// lists the root half's over that socket.
+    fn two_row_mac(
+        dirs: &tempfile::TempDir,
+        window: Duration,
+    ) -> (
+        crate::consent::ConsentBroker,
+        crate::consent::ConsentBroker,
+        Arc<SeatedRoot>,
+        Arc<DaemonState>,
+    ) {
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let root_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("root")).unwrap();
+        let own_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let root = Arc::new(SeatedRoot {
+            root: half(root_broker.clone()),
+            person: 501,
+        });
+        let per_user = half(own_broker.clone())
+            .with_macs_per_user_half(true)
+            .with_root_half(Arc::new(PersonSocketFor {
+                root: root.clone(),
+                uid: 501,
+            }));
+        (root_broker, own_broker, root, Arc::new(per_user))
+    }
+
+    /// #3967 — on a two-row Mac the app reaches the per-user half's socket,
+    /// and a question the ROOT half asks for its own row (an exec or SSH
+    /// question, which its native panel could not show while it showed
+    /// another) is listed there and answered from there: an approval and a
+    /// denial each reach the root half's broker, which decides, and the
+    /// question is then listed no more.
+    ///
+    /// Red before #3967: the per-user half listed only its own broker's
+    /// questions, so the app had nothing to show, and its answer reached a
+    /// broker that was not asking.
+    #[tokio::test]
+    async fn a_two_row_per_user_halfs_app_lists_and_decides_the_root_halfs_questions() {
+        use crate::consent::{Decision, PromptKind};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, _own_broker, _root, per_user) = two_row_mac(&dirs, window);
+        for (id, kind, allow, decided) in [
+            (
+                "396700000000000000000a01",
+                PromptKind::Exec,
+                true,
+                Decision::Granted,
+            ),
+            (
+                "396700000000000000000a02",
+                PromptKind::Ssh,
+                false,
+                Decision::Denied,
+            ),
+        ] {
+            let asking = ask_kind_on(&root_broker, id, window, kind);
+            assert!(
+                listed_to_the_app(&per_user).await.iter().any(|q| q == id),
+                "{id}: the root half's question is not listed to the app"
+            );
+            let answer = the_app_asks(
+                &per_user,
+                tunnel_core::localapi::Request::ConsentDecide {
+                    session_id: id.into(),
+                    allow,
+                },
+            )
+            .await;
+            assert_eq!(answer, Response::ConsentDecided { ok: true }, "{id}");
+            let decision = tokio::time::timeout(Duration::from_secs(3), asking)
+                .await
+                .expect("an answered question ends promptly");
+            assert_eq!(decision, decided, "{id}");
+            assert!(
+                !listed_to_the_app(&per_user).await.iter().any(|q| q == id),
+                "{id}: a decided question is still listed"
+            );
+        }
+    }
+
+    /// #3967, the control — the per-user half's OWN questions (its own row's
+    /// screen) are listed and decided by its own broker, as before #3967,
+    /// while the root half asks one of its own beside them: the answer to the
+    /// per-user half's question reaches the per-user half's broker, and the
+    /// root half's question still asks.
+    #[tokio::test]
+    async fn a_two_row_per_user_halfs_own_questions_stay_its_own_brokers() {
+        use crate::consent::{Decision, PromptKind};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, own_broker, _root, per_user) = two_row_mac(&dirs, window);
+        let own = "396700000000000000000b01";
+        let theirs = "396700000000000000000b02";
+        let own_asking = ask_on(&own_broker, own, window);
+        let _root_asking = ask_kind_on(&root_broker, theirs, window, PromptKind::Exec);
+        assert!(
+            listed_to_the_app(&per_user).await.iter().any(|q| q == own),
+            "the per-user half's own question is listed"
+        );
+        let answer = the_app_asks(
+            &per_user,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: own.into(),
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: true });
+        let decided = tokio::time::timeout(Duration::from_secs(3), own_asking)
+            .await
+            .expect("the per-user half's own question ends");
+        assert_eq!(decided, Decision::Granted);
+        assert!(
+            root_broker.is_asking(theirs),
+            "the root half's question still asks"
+        );
+        assert!(
+            !root_broker.is_asking(own),
+            "the root half's broker never held it"
+        );
+    }
+
+    /// #3967, the owner's note 2 — both halves ask at once: the per-user
+    /// half a remote-control question for its own row (under the server's
+    /// session id), the root half an SSH question for its row (under an id it
+    /// minted). The app lists both, once each; an answer to the per-user
+    /// half's reaches the per-user half's broker and leaves the root half's
+    /// asking; an answer to the root half's reaches the root half's broker.
+    /// An id neither asks is refused, by the root half, and decides nothing.
+    ///
+    /// Red before #3967: the root half's question was never listed.
+    #[tokio::test]
+    async fn a_two_row_macs_halves_each_take_the_answers_to_their_own() {
+        use crate::consent::{Decision, PromptKind};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, own_broker, _root, per_user) = two_row_mac(&dirs, window);
+        let own = bson::oid::ObjectId::new().to_hex();
+        let theirs = bson::oid::ObjectId::new().to_hex();
+        let own_asking = ask_on(&own_broker, &own, window);
+        let root_asking = ask_kind_on(&root_broker, &theirs, window, PromptKind::Ssh);
+        let mut listed = listed_to_the_app(&per_user).await;
+        listed.sort();
+        let mut both = vec![own.clone(), theirs.clone()];
+        both.sort();
+        assert_eq!(listed, both, "both, once each");
+
+        let answer = the_app_asks(
+            &per_user,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: own.clone(),
+                allow: false,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: true });
+        let decided = tokio::time::timeout(Duration::from_secs(3), own_asking)
+            .await
+            .expect("the per-user half's own question ends");
+        assert_eq!(decided, Decision::Denied);
+        assert!(
+            root_broker.is_asking(&theirs),
+            "the root half's question still asks"
+        );
+        assert!(
+            !root_broker.is_asking(&own) && !own_broker.is_asking(&theirs),
+            "neither broker ever held the other's question"
+        );
+
+        let answer = the_app_asks(
+            &per_user,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: theirs.clone(),
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: true });
+        let decided = tokio::time::timeout(Duration::from_secs(3), root_asking)
+            .await
+            .expect("the root half's question ends");
+        assert_eq!(decided, Decision::Granted);
+
+        let nobodys = bson::oid::ObjectId::new().to_hex();
+        let answer = the_app_asks(
+            &per_user,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: nobodys,
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: false });
+        assert!(listed_to_the_app(&per_user).await.is_empty());
+    }
+
+    /// #3967 — the root half's questions reach the console person's per-user
+    /// half alone. Another account's per-user half (signed in, but not at the
+    /// screen) asks the root half's person socket for its own uid, which the
+    /// root half does not serve: its app lists only that half's own
+    /// questions, and an answer from it to the root half's question is
+    /// refused and decides nothing. The console person's app, beside it,
+    /// lists the root half's question.
+    #[tokio::test]
+    async fn another_accounts_per_user_half_gets_no_root_questions() {
+        use crate::consent::PromptKind;
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, _own_broker, root, console_half) = two_row_mac(&dirs, window);
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let bobs_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("bob")).unwrap();
+        let bobs_half = Arc::new(
+            half(bobs_broker.clone())
+                .with_macs_per_user_half(true)
+                .with_root_half(Arc::new(PersonSocketFor { root, uid: 502 })),
+        );
+        let theirs = "396700000000000000000c01";
+        let bobs_own = "396700000000000000000c02";
+        let _root_asking = ask_kind_on(&root_broker, theirs, window, PromptKind::Exec);
+        let _bobs_asking = ask_on(&bobs_broker, bobs_own, window);
+
+        assert_eq!(
+            listed_to_the_app(&bobs_half).await,
+            [bobs_own],
+            "another account's app lists only its own half's questions"
+        );
+        let answer = the_app_asks(
+            &bobs_half,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: theirs.into(),
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            answer,
+            Response::Error {
+                message: crate::consent_relay::NO_ANSWER_FROM_THE_ROOT.into()
+            }
+        );
+        assert!(
+            root_broker.is_asking(theirs),
+            "the root half's question still asks"
+        );
+        assert!(
+            listed_to_the_app(&console_half)
+                .await
+                .iter()
+                .any(|q| q == theirs),
+            "the console person's app lists it"
+        );
+    }
+
+    /// #3864, the owner's question 4 — each half keeps its own questions. The
+    /// worker's broker asks one too (a recording's question, under an id it
+    /// mints), and the root half asks another: the app lists both, once
+    /// each; an answer to the worker's own reaches the worker's broker and
+    /// leaves the root half's question asking; an answer to the root half's
+    /// reaches the root half's broker. An id neither asks is refused, by the
+    /// root half, and decides nothing.
+    ///
+    /// Red before #3864: the root half's question was never listed.
+    #[tokio::test]
+    async fn the_worker_and_the_root_half_each_take_the_answers_to_their_own() {
+        use crate::consent::Decision;
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, worker_broker, worker) = one_row_mac(&dirs, window, false);
+        // Ids as each daemon makes them: an ObjectId the worker minted for its
+        // own question, and the server's session id for the root half's.
+        let own = bson::oid::ObjectId::new().to_hex();
+        let theirs = bson::oid::ObjectId::new().to_hex();
+        let own_asking = ask_on(&worker_broker, &own, window);
+        let root_asking = ask_on(&root_broker, &theirs, window);
+        let mut listed = listed_to_the_app(&worker).await;
+        listed.sort();
+        let mut both = vec![own.clone(), theirs.clone()];
+        both.sort();
+        assert_eq!(listed, both, "both, once each");
+
+        let answer = the_app_asks(
+            &worker,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: own.clone(),
+                allow: false,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: true });
+        let decided = tokio::time::timeout(Duration::from_secs(3), own_asking)
+            .await
+            .expect("the worker's own question ends");
+        assert_eq!(decided, Decision::Denied);
+        assert!(
+            root_broker.is_asking(&theirs),
+            "the root half's question still asks"
+        );
+        assert!(
+            !root_broker.is_asking(&own) && !worker_broker.is_asking(&theirs),
+            "neither broker ever held the other's question"
+        );
+
+        let answer = the_app_asks(
+            &worker,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: theirs.clone(),
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: true });
+        let decided = tokio::time::timeout(Duration::from_secs(3), root_asking)
+            .await
+            .expect("the root half's question ends");
+        assert_eq!(decided, Decision::Granted);
+
+        let nobodys = bson::oid::ObjectId::new().to_hex();
+        let answer = the_app_asks(
+            &worker,
+            tunnel_core::localapi::Request::ConsentDecide {
+                session_id: nobodys,
+                allow: true,
+            },
+        )
+        .await;
+        assert_eq!(answer, Response::ConsentDecided { ok: false });
+        assert!(listed_to_the_app(&worker).await.is_empty());
+    }
+
+    /// The root half gone or stalled, stood in: it never answers, or has
+    /// nothing at all to say.
+    struct StalledRootHalf {
+        gone: bool,
+    }
+
+    #[async_trait]
+    impl crate::consent_relay::RootHalf for StalledRootHalf {
+        async fn ask(
+            &self,
+            _req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
+            if self.gone {
+                return crate::consent_relay::RootReply::Gone;
+            }
+            std::future::pending().await
+        }
+    }
+
+    /// #3864, the owner's question 5 — the relay is bounded. With the root
+    /// half's socket gone, or the root half stalled, the app still hears the
+    /// worker's own list, within [`crate::consent_relay::RELAY_WITHIN`].
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_or_stalled_root_half_leaves_the_workers_own_list_in_time() {
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let broker = crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let own = "386400000000000000000c01";
+        let _asking = ask_on(&broker, own, window);
+        for gone in [true, false] {
+            let worker = Arc::new(
+                half(broker.clone())
+                    .with_no_enrollment(true)
+                    .with_root_half(Arc::new(StalledRootHalf { gone })),
+            );
+            let asked = tokio::time::Instant::now();
+            assert_eq!(listed_to_the_app(&worker).await, [own], "gone: {gone}");
+            let waited = asked.elapsed();
+            assert!(
+                waited <= crate::consent_relay::RELAY_WITHIN + Duration::from_millis(50),
+                "gone: {gone}: the app waited {waited:?}"
+            );
+        }
+    }
+
+    /// #3967, the owner's question 5 — the relay is bounded on a two-row Mac
+    /// too. With the root half's socket gone, or the root half stalled, the
+    /// app still hears the per-user half's own list within
+    /// [`crate::consent_relay::RELAY_WITHIN`], and an answer to a question
+    /// that is not the per-user half's is refused within
+    /// [`crate::consent_relay::DECIDE_WITHIN`], in words that say to try
+    /// again.
+    ///
+    /// Red before #3967: the per-user half sent no answer to the root half,
+    /// and its own broker refused it at once as one it was not asking.
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_or_stalled_root_half_leaves_the_per_user_halfs_own_list_and_answer_in_time() {
+        use crate::consent_relay::{DECIDE_WITHIN, NO_ANSWER_FROM_THE_ROOT, RELAY_WITHIN};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let broker = crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let own = "396700000000000000000d01";
+        let theirs = "396700000000000000000d02";
+        let _asking = ask_on(&broker, own, window);
+        for gone in [true, false] {
+            let per_user = Arc::new(
+                half(broker.clone())
+                    .with_macs_per_user_half(true)
+                    .with_root_half(Arc::new(StalledRootHalf { gone })),
+            );
+            let asked = tokio::time::Instant::now();
+            assert_eq!(listed_to_the_app(&per_user).await, [own], "gone: {gone}");
+            let waited = asked.elapsed();
+            assert!(
+                waited <= RELAY_WITHIN + Duration::from_millis(50),
+                "gone: {gone}: the list waited {waited:?}"
+            );
+            let asked = tokio::time::Instant::now();
+            let answer = the_app_asks(
+                &per_user,
+                tunnel_core::localapi::Request::ConsentDecide {
+                    session_id: theirs.into(),
+                    allow: true,
+                },
+            )
+            .await;
+            assert_eq!(
+                answer,
+                Response::Error {
+                    message: NO_ANSWER_FROM_THE_ROOT.into()
+                },
+                "gone: {gone}"
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited <= DECIDE_WITHIN + Duration::from_millis(50),
+                "gone: {gone}: the answer waited {waited:?}"
+            );
+        }
+    }
+
+    /// #4011 — the root half's road, stood in so that it can miss a list or
+    /// be gone: while `misses`, a list asked of it never answers (a root half
+    /// slow for that poll); while `gone`, no socket is at its path. Otherwise
+    /// it is the root half's person socket, as [`ServedRootHalf`] asks it.
+    struct Unsteady {
+        root: Arc<SeatedRoot>,
+        misses: AtomicBool,
+        gone: AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::consent_relay::RootHalf for Unsteady {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.gone.load(SeqCst) {
+                return crate::consent_relay::RootReply::Gone;
+            }
+            if self.misses.load(SeqCst)
+                && matches!(req, tunnel_core::localapi::Request::ConsentPending)
+            {
+                return std::future::pending().await;
+            }
+            let served = ServedRootHalf {
+                root: self.root.clone(),
+            };
+            crate::consent_relay::RootHalf::ask(&served, req).await
+        }
+    }
+
+    /// #4011 — on a one-row Mac's worker and on a two-row Mac's per-user
+    /// half, a root half that misses one list between two answers leaves its
+    /// question on the list the app reads, after the process's own, at every
+    /// step. So the companion's prompt for it neither comes down for that
+    /// poll nor comes back placed anew, with its click hold armed again. The
+    /// miss costs the relay's own bound, no more. A root half that is gone
+    /// takes its question off at once.
+    ///
+    /// Red before #4011: the missed list held the process's own question
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_misses_one_list_leaves_its_question_on_the_apps_list() {
+        use crate::consent_relay::RELAY_WITHIN;
+        use std::sync::atomic::Ordering::SeqCst;
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let root_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("root")).unwrap();
+        let own_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let root = Arc::new(SeatedRoot {
+            root: half(root_broker.clone()),
+            person: 501,
+        });
+        let own = "401100000000000000000a01";
+        let theirs = "401100000000000000000a02";
+        let _own_asking = ask_on(&own_broker, own, window);
+        let _root_asking = ask_kind_on(
+            &root_broker,
+            theirs,
+            window,
+            crate::consent::PromptKind::Exec,
+        );
+        for one_row in [true, false] {
+            let road = Arc::new(Unsteady {
+                root: root.clone(),
+                misses: AtomicBool::new(false),
+                gone: AtomicBool::new(false),
+            });
+            let process = if one_row {
+                half(own_broker.clone()).with_no_enrollment(true)
+            } else {
+                half(own_broker.clone()).with_macs_per_user_half(true)
+            };
+            let process = Arc::new(process.with_root_half(road.clone()));
+            let shape = if one_row { "one row" } else { "two rows" };
+
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: an answer"
+            );
+            road.misses.store(true, SeqCst);
+            let asked = tokio::time::Instant::now();
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: a missed list"
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited <= RELAY_WITHIN + Duration::from_millis(50),
+                "{shape}: the missed list waited {waited:?}"
+            );
+            road.misses.store(false, SeqCst);
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: an answer again"
+            );
+
+            road.gone.store(true, SeqCst);
+            let asked = tokio::time::Instant::now();
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own],
+                "{shape}: the root half is gone"
+            );
+            assert_eq!(asked.elapsed(), Duration::ZERO, "{shape}: at once");
+        }
+    }
+
+    /// #3967 — which daemon tells a root half that it lists the root half's
+    /// questions: a Mac's per-user half that holds an enrollment, which is a
+    /// two-row Mac's (the LaunchAgent's, or the supervised worker's). Not a
+    /// one-row Mac's worker, whose channel says it (`relay-consent`), and not
+    /// a root half, nor any daemon on Linux or Windows.
+    ///
+    /// Red before #3967: no daemon said so.
+    #[test]
+    fn only_a_two_row_macs_per_user_half_tells_its_root_half() {
+        let broker = consent_broker("tells");
+        assert!(
+            half(broker.clone())
+                .with_macs_per_user_half(true)
+                .announces_consent_relay(),
+            "a two-row Mac's per-user half"
+        );
+        assert!(
+            !half(broker.clone())
+                .with_macs_per_user_half(true)
+                .with_no_enrollment(true)
+                .announces_consent_relay(),
+            "a one-row Mac's worker"
+        );
+        assert!(
+            !half(broker).announces_consent_relay(),
+            "a root half, a Linux or a Windows daemon"
+        );
+    }
+
+    /// #3967 — a two-row Mac's root half takes its console person's
+    /// announcement over the person socket, for as long as that connection
+    /// stays open, and reads it at every prompt: from that person only, not
+    /// from root. A daemon that is no Mac's root half refuses it.
+    ///
+    /// Red before #3967: the person socket refused it.
+    #[tokio::test]
+    async fn a_two_row_root_half_takes_its_persons_announcement_while_the_connection_is_open() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let book = Arc::new(crate::consent_relay::Announcements::default());
+        let root: Arc<dyn LocalApiState> =
+            Arc::new(half(consent_broker("takes")).with_announcements(book.clone()));
+        let person = tunnel_core::localapi::ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..tunnel_core::localapi::ClientPeer::UNKNOWN
+        };
+        let scope = tunnel_core::localapi::Scope::Person { owner_uid: 501 };
+        let say = tunnel_core::localapi::Request::ConsentRelaying;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn({
+            let root = root.clone();
+            let person = person.clone();
+            async move {
+                tunnel_core::localapi::serve_connection_scoped(server, &*root, person, scope).await
+            }
+        });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        let mut line = serde_json::to_string(&say).unwrap();
+        line.push('\n');
+        wr.write_all(line.as_bytes()).await.unwrap();
+        let answer: Response =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(answer, Response::ConsentRelayingTaken);
+        assert_eq!(book.current(), Some(501), "taken while it is open");
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!(book.current(), None, "gone with its connection");
+
+        let root_peer = tunnel_core::localapi::ClientPeer {
+            uid: Some(0),
+            ..person.clone()
+        };
+        let answer = round_trip(root.clone(), root_peer, scope, &say).await;
+        assert!(matches!(answer, Some(Response::Error { .. })), "{answer:?}");
+        assert_eq!(book.current(), None, "root is no per-user half");
+
+        let elsewhere: Arc<dyn LocalApiState> = Arc::new(half(consent_broker("refuses")));
+        let answer = round_trip(elsewhere, person, scope, &say).await;
+        assert!(matches!(answer, Some(Response::Error { .. })), "{answer:?}");
     }
 
     #[tokio::test]

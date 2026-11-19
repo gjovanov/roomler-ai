@@ -1450,6 +1450,14 @@ pub enum Request {
     /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
     /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
+    /// #3967 — a two-row Mac's per-user half tells its root half, over the
+    /// root half's person socket, that it lists the root half's consent
+    /// questions to its person's app and sends their answers back. Taken only
+    /// there, and only from that socket's own person, never root
+    /// ([`LocalApiState::consent_relaying`]). The root half keeps it for as
+    /// long as the connection stays open ([`HeldForTheConnection`]), and
+    /// counts that person's app as its questions' surface only meanwhile.
+    ConsentRelaying,
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
@@ -1897,6 +1905,11 @@ pub enum Response {
     ConsentDecided {
         ok: bool,
     },
+    /// #3967 — a [`Request::ConsentRelaying`] was taken, for as long as the
+    /// connection that said it stays open. A daemon that does not take it
+    /// answers [`Response::Error`]; one older than the verb answers "unknown
+    /// variant" ([`is_unknown_verb`]) and keeps the connection open.
+    ConsentRelayingTaken,
     /// FR-27 — live remote-control sessions.
     RcSessions(Vec<RcSessionInfo>),
     /// FR-27 — result of [`Request::RcDisconnect`]; `ok` = a session with that
@@ -2934,6 +2947,59 @@ pub struct OverlayView {
     pub derp_inbound_drops: Option<(u64, u64)>,
 }
 
+/// #3967 — how a connection that holds something ([`HeldForTheConnection`])
+/// ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    /// Its far end closed it, or reading or writing it failed: the process
+    /// that dialled is gone, or let it go.
+    ClosedByThePeer,
+    /// The daemon stopped serving it: the person socket's listener stopped
+    /// (the person at the seat changed, or the daemon is stopping).
+    Dropped,
+}
+
+/// #3967 — what a daemon keeps for one connection, for as long as that
+/// connection is open ([`LocalApiState::consent_relaying`]). The connection's
+/// loop holds it, and `on_end` runs once when the connection ends, saying how
+/// ([`ConnectionEnd`]).
+pub struct HeldForTheConnection {
+    on_end: Option<Box<dyn FnOnce(ConnectionEnd) + Send>>,
+}
+
+impl HeldForTheConnection {
+    /// Held until the connection ends; `on_end` is told how.
+    pub fn new(on_end: impl FnOnce(ConnectionEnd) + Send + 'static) -> Self {
+        Self {
+            on_end: Some(Box::new(on_end)),
+        }
+    }
+
+    /// The connection ended `how`.
+    fn end(mut self, how: ConnectionEnd) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(how);
+        }
+    }
+}
+
+impl Drop for HeldForTheConnection {
+    /// Dropped without [`Self::end`]: the loop that held it was cut short.
+    fn drop(&mut self) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(ConnectionEnd::Dropped);
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldForTheConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldForTheConnection")
+            .field("held", &self.on_end.is_some())
+            .finish()
+    }
+}
+
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
 /// gathers this from its live overlay / tunnel / forward state; the trait keeps
 /// the protocol unit-testable with a mock and free of daemon internals.
@@ -2975,6 +3041,38 @@ pub trait LocalApiState: Send + Sync {
     /// Apply an operator consent decision to `session_id` (P2b). Returns whether
     /// it was recorded. Default: no-op `false`.
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+        false
+    }
+    /// #3864 — what a `ConsentPending` request answers. Default:
+    /// [`Self::consent_pending`]. A one-row Mac's worker overrides it: the
+    /// root half asks that Mac's questions, on a broker of its own, so the
+    /// worker lists those too, asked over the root half's person socket.
+    async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+        self.consent_pending()
+    }
+    /// #3864 — what a `ConsentDecide` request answers once the endpoint's
+    /// gates have passed. Default: [`Self::consent_decide`]'s verdict. A
+    /// one-row Mac's worker overrides it to send an answer to a question its
+    /// own broker is not asking to the root half, and passes on the root
+    /// half's refusal in its own words.
+    async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+        Response::ConsentDecided {
+            ok: self.consent_decide(session_id, allow),
+        }
+    }
+    /// #3967 — a [`Request::ConsentRelaying`] from `uid`, the person socket's
+    /// own person (the dispatcher admits nobody else, root included): that
+    /// person's per-user half lists this daemon's consent questions to their
+    /// app. `Some` takes it, kept until the connection ends; `None` refuses
+    /// it. Default: refused. A two-row Mac's root half takes it.
+    fn consent_relaying(&self, _uid: u32) -> Option<HeldForTheConnection> {
+        None
+    }
+    /// #3967 — whether this daemon is a two-row Mac's per-user half, which
+    /// lists its root half's questions to its person's app and so tells the
+    /// root half ([`Request::ConsentRelaying`]) for as long as it runs.
+    /// Default: no.
+    fn announces_consent_relay(&self) -> bool {
         false
     }
     /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
@@ -3608,7 +3706,15 @@ pub fn person_may(req: &Request) -> bool {
         // it), and it changes nothing on the host. The denylist and the
         // preference it reports are on the configuration listing above
         // already, and Windows serves the verb to every interactive user.
-        | Request::EncoderCaps => true,
+        | Request::EncoderCaps
+        // #3967 — a two-row Mac's per-user half says it lists the root
+        // half's consent questions to its person's app. It reads nothing and
+        // grants nothing: it decides only whether the root half counts that
+        // person's app as its questions' surface, which nobody but that
+        // person can reach anyway. The dispatcher takes it only from the
+        // socket's own person, never root, and only for as long as the
+        // connection stays open.
+        | Request::ConsentRelaying => true,
         // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
         // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
         // files land, whether a controller may record their screen, what a
@@ -3863,6 +3969,7 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
         | Request::Mesh { .. }
+        | Request::ConsentRelaying
         | Request::RestartDaemon { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
@@ -3914,6 +4021,11 @@ where
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
+    // #3967 — what this connection holds for as long as it stays open: a
+    // per-user half's `ConsentRelaying`. Ended below when the loop ends
+    // (the peer closed it, or it failed); dropped with this future when the
+    // listener stops serving it.
+    let mut held: Option<HeldForTheConnection> = None;
     let served: std::io::Result<()> = async {
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -3937,6 +4049,34 @@ where
                 // another process (a two-half Mac's root half).
                 Ok(Request::Status) => Response::Status(Box::new(state.status_view().await)),
                 Ok(Request::Peers) => Response::Peers(state.peers_view().await),
+                // #3864 — and the consent questions, which a one-row Mac's
+                // worker lists from the root half too.
+                Ok(Request::ConsentPending) => {
+                    Response::ConsentPending(state.consent_pending_view().await)
+                }
+                // #3967 — a two-row Mac's per-user half says it lists them,
+                // over the root half's person socket: taken only from that
+                // socket's own person, never root, and held on this
+                // connection.
+                Ok(Request::ConsentRelaying) => match scope {
+                    Scope::Person { owner_uid }
+                        if owner_uid != 0 && peer.uid == Some(owner_uid) =>
+                    {
+                        if held.is_none() {
+                            held = state.consent_relaying(owner_uid);
+                        }
+                        if held.is_some() {
+                            Response::ConsentRelayingTaken
+                        } else {
+                            Response::Error {
+                                message: CONSENT_RELAYING_NOT_TAKEN.into(),
+                            }
+                        }
+                    }
+                    _ => Response::Error {
+                        message: CONSENT_RELAYING_NOT_HERE.into(),
+                    },
+                },
                 Ok(Request::Ping {
                     target,
                     timeout_ms,
@@ -4010,9 +4150,7 @@ where
                     if scope.is_person() && !peer.is_root() =>
                 {
                     match still_at_the_seat(state, &peer).await {
-                        AtTheSeat::Yes => Response::ConsentDecided {
-                            ok: state.consent_decide(&session_id, allow),
-                        },
+                        AtTheSeat::Yes => state.consent_decide_view(&session_id, allow).await,
                         AtTheSeat::No => not_at_the_seat_to_answer(),
                         AtTheSeat::NotKnownYet => Response::Error {
                             message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
@@ -4029,6 +4167,10 @@ where
                     if !scope.is_person() && !peer.may_decide_for_the_screen() =>
                 {
                     not_the_screens_person(&peer, false)
+                }
+                // #3864 — an answer past its gates: the daemon's view of it.
+                Ok(Request::ConsentDecide { session_id, allow }) => {
+                    state.consent_decide_view(&session_id, allow).await
                 }
                 Ok(Request::RcDisconnect { .. })
                     if !scope.is_person() && !peer.may_decide_for_the_screen() =>
@@ -4159,8 +4301,25 @@ where
         Ok(())
     }
     .await;
+    // #3967 — the peer closed the connection (EOF), or reading or writing it
+    // failed: whatever it held ends with it.
+    if let Some(held) = held.take() {
+        held.end(ConnectionEnd::ClosedByThePeer);
+    }
     served
 }
+
+/// #3967 — a `ConsentRelaying` the daemon does not take: it is no Mac's root
+/// half.
+const CONSENT_RELAYING_NOT_TAKEN: &str = "consent_relaying was not taken: only a two-row Mac's \
+                                          root daemon takes it, from the per-user half of the \
+                                          person at its screen";
+
+/// #3967 — a `ConsentRelaying` anywhere but the person socket, or from anyone
+/// but that socket's own person.
+const CONSENT_RELAYING_NOT_HERE: &str = "consent_relaying is taken only over the person-at-the-\
+                                         device socket, from the person it serves, never from \
+                                         root";
 
 // ---------------------------------------------------------------------------
 // Platform listener (unification P1-cont)
@@ -5721,6 +5880,18 @@ fn own_account_sid() -> Option<String> {
 /// a socket served by anyone else is refused, not believed.
 #[cfg(unix)]
 pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::Result<Client> {
+    let stream = connect_unix_stream_served_by_root(path).await?;
+    Ok(Client::new(Box::new(stream)))
+}
+
+/// #3967 — [`connect_unix_served_by_root`]'s stream itself, for a caller that
+/// holds the connection open after its request: a two-row Mac's per-user
+/// half, telling its root half that it lists the root half's questions
+/// ([`Request::ConsentRelaying`]).
+#[cfg(unix)]
+pub async fn connect_unix_stream_served_by_root(
+    path: std::path::PathBuf,
+) -> std::io::Result<tokio::net::UnixStream> {
     let stream = tokio::net::UnixStream::connect(&path).await?;
     let server = stream.peer_cred()?.uid();
     if server != 0 {
@@ -5729,7 +5900,7 @@ pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::R
             format!("{} is served by uid {server}, not root", path.display()),
         ));
     }
-    Ok(Client::new(Box::new(stream)))
+    Ok(stream)
 }
 
 impl Client {
@@ -6521,6 +6692,51 @@ pub struct LanCaptureStatus {
     /// That interface's name when the daemon could resolve it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_name: Option<String>,
+}
+
+/// #3998 — whether this account's OWN endpoint is gone: the first one
+/// [`connect`] tries, the per-user socket, is not there or nothing listens on
+/// it. On a Linux system install that socket is the person socket its root
+/// daemon serves the person at the seat; on a Mac it is the per-user half's,
+/// or a one-row Mac's screen worker's. Each goes with its daemon.
+///
+/// With it gone, no device service is there for this account, whatever a
+/// later endpoint answered. `connect` returns its LAST endpoint's error, and
+/// on a Linux system install or a Mac that is the system socket, in a folder
+/// only root may enter: a stopped daemon reads there as `PermissionDenied`,
+/// exactly as a running one does. `false` with no own endpoint to look at.
+#[cfg(unix)]
+pub async fn own_endpoint_gone() -> bool {
+    match per_user_socket_path() {
+        Some(path) => endpoint_gone(&path).await,
+        None => false,
+    }
+}
+
+/// #3998 — on Windows the pipe is [`connect`]'s only endpoint, and its own
+/// `NotFound` already says that no service is there.
+#[cfg(windows)]
+pub async fn own_endpoint_gone() -> bool {
+    false
+}
+
+/// #3998 — how long [`endpoint_gone`] waits for a connect: a unix socket
+/// answers at once, or is there and busy.
+#[cfg(unix)]
+const ENDPOINT_GONE_WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// #3998 — whether nothing a client could reach is at `path`: no socket, or
+/// one that nothing listens on (a daemon that stopped and left it behind).
+/// A socket that a service listens on is not gone, however busy or silent.
+#[cfg(unix)]
+pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
+    match tokio::time::timeout(ENDPOINT_GONE_WITHIN, tokio::net::UnixStream::connect(path)).await {
+        Ok(Err(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        Ok(Ok(_)) | Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -9598,6 +9814,10 @@ mod tests {
             // #3831 — what this device can encode, the Overview's card: the
             // probe's cached summary, read-only, never a probe.
             r#"{"t":"encoder_caps"}"#,
+            // #3967 — a two-row Mac's per-user half says it lists the root
+            // half's consent questions; taken from the socket's own person
+            // only, on the dispatcher's own check.
+            r#"{"t":"consent_relaying"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -10453,6 +10673,280 @@ mod tests {
         };
         let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana_elevated, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
+    }
+
+    /// #3864 — a daemon whose consent questions are another process's, as a
+    /// one-row Mac's worker's are the root half's: its own list is empty and
+    /// it takes no answer itself, while its views list the question and pass
+    /// the other process's verdict on, a refusal in its own words.
+    struct Relaying;
+    #[async_trait]
+    impl LocalApiState for Relaying {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            if uid == 501 {
+                AtTheSeat::Yes
+            } else {
+                AtTheSeat::No
+            }
+        }
+        fn consent_pending(&self) -> Vec<ConsentRequest> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            false
+        }
+        async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+            vec![ConsentRequest {
+                session_id: "c3".into(),
+                controller_name: "Alice".into(),
+                permissions: "VIEW".into(),
+                timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
+                surface: "companion".into(),
+                org: String::new(),
+            }]
+        }
+        async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+            if session_id == "c3" && allow {
+                Response::ConsentDecided { ok: true }
+            } else {
+                Response::Error {
+                    message: "refused by the process that asked".into(),
+                }
+            }
+        }
+    }
+
+    /// #3864 — a list and an answer are the daemon's views
+    /// ([`LocalApiState::consent_pending_view`],
+    /// [`LocalApiState::consent_decide_view`]) on the daemon's own endpoint
+    /// and on the person socket alike, so a one-row Mac's worker can serve
+    /// the root half's questions on the socket its person's app dials. The
+    /// gates still come first: a peer the endpoint does not admit, or someone
+    /// who is not at the seat now, is refused before the view is asked.
+    ///
+    /// Red before #3864: both verbs were the sync dispatch's (`handle`), which
+    /// read the daemon's own lists, so the question was never listed and its
+    /// answer never taken.
+    #[tokio::test]
+    async fn the_consent_verbs_are_answered_by_the_daemons_views() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        // The daemon's own endpoint admits an answer from an elevated
+        // administrator on every OS (`peer_may_decide_for_the_screen`).
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        let list = r#"{"t":"consent_pending"}"#;
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":false}}"#;
+        for (scope, peer, what) in [
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+            (SEAT, ana.clone(), "the person socket"),
+        ] {
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), list).await;
+            assert!(
+                matches!(&r, Response::ConsentPending(v) if v.len() == 1 && v[0].session_id == "c3"),
+                "{what}: {r:?}"
+            );
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), approve).await;
+            assert_eq!(r, Response::ConsentDecided { ok: true }, "{what}");
+            let r = ask_state_scoped_as(Relaying, scope, peer, deny).await;
+            assert_eq!(
+                r,
+                Response::Error {
+                    message: "refused by the process that asked".into()
+                },
+                "{what}: a refusal passes through in its own words"
+            );
+        }
+        // The gates come first. On the person socket, someone who is not at
+        // the seat now; on the daemon's own endpoint, a peer it cannot read.
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let r = ask_state_scoped_as(Relaying, SEAT, bob, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("was not taken")),
+            "{r:?}"
+        );
+        let r = ask_state_scoped_as(Relaying, Scope::Full, ClientPeer::UNKNOWN, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("This caller is none of those")),
+            "{r:?}"
+        );
+    }
+
+    /// #3967 — a daemon that takes a relay announcement, as a two-row Mac's
+    /// root half does, and writes down each one it takes and how it ends.
+    #[derive(Clone, Default)]
+    struct TakesRelays {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl LocalApiState for TakesRelays {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_relaying(&self, uid: u32) -> Option<HeldForTheConnection> {
+            self.log.lock().unwrap().push(format!("taken {uid}"));
+            let log = self.log.clone();
+            Some(HeldForTheConnection::new(move |how| {
+                log.lock().unwrap().push(format!("ended {uid} {how:?}"));
+            }))
+        }
+    }
+
+    /// One connection `state` serves for `peer` under `scope`, asked line by
+    /// line, as a client that keeps it open between its requests.
+    struct HeldOpen {
+        wr: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        served: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl HeldOpen {
+        fn open<S: LocalApiState + 'static>(state: S, scope: Scope, peer: ClientPeer) -> Self {
+            let (client, server) = tokio::io::duplex(4096);
+            let served =
+                tokio::spawn(
+                    async move { serve_connection_scoped(server, &state, peer, scope).await },
+                );
+            let (rd, wr) = tokio::io::split(client);
+            Self {
+                wr,
+                lines: tokio::io::BufReader::new(rd).lines(),
+                served,
+            }
+        }
+
+        async fn ask(&mut self, line: &str) -> Response {
+            self.wr
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let answer = self.lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&answer).unwrap()
+        }
+
+        /// The client closes its end, and the daemon's loop finishes.
+        async fn close(self) {
+            drop(self.wr);
+            drop(self.lines);
+            self.served.await.unwrap().unwrap();
+        }
+    }
+
+    /// #3967 — a two-row Mac's per-user half says `consent_relaying` over the
+    /// root half's person socket, and the root half takes it from that
+    /// socket's own person for exactly as long as the connection stays open:
+    /// until the per-user half closes it (it stopped, or restarted), or until
+    /// the listener stops serving it (the seat changed: `serve_person_listener`
+    /// aborts every connection it holds). One connection holds one, however
+    /// often it says so. Nobody else is taken: not root, not another account,
+    /// not a caller on the daemon's own endpoint. A daemon that does not take
+    /// it refuses it, and keeps the connection open for the next request, as
+    /// an older daemon does with a verb it does not know.
+    ///
+    /// Red before #3967: the person socket refused the verb.
+    #[tokio::test]
+    async fn a_relay_announcement_is_held_for_its_connections_life() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let say = r#"{"t":"consent_relaying"}"#;
+        let list = r#"{"t":"consent_pending"}"#;
+
+        // Taken, and the per-user half closes the connection.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        assert_eq!(
+            conn.ask(say).await,
+            Response::ConsentRelayingTaken,
+            "said again"
+        );
+        assert!(
+            matches!(conn.ask(list).await, Response::ConsentPending(_)),
+            "the connection serves its next request"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501"],
+            "one held, while it is open"
+        );
+        conn.close().await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501", "ended 501 ClosedByThePeer"]
+        );
+
+        // Taken, and the listener stops serving it.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        conn.served.abort();
+        let _ = (&mut conn.served).await;
+        assert_eq!(*log.lock().unwrap(), ["taken 501", "ended 501 Dropped"]);
+
+        // Refused, and nothing is held: root and another account on the
+        // person socket, and a caller on the daemon's own endpoint.
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ana.clone()
+        };
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        for (scope, peer, what) in [
+            (SEAT, root, "root on the person socket"),
+            (SEAT, bob, "another account on the person socket"),
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+        ] {
+            let state = TakesRelays::default();
+            let log = state.log.clone();
+            let r = ask_state_scoped_as(state, scope, peer, say).await;
+            assert!(matches!(r, Response::Error { .. }), "{what}: {r:?}");
+            assert!(log.lock().unwrap().is_empty(), "{what}: nothing is held");
+        }
+
+        // A daemon that does not take it refuses it, and the connection
+        // serves its next request.
+        let mut conn = HeldOpen::open(Mock, SEAT, ana);
+        assert!(matches!(conn.ask(say).await, Response::Error { .. }));
+        assert!(matches!(conn.ask(list).await, Response::ConsentPending(_)));
+        conn.close().await;
     }
 
     /// A daemon that counts the consent answers and the Disconnects that
@@ -12103,6 +12597,32 @@ mod tests {
                 held.push(stream);
             }
         })
+    }
+
+    /// #3998 — an endpoint is gone when nothing is at its path, or nothing
+    /// listens on what is there: a daemon that stopped and left its socket
+    /// behind. One that a service listens on is not, busy or silent. On a
+    /// Linux system install and a Mac this is what tells a stopped daemon
+    /// from a refusal: `connect` returns its last endpoint's error, the
+    /// system socket's `PermissionDenied`, whether or not the daemon runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endpoint_missing_or_left_behind_is_gone_and_a_served_one_is_not() {
+        let dir = test_socket_dir("3998-gone");
+        let missing = dir.join("missing.sock");
+        assert!(endpoint_gone(&missing).await, "nothing at the path");
+        let left = dir.join("left.sock");
+        drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+        assert!(left.exists(), "the socket stays behind its listener");
+        assert!(endpoint_gone(&left).await, "nothing listens on it");
+        let served = dir.join("served.sock");
+        let held = hold_silently(tokio::net::UnixListener::bind(&served).unwrap());
+        assert!(
+            !endpoint_gone(&served).await,
+            "a service listens on it, silent or not"
+        );
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real kernel credentials, for a caller that is NOT the account

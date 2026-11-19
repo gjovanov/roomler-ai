@@ -93,6 +93,17 @@ device the exec prompt then says "On behalf of «org»" by the same rule as a
 screen-control prompt ([multi-org.md](multi-org.md) §8b). Before, it named the
 enrollment's label, which on the primary enrollment is literally `primary`.
 
+**An unanswered prompt says whether anyone could be asked** (#3982). The
+question goes up as an SSH session's does: the native panel, else the desktop
+companion, else a desktop notification, while the command waits on the consent
+broker alone. A window that runs out with none of them showing the question
+ends with SSH's sentence, naming the execution policy: "nobody could be asked
+at this device — it has no prompt surface (…); answer with `roomlerd consent`
+there, start the desktop app, or set this device's execution policy to auto".
+One a surface showed, which nobody answered, ends "the operator at this device
+did not approve the command (Timeout)", as before. The chain and its log line
+are in [remote-control.md](remote-control.md), "Prompt surfaces".
+
 ## The four gates
 
 A command runs only if all four allow it. Each is owned by a different party,
@@ -513,7 +524,7 @@ run the command as root:
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5959`](../agents/roomlerd/src/signaling.rs#L5959) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5889`](../agents/roomlerd/src/signaling.rs#L5889) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

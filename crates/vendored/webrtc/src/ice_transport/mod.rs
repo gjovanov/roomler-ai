@@ -95,6 +95,20 @@ impl RTCIceTransport {
         None
     }
 
+    /// Roomler patch (FR-148 P4): the local candidates gathered so far, empty
+    /// when the agent is gone. Unlike the gatherer's own accessor it never
+    /// creates an agent, so a read after close binds nothing.
+    pub async fn local_candidates(&self) -> Vec<RTCIceCandidate> {
+        match self.gatherer.get_agent().await {
+            Some(agent) => agent
+                .get_local_candidates()
+                .await
+                .map(|c| ice_candidate::rtc_ice_candidates_from_ice_candidates(&c))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
     /// Start incoming connectivity checks based on its configured role.
     pub async fn start(&self, params: &RTCIceParameters, role: Option<RTCIceRole>) -> Result<()> {
         if self.state() != RTCIceTransportState::New {

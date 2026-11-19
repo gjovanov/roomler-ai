@@ -1432,6 +1432,22 @@ const KEYS: &[KeyMeta] = &[
         description: "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
     },
     KeyMeta {
+        key: "rc_carrier_rank",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:0|prio|1",
+        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio` or `1`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
+        key: "path_model",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:off|shadow|on",
+        description: "FR-148 P1 - the path model's switch for a remote-desktop session on a relay: `shadow` (empty; the default: the path memory is kept and logged beside the opening, and the session opens as before), `on` (a relayed session whose pair has a fresh entry in the path memory opens from it: 0.85 x its floor, at most the relay cap, under the nominal opening only after a trusted push-back, and on the slow-link profile only after a trusted push-back at or under 1 Mbit/s) or `off` (no delivery samples, no path memory, no lines: the release before). ⚠️ Do not set `on` on a device yet: it is for tests until FR-148's open decision O7 is ruled. Under `on` a quiet screen whose viewer's two reports disagree can teach the memory a false slow path, and the pair's next sessions then open low, on the slow-link profile, for up to a day. `shadow` and a restart take a device back. A device set to `shadow` stays at shadow when the default changes; empty takes the default. Env: ROOMLERD_PATH_MODEL (a set variable wins). This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "relay_max_kbps",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -1526,6 +1542,14 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "tribool",
         description: "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
+    },
+    KeyMeta {
+        key: "measured_evidence",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Measured evidence (2026-11-02, FR-79 V5b). Default ON: only a measurement is evidence about the rate. A transit stall is judged against a live reading (the goodput, or the viewer's arrival rate inside its TTL) and never against the prior's stand-in, and it no longer walks that prior. A delivery that raises the demonstrated floor to at least twice a reading takes the reading out. A hold reaches the pair memory only if a valid window carried it, and a session with no reading writes nothing there. A growing viewer queue counts only while the sender offered more than arrived. `false` restores FR-79 V5a's rules.",
     },
     KeyMeta {
         key: "slow_link_profile",
@@ -1742,6 +1766,14 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "string",
         description: "FR-119 - how NVENC splits an HEVC or AV1 frame across its engines above 60 fps: `auto` (empty; the driver picks the number of strips), `off` (never ask, as before), or a strip count 2-4 (applied only on a GPU with that many engines). Env: ROOMLERD_NVENC_SPLIT. Read at every encoder open.",
+    },
+    KeyMeta {
+        key: "qsv_rate_mode",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:cbr|qvbr",
+        description: "FR-148 P2 - the rate control an Intel QSV HEVC or H.264 encoder opens in for a remote-desktop session: `cbr` (empty; constant bitrate, as before) or `qvbr` (a target at 0.9 x the cap, under the cap, at the session's quality, so a still screen can send less than the cap). A driver that refuses qvbr opens as cbr and the log says so. VP9, AV1 and recordings stay at cbr. Env: ROOMLERD_QSV_RATE_MODE. This device only: never pushable. Restart required.",
     },
     KeyMeta {
         key: "vaapi_device",
@@ -2112,6 +2144,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
+        "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
+        "path_model" => cfg.path_model.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2124,6 +2158,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "seed_contradiction" => cfg.seed_contradiction.map(fmt_bool),
         "viewer_rate_clamp" => cfg.viewer_rate_clamp.map(fmt_bool),
         "queue_drain" => cfg.queue_drain.map(fmt_bool),
+        "measured_evidence" => cfg.measured_evidence.map(fmt_bool),
         "slow_link_profile" => cfg.slow_link_profile.map(fmt_bool),
         "slow_link_profile_bps" => cfg.slow_link_profile_bps.map(|p| p.to_string()),
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
@@ -2158,6 +2193,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rc_media_legacy" => cfg.rc_media_legacy.clone(),
         "rc_media_canary" => cfg.rc_media_canary.clone(),
         "nvenc_split" => cfg.nvenc_split.clone(),
+        "qsv_rate_mode" => cfg.qsv_rate_mode.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
@@ -2686,6 +2722,28 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
+        "rc_carrier_rank" => {
+            cfg.rc_carrier_rank = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() || v == "0" => None,
+                Some(v) if v == "prio" || v == "1" => Some(v),
+                Some(v) => {
+                    return Err(format!("rc_carrier_rank must be 0, prio or 1 (got {v:?})"));
+                }
+            }
+        }
+        // `shadow` is stored, not cleared: a device taken back to it stays
+        // there when the default changes (D28).
+        "path_model" => {
+            cfg.path_model = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() => None,
+                Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
+                Some(v) => {
+                    return Err(format!("path_model must be off, shadow or on (got {v:?})"));
+                }
+            }
+        }
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
@@ -2700,6 +2758,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "seed_contradiction" => cfg.seed_contradiction = parse_tribool(value)?,
         "viewer_rate_clamp" => cfg.viewer_rate_clamp = parse_tribool(value)?,
         "queue_drain" => cfg.queue_drain = parse_tribool(value)?,
+        "measured_evidence" => cfg.measured_evidence = parse_tribool(value)?,
         "slow_link_profile" => cfg.slow_link_profile = parse_tribool(value)?,
         "slow_link_profile_bps" => {
             cfg.slow_link_profile_bps = parse_u32_range(key, value, 0, 100_000_000)?
@@ -2824,6 +2883,16 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     return Err(format!(
                         "nvenc_split must be auto, off, 2, 3 or 4 (got {v:?})"
                     ));
+                }
+            }
+        }
+        "qsv_rate_mode" => {
+            cfg.qsv_rate_mode = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() || v == "cbr" => None,
+                Some(v) if v == "qvbr" => Some(v),
+                Some(v) => {
+                    return Err(format!("qsv_rate_mode must be cbr or qvbr (got {v:?})"));
                 }
             }
         }
@@ -4945,6 +5014,107 @@ mod tests {
         for bad in ["1", "5", "forced", "on"] {
             assert!(
                 apply(&mut cfg, "nvenc_split", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P2 — `qsv_rate_mode`: `qvbr` is stored, `cbr` and blank clear
+    /// the key (today's open), and anything else is refused rather than stored
+    /// and read as `cbr` without a word.
+    #[test]
+    fn qsv_rate_mode_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "qsv_rate_mode"), None);
+        apply(&mut cfg, "qsv_rate_mode", Some(" QVBR ")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode.as_deref(), Some("qvbr"));
+        assert_eq!(
+            entry_for(&cfg, "qsv_rate_mode").unwrap().value.as_deref(),
+            Some("qvbr")
+        );
+        apply(&mut cfg, "qsv_rate_mode", Some("cbr")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode, None, "cbr is the default");
+        apply(&mut cfg, "qsv_rate_mode", Some("qvbr")).unwrap();
+        apply(&mut cfg, "qsv_rate_mode", Some("")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode, None, "blank clears to the default");
+        for bad in ["on", "1", "vbr", "icq", "qvbr2"] {
+            assert!(
+                apply(&mut cfg, "qsv_rate_mode", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P1 — `path_model`: `off`, `shadow` and `on` are stored, blank
+    /// clears the key (the default, `shadow` today), and anything else is
+    /// refused rather than read as `shadow` without a word. `shadow` is
+    /// stored, so a device taken back stays there when the default moves. It
+    /// reaches the daemon's env fallbacks under the switch's own name.
+    #[test]
+    fn path_model_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "path_model"), None);
+        apply(&mut cfg, "path_model", Some(" ON ")).unwrap();
+        assert_eq!(cfg.path_model.as_deref(), Some("on"));
+        assert_eq!(
+            entry_for(&cfg, "path_model").unwrap().value.as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("PATH_MODEL")
+                .map(String::as_str),
+            Some("on")
+        );
+        apply(&mut cfg, "path_model", Some("shadow")).unwrap();
+        assert_eq!(
+            cfg.path_model.as_deref(),
+            Some("shadow"),
+            "kept, not cleared"
+        );
+        apply(&mut cfg, "path_model", Some("off")).unwrap();
+        assert_eq!(cfg.path_model.as_deref(), Some("off"));
+        apply(&mut cfg, "path_model", Some("")).unwrap();
+        assert_eq!(cfg.path_model, None, "blank clears to the default");
+        assert_eq!(crate::config::env_fallbacks(&cfg).get("PATH_MODEL"), None);
+        for bad in ["1", "true", "model", "on1", "shadow,on"] {
+            assert!(
+                apply(&mut cfg, "path_model", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P4 — `rc_carrier_rank`: `prio` and `1` are stored, `0` and
+    /// blank clear the key (off), and anything else is refused rather than
+    /// stored and read as `0` without a word. It reaches the daemon's env
+    /// fallbacks under the switch's own name.
+    #[test]
+    fn rc_carrier_rank_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "rc_carrier_rank"), None);
+        apply(&mut cfg, "rc_carrier_rank", Some(" PRIO ")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank.as_deref(), Some("prio"));
+        assert_eq!(
+            entry_for(&cfg, "rc_carrier_rank").unwrap().value.as_deref(),
+            Some("prio")
+        );
+        apply(&mut cfg, "rc_carrier_rank", Some("1")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank.as_deref(), Some("1"));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("RC_CARRIER_RANK")
+                .map(String::as_str),
+            Some("1")
+        );
+        apply(&mut cfg, "rc_carrier_rank", Some("0")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank, None, "0 is the default");
+        apply(&mut cfg, "rc_carrier_rank", Some("prio")).unwrap();
+        apply(&mut cfg, "rc_carrier_rank", Some("")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank, None, "blank clears to the default");
+        for bad in ["on", "true", "2", "cost", "prio1"] {
+            assert!(
+                apply(&mut cfg, "rc_carrier_rank", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

@@ -1343,7 +1343,7 @@ mod keeper_tests {
         registry: RcSessionRegistry,
         activity: ActivityCounter,
         kill: crate::rc_sessions::KillSender,
-        _killed: tokio::sync::mpsc::Receiver<ObjectId>,
+        _killed: tokio::sync::mpsc::Receiver<crate::rc_sessions::KillOrder>,
     }
 
     /// A session that is live while this is.
