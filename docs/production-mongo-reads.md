@@ -230,12 +230,12 @@ cannot tell, is in the script's header. This section is the read's contract with
 
 | Bound | What it is | Where |
 |---|---|---|
-| Window | at most 8 days, read as one query per day | `scripts/rc-path-report.cjs:1951` |
-| Index | pinned with `hint`: `created_at_1` for the fleet and for `--agent` alone, `tenant_id_1_agent_id_1_created_at_-1` for one agent of one `--tenant`, `tenant_id_1_source_1_created_at_-1` for any other `--tenant` read. Each returns the batches in `created_at` order, so the `$sort` is no blocking SORT stage | `scripts/rc-path-report.cjs:1981` |
-| Time | `maxTimeMS` 240,000 per query | `scripts/rc-path-report.cjs:1986` |
-| Memory | `allowDiskUse: false`. After the `$match`, only streaming stages: a `$project` whose `$filter` keeps the lines of the twelve messages read, `$unwind`, and a `$project` of 37 named fields | `scripts/rc-path-report.cjs:1874` |
+| Window | at most 8 days, read as one query per day | `scripts/rc-path-report.cjs:2086` |
+| Index | pinned with `hint`: `created_at_1` for the fleet and for `--agent` alone, `tenant_id_1_agent_id_1_created_at_-1` for one agent of one `--tenant`, `tenant_id_1_source_1_created_at_-1` for any other `--tenant` read. Each returns the batches in `created_at` order, so the `$sort` is no blocking SORT stage | `scripts/rc-path-report.cjs:2116` |
+| Time | `maxTimeMS` 240,000 per query | `scripts/rc-path-report.cjs:2121` |
+| Memory | `allowDiskUse: false`. After the `$match`, only streaming stages: a `$project` whose `$filter` keeps the lines of the twelve messages read, `$unwind`, and a `$project` of 40 named fields | `scripts/rc-path-report.cjs:2009` |
 | Cost | every batch in the window is examined once. `agent_logs` held 354,193 batches over its 7 days on 2026-11-10 (§7), so a 7-day run examines about 350,000 documents, about 50,000 per daily query, through the index | — |
-| What leaves | the matching lines' named fields only. The memory key leaves as its carrier half and the controlling user as the last 6 hex of its id: no address, no host name, no person's name. The P1 line's key leaves the same way | `scripts/rc-path-report.cjs:1878` |
+| What leaves | the matching lines' named fields only. The memory key leaves as its carrier half and the controlling user as the last 6 hex of its id: no address, no host name, no person's name. The P1 line's key leaves the same way | `scripts/rc-path-report.cjs:2013` |
 
 The runner prints `mongodb-0`'s restart count and memory before and after the read, and a
 restart fails the run (exit 3), as for every reader in §6.
@@ -245,6 +245,12 @@ What leaves grows by one `path delivery` line per pump per 10 s, about a fifth m
 an FFmpeg session's heartbeats and a tenth more than a VP9-444 session's, and by at most one P1
 line per pump start. Agents built before #3968 and #3969 write neither, and their sessions read
 `–` in the new columns.
+
+The fields added for FR-148 P0's standing queue change nothing the read examines either: the
+`$match` and the message filter are the same, and the `$project` names three more fields,
+`queued` and `standing_ms` from the `path delivery` line and `relay_transport` from the carrier
+line. Each is a count, a pair of milliseconds or a word, never an address. An agent built before
+them writes none, and its sessions read `standing queue: –, relay no line`.
 
 | Term | Rule | Constant |
 |---|---|---|
@@ -258,6 +264,9 @@ line per pump start. Agents built before #3968 and #3969 write neither, and thei
 | F3 | judged on a session that opened with the slow-link profile, had a size and frame rate at its opening, and lasted at least 5 min. Raised when its plan stood above 1,000,000 bit/s for at least 60 s in a row (an open at or below that engages the profile) and no heartbeat's picture was both larger and faster than the opening: AC14 asks for both back | `SLOW_LINK_PROFILE_BPS`, checked against `rate_profile.rs`; `F3_MIN_SESSION_MS`, `F3_RUN_MS` |
 | At nominal after | for a session that opened on a relay below 3,000,000 bit/s (`relay_max_bps`'s default), the first heartbeat on the relay whose target reached it, or "left the relay first" | `RELAY_NOMINAL_BPS`, checked against `encode/mod.rs` |
 | Entry at the open | the entry the open was seeded with. A P1 line goes to the same agent's earliest pump start in the 5 s after it. "Opened without the pair's entry" is an FFmpeg pump that started on a relay with no entry, although the pair's last write with evidence before it, at most 7 days old, left one. It is inferred, as the trail is: the key may have differed, no key may have formed, or the daemon may have run under another user's data directory | `OPEN_LAG_MS`; `MEMORY_TTL_MS`, checked against `rate_memory.rs` with its `<=` |
+| Standing queue (the session row) | `standing queue: queued <q> of <n> samples, standing <p50>/<max> ms, relay <transport>`. Over every `path delivery` line of the session that carries `queued`, whatever its side, since a queue is the path's and not the pump's flag's: q is the sum of `queued`, n the sum of the line's samples (`delivery_samples`), and p50 and max are over each line's highest standing (`standing_ms`). A sample is queued when it acknowledged enough bytes to count and its least acknowledgement delay stood 250 ms or more over the session's least ([rate-control.md § The standing queue](rate-control.md#the-standing-queue-what-a-tcp-carrier-holds)). A session with no such line reads `–`, and a line none of whose samples counted gives no standing | — |
+| Relay transport | the last carrier line's `relay_transport`: what carries the agent's own TURN allocation, `udp`, `tcp` or `tls`; `none` when the agent's candidate is no relay, though the browser's may be; `unknown` when the agent could not say, and for a word this build does not know. A session whose carrier line lacks the field, or that has none, is `no line` | `RELAY_TRANSPORTS` |
+| Devices: the relay transport and the standing queue | per agent, its sessions by relay transport (udp, tcp, tls, none, unknown, no line), and by carrier class the sessions with a standing queue (at least 3 queued samples) of those whose lines carried the fields. One queued sample is no standing queue | `SQ_SESSION_MIN` |
 
 **Rehearsed, not run on production.** On 2026-11-16 the self-test's invented sessions (both
 reference chains and a healthy session) went into a throwaway `mongo:7` as 254 batches. The
@@ -279,7 +288,7 @@ the message filter grew. The container needs `MONGO_INITDB_ROOT_USERNAME` and `_
 start: without them the seed loads, and the read stops at "No connected database".
 
 ```bash
-node scripts/rc-path-report.cjs --self-test                     # 162 cases: both chains, the rule's and the flags' edges, the path's lines, privacy, the seed
+node scripts/rc-path-report.cjs --self-test                     # 179 cases: both chains, the rule's and the flags' edges, the path's lines, the standing queue and the relay transport, privacy, the seed
 node scripts/rc-path-report.cjs --fixtures > seed.ejson          # the self-test's fixtures as agent_logs batches
 bash scripts/rc-path-report.sh --docker NAME --seed seed.ejson   # the rehearsal, against a mongo:7 you started with MONGO_INITDB_ROOT_* (an --env-file)
 bash scripts/rc-path-report.sh --mars --yes --label HEX=CORPLAP-1 --label HEX=CORPLAP-2   # the fleet read: the last 7 days

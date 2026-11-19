@@ -39,7 +39,8 @@
 //                                 the rate-apply counters, goodput_bps, prior_bps, constrained
 //   DC pump starting              the pump's start, and `slow_link` (FFmpeg)
 //   incoming session request      the controlling user, as its last 6 hex only
-//   session carrier recorded      the carrier class (FR-102 P9c)
+//   session carrier recorded      the carrier class (FR-102 P9c), and since FR-148 P0 what
+//                                 carries the agent's own TURN allocation (`relay_transport`)
 //   per-session ICE path detected the class's fallback on a build without the line above
 //   …opening ceiling seeded…      the remembered entry a session opened from, and the
 //                                 carrier half of its memory key
@@ -50,7 +51,9 @@
 //   path delivery (FR-148 P0…)    ≈10 s of the transport's delivery samples, from both DC
 //                                 pumps (#3968): the samples by class, the backlogged rates
 //                                 (lowest, mean, highest), the highest application-limited
-//                                 rate, the stalled time
+//                                 rate, the stalled time; and on a newer agent the samples
+//                                 queued (`queued`) and their standing over the session's
+//                                 least acknowledgement delay (`standing_ms`)
 //   …no measured provenance…      FR-148 P1 (#3969): an entry an open passed over as assumed,
 //                                 its rate and age, and the carrier half of its memory key
 //
@@ -68,12 +71,17 @@
 //   without that line falls back to the ICE line: `relay=true` reads `turn (ice)`;
 //   a non-relay pair the pump runs constrained is an overlay remote on a relay
 //   tier, `mesh-relayed (pump)`; any other is `direct or mesh (ice)`.
+//   THE RELAY TRANSPORT, from the same line on a newer agent (FR-148 P0): what
+//   carries the agent's own TURN allocation for the selected pair, from the TURN
+//   URL it allocated over: `udp`, `tcp` or `tls`; `none` where the agent's
+//   selected candidate is no relay; `unknown` where the agent could not say. A
+//   session whose carrier line lacks the field (an older agent), or that has no
+//   carrier line, counts as `no line`.
 //   What the lines cannot tell:
-//   - TURN over UDP from TURN over TCP or TLS. The agent's relay candidate names
-//     its relayed address, which is UDP whatever carries it to the server
-//     (crates/vendored/webrtc-ice/src/agent/agent_gather.rs:829), and the
-//     browser's own transport to its TURN server never reaches the agent. So
-//     `turn` is either.
+//   - The transport of a relay the agent did not allocate: the browser's own
+//     transport to its TURN server never reaches the agent. So on a `turn`
+//     session whose relay is the browser's, `relay_transport` reads `none`, and
+//     the browser's leg may be TURN over UDP, TCP or TLS.
 //   - The mesh relay's own transport, except on a session that read the memory:
 //     its key carries it (`relay:derp/tcp`), printed as the key's carrier.
 //   - A carrier change inside a session: the line is written once a peer
@@ -134,6 +142,19 @@
 //   delivery lines count only on the side its class runs on (a run breaks where
 //   the flag flips); a delivery line whose ≈10 s cross a flip counts nowhere. A
 //   VP9-444 pump has no flag: its windows and lines are never split by side.
+//
+// THE STANDING QUEUE
+//
+//   A newer agent's delivery line also says how many of its samples were
+//   QUEUED: the sample's least acknowledgement delay stood 250 ms or more over
+//   the session's least, and it acknowledged enough bytes for that least to hold
+//   no receiver's delayed SACK (docs/rate-control.md § The standing queue). Per
+//   session, over every such line whatever its side (a standing queue is the
+//   path's, not the flag's): the queued samples of the lines' samples, and each
+//   line's highest standing, of which the row prints the p50 and the max. A
+//   session with no such line reads `–`. Per agent: its sessions by relay
+//   transport, and by carrier class the sessions with at least SQ_SESSION_MIN
+//   queued samples, of those that carried the fields.
 //
 // THE PICTURE AND THE PROFILE
 //
@@ -318,6 +339,13 @@ const OPEN_LAG_MS = 5000;
  *  starts kept, so a flapping session stays a few numbers in the fold. */
 const MAX_CHANGES = 8;
 const MAX_STARTS = 16;
+/** A session with at least this many queued samples had a standing queue. */
+const SQ_SESSION_MIN = 3;
+/** The carrier line's `relay_transport` vocabulary
+ *  (`session_carrier::RelayTransport::as_str`), and the report's bucket for a
+ *  session whose carrier line lacks the field or that has none. */
+const RELAY_TRANSPORTS = ['udp', 'tcp', 'tls', 'none', 'unknown'];
+const NO_LINE = 'no line';
 
 /** The lines this reads, by message text. Each phrase is in exactly one
  *  message of the agent (the self-test checks the source). */
@@ -378,11 +406,14 @@ const FIELDS = [
   'backlogged_bps',
   'app_limited_bps',
   'stalled_ms',
+  'queued',
+  'standing_ms',
+  'relay_transport',
   'assumed_bps',
   'age_s',
 ];
 /** Identifiers and labels: emitted as text, so an all-digit value stays a string. */
-const ID_FIELDS = new Set(['session_id', 'codec_label', 'encoder', 'carrier', 'peer_carrier', 'user6']);
+const ID_FIELDS = new Set(['session_id', 'codec_label', 'encoder', 'carrier', 'relay_transport', 'peer_carrier', 'user6']);
 
 /** The carrier line's vocabulary (`session_carrier::SessionCarrier::as_str`). */
 const CARRIER_CLASS = {
@@ -478,6 +509,22 @@ function triple(v) {
   const s = text(v);
   const m = s && /^\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/.exec(s);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** A Debug tuple of two integers, `(a, b)`, bare or inside `Some(…)`; null for
+ *  `None`. The delivery line's `standing_ms` has this shape. */
+function couple(v) {
+  const s = text(v);
+  const m = s && /^\(\s*(\d+)\s*,\s*(\d+)\s*\)$/.exec(s);
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+/** The carrier line's `relay_transport`, as one of RELAY_TRANSPORTS: a value
+ *  this build does not know reads `unknown`, never a guess. */
+function relayTransportOf(v) {
+  const t = text(v);
+  if (t === null) return null;
+  return RELAY_TRANSPORTS.indexOf(t) >= 0 ? t : 'unknown';
 }
 
 /** The windows the classifier gave a verdict: every one but `unknown`, which
@@ -838,6 +885,9 @@ class PathReport {
         changeCount: 0,
         dl: { c: null, d: null, u: null, x: null },
         dlLast: null,
+        // The standing queue (every side) and the relay transport.
+        sq: null,
+        relay: null,
         pic: null,
         above: null,
         aboveBestMs: 0,
@@ -900,6 +950,9 @@ class PathReport {
           }
           s.carrier = c;
         }
+        // The last line names it, as it names the class.
+        const rt = relayTransportOf(f.relay_transport);
+        if (rt) s.relay = rt;
         break;
       }
       case 'ice': {
@@ -1107,6 +1160,20 @@ class PathReport {
     }
     s.dlLast = at;
     this.deliveryLines++;
+    // The standing queue, on a line that carries it: every side, since a
+    // standing queue is the path's and the flag's side says nothing of it.
+    const queued = num(f.queued);
+    if (queued !== null) {
+      const q = s.sq || (s.sq = { lines: 0, samples: 0, queued: 0, highs: new Map(), max: null });
+      q.lines++;
+      q.samples += counts[0] + counts[1] + counts[2];
+      q.queued += queued;
+      const standing = couple(f.standing_ms);
+      if (standing) {
+        bump(q.highs, standing[1]);
+        if (q.max === null || standing[1] > q.max) q.max = standing[1];
+      }
+    }
     const span = num(f.span_ms);
     const stalled = num(f.stalled_ms) || 0;
     const bl = triple(f.backlogged_bps);
@@ -1419,6 +1486,11 @@ class PathReport {
             }
           : null,
         planAboveProfileS: s.aboveBestAt === null ? null : Math.round(s.aboveBestMs / 1000),
+        // Every line's highest standing gives the p50 and the max.
+        standingQueue: s.sq
+          ? { lines: s.sq.lines, samples: s.sq.samples, queued: s.sq.queued, standingP50Ms: percentile(s.sq.highs, 0.5), standingMaxMs: s.sq.max }
+          : null,
+        relayTransport: s.relay,
         atNominal: {
           judged: nominalJudged,
           afterS: nominalJudged ? after(s.nominalAt) : null,
@@ -1537,6 +1609,37 @@ class PathReport {
         };
       });
 
+    // Per agent: its sessions by relay transport, and by carrier class the
+    // sessions with a standing queue, of those that carried the fields.
+    const devices = new Map();
+    for (const row of rows) {
+      const k = row.s.agent || '';
+      let d = devices.get(k);
+      if (!d) {
+        d = { agent: agentName(row.s.agent, labels), sessions: 0, relayTransport: { udp: 0, tcp: 0, tls: 0, none: 0, unknown: 0, noLine: 0 }, byCarrier: new Map() };
+        devices.set(k, d);
+      }
+      d.sessions++;
+      if (row.s.relay === null) d.relayTransport.noLine++;
+      else d.relayTransport[row.s.relay]++;
+      if (row.s.sq) {
+        const c = d.byCarrier.get(row.cls) || { carrier: row.cls, sessions: 0, standingQueue: 0 };
+        c.sessions++;
+        if (row.s.sq.queued >= SQ_SESSION_MIN) c.standingQueue++;
+        d.byCarrier.set(row.cls, c);
+      }
+    }
+    const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    const devicesOut = [...devices.keys()].sort(byText).map((k) => {
+      const d = devices.get(k);
+      return {
+        agent: d.agent,
+        sessions: d.sessions,
+        relayTransport: d.relayTransport,
+        standingQueue: [...d.byCarrier.values()].sort((a, b) => byText(a.carrier, b.carrier)),
+      };
+    });
+
     const verdict = (n, judged) => (!judged ? 'not judged' : n ? 'RAISED' : 'clear');
     const f1Out = Object.assign({ ratio: F1_RATIO, ac6Ratio: AC6_RATIO }, f1, { verdict: verdict(f1.below, f1.judged) });
     f1Out.line = !f1.judged
@@ -1573,6 +1676,7 @@ class PathReport {
         deliveryReplays: this.deliveryReplays,
         sessionsWithDelivery: rows.filter((row) => row.anyDelivery).length,
         sessionsWithPathChange: rows.filter((row) => row.s.changeCount > 0).length,
+        sessionsWithStandingQueue: rows.filter((row) => row.s.sq).length,
         assumedLines: this.assumed.length,
         assumedUnplaced,
       },
@@ -1592,9 +1696,11 @@ class PathReport {
         f3MinSessionS: F3_MIN_SESSION_MS / 1000,
         memoryTtlS: MEMORY_TTL_MS / 1000,
         openLagMs: OPEN_LAG_MS,
+        sqSessionMin: SQ_SESSION_MIN,
       },
       flags: { f1: f1Out, f2: f2Out, f3: f3Out },
       pairs: pairsOut,
+      devices: devicesOut,
       sessions,
       memoryTrail: trail,
     };
@@ -1674,7 +1780,12 @@ function pathCells(s) {
     entry = `none, though the pair's write of ${minute(we.writtenAt)} left ${mbps(we.keptBps)} under ${we.keyCarrier || 'a key with no carrier'} (inferred)`;
   } else if (e.withoutPairEntry === false) entry = 'none';
   const f3 = !P.f3 ? '–' : P.f3.raised ? 'F3' : P.f3.left ? 'no: the picture left the profile' : `no: the plan was not above ${mbps(SLOW_LINK_PROFILE_BPS)} for ${F3_RUN_MS / 1000} s`;
-  return [change, samples, bl, app, stalled, ratio, pic, nominal, entry, f3];
+  const Q = P.standingQueue;
+  const relay = `relay ${P.relayTransport === null ? NO_LINE : P.relayTransport}`;
+  const sq = Q
+    ? `standing queue: queued ${Q.queued} of ${Q.samples} samples, standing ${dash(Q.standingP50Ms)}/${dash(Q.standingMaxMs)} ms, ${relay}`
+    : `standing queue: –, ${relay}`;
+  return [change, samples, bl, app, stalled, ratio, pic, nominal, entry, f3, sq];
 }
 
 function render(r) {
@@ -1695,6 +1806,9 @@ function render(r) {
     L.push(`- ${P.sessionsWithDelivery} sessions carried \`path delivery\` lines (${P.deliveryLines} lines); the others read – in the delivery columns.`);
   }
   if (P.deliveryReplays) L.push(`- ${P.deliveryReplays} delivery lines repeated an earlier one of the same session and were skipped.`);
+  if (P.sessionsWithStandingQueue) {
+    L.push(`- ${P.sessionsWithStandingQueue} sessions carried the delivery line's standing-queue fields; the others read – in that column.`);
+  }
   if (P.assumedLines) {
     L.push(
       `- Opens that passed over an entry with no measured provenance (the FR-148 P1 line): ${P.assumedLines}` +
@@ -1760,6 +1874,19 @@ function render(r) {
   if (!r.pairs.length) L.push('| – | – | – | 0 | – | – | – | – | 0 | 0 | – |');
   L.push('');
 
+  L.push('## Devices: the relay transport and the standing queue', '');
+  L.push(
+    `| Agent | Sessions | Sessions by relay transport (udp, tcp, tls, none, unknown, no line) | Sessions with a standing queue (at least ${SQ_SESSION_MIN} queued samples), by carrier class |`,
+  );
+  L.push('|---|---|---|---|');
+  for (const d of r.devices) {
+    const t = d.relayTransport;
+    const sq = d.standingQueue.length ? d.standingQueue.map((c) => `${c.carrier} ${c.standingQueue} of ${c.sessions}`).join(', ') : '–';
+    L.push(`| ${d.agent} | ${d.sessions} | ${t.udp}, ${t.tcp}, ${t.tls}, ${t.none}, ${t.unknown}, ${t.noLine} | ${sq} |`);
+  }
+  if (!r.devices.length) L.push('| – | 0 | – | – |');
+  L.push('');
+
   L.push('## Sessions', '');
   L.push(
     '| Start | Ran | Agent | Session | User | Carrier | Encoder | Opening | Slow-link | Entry | Demonstrated: window · before | ' +
@@ -1788,11 +1915,11 @@ function render(r) {
   L.push('## Sessions: the path', '');
   L.push(
     '| Start | Agent | Session | Carrier | Path change | Samples b · a · s | Backlogged min / mean / max | App-limited max | Stalled | ' +
-      'Opening ÷ backlogged max | Picture | At nominal after | Entry at the open | F3 |',
+      'Opening ÷ backlogged max | Picture | At nominal after | Entry at the open | F3 | Standing queue and relay |',
   );
-  L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
+  L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
   for (const s of r.sessions) L.push(`| ${minute(s.start)} | ${s.agent} | ${s.session} | ${s.carrier} | ${pathCells(s).join(' | ')} |`);
-  if (!r.sessions.length) L.push('| – | – | – | – | – | – | – | – | – | – | – | – | – | – |');
+  if (!r.sessions.length) L.push('| – | – | – | – | – | – | – | – | – | – | – | – | – | – | – |');
   L.push('');
 
   L.push('## Memory trail (every row inferred)', '');
@@ -1810,7 +1937,9 @@ function render(r) {
   L.push('## How this was read', '');
   L.push(
     "- Carrier: the `session carrier recorded` line, else the ICE line and the pump's `constrained` flag, marked (ice) or (pump). " +
-      '`turn` is TURN over UDP or over TCP/TLS: the agent\'s lines do not tell them apart.',
+      "Relay: that line's `relay_transport` on a newer agent, what carries the agent's own TURN allocation (`udp`, `tcp` or `tls`), " +
+      "`none` where the agent's selected candidate is no relay, `unknown` where the agent could not say, and `no line` where the carrier line lacks the field or there is none. " +
+      "A browser's own relay never reaches the agent: a `turn` session on it reads `none`, and its leg may be TURN over UDP, TCP or TLS.",
   );
   L.push(
     '- Pair: the agent, the controlling user (its last 6 hex; `?` when its request line was not read) and the carrier class. ' +
@@ -1841,6 +1970,12 @@ function render(r) {
     "- Backlogged max: the highest backlogged sample any of the pair's sessions read on its carrier, a rate the path carried for about 2 s while the sender had more to send. " +
       'It is not a capacity either: a sample partly stalled reads low, a viewer that stops reading holds the queue full, and the bytes are the whole association\'s ' +
       "(docs/rate-control.md § Delivery samples). F1's third row judges the opening against it; a pair with none is not judged there.",
+  );
+  L.push(
+    '- Standing queue: on a newer agent the delivery line counts its queued samples, those whose least acknowledgement delay stood 250 ms or more over the session\'s least ' +
+      'and that acknowledged enough bytes for that least to hold no delayed SACK (docs/rate-control.md § The standing queue). The row adds them over every line of the session, ' +
+      "whatever its side, of all those lines' samples; the p50 and the max are of each line's highest standing. A session with no such line reads –. " +
+      `Devices: per agent, its sessions by relay transport, and by carrier class the sessions with at least ${SQ_SESSION_MIN} queued samples, of those that carried the fields.`,
   );
   L.push(
     "- Path change: a flip of the FFmpeg heartbeat's `constrained` flag, or a carrier or ICE line that repeats with another value, at + seconds from the opening " +
@@ -2112,6 +2247,9 @@ const FX = {
   leftAgent: hex24('f148', 'c0a004'),
   rekeyAgent: hex24('f148', 'c0a005'),
   profileAgent: hex24('f148', 'c0a006'),
+  /** `standingFixtures`' agents: the standing queue and the relay transport. */
+  queueAgent: hex24('f148', 'c0a007'),
+  queueAgent2: hex24('f148', 'c0a008'),
   /** The CORPLAP-2 chain's memory entries and the quarter steps between them
    *  (FR-148 §2.1): each is damp(entry, entry raised n times). */
   entries: [179980, 197134, 208222, 213427, 233769, 281732],
@@ -2229,15 +2367,20 @@ function fxSession(o) {
   }
   if (o.carrier) {
     L.push(
-      fxLine(t + 2600, 'session carrier recorded (FR-102 P9c)', [
-        ['session_id', o.sid],
-        ['carrier', q(o.carrier)],
-        ['local_typ', 'Host'],
-        ['local_addr', 'ADDR-SECRET-L'],
-        ['remote_typ', 'Host'],
-        ['remote_addr', 'ADDR-SECRET-R'],
-        ['overlay', 'None'],
-      ]),
+      fxLine(
+        t + 2600,
+        'session carrier recorded (FR-102 P9c)',
+        [['session_id', o.sid], ['carrier', q(o.carrier)]]
+          // FR-148 P0: what carries the agent's own relay, on a newer agent.
+          .concat(o.relayTransport ? [['relay_transport', q(o.relayTransport)]] : [])
+          .concat([
+            ['local_typ', 'Host'],
+            ['local_addr', 'ADDR-SECRET-L'],
+            ['remote_typ', 'Host'],
+            ['remote_addr', 'ADDR-SECRET-R'],
+            ['overlay', 'None'],
+          ]),
+      ),
     );
   }
   let ts = t + 3000;
@@ -2268,20 +2411,41 @@ function fxSession(o) {
     // The delivery line follows the heartbeat that closed its last sample:
     // `n` the samples (backlogged, application-limited, stalled), `bl` the
     // backlogged rates (lowest, mean, highest) or none, `app` the highest
-    // application-limited rate or none. The shapes are media_delivery.rs's.
+    // application-limited rate or none; and on a newer agent `q`, the standing
+    // queue's fields (`ack` and `standing` tuples or none, `queued`). The
+    // shapes are media_delivery.rs's.
     const delivery = () => {
       if (!w.dl) return;
       const d = w.dl;
+      const g = d.q;
       L.push(
-        fxLine(ts + 1, 'path delivery (FR-148 P0, shadow, ≈10s)', [
-          ['session_id', o.sid],
-          ['span_ms', String(d.span === undefined ? 10000 : d.span)],
-          ['delivery_samples', `(${d.n.join(', ')})`],
-          ['backlogged_bps', d.bl ? `Some((${d.bl.join(', ')}))` : 'None'],
-          ['app_limited_bps', some(d.app)],
-          ['stalled_ms', String(d.stalledMs || 0)],
-          ['acked_bytes', String(d.acked === undefined ? 1200000 : d.acked)],
-        ]),
+        fxLine(
+          ts + 1,
+          'path delivery (FR-148 P0, shadow, ≈10s)',
+          [
+            ['session_id', o.sid],
+            ['span_ms', String(d.span === undefined ? 10000 : d.span)],
+            ['delivery_samples', `(${d.n.join(', ')})`],
+            ['backlogged_bps', d.bl ? `Some((${d.bl.join(', ')}))` : 'None'],
+            ['app_limited_bps', some(d.app)],
+            ['stalled_ms', String(d.stalledMs || 0)],
+            ['acked_bytes', String(d.acked === undefined ? 1200000 : d.acked)],
+          ].concat(
+            g
+              ? [
+                  ['ack_ms', g.ack ? `Some((${g.ack.join(', ')}))` : 'None'],
+                  ['standing_ms', g.standing ? `Some((${g.standing.join(', ')}))` : 'None'],
+                  ['queued', String(g.queued)],
+                  ['inflight', '(1200, 60000)'],
+                  ['cwnd', '(4380, 131072)'],
+                  ['ssthresh', '1048576'],
+                  ['rwnd_low', '0'],
+                  ['pending_high', '131072'],
+                  ['loss', '(0, 0)'],
+                ]
+              : [],
+          ),
+        ),
       );
     };
     if (o.vp9) {
@@ -2744,9 +2908,64 @@ function pathFixtures() {
   return out;
 }
 
-/** Every fixture: the reference chains and the path questions. */
+/**
+ * FR-148 P0's standing queue and relay transport, as rolling-log lines with
+ * invented ids, beside the other sets, whose lines stay as they were. Every
+ * session is under 30 s, and no window reads an age, so none demonstrates a
+ * rate or is judged by a flag.
+ *
+ * - c0a007: f70001 on TURN over TLS (the agent's own relay) queued 8 of its 15
+ *   samples, its first line loaded with no queue and the two after it queued;
+ *   f70002 on TURN over UDP queued none; f70003, direct, queued 1; f70004 is an
+ *   older agent's, whose carrier line has no relay transport and whose
+ *   delivery lines no standing queue.
+ * - c0a008: f80001 on the device's own TURN, whose relay transport the agent
+ *   could not say, on a still screen; f80002 has no carrier line, and queued 4.
+ */
+function standingFixtures() {
+  const out = [];
+  const push = (agent, lines) => {
+    for (const l of lines) out.push([agent, l]);
+  };
+  const at = (s) => Date.parse(s);
+  const app = (queue) => ({ n: [0, 5, 0], bl: null, app: 1900000, q: queue });
+  const session = (agent, sid, when, o, lines) =>
+    push(
+      agent,
+      fxSession(
+        Object.assign({ sid: hex24('f148', sid), user: FX.other, at: at(when), enc: 'av1_nvenc', codec: 'AV1', w: 1920, h: 1080, fps: 30 }, o, {
+          wins: Array.from({ length: 15 }, (_, i) => ({ target: 2000000, rate: 1800000, age: null, floor: null, qp: 30, dl: lines[i] })),
+        }),
+      ),
+    );
+  const turn = { carrier: 'turn', relay: true, constrained: true };
+  session(FX.queueAgent, 'f70001', '2026-11-17T09:00:00Z', Object.assign({ relayTransport: 'tls' }, turn), {
+    4: app({ ack: [61, 61, 64], standing: [0, 3], queued: 0 }),
+    9: app({ ack: [61, 240, 1318], standing: [179, 1257], queued: 3 }),
+    14: app({ ack: [61, 361, 2271], standing: [300, 2210], queued: 5 }),
+  });
+  session(FX.queueAgent, 'f70002', '2026-11-17T10:00:00Z', Object.assign({ relayTransport: 'udp' }, turn), {
+    4: app({ ack: [58, 58, 70], standing: [0, 12], queued: 0 }),
+    9: app({ ack: [58, 59, 119], standing: [1, 61], queued: 0 }),
+  });
+  session(FX.queueAgent, 'f70003', '2026-11-17T11:00:00Z', { carrier: 'direct', relay: false, constrained: false, relayTransport: 'none' }, {
+    4: app({ ack: [20, 20, 50], standing: [0, 30], queued: 0 }),
+    9: app({ ack: [20, 22, 280], standing: [2, 260], queued: 1 }),
+    14: app({ ack: [20, 20, 60], standing: [0, 40], queued: 0 }),
+  });
+  session(FX.queueAgent, 'f70004', '2026-11-17T12:00:00Z', turn, { 4: app(undefined), 9: app(undefined) });
+  session(FX.queueAgent2, 'f80001', '2026-11-17T13:00:00Z', { carrier: 'turn_local', relay: true, constrained: false, relayTransport: 'unknown' }, {
+    4: { n: [0, 5, 0], bl: null, app: 16384, acked: 20480, q: { ack: null, standing: null, queued: 0 } },
+  });
+  session(FX.queueAgent2, 'f80002', '2026-11-17T14:00:00Z', { relay: true, constrained: true }, {
+    4: app({ ack: [70, 400, 900], standing: [330, 830], queued: 4 }),
+  });
+  return out;
+}
+
+/** Every fixture: the reference chains, the path questions and the standing queue. */
 function allFixtures() {
-  return fixtures().concat(pathFixtures());
+  return fixtures().concat(pathFixtures(), standingFixtures());
 }
 
 /** The fixtures as `agent_logs` batches, canonical EJSON, one string each: every
@@ -3208,10 +3427,75 @@ function selfTest() {
   );
   ok(sessionOf(kept, 'e80005').path.entryAtOpen.withoutPairEntry === false, 'a write with no evidence on day 6 does not renew the age of day 0');
 
+  // --- FR-148 P0: the standing queue and the relay transport
+  ok(
+    JSON.stringify(couple('Some((3, 1257))')) === '[3,1257]' && JSON.stringify(couple('(1200, 60000)')) === '[1200,60000]' && couple('None') === null && couple('(1, 2, 3)') === null && couple(null) === null,
+    'standing_ms: Some((low, high)) reads, None is no standing, and a three-tuple is no pair',
+  );
+  ok(
+    relayTransportOf('"tls"') === 'tls' && relayTransportOf('none') === 'none' && relayTransportOf('quic') === 'unknown' && relayTransportOf(null) === null && relayTransportOf('None') === null,
+    "relay_transport: its words read, a word this build does not know reads unknown, never a guess, and no field is no line's",
+  );
+  const sfx = standingFixtures();
+  const rs = runPairs(sfx);
+  const sqRow = (sid) => cells(sessionOf(rs, sid))[10];
+  ok(sqRow('f70001') === 'standing queue: queued 8 of 15 samples, standing 1257/2210 ms, relay tls', "f70001 on TURN over TLS: 8 of its 15 samples queued, the p50 and the max of its lines' highest standing", sqRow('f70001'));
+  ok(sqRow('f70002') === 'standing queue: queued 0 of 10 samples, standing 12/61 ms, relay udp', 'f70002 on TURN over UDP: none queued', sqRow('f70002'));
+  ok(sqRow('f70003') === 'standing queue: queued 1 of 15 samples, standing 40/260 ms, relay none', 'f70003, direct: one queued, and no relay of its own', sqRow('f70003'));
+  const older = sessionOf(rs, 'f70004');
+  ok(
+    sqRow('f70004') === 'standing queue: –, relay no line' && older.path.standingQueue === null && older.path.relayTransport === null && older.path.delivery.lines === 2,
+    "an older agent's session: its delivery lines count as before, its standing queue reads –, and its relay no line",
+    older.path,
+  );
+  ok(sqRow('f80001') === 'standing queue: queued 0 of 5 samples, standing –/– ms, relay unknown', 'a still screen: no sample counted, so no standing, on a relay the agent could not name', sqRow('f80001'));
+  ok(
+    sqRow('f80002') === 'standing queue: queued 4 of 5 samples, standing 830/830 ms, relay no line' && sessionOf(rs, 'f80002').carrier === 'turn (ice)',
+    'no carrier line: the class from the ICE line, and no line for the relay',
+    sqRow('f80002'),
+  );
+  const dev = (agent) => rs.devices.find((d) => d.agent === agent);
+  ok(
+    dev('c0a007').sessions === 4 && JSON.stringify(dev('c0a007').relayTransport) === JSON.stringify({ udp: 1, tcp: 0, tls: 1, none: 1, unknown: 0, noLine: 1 }),
+    'per device: its sessions by relay transport, an older line counted as no line',
+    dev('c0a007'),
+  );
+  ok(
+    JSON.stringify(dev('c0a007').standingQueue) === JSON.stringify([{ carrier: 'direct', sessions: 1, standingQueue: 0 }, { carrier: 'turn', sessions: 2, standingQueue: 1 }]),
+    `and by carrier class, the sessions with at least ${SQ_SESSION_MIN} queued samples of those that carried the fields: one queued sample is no standing queue`,
+    dev('c0a007').standingQueue,
+  );
+  const mdS = render(rs);
+  ok(
+    /\| c0a007 \| 4 \| 1, 0, 1, 1, 0, 1 \| direct 0 of 1, turn 1 of 2 \|/.test(mdS) && /\| c0a008 \| 2 \| 0, 0, 0, 0, 1, 1 \| turn \(ice\) 1 of 1, turn-local 0 of 1 \|/.test(mdS),
+    'the device summary renders',
+    mdS.split('\n').filter((l) => /^\| c0a00[78] \| \d \|/.test(l)),
+  );
+  ok(rs.provenance.sessionsWithStandingQueue === 5 && /- 5 sessions carried the delivery line's standing-queue fields/.test(mdS), 'the sessions that carried the fields are counted', rs.provenance);
+  const dupS = runPairs(sfx.concat(sfx.filter(([, l]) => /path delivery/.test(l))));
+  ok(
+    dupS.provenance.deliveryReplays === 12 && JSON.stringify(dupS.sessions) === JSON.stringify(rs.sessions) && JSON.stringify(dupS.devices) === JSON.stringify(rs.devices),
+    'a delivery line uploaded twice changes no standing queue',
+    dupS.provenance,
+  );
+  const relayLater = runPairs(
+    edge(
+      'e90001',
+      flat(6, (i) => (i === 3 ? { extra: [[600, 'session carrier recorded (FR-102 P9c)', [['carrier', '"turn"'], ['relay_transport', '"tls"']]]] } : {})),
+      { relayTransport: 'udp' },
+    ),
+  ).sessions[0];
+  ok(relayLater.path.relayTransport === 'tls', 'a carrier line that repeats: the last one names the relay, as it names the class', relayLater.path);
+
   // The base chains carry none of the new lines: their delivery cells read –.
   ok(
     r.provenance.deliveryLines === 0 && r.provenance.assumedLines === 0 && r.sessions.every((s) => s.path.delivery === null && cells(s)[1] === '–'),
     'on the reference chains, which carry no delivery line, every delivery cell reads –',
+  );
+  ok(
+    r.sessions.every((s) => s.path.standingQueue === null && s.path.relayTransport === null && cells(s)[10] === 'standing queue: –, relay no line') &&
+      r.devices.every((d) => d.relayTransport.noLine === d.sessions && d.standingQueue.length === 0),
+    'nor a standing queue or a relay transport: each reads – and no line',
   );
 
   // --- what leaves: no address, no name, no full id
@@ -3339,6 +3623,25 @@ function selfTest() {
         /backlogged_bps=None/.test(deliveryRs),
       "the daemon's pinned line reads back: (2, 3, 0), Some((…)), Some(310112), and None",
       [pinned('delivery_samples'), pinned('backlogged_bps'), pinned('app_limited_bps')],
+    );
+    // FR-148 P0: the standing queue's fields, and the carrier line's relay words.
+    ok(
+      num(pinned('queued')) === 2 &&
+        JSON.stringify(couple(pinned('standing_ms'))) === '[3,1257]' &&
+        /queued = q\.queued,/.test(deliveryRs) &&
+        /standing_ms = \?q\.standing_ms,/.test(deliveryRs) &&
+        /standing_ms=None/.test(deliveryRs),
+      "the standing queue's fields: queued an integer, standing_ms a ?Debug Option of a pair, as the daemon's pinned line has them",
+      [pinned('queued'), pinned('standing_ms')],
+    );
+    const carrierRs = src('session_carrier.rs');
+    const words = [];
+    const wordRe = /RelayTransport::\w+ => "([a-z]+)"/g;
+    for (let m = wordRe.exec(carrierRs); m; m = wordRe.exec(carrierRs)) words.push(m[1]);
+    ok(
+      JSON.stringify(words.slice().sort()) === JSON.stringify(RELAY_TRANSPORTS.slice().sort()) && /relay_transport = relay\.as_str\(\),/.test(carrierRs),
+      "the carrier line's relay_transport words are session_carrier.rs's, logged as text",
+      words,
     );
     // The assumed line: its key is a &str, its rate and age integers.
     ok(
@@ -3489,6 +3792,7 @@ if (typeof module !== 'undefined' && module.exports) {
     judgeF3,
     fixtures,
     pathFixtures,
+    standingFixtures,
     allFixtures,
     FIELDS,
     MSG_PATTERN,

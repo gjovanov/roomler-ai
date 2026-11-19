@@ -1759,6 +1759,11 @@ it. A session with no nominated pair within the wait writes no carrier line, as 
 | `session_carrier::tests::a_pair_on_the_agents_udp_relay_names_its_transport` | two peer connections that gather relay candidates only, from a TURN server on loopback over UDP: the agent's nominated pair reads `Relay` and `udp`, through both vendored crates |
 | the fork's `candidate_relay_test.rs`, `a_relay_candidate_names_what_carries_its_allocation` | a relay gathered over a UDP TURN URL carries `(Udp, Turn)`, and a host candidate carries none (CI's vendored-ice lane) |
 
+FR-148's path report reads both from the fleet's logs: each session's queued samples and
+its relay transport, and per device its sessions by relay transport and, by carrier
+class, those with a standing queue ([production-mongo-reads.md](production-mongo-reads.md)
+§8).
+
 ## The open-time train (FR-148 P0): reading the path before the first frame
 
 FR-148 P0, step 4a (#3953). **Built and tested, and run by no session yet**: step 4b
