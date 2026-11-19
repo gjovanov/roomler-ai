@@ -218,6 +218,16 @@ config: the legacy-config migration makes it `0700` as it moves one in, and a re
 applies to `enroll`'s own folder. The report then carries `enrollment_unknown: true`, with
 `enrolled: false`, until a service names the device (`take_daemon_word`, `:93`):
 
+```mermaid
+flowchart TD
+    A["the config this person reads<br/>holds an enrollment?"] -->|yes| E["Enrolled"]
+    A -->|no| B["the daemon names the device?"]
+    B -->|yes| E
+    B -->|"no answer, or no name"| C["the service's own config,<br/>looked for as the table above says"]
+    C -->|"there, or its folder does not say"| U["not known: Offline,<br/>no set-up offer"]
+    C -->|"not there, or not looked for"| N["Not enrolled:<br/>set-up offered"]
+```
+
 | Page | Not enrolled | Not known (`enrollment_unknown`) |
 |---|---|---|
 | Overview, the device card | chip **Not enrolled**; the banner "Not enrolled … Set up this device" | chip **Offline** and "The device service is not running.", the encoders and files cards' words, or "The device service did not answer." while it runs; no banner (`src/front/overview.js:21-52`) |
