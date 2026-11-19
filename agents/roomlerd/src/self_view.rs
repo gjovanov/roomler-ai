@@ -1670,9 +1670,12 @@ mod tests {
     /// apart share one connection, and a GET after the connection sat idle
     /// longer than the timeout dials a new one. Production's value is held
     /// at 20 s or less by a const assertion beside [`POOL_IDLE_TIMEOUT`].
+    /// The timeout is 2 s so that a loaded CI runner would have to stall for
+    /// almost 2 s between the first two GETs to split them (#4009 was a
+    /// timing test on this suite's runners).
     #[tokio::test]
     async fn a_connection_idle_past_the_pool_timeout_is_never_reused() {
-        const IDLE: Duration = Duration::from_millis(500);
+        const IDLE: Duration = Duration::from_secs(2);
         let srv = scripted_server(|_, _| Turn::Answer).await;
         let http = pooled_client(IDLE).build().map_err(|e| e.to_string());
         let view = SelfView::with_client(registry(&srv.url), http, no_cache());
@@ -1681,7 +1684,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
         assert_eq!(srv.seen(), (1, 2), "50 ms apart: one connection");
-        tokio::time::sleep(IDLE + Duration::from_millis(300)).await;
+        tokio::time::sleep(IDLE + Duration::from_millis(500)).await;
         assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
         assert_eq!(
             srv.seen(),
