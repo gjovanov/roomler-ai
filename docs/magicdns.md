@@ -22,9 +22,9 @@ gated on the bind, never the reverse.
 
 🔑 **Whether the two meet is measured, never inferred** (#1363). Both halves can
 be up while the host's own lookups never arrive: a policy-managed NRPT ignores
-the rule, or an enforced corporate DNS layer refuses the query. So once a minute
-the daemon asks the OS for a name only an overlay resolver answers, and
-`roomler status` says `active` only on that answer
+the rule, or an enforced corporate DNS layer refuses the query. So the daemon
+asks the OS for a name only an overlay resolver answers, and `roomler status`
+says `active` only on that answer
 ([What `roomler status` says](#what-roomler-status-says)).
 
 ## Who sets the domain and the upstreams
@@ -216,12 +216,13 @@ write that name — it would answer its own probe, and the ladder could never
 climb back. A check that cannot fail is not a check.
 
 Since #1363 the probe is one task that the ladder and the status share
-(`OsProbe`, `crates/tunnel-core/src/overlay/dns_probe.rs:168`): one lookup a
-minute, on a task of its own. It never runs on the runtime loop, because a host
-whose DNS drops queries rather than refusing them holds `getaddrinfo` for the
-whole 5 s timeout. The ladder reads the latest reading on each tick
-(`hosts.rs:222`) and counts any answer as the DNS rung, as before. The status
-is stricter: it says `active` only when the answer is this node's own address.
+(`OsProbe`, `crates/tunnel-core/src/overlay/dns_probe.rs:257`), and while the
+hosts rung is switched on it keeps the ladder's cadence: one lookup a minute.
+It never runs on the runtime loop, because a host whose DNS drops queries
+rather than refusing them holds `getaddrinfo` for the whole 5 s timeout. The
+ladder reads the latest reading on each tick (`hosts.rs:254`) and counts any
+answer as the DNS rung, as before. The status is stricter: it says `active` only
+when the answer is this node's own address.
 
 ### The hosts rung, and what it is careful about
 
@@ -266,24 +267,24 @@ something on the host is eating its own DNS.
 ## What `roomler status` says
 
 `roomler status` and the companion's DNS line print the same words, from one
-function (`DnsStatus::health`, `crates/localapi/src/dns.rs:146`). 🔑 **They come
-from a measurement, not from what was attempted** (#1363). Once a minute the
-daemon resolves `_roomler-probe.<magic domain>` through the OS (`getaddrinfo`,
-the path an application takes), and only an overlay resolver answers that
-name. The probe runs whenever the steer is written or the hosts rung is
-switched on. Its first reading comes 2 s after it starts, and a late steer, or a
-resolver that gets its socket back, makes it ask again at once.
+function (`DnsStatus::health`, `crates/localapi/src/dns_health.rs:202`). 🔑 **They come
+from a measurement, not from what was attempted** (#1363). The daemon resolves
+`_roomler-probe.<magic domain>` through the OS (`getaddrinfo`, the path an
+application takes), and only an overlay resolver answers that name. The probe
+runs whenever the steer is written or the hosts rung is switched on, on the
+schedule in [What the probe costs the host's DNS](#what-the-probe-costs-the-hosts-dns).
 
 | `magicdns <domain> (…)` | What was measured | What to do |
 |---|---|---|
-| `active` | the OS resolved the probe name to **this node's own** overlay address, at most 3 min ago | nothing |
+| `active` | the OS resolved the probe name to **this node's own** overlay address, in the latest reading | nothing |
 | `names resolve through another resolver` | the OS resolved it to **another** address, so something else answers the domain on this host. On WSL that is the Windows host's resolver, through its DNS proxy, when that host runs roomlerd in the same org. The second line names who answered, and the bypass | nothing urgent: names work, through another node. For this node's own resolver, fix the bypass (the Linux row above) |
 | `names served from the hosts file` | the hosts rung serves the names ([below](#the-hosts-rung-and-what-it-is-careful-about)), and the second line says why the DNS rung does not | nothing urgent: the ladder climbs back on its own |
 | `resolver binding (retrying)` | the resolver has no socket: it never bound, or it lost the socket and its rebind fails (1 s → 60 s) | who holds `<overlay ip>:53` ([below](#diagnosing-it--and-the-probes-that-lie)) |
 | `resolver up, OS steer FAILED` | the steer could not be written, or the platform has none | the log: `magicdns: OS-config command failed` |
 | `the OS does not reach the resolver` | the probe had no answer within 5 s. The second line names why, when the daemon can tell | by the reason, next table |
 | `not measured yet` | the first reading is not in | wait a few seconds |
-| `not measured for <N> min` | the last reading is more than 3 min old: the measurement stopped | the daemon's log |
+| `not measured for <N> min` | the next reading is more than 2 min later than the time the last one announced (`next_at_ms`): the measurement stopped. `<N>` is the last reading's age | the daemon's log |
+| `steered, not measured (probe off)` | nothing: the probe is switched off on this node (`ROOMLERD_MAGICDNS_PROBE=0`). The other words of an older daemon (`resolver DOWN`, `resolver up, OS steer FAILED`, `steered but BYPASSED`) can show too | nothing, or switch the probe back on to see the outcome |
 
 The second line under `the OS does not reach the resolver`:
 
@@ -295,7 +296,7 @@ The second line under `the OS does not reach the resolver`:
 | `the steer is bypassed: <where lookups go>` | Linux: nsswitch and `/etc/resolv.conf`, read when the steer is written | nothing asks systemd-resolved (the Linux row above) |
 
 ⚠️ The Windows reason is read from the registry by the daemon itself
-(`dns_probe.rs:306`), without starting PowerShell, and only after a probe that
+(`dns_probe.rs:448`), without starting PowerShell, and only after a probe that
 was not answered. It chooses the words and never the state: a rule the NRPT
 holds is still not an answer.
 
@@ -312,11 +313,40 @@ a label missing from the name map is NXDOMAIN. Nor does it prove that an
 application which does its own DNS takes the OS path (a browser with
 DNS-over-HTTPS, a container with its own `resolv.conf`).
 
-⚠️ Where the OS does not reach the resolver, the probe goes wherever the OS
-sends it, so the host's own DNS sees one query a minute for
-`_roomler-probe.<magic domain>`. FR-72 P6's ladder already sent it while the
-hosts rung was switched on. Since #1363 it also goes whenever the steer is
-written.
+### What the probe costs the host's DNS
+
+Where the steer reaches this node, the probe is answered by this node's own
+resolver, on its own overlay address, and nothing leaves the host. ⚠️ Where it
+does not, the lookup goes wherever the OS sends it: on a corporate laptop whose
+DNS is enforced, to the corporate resolver. One name asked at one fixed period
+is what a SOC's beacon detection looks for, and before #1363 only the opt-in
+hosts rung asked it. So the probe that only the status reads backs off:
+
+| Who reads it | Schedule | Lookups |
+|---|---|---|
+| the hosts rung, switched on (`ROOMLERD_MAGICDNS_HOSTS=1`) | every 60 s, with no jitter, as FR-72 P6's own lookup was before #1363 | 60 an hour, as before |
+| only the status (the default) | 2 s after it starts, then 60 s, doubled after each reading that changed nothing, up to 15 min (`dns_probe.rs:84`). Each wait varies by up to a tenth either way, so no host asks at a fixed period and a fleet never asks in step | about 7 in the first hour, then 4 an hour |
+| nobody: the steer is not written and the hosts rung is off | none | 0 |
+
+🔑 **A change is measured when it happens, not when the schedule comes round.**
+A changed reading starts the waits over at 60 s, and so does each of these,
+measured 2 s after it (kicks that come together cost one lookup):
+
+| Kick | Where |
+|---|---|
+| the steer is written late, once the resolver binds | `runtime.rs:3101` |
+| the resolver gets its socket back | `runtime.rs:3120` |
+| the network materially moves (a VPN connects, the default route changes). netstate publishes at most one such change per 120 s, so a VPN's route war never drives it | `runtime.rs:3497` |
+| the host slept: the wall clock ran more than 30 s past the monotonic one, which stops in a suspend on Linux and macOS | `dns_probe.rs:104` |
+
+Each reading says when the next one comes (`next_at_ms`), so a client reads a
+backed-off reading as current and calls it stale only when that time is more
+than 2 min past (`DnsProbeStatus::stale_after_ms`,
+`crates/localapi/src/dns_health.rs:72`).
+
+`ROOMLERD_MAGICDNS_PROBE=0` switches the status's probe off on a host where even
+that is unwanted. The status then says what was attempted, never `active`. It
+does not stop the hosts rung's probe: the rung needs the readings.
 
 ## Failure modes worth recognising
 

@@ -33,10 +33,10 @@ pub use devices::{
 
 // #1363 — MagicDNS's measured outcome and the words every client prints for
 // it, in one place so the CLI and the companion cannot disagree.
-mod dns;
-pub use dns::{
-    DNS_PROBE_EVERY_MS, DNS_PROBE_STALE_MS, DnsHealth, DnsProbeOutcome, DnsProbeStatus,
-    DnsUnreachedReason, LegacyDns,
+mod dns_health;
+pub use dns_health::{
+    DNS_PROBE_EVERY_MAX_MS, DNS_PROBE_EVERY_MS, DNS_PROBE_LATE_MS, DnsHealth, DnsProbeOutcome,
+    DnsProbeStatus, DnsUnreachedReason, LegacyDns,
 };
 
 /// How this node currently reaches a peer — the Tailscale-style connection

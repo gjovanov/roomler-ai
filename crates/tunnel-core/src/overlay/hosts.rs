@@ -339,6 +339,7 @@ mod tests {
             outcome,
             at: None,
             reason: None,
+            next_at: None,
         };
         let other = std::net::IpAddr::V4(Ipv4Addr::new(100, 65, 4, 2));
         let mut seen = 0;

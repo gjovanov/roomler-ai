@@ -4,8 +4,8 @@
 //! #1363 — the OS path, measured: do this host's own lookups reach the overlay
 //! resolver?
 //!
-//! Once a minute the runtime resolves `_roomler-probe.<magic domain>` through
-//! the OS (`getaddrinfo`). Only an overlay resolver answers that name, and this
+//! The runtime resolves `_roomler-probe.<magic domain>` through the OS
+//! (`getaddrinfo`). Only an overlay resolver answers that name, and this
 //! node's resolver answers it with this node's own overlay address
 //! ([`super::dns::PROBE_LABEL`]). Two readers share the one lookup:
 //!
@@ -26,6 +26,15 @@
 //! ⚠️ On Windows, a probe that was not answered reads the NRPT stores to CHOOSE
 //! THE WORDS, never to decide the state. A rule the NRPT holds is still not an
 //! answer (FR-72: "effective ≠ answers").
+//!
+//! ⚠️ **What it costs the host's DNS** ([`Cadence`]). Where the steer reaches
+//! this node, the lookup is answered by this node's own resolver and leaves
+//! nothing on the wire. Where it is bypassed (the corporate laptop whose DNS
+//! is enforced), the lookup goes to the host's own DNS servers, and a lookup
+//! of one name at one fixed period reads as a beacon to a SOC. So the status's
+//! probe waits twice as long after each reading that changed nothing, up to
+//! 15 min, each wait jittered, and measures again at once only when something
+//! it can see changed. The ladder, opt-in, keeps its one lookup a minute.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
@@ -35,13 +44,66 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, watch};
 
 use crate::localapi::{
-    DNS_PROBE_EVERY_MS, DnsProbeOutcome, DnsProbeStatus, DnsStatus, DnsUnreachedReason,
+    DNS_PROBE_EVERY_MAX_MS, DNS_PROBE_EVERY_MS, DnsProbeOutcome, DnsProbeStatus, DnsStatus,
+    DnsUnreachedReason,
 };
 
-/// The measurement's cadence, and the ladder's (one lookup serves both). The
-/// LocalAPI constant is the single source, because a client reads a reading
-/// older than three of these as stopped.
+/// The first wait between two measurements, and the ladder's only one. The
+/// LocalAPI constants are the single source: a client reads a reading as
+/// stopped against the time it announced for the next one.
 pub const PROBE_EVERY: Duration = Duration::from_millis(DNS_PROBE_EVERY_MS);
+
+/// The longest wait between two measurements that only the status reads.
+pub const PROBE_EVERY_MAX: Duration = Duration::from_millis(DNS_PROBE_EVERY_MAX_MS);
+
+/// The longest single sleep of a wait. Between two, the probe compares its
+/// clocks, so a host that slept is measured within this long of waking.
+const CLOCK_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// The wall clock ran this much further than the monotonic one over one
+/// sleep: the host slept. Linux's and macOS's monotonic clocks stop in a
+/// suspend, so without this check a wait would run long by the time asleep.
+const SLEPT_AFTER: Duration = Duration::from_secs(30);
+
+/// Who reads the measurements, which decides how often they are taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cadence {
+    /// FR-72 P6's ladder is on (`ROOMLERD_MAGICDNS_HOSTS=1`, opt-in): one
+    /// lookup every [`PROBE_EVERY`], with no jitter, exactly as the ladder's own
+    /// lookup was before #1363. Its climb back off the hosts file waits on
+    /// the next reading.
+    Ladder,
+    /// Only the status reads them: [`PROBE_EVERY`], doubled after each
+    /// reading that changed nothing, up to [`PROBE_EVERY_MAX`], every wait
+    /// jittered by up to a tenth. A changed reading, or a kick, starts it over.
+    Status,
+}
+
+/// The wait after a reading, before its jitter. `every` is the last one, and
+/// `unchanged` says the reading was the one before it again.
+fn next_every(cadence: Cadence, every: Duration, unchanged: bool) -> Duration {
+    match cadence {
+        Cadence::Ladder => PROBE_EVERY,
+        Cadence::Status if unchanged => (every * 2).min(PROBE_EVERY_MAX),
+        Cadence::Status => PROBE_EVERY,
+    }
+}
+
+/// The wait itself: the status's varies by up to a tenth either way (`r` is
+/// a random number), so no host asks at one fixed period and a fleet never
+/// asks in step. The ladder's does not, as before #1363.
+fn jittered(cadence: Cadence, every: Duration, r: u64) -> Duration {
+    match cadence {
+        Cadence::Ladder => every,
+        Cadence::Status => every * (900 + (r % 201) as u32) / 1000,
+    }
+}
+
+/// Did the host sleep during one sleep of a wait? `mono` and `wall` are what
+/// the monotonic and the wall clock counted over it.
+fn slept(mono: Duration, wall: Duration) -> bool {
+    wall > mono + SLEPT_AFTER
+}
 
 /// A `getaddrinfo` that has not answered in this long is a failure. Generous:
 /// on an enforced-DNS host the query is refused fast, but a corporate resolver
@@ -66,6 +128,8 @@ pub enum Outcome {
     AnsweredElsewhere(IpAddr),
     /// No address within [`PROBE_TIMEOUT`].
     Unanswered,
+    /// The probe is switched off on this node (`ROOMLERD_MAGICDNS_PROBE=0`).
+    Off,
 }
 
 impl Outcome {
@@ -103,6 +167,8 @@ pub struct Reading {
     pub at: Option<SystemTime>,
     /// Windows, after an [`Outcome::Unanswered`]: what the NRPT stores say.
     pub reason: Option<DnsUnreachedReason>,
+    /// When the probe measures next, unless something kicks it sooner.
+    pub next_at: Option<SystemTime>,
 }
 
 impl Default for Reading {
@@ -119,6 +185,26 @@ impl Reading {
             outcome: Outcome::Pending,
             at: None,
             reason: None,
+            next_at: None,
+        }
+    }
+
+    /// What a runtime reads when the probe is switched off on this node. Its
+    /// `seq` stays 0, so the ladder never acts on it.
+    pub fn off() -> Self {
+        Self {
+            outcome: Outcome::Off,
+            ..Self::pending()
+        }
+    }
+
+    /// What a runtime with no probe running reads: not measured yet, or
+    /// switched off (`probe_on` is `ROOMLERD_MAGICDNS_PROBE`).
+    pub fn idle(probe_on: bool) -> Self {
+        if probe_on {
+            Self::pending()
+        } else {
+            Self::off()
         }
     }
 
@@ -131,16 +217,19 @@ impl Reading {
                 (DnsProbeOutcome::AnsweredElsewhere, Some(a.to_string()))
             }
             Outcome::Unanswered => (DnsProbeOutcome::Unanswered, None),
+            Outcome::Off => (DnsProbeOutcome::Off, None),
+        };
+        let ms = |t: SystemTime| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64)
         };
         DnsProbeStatus {
             outcome,
-            at_ms: self.at.and_then(|t| {
-                t.duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_millis() as u64)
-            }),
+            at_ms: self.at.and_then(ms),
             answered_by,
             reason: self.reason,
+            next_at_ms: self.next_at.and_then(ms),
         }
     }
 }
@@ -172,27 +261,32 @@ pub struct OsProbe {
 }
 
 impl OsProbe {
-    /// Start measuring `<PROBE_LABEL>.<magic_domain>` through the OS.
-    pub fn spawn(magic_domain: String, own: Ipv4Addr) -> Self {
+    /// Start measuring `<PROBE_LABEL>.<magic_domain>` through the OS, as often
+    /// as `cadence` says.
+    pub fn spawn(magic_domain: String, own: Ipv4Addr, cadence: Cadence) -> Self {
         let name = format!("{}.{magic_domain}:0", super::dns::PROBE_LABEL);
         let ns = format!(".{magic_domain}");
         Self::spawn_with(
             move || lookup(name.clone(), own),
             move || unreached_reason(ns.clone()),
+            cadence,
+            rand::random::<u64>,
         )
     }
 
-    /// [`Self::spawn`] with the lookup and the reason read injected (tests).
-    fn spawn_with<L, LF, R, RF>(lookup: L, reason: R) -> Self
+    /// [`Self::spawn`] with the lookup, the reason read and the jitter's
+    /// random numbers injected (tests).
+    fn spawn_with<L, LF, R, RF, J>(lookup: L, reason: R, cadence: Cadence, jitter: J) -> Self
     where
         L: Fn() -> LF + Send + 'static,
         LF: Future<Output = Outcome> + Send + 'static,
         R: Fn() -> RF + Send + 'static,
         RF: Future<Output = Option<DnsUnreachedReason>> + Send + 'static,
+        J: Fn() -> u64 + Send + 'static,
     {
         let (tx, rx) = watch::channel(Reading::pending());
         let kick = Arc::new(Notify::new());
-        let task = tokio::spawn(run(lookup, reason, tx, kick.clone()));
+        let task = tokio::spawn(run(lookup, reason, cadence, jitter, tx, kick.clone()));
         Self { rx, kick, task }
     }
 
@@ -201,9 +295,10 @@ impl OsProbe {
         self.rx.borrow().clone()
     }
 
-    /// Measure again now rather than at the next interval: the OS steer was
-    /// just installed, or the resolver just got its socket back, and the last
-    /// reading describes the state before it.
+    /// Measure again soon rather than at the next interval, and start the
+    /// waits over: the OS steer was just installed, the resolver just got its
+    /// socket back, or the network moved, and the last reading describes the
+    /// state before it. Kicks that come together cost one lookup.
     pub fn kick(&self) {
         self.kick.notify_one();
     }
@@ -216,19 +311,37 @@ impl OsProbe {
     }
 }
 
-async fn run<L, LF, R, RF>(lookup: L, reason: R, tx: watch::Sender<Reading>, kick: Arc<Notify>)
-where
+async fn run<L, LF, R, RF, J>(
+    lookup: L,
+    reason: R,
+    cadence: Cadence,
+    jitter: J,
+    tx: watch::Sender<Reading>,
+    kick: Arc<Notify>,
+) where
     L: Fn() -> LF,
     LF: Future<Output = Outcome>,
     R: Fn() -> RF,
     RF: Future<Output = Option<DnsUnreachedReason>>,
+    J: Fn() -> u64,
 {
     let mut seq = 0u64;
     let mut wait = FIRST_PROBE_AFTER;
+    // The un-jittered wait the next one is grown from.
+    let mut every = PROBE_EVERY;
+    let mut last: Option<(Outcome, Option<DnsUnreachedReason>)> = None;
     loop {
-        tokio::select! {
-            () = tokio::time::sleep(wait) => {}
-            () = kick.notified() => {}
+        let woken = pause(wait, &kick).await;
+        if woken {
+            // Something changed what the OS does: give it a moment to take
+            // the change, as the first measurement does. A kick that came in
+            // that moment asks for this same measurement.
+            tokio::time::sleep(FIRST_PROBE_AFTER).await;
+            tokio::select! {
+                biased;
+                () = kick.notified() => {}
+                () = std::future::ready(()) => {}
+            }
         }
         let outcome = lookup().await;
         let why = if outcome == Outcome::Unanswered {
@@ -236,15 +349,44 @@ where
         } else {
             None
         };
+        let unchanged = !woken && last == Some((outcome, why));
+        every = next_every(cadence, every, unchanged);
+        wait = jittered(cadence, every, jitter());
+        last = Some((outcome, why));
         seq += 1;
+        let at = SystemTime::now();
         // `send_replace`: the value is stored even with no receiver alive.
         tx.send_replace(Reading {
             seq,
             outcome,
-            at: Some(SystemTime::now()),
+            at: Some(at),
             reason: why,
+            next_at: Some(at + wait),
         });
-        wait = PROBE_EVERY;
+    }
+}
+
+/// Sleep for `wait`, at most [`CLOCK_CHECK_EVERY`] at a time. `true` when it
+/// ended early because something changed: a kick, or a host that slept (the
+/// network it measured may be gone, and a monotonic clock that stopped in the
+/// suspend would make the wait run long by the time asleep).
+async fn pause(wait: Duration, kick: &Notify) -> bool {
+    let end = tokio::time::Instant::now() + wait;
+    loop {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let (mono, wall) = (tokio::time::Instant::now(), SystemTime::now());
+        tokio::select! {
+            () = tokio::time::sleep(left.min(CLOCK_CHECK_EVERY)) => {}
+            // A kick that came while nobody waited is kept, and wakes this.
+            () = kick.notified() => return true,
+        }
+        let wall = SystemTime::now().duration_since(wall).unwrap_or_default();
+        if slept(mono.elapsed(), wall) {
+            return true;
+        }
     }
 }
 
@@ -531,20 +673,154 @@ mod tests {
             outcome: Outcome::AnsweredElsewhere(IpAddr::V4(Ipv4Addr::new(100, 65, 4, 2))),
             at: Some(at),
             reason: None,
+            next_at: Some(at + PROBE_EVERY),
         };
         let w = r.to_wire();
         assert_eq!(w.outcome, DnsProbeOutcome::AnsweredElsewhere);
         assert_eq!(w.at_ms, Some(1_234));
+        assert_eq!(w.next_at_ms, Some(61_234));
         assert_eq!(w.answered_by.as_deref(), Some("100.65.4.2"));
         let p = Reading::pending().to_wire();
         assert_eq!(p.outcome, DnsProbeOutcome::Pending);
-        assert_eq!(p.at_ms, None);
+        assert_eq!((p.at_ms, p.next_at_ms), (None, None));
+        // Switched off: nothing measured, and the ladder never acts on it.
+        let off = Reading::off();
+        assert_eq!(off.seq, 0);
+        assert!(!off.outcome.dns_resolves());
+        assert_eq!(off.to_wire().outcome, DnsProbeOutcome::Off);
+    }
+
+    /// A jitter source that leaves every wait as it is.
+    fn no_jitter() -> u64 {
+        100
+    }
+
+    /// The wait each reading announced, from its own two times.
+    fn announced(r: &Reading) -> Duration {
+        r.next_at.unwrap().duration_since(r.at.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_status_waits_double_to_fifteen_minutes_and_vary_by_a_tenth() {
+        let s = Cadence::Status;
+        let mut every = PROBE_EVERY;
+        let mut waits = vec![];
+        for _ in 0..6 {
+            every = next_every(s, every, true);
+            waits.push(every.as_secs());
+        }
+        assert_eq!(waits, [120, 240, 480, 900, 900, 900]);
+        assert_eq!(next_every(s, PROBE_EVERY_MAX, false), PROBE_EVERY);
+        // The ladder's never grow, as before #1363.
+        assert_eq!(next_every(Cadence::Ladder, PROBE_EVERY, true), PROBE_EVERY);
+
+        let t = Duration::from_secs(600);
+        assert_eq!(jittered(s, t, 0), Duration::from_secs(540));
+        assert_eq!(jittered(s, t, 100), t);
+        assert_eq!(jittered(s, t, 200), Duration::from_secs(660));
+        assert_eq!(jittered(s, t, 201), Duration::from_secs(540));
+        // Any u64 stays within the tenth (u64::MAX % 201 == 150).
+        assert_eq!(jittered(s, t, u64::MAX), Duration::from_secs(630));
+        assert_eq!(jittered(Cadence::Ladder, t, 0), t);
+    }
+
+    #[test]
+    fn a_host_that_slept_is_seen_by_its_clocks() {
+        let step = CLOCK_CHECK_EVERY;
+        assert!(!slept(step, step), "awake: both clocks agree");
+        assert!(!slept(step, step + SLEPT_AFTER), "at the bound");
+        assert!(slept(step, step + SLEPT_AFTER + Duration::from_millis(1)));
+        // A wall clock set back, or a test's paused clock, is not a sleep.
+        assert!(!slept(step, Duration::ZERO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_status_probe_waits_longer_while_nothing_changes_and_starts_over_on_a_change() {
+        let lookups = Arc::new(AtomicU32::new(0));
+        let l = lookups.clone();
+        let started = tokio::time::Instant::now();
+        let p = OsProbe::spawn_with(
+            move || {
+                // Five readings that are the same, then a changed one.
+                let n = l.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 5 {
+                        Outcome::Unanswered
+                    } else {
+                        Outcome::Answered
+                    }
+                }
+            },
+            || async { None },
+            Cadence::Status,
+            no_jitter,
+        );
+        let mut at = vec![];
+        let mut waits = vec![];
+        for seq in 1..=7 {
+            let r = until_seq(&p, seq).await;
+            at.push(started.elapsed().as_secs());
+            waits.push(announced(&r).as_secs());
+        }
+        assert_eq!(at, [2, 62, 182, 422, 902, 1802, 1862]);
+        assert_eq!(waits, [60, 120, 240, 480, 900, 60, 120]);
+        // 7 lookups in 31 min, where one a minute made 32.
+        assert_eq!(lookups.load(Ordering::SeqCst), 7);
+        p.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ladder_probe_keeps_one_lookup_a_minute() {
+        let started = tokio::time::Instant::now();
+        // A jitter source that would shorten a status wait by a tenth.
+        let p = OsProbe::spawn_with(
+            || async { Outcome::Unanswered },
+            || async { None },
+            Cadence::Ladder,
+            || 0,
+        );
+        let mut at = vec![];
+        for seq in 1..=4 {
+            let r = until_seq(&p, seq).await;
+            at.push(started.elapsed().as_secs());
+            assert_eq!(announced(&r), PROBE_EVERY);
+        }
+        assert_eq!(at, [2, 62, 122, 182]);
+        p.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kick_measures_soon_and_starts_the_waits_over() {
+        let p = OsProbe::spawn_with(
+            || async { Outcome::Unanswered },
+            || async { None },
+            Cadence::Status,
+            no_jitter,
+        );
+        // Four unchanged readings: the next wait is 8 min.
+        let r = until_seq(&p, 4).await;
+        assert_eq!(announced(&r), Duration::from_secs(480));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let t = tokio::time::Instant::now();
+        // Two kicks together cost one lookup.
+        p.kick();
+        p.kick();
+        let r = until_seq(&p, 5).await;
+        assert_eq!(
+            t.elapsed(),
+            FIRST_PROBE_AFTER,
+            "the change is given a moment"
+        );
+        assert_eq!(announced(&r), PROBE_EVERY, "and the waits start over");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(p.reading().seq, 5, "the second kick asked for nothing more");
+        p.shutdown().await;
     }
 
     /// Wait (in virtual time) until the probe publishes reading `seq`.
     async fn until_seq(p: &OsProbe, seq: u64) -> Reading {
         let mut rx = p.rx.clone();
-        tokio::time::timeout(Duration::from_secs(600), async {
+        tokio::time::timeout(2 * PROBE_EVERY_MAX, async {
             loop {
                 if rx.borrow_and_update().seq >= seq {
                     return rx.borrow().clone();
@@ -578,6 +854,8 @@ mod tests {
                 r.fetch_add(1, Ordering::SeqCst);
                 async { Some(DnsUnreachedReason::NrptPolicyManaged) }
             },
+            Cadence::Status,
+            no_jitter,
         );
         assert_eq!(p.reading(), Reading::pending(), "not measured yet");
 
@@ -659,6 +937,7 @@ mod tests {
             outcome: Outcome::Answered,
             at: Some(SystemTime::now()),
             reason: None,
+            next_at: Some(SystemTime::now() + PROBE_EVERY),
         };
         let now_ms = || {
             SystemTime::now()
@@ -705,7 +984,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_kick_measures_now_rather_than_at_the_interval() {
-        let p = OsProbe::spawn_with(|| async { Outcome::Unanswered }, || async { None });
+        let p = OsProbe::spawn_with(
+            || async { Outcome::Unanswered },
+            || async { None },
+            Cadence::Status,
+            no_jitter,
+        );
         until_seq(&p, 1).await;
         let t = tokio::time::Instant::now();
         p.kick();

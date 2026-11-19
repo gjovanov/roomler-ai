@@ -2404,10 +2404,15 @@ impl OverlayRuntime {
         // reach our resolver (a corporate DNS-enforcement layer refusing the
         // host's own queries), put the names in the hosts file instead.
         let mut dns_ladder: Option<dns_hosts::Ladder> = None;
-        // #1363 — the OS path, MEASURED: one lookup a minute of a name only an
-        // overlay resolver answers, on its own task (never this loop), shared
-        // by the ladder and the status. `active` is said only on its answer.
+        // #1363 — the OS path, MEASURED: a lookup of a name only an overlay
+        // resolver answers, on its own task (never this loop), shared by the
+        // ladder and the status. `active` is said only on its answer.
         let mut dns_probe: Option<dns_probe::OsProbe> = None;
+        // The probe's switch (`ROOMLERD_MAGICDNS_PROBE=0`): for a host where
+        // even a backed-off lookup of the probe name is unwanted. The status
+        // then says what was attempted, never `active`. The hosts rung needs
+        // the readings, so an operator who switched it on gets the probe anyway.
+        let dns_probe_on = crate::env::flag("MAGICDNS_PROBE", true);
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2496,14 +2501,25 @@ impl OverlayRuntime {
                 crate::env::node_env("MAGICDNS_HOSTS").as_deref() == Some("1"),
             );
             // #1363 — measure whenever there is something to measure: the
-            // steer is written (the status needs the outcome), or the ladder
-            // is on (it needs the probe whatever the steer's state, as it
-            // always did). With neither, nothing points the OS at this
-            // resolver, the status names that state without a reading, and a
-            // lookup would only send the tenant's domain to the upstream DNS
-            // once a minute. A late steer starts it (the tick arm).
-            if _dns_os_guard.as_ref().is_some_and(|g| g.active()) || ladder.enabled() {
-                dns_probe = Some(dns_probe::OsProbe::spawn(magic_domain.clone(), self_v4));
+            // ladder is on (it needs the probe whatever the steer's state, as
+            // it always did, and at its cadence), or the steer is written (the
+            // status needs the outcome) and the probe is not switched off.
+            // With neither, nothing points the OS at this resolver, the status
+            // names that state without a reading, and a lookup would only send
+            // the tenant's domain to the upstream DNS. A late steer starts it
+            // (the tick arm).
+            if ladder.enabled() {
+                dns_probe = Some(dns_probe::OsProbe::spawn(
+                    magic_domain.clone(),
+                    self_v4,
+                    dns_probe::Cadence::Ladder,
+                ));
+            } else if dns_probe_on && _dns_os_guard.as_ref().is_some_and(|g| g.active()) {
+                dns_probe = Some(dns_probe::OsProbe::spawn(
+                    magic_domain.clone(),
+                    self_v4,
+                    dns_probe::Cadence::Status,
+                ));
             }
             dns_ladder = Some(ladder);
             Some(names)
@@ -2524,7 +2540,7 @@ impl OverlayRuntime {
             os_steer_bypassed: _dns_os_guard
                 .as_ref()
                 .and_then(|g| g.bypassed().map(str::to_string)),
-            probe: Some(dns_probe::Reading::default().to_wire()),
+            probe: Some(dns_probe::Reading::idle(dns_probe_on).to_wire()),
             hosts_fallback: false,
         });
         // #1363 — the resolver's bound signal as the last tick saw it, so a
@@ -3052,7 +3068,7 @@ impl OverlayRuntime {
                     let dns_reading = dns_probe
                         .as_ref()
                         .map(dns_probe::OsProbe::reading)
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| dns_probe::Reading::idle(dns_probe_on));
                     if let (Some(l), Some(names)) = (dns_ladder.as_mut(), dns_names.as_ref()) {
                         l.tick(
                             &dns_reading,
@@ -3083,9 +3099,14 @@ impl OverlayRuntime {
                         // waits its settle time first.
                         match dns_probe.as_ref() {
                             Some(p) => p.kick(),
-                            None if _dns_os_guard.as_ref().is_some_and(|g| g.active()) => {
-                                dns_probe =
-                                    Some(dns_probe::OsProbe::spawn(magic_domain.clone(), self_v4));
+                            None if dns_probe_on
+                                && _dns_os_guard.as_ref().is_some_and(|g| g.active()) =>
+                            {
+                                dns_probe = Some(dns_probe::OsProbe::spawn(
+                                    magic_domain.clone(),
+                                    self_v4,
+                                    dns_probe::Cadence::Status,
+                                ));
                             }
                             None => {}
                         }
@@ -3464,6 +3485,17 @@ impl OverlayRuntime {
                 } => {
                     match net_evt {
                         Ok(delta) => {
+                            // #1363 — a network that materially moved (a VPN
+                            // connected, a new uplink) may send this host's
+                            // lookups somewhere else: measure the OS path again
+                            // rather than wait out a backed-off probe. netstate
+                            // publishes at most one such Major per 120 s.
+                            if delta.material
+                                && delta.severity == super::netstate::Severity::Major
+                                && let Some(p) = dns_probe.as_ref()
+                            {
+                                p.kick();
+                            }
                             // R3 — an ADDRESS/INTERFACE-classed burst (N4) is
                             // the roam signal: gate on the ONLY thing that
                             // justifies a plane rebuild — the sorted LAN IP

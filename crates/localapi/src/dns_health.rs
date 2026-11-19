@@ -9,7 +9,7 @@
 //! discards a written rule, and the status still said `active` while nothing
 //! resolved (#1363, comments 3 and 4).
 //!
-//! The daemon now MEASURES the outcome: once a minute it resolves
+//! The daemon now MEASURES the outcome: it resolves
 //! `_roomler-probe.<magic domain>` through the OS, a name only an overlay
 //! resolver answers (FR-72 P6's ladder probe, now shared with the status). The
 //! result travels as [`DnsProbeStatus`], and [`DnsStatus::health`] turns it into
@@ -24,14 +24,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::DnsStatus;
 
-/// How often the daemon measures the OS path, and FR-72 P6's ladder cadence:
-/// one lookup serves both. A reading older than [`DNS_PROBE_STALE_MS`] is not a
-/// current measurement.
+/// The daemon's first wait between two measurements, and FR-72 P6's ladder
+/// cadence. While the ladder is on, one lookup serves both, every this long.
 pub const DNS_PROBE_EVERY_MS: u64 = 60_000;
 
-/// A reading this old means the measurement stopped, and the status says so
-/// rather than repeat it. Three missed rounds.
-pub const DNS_PROBE_STALE_MS: u64 = 3 * DNS_PROBE_EVERY_MS;
+/// The longest wait between two measurements that only the status reads. The
+/// wait doubles from [`DNS_PROBE_EVERY_MS`] while the reading stays the same,
+/// up to this, and is back to [`DNS_PROBE_EVERY_MS`] when it changes or when
+/// something the daemon sees changes what the OS does (a steer, the
+/// resolver's socket, a network that moved, a host that slept).
+pub const DNS_PROBE_EVERY_MAX_MS: u64 = 15 * 60_000;
+
+/// A measurement this far past its announced time
+/// ([`DnsProbeStatus::next_at_ms`]) means the measurement stopped, and the
+/// status says so rather than repeat the last reading.
+pub const DNS_PROBE_LATE_MS: u64 = 2 * 60_000;
 
 /// #1363 — what the OS made of `_roomler-probe.<magic domain>` the last time
 /// the daemon asked. Only an overlay resolver answers that name, and this
@@ -52,6 +59,22 @@ pub struct DnsProbeStatus {
     /// decides the state: a rule the NRPT holds is still not an answer (FR-72).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<DnsUnreachedReason>,
+    /// When the daemon measures next, in unix milliseconds. The wait between
+    /// two measurements grows while nothing changes, so a reading is stale
+    /// only once this is more than [`DNS_PROBE_LATE_MS`] past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_at_ms: Option<u64>,
+}
+
+impl DnsProbeStatus {
+    /// When this reading stops being a current measurement, in unix
+    /// milliseconds. `None` while nothing was measured.
+    pub fn stale_after_ms(&self) -> Option<u64> {
+        let due = self
+            .next_at_ms
+            .or_else(|| self.at_ms.map(|at| at + DNS_PROBE_EVERY_MAX_MS))?;
+        Some(due + DNS_PROBE_LATE_MS)
+    }
 }
 
 /// The probe's result.
@@ -69,6 +92,9 @@ pub enum DnsProbeOutcome {
     AnsweredElsewhere,
     /// No address within the probe's timeout.
     Unanswered,
+    /// The probe is switched off on this node (`ROOMLERD_MAGICDNS_PROBE=0`),
+    /// so nothing is measured and the status says what was attempted.
+    Off,
     /// A value this build does not know, from a newer daemon. Read as not
     /// measured, never as an answer.
     #[serde(other)]
@@ -120,14 +146,18 @@ pub enum DnsHealth {
     NotReached { why: Option<String> },
     /// The first measurement has not been taken.
     NotMeasured,
-    /// The last reading is older than [`DNS_PROBE_STALE_MS`].
+    /// The next measurement is more than [`DNS_PROBE_LATE_MS`] late: the
+    /// measurement stopped. `age_s` is the last reading's age.
     Stale { age_s: u64 },
     /// A daemon older than #1363, which measures nothing: its own words,
     /// never `active`.
     Unmeasured(LegacyDns),
+    /// The probe is switched off on this node: what was attempted, never
+    /// `active`.
+    ProbeOff(LegacyDns),
 }
 
-/// What a daemon older than #1363 can say.
+/// What can be said without a measurement: what was attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyDns {
     ResolverDown,
@@ -136,7 +166,33 @@ pub enum LegacyDns {
     Steered,
 }
 
+impl LegacyDns {
+    /// The words for an attempt. `why` says why nothing was measured.
+    fn headline(&self, why: &str) -> String {
+        match self {
+            Self::ResolverDown => "resolver DOWN".into(),
+            Self::SteerFailed => "resolver up, OS steer FAILED".into(),
+            Self::Bypassed(_) => "steered but BYPASSED".into(),
+            // Nothing measured it: never `active`.
+            Self::Steered => format!("steered, not measured ({why})"),
+        }
+    }
+}
+
 impl DnsStatus {
+    /// What was attempted, from the facts a daemon older than #1363 sends too.
+    fn attempted(&self) -> LegacyDns {
+        if !self.resolver_bound {
+            LegacyDns::ResolverDown
+        } else if !self.os_steer_active {
+            LegacyDns::SteerFailed
+        } else if let Some(why) = &self.os_steer_bypassed {
+            LegacyDns::Bypassed(why.clone())
+        } else {
+            LegacyDns::Steered
+        }
+    }
+
     /// The state these facts describe at `now_ms` (unix milliseconds, the
     /// reader's own clock; the daemon is on the same host).
     ///
@@ -145,16 +201,13 @@ impl DnsStatus {
     /// the probe measured.
     pub fn health(&self, now_ms: u64) -> DnsHealth {
         let Some(probe) = &self.probe else {
-            return DnsHealth::Unmeasured(if !self.resolver_bound {
-                LegacyDns::ResolverDown
-            } else if !self.os_steer_active {
-                LegacyDns::SteerFailed
-            } else if let Some(why) = &self.os_steer_bypassed {
-                LegacyDns::Bypassed(why.clone())
-            } else {
-                LegacyDns::Steered
-            });
+            return DnsHealth::Unmeasured(self.attempted());
         };
+        if probe.outcome == DnsProbeOutcome::Off {
+            // The hosts rung never runs without the probe (it needs the
+            // readings), so there is nothing above the attempt to report.
+            return DnsHealth::ProbeOff(self.attempted());
+        }
         let not_reached_why = || {
             probe
                 .reason
@@ -185,8 +238,8 @@ impl DnsStatus {
         if !self.resolver_bound {
             return DnsHealth::ResolverBinding;
         }
-        if let Some(at) = probe.at_ms
-            && now_ms.saturating_sub(at) > DNS_PROBE_STALE_MS
+        if let (Some(at), Some(stale_after)) = (probe.at_ms, probe.stale_after_ms())
+            && now_ms > stale_after
         {
             return DnsHealth::Stale {
                 age_s: now_ms.saturating_sub(at) / 1000,
@@ -202,7 +255,9 @@ impl DnsStatus {
             DnsProbeOutcome::Unanswered => DnsHealth::NotReached {
                 why: not_reached_why(),
             },
-            DnsProbeOutcome::Pending | DnsProbeOutcome::Unknown => DnsHealth::NotMeasured,
+            DnsProbeOutcome::Pending | DnsProbeOutcome::Off | DnsProbeOutcome::Unknown => {
+                DnsHealth::NotMeasured
+            }
         }
     }
 }
@@ -233,11 +288,8 @@ impl DnsHealth {
             Self::NotReached { .. } => "the OS does not reach the resolver".into(),
             Self::NotMeasured => "not measured yet".into(),
             Self::Stale { age_s } => format!("not measured for {} min", age_s / 60),
-            Self::Unmeasured(LegacyDns::ResolverDown) => "resolver DOWN".into(),
-            Self::Unmeasured(LegacyDns::SteerFailed) => "resolver up, OS steer FAILED".into(),
-            Self::Unmeasured(LegacyDns::Bypassed(_)) => "steered but BYPASSED".into(),
-            // An older daemon measured nothing: never `active`.
-            Self::Unmeasured(LegacyDns::Steered) => "steered, not measured (older daemon)".into(),
+            Self::Unmeasured(attempt) => attempt.headline("older daemon"),
+            Self::ProbeOff(attempt) => attempt.headline("probe off"),
         }
     }
 
@@ -255,7 +307,8 @@ impl DnsHealth {
             }
             Self::HostsFile { cause } => cause.clone(),
             Self::NotReached { why } => why.clone(),
-            Self::Unmeasured(LegacyDns::Bypassed(why)) => Some(format!(
+            Self::Unmeasured(LegacyDns::Bypassed(why))
+            | Self::ProbeOff(LegacyDns::Bypassed(why)) => Some(format!(
                 "{why}: this host's own lookups never reach the steer"
             )),
             _ => None,
@@ -291,11 +344,13 @@ mod tests {
     }
 
     fn reading(outcome: DnsProbeOutcome) -> DnsProbeStatus {
+        let measured = outcome != DnsProbeOutcome::Pending;
         DnsProbeStatus {
             outcome,
-            at_ms: (outcome != DnsProbeOutcome::Pending).then_some(NOW - 5_000),
+            at_ms: measured.then_some(NOW - 5_000),
             answered_by: None,
             reason: None,
+            next_at_ms: measured.then_some(NOW - 5_000 + DNS_PROBE_EVERY_MS),
         }
     }
 
@@ -446,15 +501,65 @@ mod tests {
 
     #[test]
     fn a_reading_that_stopped_is_not_repeated_as_current() {
+        // The next measurement is more than DNS_PROBE_LATE_MS late.
         let mut r = reading(DnsProbeOutcome::Answered);
-        r.at_ms = Some(NOW - DNS_PROBE_STALE_MS - 1_000);
+        r.at_ms = Some(NOW - 16 * 60_000);
+        r.next_at_ms = Some(NOW - DNS_PROBE_LATE_MS - 1_000);
         let h = status(Some(r)).health(NOW);
-        assert_eq!(h, DnsHealth::Stale { age_s: 181 });
-        assert_eq!(h.headline(), "not measured for 3 min");
+        assert_eq!(h, DnsHealth::Stale { age_s: 960 });
+        assert_eq!(h.headline(), "not measured for 16 min");
         // At the bound it is still current.
         let mut r = reading(DnsProbeOutcome::Answered);
-        r.at_ms = Some(NOW - DNS_PROBE_STALE_MS);
+        r.next_at_ms = Some(NOW - DNS_PROBE_LATE_MS);
         assert_eq!(status(Some(r)).health(NOW), DnsHealth::Active);
+    }
+
+    #[test]
+    fn a_reading_whose_next_measurement_is_backed_off_is_still_current() {
+        // Nothing changed for a while, so the daemon waits longer between two
+        // measurements: a 14 min old reading with its next one due is current.
+        let mut r = reading(DnsProbeOutcome::Unanswered);
+        r.at_ms = Some(NOW - 14 * 60_000);
+        r.next_at_ms = Some(NOW + 60_000);
+        let h = status(Some(r)).health(NOW);
+        assert_eq!(h, DnsHealth::NotReached { why: None });
+        // A reading that does not say when the next one comes is read against
+        // the longest wait.
+        let mut r = reading(DnsProbeOutcome::Answered);
+        r.next_at_ms = None;
+        r.at_ms = Some(NOW - DNS_PROBE_EVERY_MAX_MS - DNS_PROBE_LATE_MS);
+        assert_eq!(status(Some(r.clone())).health(NOW), DnsHealth::Active);
+        r.at_ms = Some(NOW - DNS_PROBE_EVERY_MAX_MS - DNS_PROBE_LATE_MS - 60_000);
+        assert_eq!(
+            status(Some(r)).health(NOW).headline(),
+            "not measured for 18 min"
+        );
+    }
+
+    #[test]
+    fn the_probe_switched_off_says_what_was_attempted_and_never_active() {
+        let off = DnsProbeStatus {
+            outcome: DnsProbeOutcome::Off,
+            at_ms: None,
+            answered_by: None,
+            reason: None,
+            next_at_ms: None,
+        };
+        let mut s = status(Some(off));
+        let h = s.health(NOW);
+        assert_eq!(h, DnsHealth::ProbeOff(LegacyDns::Steered));
+        assert_ne!(h.headline(), "active");
+        assert_eq!(h.headline(), "steered, not measured (probe off)");
+        assert_eq!(h.detail(), None);
+        s.os_steer_bypassed = Some("/etc/resolv.conf asks 192.0.2.1".into());
+        assert_eq!(
+            s.health(NOW).one_line(),
+            "steered but BYPASSED: /etc/resolv.conf asks 192.0.2.1: this host's own lookups never reach the steer"
+        );
+        s.os_steer_active = false;
+        assert_eq!(s.health(NOW).headline(), "resolver up, OS steer FAILED");
+        s.resolver_bound = false;
+        assert_eq!(s.health(NOW).headline(), "resolver DOWN");
     }
 
     #[test]
@@ -522,12 +627,23 @@ mod tests {
             at_ms: Some(7),
             answered_by: None,
             reason: Some(DnsUnreachedReason::NrptPolicyManaged),
+            next_at_ms: Some(60_007),
         });
         let back: DnsStatus = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["probe"]["reason"], "nrpt_policy_managed");
+        assert_eq!(json["probe"]["next_at_ms"], 60_007);
+        s.probe = Some(DnsProbeStatus {
+            outcome: DnsProbeOutcome::Off,
+            at_ms: None,
+            answered_by: None,
+            reason: None,
+            next_at_ms: None,
+        });
         assert_eq!(
-            serde_json::to_value(&s).unwrap()["probe"]["reason"],
-            "nrpt_policy_managed"
+            serde_json::to_value(&s).unwrap()["probe"],
+            serde_json::json!({ "outcome": "off" })
         );
     }
 }

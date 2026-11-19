@@ -21,7 +21,7 @@ something else briefly holds the port.
 |---|---|---|---|
 | P1 | Keep the resolver's `JoinHandle` and abort it in the runtime teardown | **shipped 0.4.71** (#1397) | — (a task that was already meant to stop) |
 | P2 | Retry a failed bind; steer the OS when the bind lands late; await the aborted task | **shipped 0.4.73** (#1414), field-verified | — (retry is unconditional; the pre-P2 behaviour is "give up", not a safer state) |
-| P3 | Reporting: make `magicdns active` mean *answering* | **shipped** (#PRNUM), lab cells on #1363: the status measures the OS path once a minute and names each state ([`docs/magicdns.md`](../magicdns.md#what-roomler-status-says)) | — (a report: no rung, steer or route follows it) |
+| P3 | Reporting: make `magicdns active` mean *answering* | **shipped** (#PRNUM), lab cells on #1363: the status measures the OS path (60 s at first, backed off to 15 min while nothing changes, again at once on a change it sees; switch `ROOMLERD_MAGICDNS_PROBE=0`) and names each state ([`docs/magicdns.md`](../magicdns.md#what-roomler-status-says)) | — (a report: no rung, steer or route follows it) |
 | P4 | Docs: [`docs/magicdns.md`](../magicdns.md) in house style with diagrams, linked from `docs/README.md` | **shipped** | — |
 | P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | **PARKED** — necessary but not sufficient; the host that motivated it is blocked one layer higher | detect-and-fall-back; a host whose local rule works must keep using it |
 | P6 | **A resolution ladder, with the hosts file as its last rung** | **shipped 0.4.76** (#1437), **field-verified** — the goal is met on the enforced-DNS host | `ROOMLERD_MAGICDNS_HOSTS`, default OFF |
