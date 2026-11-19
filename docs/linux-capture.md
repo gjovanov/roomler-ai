@@ -1133,6 +1133,108 @@ a new X server, on a real X server". The capture, input and clipboard tests
 that need a real X server, and every test that writes the real clipboard, run
 only there: each prints an `x11-real:` line that its step greps.
 
+#### In the field
+
+Two reads exist, both on a Linux lab machine whose desktop is the daemon's
+virtual desktop, with the production web app in a browser on a second machine as
+the viewer. Every number below is copied from the comment named by its letter:
+
+| | Read | Comment |
+|---|---|---|
+| [a] | 16 November, #3671 | [result: the published 0.4.223 against #3947's build](https://github.com/gjovanov/roomler-ai/issues/3671#issuecomment-6916857678) |
+| [b] | 17 November, #3671 | [read again on the published 0.4.224](https://github.com/gjovanov/roomler-ai/issues/3671#issuecomment-6946866161) |
+| [c] | 16 November, #3918 | [result: the published 0.4.223 against #3947's build](https://github.com/gjovanov/roomler-ai/issues/3918#issuecomment-6916891416) |
+| [d] | 17 November, #3918 | [read again on the published 0.4.224](https://github.com/gjovanov/roomler-ai/issues/3918#issuecomment-6946869066) |
+
+On 16 November the machine ran Ubuntu 24.04 with systemd 255, the desktop was
+1280×800 on Xvfb (on Xorg with the dummy driver for one run), and the media went
+over a relay (VP9 4:4:4, software encode and decode) [a]. The same script ran
+the published 0.4.223 and the `.deb` that CI built from #3947's head, with only
+the daemon's binary swapped in; afterwards the machine went back onto the
+published bytes, checked by hash [a]. On 17 November the machine was a Linux
+guest running the daemon's system unit with the virtual desktop on (Xvfb, with
+its keeper), watched from a browser on a second guest. It took 0.4.224 by its
+own update, and the binary read is the published package's (sha256
+`1540da2f91aaa088…`) [b]. A run opens a session, sends a key to prove input
+works, then kills the desktop's X server (or its keeper) with `SIGKILL`; the
+daemon starts it again by itself. The log is counted for 60 s and the viewer is
+sampled every 2 s for its own frame-rate and bitrate readout [a]. #3947 is the
+change that fixed both issues, and it shipped in 0.4.224 [b].
+
+**An open session across the exit** (#3671):
+
+| Cell | 0.4.223, published [a] | #3947's build, 16 Nov [a] | 0.4.224, published [b] |
+|---|---|---|---|
+| Log, X server killed (Xvfb) | 3,642 lines in 60 s, 3,513 of them warnings, 3,512 the same capture line | 48 lines, 4 warnings | 4 warnings in 53 lines: `damage_warn=1 capture_once=1 exit_warn=1 told_warn=1 retired=1` |
+| Log, keeper killed | 3,640 lines, 3,513 warnings | 44 lines, 4 warnings | not read |
+| Log, X server killed (Xorg, dummy driver) | 3,640 lines, 3,511 warnings | 47 lines, 4 warnings | not read |
+| Damage warnings after the exit | 3,512 [b] | one: the damage watcher's `damage connection failed`, one of the four warnings (supervisor, capture, damage watcher, the told session) | `damage_warn=1` |
+| Viewer, X server killed (Xvfb) | 15 → 59 fps, 9 → about 207 kbps | 15 → 15 fps, 9 → 5 kbps | 15 fps and 9 kbps before the exit, 15 fps and 6 kbps after it |
+| Viewer, keeper killed | 15 → 59 fps, 9 → about 200 kbps | 15 → 15 fps, 9 → 6 kbps | not read |
+| Viewer, X server killed (Xorg, dummy driver) | 15 → 59 fps, 9 → about 238 kbps | 15 → 15 fps, 8 → 5 kbps | not read |
+| The notice | none for as long as the session was watched (60 s and more), and the daemon told nobody; `told_warn=0` [b] | on the viewer 1.1 s, 1.1 s and 1.2 s after the exit, in the three runs | on the viewer 1.1 s after the exit; the sessions were told after `told_s=1.0`, and the desktop was back after `back_s=1.2` |
+| The viewer's wording | — | — | "this device's virtual desktop is down: its X server (Xvfb) exited: signal 9 (killed). The agent starts it again by itself; reconnect in a moment" |
+| 0.4.223 after the exit, as the 17 Nov comment words it | 57 to 60 fps of one frozen picture [b] | — | — |
+| A second viewer opens the device after the exit | it joined the first session's capture and its picture did not move; neither viewer got a notice | it got a capture of its own and a live picture; the first viewer was told, the second was not | not read |
+| Clipboard, a paste from the viewer then a copy on the desktop | the paste was not acknowledged (`clipboard set_text: Unknown error while interacting with the clipboard`), nothing on the desktop after 30 s, the copy never reached the viewer | the paste was acknowledged in 3 ms and was on the desktop at once; the copy reached the viewer | not read |
+| Clipboard, first used while the desktop is down | the worker is disabled; after the desktop is back nothing arrives in either direction (30 s watched) | the first use fails while the desktop is down; once it is up, both directions work | not read |
+| A clean stop (`systemctl stop`) | one warning; `stop_exit_warn=1` [b] | none, and one `INFO` line that the server exited as the daemon stops | `stop_rc=0 stop_exit_warn=0 stop_unit_x_warn=0`, and one "exited as the daemon stops" line at the stop |
+| A restart, then a stop, each with a session open | on a restart through the daemon's own command it logged no warning either [a] | — | `restart_exit_warn=0 restart_unit_x_warn=0`, and the stop as the row above |
+
+The bitrates are the viewer's own readout: a sampler on the machine itself does
+not see relayed media and read 1 kbps throughout [a]. One `ERROR` line appears
+once per exit on both 16 November builds: the clipboard library's own worker
+reports that the X server closed [a]. The 17 November comment states that the
+values of 0.4.224 equal those of #3947's build read the day before [b].
+
+**Input across the exit** (#3918). `k0` is the keys a session types before the
+exit, `k1` the keys of the session that was open across it, `k2` the keys of a
+session opened after it, with no daemon restart:
+
+| Cell | 0.4.223, published [d] | #3947's build, 16 Nov [c] | 0.4.224, published [d] |
+|---|---|---|---|
+| A session is open and types (`k0`) | `k0=8` | not given | `k0=8`: the keys reach the desktop |
+| The new X server is up (`back_s`) | `back_s=1.3` | not given | `back_s=1.2` |
+| The session open across the exit types (`k1`) | `k1=0` | its keys did not arrive, and one `INFO` line says why: "this session is marked as having no picture of this device's virtual desktop — its input is dropped while it would reach the desktop's X server" | `k1=0`, `marked=1`: its input is dropped until it reconnects, as its notice says |
+| A session opened after the exit types and clicks (`k2`) | `k2=0 clicks2=0`, 45 errors | all 8 keys and the click arrived (Xvfb); 8 keys and the click (Xorg, dummy driver); 9 keys and the click after the keeper was killed; no injector error; one `INFO` line: "this device's virtual desktop is back on a new X server — the injector opens on it, no restart needed" | `k2=8 clicks2=1`, `input_new_server=1` |
+| The same, as the 16 Nov comment counts the errors [c] | 44 `ERROR` lines from the injector (`Broken pipe`, `simulating input failed`) after the X server, 48 after the keeper | — | — |
+| Two viewers, one open across the exit and one opening after it | the second joined the first one's old capture: its keys did not arrive and its picture did not move | the second got a capture of its own: its 8 keys arrived and its picture was live; the first one's keys did not arrive and it was told to reconnect | not read |
+| Lines about dropped input | one `ERROR` line or more per event | the 8 or 9 dropped keys of the marked session made one line in each run | not read |
+| The later session's picture | live | live [c] | live [d] |
+
+On 0.4.223 the daemon had to be restarted before every further run, because no
+input arrived after the first exit; on #3947's build all eleven runs went back
+to back with no daemon restart [c]. A session on a person's real desktop,
+captured through the compositor while the virtual desktop is also on, read the
+same on both 16 November builds across the virtual desktop's exit: its keys
+arrived before and after, no notice, nothing retired [a][c].
+
+**Where the comments do not agree.** They are not reconciled here.
+
+- The 3,512 of 0.4.223 is "the same capture line" in [a] and "damage warnings"
+  in [b]; the total of 3,642 lines is the same in both.
+- The injector's errors on 0.4.223 for the X server's kill are 44 in [c] and 45
+  in [d], the 17 November re-statement of the same cell.
+- 0.4.224's 53 lines against #3947's build's 48 (Xvfb): [b] says the values
+  equal, and its warning count (4) does, but it does not say that its 53 lines
+  were counted over the same 60 s.
+
+**Not in the field.** The desktop was down for 0.2 to 1.2 s in these runs and no
+session or key landed in that window, so a reconnect that lands while it is
+down and input that arrives while it is down rest on the unit tests only [a][c].
+The held keys and buttons across the change rest on CI's real-X-server test [c].
+Windows, macOS, the uinput route and an X11 seat that is not the virtual
+desktop were not read in the field [c].
+
+**What the read does not cover:** a session that was open across the exit is
+never brought back, and it sees the new desktop only by reconnecting (`k1=0`
+above, and the notice that says so).
+
+[a]: https://github.com/gjovanov/roomler-ai/issues/3671#issuecomment-6916857678
+[b]: https://github.com/gjovanov/roomler-ai/issues/3671#issuecomment-6946866161
+[c]: https://github.com/gjovanov/roomler-ai/issues/3918#issuecomment-6916891416
+[d]: https://github.com/gjovanov/roomler-ai/issues/3918#issuecomment-6946869066
+
 ## 3. The DRM arm (FR-36)
 
 Read the scanout plane from the kernel: `drmModeGetFB2` → `PrimeHandleToFD` →
