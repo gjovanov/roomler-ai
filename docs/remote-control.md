@@ -1836,7 +1836,7 @@ The arbiter opens the OS injector at the first event, then keeps it. If no backe
 | macOS | the Accessibility grant, read live with `AXIsProcessTrusted` | once a second |
 | Elsewhere | nothing to ask: only opening one tells (a Linux daemon before its display or `/dev/uinput` exists) | after 1 s, doubling to once a minute |
 
-A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1345`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:584`).
+A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1419`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:639`).
 
 ⚠️ A root daemon with no `DISPLAY` can never open enigo, so since #3787 its open is not tried. With no `DISPLAY`, x11rb answers `DisplayNotSet` before any I/O, and enigo printed that and `no successful connection` at ERROR on every try. `agents/roomlerd/src/input/no_display.rs` says why instead, once a session:
 
@@ -1892,7 +1892,7 @@ desktop's generation (`x_follow::opened_under`,
 `x_generation`); an injector that is no X client of the desktop records none.
 Before each of the arbiter's three lazy opens (the warm-up, an event's
 injection and a keep-busy move), and as the last step before it,
-`follow_the_desktop` (`agents/roomlerd/src/input/arbiter.rs:1432`) asks the
+`follow_the_desktop` (`agents/roomlerd/src/input/arbiter.rs:1506`) asks the
 gate (`x_follow::gate_at`, `x_follow.rs:130`):
 
 | The desktop | The cached injector | What happens |
@@ -1936,13 +1936,13 @@ server.
   input would reach the desktop's X server is left behind, and any other marked
   session is taken back. Again at the injection point, on the OS injector's
   branch and only for an injector that is an X client of the desktop
-  (`arbiter.rs:1514`), because the regrant can swap the injector and a route
+  (`arbiter.rs:1588`), because the regrant can swap the injector and a route
   can come or go inside one command. And at a shared pipeline's join (§5.1a).
 - **What a mark never touches.** Input that goes elsewhere: a portal or
   compositor route into a person's real desktop, and uinput. That is decided
   again before every command.
 - **A session left behind** is a session without input (`leave_behind`,
-  `arbiter.rs:388`): its events are dropped before any injector, and said once
+  `arbiter.rs:394`): its events are dropped before any injector, and said once
   for the session at `INFO` until it closes. Its floor requests and grants,
   its mode, keep busy and layout switches are refused as for a session without
   an INPUT grant. What it holds is forgotten, releasing nothing: its presses
@@ -6159,7 +6159,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 - **FR-97 P3e, on both platforms:** `rc:layout.set` goes through the input
   arbiter, which refuses a session that may not type, and in exclusive mode
   anyone but the floor holder, as keep busy's switch does
-  (`agents/roomlerd/src/input/arbiter.rs:962`). Before, a view-only session
+  (`agents/roomlerd/src/input/arbiter.rs:994`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
   the control DC opens (`agents/roomlerd/src/peer.rs:1279`): the emitter
   starts before the channel does, so the snapshot it starts with found no
