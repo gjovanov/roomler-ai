@@ -96,6 +96,11 @@ pub trait EncoderOps: Send + 'static {
     /// The maxrate the encoder is currently configured for.
     fn current_maxrate_bps(&self) -> u32;
     fn rate_stats(&self) -> Self::Stats;
+
+    /// FR-112 P3 — does a GPU do this encoder's work? Its thread then takes
+    /// the hardware default (`encode::clock`). That default changes nothing on
+    /// any OS, so an encoder that says nothing is hardware.
+    const HARDWARE: bool = true;
 }
 
 enum Cmd<E: EncoderOps> {
@@ -150,7 +155,7 @@ impl<E: EncoderOps> EncoderThread<E> {
                 // on Linux, threads the encoder creates later (libvpx's workers,
                 // at the first encode) inherit it. macOS and Windows do not
                 // pass it on (`encode::clock`).
-                crate::encode::clock::ask_for_this_thread("encoder");
+                crate::encode::clock::ask_for_encoder_thread(E::HARDWARE);
                 // The encoder arrives right after the spawn succeeded; a sender
                 // dropped without sending means the caller kept it, and this
                 // thread simply ends.
