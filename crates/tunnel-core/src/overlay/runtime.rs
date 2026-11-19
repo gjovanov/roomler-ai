@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 use super::WgKeypair;
 use super::direct;
 use super::dns;
+use super::dns_probe;
 use super::hosts as dns_hosts;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
@@ -2403,6 +2404,10 @@ impl OverlayRuntime {
         // reach our resolver (a corporate DNS-enforcement layer refusing the
         // host's own queries), put the names in the hosts file instead.
         let mut dns_ladder: Option<dns_hosts::Ladder> = None;
+        // #1363 — the OS path, MEASURED: one lookup a minute of a name only an
+        // overlay resolver answers, on its own task (never this loop), shared
+        // by the ladder and the status. `active` is said only on its answer.
+        let mut dns_probe: Option<dns_probe::OsProbe> = None;
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2486,10 +2491,21 @@ impl OverlayRuntime {
             // FR-72 P6. Constructed even when the switch is off, because the
             // constructor is also the BOOT RECONCILER: a block left by a
             // previous process must be cleared whether or not we will write one.
-            dns_ladder = Some(dns_hosts::Ladder::new(
+            let ladder = dns_hosts::Ladder::new(
                 magic_domain.clone(),
                 crate::env::node_env("MAGICDNS_HOSTS").as_deref() == Some("1"),
-            ));
+            );
+            // #1363 — measure whenever there is something to measure: the
+            // steer is written (the status needs the outcome), or the ladder
+            // is on (it needs the probe whatever the steer's state, as it
+            // always did). With neither, nothing points the OS at this
+            // resolver, the status names that state without a reading, and a
+            // lookup would only send the tenant's domain to the upstream DNS
+            // once a minute. A late steer starts it (the tick arm).
+            if _dns_os_guard.as_ref().is_some_and(|g| g.active()) || ladder.enabled() {
+                dns_probe = Some(dns_probe::OsProbe::spawn(magic_domain.clone(), self_v4));
+            }
+            dns_ladder = Some(ladder);
             Some(names)
         } else {
             None
@@ -2497,6 +2513,8 @@ impl OverlayRuntime {
         // S2 — record the DNS bring-up outcome for the LocalAPI view
         // (`roomler status` / the desktop's DNS section). `answer_aaaa`
         // recomputes the same expression the resolver was configured with.
+        // #1363 — the tick arm keeps it current from here on (the bound
+        // signal, the steer, the probe's reading, the hosts rung).
         self.dns_status = dns_magic.clone().map(|magic_domain| DnsStatus {
             magic_domain,
             resolver_bound: dns_bound,
@@ -2506,7 +2524,13 @@ impl OverlayRuntime {
             os_steer_bypassed: _dns_os_guard
                 .as_ref()
                 .and_then(|g| g.bypassed().map(str::to_string)),
+            probe: Some(dns_probe::Reading::default().to_wire()),
+            hosts_fallback: false,
         });
+        // #1363 — the resolver's bound signal as the last tick saw it, so a
+        // socket that comes back re-measures at once instead of showing the
+        // reading taken while it was gone for up to a minute.
+        let mut dns_bound_seen = dns_bound;
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
         // netstate PR-2 — subscribe to the process-wide network monitor
@@ -3023,11 +3047,25 @@ impl OverlayRuntime {
                     // FR-72 P6 — pick the resolution rung by measurement. Cheap
                     // (one `getaddrinfo` a minute) and it climbs back to DNS on
                     // its own, so a host that is only briefly enforced does not
-                    // keep hosts entries.
+                    // keep hosts entries. #1363: the lookup is the probe task's,
+                    // so this reads its latest reading and never waits.
+                    let dns_reading = dns_probe
+                        .as_ref()
+                        .map(dns_probe::OsProbe::reading)
+                        .unwrap_or_default();
                     if let (Some(l), Some(names)) = (dns_ladder.as_mut(), dns_names.as_ref()) {
-                        l.tick(names, crate::env::node_env("DNS_AAAA").as_deref() != Some("0"))
-                            .await;
+                        l.tick(
+                            &dns_reading,
+                            names,
+                            crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+                        );
                     }
+                    // #1363 — the resolver's own bound signal, read for the
+                    // whole session (not only at its first bind).
+                    let bound_now = dns_bound_rx.as_ref().is_some_and(|rx| *rx.borrow());
+                    let came_back = bound_now && !dns_bound_seen;
+                    dns_bound_seen = bound_now;
+                    let mut steered_late = false;
                     if _dns_os_guard.is_none()
                         && let Some(rx) = dns_bound_rx.as_mut()
                         && *rx.borrow_and_update()
@@ -3039,16 +3077,39 @@ impl OverlayRuntime {
                         );
                         // The exit-DNS "." steer is gated on the same fact.
                         exit_state.dns_bound = true;
-                        self.dns_status = Some(DnsStatus {
-                            magic_domain: magic_domain.clone(),
-                            resolver_bound: true,
-                            os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
-                            upstream: dns_upstream.to_string(),
-                            answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
-                            os_steer_bypassed: _dns_os_guard
-                                .as_ref()
-                                .and_then(|g| g.bypassed().map(str::to_string)),
-                        });
+                        steered_late = true;
+                        // #1363 — the steer changed what the OS does: measure
+                        // it, now that it is written. A probe started here
+                        // waits its settle time first.
+                        match dns_probe.as_ref() {
+                            Some(p) => p.kick(),
+                            None if _dns_os_guard.as_ref().is_some_and(|g| g.active()) => {
+                                dns_probe =
+                                    Some(dns_probe::OsProbe::spawn(magic_domain.clone(), self_v4));
+                            }
+                            None => {}
+                        }
+                    }
+                    if came_back
+                        && !steered_late
+                        && let Some(p) = dns_probe.as_ref()
+                    {
+                        // The socket came back: what the last reading saw
+                        // while it was gone is not the state now.
+                        p.kick();
+                    }
+                    // #1363 — the status follows what is true NOW, every tick:
+                    // the bound signal, the steer, the probe's latest reading
+                    // and the hosts rung.
+                    if let Some(st) = self.dns_status.as_mut() {
+                        dns_probe::refresh_status(
+                            st,
+                            bound_now,
+                            _dns_os_guard.as_ref().is_some_and(|g| g.active()),
+                            _dns_os_guard.as_ref().and_then(|g| g.bypassed()),
+                            &dns_reading,
+                            dns_ladder.as_ref().is_some_and(dns_hosts::Ladder::is_active),
+                        );
                     }
                     // FR-19 P4b — expire org-relay sessions past their lifetime
                     // and spawn the binds `request` decided on since the last
@@ -4386,6 +4447,10 @@ impl OverlayRuntime {
         // line is not merely dead — it can route to a different machine.
         if let Some(mut l) = dns_ladder.take() {
             l.shutdown();
+        }
+        // #1363 — the probe task is this session's like the resolver beside it.
+        if let Some(p) = dns_probe.take() {
+            p.shutdown().await;
         }
         if let Some(h) = dns_task {
             h.abort();
