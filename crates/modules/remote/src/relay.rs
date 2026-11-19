@@ -637,10 +637,10 @@ fn lock_ask_from_relay(
 // time) and a NACK (it answered that it cannot take the request) are answers
 // about that pod. A Redis error (the publish failed, or the shared
 // connection's response timeout fired) is not: Redis paused or restarted, and
-// the other pod may be fine. Before #3840 a Redis that stopped answering held
-// the publish instead of failing it, so this error was rare; with the bound
-// it comes with every Redis restart and every pause longer than the response
-// timeout. So what tears something down acts on the first two only.
+// the other pod may be fine. Since the shared connection fails a command it
+// gets no answer to within its response timeout (#3840), this error comes with
+// every Redis restart and every pause longer than that timeout. So what tears
+// something down acts on the first two only.
 
 /// The one wording of a session frame dropped because Redis failed its
 /// relay, with the frame type and a short session id. At most one line a
@@ -666,9 +666,14 @@ pub enum RelayFailed {
 
 /// What a failed bus request says about the pod it was sent to.
 pub fn relay_failed(e: &BusError) -> RelayFailed {
-    // Before #3840: every failure read as the owner gone.
-    let _ = e;
-    RelayFailed::OwnerGone
+    match e {
+        // No answer from the owner pod within the deadline, or its answer
+        // that it cannot take the request.
+        BusError::Deadline(_) | BusError::Nack(_) => RelayFailed::OwnerGone,
+        // Redis failed the publish. It may even have delivered it after the
+        // timeout: nothing is known of the owner pod.
+        BusError::Redis(_) => RelayFailed::Unknown,
+    }
 }
 
 /// The route bookkeeping after the relay of `conn`'s frame to `owner_pod`
@@ -707,10 +712,13 @@ pub enum ProbeVerdict {
 
 /// The verdict of one probe's answer.
 pub fn probe_verdict(answer: &Result<serde_json::Value, BusError>) -> ProbeVerdict {
-    // Before #3840: anything but a live answer reaped the proxy.
     match answer {
         Ok(rep) if rep.get("alive").and_then(|v| v.as_bool()) == Some(true) => ProbeVerdict::Alive,
-        _ => ProbeVerdict::Gone,
+        Ok(_) => ProbeVerdict::Gone,
+        Err(e) => match relay_failed(e) {
+            RelayFailed::Unknown => ProbeVerdict::Unknown,
+            RelayFailed::OwnerGone | RelayFailed::NotSent => ProbeVerdict::Gone,
+        },
     }
 }
 
@@ -730,16 +738,17 @@ where
     P: FnMut(String, String) -> F,
     F: std::future::Future<Output = ProbeVerdict>,
 {
-    // Before #3840: every quiet proxy was probed, and anything but a live
-    // answer reaped it.
-    for (conn, origin) in quiet {
-        if origin.is_empty() {
-            continue;
+    // A proxy with no origin pod is never probed, as before.
+    let quiet: Vec<(String, String)> = quiet
+        .into_iter()
+        .filter(|(_, origin)| !origin.is_empty())
+        .collect();
+    let total = quiet.len();
+    for (i, (conn, origin)) in quiet.into_iter().enumerate() {
+        let verdict = probe(conn.clone(), origin.clone()).await;
+        if verdict == ProbeVerdict::Unknown {
+            return total - i;
         }
-        let verdict = match probe(conn.clone(), origin.clone()).await {
-            ProbeVerdict::Alive => ProbeVerdict::Alive,
-            _ => ProbeVerdict::Gone,
-        };
         act(&conn, &origin, verdict);
     }
     0
@@ -761,8 +770,7 @@ impl Scoped {
 
     /// The relay to one owner pod failed.
     pub fn failed(&mut self, failed: RelayFailed) {
-        // Before #3840: a failed relay fell through to the local answer.
-        let _ = failed;
+        self.lost_to_redis |= failed == RelayFailed::Unknown;
     }
 
     /// The `rc:error` for an owner's refusal: its words, as a local dispatch
@@ -776,13 +784,20 @@ impl Scoped {
         })
     }
 
-    /// No owner refused the frame, and Redis failed its relay to one (q2 =
-    /// A): the frame is dropped, as one lost in flight. The controller is told
-    /// nothing (its own timers recover a setup) and the route is kept.
+    /// No owner refused the frame, and Redis failed its relay to one: the
+    /// frame is dropped, as one lost in flight. The controller is told nothing
+    /// (its own timers recover a setup) and the route is kept.
     pub fn dropped(&self, frame: &serde_json::Value) -> bool {
-        // Before #3840: never.
-        let _ = (frame, self.lost_to_redis);
-        false
+        if self.refusal.is_some() || !self.lost_to_redis {
+            return false;
+        }
+        static FRAME_DROPPED: roomler_core::ws::redis_conn::LineBound =
+            roomler_core::ws::redis_conn::LineBound::per_second();
+        if let Some(suppressed) = FRAME_DROPPED.admit() {
+            let (kind, session) = frame_tag(frame);
+            warn!(frame = kind, session, suppressed, "{FRAME_DROPPED_LINE}");
+        }
+        true
     }
 }
 
@@ -1138,9 +1153,8 @@ mod relay_failure_tests {
         ]
     }
 
-    /// q2 = A — Redis lost the frame on its way to the owner pod, and no
-    /// owner refused it: the frame is dropped and the controller is told
-    /// nothing.
+    /// Redis lost the frame on its way to the owner pod, and no owner
+    /// refused it: the frame is dropped and the controller is told nothing.
     #[test]
     fn a_frame_redis_lost_is_dropped_and_the_controller_is_told_nothing() {
         for frame in relayed_frames() {

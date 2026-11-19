@@ -461,8 +461,8 @@ pub async fn dispatch_controller_rc(
                     let _ = controller_tx.try_send(refusal);
                     return true;
                 }
-                // #3840 (q2 = A): Redis lost it on the way and no owner refused
-                // it: no word to the controller, whose timers recover a setup.
+                // #3840: Redis lost it on the way and no owner refused it: no
+                // word to the controller, whose timers recover a setup.
                 if said.dropped(&frame_val) {
                     return true;
                 }

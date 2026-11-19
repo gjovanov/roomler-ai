@@ -313,7 +313,7 @@ async fn with_both_bounds_at_0_a_command_waits_as_before() {
     assert_eq!(ps.connection().timeouts(), 0);
 }
 
-// ── Review item 2: a session frame whose relay Redis fails ──────────────────
+// ── A session frame whose relay Redis fails ─────────────────────────────────
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -346,7 +346,7 @@ fn kind(frame: &serde_json::Value) -> &str {
     frame.get("t").and_then(|t| t.as_str()).unwrap_or("")
 }
 
-/// #3840, review item 2 (q2 = A). A controller on one pod runs a session
+/// #3840, a relayed session frame. A controller on one pod runs a session
 /// with a device on the other pod through the relay. While the controller's
 /// pod gets no answer from Redis, the session frames it relays (`rc:sdp.offer`,
 /// `rc:ice`) fail on Redis, which says nothing about the owner pod: each is

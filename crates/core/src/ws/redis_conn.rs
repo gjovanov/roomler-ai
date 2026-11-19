@@ -41,8 +41,8 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
 use redis::{Cmd, Pipeline, RedisError, RedisFuture, RedisResult, Value};
@@ -298,5 +298,101 @@ impl ConnectionLike for RedisConnection {
 
     fn get_db(&self) -> i64 {
         self.shared.db
+    }
+}
+
+/// At most one log line a period for one wording, each with how many lines
+/// were held back since the one before it. A field read counts lines, so an
+/// outage of an hour writes one line a second per pod at most, and
+/// `suppressed` says how many each stands for.
+#[derive(Debug)]
+pub struct LineBound {
+    /// When the last line was let through, in [`now_ms`]; 0 is never.
+    last: AtomicU64,
+    held: AtomicU64,
+    every_ms: u64,
+}
+
+impl LineBound {
+    /// One line a second.
+    pub const fn per_second() -> Self {
+        Self {
+            last: AtomicU64::new(0),
+            held: AtomicU64::new(0),
+            every_ms: 1000,
+        }
+    }
+
+    /// `Some(n)` when a line may be written now, `n` the lines held back
+    /// since the last one written; `None` holds this one back.
+    pub fn admit(&self) -> Option<u64> {
+        self.admit_at(now_ms())
+    }
+
+    fn admit_at(&self, now: u64) -> Option<u64> {
+        let last = self.last.load(Ordering::Acquire);
+        let recent = last != 0 && now < last.saturating_add(self.every_ms);
+        if recent
+            || self
+                .last
+                .compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            self.held.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.held.swap(0, Ordering::AcqRel))
+    }
+}
+
+/// Milliseconds since the first call in this process, from 1.
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+#[cfg(test)]
+mod line_bound_tests {
+    use super::*;
+
+    #[test]
+    fn one_line_a_second_each_with_the_count_held_back() {
+        let bound = LineBound::per_second();
+        assert_eq!(bound.admit_at(5), Some(0), "the first line is written");
+        assert_eq!(bound.admit_at(6), None);
+        assert_eq!(bound.admit_at(1004), None, "still within the second");
+        assert_eq!(
+            bound.admit_at(1005),
+            Some(2),
+            "a second on: written, 2 held"
+        );
+        assert_eq!(bound.admit_at(1006), None);
+        assert_eq!(bound.admit_at(60_000), Some(1), "a quiet minute later");
+        assert_eq!(bound.admit_at(61_000), Some(0), "nothing held since");
+    }
+
+    /// 8 threads ask 1000 times each within one second: one line is written,
+    /// and every one of the 8000 is either written or counted as held back.
+    #[test]
+    fn lines_on_many_threads_are_all_counted() {
+        let bound = Arc::new(LineBound::per_second());
+        let (lines, counted) = (0..8)
+            .map(|_| {
+                let bound = bound.clone();
+                std::thread::spawn(move || {
+                    (0..1000)
+                        .filter_map(|_| bound.admit_at(7))
+                        .fold((0u64, 0u64), |(n, c), held| (n + 1, c + held + 1))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .fold((0, 0), |(n, c), (tn, tc)| (n + tn, c + tc));
+        assert_eq!(lines, 1, "one line within the second");
+        let rest = bound
+            .admit_at(2000)
+            .expect("a second on, a line is written");
+        assert_eq!(counted + rest, 8000, "every line is written or counted");
     }
 }
