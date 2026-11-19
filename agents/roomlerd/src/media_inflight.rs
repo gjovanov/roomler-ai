@@ -32,6 +32,20 @@
 //!   (the clock's handle changes) and a new selected candidate pair start it
 //!   over.
 //! - `S` is [`SLACK`], 150 ms, a constant and not a knob.
+//! - A still span is the clock unmoved for `least + S` with bytes out. Its
+//!   release is read at the first frame [`BURST_WITHIN`] after its last still
+//!   reading or later: a burst, [`BURST_PERMILLE`] or more of what SCTP had in
+//!   flight then already acknowledged, is a head-of-line stall, through which
+//!   the carrier kept serializing; anything less is a drain at the link's rate
+//!   (an outage, or a TCP RTO), and so is a first frame too late to tell. After
+//!   [`HOL_RELEASES`] head-of-line releases in a row a still span writes
+//!   through: a frame goes while `out < budget + rate × still_age` and SCTP
+//!   queues nothing, never faster than the clock's rate. Otherwise it holds,
+//!   the first still span on an association too. A new association or a new
+//!   selected pair forgets the class, with the least. A second of the clock
+//!   that starts inside a released still span, or while its release comes
+//!   back, counts from the span's first still reading: the burst brought back
+//!   what the carrier serialized through all of it.
 //!
 //! [`Budget`] is the core: it reads no clock and does no I/O; it takes the time
 //! and the readings as arguments, its rings are fixed (no allocation per
@@ -73,6 +87,27 @@ pub const FLOOR_PACKETS: u64 = 3;
 /// The clock's readings and the rate's figures are kept at most one per this
 /// long, so the core's rings are fixed.
 pub const GRAIN: Duration = Duration::from_millis(50);
+
+/// FR-148 D46 — a still span's release is a burst when this share of what
+/// SCTP had in flight at the span's last still reading is acknowledged by the
+/// first frame [`BURST_WITHIN`] after that reading, per mille. A head-of-line
+/// stall's release brings back at once what the carrier serialized through
+/// the stall; a drain at the link's rate, what the link carries in the time,
+/// of a budget's worth in flight (the rate over the least and S). Pending
+/// bytes are not counted: SCTP had not sent them, and no release brings them
+/// back. Chosen on the `tcp_shape` stall and outage cells
+/// (`docs/rate-control.md`).
+pub const BURST_PERMILLE: u64 = 600;
+
+/// FR-148 D46 — how long after a still span's last still reading its release
+/// is read. A first frame at [`BURST_PERMILLE`] of the least and S or later is
+/// too late to tell: a drain at the rate has brought back that share of a
+/// budget by then, and the release reads as a drain.
+pub const BURST_WITHIN: Duration = Duration::from_millis(50);
+
+/// FR-148 D46 — head-of-line releases in a row before a still span writes
+/// through. A drain starts the count over.
+pub const HOL_RELEASES: u32 = 1;
 
 /// `RATE_WINDOW / GRAIN` readings and the one the window starts from, with room.
 const CLOCK_SLOTS: usize = 32;
@@ -152,6 +187,10 @@ pub enum Verdict {
     NothingOut,
     /// `out >= budget`, but SCTP's own window binds with nothing pending.
     WindowBinds,
+    /// `out >= budget`, in a still span after head-of-line releases, with
+    /// nothing pending in SCTP and `out < budget + rate × still_age`: written
+    /// through the stall.
+    WritesThrough,
     /// `out >= budget`.
     Hold,
 }
@@ -159,6 +198,37 @@ pub enum Verdict {
 impl Verdict {
     pub fn holds(self) -> bool {
         self == Verdict::Hold
+    }
+}
+
+/// FR-148 D46 — what a still span's release showed about the carrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Release {
+    /// A burst: the carrier kept serializing through the stall, as a TCP leg
+    /// does behind a lost segment, and what waited came back at once.
+    HeadOfLine,
+    /// No burst: the release acknowledged as fast as the link drains what
+    /// waited (an outage, or a TCP RTO).
+    Drain,
+}
+
+/// FR-148 D46 — the stall classifier's thresholds: [`BURST_PERMILLE`],
+/// [`BURST_WITHIN`] and [`HOL_RELEASES`]. Constants, not knobs: only the
+/// `tcp_shape` harness runs others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Classifier {
+    pub burst_permille: u64,
+    pub within: Duration,
+    pub releases: u32,
+}
+
+impl Default for Classifier {
+    fn default() -> Self {
+        Self {
+            burst_permille: BURST_PERMILLE,
+            within: BURST_WITHIN,
+            releases: HOL_RELEASES,
+        }
     }
 }
 
@@ -200,6 +270,12 @@ pub struct WindowReport {
     /// Today's bounds: (VP9 watermark sheds, FFmpeg ledger gate passes,
     /// channel-full passes and sheds).
     pub bounds: (u64, u64, u64),
+    /// FR-148 D46 — still spans whose release was read in the window, by
+    /// class: (head-of-line, drain).
+    pub released: (u64, u64),
+    /// FR-148 D46 — frames admitted while a still span stood, whatever let
+    /// them go: under the budget, on SCTP's window, or written through.
+    pub still_admitted: u64,
 }
 
 /// A fixed ring: a push to a full ring drops its oldest.
@@ -279,12 +355,24 @@ struct Figure {
 }
 
 /// The clock standing still with bytes out: at what count, from the first
-/// reading at it to the last.
+/// reading at it to the last, and what SCTP had in flight at the last.
 #[derive(Clone, Copy, Debug, Default)]
 struct Still {
     acked: u64,
     from: u64,
     to: u64,
+    inflight: u64,
+}
+
+/// FR-148 D46 — a still span's release, being read: the span's first and
+/// last still readings (µs), the count the clock stood at, and what SCTP had
+/// in flight at the last.
+#[derive(Clone, Copy, Debug)]
+struct Releasing {
+    first: u64,
+    from: u64,
+    acked: u64,
+    inflight: u64,
 }
 
 const FINE_MS: u64 = 5;
@@ -373,6 +461,8 @@ struct Window {
     spread: Spread,
     still: (u64, u64),
     bounds: (u64, u64, u64),
+    released: (u64, u64),
+    still_admitted: u64,
 }
 
 impl Window {
@@ -387,6 +477,8 @@ impl Window {
             spread: Spread::new(),
             still: (0, 0),
             bounds: (0, 0, 0),
+            released: (0, 0),
+            still_admitted: 0,
         }
     }
 }
@@ -428,6 +520,19 @@ pub struct Budget {
     hold_grain: u64,
     last_acked: Option<u64>,
     still: Option<Still>,
+    /// FR-148 D46 — the stall classifier: its thresholds, the release being
+    /// read, the head-of-line releases in a row (0 after a drain, before the
+    /// first release and after a reset), and the last release's class.
+    classifier: Classifier,
+    releasing: Option<Releasing>,
+    hol_run: u32,
+    released: Option<Release>,
+    /// FR-148 D46 — the last released still span: its first still reading
+    /// (µs), where its release ends (its last still reading, then the step
+    /// that read the release), and the count the clock stood at. A second of
+    /// the clock that starts from the first to that end counts from the first
+    /// and that count: a burst can come back over more than one step.
+    last_still: Option<(u64, u64, u64)>,
     /// The last step's budget, `out` and rate.
     last: (u64, u64, Option<u64>),
     window: Window,
@@ -441,16 +546,23 @@ impl Default for Budget {
 
 impl Budget {
     pub fn new() -> Self {
-        Self::slacked(SLACK)
+        Self::slacked(SLACK, Classifier::default())
     }
 
     /// The tcp_shape harness's slack sweep only: S is not a knob.
     #[cfg(test)]
     pub(crate) fn with_slack(slack: Duration) -> Self {
-        Self::slacked(slack)
+        Self::slacked(slack, Classifier::default())
     }
 
-    fn slacked(slack: Duration) -> Self {
+    /// The tcp_shape harness's classifier runs only: its thresholds are not
+    /// knobs either.
+    #[cfg(test)]
+    pub(crate) fn with_classifier(slack: Duration, classifier: Classifier) -> Self {
+        Self::slacked(slack, classifier)
+    }
+
+    fn slacked(slack: Duration, classifier: Classifier) -> Self {
         Self {
             slack,
             epoch: None,
@@ -463,6 +575,11 @@ impl Budget {
             hold_grain: 0,
             last_acked: None,
             still: None,
+            classifier,
+            releasing: None,
+            hol_run: 0,
+            released: None,
+            last_still: None,
             last: (0, 0, None),
             window: Window::new(),
         }
@@ -477,9 +594,16 @@ impl Budget {
         if moved && let (Some(delay), Some(least)) = (r.gauges.ack_delay, self.least) {
             self.window.spread.add(ms(delay.saturating_sub(least)));
         }
-        let rate = self.rate_at(t, r.acked_bytes, r.open_bps);
+        // A release due is read before a span's end can start another, and
+        // one that starts here is read here when it is due already. A span
+        // that ends here is the rate's to see at this step.
+        self.read_release(t, r.acked_bytes);
         self.watch_still(t, r);
+        self.read_release(t, r.acked_bytes);
+        let rate = self.rate_at(t, r.acked_bytes, r.open_bps);
         let budget = self.size(rate, &r.gauges);
+        let still = self.still_age(t);
+        let through = still.and_then(|age| self.through(rate, age));
         let out = r.out();
         let verdict = if out == 0 {
             Verdict::NothingOut
@@ -487,6 +611,10 @@ impl Budget {
             Verdict::Admit
         } else if window_binds(&r.gauges) {
             Verdict::WindowBinds
+        } else if r.gauges.pending_bytes == 0
+            && through.is_some_and(|extra| out < budget.saturating_add(extra))
+        {
+            Verdict::WritesThrough
         } else {
             Verdict::Hold
         };
@@ -498,6 +626,7 @@ impl Budget {
         let w = &mut self.window;
         w.offered += 1;
         w.held += u64::from(verdict.holds());
+        w.still_admitted += u64::from(still.is_some() && !verdict.holds());
         w.budget_max = w.budget_max.max(budget);
         w.out_max = w.out_max.max(out);
         w.rate_bps = rate.unwrap_or(0);
@@ -527,10 +656,17 @@ impl Budget {
         self.least.unwrap_or(self.slack) + self.slack
     }
 
+    /// FR-148 D46 — the class of the last still span released on this
+    /// association and pair; `None` before the first, and after a reset.
+    pub fn last_release(&self) -> Option<Release> {
+        self.released
+    }
+
     /// The selected candidate pair changed: the old path's least is no floor
-    /// for the new one's.
+    /// for the new one's, and its releases say nothing of the new carrier.
     pub fn reset_least(&mut self) {
         self.least = None;
+        self.forget_releases();
     }
 
     /// A new association: its clock counts from 0 and its delays are its own.
@@ -543,6 +679,69 @@ impl Budget {
         self.holds = 0;
         self.last_acked = None;
         self.still = None;
+        self.last_still = None;
+        self.forget_releases();
+    }
+
+    /// FR-148 D46 — the class of the releases goes with the least: the next
+    /// still span holds until a release is read again.
+    fn forget_releases(&mut self) {
+        self.releasing = None;
+        self.hol_run = 0;
+        self.released = None;
+    }
+
+    /// FR-148 D46 — how long a still span has stood at `t`, µs from its first
+    /// still reading, once that is the least and S; `None` while the clock
+    /// moves or nothing is out.
+    fn still_age(&self, t: u64) -> Option<u64> {
+        let s = self.still?;
+        let age = t.saturating_sub(s.from);
+        (age >= us(self.still_after())).then_some(age)
+    }
+
+    /// FR-148 D46 — what a still span `age` µs old may have out past the
+    /// budget, bytes: the clock's rate over the span's age, after
+    /// [`Classifier::releases`] head-of-line releases in a row. `None`
+    /// otherwise, or with no rate known: the span holds.
+    fn through(&self, rate: Option<u64>, age: u64) -> Option<u64> {
+        if self.hol_run < self.classifier.releases.max(1) {
+            return None;
+        }
+        rate.map(|bps| bps.saturating_mul(age) / 8_000_000)
+    }
+
+    /// FR-148 D46 — a still span's release, read at the first step
+    /// [`Classifier::within`] after the span's last still reading: a burst
+    /// when [`Classifier::burst_permille`] of what SCTP had in flight then is
+    /// acknowledged by now, else a drain. A step that late a share of the
+    /// least and S after it is too late to tell, and reads as a drain.
+    fn read_release(&mut self, t: u64, acked: u64) {
+        let Some(r) = self.releasing else {
+            return;
+        };
+        let since = t.saturating_sub(r.from);
+        if since < us(self.classifier.within) {
+            return;
+        }
+        self.releasing = None;
+        self.last_still = Some((r.first, t, r.acked));
+        let permille = self.classifier.burst_permille;
+        let late = since.saturating_mul(1_000) >= us(self.still_after()).saturating_mul(permille);
+        let back = acked.saturating_sub(r.acked);
+        let burst = !late
+            && r.inflight > 0
+            && back.saturating_mul(1_000) >= r.inflight.saturating_mul(permille);
+        let class = if burst {
+            self.hol_run = self.hol_run.saturating_add(1);
+            self.window.released.0 += 1;
+            Release::HeadOfLine
+        } else {
+            self.hol_run = 0;
+            self.window.released.1 += 1;
+            Release::Drain
+        };
+        self.released = Some(class);
     }
 
     pub fn note_bound(&mut self, b: Bound) {
@@ -571,6 +770,8 @@ impl Budget {
             ack_over_ms: w.spread.read(),
             still: w.still,
             bounds: w.bounds,
+            released: w.released,
+            still_admitted: w.still_admitted,
         }
     }
 
@@ -621,8 +822,15 @@ impl Budget {
         let Some(from) = from else {
             return opening;
         };
-        let bps =
-            acked.saturating_sub(from.acked).saturating_mul(8_000_000) / t.saturating_sub(from.at);
+        // FR-148 D46 — a window that starts inside a released still span, or
+        // while its release comes back, starts at the span's first still
+        // reading and its count: the release brought back what the carrier
+        // serialized from there.
+        let (start, base) = self
+            .last_still
+            .filter(|&(first, end, _)| first < from.at && from.at <= end)
+            .map_or((from.at, from.acked), |(first, _, count)| (first, count));
+        let bps = acked.saturating_sub(base).saturating_mul(8_000_000) / t.saturating_sub(start);
         self.add_figure(t, bps);
         while self
             .figures
@@ -685,14 +893,17 @@ impl Budget {
 
     /// A span of the clock standing still with bytes out, from the first
     /// reading at its count to the last: counted when it ends, if it lasted
-    /// the least and S.
+    /// the least and S; when the clock moved, its release read from its last
+    /// still reading, and the span kept for the rate (FR-148 D46).
     fn watch_still(&mut self, t: u64, r: &Reading) {
         let out = r.sctp_out() > 0;
+        let inflight = r.gauges.inflight_bytes;
         if out
             && let Some(s) = self.still.as_mut()
             && s.acked == r.acked_bytes
         {
             s.to = t;
+            s.inflight = inflight;
             return;
         }
         if let Some(s) = self.still.take() {
@@ -700,6 +911,15 @@ impl Budget {
             if len >= us(self.still_after()) {
                 self.window.still.0 += 1;
                 self.window.still.1 = self.window.still.1.max(len / 1_000);
+                if r.acked_bytes != s.acked {
+                    self.releasing = Some(Releasing {
+                        first: s.from,
+                        from: s.to,
+                        acked: s.acked,
+                        inflight: s.inflight,
+                    });
+                    self.last_still = Some((s.from, s.to, s.acked));
+                }
             }
         }
         if out {
@@ -707,6 +927,7 @@ impl Budget {
                 acked: r.acked_bytes,
                 from: t,
                 to: t,
+                inflight,
             });
         }
     }
@@ -1467,5 +1688,308 @@ mod tests {
         let off = PumpCount::default();
         let mut frame = off.unsent(16_384);
         frame.sent(16_384);
+    }
+
+    /// FR-148 D46's stall classifier: busy at 2 Mbit/s with 40 000 bytes in
+    /// flight, a still span from 2 s to 2.8 s with 60 000, and its release,
+    /// then busy to 5.95 s with 8 000. A burst brings what was in flight back
+    /// at once; a drain brings back the link's 12 500 bytes a step. One
+    /// pending byte throughout, so no window binds. (ms, acked, in flight), a
+    /// step every 50 ms.
+    fn stall_then_release(burst: bool) -> Vec<(u64, u64, u64)> {
+        let mut steps = Vec::new();
+        let mut acked = 0;
+        for t in (0..=1_950).step_by(50) {
+            steps.push((t, acked, 40_000));
+            acked += 12_500;
+        }
+        for t in (2_000..=2_800).step_by(50) {
+            steps.push((t, acked, 60_000));
+        }
+        acked += if burst { 60_001 } else { 12_500 };
+        steps.push((2_850, acked, if burst { 8_000 } else { 47_501 }));
+        for t in (2_900..=5_950).step_by(50) {
+            acked += 12_500;
+            steps.push((t, acked, 8_000));
+        }
+        steps
+    }
+
+    fn feed(b: &mut Budget, t0: Instant, steps: &[(u64, u64, u64)]) {
+        for &(t, acked, out) in steps {
+            b.step(at(t0, t), &read(acked, wide(out, 1), 1_500_000));
+        }
+    }
+
+    /// The budget after [`stall_then_release`], with a fresh window, and the
+    /// clock's count for a step at 6 s that sees it move.
+    fn released(burst: bool) -> (Budget, Instant, u64) {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let steps = stall_then_release(burst);
+        feed(&mut b, t0, &steps);
+        let w = b.take_window();
+        let class = if burst { (1, 0) } else { (0, 1) };
+        assert_eq!((w.released, w.still), (class, (1, 800)));
+        let acked = steps.last().unwrap().1 + 12_500;
+        (b, t0, acked)
+    }
+
+    /// A still span at `acked`, a step every 50 ms from `from` to `to` ms with
+    /// `out` bytes in flight and nothing pending: what holds here holds on
+    /// the class, not on SCTP's queue.
+    fn stand(
+        b: &mut Budget,
+        t0: Instant,
+        from: u64,
+        to: u64,
+        acked: u64,
+        out: u64,
+    ) -> Vec<Verdict> {
+        (from..=to)
+            .step_by(50)
+            .map(|t| b.step(at(t0, t), &read(acked, wide(out, 0), 1_500_000)))
+            .collect()
+    }
+
+    /// [`stall_then_release`]'s steps to the span's last still reading at
+    /// 2.8 s, and the count the clock stood at.
+    fn to_the_last_still_reading() -> (Vec<(u64, u64, u64)>, u64) {
+        let steps: Vec<_> = stall_then_release(true)
+            .into_iter()
+            .filter(|s| s.0 <= 2_800)
+            .collect();
+        let a = steps.last().unwrap().1;
+        (steps, a)
+    }
+
+    #[test]
+    fn a_burst_release_is_head_of_line_and_one_at_the_rate_a_drain() {
+        for (burst, class) in [(true, Release::HeadOfLine), (false, Release::Drain)] {
+            let steps = stall_then_release(burst);
+            let mut b = Budget::new();
+            let t0 = Instant::now();
+            // Not read until the first step 50 ms after the last still
+            // reading, at 2.8 s.
+            let (to_2_8, rest) = steps.split_at(steps.iter().position(|s| s.0 == 2_850).unwrap());
+            feed(&mut b, t0, to_2_8);
+            assert_eq!(b.last_release(), None, "burst {burst}");
+            feed(&mut b, t0, &rest[..1]);
+            assert_eq!(b.last_release(), Some(class), "burst {burst}");
+            let w = b.take_window();
+            assert_eq!(w.still, (1, 800));
+            let want = if burst { (1, 0) } else { (0, 1) };
+            assert_eq!(w.released, want, "burst {burst}");
+        }
+        // The share is of what SCTP had in flight at the last still reading,
+        // 60 000 bytes, and not of its pending byte: 36 000 back by 50 ms
+        // after it is a burst at 600 per mille, 35 999 not. A step 25 ms after
+        // it reads nothing yet.
+        for (back, class) in [(36_000, Release::HeadOfLine), (35_999, Release::Drain)] {
+            let mut b = Budget::new();
+            let t0 = Instant::now();
+            let (mut steps, a) = to_the_last_still_reading();
+            steps.push((2_825, a + 1, 59_999));
+            feed(&mut b, t0, &steps);
+            assert_eq!(b.last_release(), None, "{back} back");
+            feed(&mut b, t0, &[(2_850, a + back, 8_000)]);
+            assert_eq!(b.last_release(), Some(class), "{back} back");
+        }
+    }
+
+    #[test]
+    fn a_release_whose_first_step_comes_too_late_to_tell_is_a_drain() {
+        // The least and S are 300 ms here (no SACK's delay), so a first step
+        // 180 ms after the last still reading, 600 per mille of them, is
+        // late, and 179 ms is not: all 60 001 bytes back reads as a drain in
+        // the one and as a burst in the other.
+        for (late_ms, class) in [(180, Release::Drain), (179, Release::HeadOfLine)] {
+            let mut b = Budget::new();
+            let t0 = Instant::now();
+            let (steps, a) = to_the_last_still_reading();
+            feed(&mut b, t0, &steps);
+            feed(&mut b, t0, &[(2_800 + late_ms, a + 60_001, 8_000)]);
+            assert_eq!(b.last_release(), Some(class), "{late_ms} ms");
+        }
+    }
+
+    #[test]
+    fn the_first_still_span_holds() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        // 2 Mbit/s × (S + S) = 75 000 bytes, and 100 000 out.
+        let verdicts = stand(&mut b, t0, 2_000, 2_800, acked, 100_000);
+        assert_eq!(b.last_budget(), 75_000);
+        assert_eq!(b.last_release(), None);
+        assert!(verdicts.iter().all(|&v| v == Verdict::Hold), "{verdicts:?}");
+        let w = b.take_window();
+        assert_eq!((w.still_admitted, w.released), (0, (0, 0)));
+    }
+
+    #[test]
+    fn after_a_head_of_line_release_a_still_span_writes_through_at_the_clock_s_rate() {
+        let (mut b, t0, acked) = released(true);
+        assert_eq!(b.last_release(), Some(Release::HeadOfLine));
+        // Until the clock has stood still for the least and S (300 ms with no
+        // SACK's delay) the budget holds as before.
+        let verdicts = stand(&mut b, t0, 6_000, 6_250, acked, 500_000);
+        assert!(verdicts.iter().all(|&v| v == Verdict::Hold), "{verdicts:?}");
+        // From then a frame goes while out < budget + rate × still_age, the
+        // span's age from its first still reading, and no more.
+        let probe = |b: &Budget, t: u64, out: u64| {
+            let mut b = b.clone();
+            let v = b.step(at(t0, t), &read(acked, wide(out, 0), 1_500_000));
+            (v, b.last_budget(), b.rate_bps().unwrap())
+        };
+        for t in (6_300..=6_800).step_by(50) {
+            let (_, budget, rate) = probe(&b, t, 1);
+            let through = rate * (t - 6_000) * 1_000 / 8_000_000;
+            assert!(through > 0, "at {t} ms");
+            assert_eq!(
+                probe(&b, t, budget + through - 1).0,
+                Verdict::WritesThrough,
+                "at {t} ms"
+            );
+            assert_eq!(probe(&b, t, budget + through).0, Verdict::Hold, "at {t} ms");
+            assert_eq!(probe(&b, t, budget - 1).0, Verdict::Admit, "at {t} ms");
+            // Each step of the span: a frame that goes.
+            let v = b.step(
+                at(t0, t),
+                &read(acked, wide(budget + through - 1, 0), 1_500_000),
+            );
+            assert_eq!(v, Verdict::WritesThrough, "at {t} ms");
+        }
+        let w = b.take_window();
+        assert_eq!(w.still_admitted, 11, "{w:?}");
+        assert_eq!(w.held.0, 6, "the six steps before the span was still");
+    }
+
+    #[test]
+    fn after_a_drain_release_a_still_span_holds() {
+        let (mut b, t0, acked) = released(false);
+        assert_eq!(b.last_release(), Some(Release::Drain));
+        let verdicts = stand(&mut b, t0, 6_000, 6_800, acked, 500_000);
+        assert!(verdicts.iter().all(|&v| v == Verdict::Hold), "{verdicts:?}");
+        assert_eq!(b.take_window().still_admitted, 0);
+    }
+
+    #[test]
+    fn a_new_association_and_a_new_pair_each_forget_the_class() {
+        let (mut b, t0, _) = released(true);
+        b.on_new_association();
+        assert_eq!(b.last_release(), None);
+        // The new association's clock counts from 0, and its first still span
+        // holds.
+        let verdicts = stand(&mut b, t0, 6_000, 6_800, 0, 500_000);
+        assert!(verdicts.iter().all(|&v| v == Verdict::Hold), "{verdicts:?}");
+        // Through the pumps' side, with a least of 60 ms: a new selected pair
+        // forgets it too.
+        let mut s = Shadow::new();
+        let t0 = Instant::now();
+        for (t, acked, out) in stall_then_release(true) {
+            s.on_reading(at(t0, t), acked, delayed(wide(out, 1), 60, 60), 1_500_000);
+        }
+        s.on_pair(Some(pair(50_000)));
+        assert_eq!(s.budget().last_release(), Some(Release::HeadOfLine));
+        assert_eq!(s.budget().least(), Some(d(60)));
+        s.on_pair(Some(pair(50_001)));
+        assert_eq!(s.budget().last_release(), None);
+        assert_eq!(s.budget().least(), None, "with the least");
+    }
+
+    /// The verdict on a frame that leaves `out` at the budget, at `t` ms on a
+    /// clock standing at `acked`: B1's budget holds it.
+    fn at_the_budget(b: &Budget, t0: Instant, t: u64, acked: u64) -> Verdict {
+        let mut look = b.clone();
+        look.step(at(t0, t), &read(acked, wide(1, 0), 1_500_000));
+        let budget = look.last_budget();
+        let mut b = b.clone();
+        b.step(at(t0, t), &read(acked, wide(budget, 0), 1_500_000))
+    }
+
+    #[test]
+    fn two_head_of_line_releases_in_a_row_when_two_are_asked() {
+        let two = Classifier {
+            releases: 2,
+            ..Classifier::default()
+        };
+        let mut b = Budget::with_classifier(SLACK, two);
+        let t0 = Instant::now();
+        let steps = stall_then_release(true);
+        feed(&mut b, t0, &steps);
+        assert_eq!(b.last_release(), Some(Release::HeadOfLine));
+        // One is not enough: 300 ms into the next still span, a frame at the
+        // budget holds.
+        let a = steps.last().unwrap().1 + 12_500;
+        stand(&mut b, t0, 6_000, 6_250, a, 1);
+        assert_eq!(at_the_budget(&b, t0, 6_300, a), Verdict::Hold);
+        // That span's release is the second in a row: the next span writes
+        // through.
+        stand(&mut b, t0, 6_300, 6_800, a, 1);
+        b.step(at(t0, 6_850), &read(a + 2, wide(8_000, 1), 1_500_000));
+        b.step(at(t0, 6_900), &read(a + 12_502, wide(8_000, 1), 1_500_000));
+        assert_eq!(b.last_release(), Some(Release::HeadOfLine));
+        let a = a + 25_002;
+        stand(&mut b, t0, 7_000, 7_250, a, 1);
+        assert_eq!(at_the_budget(&b, t0, 7_300, a), Verdict::WritesThrough);
+        // And a drain between starts the count over: 1 250 of the 10 000
+        // bytes in flight back 50 ms after the span's last still reading.
+        stand(&mut b, t0, 7_300, 7_300, a, 10_000);
+        b.step(at(t0, 7_350), &read(a + 1_250, wide(8_000, 1), 1_500_000));
+        assert_eq!(b.last_release(), Some(Release::Drain));
+        let a = a + 12_500;
+        stand(&mut b, t0, 7_500, 7_750, a, 1);
+        assert_eq!(at_the_budget(&b, t0, 7_800, a), Verdict::Hold);
+    }
+
+    #[test]
+    fn a_still_span_writes_through_only_while_sctp_queues_nothing() {
+        let (mut b, t0, acked) = released(true);
+        stand(&mut b, t0, 6_000, 6_250, acked, 1);
+        // 300 ms into the span a frame over the budget goes with nothing
+        // pending in SCTP, and holds with one byte pending: SCTP's window
+        // binds, and what is written waits in its queue for the release.
+        let mut look = b.clone();
+        look.step(at(t0, 6_300), &read(acked, wide(1, 0), 1_500_000));
+        let over = look.last_budget() + 1;
+        let verdict = |pending: u64| {
+            let mut b = b.clone();
+            b.step(at(t0, 6_300), &read(acked, wide(over, pending), 1_500_000))
+        };
+        assert_eq!(verdict(0), Verdict::WritesThrough);
+        assert_eq!(verdict(1), Verdict::Hold);
+    }
+
+    #[test]
+    fn a_second_that_starts_inside_a_released_still_span_counts_from_its_first_still_reading() {
+        // Busy at 2 Mbit/s, 12 500 bytes a 50 ms step; a head-of-line stall
+        // from 2 s to 2.8 s through which the carrier serialized at the same
+        // rate, its 225 000 bytes back over two steps, 50 000 at 2.85 s and
+        // the rest at 2.9 s; then busy again.
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let mut acked = 0;
+        for t in (0..=1_950).step_by(50) {
+            b.step(at(t0, t), &read(acked, wide(40_000, 1), 1_500_000));
+            acked += 12_500;
+        }
+        for t in (2_000..=2_800).step_by(50) {
+            b.step(at(t0, t), &read(acked, wide(60_000, 1), 1_500_000));
+        }
+        let stood = acked;
+        // The second from 2.8 s to 3.8 s counts from 2 s: 450 000 bytes over
+        // 1.8 s are the link's 2 Mbit/s, where over the 1 s they would be 3.6
+        // Mbit/s. So does the second from 2.85 s, which starts while the
+        // release comes back (3.3 Mbit/s over its 1 s). The rate stays at the
+        // link's.
+        for t in (2_850..=4_000).step_by(50) {
+            let acked = match t {
+                2_850 => stood + 50_000,
+                _ => stood + 250 * (t - 2_000),
+            };
+            b.step(at(t0, t), &read(acked, wide(40_000, 1), 1_500_000));
+            assert_eq!(b.rate_bps(), Some(2_000_000), "at {t} ms");
+        }
     }
 }

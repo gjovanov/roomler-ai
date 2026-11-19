@@ -68,14 +68,20 @@ flowchart LR
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
 
-⚠️ **Measured: on a software-only host, a session beside a recording costs it ticks.** On a 4-vCPU guest with
-no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
-ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
-the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
-count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
-bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
-AC1's bound is held to hosts with a hardware encoder (decided 2026-11-05). Giving the recorder the CPU first on a
-host with no GPU is [#3492](https://github.com/gjovanov/roomler-ai/issues/3492).
+⚠️ **Measured: on a software-only host, a recording beside a session can lose ticks; on 8 vCPUs it did so only
+early on.** On a 4-vCPU guest with no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small
+moving region dropped 0.72 % of its ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside
+it. The frames stayed native and the file kept time, because a missed tick is the previous frame lasting longer. The
+sidecar's `late_ticks` is that count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone
+dropped 0.32 %, and then 1.62 % with the session beside it. On release 0.4.227 (2026-11-19, 8 vCPUs, a relay-capped
+session beside the recording) the first two cells after the guest booted read 0.69 % (9 minutes in) and 0.78 %
+(22 minutes in, with every recorder thread raised to nice −10). Every cell from 35 minutes on read 0.01–0.03 %,
+including a repeat of the first cell with nothing changed (0.011 %, 87 minutes in). With a session beside the
+recording, the recorder, the session's encoder and Xorg together used about one core of the eight
+([the cells](https://github.com/gjovanov/roomler-ai/issues/3492#issuecomment-7013382966)). So on 8 vCPUs the
+session's encoder does not starve the recorder, and what cost the early ticks is not known.
+[#3492](https://github.com/gjovanov/roomler-ai/issues/3492), which would have given the recorder the CPU first, was
+closed as not reproduced in steady state. AC1's bound is held to hosts with a hardware encoder (decided 2026-11-05).
 
 ⚠️ **Measured: on a Mac, the recorder's own disk check cost a tick every 5 s.** On a MacBook (Apple M5 Pro,
 release 0.4.200, FR-85's field log), a 3024×1964 recording on `h264_videotoolbox` read 0.63 % late ticks with a
@@ -1463,10 +1469,10 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:438` (`SessionParams::record`), `signaling.rs:4204` (sent AFTER the consent mode is resolved), `signaling.rs:3123` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1102`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1573` (`effective_record`), `signaling.rs:7016` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:438` (`SessionParams::record`), `signaling.rs:4222` (sent AFTER the consent mode is resolved), `signaling.rs:3141` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1102`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1629` (`effective_record`), `signaling.rs:7057` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:596-615` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
-| The worker's account of a recording | `delegate.rs:1486` (noted where the grant crosses), `delegate.rs:2123` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:735`). The server bounds it again to a live session of this agent |
+| The worker's account of a recording | `delegate.rs:1542` (noted where the grant crosses), `delegate.rs:2204` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:762`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
   worker runs without `--config`, so it reads the user's. The companion's

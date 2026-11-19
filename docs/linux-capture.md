@@ -529,8 +529,8 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7023`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2669`).
+heartbeat only read that cache (`signaling.rs:7062`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2687`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
@@ -1184,11 +1184,42 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:1302`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:1352`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
 the settle for measuring it on a host.
+
+⚠️ **On a system install the warm-up waits for the automatic capture, and runs
+again when it goes live** (#4069). `open_default` picks the automatic uinput of
+§1.2.1 only while an automatic capture is alive. Before that it picks enigo,
+which a root daemon has no display for: the open fails, logs #3787's ERROR when
+a person is at the screen, and caches nothing, so the uinput opened at the first
+event, without its warm-up. 0.4.226's capture went live before the control
+channel was ready. 0.4.227 connected faster, so the control channel came first
+and the warm-up lost that race. Now, where the automatic uinput is planned (the
+brief plans the DRM arm, `uinput` is unset and `/dev/uinput` opens) and no
+automatic capture is alive yet, the warm-up opens nothing
+(`awaits_automatic_capture`, `agents/roomlerd/src/input/mod.rs:354`). The
+capture's live edge runs it again for every session that may input
+(`Cmd::CaptureLive`):
+
+| Order | Before #4069 | Now |
+|---|---|---|
+| the capture goes live, then the control channel (0.4.226) | the control channel's warm-up opens the uinput | the live edge opens it, if a session that may input is registered by then; otherwise the control channel's warm-up does. One open either way |
+| the control channel, then the capture (0.4.227) | the warm-up opens enigo, which fails on a root daemon; the uinput opens at the first event | the warm-up waits (`the warm-up waits for the planned automatic system capture to go live (#4069)`, `on="control_ready"`); the live edge opens the uinput (`injector opened ahead of the first event (FR-93 P4c)`, `on="capture_live"`) |
+
+The edge is the first automatic capture alive: `ViewingMark`'s count going from
+0 to 1. After the count, it runs the hook the input arbiter set as it started
+(`seat_guard::on_live`, `agents/roomlerd/src/capture/seat_guard.rs:216`): one
+command, handed over with a `try_send`, which drops it on a full queue rather
+than wait. So the capture's code calls no input code, the edge never starts the
+arbiter, and a process without one tells nobody. The caps' `mouse-rel` word reads the same
+prediction (`automatic_uinput_planned`, [relative-mouse.md](relative-mouse.md)).
+A wrong prediction costs the warm-up, never input. A planned capture that never
+goes live leaves the first event to open, as before. A capture that comes
+unpredicted replaces what the control channel opened (`stale`).
+`ROOMLERD_INPUT_WARM=0` turns off both warm-ups.
 
 ⚠️ **Root, or a refusal at open (FR-93 P3h).** `drmModeGetFB2` does not fail
 for a caller without `CAP_SYS_ADMIN`. It answers with the geometry and **no
@@ -1196,7 +1227,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:1157`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1161`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -1475,9 +1506,9 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3817`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1439`; `set_output_cap`, `drm_backend.rs:1668` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3817`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1513`; `set_output_cap`, `drm_backend.rs:1742` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
 | **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:713`; `band_threads`, `drm_backend.rs:741` | `ROOMLERD_DRM_THREADS=1` |
-| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1544` | — (a timing fix) |
+| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1618` | — (a timing fix) |
 | **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:152` | `ROOMLERD_DRM_GPU=0` |
 
 Shipped in **0.4.140**. Measured on that box (GNOME, 4096×2160 `XR30`), one
@@ -1540,7 +1571,7 @@ pipeline.** The animation moves for part of each toggle, and the idle skip
 (§3.2) rightly sends nothing in between, so "frames per second" there reads 4–5
 for every build. Measure with motion that never stops.
 
-### 3.5 A framebuffer freed under a grab (#4035)
+### 3.5 A framebuffer freed under a grab or the open (#4035, #4040)
 
 Each grab reads which framebuffer the primary plane shows, reads the cursor
 plane, and then asks the kernel for that framebuffer (`drmModeGetFB2`). A
@@ -1555,7 +1586,7 @@ FR-148 lab cell they landed inside two measurement holds, and a result was
 withdrawn (#3953).
 
 An `ENOENT` now costs its grab one tick, and a run of them is bounded
-(`FreedRun`, `agents/roomlerd/src/capture/drm_backend.rs:1189`):
+(`FreedRun`, `agents/roomlerd/src/capture/drm_backend.rs:1193`):
 
 ```mermaid
 flowchart TD
@@ -1580,7 +1611,7 @@ flowchart TD
 
 ⚠️ **The errno decides, never the message.** The drm crate hands the ioctl's
 errno over as `io::Error::from_raw_os_error`, and `freed`
-(`drm_backend.rs:1226`) compares that code with `ENOENT`. An error that only
+(`drm_backend.rs:1230`) compares that code with `ENOENT`. An error that only
 reads like one, with *"No such file or directory"* in its text, fails the grab
 like any other, and `any_other_getfb2_failure_fails_at_once` holds it to that.
 
@@ -1591,13 +1622,13 @@ worker to check for a dark display (§3.3); a race does none of that. The cursor
 plane was read and published before GETFB2, so the pointer keeps following the
 viewer's mouse through a skip, and the gate still holds the frame it last
 delivered. `next_frame` waits a race out on the same arm as an unchanged frame
-(`drm_backend.rs:1605`), but does not count it in `frames_unchanged`, which
+(`drm_backend.rs:1679`), but does not count it in `frames_unchanged`, which
 stays the idle skip's own measure.
 
 ⚠️ **Bounded on purpose.** A plane that keeps naming a framebuffer the kernel
 cannot find has not lost a race, and skipping it for good would freeze the
 picture with nothing to recover it. Ten in a row (`FREED_RUN_MAX`,
-`drm_backend.rs:1167`) is a third of a second at 30 fps and a sixth at 60. The
+`drm_backend.rs:1171`) is a third of a second at 30 fps and a sixth at 60. The
 run ends in the rebuild every `ENOENT` caused before, and its error carries the
 count, so a field read can tell a bounded run's end from the race #4035
 removed.
@@ -1614,9 +1645,9 @@ and 10 in a row rebuild the capture (#4035)`. When the capture ends, `drm
 capture: ticks skipped because the compositor freed their framebuffer mid-grab
 (#4035)` gives the total as `skipped`.
 
-The open's own GETFB2 (`drm_backend.rs:1026`) is unchanged: an error there,
-`ENOENT` included, fails the open as before. There is no kill switch: the bound
-already falls back to the old rebuild for a plane that stays broken, and a knob
+The open makes the same two calls and can lose the same race; since #4040 it
+reads the plane again (below). There is no kill switch: the bound already falls
+back to the old rebuild for a plane that stays broken, and a knob
 would raise FR-135's ratchet (`scripts/rc-media-ratchet.sh` counts env reads in
 `capture/`). The class this belongs to, a transient capture error that forces a
 full rebuild, is FR-135's `CaptureStage` (phase R4b). Its ledger row,
@@ -1626,6 +1657,79 @@ persistent one reopens. Unit-tested without a DRM device (`FreedRun::judge`,
 and `next_frame` against a stand-in worker); not yet field-verified: #4035's
 acceptance is the same bounded log read, over a week, after the release that
 carries it.
+
+**At the open (#4040).** Before the first grab, the open reads the primary plane
+and asks GETFB2 for its framebuffer, to size the capture and to refuse a scanout
+it may not read (`unreadable`, §3). Until #4040 an `ENOENT` there failed the
+open. A failed open falls through the cascade (§1): to the portal arm where that
+is switched on, otherwise to arms that may not serve a Wayland system install,
+and the viewer is shown the open's error (§1.1). Every reopen comes back through
+this open, including a pump's rebuild at the end of a run of freed grabs
+(above). Now the open reads the plane again (`open_framebuffer`,
+`drm_backend.rs:1275`, called from the worker at `drm_backend.rs:1021`):
+
+```mermaid
+flowchart TD
+    P["the open reads the primary plane"] -- "nothing scanned out" --> N["the open fails as before:<br/>no plane is bound"]
+    P -- "a framebuffer" --> G{"GETFB2 for that framebuffer"}
+    G -- found --> O["the open goes on with it:<br/>the handle, the modifier, the size"]
+    G -- "ENOENT, under 4 in a row" --> W["wait 2 ms, for the buffer<br/>that replaced the freed one"]
+    W --> P
+    G -- "ENOENT, the 4th in a row" --> X["the open fails and names the count"]
+    G -- "any other failure" --> F["the open fails at once,<br/>naming the call and the errno"]
+```
+
+| What the open meets | Transient? | What the cascade sees |
+|---|---|---|
+| GETFB2 answers `ENOENT`: the compositor freed the framebuffer after the plane read | **yes**, the same race | nothing: the open reads the plane again `OPEN_REREAD_WAIT` (2 ms) later, asks GETFB2 for the buffer that replaced the freed one, and opens on it |
+| `ENOENT` on `OPEN_FREED_MAX` (4) reads in a row | **no** | the open's error, *"drmModeGetFB2 failed on 4 reads of the primary plane in a row (#4040): No such file or directory (os error 2)"*, and the cascade falls through as before |
+| any other GETFB2 failure, or a fourcc the drm crate does not know | no | the open's error at once, naming the call and what it got: *"drmModeGetFB2 failed on the primary plane's framebuffer: Invalid argument (os error 22)"* |
+| a read of the plane, the first or a later one, finds nothing scanned out | as before | the open's error as before, *"no plane is bound to a CRTC with a live framebuffer …"* (`NO_SCANOUT`). A display switched off is still waited for (§3.3): that wait asks the display, not the words |
+
+⚠️ **The plane again, not GETFB2 again.** GETFB2 for the freed id would only
+answer `ENOENT` again: the kernel no longer has that framebuffer. The plane
+names the one that replaced it, so the open reads the plane and asks for that
+one. `a_framebuffer_freed_at_the_open_reads_the_plane_again_and_opens` checks
+that GETFB2 is asked for the new id.
+
+⚠️ **A GETFB2 failure is never the missing capability.** The open's error used
+to read *"drmModeGetFB2 failed (…) — this needs CAP_SYS_ADMIN to receive the GEM
+handle"*, so a lost race read as a permission problem. GETFB2 does not fail for
+a caller without `CAP_SYS_ADMIN`: it answers with no buffer handle, and
+`unreadable` refuses that case in its own words (§3, FR-93 P3h). The open's
+GETFB2 errors now name the call and the errno, and
+`no_getfb2_failure_blames_cap_sys_admin` holds every GETFB2 error, at the open
+and in a grab, to that. Both still start with *"drmModeGetFB2 failed"*, as the
+old line did, so one search counts the open's failures before and after #4040.
+
+**Four reads, 2 ms apart.** The race is a window between two ioctls, and the
+open's caller waits on it, so its worst case stays small: three waits, 6 ms.
+Right after an `ENOENT` the plane names the buffer that replaced the freed one,
+which stays on screen until the compositor's next flip completes, so the next
+read almost always wins, and losing again takes a second race. 2 ms is short
+beside a refresh period (4.2 ms at 240 Hz), and the sleep gives the CPU back, so
+the next two ioctls start on a fresh time slice: a thread preempted between
+them, as a busy guest's vCPU can be, is the likeliest way to stretch the window.
+Four in a row are no longer a lost race, and the open fails as it did before
+#4040, saying how many. A grab's tick is not the unit here: the open has no tick
+to skip and must hand the cascade a size or an error, and `FreedRun` counts
+frame periods and names grabs. So the open's rule is its own, with every effect
+passed in (the plane read, GETFB2, the wait), which is how the unit tests drive
+it without a DRM device.
+
+**The log.** An open that read the plane again says so once, with the count as
+`rereads`: `drm capture: the open found the primary plane's framebuffer freed
+(ENOENT) and read the plane again (#4040)`.
+
+Its ledger row is `cap:SPC-59` (`CaptureStage`, R4b), beside `cap:SPC-58` and
+with the same retire condition. Unit-tested without a DRM device:
+`a_framebuffer_freed_at_the_open_reads_the_plane_again_and_opens`,
+`a_run_of_freed_framebuffers_at_the_open_fails_it_and_names_the_count`,
+`any_other_getfb2_failure_at_the_open_fails_it_at_once`,
+`a_reread_that_finds_nothing_scanned_out_fails_as_the_first_read_does` and
+`no_getfb2_failure_blames_cap_sys_admin`. Not yet field-verified: #4040's
+acceptance is a bounded read of `agent_logs` that counts the open's GETFB2
+failures before, and over a week after, the release that carries it.
 
 ## 4. The portal arm (FR-45 P1–P4)
 
@@ -2719,9 +2823,10 @@ is still in its file (`scripts/code-map-audit.sh`).
 | `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, collects what exits and takes the desktop down when its input ends (`run`, `serve`, `teardown_with`, `may_signal`) |
 | `agents/roomlerd/src/media_share.rs` | #3671: the shared pipelines retired with the desktop's X server (`retire_all`); #3918: a joiner under a marked owner (`try_join`), from what the owner published (`names_a_capture_off_x`) |
 | `agents/roomlerd/src/input/x_follow.rs` | #3918: the X11 injector's follow (`gate`, `let_go`, `opened_under`) and its kill switch (`enabled`); the marks (`no_picture`) and who is left behind (`Sessions`) |
-| `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`) |
+| `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`); FR-93 P4c's warm-up (`warm`) and its kill switch (`warm_on`); #4069: the wait for a planned automatic capture (`awaits_automatic_capture`), the one prediction it and the caps' word share (`automatic_uinput_planned`), and the capture's live edge (`live_edge`, `CaptureLive`) |
+| `agents/roomlerd/src/capture/seat_guard.rs` | FR-95 P2: the automatic captures alive and viewing (`live`, `viewing`, `ViewingMark`); #4069: the live edge and the hook the input arbiter sets for it (`on_live`, `LiveHook`, `goes_live`, `tell_live`) |
 | `agents/roomlerd/src/clipboard.rs` | #3671: the worker's follow of the desktop's X server (`x11_follow`, `Follow`, `connect_anew`, `REBUILD_BOUND`), the retry that `shared` and `available` read (`Retry`), and the teardown that holds back arboard's dead-connection lines (`quietly_drop`) |
-| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled`, `primary`) and the scanout's channel order, both depths (`Layout::of`, `repack_to_bgra`, `repack_bgra_half`); FR-93 P3c: the plane table with each plane's type (`read_planes`), the primary by type (`primary_plane`), the cursor caps (`enable_cursor_caps`) and the per-frame cursor read (`CursorReader`, `read_cursor_pixels`); FR-93 P3d/P3f: the buffer's identity (`BufferId`) and the mapping's key (`maps`), the kill switch (`idle_skip_enabled`), the gate in `grab`, and the still screen waited out in `next_frame`; FR-93 P3e: a display switched off (`display_off`, for an open `display_is_off`), told apart in the worker loop (`worker`), waited out in `next_frame` (`DARK_POLL`) and reported by `waits_for`, and its kill switch (`wake_wait_enabled`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable`); #4035: a framebuffer freed between the plane read and GETFB2 costs its grab a tick, bounded (`FreedRun`, `FREED_RUN_MAX`, `freed`), answered as `Grabbed::Raced` and waited out in `next_frame` |
+| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled`, `primary`) and the scanout's channel order, both depths (`Layout::of`, `repack_to_bgra`, `repack_bgra_half`); FR-93 P3c: the plane table with each plane's type (`read_planes`), the primary by type (`primary_plane`), the cursor caps (`enable_cursor_caps`) and the per-frame cursor read (`CursorReader`, `read_cursor_pixels`); FR-93 P3d/P3f: the buffer's identity (`BufferId`) and the mapping's key (`maps`), the kill switch (`idle_skip_enabled`), the gate in `grab`, and the still screen waited out in `next_frame`; FR-93 P3e: a display switched off (`display_off`, for an open `display_is_off`), told apart in the worker loop (`worker`), waited out in `next_frame` (`DARK_POLL`) and reported by `waits_for`, and its kill switch (`wake_wait_enabled`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable`); #4035: a framebuffer freed between the plane read and GETFB2 costs its grab a tick, bounded (`FreedRun`, `FREED_RUN_MAX`, `freed`), answered as `Grabbed::Raced` and waited out in `next_frame`; #4040: at the open, the same race reads the plane again, bounded (`open_framebuffer`, `OPEN_FREED_MAX`, `OPEN_REREAD_WAIT`), and a read that finds nothing scanned out fails in the words it always had (`NO_SCANOUT`) |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish`, `latest`) and the pure conversions (`straighten_and_crop`, `place`, `shape_id`, `pick_primary`) |
 | `agents/roomlerd/src/capture/drm_idle.rs` | FR-93 P3d: the bounds (`MAX_SKIP`, `IDLE_WAIT`, `SAMPLE_ROWS`), what a tick showed (`Shown`), the gate (`IdleGate`, `unchanged`) and the row hash (`sample_rows`, `sampled_row`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect`, P2d-3's bounded `detect_within`, `detect_in_session`); the brief's non-activating `reachable`; `pub mod helper`: the `portal-helper` subcommand, `spawn_streaming`, `spawn_child`; FR-93 P5b: the helper ends with its mutter session, exit 3 on `Closed` (`EXIT_SESSION_CLOSED`, armed in `run_stream_mutter`); FR-93 P5c: and with its stream, exit 4 once that has left *streaming* for good (`EXIT_STREAM_ENDED`, `SOURCE_GONE_AFTER`, `source_gone`, read in the frame loop both arms share, P5d: `write_frames`, which since P5e writes the first frame first); FR-93 P2d-4: a helper that fails before its stream says why (`STREAM_FAILED_MARKER`, `fail_stream`, read in `read_stream_handshake`); FR-93 P6c: who closed the session (`ClosedBy`, mutter's `closed_mutter`, the portal's `closed_portal`, `end_closed`), the person's stop as exit 5 (`EXIT_STOPPED_AT_SCREEN`), the portal arm's watcher armed in `run_stream`, with KWin's bus owner telling a crash apart (`KWIN_BUS`) |

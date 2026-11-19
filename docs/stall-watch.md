@@ -345,9 +345,9 @@ What it cannot see, and what it prints about that:
 | Limit | Why | What the read does |
 |---|---|---|
 | **7 days**, where the host census read 14 | the TTL on `agent_logs` | A window is at most 8 days. A before and an after are compared at the same length, or by rate per 1 000 heartbeats. |
-| **The uploader can lose lines** | a full channel drops and counts (`note_dropped_lines`, `crates/agent-core/src/logs_upload.rs:148`); a shed batch (`:419`) and a refused one are counted nowhere | Each row prints `dropped`, `hb_gaps` (a session's heartbeats over 10 s apart, with the seconds missing) and `counted`, the sum of the heartbeats' `pump_stalls`. `counted` under `stalls` means heartbeats were lost. |
+| **The uploader can lose lines** | a full channel drops and counts (`note_dropped_lines`, `crates/agent-core/src/logs_upload.rs:166`); a shed batch (`:452`) and a refused one are counted nowhere | Each row prints `dropped`, `hb_gaps` (a session's heartbeats over 10 s apart, with the seconds missing) and `counted`, the sum of the heartbeats' `pump_stalls`. `counted` under `stalls` means heartbeats were lost. |
 | **`reset` needs the heartbeat before it** | a lost heartbeat would turn a `reset` line into `untimed` | Such a line is counted again as `reset_no_hb`. |
-| **A stamp is in milliseconds** where the file has microseconds | `DateTime::now()` in the upload layer (`logs_upload.rs:190`) | 4.7 ms can read 5, so the fleet read takes ≤ 5 ms: an edge line is called `reset`, the class AC7 wants at 0. |
+| **A stamp is in milliseconds** where the file has microseconds | `DateTime::now()` in the upload layer (`logs_upload.rs:208`) | 4.7 ms can read 5, so the fleet read takes ≤ 5 ms: an edge line is called `reset`, the class AC7 wants at 0. |
 | **Silence is not health** | only the FFmpeg DC pump has the watch (§9) | `heartbeats` is the denominator: a row with none ran another pump, or no session. |
 
 ⚠️ **The two ends agree, and this is the check to repeat if the classifier

@@ -275,35 +275,90 @@ fn injector_carries_rel() -> bool {
 /// device cannot be opened: `open_default` then falls through to enigo.
 /// - opted in (`ROOMLERD_UINPUT=1`);
 /// - an automatic system capture (FR-95) already alive;
-/// - the brief planning the DRM arm with `uinput` unset: a system install's
-///   automatic capture pairs that arm with uinput (`planned_input_route` leaves
-///   it to the OS injector, and `open_default` picks uinput for it).
+/// - the automatic uinput planned ([`automatic_uinput_planned`]), the one
+///   prediction the input arbiter's warm-up waits on too (#4069).
 #[cfg(all(target_os = "linux", feature = "enigo-input"))]
 fn uinput_would_inject(brief: Option<&roomler_ai_remote_control::models::DesktopBrief>) -> bool {
-    #[cfg(feature = "uinput-input")]
+    #[cfg(all(feature = "uinput-input", feature = "drm-capture"))]
     {
-        if !uinput_backend::available() {
-            return false;
+        if uinput_backend::env_enabled() || crate::capture::seat_guard::live() {
+            return uinput_backend::available();
         }
-        if uinput_backend::env_enabled() {
-            return true;
-        }
-        #[cfg(feature = "drm-capture")]
-        {
-            if crate::capture::seat_guard::live() {
-                return true;
-            }
-            if uinput_unset() && brief.is_some_and(|b| b.capture_arm == "drm") {
-                return true;
-            }
-        }
-        #[cfg(not(feature = "drm-capture"))]
+        automatic_uinput_planned(brief)
+    }
+    #[cfg(all(feature = "uinput-input", not(feature = "drm-capture")))]
+    {
         let _ = brief;
-        false
+        uinput_backend::env_enabled() && uinput_backend::available()
     }
     #[cfg(not(feature = "uinput-input"))]
     {
         let _ = brief;
+        false
+    }
+}
+
+/// FR-109 P2b, #4069 — the automatic uinput is planned, whether or not its
+/// capture is live yet: the desktop brief plans the DRM arm with `uinput`
+/// unset, which a system install's automatic capture pairs with uinput
+/// (`planned_input_route` leaves it to the OS injector, and `open_default`
+/// picks uinput while that capture is live), and `/dev/uinput` opens. The one
+/// prediction behind the caps' word ([`uinput_would_inject`]) and the input
+/// arbiter's wait ([`awaits_automatic_capture`]), so the two cannot drift
+/// apart. It runs on the arbiter's thread, so it reads only what is cheap: the
+/// cached brief, the environment and one open of `/dev/uinput`; no D-Bus, no
+/// subprocess.
+#[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+fn automatic_uinput_planned(
+    brief: Option<&roomler_ai_remote_control::models::DesktopBrief>,
+) -> bool {
+    #[cfg(test)]
+    if let Some(here) = PLANNED_HERE.with(std::cell::Cell::get) {
+        return here;
+    }
+    automatic_uinput_planned_with(uinput_unset(), brief, uinput_backend::available)
+}
+
+/// [`automatic_uinput_planned`], with `uinput` being unset and the device
+/// given. The device is asked last, only when the rest says yes.
+#[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+fn automatic_uinput_planned_with(
+    uinput_unset: bool,
+    brief: Option<&roomler_ai_remote_control::models::DesktopBrief>,
+    available: impl FnOnce() -> bool,
+) -> bool {
+    uinput_unset && brief.is_some_and(|b| b.capture_arm == "drm") && available()
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "uinput-input",
+    feature = "drm-capture"
+))]
+thread_local! {
+    /// #4069 — `Some(planned)` answers [`automatic_uinput_planned`] on this
+    /// thread, as `seat_guard::LIVE_HERE` answers `live`: the input arbiter's
+    /// tests read no brief, key or device of the process.
+    pub(crate) static PLANNED_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// #4069 — whether the input arbiter's warm-up waits: the automatic uinput is
+/// planned ([`automatic_uinput_planned`]) and no automatic system capture is
+/// live yet, so [`open_default`] would fall through to enigo now, which a root
+/// daemon has no display for (#3787 says so at ERROR when a person is at the
+/// screen). The capture's live edge runs the warm-up again. A wrong prediction
+/// costs the warm-up and never input: an event before the edge opens whatever
+/// `open_default` picks then. `false` where the automatic uinput is not built.
+pub(crate) fn awaits_automatic_capture() -> bool {
+    #[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+    {
+        !crate::capture::seat_guard::live()
+            && automatic_uinput_planned(crate::desktop_brief::current().as_ref())
+    }
+    #[cfg(not(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture")))]
+    {
         false
     }
 }
@@ -1078,5 +1133,95 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #4069, FR-109 P2b — the automatic uinput is planned for the DRM arm
+    /// with `uinput` unset and a device that opens, and for nothing else:
+    /// another arm, no brief, `uinput` set (`true` or `false`), no device.
+    /// The device is asked last, only when the rest says yes.
+    #[cfg(all(target_os = "linux", feature = "uinput-input", feature = "drm-capture"))]
+    #[test]
+    fn the_automatic_uinput_is_planned_only_for_the_drm_arm_with_uinput_unset() {
+        use roomler_ai_remote_control::models::DesktopBrief;
+        let arm = |name: &str| DesktopBrief {
+            session: "user".into(),
+            kind: "wayland".into(),
+            desktop: None,
+            capture_arm: name.into(),
+            input_reach: "full".into(),
+        };
+        let asked = std::cell::Cell::new(0);
+        let device = |opens: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                opens
+            }
+        };
+        let drm = arm("drm");
+        assert!(automatic_uinput_planned_with(
+            true,
+            Some(&drm),
+            device(true)
+        ));
+        assert!(
+            !automatic_uinput_planned_with(true, Some(&drm), device(false)),
+            "no device"
+        );
+        assert_eq!(asked.get(), 2);
+        for other in ["x11", "portal", "mutter", "none", ""] {
+            assert!(
+                !automatic_uinput_planned_with(true, Some(&arm(other)), device(true)),
+                "the {other:?} arm"
+            );
+        }
+        assert!(
+            !automatic_uinput_planned_with(true, None, device(true)),
+            "no brief"
+        );
+        assert!(
+            !automatic_uinput_planned_with(false, Some(&drm), device(true)),
+            "uinput set"
+        );
+        assert_eq!(
+            asked.get(),
+            2,
+            "the device was asked before the rest said yes"
+        );
+    }
+
+    /// #4069 — the caps' `mouse-rel` word ([`uinput_would_inject`]) and the
+    /// input arbiter's wait ([`awaits_automatic_capture`]) read one
+    /// prediction, [`automatic_uinput_planned`]: with no capture live, both
+    /// follow it; once one is live, the warm-up waits no more. On this
+    /// thread's seams, with `ROOMLERD_UINPUT` unset, as in a test process.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "enigo-input",
+        feature = "uinput-input",
+        feature = "drm-capture"
+    ))]
+    #[test]
+    fn the_caps_word_and_the_warm_ups_wait_read_one_prediction() {
+        use crate::capture::seat_guard::LIVE_HERE;
+        LIVE_HERE.with(|l| l.set(Some(false)));
+        let mut seen = Vec::new();
+        for planned in [false, true] {
+            PLANNED_HERE.with(|p| p.set(Some(planned)));
+            seen.push((
+                planned,
+                uinput_would_inject(None),
+                awaits_automatic_capture(),
+            ));
+        }
+        LIVE_HERE.with(|l| l.set(Some(true)));
+        let waits_while_live = awaits_automatic_capture();
+        PLANNED_HERE.with(|p| p.set(None));
+        LIVE_HERE.with(|l| l.set(None));
+        assert_eq!(seen, vec![(false, false, false), (true, true, true)]);
+        assert!(
+            !waits_while_live,
+            "the warm-up waits for a capture already live"
+        );
     }
 }

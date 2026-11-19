@@ -1946,11 +1946,13 @@ jobs:
       # #3702 — and the machine's folders and the service account's profile as
       # the system names them, the one-time folder move's gate and its link
       # refusal: `appdirs`' Windows tests run in no other lane.
+      # #4067 — and the log uploader's, the pool's idle timeout among them: they
+      # ran only on Linux.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |

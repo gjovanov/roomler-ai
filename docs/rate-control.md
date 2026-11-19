@@ -1620,7 +1620,7 @@ carry yet and loses nothing. So SCTP's congestion window grows past what the lin
 carries, the bytes wait in the carrier, and the queue of unsent chunks keeps running
 empty: every sample reads application-limited while seconds of bytes stand on the link.
 The shaped link's TCP cells showed it (`shaped_link::tcp_shape`,
-`agents/roomlerd/src/media_delivery.rs:3107`), and so did the lab: on TURN over TCP 443
+`agents/roomlerd/src/media_delivery.rs:3180`), and so did the lab: on TURN over TCP 443
 at 2 Mbit/s the viewer's round trip ended at 1,262 ms, against 154 ms on TURN over UDP at
 the same rate.
 
@@ -1987,7 +1987,7 @@ of 1 MiB holds either path under 34 Mbit/s.
 
 **Which path a session took (O10).** How often each path wins on the fleet is not known,
 so each data-channel pump writes one line at its first media write:
-`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:901`).
+`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:905`).
 The call sits where the pump hands each media message to its send task
 (`agents/roomlerd/src/peer.rs:5241` in the VP9 4:4:4 pump, `:9914` in the FFmpeg one),
 and only its first call reads anything (`DeliverySampler::on_first_write`,
@@ -1998,7 +1998,7 @@ which never waits for the transport's slot, with `GaugeReader::peek`
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
 `crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1167`).
 The answer is a pure function of the gauges (`OpenedBy::of`,
-`agents/roomlerd/src/media_delivery.rs:943`):
+`agents/roomlerd/src/media_delivery.rs:947`):
 
 | `open_path` | When |
 |---|---|
@@ -2016,19 +2016,19 @@ written at INFO, like the other P0 lines, so the default filter ships it
 follower of a shared pipeline runs no pump and writes no line, and a pump that starts
 again for the same session writes its own. The cells open a pair by each path over the
 shaped link and read `init_ack` and `cookie_echo` at the first write
-(`agents/roomlerd/src/media_delivery.rs:2188`, `:2207`). The path report counts one
+(`agents/roomlerd/src/media_delivery.rs:2196`, `:2215`). The path report counts one
 device's sessions by answer (`docs/production-mongo-reads.md` §8a).
 
 **The properties and their cells.** Each cell opens two in-process associations of the
 vendored SCTP over `media_delivery`'s shaped link (`shaped`,
-`agents/roomlerd/src/media_delivery.rs:2497`; `pair_opened`, `:2624`, by either path,
-`OpenPath`, `:2609`), steps the machine every millisecond, writes what it asks, and
+`agents/roomlerd/src/media_delivery.rs:2570`; `pair_opened`, `:2697`, by either path,
+`OpenPath`, `:2682`), steps the machine every millisecond, writes what it asks, and
 after the stop waits for every byte written to be acknowledged. A grid cell's link
 serialises each direction at its rate, adds half the round trip to every packet, and
 queues up to a second, deeper than anything the train can fill (`Cell::grid`,
 `agents/roomlerd/src/media_train.rs:800`). The shaper records the longest any packet of
-the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:2348`)
-and its tail drops (`:2353`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
+the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:2386`)
+and its tail drops (`:2391`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
 every cell; it also checks that `floor_only` matches the stop, and that the slow start
 threshold at the first write is 0 on path C and not 0 on path I.
 
@@ -2108,8 +2108,8 @@ held it:
 
 The shaped link now adds a busy runner's scheduling noise on request, seeded so that a
 cell meets the same draws on every run (`Noise`,
-`agents/roomlerd/src/media_delivery.rs:2366`; `Draws`, `:2386`; `shaped_noisy`,
-`:2502`). Every wake-up of a task comes up to the jitter late, and about once a period
+`agents/roomlerd/src/media_delivery.rs:2404`; `Draws`, `:2424`; `shaped_noisy`,
+`:2575`). Every wake-up of a task comes up to the jitter late, and about once a period
 the scheduler takes the task's core away for up to the stall, so that a wake-up due then
 comes when it returns. On the link a wake-up is a packet's delivery, and the packets
 behind a late one wait for it, in order. Under the rule before this one, 2 ms of jitter
@@ -2301,7 +2301,7 @@ When every input is backlogged the model is `Pipe`'s law exactly
 (`the_model_is_pipes_law_when_everything_is_backlogged`).
 
 **The line** is `path model (FR-148 P0, shadow, ≈10s)`, at INFO, written by
-`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:865`). The delivery
+`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:869`). The delivery
 sampler takes the numbers at every pump heartbeat (`on_view`, `:615`) and writes them
 at the first heartbeat 10 s after the last line; the first heartbeat starts the count,
 and a pump that ends between two lines writes its last numbers as it drops. Each value
@@ -2380,7 +2380,7 @@ the base (`peer.rs:3405`).
 |---|---|
 | the tags and the model | `agents/roomlerd/src/encode/pipe.rs:420` (`Basis`), `:455` (`PathNumber`), `:521` (`PathModel`), `:639` (`PathView`); `Pipe` takes the class at `:189` (`observe_delivered`) and `:243` (`observe_capacity`) |
 | the governor's tags and the view | `agents/roomlerd/src/encode/governor.rs:1441` (a delivery, classed), `:1639` (an arrival-rate push-back, classed), `:2069` (`path_view`), `:2200` (`PathTags`) |
-| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:615` (`on_view`), `:865` (`emit_model`), `:888` (`seed_at_open`) |
+| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:615` (`on_view`), `:869` (`emit_model`), `:892` (`seed_at_open`) |
 | the pumps | `agents/roomlerd/src/peer.rs:5394` (VP9-444), `:10360` (FFmpeg), `:6630` (the FFmpeg pump's seed and its age) |
 
 **The tests** (`cargo test -p roomlerd --lib -- pipe:: governor:: media_delivery`):
@@ -2455,7 +2455,7 @@ pump's 4 s wait), `carrier_unknown`, `no_user`, or `learner_off` (`relay_max_hi_
 
 **Where the viewer's facts come from.** `PairFacts` (`media_pair_memory.rs:61`) is
 registered by session id in `AgentPeer::new`, before the pump starts. The user comes from
-the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4742`). The srflx addresses
+the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4760`). The srflx addresses
 are taken from the candidates the viewer trickles (`AgentPeer::add_remote_candidate`), at
 most 16. They are not read through `get_stats`: the vendored ICE agent's accessor is
 crate-private, and a stats read takes the ICE and SCTP locks. **Limit**: a candidate
@@ -2852,12 +2852,14 @@ budget = max( min(rate, window / least) × (least + S),  3 × max_payload )
 a frame is admitted while out < budget, and held at out = budget or over, except:
   out = 0                                      nothing is out
   cwnd > 0, pending = 0 and inflight ≥ cwnd    SCTP's own window binds
+  a still span after a head-of-line release,   written through the stall
+    pending = 0 and out < budget + rate × still_age     (D46's classifier, below)
 ```
 
 | Term | What it is |
 |---|---|
 | `out` | over the whole association: the pump's own count of the bytes it handed its send task and SCTP has not taken yet (below), and SCTP's pending and in-flight bytes from its gauges |
-| `rate` | the acknowledgement clock's bytes over the last second, the most of those figures over the last two. Before the first full second, the rate it last stood at, else the pump's opening rate (the governor's applied rate, or the rate it opened at); with neither, the window alone bounds it |
+| `rate` | the acknowledgement clock's bytes over the last second, the most of those figures over the last two; a second that starts inside a released still span, or while its release comes back, counts from the span's first still reading (below). Before the first full second, the rate it last stood at, else the pump's opening rate (the governor's applied rate, or the rate it opened at); with neither, the window alone bounds it |
 | `least` | the least acknowledgement delay a peek of the gauges showed on this association and pair; S before the first SACK |
 | `S` | 150 ms, a constant (`SLACK`) |
 | `window` | SCTP's congestion window, or less where the peer's receive window binds |
@@ -2886,6 +2888,113 @@ starts over within 5 s. The least takes a gauge's delay only when it changed sin
 last peek, so the delivery sampler's takes, which reset `ack_delay_min`, cannot carry an
 old least across a reset.
 
+### Through a stall: the stall classifier (D46)
+
+FR-148 D46's next step after B1, in shadow like it. B1 holds through every still span
+alike: once the clock has stood still for `least + S` with bytes out, `out` stays at the
+budget until the clock moves. Where the carrier is a TCP leg (TURN over TCP) and one
+segment is lost, the leg keeps serializing behind the hole, and the receiver hands over
+the whole stall at once when it fills. The frames written in the stall's last 300 ms then
+still arrive fresh, and B1 held them: its fresh delivery on the 80 % path I stall shape
+was 0.876, 0.880 and 0.952 of today's writer's. The classifier tells that stall from one
+through which nothing moved, from the acknowledgement clock alone:
+
+```text
+a still span:  bytes out, the clock unmoved for least + S             (B1's, unchanged)
+its release:   read at the first frame 50 ms or more after the span's last still reading
+  head-of-line   600 ‰ or more of what SCTP had in flight at that reading is acknowledged:
+                 a burst, so the carrier serialized through the stall
+  drain          less, or a first frame at 600 ‰ of least + S or later: the release
+                 acknowledges at the rate the link drains (an outage, or a TCP RTO)
+the next still span, once its age is least + S, after one head-of-line release:
+  a frame goes while  out < budget + rate × still_age  and SCTP's pending = 0
+  otherwise it holds, as in B1; the first still span on an association holds too
+a new association or a new selected pair forgets the class, with the least
+the rate: a 1 s figure whose second starts inside a released still span, or while its
+          release comes back, counts from the span's first still reading
+```
+
+```mermaid
+flowchart TD
+  S["a still span:<br/>bytes out, the clock unmoved<br/>for least + S"] --> C{"the last release<br/>read head-of-line?"}
+  C -->|"no, or none yet"| H["hold at the budget, as B1"]
+  C -->|yes| P{"SCTP pending = 0 and<br/>out < budget + rate × still_age"}
+  P -->|yes| W["write through"]
+  P -->|no| H
+  S -. "the clock moves" .-> R{"in-flight bytes back<br/>at the first frame 50 ms on"}
+  R -->|"600 ‰ or more"| HL["head-of-line:<br/>the next span writes through"]
+  R -->|"less, or too late to tell"| D["drain:<br/>the next span holds"]
+```
+
+| Term | What it is |
+|---|---|
+| `still_age` | how long the span has stood, from its first still reading |
+| `rate` | the budget's rate at that frame: the write-through goes no faster than the clock measured the carrier |
+| what SCTP had in flight | its in-flight bytes at the span's last still reading. Pending bytes are not counted: SCTP had not sent them, and no release brings them back |
+
+**Why in flight, why 50 ms, why 600 ‰.** A head-of-line release brings back at once
+what the carrier serialized through the stall; a drain at the link's rate brings back in
+`t` what the link carries in `t`, and with a budget's worth in flight (the rate over
+`least + S`) that is `t / (least + S)` of it. Read at `least + S`, a drain has brought
+back most of it too, so the read comes early: at the first frame 50 ms or more after the
+last still reading, at most one frame interval later. A first frame at 600 ‰ of
+`least + S` or later is too late to tell, and reads as a drain. The values are the
+`tcp_shape` stall and outage cells' (below), every release of every cell under one set,
+never per cell. On the first exploratory pass (live: 100 ms, 750 ‰, and SCTP's out with
+its pending bytes as the share's base) its 40 releases, 20 head-of-line stalls and 20
+outages, read:
+
+| Read at, ms after the last still reading | Share of | Least head-of-line, ‰ | Most drain, ‰ | Misread at 600 ‰ | Misread at 750 ‰ |
+|---|---|---|---|---|---|
+| the first frame | SCTP's out | 15 | 178 | 8 + 0 | 11 + 0 |
+| 50 | SCTP's out | 247 | 282 | 4 + 0 | 9 + 0 |
+| 100 | SCTP's out | 247 | 567 | 3 + 0 | 8 + 0 |
+| 33 | in flight | 99 | 439 | 1 + 0 | 3 + 0 |
+| **50** | **in flight** | **694** | **439** | **0 + 0** | 3 + 0 |
+| 80 | in flight | 707 | 576 | 0 + 0 | 2 + 0 |
+| 100 | in flight | 707 | 879 | 0 + 2 | 2 + 1 |
+| 133 | in flight | 707 | 923 | 0 + 8 | 2 + 3 |
+
+A misread is a head-of-line release read as a drain, plus a drain read as head-of-line.
+SCTP's out never separates them: on path C SCTP's window binds, and a stall's backlog
+waits in its queue, where no release can bring it back. 500, 700, 800 and 900 ‰ were
+swept too. 500 and 600 ‰ both separate the 40 at 50 ms; 600 also keeps a drain under it
+at any least when the read comes one 33 ms frame late (83 ms over a `least + S` of
+150 ms is 553 ‰), and the least head-of-line release, 694 ‰, still clears it. Read the
+same way, the three passes below misread 6 + 0 of the budget's 171 releases (111 on the
+stall shapes, 60 in the outages) at 50 ms and 500 to 700 ‰: the six are stalls a lone
+packet's acknowledgement split (the open edges, below). At 67 ms they misread 6 + 4, at
+100 ms 6 + 9.
+
+**Only while SCTP queues nothing.** On path C, SCTP's window binds through a stall, and
+what is written through waits in its queue for the release, then goes ahead of the
+frames captured after it. On the exploratory pass a 778 ms stall on the 80 % path C shape
+ended with 99,990 bytes pending against 59,994 in flight, and the shape's transit reached
+449 ms at most against B1's 106 to 144 ms, for the same fresh delivery (58 % against
+57–59 %).
+
+**The rate counts a stall from its start.** A 1 s figure whose second starts inside a
+still span sees the span's whole burst come back in less time than the carrier took to
+serialize it. With the write-through that burst is the carrier's rate over the stall,
+and on the exploratory pass the rate stood at 2,651 to 2,838 kbit/s on the 80 % path I
+shape and at 3,361 kbit/s on the 150 % path I shape, on a link of 1,954. Such a second
+now counts from the span's first still reading and the count the clock stood at, and
+the budget it sizes stays at the link's. A release can come back over two frames: on
+the first full pass one on the 80 % path I shape brought back 30,264 bytes of the
+150,918 in flight by its first frame, 46 ms after the span's last still reading, and
+146,652 by the next, 76 ms after it, and the rate stood at 2,421 kbit/s at the next
+release. A second that starts while the release comes back, up to the frame that reads
+it, now counts from the span's start too.
+
+**One head-of-line release is enough.** The cells' last writer asks two in a row
+(`HOL_RELEASES` = 2). It delivered less fresh than one release in each of the nine runs
+with a ratio, and on the 80 % path I shape fell under the bar in the third: 1.055, 1.039
+and 0.944 of today's writer's, against 1.072, 1.059 and 0.957. A second release guards
+against a drain read as head-of-line, and no cell read one: every release in the outage
+cells read as a drain, 120 of 120 over the three runs.
+
+**The AIMD is unchanged:** a still span calls no decrease (D46).
+
 ### Where it runs
 
 ```mermaid
@@ -2913,14 +3022,14 @@ verdict reaches the line's counters and nothing else.
 | Proof | What it shows |
 |---|---|
 | `media_delivery::tests::the_inflight_budget_in_shadow_answers_every_pump_call_as_off_does` | over 900 frames of a deep queue, a sampler with the budget in shadow and one without it get the same calls and answer each alike: the same samples, and the same lines but for the budget's field, while the shadow's verdicts held |
-| `media_delivery::shaped_link::tcp_shape::the_inflight_budget_in_shadow_holds_nothing_on_a_shaped_link` | today's writer on the deep 2 Mbit/s path I shape, off and then in shadow through the pumps' own `Shadow`: in each of three runs it writes at every tick and holds and skips nothing in both (off 480, 480 and 481 ticks, shadow 480, 479 and 481), while the shadow's verdicts would have held 479, 478 and 479 frames. Today's skip writer, whose skips follow the link's timing, skipped 193 to 195 frames a run off and 193 to 195 in shadow, and held none |
+| `media_delivery::shaped_link::tcp_shape::the_inflight_budget_in_shadow_holds_nothing_on_a_shaped_link` | today's writer on the deep 2 Mbit/s path I shape, off and then in shadow through the pumps' own `Shadow`: in each of three runs it writes at every tick and holds and skips nothing in both (off 480, 480 and 481 ticks, shadow 480, 479 and 481), while the shadow's verdicts would have held 479, 478 and 479 frames. Today's skip writer, whose skips follow the link's timing, skipped 193 to 195 frames a run off and 193 to 195 in shadow, and held none. With the classifier, in the three runs below: off 480, 478 and 478 frames written of 481, 479 and 479 ticks, shadow 480, 479 and 478 of 481, 480 and 479, nothing held or skipped in either, while the shadow's verdicts would have held 480, 479 and 478; the skip writer skipped 193 to 194 a run off and in shadow, and held none |
 | the diff | every line the change adds to the pumps is a count or a read; no path leads from the verdict to a gate, an AIMD call or a keyframe request |
 
 ### The budget's switch
 
 `ROOMLERD_INFLIGHT_BUDGET`, or the config key `inflight_budget`, read once per pump
 beside `ROOMLERD_PATH_MODEL` (`media_inflight::mode`,
-`agents/roomlerd/src/media_inflight.rs:109`, from `DeliverySampler::from_env`,
+`agents/roomlerd/src/media_inflight.rs:144`, from `DeliverySampler::from_env`,
 `agents/roomlerd/src/media_delivery.rs:409`):
 
 | Value | The pumps |
@@ -2958,119 +3067,235 @@ for.
 | `bound_watermark` | the VP9-444 pump's sheds over its watermark |
 | `bound_ledger` | the FFmpeg pump's gate passes its ledger held |
 | `bound_full` | gate passes a full send channel held, and `try_send`s that found it full |
+| `budget_released` | `(head-of-line, drain)`: the still spans whose release was read in the window, by class (D46's classifier) |
+| `budget_still_admitted` | the frames admitted while a still span stood, whatever let them go: under the budget, on SCTP's window, or written through |
 
 A line with made-up values:
 
 ```text
-path delivery (FR-148 P0, shadow, ≈10s) session_id=… span_ms=10004 delivery_samples=(3, 2, 0) backlogged_bps=Some((1712000, 1840000, 1951000)) app_limited_bps=Some(1206000) stalled_ms=0 acked_bytes=2301441 ack_ms=Some((62, 74, 391)) standing_ms=Some((12, 329)) queued=1 inflight=(18240, 58650) cwnd=(61440, 98304) ssthresh=65536 rwnd_low=1015808 pending_high=24576 loss=(0, 0) budget_held=(212, 300) budget_max=61440 budget_out_max=79680 budget_rate_bps=1987000 budget_least_ms=Some(62) budget_slack_ms=150 budget_ack_over_ms=Some((3, 45, 1257)) budget_still=(1, 812) bound_watermark=0 bound_ledger=37 bound_full=4
+path delivery (FR-148 P0, shadow, ≈10s) session_id=… span_ms=10004 delivery_samples=(3, 2, 0) backlogged_bps=Some((1712000, 1840000, 1951000)) app_limited_bps=Some(1206000) stalled_ms=0 acked_bytes=2301441 ack_ms=Some((62, 74, 391)) standing_ms=Some((12, 329)) queued=1 inflight=(18240, 58650) cwnd=(61440, 98304) ssthresh=65536 rwnd_low=1015808 pending_high=24576 loss=(0, 0) budget_held=(212, 300) budget_max=61440 budget_out_max=79680 budget_rate_bps=1987000 budget_least_ms=Some(62) budget_slack_ms=150 budget_ack_over_ms=Some((3, 45, 1257)) budget_still=(1, 812) bound_watermark=0 bound_ledger=37 bound_full=4 budget_released=(1, 0) budget_still_admitted=9
 ```
 
-With them a busy line is 675 bytes in the daemon's log-file format, against 435 without:
-at most 243,000 bytes a session hour per pump, measured by
+With them a busy line is 723 bytes in the daemon's log-file format, against 435 without:
+at most 260,280 bytes a session hour per pump, measured by
 `the_inflight_budget_s_fields_close_the_line`, which also pins their order and the line
 with the switch `off`.
 
 ### Fresh delivery on the shaped link
 
 The `tcp_shape` cells (`media_delivery::shaped_link::tcp_shape`) run the D46 prototype's
-cells on the product core: today's writer, then the budget's, on the same shape. A
-writer under the budget holds a frame at the core's verdict
-(`media_inflight::Budget::step`); the pumps in B1 do not. Each run prints a `D46 |`
-line. **Fresh delivery** is what the viewer read within 300 ms of the fastest a frame
-can go (the one-way delay and the frame's packets on the link, `fastest_ms`), as a share
-of the link's payload rate; read is all it read. The link queue is the least each
-second's queue stood at, and the transit each second's least, write to read, over the
-fastest, both as median / most over the 20 seconds. Three runs, Windows, debug build;
-each cell is the least and the most of the three. The budget runs at S = 150 ms unless a
-row says otherwise.
+cells on the product core: today's writer, then the budget's, on the same shape. On the
+stall and outage shapes B1's budget runs between them, its still spans never written
+through, and on the stall shapes the classifier asking two head-of-line releases in a
+row runs last. A writer under the budget holds a frame at the core's verdict
+(`media_inflight::Budget::step`) and writes one through where the verdict says so; the
+pumps do not. Each run prints a `D46 |` line, and a holding budget's run a
+`D46 release |` line for each still span it saw released: what SCTP had in flight and
+pending at its last still reading, the rate and the budget, the bytes back at each step
+of the next 400 ms, and the class it read. **Fresh delivery** is what the viewer read
+within 300 ms of the fastest a frame can go (the one-way delay and the frame's packets
+on the link, `fastest_ms`), as a share of the link's payload rate; read is all it read.
+The link queue is the least each second's queue stood at, and the transit each second's
+least, write to read, over the fastest, both as median / most over the 20 seconds.
+Three runs, Windows, debug build; each cell is the least and the most of the three. The
+budget runs at S = 150 ms unless a row says otherwise, with the classifier. B1's rows
+measured beside it run B1's verdicts with the classifier's rate (a second that starts
+inside a released still span counts from the span's start); the rows marked "B1's own
+runs" are B1's three runs before the classifier.
 
 **The stall shapes, D46 item 11's bar.** 800 ms stalls every 3.3 s on the 2 Mbit/s
 deep-queue link. At 1.5 times the link today's writer is the VP9-444 pump's skip over
-256 KiB: a writer without one queues without end there.
+256 KiB: a writer without one queues without end there. The 1.5 times path C shape is
+new with the classifier; today's skip reads nothing fresh on it, so it has no ratio.
+"Written through" counts the frames the write-through let go, and the releases are the
+still spans' by class, per run.
 
-| Stall shape | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held or skipped | Fresh over today's, each run |
-|---|---|---|---|---|---|---|---|
-| offer 80 %, path I | today's | 64–69 | 80 | 0 / 24–90 | 1–3 / 65–349 | 0 | |
-| | **the budget** | 61 | 66–67 | 0 / 0 | 1–3 / 1–5 | 100–103 | **0.876, 0.880, 0.952** |
-| offer 80 %, path C | today's | 16–23 | 76–79 | 0–10 / 213–254 | 265–373 / 637–729 | 0 | |
-| | **the budget** | 57–59 | 63–65 | 0 / 0 | 0–3 / 106–144 | 113–129 | 3.32, 3.54, 2.58 |
-| offer 150 %, path I | today's skip | 8–10 | 96–97 | 491–511 / 949–976 | 451–461 / 960–986 | 199–200 | |
-| | **the budget** | 73–74 | 80–81 | 0 / 132–147 | 117–120 / 149–175 | 277–279 | 9.04, 7.79, 7.25 |
+| Stall shape | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held or skipped | Written through | Released head-of-line / drain | Fresh over today's, each run |
+|---|---|---|---|---|---|---|---|---|---|
+| offer 80 %, path I | today's | 62–69 | 80 | 0 / 0–176 | 1–3 / 49–454 | 0 | | | |
+| | B1's own runs | 61 | 66–67 | 0 / 0 | 1–3 / 1–5 | 100–103 | – | – | 0.876, 0.880, 0.952 |
+| | B1's budget | 61 | 66 | 0 / 0 | 0–3 / 1–4 | 104–105 | 0 | 5 / 0–1 | 0.987, 0.987, 0.873 |
+| | **the budget** | 66–67 | 72–74 | 0 / 0 | 0–3 / 1–3 | 49–59 | 45–59 | 5 / 0–1 | **1.072, 1.059, 0.957** |
+| | the budget, two releases | 65–66 | 70–73 | 0 / 0 | 0–3 / 1–4 | 50–73 | 31–57 | 5 / 0 | 1.055, 1.039, 0.944 |
+| offer 80 %, path C | today's | 19–23 | 77–79 | 0 / 228–254 | 267–374 / 608–637 | 0 | | | |
+| | B1's own runs | 57–59 | 63–65 | 0 / 0 | 0–3 / 106–144 | 113–129 | – | – | 3.32, 3.54, 2.58 |
+| | B1's budget | 58–59 | 63–64 | 0 / 0 | 0–1 / 105–157 | 122–125 | 0 | 5 / 0–1 | 2.557, 2.515, 2.920 |
+| | **the budget** | 59–60 | 65–66 | 0 / 0 | 0–1 / 106–108 | 109–111 | 12–13 | 5 / 0 | **2.594, 2.537, 3.020** |
+| | the budget, two releases | 59 | 64–65 | 0 / 0 | 0–3 / 108–126 | 110–119 | 3–15 | 5 / 0 | 2.559, 2.531, 2.961 |
+| offer 150 %, path I | today's skip | 8–10 | 96–97 | 470–560 / 948–976 | 448–467 / 971–986 | 199–201 | | | |
+| | B1's own runs | 73–74 | 80–81 | 0 / 132–147 | 117–120 / 149–175 | 277–279 | – | – | 9.04, 7.79, 7.25 |
+| | B1's budget | 73 | 80–81 | 0–6 / 112–127 | 103–118 / 140–146 | 277–282 | 0 | 5 / 0 | 7.603, 7.021, 8.227 |
+| | **the budget** | 79–80 | 88–92 | 50–96 / 114–130 | 114–116 / 134–147 | 232–250 | 37–60 | 5 / 0–1 | **8.209, 7.559, 9.009** |
+| | the budget, two releases | 78–79 | 87–88 | 55–87 / 113–123 | 115–117 / 124–165 | 246–256 | 25–45 | 5 / 0 | 8.182, 7.556, 8.796 |
+| offer 150 %, path C | today's skip | 0 | 77–79 | 0–16 / 274–305 | 617–623 / 1259–1282 | 0 | | | |
+| | B1's budget | 68–71 | 75–78 | 0 / 107–125 | 103–118 / 155–213 | 291–300 | 0 | 5 / 0 | – |
+| | **the budget** | 68–70 | 76–78 | 0 / 104–124 | 102–118 / 154–165 | 285–295 | 5–7 | 5 / 0 | – |
+| | the budget, two releases | 68–70 | 76–78 | 0 / 105–125 | 115–118 / 157–222 | 285–293 | 5–9 | 5 / 0 | – |
 
-⚠️ **The bar is not met.** On the 80 % path I shape the budget's fresh delivery is 0.876
-and 0.880 of today's writer's in two runs, and 0.952 in the third. There today's writer
-has no standing queue (transit 1–3 ms over the fastest at the median), so only what it
-writes in a stall arrives late, and what it writes in a stall's last 300 ms still counts
-as fresh. The budget holds those frames: about 100 a run, from the point a stall has let
-`least + S` of the offer pile up until the stall's bytes are acknowledged. On path C and
-at 1.5 times the link its fresh delivery is 2.6 to 9 times today's. On all three it reads
-less, by the frames it held: 66–67 % against 80 % on path I.
+**The bar is met in each run.** On the 80 % path I shape the budget's fresh delivery is
+1.072, 1.059 and 0.957 of today's writer's, where B1's own runs read 0.876, 0.880 and
+0.952; on path C and at 1.5 times the link it is 2.5 to 9 times today's. That shape is
+the hard one: today's writer has no standing queue there, so only what it writes in a
+stall arrives late, and what it writes in a stall's last 300 ms still counts as fresh.
+The ratio moves with today's writer as much as with the budget: today's delivered 62 %
+fresh in the first two runs and 69 % in the third (64–69 % in B1's own runs), and B1's
+budget, run beside it, read 0.987, 0.987 and 0.873. Against B1's budget in the same run
+the classifier adds 5 to 6 points of fresh delivery (66–67 % against 61 %) and 6 to 8 of
+read on the 80 % path I shape, and 6 to 7 points of fresh at 1.5 times the link on path
+I. On the path C shapes it moves fresh delivery by −1 to +2 points: SCTP's window binds
+through a stall, and the pending gate lets 5 to 13 frames a run through. Its link queue
+and transit stay at B1's on every shape but the 1.5 times path I one, where the queue's
+median rises to 50–96 ms (B1's budget: 0–6) and the transit stays under 150 ms at most.
+What still separates it from today's writer on the 80 % path I shape is what it holds,
+49 to 59 frames a run: the first stall on the association holds by design (17 to 20
+frames), and each later stall holds until its span is `least + S` old and while SCTP
+queues anything (2 to 14 frames a stall).
+
+**The outage shapes.** The stall shape's link, but in each of its 800 ms stalls the
+link neither serializes nor delivers, in both directions, and after it drains what
+queued at its rate (`media_delivery::shaped_link::Outages`): a still span through which
+nothing moved, where writing through would only queue. A packet whose turn on the link
+falls in an outage starts at its end, and one due to arrive in an outage arrives that
+much later. Offer 80 % and 150 %, paths I and C; at 1.5 times the link today's writer is
+the skip writer. After each outage's end with a second of the run after it, the cell
+reads when the link's queue and each arrival's transit over the fastest last stood at
+300 ms or more before the next outage began (the queue until 300 ms before it, since a
+packet sent in that stretch waits for that outage too), and prints a `D46 outage |` line
+for it; the cell's bar is under 1 s for both, and fresh delivery at least today's
+writer's.
+
+| Outage shape | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held or skipped | Released head-of-line / drain | Back under 300 ms after an outage, the most, each run: queue / transit, ms | Fresh over today's, each run |
+|---|---|---|---|---|---|---|---|---|---|
+| offer 80 %, path I | today's | 13 | 74–75 | 751–759 / 1756–1761 | 775–789 / 1629–1637 | 0 | | 2198, 2199, 2198 / 2499, 2495, 2485 | |
+| | B1's budget | 61–62 | 66–67 | 0 / 51–57 | 0–3 / 85–794 | 102–105 | 0 / 5 | 0, 0, 0 / 185, 190, 224 | 4.569, 4.537, 4.635 |
+| | **the budget** | 61–62 | 66–67 | 0 / 52–58 | 0–3 / 80–89 | 102–107 | 0 / 5 | 0, 0, 0 / 185, 190, 226 | 4.571, 4.536, 4.645 |
+| offer 80 %, path C | today's | 2–4 | 72–74 | 171–199 / 277–305 | 463–488 / 1011–1068 | 0 | | 2188, 2195, 2195 / 2499, 2499, 2490 | |
+| | B1's budget | 58–60 | 63–64 | 0 / 58–59 | 1–3 / 107–128 | 119–128 | 0 / 5 | 0, 0, 0 / 191, 191, 226 | 13.751, 14.195, 25.494 |
+| | **the budget** | 58–60 | 63–64 | 0 / 12–53 | 1–3 / 105–787 | 118–128 | 0 / 5 | 0, 0, 0 / 190, 185, 227 | 13.783, 14.228, 25.544 |
+| offer 150 %, path I | today's skip | 2 | 77 | 976–979 / 1595–1598 | 972–978 / 1775–1776 | 277 | | 2197, 2199, 2199 / 2497, 2497, 2485 | |
+| | B1's budget | 70–71 | 76–77 | 107–123 / 133–135 | 117–120 / 130–146 | 294–296 | 0 / 5 | 0, 0, 0 / 235, 235, 254 | 27.967, 27.965, 27.527 |
+| | **the budget** | 71 | 77 | 104–122 / 126–135 | 118–120 / 131–136 | 294–295 | 0 / 5 | 0, 0, 0 / 230, 236, 241 | 27.974, 27.965, 27.843 |
+| offer 150 %, path C | today's skip | 0 | 72–74 | 163–198 / 274–305 | 731–748 / 1589–1608 | 0 | | 2190, 2199, 0 / 2492, 2497, 2497 | |
+| | B1's budget | 66–68 | 72–74 | 116–131 / 131–140 | 120–130 / 155–181 | 306–312 | 0 / 5 | 0, 0, 0 / 230, 236, 243 | – |
+| | **the budget** | 68 | 74 | 117–122 / 132–139 | 119–122 / 156–165 | 306 | 0 / 5 | 0, 0, 0 / 235, 232, 231 | – |
+
+Every release in the outage cells read as a drain, 120 of 120 over the three runs, B1's
+budget's included, so the classifier held through each outage as B1's budget does: the
+two read alike to within two points. After every outage the budget's link queue was
+under 300 ms at once and its transit within 241 ms (B1's budget: 254). Today's writers'
+transit stood at 300 ms or more for 2,161 to 2,499 ms after each outage, nearly to the
+next; their link queue did too on path I (2,061 to 2,199 ms), and on path C, where
+SCTP's window bounds it, it was under 300 ms at once after some. The budget delivered
+4.5 to 25.5 times today's writer's fresh at 80 %, and 28 times today's skip at 1.5 times
+the link on path I; on path C there today's skip reads nothing fresh. A run's most
+transit, up to 787 ms for the budget and 794 ms for B1's, falls in a second an outage
+cut through; the recoveries are the cell's measure.
 
 **The four deep shapes.** Offer 150 %, a deep queue.
 
 | Shape | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held or skipped |
 |---|---|---|---|---|---|---|
-| 2 Mbit/s, path I | today's | 1–2 | 98–99 | 4139–4171 / 4143–4176 | 3555–3614 / 4719–4743 | 0 |
-| | today's skip | 2 | 98–99 | 940–975 / 953–982 | 948–973 / 965–979 | 193–194 |
-| | **the budget** | 98–99 | 98–99 | 101–124 / 112–131 | 105–132 / 119–136 | 210–211 |
-| 2 Mbit/s, path C | today's | 0 | 94–95 | 201–229 / 327–354 | 741–757 / 863–882 | 0 |
-| | today's skip | 0 | 94–95 | 201–228 / 327–354 | 744–757 / 870–881 | 0 |
-| | **the budget** | 94–95 | 94–95 | 97–120 / 111–127 | 115–118 / 158–197 | 221–227 |
-| 0.4 Mbit/s, path I | today's | 3 | 98 | 5539–5570 / 10494–10522 | 3560–3583 / 6752–6778 | 0 |
-| | today's skip | 3 | 98 | 5240–5279 / 5263–5291 | 3562–3576 / 5262–5283 | 111–112 |
-| | **the budget** | 97–98 | 98 | 85–134 / 97–142 | 88–136 / 102–148 | 211–212 |
-| 0.4 Mbit/s, path C | today's | 0 | 96–97 | 556–585 / 814–846 | 3168–3193 / 3478–3487 | 0 |
-| | today's skip | 0 | 96–97 | 555–586 / 813–841 | 3174–3192 / 3476–3482 | 0 |
-| | **the budget** | 96–97 | 96–97 | 78–116 / 99–124 | 87–115 / 103–118 | 216–219 |
+| 2 Mbit/s, path I | today's | 1–2 | 98–99 | 4141–4172 / 4175–4177 | 3552–3575 / 4742–4744 | 0 |
+| | today's skip | 2 | 99 | 974–975 / 981–983 | 972–973 / 977 | 193 |
+| | **the budget** | 99 | 99 | 119–121 / 125–128 | 118–119 / 123–124 | 210 |
+| | B1's own runs | 98–99 | 98–99 | 101–124 / 112–131 | 105–132 / 119–136 | 210–211 |
+| 2 Mbit/s, path C | today's | 0 | 95 | 205–229 / 325–355 | 745–759 / 870–882 | 0 |
+| | today's skip | 0 | 94–95 | 202–232 / 328–353 | 738–759 / 870–883 | 0 |
+| | **the budget** | 94–95 | 94–95 | 109–121 / 114–127 | 117–119 / 157–209 | 221–227 |
+| | B1's own runs | 94–95 | 94–95 | 97–120 / 111–127 | 115–118 / 158–197 | 221–227 |
+| 0.4 Mbit/s, path I | today's | 3 | 98 | 5539–5578 / 10492–10534 | 3560–3579 / 6751–6778 | 0 |
+| | today's skip | 3 | 98 | 5280–5281 / 5290–5294 | 3560–3576 / 5286–5288 | 111–112 |
+| | **the budget** | 98 | 98 | 116–117 / 121–125 | 115 / 118–141 | 211 |
+| | B1's own runs | 97–98 | 98 | 85–134 / 97–142 | 88–136 / 102–148 | 211–212 |
+| 0.4 Mbit/s, path C | today's | 0 | 96–97 | 556–585 / 821–842 | 3167–3194 / 3474–3479 | 0 |
+| | today's skip | 0 | 96–97 | 557–584 / 814–843 | 3178–3193 / 3474–3479 | 0 |
+| | **the budget** | 96–97 | 96–97 | 116–129 / 123–142 | 114–133 / 117–148 | 216–218 |
+| | B1's own runs | 96–97 | 96–97 | 78–116 / 99–124 | 87–115 / 103–118 | 216–219 |
 
-The budget reads what today's writers read, and its standing queue and transit stay under
-300 ms in every run (the cells' bar), where today's link queues stand at 0.2 to 5.6 s.
+No deep run saw a still span, so the classifier read no release there and the verdicts
+are B1's. The budget reads what today's writers read, its fresh and read delivery within
+B1's own runs, and its standing queue and transit stay under 300 ms in every run (the
+cells' bar), where today's link queues stand at 0.2 to 5.6 s. Its link queue on the
+0.4 Mbit/s path C shape (116–129 / 123–142 ms) and its transit there and on the 2 Mbit/s
+path C shape sit a little over B1's own runs, on B1's verdicts.
 
 **The four controls.** Offer 150 %, a shallow queue: the link drops instead of queueing,
 so the queue today's writer builds is SCTP's own.
 
 | Shape | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held or skipped |
 |---|---|---|---|---|---|---|
-| 2 Mbit/s, path I | today's | 1 | 79–89 | 0–3 / 41–58 | 565–579 / 1436–3025 | 0 |
-| | **the budget** | 75–85 | 85–90 | 0 / 46–66 | 109–119 / 134–1032 | 245–261 |
-| 2 Mbit/s, path C | today's | 0 | 90–93 | 0–17 / 41–65 | 563–574 / 615–685 | 0 |
-| | **the budget** | 86–91 | 89–93 | 0–10 / 42–62 | 118–119 / 160–213 | 233–247 |
-| 0.4 Mbit/s, path I | today's | 1 | 81–83 | 0 / 0 | 2922–3068 / 3248–3692 | 0 |
-| | **the budget** | 45–54 | 78–85 | 0 / 0 | 102–114 / 304–746 | 259–288 |
-| 0.4 Mbit/s, path C | today's | 0 | 81–85 | 0 / 0 | 2951–2992 / 3176–3719 | 0 |
-| | **the budget** | 47–59 | 81–85 | 0 / 0 | 102–115 / 212–358 | 258–276 |
+| 2 Mbit/s, path I | today's | 1 | 85–90 | 0 / 42–55 | 554–559 / 606–1724 | 0 |
+| | **the budget** | 76–81 | 83–87 | 0 / 40–61 | 104–116 / 1613–2973 | 256–271 |
+| | B1's own runs | 75–85 | 85–90 | 0 / 46–66 | 109–119 / 134–1032 | 245–261 |
+| 2 Mbit/s, path C | today's | 0 | 92 | 0–13 / 39–67 | 557–577 / 595–634 | 0 |
+| | **the budget** | 90–92 | 92–93 | 0–14 / 39–63 | 119–120 / 152–164 | 232–236 |
+| | B1's own runs | 86–91 | 89–93 | 0–10 / 42–62 | 118–119 / 160–213 | 233–247 |
+| 0.4 Mbit/s, path I | today's | 1 | 79–84 | 0 / 0 | 2988–3078 / 3304–3463 | 0 |
+| | **the budget** | 33–47 | 75–83 | 0 / 0 | 84–116 / 184–700 | 258–299 |
+| | B1's own runs | 45–54 | 78–85 | 0 / 0 | 102–114 / 304–746 | 259–288 |
+| 0.4 Mbit/s, path C | today's | 0 | 78–82 | 0 / 0 | 3015–3168 / 3700–4009 | 0 |
+| | **the budget** | 42–44 | 81–84 | 0 / 0 | 114–122 / 268–1124 | 268–272 |
+| | B1's own runs | 47–59 | 81–85 | 0 / 0 | 102–115 / 212–358 | 258–276 |
 
-⚠️ The controls' cell asks the budget to read at least 0.95 of what today's writer reads.
-The 0.4 Mbit/s path I control missed it in one run of three: 0.945, 308 against 326 kbit/s.
+⚠️ **Outside B1's own runs, on B1's verdicts.** The controls' cell asks the budget to
+read at least 0.95 of what today's writer reads. B1's own runs missed it once (0.945 on
+the 0.4 Mbit/s path I control); the third run here missed it twice: 0.892 on the
+0.4 Mbit/s path I control (296 against 332 kbit/s, 299 frames held against B1's 259–288)
+and 0.927 on the 2 Mbit/s path I control (1,631 against 1,761 kbit/s). The classifier
+changes nothing until a still span is released, and neither run released one: both are
+B1's verdicts. Over the twelve control runs it read one release, on the 0.4 Mbit/s path
+I control in the second run, and wrote nothing through. The budget's steps ran slower in
+the third run than in the two before (34 µs on average, against 31 and 29). The fresh
+delivery on the 0.4 Mbit/s controls (33–47 % on path I and 42–44 % on path C, against
+B1's 45–54 and 47–59) and the most transit on the 2 Mbit/s path I control (to 2,973 ms,
+against B1's 1,032 and today's writer's 1,724) fall outside B1's own runs as well, with
+nothing written through.
 
 **The slack.** 2 Mbit/s, path I, offer 150 %; the stall shape is the one above at 1.5
 times the link.
 
-| Shape | S, ms | Fresh % | Read % | Link queue, ms | Transit, ms | Held |
-|---|---|---|---|---|---|---|
-| deep | 75 | 99 | 99 | 21–47 / 34–56 | 26–45 / 52–57 | 211 |
-| deep | 150 | 98–99 | 98–99 | 107–123 / 120–129 | 116–119 / 121–124 | 210–211 |
-| deep | 300 | 48–74 | 98 | 253–264 / 259–284 | 257–271 / 316–352 | 207 |
-| stalls | 75 | 73–74 | 78–79 | 0 / 34–54 | 26–47 / 56–75 | 289–290 |
-| stalls | 150 | 73–75 | 80–81 | 0 / 140–155 | 118–120 / 149–174 | 277–279 |
-| stalls | 300 | 28–30 | 86–87 | 138–159 / 407–434 | 269–271 / 425–429 | 247–251 |
-| shallow | 75 | 85–90 | 90–94 | 0–19 / 28–44 | 39–42 / 851–1510 | 227–243 |
-| shallow | 150 | 72–80 | 83–89 | 0 / 45–54 | 103–118 / 181–1625 | 247–268 |
-| shallow | 300 | 33–65 | 86–89 | 0 / 46–65 | 267–272 / 624–2434 | 245–256 |
+| Shape | S, ms | Writer | Fresh % | Read % | Link queue, ms | Transit, ms | Held | Written through |
+|---|---|---|---|---|---|---|---|---|
+| deep | 75 | **the budget** | 99 | 99 | 22–46 / 46–54 | 25–45 / 52–56 | 211–212 | 0 |
+| | | B1's own runs | 99 | 99 | 21–47 / 34–56 | 26–45 / 52–57 | 211 | |
+| deep | 150 | **the budget** | 98–99 | 98–99 | 107–120 / 116–128 | 117–119 / 119–125 | 210–211 | 0 |
+| | | B1's own runs | 98–99 | 98–99 | 107–123 / 120–129 | 116–119 / 121–124 | 210–211 | |
+| deep | 300 | **the budget** | 54–78 | 98–99 | 262–276 / 276–291 | 270–272 / 348–356 | 207–208 | 0 |
+| | | B1's own runs | 48–74 | 98 | 253–264 / 259–284 | 257–271 / 316–352 | 207 | |
+| stalls | 75 | **the budget** | 75–77 | 84–87 | 0–19 / 35–50 | 28–45 / 57–74 | 249–265 | 24–48 |
+| | | B1's own runs | 73–74 | 78–79 | 0 / 34–54 | 26–47 / 56–75 | 289–290 | |
+| stalls | 150 | **the budget** | 78–80 | 88–90 | 45–89 / 108–121 | 105–118 / 134–149 | 240–248 | 34–52 |
+| | | B1's own runs | 73–75 | 80–81 | 0 / 140–155 | 118–120 / 149–174 | 277–279 | |
+| stalls | 300 | **the budget** | 45–71 | 89–93 | 94–172 / 278–285 | 258–272 / 350–366 | 228–242 | 26–46 |
+| | | B1's own runs | 28–30 | 86–87 | 138–159 / 407–434 | 269–271 / 425–429 | 247–251 | |
+| shallow | 75 | **the budget** | 74–90 | 88–94 | 0–16 / 34–48 | 40–42 / 1118–1502 | 227–245 | 0 |
+| | | B1's own runs | 85–90 | 90–94 | 0–19 / 28–44 | 39–42 / 851–1510 | 227–243 | |
+| shallow | 150 | **the budget** | 75–84 | 84–90 | 0–2 / 47–65 | 118 / 133–2359 | 244–266 | 0 |
+| | | B1's own runs | 72–80 | 83–89 | 0 / 45–54 | 103–118 / 181–1625 | 247–268 | |
+| shallow | 300 | **the budget** | 37–61 | 86–88 | 0–4 / 44–47 | 265–271 / 299–1727 | 248–254 | 0 |
+| | | B1's own runs | 33–65 | 86–89 | 0 / 46–65 | 267–272 / 624–2434 | 245–256 | |
 
-The standing queue follows S in every run. A step of the core took 24 to 39 µs on average
-per run, in the unoptimised test build.
+The standing queue follows S in every run. On the stall shape the classifier writes
+through at every S: fresh 75–80 % against B1's 73–75 % at S = 75 and 150 ms. At S =
+300 ms the transit's median sits near the 300 ms that counts as fresh (258–272 ms), and
+fresh delivery swings with it: 45–71 % against B1's 28–30 %, with the link queue at
+278–285 ms at most against B1's 407–434. The deep shapes saw no still span, and the
+shallow ones one, in one run at S = 150 ms, released as a drain: neither wrote anything
+through. A step of the core took 26 to 53 µs on average per run, in the unoptimised test
+build (B1's runs: 24 to 39).
 
 ### Where
 
 | Where | Anchor |
 |---|---|
-| the core | `agents/roomlerd/src/media_inflight.rs:411` (`Budget`), `:472` (`step`), `:715` (`size`), `:600` (`rate_at`), `:671` (`held_throughout`), `:577` (`fold_least`), `:689` (`watch_still`), `:559` (`take_window`), `:532` (`reset_least`), `:538` (`on_new_association`) |
-| the pump's side | `agents/roomlerd/src/media_inflight.rs:823` (`Shadow`), `:851` (`for_pump`), `:885` (`on_frame`), `:903` (`on_frame_with`), `:941` (`on_pair_check`); the count: `:731` (`PumpBytes`), `:750` (`PumpCount`), `:770` (`Unsent`) |
+| the core | `agents/roomlerd/src/media_inflight.rs:503` (`Budget`), `:589` (`step`), `:936` (`size`), `:801` (`rate_at`), `:879` (`held_throughout`), `:778` (`fold_least`), `:898` (`watch_still`), `:758` (`take_window`), `:667` (`reset_least`), `:674` (`on_new_association`) |
+| the stall classifier | `agents/roomlerd/src/media_inflight.rs:100` (`BURST_PERMILLE`), `:106` (`BURST_WITHIN`), `:110` (`HOL_RELEASES`), `:219` (`Classifier`), `:719` (`read_release`), `:707` (`through`), `:697` (`still_age`), `:688` (`forget_releases`), `:614` (the write-through's verdict in `step`), `:829` (the rate's start in `rate_at`); its fields: `agents/roomlerd/src/media_delivery.rs:821` (`budget_released`) |
+| the pump's side | `agents/roomlerd/src/media_inflight.rs:1044` (`Shadow`), `:1072` (`for_pump`), `:1106` (`on_frame`), `:1124` (`on_frame_with`), `:1162` (`on_pair_check`); the count: `:952` (`PumpBytes`), `:971` (`PumpCount`), `:991` (`Unsent`) |
 | the sampler and the line | `agents/roomlerd/src/media_delivery.rs:403` (the field), `:667` (`on_frame`), `:676` (`on_pair_check`), `:684` (`note_gate`), `:711` (`on_handed`), `:719` (`pump_count`), `:603` (`report`), `:762` (`emit`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4293` (the send task's count), `:4307` and `:4336` (each frame taken, each chunk released), `:4390` (the pair), `:4506` (the gate's count), `:4524` (the step), `:5210` (the watermark), `:5245` (`on_handed`), `:5262` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7304` (the send task's count), `:7326` and `:7382` (each frame taken, each chunk released), `:7720` (the pair), `:8122` (the gate's count, the ledger beside the channel), `:8199` (the step), `:9925` (`on_handed`), `:9951` (a full channel) |
 | the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3463` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2758` (its check) |
+| the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:2327` (`Outages`), `:2525` (`out_direction`), `:3865` (`outaged`), `:4893` (`print_releases`), `:4953` (`recoveries`), `:5090` (`stalls_against_today`), `:5210` (`outages_against_today`) |
 
 ### The tests
 
@@ -3086,6 +3311,10 @@ per run, in the unoptimised test build.
 | `a_still_clock_counts_only_with_bytes_out`, `a_still_clock_counts_only_past_the_least_and_s`, `the_inflight_budget_s_window_counts_and_starts_over`, `the_spread_s_median_is_to_its_slot`, `the_inflight_budget_s_rings_are_fixed` | the window's counters, and the fixed rings |
 | `the_inflight_budget_switch_is_off_unless_shadow_or_on`, `media_delivery::tests::the_inflight_budget_on_runs_as_shadow_with_one_warning`, `roomler_node_core::config_surface::tests::inflight_budget_set_echo_clear_and_validate` | the switch, its warning, and the key |
 | `the_inflight_budget_s_pump_count_takes_and_releases_per_chunk` | the pump's count |
+| `a_burst_release_is_head_of_line_and_one_at_the_rate_a_drain`, `a_release_whose_first_step_comes_too_late_to_tell_is_a_drain` | D46's classifier: the release's two classes, the share's edge (of what was in flight, not pending), and when it is read |
+| `the_first_still_span_holds`, `after_a_head_of_line_release_a_still_span_writes_through_at_the_clock_s_rate`, `after_a_drain_release_a_still_span_holds`, `a_still_span_writes_through_only_while_sctp_queues_nothing`, `two_head_of_line_releases_in_a_row_when_two_are_asked` | the write-through: when it goes, up to `rate × still_age` over the budget and no more, and when it holds |
+| `a_new_association_and_a_new_pair_each_forget_the_class` | the class's two resets, the second through the pumps' side |
+| `a_second_that_starts_inside_a_released_still_span_counts_from_its_first_still_reading` | the rate across a release that comes back over two frames |
 | `media_delivery::tests::the_inflight_budget_s_fields_close_the_line` | the fields, their order, and the line with the switch off |
 | `the_inflight_budget_in_shadow_answers_every_pump_call_as_off_does` | shadow acts on nothing (above) |
 
@@ -3094,11 +3323,49 @@ The `tcp_shape` cells are real-time measurements, ignored in CI (FR-148 D44):
 --include-ignored --nocapture --test-threads=1 --skip clipboard::`.
 
 **What is left.** B2 takes P1 and P3 into the shadow model, and B3 turns `on` for relay
-sessions: the hold, the no-decrease rule, and the watermark arm and the relay byte gate
-out (D46 item 13). Direct sessions go `on` only after their own shadow read. Until then
-the switch and its calls are FR-135 debt: `p2:BUDGET-1` (the switch), `p2:BUDGET-2` and
-`p2:BUDGET-3` (9 lines in the VP9-444 pump, 8 in the FFmpeg pump), all retiring with
-FR-148 P5 (`docs/plans/rc-media-debt.tsv`).
+sessions: the hold and its write-through, the no-decrease rule, and the watermark arm
+and the relay byte gate out (D46 item 13). Direct sessions go `on` only after their own
+shadow read. Until then the switch and its calls are FR-135 debt: `p2:BUDGET-1` (the
+switch), `p2:BUDGET-2` and `p2:BUDGET-3` (9 lines in the VP9-444 pump, 8 in the FFmpeg
+pump), all retiring with FR-148 P5 (`docs/plans/rc-media-debt.tsv`). The classifier adds
+no switch, no read of the environment and no line to a pump: the ratchet's counts are
+unchanged.
+
+The classifier's open edges, none of them measured on a real carrier yet:
+
+- It reads a release at a frame. At under about ten frames a second the first frame
+  50 ms after a span's last still reading comes too late to tell, and every release
+  reads as a drain: the budget holds through every still span, as B1 does.
+- A drain read as head-of-line lets the next still span write through, up to
+  `rate × still_age` over the budget. Where in flight was far under a budget's worth (an
+  application-limited path whose link is much faster than the offer) a drain at the
+  link's rate can bring back 600 ‰ of it within 50 ms. If the next span is an outage,
+  what was written through drains at the link's rate after it, the release reads as a
+  drain, and the span after holds.
+- A lone packet delivered as a stall begins is acknowledged one `ACK_INTERVAL` later
+  (200 ms, `crates/vendored/webrtc-sctp/src/timer/ack_timer.rs:7`), inside the stall. Its
+  1,200 bytes end a still span of about 200 ms, whose release reads as a drain, and the
+  rest of the stall holds as a new span: 6 of the 111 releases the budget read on the
+  stall shapes over the three runs read so, four at S = 75 ms, where a span of 165 to
+  200 ms is already `least + S` old, one on the first stall of an association, which
+  holds anyway, and one at 1.5 times the link. The error is B1's hold. Not
+  reading a release whose clock stands still again by the read would keep the class
+  through such a stall, and would also write through an outage whose start lets one
+  acknowledgement through: no cell has that, and the rule is not built.
+- The rate remembers the last released still span only. When a second stall is released
+  within a second of the first, the seconds that start inside the first and end after
+  that count from where they start, and the first stall's burst can lift the rate for up
+  to two seconds. No cell has two stalls that close.
+- A stall that writes through releases more than the budget, and the run's fold reads
+  the release as delivery. On the stall shapes the budget's floor and P1's ended at 1.02
+  to 1.72 times the link, against 0.91 to 1.17 under B1's budget beside it, and its P3
+  at 1.02 to 1.37 against B1's 0.91 to 1.16. Today's writers' floor ended at 1.24 to
+  1.78 and their P1 at 1.04 to 1.55; at 1.5 times the link the budget's P1 ended over
+  today's skip's on path I (1.65 to 1.72 against 1.30 to 1.31), and its floor over
+  today's skip's on path C in one run (2,462 against 2,456 kbit/s). B1's cell asserted
+  the lower floor on its budget, and now asserts it on B1's budget only. B2 takes P1 and
+  P3 into the shadow model. Through the outages every writer's floor stays at 0.95 to
+  1.01 times the link.
 
 ## Config / env reference
 
@@ -3124,7 +3391,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_FFMPEG_MAXRATE_KBPS` | unset | Env only — replaces the computed ceiling in both directions (the FR-74 P0 A/B knob and the way back from P1) |
 | `ROOMLERD_VP9_DIRECT_MAX_Q` | 16 | FR-74 P3 — the libvpx VP9 4:4:4 pump's worst quality on direct transports (q-index 64); 63 = the pre-P3 behaviour |
 | `ROOMLERD_SW_FPS_60` | on (Linux), off (Windows, macOS) | FR-112 P2 — software encoders target 60, paced down to what they sustain, never below 30; `0` = 30 and the old base everywhere, `1` opts Windows or macOS in ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
-| `ROOMLERD_ENCODER_CLOCK` | on (Linux), off (Windows, macOS) | FR-112 P1, P3 — the encoding and capture threads ask for their clock (Linux: a `uclamp_min`; macOS: a QoS class; Windows: out of power throttling); `0` = the scheduler's default, `1` opts Windows or macOS in until their own numbers decide ([`encoders.md`](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) |
+| `ROOMLERD_ENCODER_CLOCK` | on (Linux), on for software encoders (Windows), off (macOS) | FR-112 P1, P3 — the encoding and capture threads ask for their clock (Linux: a `uclamp_min`; macOS: a QoS class; Windows: out of power throttling); `0` = the scheduler's default, `1` asks on every thread that can, hardware encoders' included; each OS's default follows its own numbers ([`encoders.md`](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) |
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
 | `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
 | `ROOMLERD_PATH_MODEL` (config key `path_model`) | shadow | FR-148 P0, P1 (D28) — `off` is the release before P0: no delivery sample, no path number, no path memory, none of their lines. `shadow` (unset, or any value but `off` and `on`) takes the samples and the tagged path numbers ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)) and keeps the path model's memory ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)); the opener reads today's rate memory. `on` is `shadow`, and a constrained session of the FFmpeg data-channel pump whose pair has a key and a fresh entry opens from the path memory ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ it is set on no device until FR-148's O7 is ruled ([§ The switch](#the-switch-d28)). A set variable wins over the key; remote config cannot set it |
@@ -3192,7 +3459,7 @@ still waiting for its evidence.
 | `SHARED_RATE_SPLIT` (env only) | `:926` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
 | `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:145`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
 | `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
-| `INFLIGHT_BUDGET` | `agents/roomlerd/src/media_inflight.rs:109`, not `encode/mod.rs` | FR-148 D46 B1 | off | the in-flight budget, computed in shadow on both data-channel pumps, and its fields at the end of the `path delivery` line ([§ The in-flight budget](#the-in-flight-budget-fr-148-d46--what-may-be-out-in-time)). `on` runs as `shadow` until D46's step B3 | B3's gates: D46's fresh-delivery bar on the stall shapes, O11's field read of the sessions that ride a TCP leg, and AC32 in the lab; B3 then holds on it on relay sessions. FR-148 P5 deletes the switch, kept or not | FR-148 P5 | — |
+| `INFLIGHT_BUDGET` | `agents/roomlerd/src/media_inflight.rs:144`, not `encode/mod.rs` | FR-148 D46 B1 | off | the in-flight budget, computed in shadow on both data-channel pumps, and its fields at the end of the `path delivery` line ([§ The in-flight budget](#the-in-flight-budget-fr-148-d46--what-may-be-out-in-time)). `on` runs as `shadow` until D46's step B3 | B3's gates: D46's fresh-delivery bar on the stall shapes, O11's field read of the sessions that ride a TCP leg, and AC32 in the lab; B3 then holds on it on relay sessions. FR-148 P5 deletes the switch, kept or not | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
 Each one retires through this table too, and its deletion PR cites the precondition below.

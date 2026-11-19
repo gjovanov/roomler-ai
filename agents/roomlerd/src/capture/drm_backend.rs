@@ -1015,23 +1015,27 @@ fn worker(
     );
 
     // Resolve the geometry once so the caller gets a real size, and so an
-    // unusable modifier is refused at open rather than per frame.
-    let Some((fb, crtc_handle)) = primary_plane(&card, &planes) else {
-        let _ = ready_tx.send(Err(anyhow!(
-            "no plane is bound to a CRTC with a live framebuffer — is anything being scanned out? \
-             (a blanked screen stops scanout, which is why screen blanking must be disabled)"
-        )));
-        return;
-    };
-    let info = match card.get_planar_framebuffer(fb) {
-        Ok(i) => i,
+    // unusable modifier is refused at open rather than per frame. #4040 — a
+    // framebuffer freed between the plane read and GETFB2 reads the plane
+    // again, a few times at most.
+    let (info, crtc_handle, rereads) = match open_framebuffer(
+        || primary_plane(&card, &planes),
+        |fb| card.get_planar_framebuffer(fb),
+        std::thread::sleep,
+    ) {
+        Ok(opened) => opened,
         Err(e) => {
-            let _ = ready_tx.send(Err(anyhow!(
-                "drmModeGetFB2 failed ({e}) — this needs CAP_SYS_ADMIN to receive the GEM handle"
-            )));
+            let _ = ready_tx.send(Err(e));
             return;
         }
     };
+    if rereads > 0 {
+        info!(
+            rereads,
+            "drm capture: the open found the primary plane's framebuffer freed (ENOENT) and read \
+             the plane again (#4040)"
+        );
+    }
     // This look only reads the geometry; its handles close before the loop
     // (and on every early return below, with the guard).
     let open_handles = FbHandles::new(&card, info.buffers());
@@ -1225,6 +1229,76 @@ impl FreedRun {
 /// from the error's errno and never from its text.
 fn freed(e: &GetPlanarFramebufferError) -> bool {
     matches!(e, GetPlanarFramebufferError::Io(io) if io.raw_os_error() == Some(libc::ENOENT))
+}
+
+/// #4040 — the longest run of the open's plane reads whose framebuffer GETFB2
+/// finds freed: after each one before the last the open reads the plane again,
+/// and the last fails the open. So the open waits [`OPEN_REREAD_WAIT`] three
+/// times at most, 6 ms in all.
+const OPEN_FREED_MAX: u32 = 4;
+
+/// #4040 — the wait before the open reads the primary plane again: short
+/// beside a refresh period (4.2 ms at 240 Hz), so the next read comes while the
+/// buffer that replaced the freed one is still on screen. The sleep also gives
+/// the CPU back, so the next two ioctls start on a fresh time slice: a thread
+/// preempted between them, as a busy guest's vCPU can be, is the likeliest way
+/// to stretch the window the race needs.
+const OPEN_REREAD_WAIT: Duration = Duration::from_millis(2);
+
+/// Why the open fails when no plane shows a framebuffer, on its first read of
+/// the plane or on a later one (#4040).
+const NO_SCANOUT: &str = "no plane is bound to a CRTC with a live framebuffer — is anything being \
+                          scanned out? (a blanked screen stops scanout, which is why screen \
+                          blanking must be disabled)";
+
+/// #4040 — the framebuffer the open sizes the capture from, GETFB2's answer
+/// for the one the primary plane shows, with the CRTC it is on and how many
+/// times the plane was read again to get it.
+///
+/// The open makes the same two calls as [`grab`]: it reads the plane (`plane`)
+/// and then asks the kernel for its framebuffer (`getfb2`). It can lose the
+/// same race ([`FreedRun`]): a compositor that flips and frees the old buffer
+/// between the two makes GETFB2 answer ENOENT. Until #4040 that failed the
+/// open, which falls through the capture cascade, and its error blamed a
+/// missing `CAP_SYS_ADMIN`. GETFB2 does not fail for that: it answers with no
+/// buffer handle, and [`unreadable`] refuses that case in words.
+///
+/// So an ENOENT reads the plane again after [`OPEN_REREAD_WAIT`], for the
+/// buffer that replaced the freed one: GETFB2 for the same id would only answer
+/// ENOENT again. The [`OPEN_FREED_MAX`]th in a row fails the open with its
+/// count. A read that finds nothing scanned out fails as the first read does
+/// ([`NO_SCANOUT`]). Any other GETFB2 failure fails at once, and no error here
+/// names a capability. It is not [`FreedRun`], whose bound counts frame
+/// periods and whose error names grabs: the open has no tick to skip, and its
+/// caller waits on it. Every effect is passed in, so the rule is tested
+/// without a DRM device.
+fn open_framebuffer<F, C, T>(
+    mut plane: impl FnMut() -> Option<(F, C)>,
+    mut getfb2: impl FnMut(F) -> Result<T, GetPlanarFramebufferError>,
+    mut wait: impl FnMut(Duration),
+) -> Result<(T, C, u32)> {
+    // ENOENTs so far: each one before the last is one more read of the plane.
+    let mut freed_reads = 0;
+    loop {
+        let Some((fb, crtc)) = plane() else {
+            bail!(NO_SCANOUT);
+        };
+        let e = match getfb2(fb) {
+            Ok(info) => return Ok((info, crtc, freed_reads)),
+            Err(e) => e,
+        };
+        if !freed(&e) {
+            bail!("drmModeGetFB2 failed on the primary plane's framebuffer: {e}");
+        }
+        freed_reads += 1;
+        if freed_reads >= OPEN_FREED_MAX {
+            bail!(
+                "drmModeGetFB2 failed on {freed_reads} reads of the primary plane in a row \
+                 (#4040): {e}"
+            );
+        }
+        wait(OPEN_REREAD_WAIT);
+    }
 }
 
 fn grab(
@@ -2237,5 +2311,215 @@ mod tests {
             panic!("the run's end reaches the pump as an error");
         };
         assert!(format!("{e:#}").contains("grabs in a row"), "{e:#}");
+    }
+
+    /// The open's answer, the framebuffer ids GETFB2 was asked for, and the
+    /// waits between the reads of the plane.
+    type Opening = (Result<(u32, u8, u32)>, Vec<u32>, Vec<Duration>);
+
+    /// What the open came to against stand-ins: `planes` answers each read
+    /// of the primary plane in turn (a framebuffer id and its CRTC, or nothing
+    /// scanned out), and `getfb2` each GETFB2 in turn.
+    fn open_with(
+        planes: Vec<Option<(u32, u8)>>,
+        getfb2: Vec<std::result::Result<u32, GetPlanarFramebufferError>>,
+    ) -> Opening {
+        let mut planes = planes.into_iter();
+        let mut answers = getfb2.into_iter();
+        let mut asked = Vec::new();
+        let mut waits = Vec::new();
+        let opened = open_framebuffer(
+            || planes.next().expect("a plane read the test planned"),
+            |fb| {
+                asked.push(fb);
+                answers.next().expect("a GETFB2 the test planned")
+            },
+            |d| waits.push(d),
+        );
+        (opened, asked, waits)
+    }
+
+    /// Whether the open's error reaches the viewer whole: after either of the
+    /// cascade's prefixes (`capture/mod.rs`), within FR-80's cap.
+    fn shown_whole(e: &str) -> bool {
+        let max = crate::capture::CaptureUnavailable::DETAIL_MAX;
+        [
+            format!("drm_capture is on, but DRM capture could not open: {e}"),
+            format!(
+                "this system install switched DRM capture on by itself, and it could not open: {e}"
+            ),
+        ]
+        .iter()
+        .all(|shown| shown.chars().count() <= max)
+    }
+
+    /// #4040 cell 1 — the compositor freed the framebuffer between the open's
+    /// plane read and its GETFB2: the open reads the plane again, a short wait
+    /// later, asks GETFB2 for the buffer that replaced it (never again for the
+    /// freed id), and opens on it.
+    #[test]
+    fn a_framebuffer_freed_at_the_open_reads_the_plane_again_and_opens() {
+        let (opened, asked, waits) =
+            open_with(vec![Some((7, 1)), Some((8, 2))], vec![enoent(), Ok(80)]);
+        let (info, crtc, rereads) = opened.expect("the open goes on");
+        assert_eq!((info, crtc, rereads), (80, 2, 1));
+        assert_eq!(asked, vec![7, 8], "the replacement, not the freed id again");
+        assert_eq!(waits, vec![OPEN_REREAD_WAIT]);
+
+        // One ENOENT short of the bound still opens.
+        let n = OPEN_FREED_MAX as usize;
+        let mut answers: Vec<_> = (1..n).map(|_| enoent()).collect();
+        answers.push(Ok(90));
+        let planes = (0..n as u32).map(|fb| Some((fb, 0))).collect();
+        let (opened, asked, waits) = open_with(planes, answers);
+        let (info, _, rereads) = opened.expect("opens on its last read");
+        assert_eq!((info, rereads), (90, OPEN_FREED_MAX - 1));
+        assert_eq!(asked.len(), n);
+        assert_eq!(waits.len(), n - 1);
+    }
+
+    /// #4040 cell 2 — a run of ENOENTs up to the bound fails the open, and the
+    /// error says how long the run was. The open's worst case stays small, and
+    /// the error the viewer is shown keeps the count and the errno whole.
+    #[test]
+    fn a_run_of_freed_framebuffers_at_the_open_fails_it_and_names_the_count() {
+        let n = OPEN_FREED_MAX as usize;
+        let planes = (0..n as u32).map(|fb| Some((fb, 0))).collect();
+        let (opened, asked, waits) = open_with(planes, (0..n).map(|_| enoent()).collect());
+        let e = format!(
+            "{:#}",
+            opened.expect_err("the run's last read fails the open")
+        );
+        assert!(e.starts_with("drmModeGetFB2 failed"), "{e}");
+        assert!(
+            e.contains(&format!(
+                "on {OPEN_FREED_MAX} reads of the primary plane in a row"
+            )),
+            "{e}"
+        );
+        assert!(e.ends_with("No such file or directory (os error 2)"), "{e}");
+        assert_eq!(
+            asked,
+            (0..n as u32).collect::<Vec<_>>(),
+            "a new read each time"
+        );
+        assert_eq!(waits, vec![OPEN_REREAD_WAIT; n - 1]);
+        let worst: Duration = waits.iter().sum();
+        assert!(worst <= Duration::from_millis(10), "{worst:?}");
+        assert!(shown_whole(&e), "{e}");
+    }
+
+    /// #4040 cell 3 — only ENOENT is a race. Any other errno, a fourcc the drm
+    /// crate does not know, and an error that only reads like ENOENT fail the
+    /// open at once, with no wait and no second read, and the error names the
+    /// call and the errno. One after an ENOENT fails the open at once too.
+    #[test]
+    fn any_other_getfb2_failure_at_the_open_fails_it_at_once() {
+        for code in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENODEV] {
+            let (opened, asked, waits) = open_with(vec![Some((7, 1))], vec![errno(code)]);
+            let e = format!("{:#}", opened.expect_err("fails at once"));
+            let errno_text = std::io::Error::from_raw_os_error(code).to_string();
+            assert_eq!(
+                e,
+                format!("drmModeGetFB2 failed on the primary plane's framebuffer: {errno_text}")
+            );
+            assert_eq!(asked, vec![7]);
+            assert!(waits.is_empty(), "{code}");
+            assert!(shown_whole(&e), "{e}");
+        }
+        let fourcc = GetPlanarFramebufferError::UnrecognizedFourcc(
+            drm::buffer::UnrecognizedFourcc(0x2020_2020),
+        );
+        let (opened, _, waits) = open_with(vec![Some((7, 1))], vec![Err(fourcc)]);
+        assert!(opened.is_err());
+        assert!(waits.is_empty());
+        // The errno decides, never the text.
+        let lookalike = GetPlanarFramebufferError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        let (opened, _, waits) = open_with(vec![Some((7, 1))], vec![Err(lookalike)]);
+        assert!(opened.is_err());
+        assert!(waits.is_empty());
+
+        let (opened, asked, waits) = open_with(
+            vec![Some((7, 1)), Some((8, 1))],
+            vec![enoent(), errno(libc::EPERM)],
+        );
+        let e = format!("{:#}", opened.expect_err("the EPERM fails the open"));
+        assert!(e.ends_with("Operation not permitted (os error 1)"), "{e}");
+        assert!(!e.contains("in a row"), "{e}");
+        assert_eq!((asked, waits.len()), (vec![7, 8], 1));
+    }
+
+    /// #4040 — a read that finds nothing scanned out fails the open as it
+    /// always has, in the same words, whether it is the first read or one after
+    /// an ENOENT.
+    #[test]
+    fn a_reread_that_finds_nothing_scanned_out_fails_as_the_first_read_does() {
+        let (opened, asked, waits) = open_with(vec![None], vec![]);
+        assert_eq!(
+            format!("{:#}", opened.expect_err("nothing to open")),
+            NO_SCANOUT
+        );
+        assert!(asked.is_empty() && waits.is_empty());
+
+        let (opened, asked, waits) = open_with(vec![Some((7, 1)), None], vec![enoent()]);
+        assert_eq!(
+            format!("{:#}", opened.expect_err("nothing to open")),
+            NO_SCANOUT
+        );
+        assert_eq!((asked, waits.len()), (vec![7], 1));
+        assert!(NO_SCANOUT.starts_with("no plane is bound"), "{NO_SCANOUT}");
+    }
+
+    /// #4040 cell 4 — GETFB2 does not fail for a caller without
+    /// CAP_SYS_ADMIN: it answers with no buffer handle, which `unreadable`
+    /// refuses in words. So no GETFB2 failure's error names the capability, at
+    /// the open or in a grab, and the one check that sees that case still does.
+    #[test]
+    fn no_getfb2_failure_blames_cap_sys_admin() {
+        fn fourcc() -> std::result::Result<u32, GetPlanarFramebufferError> {
+            Err(GetPlanarFramebufferError::UnrecognizedFourcc(
+                drm::buffer::UnrecognizedFourcc(0x2020_2020),
+            ))
+        }
+        let codes = [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EINVAL,
+            libc::ENODEV,
+            libc::ENOMEM,
+        ];
+        let mut errors = Vec::new();
+        for code in codes {
+            let (opened, _, _) = open_with(vec![Some((7, 1))], vec![errno(code)]);
+            errors.push(format!("{:#}", opened.expect_err("the open fails")));
+            let grab = FreedRun::default().judge(errno(code));
+            errors.push(format!("{:#}", grab.expect_err("the grab fails")));
+        }
+        let (opened, _, _) = open_with(vec![Some((7, 1))], vec![fourcc()]);
+        errors.push(format!("{:#}", opened.expect_err("the open fails")));
+        let grab = FreedRun::default().judge(fourcc());
+        errors.push(format!("{:#}", grab.expect_err("the grab fails")));
+        // ENOENT fails only at a run's end: the open's, and the grabs'.
+        let n = OPEN_FREED_MAX as usize;
+        let planes = (0..n as u32).map(|fb| Some((fb, 0))).collect();
+        let (opened, _, _) = open_with(planes, (0..n).map(|_| enoent()).collect());
+        errors.push(format!("{:#}", opened.expect_err("the open's run ends")));
+        let mut run = FreedRun::default();
+        for _ in 1..FREED_RUN_MAX {
+            assert_eq!(run.judge(enoent()).unwrap(), None);
+        }
+        let end = run.judge(enoent()).expect_err("the grabs' run ends");
+        errors.push(format!("{end:#}"));
+
+        assert_eq!(errors.len(), 2 * (codes.len() + 1) + 2, "{errors:#?}");
+        for e in &errors {
+            assert!(e.starts_with("drmModeGetFB2"), "{e}");
+            assert!(!e.contains("CAP_SYS_ADMIN"), "{e}");
+        }
+        let why = unreadable([None; 4]).expect("no handle");
+        assert!(why.contains("CAP_SYS_ADMIN"), "{why}");
     }
 }
