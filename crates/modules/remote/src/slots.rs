@@ -315,10 +315,13 @@ async fn drop_stale(slots: &SessionSlots, scope: SlotScope, stale: &[ObjectId]) 
 /// no session holds, and the claim decides as when Redis cannot answer it
 /// ([`stale_fallback`]): never a refusal that a Redis that is down would not
 /// make. A set full of live holders still refuses.
-///
-/// Today's rule, kept until the fix: every full set refuses.
-fn full_but_stale(_holders: &[SlotHolder], _undropped: &[ObjectId], _cap: u32) -> bool {
-    false
+fn full_but_stale(holders: &[SlotHolder], undropped: &[ObjectId], cap: u32) -> bool {
+    !undropped.is_empty()
+        && holders
+            .iter()
+            .filter(|h| !undropped.iter().any(|id| id.to_hex() == h.session))
+            .count()
+            < cap as usize
 }
 
 /// The claim's answer when [`full_but_stale`]: as when the claim itself

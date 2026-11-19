@@ -400,15 +400,11 @@ impl SessionSlots {
 pub const KEEP_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(SLOT_TTL_SECS);
 
 /// The wait before the next try of a keep that failed for the `failures`th
-/// time, or `None` when that try would start past [`KEEP_RETRY_WINDOW`],
-/// counted from the first try (`elapsed`).
-///
-/// Today's rule, kept until the fix: a keep is tried once.
-pub fn keep_retry_wait(
-    _failures: u32,
-    _elapsed: std::time::Duration,
-) -> Option<std::time::Duration> {
-    None
+/// time (1, 2, 4, 8, then 16 s), or `None` when that try would start past
+/// [`KEEP_RETRY_WINDOW`], counted from the first try (`elapsed`).
+pub fn keep_retry_wait(failures: u32, elapsed: std::time::Duration) -> Option<std::time::Duration> {
+    let wait = std::time::Duration::from_secs(1 << failures.saturating_sub(1).min(4));
+    (elapsed + wait < KEEP_RETRY_WINDOW).then_some(wait)
 }
 
 impl SessionSlots {
