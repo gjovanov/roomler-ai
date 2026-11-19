@@ -13790,3 +13790,7 @@ mod refused_begin_tests {
         }
     }
 }
+
+/// #3682 — the drawer's reads to their edges: tests, and the seams they stand in.
+#[cfg(test)]
+mod drawer_edges;
