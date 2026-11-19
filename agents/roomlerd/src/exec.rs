@@ -2808,8 +2808,8 @@ mod tests {
             RunAs::ConsoleUser
         );
         assert_eq!(
-            RunAs::from_wire("named", Some("goran")).unwrap(),
-            RunAs::Named("goran".into())
+            RunAs::from_wire("named", Some("casey")).unwrap(),
+            RunAs::Named("casey".into())
         );
 
         // A newer server naming a mode this agent has never heard of must not
@@ -2829,7 +2829,7 @@ mod tests {
         assert!(RunAs::Daemon.is_privileged());
         assert!(!RunAs::Named("nobody".into()).is_privileged());
         assert!(!RunAs::ConsoleUser.is_privileged());
-        assert_eq!(RunAs::Named("goran".into()).label(), "named:goran");
+        assert_eq!(RunAs::Named("casey".into()).label(), "named:casey");
     }
 
     /// A command that cannot be run as the requested identity must FAIL, and

@@ -8107,9 +8107,9 @@ XMODIFIERS=@im=ibus
     #[test]
     fn session_ids_survive_both_observed_column_layouts() {
         // systemd 255 (Ubuntu 24.04): SESSION UID USER SEAT TTY STATE IDLE SINCE
-        let s255 = "7173 1000 gjovanov - -     active no  -\n\
-                    7631 1000 gjovanov - pts/5 active yes 17h ago\n\
-                    7767 1000 gjovanov - -     active no  -\n";
+        let s255 = "7173 1000 cjackson - -     active no  -\n\
+                    7631 1000 cjackson - pts/5 active yes 17h ago\n\
+                    7767 1000 cjackson - -     active no  -\n";
         assert_eq!(session_ids(s255), ["7173", "7631", "7767"]);
 
         // systemd 257 (Fedora 42): a LEADER and a CLASS column appear, so

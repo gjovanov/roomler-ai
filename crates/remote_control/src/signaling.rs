@@ -7874,7 +7874,7 @@ mod tests {
             timeout_ms: 30_000,
             max_output_bytes: 262_144,
             cwd: None,
-            caller: "goran".into(),
+            caller: "casey".into(),
             consent_mode: Some(crate::models::ConsentMode::Auto),
             via_service: false,
             run_as: None,
@@ -7915,7 +7915,7 @@ mod tests {
                 assert_eq!(shell, "pwsh");
                 assert_eq!(timeout_ms, 30_000);
                 assert_eq!(max_output_bytes, 262_144);
-                assert_eq!(caller, "goran");
+                assert_eq!(caller, "casey");
             }
             other => panic!("expected RpcExec, got {other:?}"),
         }

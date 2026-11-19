@@ -3487,13 +3487,13 @@ mod tests {
             RunAs::ConsoleUser
         );
         assert_eq!(
-            super::sshd::parse_account_mode("named:goran").unwrap(),
-            RunAs::Named("goran".into())
+            super::sshd::parse_account_mode("named:casey").unwrap(),
+            RunAs::Named("casey".into())
         );
         // Whitespace is tolerated; an empty account and an unknown word are not.
         assert_eq!(
-            super::sshd::parse_account_mode(" named: goran ").unwrap(),
-            RunAs::Named("goran".into())
+            super::sshd::parse_account_mode(" named: casey ").unwrap(),
+            RunAs::Named("casey".into())
         );
         assert!(super::sshd::parse_account_mode("named:").is_err());
         assert!(super::sshd::parse_account_mode("root").is_err());

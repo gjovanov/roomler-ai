@@ -517,7 +517,7 @@ mod tests {
     <link rel="alternate" type="text/html" href="https://roomler.ai/blog/self-hosted-teamviewer-alternative/"/>
     <published>2026-09-25T22:45:13Z</published>
     <updated>2026-10-01T08:00:00Z</updated>
-    <author><name>Goran</name></author>
+    <author><name>Casey</name></author>
     <summary>One &#8212; two</summary>
     <content type="html">&lt;title&gt;not the title&lt;/title&gt;&lt;p&gt;Body&lt;/p&gt;</content>
   </entry>
@@ -527,7 +527,7 @@ mod tests {
     <link rel="alternate" type="text/html" href="https://roomler.ai/blog/ssh-without-port-forwarding/"/>
     <published>2026-10-19T06:00:00+02:00</published>
     <updated>2026-10-19T06:00:00+02:00</updated>
-    <author><name>Goran</name></author>
+    <author><name>Casey</name></author>
   </entry>
   <entry>
     <id>https://roomler.ai/docs/x/</id>
