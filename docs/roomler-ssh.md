@@ -690,7 +690,7 @@ answering: a stopped `systemd-logind`, an SSSD or LDAP server stalled on a large
 group. The agent used to run `loginctl` inline, on the async worker that applied
 the account, for as long as it took. It now asks through the one seat0 lookup in
 flight that a received file asks (`files::ask_seat0`, on a thread named
-`seat0-lookup`, [`files.rs:1046`](../agents/roomlerd/src/files.rs#L1046)), awaited
+`seat0-lookup`, [`files.rs:1061`](../agents/roomlerd/src/files.rs#L1061)), awaited
 from the session's own task, `SEAT_LOOKUP_WAIT` (1.5 s) at most
 (`exec::console_account`, [`exec.rs:919`](../agents/roomlerd/src/exec.rs#L919)). It
 asks at the same point as before: after every gate and the consent prompt, right
