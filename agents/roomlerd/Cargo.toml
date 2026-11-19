@@ -61,6 +61,11 @@ tokio-tungstenite = { workspace = true }
 # tunnel-core already uses so the agent links one socket2, not two.
 socket2 = "0.5"
 reqwest = { workspace = true }
+# #4018 — the self-view asks a GET once more when hyper says its connection
+# closed before any answer came (`hyper::Error::is_incomplete_message`), read by
+# downcasting reqwest's error chain. reqwest 0.12 already links hyper 1 with
+# these features, so a direct dep adds no compilation.
+hyper = { version = "1", features = ["client", "http1"] }
 futures = { workspace = true }
 
 # Subnet auto-detection for the tunnel mesh subnet-router (advertised_routes):

@@ -441,7 +441,7 @@ sequenceDiagram
     participant S as /api/agent/self/*
     G->>L: Devices {org, page, per_page, q, sort, dir}
     L->>V: cache hit (≤ 10 s)? answer it
-    V->>S: GET with THAT org's agent token (10 s timeout)
+    V->>S: GET with THAT org's agent token (10 s timeout, asked once more if its connection closed before any answer)
     S-->>V: VisibleDevicesPage
     V-->>G: DevicesPage — or Upstream {code, message}
     Note over G: live connection / RTT cells come from the local<br/>Peers poll (2 s), joined on the overlay node id
@@ -451,8 +451,29 @@ sequenceDiagram
   URL and agent token (the token is redacted from `Debug` and never logged) and asks with
   the right one. Answers are cached — 10 s for a page, 20 s for the mesh, 32 entries, one
   request in flight per key — so the companion, the CLI and re-renders share a fetch.
+- **A poll never rides a connection the server is closing (#4018).** The server side closes an
+  idle HTTP/1.1 connection after 30 s (measured on 2026-11-19: its FIN came 29.99 s after the
+  answer, in both of two trials), and the page asks again 30 s after its last answer.
+  reqwest's default pool kept an idle connection for 90 s, so a poll went out on a pooled
+  connection just as the server closed it. A GET written in the last few tens of milliseconds
+  before the FIN got no answer, and about every other poll logged `refresh failed
+  surface="devices"` with `connection closed before message completed`. Two changes, each
+  pinned by a test:
+
+  | What | Where (`agents/roomlerd/src/self_view.rs`) | Why |
+  |---|---|---|
+  | The pool drops a connection idle for 10 s | `POOL_IDLE_TIMEOUT` (`:69`), set by `client_builder` (`:247`); a const assertion (`:70`) holds it at 20 s or less | a third of the server's close: the 30 s poll and the 60 s mesh ask always dial a new connection and never meet that close, while a burst (a search being typed, a page turn, the CLI beside the companion) still shares one |
+  | A GET whose connection closed before any answer came is asked once more, at once | `closed_before_any_answer` (`:671`), from `SelfView::get` (`:459`) | hyper's incomplete message, found by downcasting reqwest's error chain, never by its text. It covers a self-hosted server behind a front or middlebox whose idle close nobody here knows (5 s, 15 s, 60 s). Both routes are GETs, so asking again is safe. A timeout, a connect failure and any HTTP status are never asked again, and nothing is asked a third time. A second ask that answers is a DEBUG line only; one that fails returns its error as before |
+
+  Tested by `a_get_whose_connection_closes_before_any_answer_is_asked_once_more` (a raw server
+  closes the pooled connection on the second GET; the caller gets the answer after two
+  connections and three requests), `a_get_closed_again_on_its_second_ask_fails_as_before`,
+  `a_get_that_times_out_is_not_asked_again`, `a_get_that_is_answered_is_not_asked_again`,
+  `a_connect_failure_is_not_a_close_before_any_answer` and
+  `a_connection_idle_past_the_pool_timeout_is_never_reused`.
 - **A failure has a name, never an empty list.** `Response::Upstream { code }`:
-  `server_unreachable` (connect, TLS, timeout), `unauthorized` (401), `unsupported_server`
+  `server_unreachable` (connect, TLS, timeout, a connection closed before any answer on both
+  asks), `unauthorized` (401), `unsupported_server`
   (404 — a server older than the route), `module_unmounted` (the server's own 503),
   `rate_limited` (429), `server_error`, `unknown_org`, `org_disabled`.
 - **The page.** `front/grid.js` is the web grid's model ported to plain JS: server sort keys,

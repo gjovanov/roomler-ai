@@ -21,6 +21,7 @@
 //!                                                  │ cache hit (10 s / 20 s)? ──▶ answer
 //!                                                  ▼ single flight per (org, query)
 //!                           GET {server}/api/agent/self/devices?…  (bearer = agent token)
+//!                           once more, at once, if its connection closed before any answer
 //!                                                  ▼
 //!                  2xx → VisibleDevicesPage → DevicesPage (field by field)
 //!                  else → Upstream{code}: server_unreachable · unauthorized ·
@@ -52,6 +53,24 @@ use crate::config::{AgentConfig, OrgEntry, PRIMARY_ORG_LABEL};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Whole-request budget (connect + TLS + answer).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// #4018 — how long an idle connection may wait in the pool for the next
+/// request. reqwest's default is 90 s. The server side closes an idle
+/// HTTP/1.1 connection after 30 s (measured on 2026-11-19: its FIN came
+/// 29.99 s after the answer, in both of two trials), and the Devices page asks
+/// again 30 s after its last answer. So a poll went out on a pooled connection
+/// just as the server closed it, and a GET written in the last few tens of
+/// milliseconds before the FIN got no answer: about every other poll failed
+/// with "connection closed before message completed". 10 s is a third of that
+/// close, so the 30 s poll and the 60 s mesh ask always dial a new connection
+/// and never meet the server's close. A burst (a search typed key by key, a
+/// page turn, the CLI beside the companion) still shares one connection. A
+/// front that closes sooner than this is what the one retry in
+/// [`SelfView::get`] is for.
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const _: () = assert!(
+    POOL_IDLE_TIMEOUT.as_millis() <= 20_000,
+    "the pool must drop an idle connection well before the server's 30 s idle close (#4018)"
+);
 /// How long a device page stays fresh. The companion re-asks every 30 s while
 /// the page is on screen; this only coalesces a burst (a search being typed,
 /// two windows, the CLI next to the companion).
@@ -218,12 +237,19 @@ pub struct SelfView {
 /// The production HTTP client: the crash uploader's posture (system TLS
 /// roots, the platform's proxy settings) with this module's budgets.
 fn build_client() -> Result<reqwest::Client, String> {
+    client_builder(POOL_IDLE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("building the HTTP client: {e}"))
+}
+
+/// [`build_client`]'s builder, with `pool_idle` as the pool's idle timeout:
+/// [`POOL_IDLE_TIMEOUT`] in production, a short one in a test.
+fn client_builder(pool_idle: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(concat!("roomlerd-localapi/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| format!("building the HTTP client: {e}"))
+        .pool_idle_timeout(pool_idle)
 }
 
 impl SelfView {
@@ -419,6 +445,17 @@ impl SelfView {
 
     /// One authenticated GET against the org's server. `Ok` is a 2xx body;
     /// every other outcome is a named [`Upstream`].
+    ///
+    /// #4018 — a GET whose connection closed before any answer came is asked
+    /// once more, at once ([`closed_before_any_answer`]). A GET written on a
+    /// pooled connection gets exactly that when the far side closes the
+    /// connection as the GET arrives. [`POOL_IDLE_TIMEOUT`] keeps it from
+    /// happening against our own server, whose idle close was measured, but a
+    /// self-hosted server may sit behind a front or a middlebox whose idle
+    /// close nobody here knows (5 s, 15 s, 60 s). Both routes are GETs, so the
+    /// second ask is safe. It is never made after a timeout, a connect failure
+    /// or any answer, and never twice. Its answer is the caller's, with a
+    /// DEBUG line only; its failure is returned as the first one was before.
     async fn get(
         &self,
         org: &OrgHttp,
@@ -440,13 +477,26 @@ impl SelfView {
             ));
         }
         let url = format!("{base}{path}");
-        let resp = http
-            .get(&url)
-            .bearer_auth(org.token.get())
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| transport_error(base, e))?;
+        let send = || {
+            http.get(&url)
+                .bearer_auth(org.token.get())
+                .query(params)
+                .send()
+        };
+        let resp = match send().await {
+            Ok(resp) => resp,
+            Err(e) if closed_before_any_answer(&e) => {
+                let reason = crate::error_chain::error_chain(&e.without_url());
+                tracing::debug!(
+                    org = %org.label,
+                    path,
+                    %reason,
+                    "localapi self-view: the connection closed before any answer came; asking once more"
+                );
+                send().await.map_err(|e| transport_error(base, e))?
+            }
+            Err(e) => return Err(transport_error(base, e)),
+        };
         let status = resp.status().as_u16();
         let body = read_capped(resp, MAX_BODY).await.map_err(|e| match e {
             BodyError::TooLarge => Upstream {
@@ -609,6 +659,24 @@ fn transport_error(server: &str, e: reqwest::Error) -> Upstream {
     let e = e.without_url();
     let chain = crate::error_chain::error_chain(&e);
     Upstream::new("server_unreachable", format!("{what} ({chain})"))
+}
+
+/// #4018 — `send`'s error says the request went out and its connection then
+/// closed before any answer came: hyper's incomplete message, the field's
+/// "connection closed before message completed". Read by walking reqwest's
+/// `source()` chain down to hyper's own error, never from the text. A timeout
+/// and a connect failure are never it, whatever their chain holds. An answer
+/// is never it either: this is asked of `send`'s error only, which comes
+/// before any status, and a body cut short after its status is not asked.
+fn closed_before_any_answer(e: &reqwest::Error) -> bool {
+    if e.is_timeout() || e.is_connect() {
+        return false;
+    }
+    std::iter::successors(std::error::Error::source(e), |cause| cause.source()).any(|cause| {
+        cause
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+    })
 }
 
 /// A non-2xx answer → its named cause. Pure, so the table is a unit test.
@@ -1361,6 +1429,264 @@ mod tests {
             view.cache_len() <= CACHE_CAP,
             "cache grew to {}",
             view.cache_len()
+        );
+    }
+
+    // ── #4018: a connection the far side closes, the pool, the one retry ──
+
+    /// No answer comes from the cache: every ask reaches the server.
+    fn no_cache() -> Freshness {
+        Freshness {
+            devices: Duration::ZERO,
+            mesh: Duration::ZERO,
+            error: Duration::ZERO,
+        }
+    }
+
+    /// The production client's builder with `pool_idle` as its pool's idle
+    /// timeout, and no proxy, as every test client here.
+    fn pooled_client(pool_idle: Duration) -> reqwest::ClientBuilder {
+        client_builder(pool_idle).no_proxy()
+    }
+
+    /// What a [`scripted_server`] does with one request.
+    #[derive(Clone, Copy, Debug)]
+    enum Turn {
+        /// A 200 with a device page, and the connection kept open.
+        Answer,
+        /// Read the request, then close the connection with no answer: a
+        /// server whose idle close fired while the request was on its way.
+        Close,
+        /// Read the request and never answer it.
+        Hold,
+    }
+
+    struct ScriptedServer {
+        url: String,
+        connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedServer {
+        /// `(connections accepted, requests read)` so far.
+        fn seen(&self) -> (usize, usize) {
+            (
+                self.connections.load(Ordering::SeqCst),
+                self.requests.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// A raw HTTP/1.1 server that keeps its connections, so a test decides
+    /// exactly when one closes: request `nth` on connection `conn` (both
+    /// counted from 0, connections in the order they were accepted) gets
+    /// `script(conn, nth)`.
+    async fn scripted_server(
+        script: impl Fn(usize, usize) -> Turn + Send + Sync + 'static,
+    ) -> ScriptedServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(script);
+        {
+            let connections = connections.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let conn = connections.fetch_add(1, Ordering::SeqCst);
+                    let requests = requests.clone();
+                    let script = script.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        for nth in 0.. {
+                            // One request head: a GET has no body.
+                            let end = loop {
+                                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break at + 4;
+                                }
+                                match sock.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                }
+                            };
+                            buf.drain(..end);
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            match script(conn, nth) {
+                                Turn::Answer => {
+                                    let body = page_json(&["me", "peer"]);
+                                    let reply = format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                         content-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                                        body.len()
+                                    );
+                                    if sock.write_all(reply.as_bytes()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Turn::Close => {
+                                    let _ = sock.shutdown().await;
+                                    return;
+                                }
+                                Turn::Hold => std::future::pending::<()>().await,
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        ScriptedServer {
+            url,
+            connections,
+            requests,
+        }
+    }
+
+    /// #4018, the field's failure on a real socket. The server answers the
+    /// first GET and keeps the connection, then reads the second GET on it and
+    /// closes it with no answer, as a server does whose idle close fires while
+    /// the GET is on its way. The GET is asked once more, on a new
+    /// connection, and the caller gets that answer.
+    #[tokio::test]
+    async fn a_get_whose_connection_closes_before_any_answer_is_asked_once_more() {
+        let srv = scripted_server(|conn, nth| match (conn, nth) {
+            (0, 1) => Turn::Close,
+            _ => Turn::Answer,
+        })
+        .await;
+        let http = pooled_client(POOL_IDLE_TIMEOUT)
+            .build()
+            .map_err(|e| e.to_string());
+        let view = SelfView::with_client(registry(&srv.url), http, no_cache());
+        let q = DevicesQuery::default();
+        assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
+        assert_eq!(srv.seen(), (1, 1), "(connections, requests)");
+        match view.devices("", &q).await {
+            Response::Devices(page) => assert_eq!(page.items.len(), 2),
+            other => panic!("the GET asked once more must answer: {other:?}"),
+        }
+        assert_eq!(srv.seen(), (2, 3), "(connections, requests)");
+    }
+
+    /// #4018 — once more, never twice. A GET whose second ask is closed
+    /// with no answer too fails as it did before the retry, after three
+    /// requests on two connections.
+    #[tokio::test]
+    async fn a_get_closed_again_on_its_second_ask_fails_as_before() {
+        let srv = scripted_server(|conn, nth| match (conn, nth) {
+            (0, 0) => Turn::Answer,
+            _ => Turn::Close,
+        })
+        .await;
+        let http = pooled_client(POOL_IDLE_TIMEOUT)
+            .build()
+            .map_err(|e| e.to_string());
+        let view = SelfView::with_client(registry(&srv.url), http, no_cache());
+        let q = DevicesQuery::default();
+        assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
+        match view.devices("", &q).await {
+            Response::Upstream { code, status, .. } => {
+                assert_eq!((code.as_str(), status), ("server_unreachable", None));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(srv.seen(), (2, 3), "(connections, requests)");
+    }
+
+    /// #4018 — a server that never answers is a timeout, and a timeout is
+    /// never asked again: the GET fails once, after the client's budget and
+    /// before twice that, and the server read one request.
+    #[tokio::test]
+    async fn a_get_that_times_out_is_not_asked_again() {
+        const BUDGET: Duration = Duration::from_secs(2);
+        let srv = scripted_server(|_, _| Turn::Hold).await;
+        let http = pooled_client(POOL_IDLE_TIMEOUT)
+            .timeout(BUDGET)
+            .build()
+            .map_err(|e| e.to_string());
+        let view = SelfView::with_client(registry(&srv.url), http, no_cache());
+        let started = Instant::now();
+        match view.devices("", &DevicesQuery::default()).await {
+            Response::Upstream { code, status, .. } => {
+                assert_eq!((code.as_str(), status), ("server_unreachable", None));
+            }
+            other => panic!("{other:?}"),
+        }
+        let took = started.elapsed();
+        assert!(
+            took >= BUDGET,
+            "it failed before the budget ran out: {took:?}"
+        );
+        assert!(
+            took < 2 * BUDGET,
+            "a second ask takes twice the budget: {took:?}"
+        );
+        assert_eq!(srv.seen(), (1, 1), "(connections, requests)");
+    }
+
+    /// #4018 — an answer is never asked again, whatever it says: a 503 is
+    /// passed through as before, after one request.
+    #[tokio::test]
+    async fn a_get_that_is_answered_is_not_asked_again() {
+        let srv = fake_server(
+            |_| (503, "<html>upstream unavailable</html>".into()),
+            Duration::ZERO,
+        )
+        .await;
+        let http = pooled_client(POOL_IDLE_TIMEOUT)
+            .build()
+            .map_err(|e| e.to_string());
+        let view = SelfView::with_client(registry(&srv.url), http, no_cache());
+        match view.devices("", &DevicesQuery::default()).await {
+            Response::Upstream { code, status, .. } => {
+                assert_eq!((code.as_str(), status), ("server_error", Some(503)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(srv.hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// #4018 — a connect failure is never a close before any answer: no
+    /// connection was there to close.
+    #[tokio::test]
+    async fn a_connect_failure_is_not_a_close_before_any_answer() {
+        // Bind, learn the port, close it: nothing listens there.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = test_client()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert!(!closed_before_any_answer(&e));
+    }
+
+    /// #4018 — the pool's idle timeout is the builder's: two GETs 50 ms
+    /// apart share one connection, and a GET after the connection sat idle
+    /// longer than the timeout dials a new one. Production's value is held
+    /// at 20 s or less by a const assertion beside [`POOL_IDLE_TIMEOUT`].
+    #[tokio::test]
+    async fn a_connection_idle_past_the_pool_timeout_is_never_reused() {
+        const IDLE: Duration = Duration::from_millis(500);
+        let srv = scripted_server(|_, _| Turn::Answer).await;
+        let http = pooled_client(IDLE).build().map_err(|e| e.to_string());
+        let view = SelfView::with_client(registry(&srv.url), http, no_cache());
+        let q = DevicesQuery::default();
+        assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
+        assert_eq!(srv.seen(), (1, 2), "50 ms apart: one connection");
+        tokio::time::sleep(IDLE + Duration::from_millis(300)).await;
+        assert!(matches!(view.devices("", &q).await, Response::Devices(_)));
+        assert_eq!(
+            srv.seen(),
+            (2, 3),
+            "idle past the timeout: a new connection"
         );
     }
 }

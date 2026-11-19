@@ -8867,6 +8867,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hmac 0.12.1",
+ "hyper",
  "if-addrs",
  "ipnet",
  "libc",
