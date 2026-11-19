@@ -1114,3 +1114,56 @@ async fn callers_queued_in_front_of_a_socket_redis_stopped_reading_fail_within_t
     );
     assert_eq!(counted, 160, "each counted once");
 }
+
+/// #3840 — a DERP registration's late claim can land after its own teardown:
+/// the teardown ran while the claim was in flight and found no record to
+/// release. The step after the claim (`keep_late_claim`) releases the record
+/// the claim wrote, so no record outlives its socket, and a registration that
+/// still holds its token keeps its record.
+#[tokio::test]
+async fn a_late_claim_that_lands_after_its_teardown_is_released() {
+    use bson::oid::ObjectId;
+    use roomler_ai_mod_network::derp_cluster::{keep_late_claim, pk_hex};
+    use roomler_core::cluster::directory::derp_key;
+
+    let app = TestApp::spawn().await;
+    let pod = app.state.network();
+    let dir = pod.cluster_directory.clone().expect("the pod's directory");
+    let mut wrong = Vec::new();
+    for (case, held) in [
+        ("torn down while its claim was in flight", false),
+        ("still registered", true),
+    ] {
+        let network = ObjectId::new();
+        let mut pk = [7u8; 32];
+        pk[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let key = derp_key(&network.to_hex(), &pk_hex(&pk));
+        let token = dir.owner_token(&ObjectId::new().to_hex());
+        if held {
+            pod.derp_presence_tokens
+                .insert((network, pk), token.clone());
+        }
+        // The late claim landed: the record holds the registration's token.
+        let wrote = dir
+            .claim_if_newer(&key, &token, 90)
+            .await
+            .expect("a Redis that answers answers");
+        let kept = keep_late_claim(pod, network, &pk, &token).await;
+        let record = dir.get(&key).await.expect("GET");
+        eprintln!(
+            "W14-RESULT late claim, {case}: wrote {wrote}, kept {kept}, record held {}",
+            record.is_some()
+        );
+        if !wrote || kept != held || record.is_some() != held {
+            wrong.push(format!(
+                "{case}: wrote {wrote}, kept {kept}, record {record:?}"
+            ));
+        }
+        pod.derp_presence_tokens.remove(&(network, pk));
+        let _ = dir.release(&key, &token).await;
+    }
+    assert!(
+        wrong.is_empty(),
+        "W14-RED a late claim that landed after its teardown kept its record: {wrong:#?}"
+    );
+}

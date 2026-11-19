@@ -388,6 +388,10 @@ async fn finish_registration(
                     continue;
                 }
             }
+            // A teardown while the claim was in flight released nothing.
+            if !keep_late_claim(&state, network_id, &pk, &token).await {
+                return;
+            }
             if let Err(e) = dir.set_add(&derpnet_key(&net_hex), &member).await {
                 debug!(%network_id, %e, "derp net-index add failed again");
                 continue;
@@ -399,6 +403,25 @@ async fn finish_registration(
             return;
         }
     }
+}
+
+/// #3840 — the step after a late claim that wrote the record: whether the
+/// registration still holds its token, so that its finisher goes on to the
+/// index and the sweep. A teardown that ran while the claim was in flight
+/// found no record to release, because the claim had not written it yet; the
+/// record the claim wrote is released here, by its token, so it cannot
+/// outlive its socket. The index member is left to the next sweep, which
+/// prunes a member with no record: removing it here could race a newer
+/// registration's add on the other pod.
+/// TODAY: the record is kept, and the finisher adds the member.
+pub async fn keep_late_claim(
+    state: &NetworkState,
+    network_id: ObjectId,
+    pk: &DerpPubKey,
+    token: &str,
+) -> bool {
+    let _ = (state, network_id, pk, token);
+    true
 }
 
 #[cfg(test)]
