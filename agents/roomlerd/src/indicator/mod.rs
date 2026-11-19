@@ -463,6 +463,17 @@ mod x11;
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 pub mod mac;
 
+/// #4053 — whether the macOS panel can show a question now: the window
+/// server serves this process, in the console session it served when the
+/// pump started. [`mac`] asks it; its cells run on every lane.
+#[cfg(any(test, all(target_os = "macos", feature = "viewer-indicator-macos")))]
+pub(crate) mod panel_gate;
+
+/// #4053 — whether another console session has started since the panel came
+/// up, from the window server's notify(3) names, for [`panel_gate`].
+#[cfg(all(target_os = "macos", any(test, feature = "viewer-indicator-macos")))]
+pub(crate) mod console_watch;
+
 /// FR-93 P6f — the desktop's notifications as the last consent surface, where
 /// neither the native panel nor the companion can show a question. `pub`
 /// because `app.rs` runs its session helper (`portal-helper --notify`).
