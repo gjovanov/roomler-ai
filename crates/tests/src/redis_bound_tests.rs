@@ -10,11 +10,12 @@
 
 use std::time::{Duration, Instant};
 
-use roomler_core::ws::redis_conn::RedisBounds;
+use roomler_core::ws::redis_conn::{CONNECT_LINE, RedisBounds, TIMEOUT_LINE};
 use roomler_core::ws::redis_pubsub::RedisPubSub;
 
 use crate::fixtures::redis_blackout::{RedisBlackout, test_redis_url};
 use crate::fixtures::test_app::TestApp;
+use crate::session_media_plan_tests::Logged;
 
 /// The default response timeout (`ROOMLER__REDIS__RESPONSE_TIMEOUT_MS`,
 /// 3000): a command with no answer fails this long after it was sent.
@@ -164,11 +165,13 @@ async fn through(fwd: &RedisBlackout) -> RedisPubSub {
 }
 
 /// A Redis that answers: every kind of call the server sends (a command, a
-/// pipeline, a script, a publish) is answered, with no timeout and so no warn
-/// line (the counter counts exactly those lines), no replacement and no
-/// second connection.
+/// pipeline, a script, a publish) is answered, with no timeout, no connection
+/// failure, no warn line of either wording, no replacement and no second
+/// connection.
 #[tokio::test]
 async fn a_healthy_redis_sees_no_timeout_and_no_replacement() {
+    let logged = Logged::default();
+    let _log = logged.install();
     let fwd = RedisBlackout::start(&test_redis_url()).await;
     let ps = through(&fwd).await;
     let key = unique("roomler:test:w14:");
@@ -185,6 +188,12 @@ async fn a_healthy_redis_sees_no_timeout_and_no_replacement() {
     ps.kv_del(&key).await.expect("DEL");
     let conn = ps.connection();
     assert_eq!(conn.timeouts(), 0, "a Redis that answers logs no timeout");
+    assert_eq!(conn.connect_failures(), 0, "and no connection failure");
+    let text = logged.text();
+    assert!(
+        !text.contains(TIMEOUT_LINE) && !text.contains(CONNECT_LINE),
+        "a Redis that answers writes neither warn line:\n{text}"
+    );
     assert_eq!(conn.replacements(), 0, "and replaces nothing");
     assert_eq!(fwd.accepted(), 1, "one connection carried all of it");
 }
@@ -835,4 +844,273 @@ async fn a_derp_registration_redis_did_not_answer_is_written_once_redis_answers_
         "W14-RED once Redis answered again: {wrong:?} in {report:#?}"
     );
     drop(sockets);
+}
+
+// ── The bounds as they are set, and the lines a firing writes ───────────────
+
+/// A response timeout set under 1 s (3, meant as seconds) is used as 1 s,
+/// with one warn line at boot that names the setting; a bound set to 0 stays
+/// no bound and writes nothing. The boot line names the address Redis is
+/// reached at (host and port, never the URL) and both bounds as used, in ms.
+#[tokio::test]
+async fn a_bound_under_1_s_is_used_as_1_s_and_the_boot_line_says_what_is_used() {
+    let logged = Logged::default();
+    let _log = logged.install();
+    let settings = roomler_ai_config::RedisSettings {
+        url: test_redis_url(),
+        response_timeout_ms: 3,
+        connection_timeout_ms: 0,
+    };
+    let ps = RedisPubSub::from_settings(&settings, unique("w14-test/"))
+        .await
+        .expect("connects");
+    let used = ps.connection().bounds();
+    let text = logged.text();
+    let raised: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("ROOMLER__REDIS__"))
+        .collect();
+    let boot = text
+        .lines()
+        .find(|l| l.contains("Redis Pub/Sub publisher connected"))
+        .unwrap_or_default();
+    eprintln!(
+        "W14-RESULT bounds set 3 and 0: used {used:?}; raised {raised:?}; boot line `{boot}`"
+    );
+    assert_eq!(
+        used,
+        RedisBounds {
+            response_timeout: Some(Duration::from_secs(1)),
+            connection_timeout: None,
+        },
+        "W14-RED a response timeout set to 3 must be used as 1 s, and 0 as no bound"
+    );
+    assert_eq!(raised.len(), 1, "one warn line, for the one setting raised");
+    for part in [
+        "WARN",
+        "ROOMLER__REDIS__RESPONSE_TIMEOUT_MS",
+        "given_ms=3",
+        "used_ms=1000",
+    ] {
+        assert!(
+            raised[0].contains(part),
+            "the warn line has `{part}`: {}",
+            raised[0]
+        );
+    }
+    let addr = redis::Client::open(test_redis_url().as_str())
+        .expect("the lane's Redis URL")
+        .get_connection_info()
+        .addr
+        .to_string();
+    for part in [
+        format!("addr={addr}"),
+        "response_timeout_ms=1000".to_string(),
+        "connection_timeout_ms=0".to_string(),
+    ] {
+        assert!(boot.contains(&part), "the boot line has `{part}`: {boot}");
+    }
+    assert!(
+        !boot.contains("redis://"),
+        "the boot line names no URL: {boot}"
+    );
+}
+
+/// How long the restart test lets Redis refuse: longer than the crate's first
+/// retry of a reconnect (1 to 2 s), after which that reconnect waits 60 to
+/// 120 s before it tries again.
+const REFUSED: Duration = Duration::from_secs(5);
+
+/// A Redis that restarts: every connection is closed and every new one
+/// refused, then it listens again. Every command in the gap fails within the
+/// bound, and none of it is logged as "no answer within the timeout", the
+/// line of a Redis that took the bytes and said nothing: the gap is "no
+/// connection could be made". Once Redis listens again the connection is
+/// used again within `RECOVERY`, without a restart of the server.
+#[tokio::test]
+async fn a_restarting_redis_is_logged_as_no_connection_and_used_again_once_it_listens() {
+    let logged = Logged::default();
+    let _log = logged.install();
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    fwd.refuse().await;
+    let gone = Instant::now();
+    let (mut failed, mut slowest) = (0, Duration::ZERO);
+    while gone.elapsed() < REFUSED {
+        let started = Instant::now();
+        let res = tokio::time::timeout(OUTER, ps.kv_get(&key)).await;
+        let took = started.elapsed();
+        slowest = slowest.max(took);
+        match res {
+            Ok(Err(_)) => failed += 1,
+            Ok(Ok(v)) => panic!("a Redis that refuses answered {v:?}"),
+            Err(_) => panic!(
+                "W14-RED a GET while Redis refused was still waiting after {took:?} \
+                 (the test's own limit)"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    fwd.listen_again();
+    let back = Instant::now();
+    let mut answered = None;
+    while back.elapsed() < RECOVERY + BOUND {
+        // A short wait of the test's own, as in the blackout's recovery test.
+        if let Ok(Ok(v)) = tokio::time::timeout(Duration::from_millis(300), ps.kv_get(&key)).await {
+            answered = Some(v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let took = back.elapsed();
+    let conn = ps.connection();
+    let text = logged.text();
+    let no_answer: Vec<&str> = text.lines().filter(|l| l.contains(TIMEOUT_LINE)).collect();
+    let no_connection = text.lines().filter(|l| l.contains(CONNECT_LINE)).count();
+    eprintln!(
+        "W14-RESULT restart: {failed} GETs failed while Redis refused, the slowest after \
+         {slowest:?}; used again {took:?} after it listened again; lines: no answer {}, no \
+         connection {no_connection}; counted: timeouts {}, connection failures {}, \
+         replacements {}",
+        no_answer.len(),
+        conn.timeouts(),
+        conn.connect_failures(),
+        conn.replacements()
+    );
+    assert!(
+        slowest <= BOUND + SLACK,
+        "a GET while Redis refused failed only after {slowest:?}; the bound is {BOUND:?}"
+    );
+    assert!(
+        no_answer.is_empty(),
+        "W14-RED a Redis that refused was logged as one that took the bytes and said \
+         nothing: {no_answer:#?}"
+    );
+    assert_eq!(conn.timeouts(), 0, "and counted as one");
+    assert!(no_connection >= 1, "the gap is logged as no connection");
+    assert!(conn.connect_failures() >= 1, "and counted");
+    assert_eq!(
+        answered,
+        Some(Some("v".to_string())),
+        "a Redis that listens again was not used again within {:?}",
+        RECOVERY + BOUND
+    );
+    assert!(
+        took <= RECOVERY,
+        "used again only {took:?} after Redis listened again"
+    );
+    ps.kv_del(&key).await.expect("DEL");
+}
+
+/// Twenty commands that time out within one second write one line between
+/// them, and the next line written says how many it stood for
+/// (`suppressed`). The counter counts every one, so an outage of an hour
+/// writes one line a second per pod at most and the count stays exact.
+#[tokio::test]
+async fn timeouts_within_a_second_write_one_line_and_every_one_is_counted() {
+    let logged = Logged::default();
+    let _log = logged.install();
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    fwd.swallow();
+    let mut gets = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let (ps, key) = (ps.clone(), key.clone());
+        gets.spawn(async move { ps.kv_get(&key).await });
+    }
+    let results = tokio::time::timeout(OUTER, gets.join_all())
+        .await
+        .expect("W14-RED twenty GETs into a silent Redis were still waiting at the test's limit");
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r, Err(e) if e.is_timeout())),
+        "every GET failed with the response timeout: {results:?}"
+    );
+    // The replacement the first timeout started tries one connection; Redis
+    // is silent, so it gives up after the connection timeout (3 s), seconds
+    // after the twenty: its line is written, and says how many were held
+    // back. The next attempt waits 1 s, then 3 s more.
+    tokio::time::sleep(BOUND + Duration::from_secs(1)).await;
+    let conn = ps.connection();
+    let text = logged.text();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(TIMEOUT_LINE)).collect();
+    eprintln!(
+        "W14-RESULT twenty timeouts within a second: {} lines, counted {}: {lines:#?}",
+        lines.len(),
+        conn.timeouts()
+    );
+    assert_eq!(
+        conn.timeouts(),
+        21,
+        "every timeout is counted: the 20 GETs and 1 connection attempt"
+    );
+    assert_eq!(
+        lines.len(),
+        2,
+        "W14-RED one line for the twenty, and one for the attempt seconds later"
+    );
+    assert!(
+        lines[0].contains("suppressed=0"),
+        "the first line held nothing back: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("suppressed=19") && lines[1].contains("timeouts=21"),
+        "the second line stands for the 19 held back: {}",
+        lines[1]
+    );
+}
+
+/// Callers queued in front of a socket Redis stopped reading. The crate's own
+/// response timeout starts only once a command is in its queue to the socket,
+/// and that queue holds 50, so a caller still waiting for room in it is
+/// bounded by the outer timeout alone. 160 SETs of 256 KiB fill the socket
+/// and the queue, and every one fails with the response timeout within the
+/// bound.
+#[tokio::test]
+async fn callers_queued_in_front_of_a_socket_redis_stopped_reading_fail_within_the_bound() {
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    fwd.stop_reading();
+    let value: std::sync::Arc<str> = "x".repeat(256 * 1024).into();
+    let started = Instant::now();
+    let mut sets = tokio::task::JoinSet::new();
+    for i in 0..160 {
+        let (ps, key, value) = (ps.clone(), format!("{key}:{i}"), value.clone());
+        sets.spawn(async move { ps.kv_set_ex(&key, &value, 60).await });
+    }
+    let results = tokio::time::timeout(OUTER, sets.join_all()).await;
+    let took = started.elapsed();
+    let counted = ps.connection().timeouts();
+    let timed_out = results.as_ref().map_or(0, |r| {
+        r.iter()
+            .filter(|r| matches!(r, Err(e) if e.is_timeout()))
+            .count()
+    });
+    eprintln!(
+        "W14-RESULT 160 queued SETs: {timed_out} failed with the response timeout after \
+         {took:?}, counted {counted}"
+    );
+    assert!(
+        results.is_ok(),
+        "W14-RED SETs queued in front of a socket Redis stopped reading were still waiting \
+         after {took:?} (the test's own limit)"
+    );
+    assert_eq!(timed_out, 160, "every SET failed with the response timeout");
+    assert!(
+        took <= BOUND + SLACK,
+        "the queued SETs failed after {took:?}; the bound is {BOUND:?}"
+    );
+    assert_eq!(counted, 160, "each counted once");
 }

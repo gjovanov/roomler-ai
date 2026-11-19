@@ -62,6 +62,12 @@ pub const REPLACE_WAIT_MAX: Duration = Duration::from_secs(5);
 /// a Redis that answers its count is 0.
 pub const TIMEOUT_LINE: &str = "redis: no answer within the timeout";
 
+/// The wording of a Redis that refused or closed the connection, or of a
+/// connection attempt that failed for another reason than a timeout: a Redis
+/// that is down, as opposed to one that took the bytes and said nothing. On a
+/// Redis that answers its count is 0 too.
+pub const CONNECT_LINE: &str = "redis: no connection could be made";
+
 /// The two bounds. `None` is no bound, the crate's own default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedisBounds {
@@ -91,10 +97,9 @@ impl RedisBounds {
 
     /// From the settings, in milliseconds; 0 is no bound.
     pub fn from_settings(settings: &roomler_ai_config::RedisSettings) -> Self {
-        let bound = |ms: u64| (ms > 0).then(|| Duration::from_millis(ms));
         Self {
-            response_timeout: bound(settings.response_timeout_ms),
-            connection_timeout: bound(settings.connection_timeout_ms),
+            response_timeout: bound_setting(RESPONSE_SETTING, settings.response_timeout_ms),
+            connection_timeout: bound_setting(CONNECTION_SETTING, settings.connection_timeout_ms),
         }
     }
 
@@ -128,6 +133,7 @@ struct Shared {
     current: RwLock<ConnectionManager>,
     replacing: AtomicBool,
     timeouts: AtomicU64,
+    connect_failures: AtomicU64,
     replacements: AtomicU64,
 }
 
@@ -159,6 +165,7 @@ impl RedisConnection {
                 current: RwLock::new(manager),
                 replacing: AtomicBool::new(false),
                 timeouts: AtomicU64::new(0),
+                connect_failures: AtomicU64::new(0),
                 replacements: AtomicU64::new(0),
             }),
         })
@@ -171,6 +178,11 @@ impl RedisConnection {
     /// Timeouts logged so far, one per line in the one wording.
     pub fn timeouts(&self) -> u64 {
         self.shared.timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Connections refused, closed or failed, as [`CONNECT_LINE`] counts them.
+    pub fn connect_failures(&self) -> u64 {
+        self.shared.connect_failures.load(Ordering::Relaxed)
     }
 
     /// Times the connection was replaced after a timeout.
@@ -351,9 +363,64 @@ fn now_ms() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
+/// The two settings by the names a deployment sets them with.
+const RESPONSE_SETTING: &str = "ROOMLER__REDIS__RESPONSE_TIMEOUT_MS";
+const CONNECTION_SETTING: &str = "ROOMLER__REDIS__CONNECTION_TIMEOUT_MS";
+
+/// A bound setting in milliseconds as it is used: 0 is no bound.
+pub fn bound_ms_used(given: u64) -> Option<u64> {
+    (given > 0).then_some(given)
+}
+
+/// One bound setting as it is used.
+fn bound_setting(_setting: &str, given: u64) -> Option<Duration> {
+    bound_ms_used(given).map(Duration::from_millis)
+}
+
 #[cfg(test)]
-mod line_bound_tests {
+mod tests {
     use super::*;
+
+    /// A value under 1 s (3, meant as seconds) would put every Redis user
+    /// into "Redis down" on a Redis that answers: it is used as 1 s. 0 stays
+    /// no bound, and 1 s and over are used as given.
+    #[test]
+    fn a_bound_under_1_s_is_used_as_1_s_and_0_stays_no_bound() {
+        let used: Vec<_> = [0, 1, 3, 999, 1000, 1001, 3000, 60_000]
+            .into_iter()
+            .map(|given| (given, bound_ms_used(given)))
+            .collect();
+        assert_eq!(
+            used,
+            [
+                (0, None),
+                (1, Some(1000)),
+                (3, Some(1000)),
+                (999, Some(1000)),
+                (1000, Some(1000)),
+                (1001, Some(1001)),
+                (3000, Some(3000)),
+                (60_000, Some(60_000)),
+            ],
+            "W14-RED a bound under 1 s is used as given"
+        );
+        let settings = |response_timeout_ms, connection_timeout_ms| {
+            RedisBounds::from_settings(&roomler_ai_config::RedisSettings {
+                url: "redis://r:6379".to_string(),
+                response_timeout_ms,
+                connection_timeout_ms,
+            })
+        };
+        assert_eq!(
+            settings(3, 0),
+            RedisBounds {
+                response_timeout: Some(Duration::from_secs(1)),
+                connection_timeout: None,
+            }
+        );
+        assert_eq!(settings(3000, 3000), RedisBounds::default());
+        assert_eq!(settings(0, 0), RedisBounds::NONE);
+    }
 
     #[test]
     fn one_line_a_second_each_with_the_count_held_back() {

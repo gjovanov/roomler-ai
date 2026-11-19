@@ -14,6 +14,11 @@
 //!   same way, from its first byte.
 //! - **one delayed reply**: the next chunk Redis sends on any connection is
 //!   held for the given time, a slow answer that still arrives.
+//! - **refuse**, then **listen again**: a Redis process that went away and
+//!   came back. Every connection is closed, and every new one refused on the
+//!   same port, until it listens again.
+//! - **stop reading**: what clients send is no longer read, and nothing is
+//!   closed, so a client's writes fill its socket, then its own queue.
 //!
 //! Dropping the forwarder aborts every task it started, which closes its
 //! sockets.
@@ -25,12 +30,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 
 #[derive(Default)]
 struct Shared {
     swallow: AtomicBool,
+    stop_reading: AtomicBool,
     delay_next_reply_ms: AtomicU64,
     accepted: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -47,8 +53,13 @@ impl Shared {
 /// [`RedisBlackout::url_for`], then flip it.
 pub struct RedisBlackout {
     addr: SocketAddr,
+    upstream: String,
     shared: Arc<Shared>,
-    accept: JoinHandle<()>,
+    /// The accept loop while listening; `None` while refusing.
+    accept: Mutex<Option<JoinHandle<()>>>,
+    /// The port while refusing: bound and not listening, so every connection
+    /// attempt is refused and no other listener can take the port.
+    held: Mutex<Option<TcpSocket>>,
 }
 
 /// The test Redis the integration lane uses: `ROOMLER__REDIS__URL`, else the
@@ -82,41 +93,13 @@ impl RedisBlackout {
             .expect("bind the forwarder");
         let addr = listener.local_addr().expect("forwarder address");
         let shared = Arc::new(Shared::default());
-        let accept = {
-            let shared = shared.clone();
-            tokio::spawn(async move {
-                loop {
-                    let Ok((client, _)) = listener.accept().await else {
-                        continue;
-                    };
-                    shared.accepted.fetch_add(1, Ordering::SeqCst);
-                    let Ok(server) = TcpStream::connect(&upstream).await else {
-                        // No upstream: close the client, as a refused Redis would.
-                        drop(client);
-                        continue;
-                    };
-                    let _ = client.set_nodelay(true);
-                    let _ = server.set_nodelay(true);
-                    let lost = Arc::new(AtomicBool::new(false));
-                    let (client_rx, client_tx) = client.into_split();
-                    let (server_rx, server_tx) = server.into_split();
-                    let up = tokio::spawn(pump(
-                        client_rx,
-                        server_tx,
-                        shared.clone(),
-                        lost.clone(),
-                        false,
-                    ));
-                    let down = tokio::spawn(pump(server_rx, client_tx, shared.clone(), lost, true));
-                    shared.keep(up);
-                    shared.keep(down);
-                }
-            })
-        };
+        let accept = accept_loop(listener, upstream.clone(), shared.clone());
         Self {
             addr,
+            upstream,
             shared,
-            accept,
+            accept: Mutex::new(Some(accept)),
+            held: Mutex::new(None),
         }
     }
 
@@ -156,17 +139,99 @@ impl RedisBlackout {
     pub fn accepted(&self) -> u64 {
         self.shared.accepted.load(Ordering::SeqCst)
     }
+
+    /// Go away as a Redis process that stops does: close every connection
+    /// (each client sees the close) and refuse every new one on the same port
+    /// until [`RedisBlackout::listen_again`]. Returns once the port refuses.
+    pub async fn refuse(&self) {
+        let accept = self.accept.lock().expect("accept loop").take();
+        if let Some(accept) = accept {
+            accept.abort();
+            // Wait until the task, and with it the listener, is gone.
+            let _ = accept.await;
+        }
+        let tasks: Vec<_> = self
+            .shared
+            .tasks
+            .lock()
+            .expect("forwarder task list")
+            .drain(..)
+            .collect();
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let socket = TcpSocket::new_v4().expect("a socket for the port");
+        socket.set_reuseaddr(true).expect("SO_REUSEADDR");
+        socket.bind(self.addr).expect("hold the forwarder's port");
+        *self.held.lock().expect("held port") = Some(socket);
+    }
+
+    /// Listen again on the same port, as a Redis that restarted does.
+    pub fn listen_again(&self) {
+        let socket = self
+            .held
+            .lock()
+            .expect("held port")
+            .take()
+            .expect("refuse() first");
+        let listener = socket.listen(1024).expect("listen again on the port");
+        let accept = accept_loop(listener, self.upstream.clone(), self.shared.clone());
+        *self.accept.lock().expect("accept loop") = Some(accept);
+    }
+
+    /// Stop reading what clients send, on every connection, and close
+    /// nothing.
+    pub fn stop_reading(&self) {
+        self.shared.stop_reading.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for RedisBlackout {
     fn drop(&mut self) {
-        self.accept.abort();
+        if let Ok(mut slot) = self.accept.lock()
+            && let Some(accept) = slot.take()
+        {
+            accept.abort();
+        }
         if let Ok(tasks) = self.shared.tasks.lock() {
             for t in tasks.iter() {
                 t.abort();
             }
         }
     }
+}
+
+/// Accept connections and forward each to `upstream`.
+fn accept_loop(listener: TcpListener, upstream: String, shared: Arc<Shared>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                continue;
+            };
+            shared.accepted.fetch_add(1, Ordering::SeqCst);
+            let Ok(server) = TcpStream::connect(&upstream).await else {
+                // No upstream: close the client, as a refused Redis would.
+                drop(client);
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = server.set_nodelay(true);
+            let lost = Arc::new(AtomicBool::new(false));
+            let (client_rx, client_tx) = client.into_split();
+            let (server_rx, server_tx) = server.into_split();
+            let up = tokio::spawn(pump(
+                client_rx,
+                server_tx,
+                shared.clone(),
+                lost.clone(),
+                false,
+            ));
+            let down = tokio::spawn(pump(server_rx, client_tx, shared.clone(), lost, true));
+            shared.keep(up);
+            shared.keep(down);
+        }
+    })
 }
 
 /// One direction of one connection. `reply` marks the Redis-to-client side,
@@ -180,6 +245,9 @@ async fn pump(
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
+        while !reply && shared.stop_reading.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let n = match from.read(&mut buf).await {
             Ok(0) | Err(_) => {
                 // The peer closed: pass the close on, unless this connection
