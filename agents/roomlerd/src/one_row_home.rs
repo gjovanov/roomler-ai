@@ -1590,6 +1590,17 @@ mod tests {
         writes_fail: bool,
     }
 
+    /// #3802, moved from `macos_supervisor`'s tests (FR-147): the names the
+    /// give-up keeps are the ones `put-back-legacy` renames back in the
+    /// person's folder.
+    #[test]
+    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
+        let at = Places::of(Path::new("/u"), &FakeFs::new());
+        let [plist, config] = crate::macos_supervisor::kept_for_revert();
+        assert_eq!(at.folder.join(plist), at.legacy_plist);
+        assert_eq!(at.folder.join(config), at.legacy_config);
+    }
+
     impl FakeFs {
         fn new() -> FakeFs {
             FakeFs {

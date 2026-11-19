@@ -1019,10 +1019,12 @@ pub struct KeptCopy {
     pub stat: Option<(u32, u32)>,
 }
 
-/// #3802 — the files `sudo roomlerd one-row --revert` reads back from the
-/// person's folder, and from nowhere else (`one_row::revert_plan`): the
-/// LaunchAgent plist the conversion moved there, and the copy of the person's
-/// config it kept beside their config. Names, inside that folder.
+/// #3802 — the copies an older conversion kept in the person's folder: the
+/// LaunchAgent plist it moved there, and the copy of the person's config it
+/// kept beside their config. Names, inside that folder. FR-147: root reads
+/// nothing in a home; the person's own `one-row-home put-back-legacy` renames
+/// these back (`one_row_home::Places`), and `sudo roomlerd one-row --revert`
+/// starts it where that person's `read` reports them.
 pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
     use crate::one_row::{AGENT_PLIST, kept_path};
     [
@@ -3738,27 +3740,6 @@ mod tests {
             println!("GIVE-UP [{case}] {why}");
             assert_eq!(why, want, "{case}");
         }
-    }
-
-    /// #3802 — the names the give-up keeps are the paths the revert reads in
-    /// the person's folder (`one_row::revert_plan`).
-    #[test]
-    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
-        let dir = std::path::PathBuf::from("/u/F");
-        let person = crate::one_row::Person {
-            user: "p".into(),
-            uid: 501,
-            home: "/u".into(),
-            dir: dir.clone(),
-            config: None,
-            has_plist: true,
-        };
-        let [plist, config] = kept_for_revert();
-        assert_eq!(dir.join(plist), person.plist_aside());
-        assert_eq!(
-            dir.join(config),
-            crate::one_row::kept_path(&person.config_path())
-        );
     }
 
     /// FR-43 P3a — a worker with no enrollment cannot be missing one, so the
