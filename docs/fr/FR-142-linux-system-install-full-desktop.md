@@ -226,7 +226,7 @@ test of root or of a display variable (code):
 | desktops served | any the cascade reaches | GNOME and KDE, unlocked; other X11 desktops `x11_not_enabled` | `capture/mod.rs:755`, `:1255` | no: P2, after a lock signal (D1) |
 | the computer's sound | Pulse, directly | yes, through the session helper the released build carries (`portal-capture` is in `full`) | `audio_source.rs:210`, `:228-245`; `agents/roomlerd/Cargo.toml:744`, `:757` | left out: it already works |
 | Remote Apps | yes | yes, run as whoever is at the screen | `apps/linux.rs:502-508`, `apps/mod.rs:396-404` | left out: same answer |
-| files | as the person | writes as seat0's person; reads are #3688's subject | `files.rs:341-376` | left out: same feature |
+| files | as the person | writes as seat0's person; reads are #3688's subject | `files.rs:343-378` | left out: same feature |
 | cursor shape | XFixes | the DRM arm's cursor plane | `capture/x11_cursor.rs:3-11`, `capture/cursor.rs:27-28` | left out: same answer |
 | consent prompt | the companion or the desktop's own | the companion, by design | `.claude/rules/remote-desktop.md` | left out |
 
