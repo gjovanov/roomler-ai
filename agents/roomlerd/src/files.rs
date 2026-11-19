@@ -2350,8 +2350,9 @@ pub struct FilesHandler {
     /// runs on any machine. `None` = [`partial_dir_for`]'s rule.
     #[cfg(test)]
     staging_root: Option<PathBuf>,
-    /// #3682 — this channel's folder listings: one step at a time.
-    lane: reads::Lane,
+    /// #3682 — this channel's listings: its folders one step at a time, its
+    /// Drives view on a lane of its own.
+    listings: reads::Listings,
 }
 
 impl Default for FilesHandler {
@@ -2369,7 +2370,7 @@ impl FilesHandler {
             refused: Arc::default(),
             #[cfg(test)]
             staging_root: None,
-            lane: reads::Lane::default(),
+            listings: reads::Listings::default(),
         }
     }
 
@@ -3052,7 +3053,7 @@ impl FilesHandler {
         // First, so a begin that takes its lock after this refuses, and one
         // that took it before is caught below.
         self.ended.store(true, Ordering::Release);
-        self.lane.close();
+        self.listings.close();
         self.abort().await;
         if let Some(state) = self.outgoing.lock().await.as_ref() {
             state.cancel.cancel();
@@ -4057,29 +4058,29 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
 
 /// [`list_dir`], read as `who` (#3669). With nobody signed in it is refused
 /// outright, the roots view included, so the drawer says so as it opens.
-/// #3682 — on a lane of its own; a channel's listings share the channel's
+/// #3682 — on lanes of its own; a channel's listings share the channel's
 /// ([`FilesHandler::list_dir`]).
 pub(crate) async fn list_dir_as(who: &FsAs, path: &str) -> Result<DirListing> {
     let by = std::time::Instant::now() + reads::LISTING_ANSWERED_WITHIN;
-    list_dir_in(&reads::Lane::default(), who, path, by).await
+    list_dir_in(&reads::Listings::default(), who, path, by).await
 }
 
-/// [`list_dir_as`] on `lane`, answered `by`: one step at a time, each
-/// bounded whole.
+/// [`list_dir_as`] on `listings`, answered `by`: one step at a time on each
+/// lane, each bounded whole. The Drives view takes its own lane.
 async fn list_dir_in(
-    lane: &reads::Lane,
+    listings: &reads::Listings,
     who: &FsAs,
     path: &str,
     by: std::time::Instant,
 ) -> Result<DirListing> {
     who.refuse_read(NOBODY_SIGNED_IN_TO_BROWSE)?;
     if path.is_empty() || path == "~" {
-        return reads::roots(lane, who, by).await;
+        return reads::roots(&listings.drives, who, by).await;
     }
     if path == STAGING_SENTINEL {
-        return list_staging(lane, who, by).await;
+        return list_staging(&listings.folders, who, by).await;
     }
-    list_canonical(lane, who, &PathBuf::from(path), by).await
+    list_canonical(&listings.folders, who, &PathBuf::from(path), by).await
 }
 
 /// Canonicalise, enumerate and shape one directory, as `who`. Shared by the

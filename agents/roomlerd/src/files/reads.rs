@@ -62,11 +62,10 @@ pub(super) fn resolve_path(asked: &Path) -> std::io::Result<PathBuf> {
 // ---------------------------------------------------------------------------
 // Item 3 (D1-B): one bound over a listing, one step at a time per channel
 
-/// The one bound over a whole listing: resolving the folder, opening it,
-/// reading its entries, and waiting for the channel's lane before that.
-/// With the Windows person lookup's 1.5 s ([`PERSON_LOOKUP_WAIT`]) or Linux's
-/// seat0 lookup's before it, a listing answers within 4.5 s, inside the
-/// viewer's 5 s.
+/// The one bound over a listing's step: resolving the folder, opening it and
+/// reading its entries. It starts when the step takes the channel's lane, so
+/// a listing that waited for another still has all of it; the listing's own
+/// deadline, [`LISTING_ANSWERED_WITHIN`], covers that wait.
 pub(super) const LISTING_BOUND: Duration = Duration::from_secs(super::DIR_LIST_TIMEOUT_SECS);
 
 /// How long a listing has from its arrival to its answer, all in: the person
@@ -81,16 +80,44 @@ pub(super) const LISTING_ANSWERED_WITHIN: Duration = Duration::from_millis(4500)
 /// One more is answered at once.
 pub(super) const LISTINGS_WAITING_AT_MOST: usize = 4;
 
-/// One files channel's folder listings (#3682, D1-B). A listing is one step
+/// One files channel's listings (#3682): its folders take one [`Lane`], and
+/// its Drives view another. `GetLogicalDrives` asks no share, so a folder
+/// stuck on a share that stopped answering never refuses the viewer's way
+/// back to the drives.
+#[derive(Clone, Default)]
+pub(crate) struct Listings {
+    pub(super) folders: Lane,
+    pub(super) drives: Lane,
+    /// The channel closed, or its session ended: a listing still running
+    /// drops its answer.
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl Listings {
+    /// The channel closed, or its session ended.
+    pub(crate) fn close(&self) {
+        self.closed.cancel();
+    }
+
+    /// Cancelled once [`Self::close`] is called.
+    pub(crate) fn closed(&self) -> tokio_util::sync::CancellationToken {
+        self.closed.clone()
+    }
+}
+
+/// One lane of a files channel's listings (#3682, D1-B): its folders', or
+/// its Drives view's ([`Listings`]). A listing is one step
 /// on a blocking thread, and a step cannot be cancelled: a share that stops
 /// answering keeps its thread for as long as it likes. So a channel runs one
 /// listing step at a time, and the step keeps the lane until its thread is
 /// really done, past its bound if it must. A listing that comes while the
-/// step runs within its bound waits for it, inside its own bound: quick
-/// navigation is never refused. One that comes, or is still waiting, once
-/// the step has passed its bound is answered at once, naming the folder that
-/// is not answering. At most [`LISTINGS_WAITING_AT_MOST`] wait. So a dead
-/// share strands one thread per channel, however often the viewer asks.
+/// step runs within its bound waits for it, inside its own deadline, and its
+/// own step then has the whole [`LISTING_BOUND`]: quick navigation is never
+/// refused. One that comes, or is still waiting, once the step has passed its
+/// bound is answered at once, naming the folder that is not answering. One
+/// past its own deadline starts no step. At most
+/// [`LISTINGS_WAITING_AT_MOST`] wait. So a dead share strands one thread per
+/// channel, however often the viewer asks.
 #[derive(Clone, Default)]
 pub(crate) struct Lane(Arc<LaneInner>);
 
@@ -100,15 +127,12 @@ struct LaneInner {
     state: std::sync::Mutex<LaneState>,
     /// Told when a step's thread lets the lane go.
     step_ended: tokio::sync::Notify,
-    /// The channel closed, or its session ended: a listing still running
-    /// drops its answer.
-    closed: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
 struct LaneState {
     /// The step running now: the folder it was asked for, and when its
-    /// bound ends.
+    /// bound ends, [`LISTING_BOUND`] after it took the lane.
     running: Option<(String, Instant)>,
     /// The listings waiting for it.
     waiting: usize,
@@ -116,7 +140,8 @@ struct LaneState {
 
 /// What a listing does next, decided under the lane's lock.
 enum Turn {
-    Taken,
+    /// Taken, by a step whose bound ends then.
+    Taken(Instant),
     Wait(Instant),
     Stuck(String),
     TooMany,
@@ -148,20 +173,10 @@ impl Drop for Waiting {
 }
 
 impl Lane {
-    /// The channel closed, or its session ended.
-    pub(crate) fn close(&self) {
-        self.0.closed.cancel();
-    }
-
-    /// Cancelled once [`Self::close`] is called.
-    pub(crate) fn closed(&self) -> tokio_util::sync::CancellationToken {
-        self.0.closed.clone()
-    }
-
-    /// Run `step` as `who`, as this lane's one step, within one
-    /// [`LISTING_BOUND`] from now that covers the wait for the lane too.
-    /// `asked` is the folder as the viewer named it, a listing to be answered
-    /// `by`.
+    /// Run `step` as `who`, as this lane's one step: `asked` is the folder as
+    /// the viewer named it, a listing to be answered `by`. The step's own
+    /// bound, [`LISTING_BOUND`], starts when it takes the lane, and the
+    /// listing answers by the earlier of that bound's end and `by`.
     pub(super) async fn step<T, F>(
         &self,
         who: &FsAs,
@@ -173,42 +188,49 @@ impl Lane {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        let _ = by;
-        let until = Instant::now() + LISTING_BOUND;
-        let held = self.take(asked, until).await?;
+        let (held, its_end) = self.take(asked, by).await?;
         let ran = who.run(move || {
             let _held = held;
             step()
         });
-        match tokio::time::timeout_at(until.into(), ran).await {
+        match tokio::time::timeout_at(its_end.min(by).into(), ran).await {
             Ok(ran) => ran,
             Err(_) => Err(anyhow!("listing timed out")),
         }
     }
 
-    /// Take the lane for `asked` by `until`, or say why not.
-    async fn take(&self, asked: &str, until: Instant) -> Result<Step> {
+    /// Take the lane for `asked`, a listing to be answered `by`, or say why
+    /// not; taken, with when the step's bound ends. A listing already past
+    /// `by` takes nothing, so it starts no step: the step would hold the lane
+    /// for an answer nobody waits for.
+    async fn take(&self, asked: &str, by: Instant) -> Result<(Step, Instant)> {
         let mut waiting: Option<Waiting> = None;
         loop {
             let (turn, ended) = {
                 let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let now = Instant::now();
-                let turn = match state.running.clone() {
-                    None => {
-                        state.running = Some((asked.to_string(), until));
-                        Turn::Taken
-                    }
-                    Some((stuck, its_end)) if now >= its_end => Turn::Stuck(stuck),
-                    Some(_) if now >= until => Turn::OutOfTime,
-                    Some(_) if waiting.is_none() && state.waiting >= LISTINGS_WAITING_AT_MOST => {
-                        Turn::TooMany
-                    }
-                    Some((_, its_end)) => {
-                        if waiting.is_none() {
-                            state.waiting += 1;
-                            waiting = Some(Waiting(self.0.clone()));
+                let turn = if now >= by {
+                    Turn::OutOfTime
+                } else {
+                    match state.running.clone() {
+                        None => {
+                            let its_end = now + LISTING_BOUND;
+                            state.running = Some((asked.to_string(), its_end));
+                            Turn::Taken(its_end)
                         }
-                        Turn::Wait(its_end.min(until))
+                        Some((stuck, its_end)) if now >= its_end => Turn::Stuck(stuck),
+                        Some(_)
+                            if waiting.is_none() && state.waiting >= LISTINGS_WAITING_AT_MOST =>
+                        {
+                            Turn::TooMany
+                        }
+                        Some((_, its_end)) => {
+                            if waiting.is_none() {
+                                state.waiting += 1;
+                                waiting = Some(Waiting(self.0.clone()));
+                            }
+                            Turn::Wait(its_end.min(by))
+                        }
                     }
                 };
                 // Made under the lock, so a step that ends after it is
@@ -217,7 +239,7 @@ impl Lane {
                 (turn, ended)
             };
             match turn {
-                Turn::Taken => return Ok(Step(self.0.clone())),
+                Turn::Taken(its_end) => return Ok((Step(self.0.clone()), its_end)),
                 Turn::Stuck(stuck) => {
                     return Err(anyhow!(
                         "{asked}: not listed, because {stuck} is not answering. Try again in a \
@@ -241,7 +263,7 @@ impl Lane {
     }
 }
 
-/// #3682 item 1 — the Drives view, read on `lane` inside a step as `who`:
+/// #3682 item 1 — the Drives view, read on its own `lane` inside a step as `who`:
 /// Windows keeps drive letters per sign-in, so a letter the person mapped is
 /// in their sign-in's device map, not the service's. `GetLogicalDrives` asks
 /// no drive anything, so the step touches no share. Elsewhere the roots are
@@ -283,26 +305,27 @@ impl super::FilesHandler {
     pub(crate) async fn list_dir(&self, path: &str) -> Result<DirListing> {
         let by = Instant::now() + LISTING_ANSWERED_WITHIN;
         let who = FsAs::for_read().await;
-        super::list_dir_in(&self.lane, &who, path, by).await
+        super::list_dir_in(&self.listings, &who, path, by).await
     }
 
-    /// [`Self::list_dir`], read as `who`.
+    /// [`Self::list_dir`], read as `who`: a test's, with no lookup.
+    #[cfg(test)]
     pub(crate) async fn list_as(&self, who: &FsAs, path: &str) -> Result<DirListing> {
         let by = Instant::now() + LISTING_ANSWERED_WITHIN;
-        super::list_dir_in(&self.lane, who, path, by).await
+        super::list_dir_in(&self.listings, who, path, by).await
     }
 
     /// The channel closed: an upload's state goes, as with [`Self::abort`],
     /// and a listing still running drops its answer.
     pub(crate) async fn channel_closed(&self) {
         self.abort().await;
-        self.lane.close();
+        self.listings.close();
     }
 
     /// Cancelled once the channel closes or its session ends: a listing
     /// still running then drops its answer.
     pub(crate) fn listings_closed(&self) -> tokio_util::sync::CancellationToken {
-        self.lane.closed()
+        self.listings.closed()
     }
 }
 
