@@ -331,9 +331,9 @@ them.
 - GitHub's Windows runners set `TEMP` to an 8.3 short path, so T4's control pins the `GetLongPathNameW` compare;
   without it every tempdir-based case would fail in CI.
 - ⚠️ `roomler-node-core`'s Windows cases run elevated in one step only, filtered to `machine_tree::tests` and three
-  others (`.github/workflows/ci.yml:2244-2246`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2200`). P1 adds
+  others (`.github/workflows/ci.yml:2248-2250`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2204`). P1 adds
   `machine_tree::held::tests` and `crash_recorder::tests` to that filter, or the new cases never run on Windows.
-  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:2121-2125`).
+  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:2125-2129`).
 
 | # | Test | Where | What it holds | Elevated | RED at the seam |
 |---|---|---|---|---|---|
