@@ -2656,11 +2656,11 @@ async fn connect_once(
                     .and_then(|w| w.relayed.clone());
                 // FR-43 P2c — announce capabilities only when they have
                 // CHANGED since the hello or the last beat that carried them:
-                // a worker that attaches after the hello (or leaves, or never
-                // comes, when nobody is logged in), an owner's live switch, a
-                // new answer. #3992 — what `Announcer::now` reads is compared
-                // whole, and only a changed beat builds caps, with the
-                // builder the hello used.
+                // a worker that attaches after the hello, or leaves (the GUI
+                // worker comes when someone logs in, often after the hello),
+                // an owner's live switch, a new answer. #3992 — what
+                // `Announcer::now` reads is compared whole, and only a changed
+                // beat builds caps, with the builder the hello used.
                 //
                 // ⚠️ Sending them every beat would be ~200 bytes of nothing on
                 // a frequent message. `None` means "no news", not "no caps".
