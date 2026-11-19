@@ -326,8 +326,10 @@ pub(crate) enum FsAs {
     /// received file whose lookup ran out of its time ([`Seat::OutOfTime`]);
     /// one whose lookup failed outright takes [`Self::DaemonAlone`], as with
     /// nobody. #3796 — and so is every blocking asker's ([`Self::now`]) on a
-    /// timeout: the status refresh then shows the folder pending.
-    #[cfg(target_os = "linux")]
+    /// timeout: the status refresh then shows the folder pending. #3682 —
+    /// (machine-wide Windows) the person a read or a write starting now acts
+    /// as was not looked up in time (`reads::session_or_daemon_within`).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     CannotTell,
 }
 
@@ -358,8 +360,8 @@ const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's scree
 /// #3711 — and why a received file is refused when the lookup did not
 /// answer in time. #3796 — the LocalAPI's own words, which a `ConfigSet`
 /// over the person socket gets then too: one text.
-#[cfg(target_os = "linux")]
-const CANNOT_TELL: &str = tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const CANNOT_TELL: &str = reads::CANNOT_TELL;
 
 /// #3048 — said when a step would be taken for someone other than the person
 /// a transfer, or a listing (#3669), began for: they signed out, or another
@@ -396,8 +398,8 @@ pub(crate) const NOBODY_SIGNED_IN_TO_BROWSE: &str =
 pub(crate) const NOBODY_SIGNED_IN_TO_BROWSE: &str =
     "Nobody is signed in at this computer's screen to browse its files";
 
-/// #3669 — whether `e` is, anywhere in its chain, an access refusal.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+/// #3669 — whether `e` is, anywhere in its chain, an access refusal. #3682 —
+/// on every OS: every reader's refusal is explained.
 fn is_permission_denied(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
@@ -485,7 +487,7 @@ impl FsAs {
             Self::at_seat0(true).await
         }
         #[cfg(not(target_os = "linux"))]
-        Self::session_or_daemon()
+        reads::session_or_daemon_within().await
     }
 
     /// #3711 — who a transfer starting now writes as, asked from an async
@@ -495,14 +497,15 @@ impl FsAs {
     /// that time refuses the write as a read is refused
     /// ([`Self::CannotTell`]); one that failed outright leaves the file the
     /// daemon's alone, as with nobody at seat0 ([`linux_fs_as`]). Windows
-    /// and macOS answer as [`Self::now`] does.
+    /// and macOS answer as [`Self::now`] does. #3682 — off the async worker,
+    /// as a read's ([`Self::for_read`]).
     pub(crate) async fn for_write() -> Self {
         #[cfg(target_os = "linux")]
         {
             Self::at_seat0(false).await
         }
         #[cfg(not(target_os = "linux"))]
-        Self::session_or_daemon()
+        reads::session_or_daemon_within().await
     }
 
     /// #3688, #3711 — who a read, or a write, starting now acts as on Linux,
@@ -564,7 +567,7 @@ impl FsAs {
         if matches!(self, Self::DaemonAlone) {
             return Err(anyhow!(why));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if matches!(self, Self::CannotTell) {
             return Err(anyhow!(CANNOT_TELL));
         }
@@ -577,13 +580,19 @@ impl FsAs {
     /// for: the viewer shows only an error's outermost line, which would
     /// otherwise be a bare "reading …". It says Windows refused, not that
     /// the person may not: their rights are one cause, and an EDR or DLP
-    /// filter answers with the same code. The daemon's errors stay as they
-    /// were. #3688 — Linux says the same of the person at seat0: their
-    /// rights are one cause, and an LSM (AppArmor, SELinux) answers with the
-    /// same code.
+    /// filter answers with the same code. #3688 — Linux says the same of the
+    /// person at seat0: their rights are one cause, and an LSM (AppArmor,
+    /// SELinux) answers with the same code. #3682 — every other reader is
+    /// this agent's own account (a per-user install, a Mac, an attended
+    /// install, a service told to read as itself), on every OS, and is told
+    /// so in words true for it: that account need not be the person at the
+    /// screen.
     fn explain_refusal<T>(&self, asked: &str, read: Result<T>) -> Result<T> {
+        if !read.as_ref().is_err_and(is_permission_denied) {
+            return read;
+        }
         #[cfg(target_os = "windows")]
-        if matches!(self, Self::Person { .. }) && read.as_ref().is_err_and(is_permission_denied) {
+        if matches!(self, Self::Person { .. }) {
             return read.with_context(|| {
                 format!(
                     "{asked}: Windows refused to open it for the person signed in to this computer"
@@ -591,7 +600,7 @@ impl FsAs {
             });
         }
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::Person { .. }) && read.as_ref().is_err_and(is_permission_denied) {
+        if matches!(self, Self::Person { .. }) {
             return read.with_context(|| {
                 format!(
                     "{asked}: Linux refused to open it for the person signed in at this \
@@ -599,8 +608,14 @@ impl FsAs {
                 )
             });
         }
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        let _ = asked;
+        if self.is_the_daemon() {
+            return read.with_context(|| {
+                format!(
+                    "{asked}: {} refused to open it for the account this agent runs as",
+                    reads::THIS_OS
+                )
+            });
+        }
         read
     }
 
@@ -615,7 +630,7 @@ impl FsAs {
         if matches!(self, Self::Nobody) {
             return Some(NOBODY_AT_THE_SCREEN);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if matches!(self, Self::CannotTell) {
             return Some(CANNOT_TELL);
         }
@@ -743,7 +758,7 @@ impl FsAs {
             Self::DaemonAlone => f(),
             #[cfg(target_os = "linux")]
             Self::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             Self::CannotTell => Err(anyhow!(CANNOT_TELL)),
             #[cfg(target_os = "linux")]
             Self::Person { account, caps, .. } => {
@@ -799,7 +814,7 @@ impl FsAs {
                 privileged: true,
                 active_home: None,
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             Self::CannotTell => files_dir::Writer {
                 privileged: true,
                 active_home: None,
@@ -1251,7 +1266,7 @@ pub fn refresh_effective_files_dir() -> Option<String> {
 /// folder pending (#3795's shape), and the next status read asks again.
 fn refresh_effective_files_dir_as(who: &FsAs) -> Option<String> {
     let (raw, generation) = configured_files_dir_and_gen();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if matches!(who, FsAs::CannotTell) {
         publish_effective(generation, None, false);
         return None;
@@ -1428,7 +1443,7 @@ impl FilesDirSet {
         };
         let who = self.who;
         let _ = on_a_blocking_thread(move || {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             if matches!(who, FsAs::CannotTell) {
                 publish_effective(generation, None, false);
                 return;
@@ -2335,6 +2350,8 @@ pub struct FilesHandler {
     /// runs on any machine. `None` = [`partial_dir_for`]'s rule.
     #[cfg(test)]
     staging_root: Option<PathBuf>,
+    /// #3682 — this channel's folder listings: one step at a time.
+    lane: reads::Lane,
 }
 
 impl Default for FilesHandler {
@@ -2352,6 +2369,7 @@ impl FilesHandler {
             refused: Arc::default(),
             #[cfg(test)]
             staging_root: None,
+            lane: reads::Lane::default(),
         }
     }
 
@@ -3029,10 +3047,12 @@ impl FilesHandler {
     /// buffer never drains: only its cancel flag (or the channel's state)
     /// ends the pump, which otherwise ran on holding the file, the channel
     /// and the transfer guard the updater defers for (found in review).
+    /// #3682 — and a listing still running drops its answer.
     pub async fn end_session(&self) {
         // First, so a begin that takes its lock after this refuses, and one
         // that took it before is caught below.
         self.ended.store(true, Ordering::Release);
+        self.lane.close();
         self.abort().await;
         if let Some(state) = self.outgoing.lock().await.as_ref() {
             state.cancel.cancel();
@@ -3672,7 +3692,8 @@ pub struct OutgoingOffer {
 /// held to the file asked for before it leaves the step
 /// ([`held_to_the_person`]).
 fn open_to_send(asked: &str, checks: bool) -> Result<(PathBuf, u64, std::fs::File)> {
-    let resolved = validate_outgoing_path(asked).context("validating outgoing path")?;
+    // #3682 — a failure's outermost line is its own: the path and why.
+    let resolved = validate_outgoing_path(asked)?;
     if is_agent_secret(&resolved) {
         return Err(anyhow!(
             "{} holds the agent's own credentials — file transfer never sends it",
@@ -3746,10 +3767,9 @@ fn validate_outgoing_path(input: &str) -> Result<PathBuf> {
 
     let path = PathBuf::from(input);
     // Canonicalise to dereference symlinks + resolve `..` segments.
-    // If canonicalize fails (path doesn't exist, permission denied),
-    // surface a friendly error.
-    let canonical =
-        reads::resolve_path(&path).with_context(|| format!("canonicalising {}", path.display()))?;
+    // If canonicalize fails (path doesn't exist, permission denied), the
+    // error names the path and the OS's reason (#3682).
+    let canonical = reads::resolve(&path)?;
 
     // Re-check the denylist on the canonical form so a symlink trick
     // can't bypass us.
@@ -4037,54 +4057,51 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
 
 /// [`list_dir`], read as `who` (#3669). With nobody signed in it is refused
 /// outright, the roots view included, so the drawer says so as it opens.
+/// #3682 — on a lane of its own; a channel's listings share the channel's
+/// ([`FilesHandler::list_dir`]).
 pub(crate) async fn list_dir_as(who: &FsAs, path: &str) -> Result<DirListing> {
+    list_dir_in(&reads::Lane::default(), who, path).await
+}
+
+/// [`list_dir_as`] on `lane`: one step at a time, each bounded whole.
+async fn list_dir_in(lane: &reads::Lane, who: &FsAs, path: &str) -> Result<DirListing> {
     who.refuse_read(NOBODY_SIGNED_IN_TO_BROWSE)?;
     if path.is_empty() || path == "~" {
-        return Ok(DirListing {
-            path: roots_label(),
-            parent: None,
-            entries: enumerate_roots(),
-        });
+        return reads::roots(lane, who).await;
     }
     if path == STAGING_SENTINEL {
-        return list_staging(who).await;
+        return list_staging(lane, who).await;
     }
-    list_canonical(who, &PathBuf::from(path)).await
+    list_canonical(lane, who, &PathBuf::from(path)).await
 }
 
 /// Canonicalise, enumerate and shape one directory, as `who`. Shared by the
 /// plain path arm and the staging sentinel so the two can never drift in
 /// timeout, entry cap or error wording.
-async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> {
-    let listed = async {
-        // #3669 — resolving and opening the folder is one step as `who`,
-        // under the timeout that always bounded the open. Resolving moved
-        // off the async worker with it, so a share that hangs cannot stall
-        // one. The entries are read after, untimed as before, through the
-        // handle that step opened.
-        let (asked, checks) = (pb.to_path_buf(), who.checks_handles());
-        let (canon, read) = tokio::time::timeout(
-            std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
-            who.run(move || {
-                let canon = reads::resolve_path(&asked)
-                    .with_context(|| format!("canonicalising {}", asked.display()))?;
-                let read = folder_listing(&canon, checks)?;
-                Ok((canon, read))
-            }),
-        )
-        .await
-        .map_err(|_| anyhow!("listing timed out"))??;
-        let held_at = canon.clone();
-        let entries = who
-            .run(move || Ok(reads::read_entries(&held_at, read)))
-            .await?;
-        Ok::<_, anyhow::Error>(DirListing {
-            parent: canon.parent().map(|p| p.to_string_lossy().to_string()),
-            path: canon.to_string_lossy().to_string(),
-            entries,
+///
+/// #3669 — resolving and opening the folder is one step as `who`, so a share
+/// that hangs cannot stall an async worker. #3682 — reading its entries is
+/// in the same step, and one bound covers it all ([`reads::LISTING_BOUND`]),
+/// the wait for the channel's lane included: a share that answered the open
+/// and then stopped held the listing for as long as it liked.
+async fn list_canonical(
+    lane: &reads::Lane,
+    who: &FsAs,
+    pb: &std::path::Path,
+) -> Result<DirListing> {
+    let (asked, checks) = (pb.to_path_buf(), who.checks_handles());
+    let listed = lane
+        .step(who, &pb.to_string_lossy(), move || {
+            let canon = reads::resolve(&asked)?;
+            let read = folder_listing(&canon, checks)?;
+            let entries = reads::read_entries(&canon, read);
+            Ok(DirListing {
+                parent: canon.parent().map(|p| p.to_string_lossy().to_string()),
+                path: canon.to_string_lossy().to_string(),
+                entries,
+            })
         })
-    }
-    .await;
+        .await;
     who.explain_refusal(&pb.to_string_lossy(), listed)
 }
 
@@ -4107,9 +4124,10 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
 /// #3669 — the folder is found as the service, and listed as `who`: on a
 /// machine-wide install the service's folder is SYSTEM's and the
 /// Administrators', so a person without an elevated administrator's rights
-/// is refused, and told so.
+/// is refused, and told so. #3682 — told why, and how an administrator reads
+/// it ([`reads::explain_staging`]).
 #[cfg(target_os = "windows")]
-async fn list_staging(who: &FsAs) -> Result<DirListing> {
+async fn list_staging(lane: &reads::Lane, who: &FsAs) -> Result<DirListing> {
     let staging = reads::staging_root();
     let target = if staging.is_dir() {
         staging
@@ -4117,7 +4135,7 @@ async fn list_staging(who: &FsAs) -> Result<DirListing> {
         let root = crate::appdirs::machine_global_dir();
         nearest_existing_dir(&root).unwrap_or(root)
     };
-    list_canonical(who, &target).await
+    reads::explain_staging(who, &target, list_canonical(lane, who, &target).await)
 }
 
 /// The deepest directory that exists on `path`'s way up: `path` itself when
@@ -4135,7 +4153,7 @@ fn nearest_existing_dir(path: &std::path::Path) -> Option<PathBuf> {
 /// so there is no single staging root to open. Say so rather than inventing a
 /// path that would then be wrong in a new way.
 #[cfg(not(target_os = "windows"))]
-async fn list_staging(_who: &FsAs) -> Result<DirListing> {
+async fn list_staging(_lane: &reads::Lane, _who: &FsAs) -> Result<DirListing> {
     Err(anyhow!(
         "this host has no single staging root — non-Windows agents stage \
          alongside each destination"
@@ -4276,7 +4294,8 @@ impl FilesHandler {
         let (asked, checks) = (path.to_string(), who.checks_handles());
         let checked = who
             .run(move || {
-                let resolved = validate_outgoing_path(&asked).context("validating folder path")?;
+                // #3682 — a failure's outermost line is its own: the path and why.
+                let resolved = validate_outgoing_path(&asked)?;
                 let meta = std::fs::metadata(&resolved)
                     .with_context(|| format!("stat {}", resolved.display()))?;
                 if !meta.is_dir() {
@@ -4365,10 +4384,7 @@ where
     let checks = who.checks_handles();
     let root_canon = {
         let root = root.to_path_buf();
-        who.run(move || {
-            reads::resolve_path(&root).with_context(|| format!("canonicalising {}", root.display()))
-        })
-        .await?
+        who.run(move || reads::resolve(&root)).await?
     };
 
     let mut zip = ZipFileWriter::with_tokio(writer);
@@ -4913,7 +4929,7 @@ fn drop_folder_as(who: &FsAs) -> Result<(PathBuf, bool)> {
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
         FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         FsAs::CannotTell => Err(anyhow!(CANNOT_TELL)),
     }
 }
@@ -4935,7 +4951,7 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
         FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         FsAs::CannotTell => Err(anyhow!(CANNOT_TELL)),
     }
 }
@@ -7303,6 +7319,20 @@ mod tests {
         let Err(refused) = begun else {
             panic!("a folder that cannot be listed was offered");
         };
+        // #3682 — on Unix the refusal is explained for this agent's own
+        // account, naming the folder; a Windows sharing violation is not a
+        // refusal of access, so it keeps the step's own words.
+        #[cfg(unix)]
+        assert_eq!(
+            format!("{refused}"),
+            format!(
+                "{}: {} refused to open it for the account this agent runs as",
+                shut.display(),
+                reads::THIS_OS
+            ),
+            "the reason names the folder and why: {refused:#}"
+        );
+        #[cfg(windows)]
         assert!(
             format!("{refused}").starts_with("reading "),
             "the reason names the folder: {refused:#}"
@@ -7342,6 +7372,19 @@ mod tests {
         let Err(refused) = begun else {
             panic!("a file that will not open was offered");
         };
+        // #3682 — as for a folder: on Unix explained for this agent's own
+        // account; a Windows sharing violation keeps the step's own words.
+        #[cfg(unix)]
+        assert_eq!(
+            format!("{refused}"),
+            format!(
+                "{}: {} refused to open it for the account this agent runs as",
+                shut.display(),
+                reads::THIS_OS
+            ),
+            "the reason names the file and why: {refused:#}"
+        );
+        #[cfg(windows)]
         assert!(
             format!("{refused}").starts_with("opening "),
             "the reason names the file: {refused:#}"

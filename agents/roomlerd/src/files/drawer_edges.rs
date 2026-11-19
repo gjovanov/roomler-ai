@@ -208,6 +208,11 @@ pub(crate) mod seams {
         pub(crate) switch_on: bool,
         pub(crate) lookup:
             std::sync::Arc<dyn Fn() -> Option<crate::win_identity::SessionPerson> + Send + Sync>,
+        /// The stand-in's own lookup in flight, as `reads::PERSON` is the
+        /// process's: a test's lookups never join another test's.
+        pub(crate) flight: std::sync::Arc<
+            crate::one_in_flight::OneInFlight<Option<crate::win_identity::SessionPerson>>,
+        >,
     }
 
     #[cfg(windows)]
@@ -226,6 +231,9 @@ pub(crate) mod seams {
             own_token,
             switch_on,
             lookup: std::sync::Arc::new(lookup),
+            flight: std::sync::Arc::new(crate::one_in_flight::OneInFlight::new(
+                "person-lookup-test",
+            )),
         });
         PersonStoodIn(std::thread::current().id())
     }

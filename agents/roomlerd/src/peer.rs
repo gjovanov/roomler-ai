@@ -13092,7 +13092,8 @@ pub fn attach_files_handler(
     dc.on_close(Box::new(move || {
         let h = handler_for_close.clone();
         Box::pin(async move {
-            h.abort().await;
+            // #3682 — and a listing still running drops its answer.
+            h.channel_closed().await;
         })
     }));
     let handler_for_end = handler.clone();
@@ -13332,39 +13333,9 @@ async fn handle_files_control(
                 .await;
                 return;
             }
-            match crate::files::list_dir(&path).await {
-                Ok(listing) => {
-                    info!(
-                        %session_id, ?req_id,
-                        path = ?listing.path,
-                        entries = listing.entries.len(),
-                        "files: dir listed"
-                    );
-                    let parent_owned = listing.parent.clone();
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirList {
-                            req_id: &req_id,
-                            path: &listing.path,
-                            parent: parent_owned.as_deref(),
-                            entries: &listing.entries,
-                        },
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
-                    let msg = format!("{e}");
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirError {
-                            req_id: &req_id,
-                            message: &msg,
-                        },
-                    )
-                    .await;
-                }
-            }
+            // #3682 (D1-B) — never awaited here: this loop reads the
+            // channel's next message only once this one is handled.
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13407,6 +13378,67 @@ async fn handle_files_control(
             }
         }
     }
+}
+
+/// #3682 (D1-B) — a folder listing, in a task of its own. The files channel's
+/// read loop hands `files:dir` here and goes on reading, so a cancel or a
+/// chunk sent behind a listing that waits on a share is read at once. The
+/// listing is bounded as a whole and takes the channel's lane, one step at a
+/// time ([`crate::files::FilesHandler::list_dir`]). Its answer carries the
+/// request's `req_id`, which the viewer matches, so a later listing's answer
+/// may come first. Once the channel closes or the session ends the task
+/// stops and drops its answer, and it never sends on a channel that has
+/// closed.
+fn spawn_dir_listing(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
+    let closed = handler.listings_closed();
+    tokio::spawn(async move {
+        let listed = tokio::select! {
+            () = closed.cancelled() => return,
+            listed = handler.list_dir(&path) => listed,
+        };
+        if closed.is_cancelled() || channel_gone(dc.ready_state()) {
+            return;
+        }
+        match listed {
+            Ok(listing) => {
+                info!(
+                    %session_id, ?req_id,
+                    path = ?listing.path,
+                    entries = listing.entries.len(),
+                    "files: dir listed"
+                );
+                let parent_owned = listing.parent.clone();
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::DirList {
+                        req_id: &req_id,
+                        path: &listing.path,
+                        parent: parent_owned.as_deref(),
+                        entries: &listing.entries,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::DirError {
+                        req_id: &req_id,
+                        message: &msg,
+                    },
+                )
+                .await;
+            }
+        }
+    });
 }
 
 /// Spawn a tokio task that pumps an outgoing single-file download.
