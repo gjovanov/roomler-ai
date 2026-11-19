@@ -2452,13 +2452,13 @@ Approve granted the session.
 
 | | Until #3987 | Since |
 |---|---|---|
-| Where the prompt opens | on macOS and Windows, the top centre, 48 down: where the daemon's own panel is. On a Mac that panel is at the screen-saver level and covers the prompt. On Windows the prompt, shown later and focused, covers the overlay. Linux has opened it in the middle since #2286 (§12.2) | the middle of the main screen on every OS. Where the middle comes within 16 of the daemon's panel, 16 below the panel instead (`consent_origin`, `panels.rs:701`) |
+| Where the prompt opens | on macOS and Windows, the top centre, 48 down: where the daemon's own panel is. On a Mac that panel is at the screen-saver level and covers the prompt. On Windows the prompt, shown later and focused, covers the overlay. Linux has opened it in the middle since #2286 (§12.2) | the middle of its screen on every OS: the primary monitor, and on a Mac since #3999 the screen the pointer is on (§10.9.3). Where the middle comes within 16 of the daemon's panel, 16 below the panel instead (`consent_origin`, `panels.rs:701`) |
 | When it is placed | when its window is built | each time it comes up from hidden. A prompt that is already up stays where it is (`placed_on_show`, `panels.rs:717`) |
 | A click while it is not the key window | AppKit spent the click on making the window key, so the page never saw it and nothing logged it. The prompt is key when shown, and stops being key at the person's next click anywhere else, such as on the daemon's panel | acted on: both panels take their first click (`takes_first_click`, `panels.rs:428`) |
 | A click as it appears | held back by the rule above, which also held back a deliberate click 55 s later | held back for 1 s after its question came to the front, logged with the reason, and the page says why (`CONSENT_ARMING`, `panels.rs:727`) |
 
-**The place.** Every daemon panel fits in one box: the top centre of the main screen, 48 down,
-at most 480 × 240 logical.
+**The place.** Every daemon panel fits in one box: the top centre of its screen, 48 down, at
+most 480 × 240 logical. On a Mac, since #3999, that screen is the one the pointer is on (§10.9.3).
 
 | Daemon panel | Size | Where |
 |---|---|---|
@@ -2466,7 +2466,7 @@ at most 480 × 240 logical.
 | X11 | 480 × 236 at the desktop's scale | `agents/roomlerd/src/indicator/x11.rs:67`, `:299` |
 | Windows | 460 × 232 physical px, no larger in logical units | `agents/roomlerd/src/indicator/win.rs:135`, `:611` |
 
-The prompt opens in the middle of the main screen. Where the middle comes within 16 of that
+The prompt opens in the middle of its screen. Where the middle comes within 16 of that
 box, the prompt opens 16 below it instead, at y 304. On a screen too short for that, the
 prompt's bottom edge sits on the screen's bottom edge, so its buttons stay in view. On any
 screen from 564 to 867 tall the prompt therefore opens at y 304, and 1024 × 768, as wide as the
@@ -2479,7 +2479,7 @@ anyone's screen.
 flowchart TD
     S[the app shows the prompt] --> V{already up?}
     V -- yes --> K[it stays where it is]
-    V -- no, or not known --> M[the middle of the main screen]
+    V -- no, or not known --> M[the middle of its screen,<br/>on a Mac the pointer's]
     M --> N{within 16 of the daemon's panel?<br/>the top centre, 48 down, 480 × 240}
     N -- no --> P[it opens there]
     N -- yes --> B[16 below the panel, at y 304]
@@ -2656,6 +2656,72 @@ flowchart TD
     before reads "it is not running".
   - A LocalAPI held busy for 3 s with both up: nothing on the screen moves. Held for 15 s: the
     prompt goes after 10 s, and the banner and the red stay until the service answers.
+
+#### 10.9.3 On a Mac with several screens, the screen the pointer is on (#3999)
+
+Until #3999 the two consent surfaces on a Mac chose their screens apart. With the focused window
+on a screen without the menu bar, two questions opened on two screens, and #3987's rule (§10.9.1)
+could not keep the prompt clear of a panel on another screen.
+
+| Surface | Until #3999 | Since |
+|---|---|---|
+| the daemon's panel (`Panel::new`, `agents/roomlerd/src/indicator/mac.rs:500`) | the top centre of `NSScreen::mainScreen`, the screen of the window with the keyboard focus | the top centre of the chosen screen, 48 down as before (`question_screen`, `mac.rs:876`). With no screen at all, the same 1440 × 900 stand-in as before |
+| the app's prompt (`place_consent`, `agents/roomler-desktop/src/panels.rs:773`) | #3987's place on the primary monitor, the menu bar's (Tauri's `primary_monitor`) | #3987's place on the chosen screen (`appkit_origin`, `panels.rs:837`), set through AppKit on the main thread (`place_on_pointer_screen`, `panels.rs:797`). Where no screen can be read, the primary monitor as before (`position_consent`, `panels.rs:401`) |
+
+**The rule.** A surface opens on the screen that holds the pointer when it is shown. If no screen
+holds the pointer, it opens on the primary screen, the menu bar's (`NSScreen::screens()[0]`). One
+function decides, and both processes call it: `consent_screen::choose`
+(`crates/agent-core/src/consent_screen.rs:57`). It takes plain numbers. Each process reads
+`NSEvent::mouseLocation` and `NSScreen::screens` on its main thread and passes the pointer and
+the screens' frames in AppKit's global coordinates: points, the origin at the primary screen's
+bottom-left corner, y up. The app does not use Tauri's `cursor_position` or monitors here: across
+screens of different scale, their pixels are not AppKit's points.
+
+Which edges of a screen are on it (`Frame::holds`, `consent_screen.rs:47`):
+
+| Edge | On the screen | Why |
+|---|---|---|
+| left, `x` | yes | each axis is half-open, so a pointer on an edge two screens share is on exactly one of them |
+| right, `x + w` | no: it is the left edge of the screen beside it | |
+| top, `y + h` | yes | AppKit counts y up: the pointer on a screen's top row reads `y + h`. `NSMouseInRect` (not flipped) counts the same edges |
+| bottom, `y` | no: it is the top row of the screen below | |
+
+```mermaid
+flowchart TD
+    Q[a question is shown] --> R[read the pointer and the screens, on the main thread]
+    R --> E{any screen?}
+    E -- no --> F[the daemon: the 1440 × 900 stand-in<br/>the app: the primary monitor, as before]
+    E -- yes --> H{does a screen hold the pointer?}
+    H -- yes --> S[that screen]
+    H -- no --> P[the primary screen, the menu bar's]
+    S --> D[the daemon's panel: the top centre, 48 down<br/>the app's prompt: the middle, clear of the panel]
+    P --> D
+```
+
+**Accepted.** Each surface reads the pointer when it is shown. Two questions shown minutes apart,
+with the pointer moved to another screen in between, open on two screens, each where the person
+was at that moment.
+
+- **Unchanged:** Windows and Linux keep their placement: the primary monitor (§10.9.1).
+- **Unchanged:** the viewing banner (`position_top_centre`, `panels.rs:473`) and its top-edge
+  gesture (`Sample::read`, `panels.rs:220`) stay on the primary monitor (§12).
+- **Tested:** the rule in `roomler-node-core`'s `consent_screen::tests`, in rust-unit's "Run the
+  remaining crates' unit tests", which runs the crate's whole `--lib`. Its seven tests: a secondary
+  beside the primary, on either side; an edge two screens share; a pointer on no screen, or not a
+  number; one screen; no screen; a secondary above and below; a screen's top row. The app's half
+  runs in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop companion
+  on Windows — clippy + unit tests (#3940)":
+  `on_a_secondary_with_its_own_origin_the_prompt_opens_on_it_clear_of_the_daemons_panel` (the
+  conversion to AppKit's origin) and `the_daemons_panel_and_the_prompt_choose_their_screen_by_one_rule`
+  (both call sites read AppKit and ask the rule). Both call sites compile in "macOS overlay compile
+  check": the panel in "cargo check agent (viewer-indicator-macos — the AppKit panel + the
+  main-thread swap)", the app in "cargo check the desktop companion" and, as a test build, in
+  "cargo test the companion's enrollment status on a real Mac (#4020)". None of these tests runs
+  on the Mac.
+- **Field cells,** on a Mac with two screens: the pointer on the secondary and the focused window
+  on the primary, a viewer asks once with the app running and once with the app quit (the
+  daemon's panel). Both open on the secondary. With the pointer moved to the primary, the next
+  question opens there. With one screen, nothing changes.
 
 ## 11. Testing it
 
