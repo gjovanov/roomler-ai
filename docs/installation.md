@@ -2362,7 +2362,7 @@ flowchart TB
 |---|---|---|
 | Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
-| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
 | The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
@@ -2410,12 +2410,14 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7009`](../agents/roomlerd/src/signaling.rs#L7009)), built
-into the caps by one function ([`:7048`](../agents/roomlerd/src/signaling.rs#L7048)).
+`rc_*` floor ([`signaling.rs:7039`](../agents/roomlerd/src/signaling.rs#L7039)), built
+into the caps by one function ([`:7087`](../agents/roomlerd/src/signaling.rs#L7087)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
-the hello, or changes later, reaches the row on the next heartbeat.
+the hello, or changes later, wakes the heartbeat of each org's connection at once
+([`delegate.rs:1345`](../agents/roomlerd/src/delegate.rs#L1345)): its caps, the person's
+floor and its leaving reach the row then, not up to 30 s later at the next one.
 
 The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
 ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
