@@ -2226,6 +2226,77 @@ mod tests {
         assert_eq!(bootstrap_after_revert(&root(), None), None);
     }
 
+    /// The people `--revert` gives their old copies back to
+    /// (`put-back-legacy`).
+    fn legacy_uids(r: &Revert) -> Vec<u32> {
+        let mut uids: Vec<u32> = r.plists.iter().map(|(uid, _, _)| *uid).collect();
+        uids.sort_unstable();
+        uids.dedup();
+        uids
+    }
+
+    /// `--revert` as the command drives it, without the yes: the plan, the
+    /// bit [`bootstrap_after_revert`] reads, the revert.
+    async fn revert_now(mac: &mut Fake) -> Result<()> {
+        let read = mac.read.clone();
+        let Some(r) = revert_plan(&*mac, &read.root_path, &read.people) else {
+            bail!("nothing to revert");
+        };
+        let kept_root = crate::config::load(&r.configs[0].0)?;
+        let bootstrap_for = bootstrap_after_revert(&kept_root, Some(read.console_uid));
+        revert(mac, &r, bootstrap_for).await
+    }
+
+    impl Fake {
+        /// The person's files as every release before root's side left a
+        /// conversion: the config's copy and the plist's in `<F>`, a blank
+        /// config in its place, no plist, the agent booted out. Root's own
+        /// kept copy is gone: an older revert put it back and stopped.
+        fn converted_by_an_older_release(&mut self) {
+            let p = self.read.people[0].clone();
+            let live = p.config_path();
+            std::fs::rename(&live, kept_path(&live)).unwrap();
+            crate::config::save(&live, &without_enrollments(&goran())).unwrap();
+            std::fs::rename(p.plist(), p.plist_aside()).unwrap();
+            self.loaded.clear();
+        }
+
+        fn root_bytes(&self) -> Vec<u8> {
+            std::fs::read(&self.read.root_path).unwrap()
+        }
+    }
+
+    /// AC1: a Mac converted by a release before root's side, whose revert has
+    /// only the old copies a person's child reports to go on.
+    #[test]
+    fn revert_plan_counts_legacy_names_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        mac.converted_by_an_older_release();
+        let r = revert_plan(&mac, &mac.read.root_path, &mac.read.people)
+            .expect("the old copies alone are a revert");
+        assert_eq!(legacy_uids(&r), vec![501]);
+    }
+
+    /// AC1: an older revert put root's file back and stopped. The switch
+    /// `bootstrap_after_revert` reads comes from root's live file, which holds
+    /// the kept bytes, and root's file is not written again.
+    #[tokio::test]
+    async fn resumed_revert_reads_the_bit_without_a_kept_copy() {
+        let mut mac = Fake::new(one_row_daemon);
+        mac.converted_by_an_older_release();
+        assert!(!mac.read.root.macos_supervise_gui_worker);
+        let root_before = mac.root_bytes();
+        revert_now(&mut mac)
+            .await
+            .expect("the old copies alone are a revert");
+        assert!(
+            mac.calls.contains(&"bootstrap 501".to_string()),
+            "the console person's agent is bootstrapped: {:?}",
+            mac.calls
+        );
+        assert_eq!(mac.root_bytes(), root_before, "root's file is not written");
+    }
+
     /// The detached copy goes ahead only on the plan a person said yes to.
     #[test]
     fn the_digest_is_what_the_plan_does() {
