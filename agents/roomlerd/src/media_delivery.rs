@@ -818,6 +818,8 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             bound_watermark = b.bounds.0,
             bound_ledger = b.bounds.1,
             bound_full = b.bounds.2,
+            budget_released = ?b.released,
+            budget_still_admitted = b.still_admitted,
             "{LINE}"
         ),
         (None, Some(b)) => tracing::info!(
@@ -839,6 +841,8 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             bound_watermark = b.bounds.0,
             bound_ledger = b.bounds.1,
             bound_full = b.bounds.2,
+            budget_released = ?b.released,
+            budget_still_admitted = b.still_admitted,
             "{LINE}"
         ),
     }
@@ -1366,6 +1370,8 @@ mod tests {
             ack_over_ms: Some((3, 45, 1_257)),
             still: (1, 812),
             bounds: (0, 37, 4),
+            released: (2, 1),
+            still_admitted: 23,
         }
     }
 
@@ -1386,6 +1392,8 @@ mod tests {
             "bound_watermark=0",
             "bound_ledger=37",
             "bound_full=4",
+            "budget_released=(2, 1)",
+            "budget_still_admitted=23",
         ];
         let line = LineReport {
             budget: Some(budget_window()),
@@ -2306,6 +2314,35 @@ pub(crate) mod shaped_link {
         peak_wait_ns: AtomicU64,
         /// Packets dropped at the tail.
         tail_drops: AtomicU64,
+        /// FR-148 D46 — outages: no packet starts its serialisation in one.
+        outages: Option<Outages>,
+    }
+
+    /// FR-148 D46 — a link's outages: from `t0 + every` on, one every `every`,
+    /// `len` long, in which the link neither serializes nor delivers. Time
+    /// stands still for it: a packet that would start then starts at the
+    /// outage's end, and one due then is due `len` later, so what queued in
+    /// one drains at the link's rate after it.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Outages {
+        pub(crate) t0: Instant,
+        pub(crate) every: Duration,
+        pub(crate) len: Duration,
+    }
+
+    impl Outages {
+        /// The start of the outage `t` falls in, if it falls in one.
+        fn during(&self, t: Instant) -> Option<Instant> {
+            let k = t.saturating_duration_since(self.t0).as_nanos() / self.every.as_nanos();
+            let k = u32::try_from(k).ok().filter(|&k| k >= 1)?;
+            let start = self.t0 + self.every * k;
+            (t < start + self.len).then_some(start)
+        }
+
+        /// `t`, or the end of the outage it falls in.
+        fn after(&self, t: Instant) -> Instant {
+            self.during(t).map_or(t, |start| start + self.len)
+        }
     }
 
     impl Shaper {
@@ -2320,6 +2357,7 @@ pub(crate) mod shaped_link {
             let now = Instant::now();
             let mut next_free = self.next_free.lock().unwrap();
             let start = (*next_free).max(now);
+            let start = self.outages.map_or(start, |o| o.after(start));
             let wait = start.saturating_duration_since(now);
             if wait > self.queue {
                 self.tail_drops.fetch_add(1, Ordering::Relaxed);
@@ -2477,6 +2515,41 @@ pub(crate) mod shaped_link {
             full_packets: AtomicU64::new(0),
             peak_wait_ns: AtomicU64::new(0),
             tail_drops: AtomicU64::new(0),
+            outages: None,
+        };
+        (shaper, inbox_rx)
+    }
+
+    /// FR-148 D46 — one direction of a link with `outages`, lossless: a
+    /// packet due in an outage is due its length later.
+    fn out_direction(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        outages: Outages,
+    ) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some((due, p)) = due_rx.recv().await {
+                let due = outages.during(due).map_or(due, |_| due + outages.len);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                if inbox_tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+        let shaper = Shaper {
+            bps,
+            one_way,
+            queue,
+            next_free: StdMutex::new(Instant::now()),
+            due: due_tx,
+            drop_every: 0,
+            full_packets: AtomicU64::new(0),
+            peak_wait_ns: AtomicU64::new(0),
+            tail_drops: AtomicU64::new(0),
+            outages: Some(outages),
         };
         (shaper, inbox_rx)
     }
@@ -3111,7 +3184,9 @@ pub(crate) mod shaped_link {
         use crate::encode::goodput::{GoodputEstimator, GoodputSink};
         use crate::encode::pipe::{Basis, Pipe};
         use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
-        use crate::media_inflight::{Budget, Reading, Verdict, WindowReport};
+        use crate::media_inflight::{
+            BURST_WITHIN, Budget, Classifier, Reading, Release, Verdict, WindowReport,
+        };
 
         /// The lab slice's round trip.
         const RTT: Duration = Duration::from_millis(60);
@@ -3166,6 +3241,11 @@ pub(crate) mod shaped_link {
             Shadow,
             /// The budget's verdict holds the frame, at this slack.
             Holds(Duration),
+            /// FR-148 D46 — as `Holds`, B1's: no still span writes through.
+            HoldsAsB1(Duration),
+            /// FR-148 D46 — as `Holds`, but a still span writes through only
+            /// after two head-of-line releases in a row.
+            HoldsAfterTwo(Duration),
         }
 
         /// One cell at a time: the cells are timed.
@@ -3185,6 +3265,9 @@ pub(crate) mod shaped_link {
             budget: Budgeted,
             /// Head-of-line stalls on the agent's direction: how often, how long.
             stalls: Option<(Duration, Duration)>,
+            /// FR-148 D46 — outages of the whole link ([`Outages`]): how often,
+            /// how long.
+            outages: Option<(Duration, Duration)>,
             /// FR-148 P0 — a still screen: one [`SPARSE_LEN`] message a second
             /// instead of the frames.
             sparse: bool,
@@ -3214,10 +3297,18 @@ pub(crate) mod shaped_link {
                     Budgeted::Holds(slack) => {
                         format!("{skip}, in-flight budget, slack {} ms", ms(slack))
                     }
+                    Budgeted::HoldsAsB1(slack) => {
+                        format!("{skip}, in-flight budget as B1, slack {} ms", ms(slack))
+                    }
+                    Budgeted::HoldsAfterTwo(slack) => format!(
+                        "{skip}, in-flight budget after two releases, slack {} ms",
+                        ms(slack)
+                    ),
                 };
-                let stalls = match self.stalls {
-                    Some((every, stall)) => format!(", a {stall:?} stall every {every:?}"),
-                    None => String::new(),
+                let stalls = match (self.stalls, self.outages) {
+                    (Some((every, stall)), _) => format!(", a {stall:?} stall every {every:?}"),
+                    (None, Some((every, len))) => format!(", a {len:?} outage every {every:?}"),
+                    (None, None) => String::new(),
                 };
                 if self.sparse {
                     return format!(
@@ -3277,6 +3368,20 @@ pub(crate) mod shaped_link {
                     Budgeted::Holds(slack) => {
                         Some(Self::Holds(Box::new(Budget::with_slack(slack))))
                     }
+                    Budgeted::HoldsAsB1(slack) => {
+                        let never = Classifier {
+                            releases: u32::MAX,
+                            ..Classifier::default()
+                        };
+                        Some(Self::Holds(Box::new(Budget::with_classifier(slack, never))))
+                    }
+                    Budgeted::HoldsAfterTwo(slack) => {
+                        let two = Classifier {
+                            releases: 2,
+                            ..Classifier::default()
+                        };
+                        Some(Self::Holds(Box::new(Budget::with_classifier(slack, two))))
+                    }
                 }
             }
 
@@ -3318,6 +3423,25 @@ pub(crate) mod shaped_link {
             steps: AtomicU64,
             step_ns: AtomicU64,
             step_max_ns: AtomicU64,
+            /// FR-148 D46 — frames a still span's write-through let go, and
+            /// a holding budget's steps as it saw them.
+            through: AtomicU64,
+            trace: StdMutex<Vec<Step>>,
+        }
+
+        /// FR-148 D46 — one step of a holding budget: its time (µs from the
+        /// run's start), the reading, and what the core made of it.
+        #[derive(Debug, Clone, Copy)]
+        struct Step {
+            t_us: u64,
+            acked: u64,
+            inflight: u64,
+            pending: u64,
+            verdict: Verdict,
+            rate_bps: u64,
+            budget: u64,
+            still_after_us: u64,
+            release: Option<Release>,
         }
 
         /// One message the viewer read: when it arrived and when it was
@@ -3638,6 +3762,17 @@ pub(crate) mod shaped_link {
             silent: Vec<(u64, u64)>,
             /// The budget's step with its reads: (steps, mean ns, longest ns).
             step: (u64, u64, u64),
+            /// FR-148 D46 — the frames still spans wrote through; the still
+            /// spans released, head-of-line and drain, and the frames admitted
+            /// in still spans, over the run's windows; a holding budget's
+            /// steps; the link's queue at each poll (µs from `t0`, µs); and
+            /// what the viewer read.
+            through: u64,
+            released: (u64, u64),
+            still_admitted: u64,
+            trace: Vec<Step>,
+            queue_at: Vec<(u64, u64)>,
+            arrivals: Vec<Arrival>,
         }
 
         fn us(d: Duration) -> u64 {
@@ -3700,8 +3835,43 @@ pub(crate) mod shaped_link {
                 full_packets: AtomicU64::new(0),
                 peak_wait_ns: AtomicU64::new(0),
                 tail_drops: AtomicU64::new(0),
+                outages: None,
             };
             let (b_out, a_inbox) = direction(bps, RTT / 2, queue, 0, None);
+            let (a, b): (SocketAddr, SocketAddr) = (
+                "10.0.0.1:5000".parse().unwrap(),
+                "10.0.0.2:5000".parse().unwrap(),
+            );
+            (
+                ShapedConn {
+                    out: a_out,
+                    inbox: Mutex::new(a_inbox),
+                    local: a,
+                    remote: b,
+                },
+                ShapedConn {
+                    out: b_out,
+                    inbox: Mutex::new(b_inbox),
+                    local: b,
+                    remote: a,
+                },
+            )
+        }
+
+        /// FR-148 D46 — as [`shaped`], with an outage of `len` every `every`
+        /// from `t0` on both directions ([`Outages`]): the link neither
+        /// serializes nor delivers in it, and drains what queued in it at its
+        /// rate after it, as a link that went down and came back does.
+        fn outaged(
+            bps: u64,
+            queue: Duration,
+            t0: Instant,
+            every: Duration,
+            len: Duration,
+        ) -> (ShapedConn, ShapedConn) {
+            let outages = Outages { t0, every, len };
+            let (a_out, b_inbox) = out_direction(bps, RTT / 2, queue, outages);
+            let (b_out, a_inbox) = out_direction(bps, RTT / 2, queue, outages);
             let (a, b): (SocketAddr, SocketAddr) = (
                 "10.0.0.1:5000".parse().unwrap(),
                 "10.0.0.2:5000".parse().unwrap(),
@@ -3779,9 +3949,10 @@ pub(crate) mod shaped_link {
             #[cfg(target_os = "windows")]
             let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
             let t0 = Instant::now();
-            let (a, b) = match shape.stalls {
-                None => shaped(shape.bps, RTT / 2, shape.queue),
-                Some((every, stall)) => stalling(shape.bps, shape.queue, t0, every, stall),
+            let (a, b) = match (shape.stalls, shape.outages) {
+                (Some((every, stall)), _) => stalling(shape.bps, shape.queue, t0, every, stall),
+                (None, Some((every, len))) => outaged(shape.bps, shape.queue, t0, every, len),
+                (None, None) => shaped(shape.bps, RTT / 2, shape.queue),
             };
             let a = Arc::new(a);
             let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
@@ -3827,6 +3998,7 @@ pub(crate) mod shaped_link {
                         let hold = core.as_ref().is_some_and(|core| {
                             let mut core = core.lock().unwrap();
                             let began = Instant::now();
+                            let mut step = None;
                             let hold = match &mut *core {
                                 // The pumps' B1 call: it returns nothing.
                                 Core::Shadow(s) => {
@@ -3849,6 +4021,20 @@ pub(crate) mod shaped_link {
                                     if matches!(verdict, Verdict::WindowBinds) {
                                         stats.window.fetch_add(1, Ordering::Relaxed);
                                     }
+                                    if matches!(verdict, Verdict::WritesThrough) {
+                                        stats.through.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    step = Some(Step {
+                                        t_us: us(began.saturating_duration_since(t0)),
+                                        acked: r.acked_bytes,
+                                        inflight: r.gauges.inflight_bytes,
+                                        pending: r.gauges.pending_bytes,
+                                        verdict,
+                                        rate_bps: b.rate_bps().unwrap_or(0),
+                                        budget: b.last_budget(),
+                                        still_after_us: us(b.still_after()),
+                                        release: b.last_release(),
+                                    });
                                     // A clock that stood still with bytes out
                                     // for the least and the slack was a stall.
                                     if r.acked_bytes != moved.1 || r.out() == 0 {
@@ -3871,6 +4057,9 @@ pub(crate) mod shaped_link {
                             stats.steps.fetch_add(1, Ordering::Relaxed);
                             stats.step_ns.fetch_add(ns, Ordering::Relaxed);
                             stats.step_max_ns.fetch_max(ns, Ordering::Relaxed);
+                            if let Some(step) = step {
+                                stats.trace.lock().unwrap().push(step);
+                            }
                             stats
                                 .budget
                                 .store(core.budget().last_budget(), Ordering::Relaxed);
@@ -3925,6 +4114,7 @@ pub(crate) mod shaped_link {
             let mut split = Split::default();
             let (mut samples, mut lines) = (Vec::new(), Vec::new());
             let mut covered = 0;
+            let mut queue_at = Vec::new();
             assert_eq!(sampler.on_reading_with(start, prev.1, || Some(first)), None);
             for i in 1..=shape.seconds {
                 let end = start + SAMPLE * i;
@@ -3934,6 +4124,7 @@ pub(crate) mod shaped_link {
                     q_lo = q_lo.min(q);
                     q_hi = q_hi.max(q);
                     let now = Instant::now();
+                    queue_at.push((us(now.saturating_duration_since(t0)), us(q)));
                     if now >= end {
                         break;
                     }
@@ -4029,15 +4220,12 @@ pub(crate) mod shaped_link {
             writer.abort();
             // Its counts are final once it has stopped.
             let _ = writer.await;
-            let windows_held: u64 = lines
-                .iter()
-                .filter_map(|l| l.budget)
-                .map(|b| b.held.0)
-                .sum();
-            let would_hold = windows_held
-                + core
-                    .as_ref()
-                    .map_or(0, |c| c.lock().unwrap().take_window().held.0);
+            let last_window = core.as_ref().map(|c| c.lock().unwrap().take_window());
+            let budget_windows = || lines.iter().filter_map(|l| l.budget).chain(last_window);
+            let would_hold: u64 = budget_windows().map(|b| b.held.0).sum();
+            let released =
+                budget_windows().fold((0, 0), |(h, d), b| (h + b.released.0, d + b.released.1));
+            let still_admitted: u64 = budget_windows().map(|b| b.still_admitted).sum();
             let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
             let from_us = us(start - t0);
             let silent: Vec<(u64, u64)> = stats
@@ -4058,6 +4246,7 @@ pub(crate) mod shaped_link {
             let tail_drops = a.tail_drops();
             let arrivals = arrivals.lock().unwrap().clone();
             let frames = frames.lock().unwrap().clone();
+            let trace = std::mem::take(&mut *stats.trace.lock().unwrap());
             let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
             let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
             let windows = viewer_windows(&arrivals, &frames, us(start - t0));
@@ -4081,6 +4270,12 @@ pub(crate) mod shaped_link {
                 window_writes: load(&stats.window),
                 silent,
                 step,
+                through: load(&stats.through),
+                released,
+                still_admitted,
+                trace,
+                queue_at,
+                arrivals,
             }
         }
 
@@ -4259,6 +4454,7 @@ pub(crate) mod shaped_link {
                 skip_over: false,
                 budget: Budgeted::No,
                 stalls: None,
+                outages: None,
                 sparse: false,
                 seconds: SAMPLES,
             }
@@ -4620,8 +4816,11 @@ pub(crate) mod shaped_link {
                 would_hold: r.would_hold,
                 floor: r.belief.floor,
                 floor_p1: fold(r.samples.iter().filter(|c| c.queued()).map(at).collect()),
-                floor_p3: matches!(r.shape.budget, Budgeted::Holds(_))
-                    .then(|| fold(r.samples.iter().filter(p3).map(at).collect())),
+                floor_p3: matches!(
+                    r.shape.budget,
+                    Budgeted::Holds(_) | Budgeted::HoldsAsB1(_) | Budgeted::HoldsAfterTwo(_)
+                )
+                .then(|| fold(r.samples.iter().filter(p3).map(at).collect())),
             }
         }
 
@@ -4641,7 +4840,8 @@ pub(crate) mod shaped_link {
                  read {} %, fresh {} % of {} kbit/s | ticks {}, written {}, held or skipped \
                  {}, the budget's verdicts held {}, written on SCTP's window {} | floor {}, \
                  P1 {} from {}, P3 {p3} kbit/s; still clock {} spans | budget step {} ns \
-                 mean, {} ns most, {} steps",
+                 mean, {} ns most, {} steps | still spans released head-of-line {}, drain {}; \
+                 admitted in still spans {}, written through {}",
                 r.shape.name(),
                 s.link_ms.0,
                 s.link_ms.1,
@@ -4662,10 +4862,15 @@ pub(crate) mod shaped_link {
                 r.step.1,
                 r.step.2,
                 r.step.0,
+                r.released.0,
+                r.released.1,
+                r.still_admitted,
+                r.through,
             );
         }
 
-        /// FR-148 D46 — each shape in turn, its rows and its summary printed.
+        /// FR-148 D46 — each shape in turn, its rows and its summary printed,
+        /// and a holding budget's releases.
         async fn measured(shapes: &[Shape]) -> Vec<(TcpRun, Summary)> {
             let mut out = Vec::new();
             for &shape in shapes {
@@ -4673,9 +4878,119 @@ pub(crate) mod shaped_link {
                 print_run(&r);
                 let s = summary(&r);
                 print_summary(&r, &s);
+                print_releases(&r);
                 out.push((r, s));
             }
             out
+        }
+
+        /// FR-148 D46 — each still span a holding budget saw released: when
+        /// its clock last stood still (ms from the run's start), how long it
+        /// stood, what SCTP had out then, the rate and the budget, the bytes
+        /// back at each step of the next 400 ms (`ms:bytes` after that last
+        /// still reading), and the class the core read [`BURST_WITHIN`] after
+        /// it.
+        fn print_releases(r: &TcpRun) {
+            let name = r.shape.name();
+            let mut span: Option<(usize, usize)> = None;
+            for (i, s) in r.trace.iter().enumerate() {
+                let out = s.inflight + s.pending;
+                if out > 0
+                    && let Some((from, _)) = span
+                    && r.trace[from].acked == s.acked
+                {
+                    span = Some((from, i));
+                    continue;
+                }
+                if let Some((from, to)) = span.take() {
+                    let (first, last) = (&r.trace[from], &r.trace[to]);
+                    let still = last.t_us - first.t_us;
+                    if still >= s.still_after_us && s.acked != last.acked {
+                        let since = |x: &Step| x.t_us.saturating_sub(last.t_us);
+                        let after: Vec<String> = r.trace[i..]
+                            .iter()
+                            .take_while(|x| since(x) <= 400_000)
+                            .map(|x| format!("{}:{}", since(x) / 1000, x.acked - last.acked))
+                            .collect();
+                        let read = r.trace[i..]
+                            .iter()
+                            .find(|x| since(x) >= us(BURST_WITHIN))
+                            .and_then(|x| x.release);
+                        let span = &r.trace[from..=to];
+                        let count = |v: Verdict| span.iter().filter(|x| x.verdict == v).count();
+                        println!(
+                            "D46 release | {name} | at {} ms, still {} ms, out {} (in flight {}, \
+                             pending {}), rate {} kbit/s, budget {}, written through {}, held {} \
+                             | {} | read {read:?}",
+                            last.t_us / 1000,
+                            still / 1000,
+                            last.inflight + last.pending,
+                            last.inflight,
+                            last.pending,
+                            kbps(last.rate_bps),
+                            last.budget,
+                            count(Verdict::WritesThrough),
+                            count(Verdict::Hold),
+                            after.join(" "),
+                        );
+                    }
+                }
+                if out > 0 {
+                    span = Some((i, i));
+                }
+            }
+        }
+
+        /// FR-148 D46 — the queue and transit bar, ms.
+        const BAR_MS: u64 = 300;
+
+        /// FR-148 D46 — after each outage's end with a second of the run after
+        /// it: (its end, ms from the run's start; then how long after it, ms,
+        /// the link's queue and each arrival's transit over the fastest last
+        /// stood at [`BAR_MS`] or over, before the next outage began; 0 when
+        /// they never did). The queue is read until [`BAR_MS`] before the next
+        /// outage: a packet sent in that last stretch waits for the outage too.
+        fn recoveries(r: &TcpRun) -> Vec<(u64, u64, u64)> {
+            let Some((every, len)) = r.shape.outages else {
+                return Vec::new();
+            };
+            let end = r.queue_at.last().map_or(0, |q| q.0);
+            let fastest = fastest_ms(&r.shape);
+            let mut out = Vec::new();
+            for k in 1_u64.. {
+                let release = us(every) * k + us(len);
+                let next = us(every) * (k + 1);
+                if release + 1_000_000 > end {
+                    break;
+                }
+                let after = |t: Option<u64>| t.map_or(0, |t| (t - release) / 1000);
+                let queue = r
+                    .queue_at
+                    .iter()
+                    .filter(|q| q.0 >= release && q.0 + BAR_MS * 1000 < next)
+                    .filter(|q| q.1 >= BAR_MS * 1000)
+                    .map(|q| q.0)
+                    .max();
+                let transit = r
+                    .arrivals
+                    .iter()
+                    .filter(|x| x.at_us >= release && x.at_us < next)
+                    .filter(|x| transit_ms(x).saturating_sub(fastest) >= BAR_MS)
+                    .map(|x| x.at_us)
+                    .max();
+                out.push((release / 1000, after(queue), after(transit)));
+            }
+            out
+        }
+
+        fn print_recoveries(r: &TcpRun) {
+            for (release, queue, transit) in recoveries(r) {
+                println!(
+                    "D46 outage | {} | the outage ending at {release} ms: link queue under \
+                     {BAR_MS} ms from {queue} ms after it, transit from {transit} ms",
+                    r.shape.name()
+                );
+            }
         }
 
         /// The budget's fresh delivery over today's writer's, the bar 0.95
@@ -4697,6 +5012,27 @@ pub(crate) mod shaped_link {
             Shape {
                 skip_over: false,
                 budget: Budgeted::Holds(SLACK),
+                ..shape
+            }
+        }
+
+        /// FR-148 D46 — the budget as B1 built it, measured beside the
+        /// classifier's on the stall and outage shapes. Its rate is D46's: a
+        /// second that starts inside a released still span counts from it.
+        fn as_b1(shape: Shape) -> Shape {
+            Shape {
+                skip_over: false,
+                budget: Budgeted::HoldsAsB1(SLACK),
+                ..shape
+            }
+        }
+
+        /// FR-148 D46 — the classifier asking two head-of-line releases in a
+        /// row before a still span writes through, on the stall shapes.
+        fn after_two(shape: Shape) -> Shape {
+            Shape {
+                skip_over: false,
+                budget: Budgeted::HoldsAfterTwo(SLACK),
                 ..shape
             }
         }
@@ -4746,16 +5082,28 @@ pub(crate) mod shaped_link {
             );
         }
 
-        /// A stall shape under today's writer, then under the budget, whose
-        /// floor ends lower: a stall releases at most the budget.
+        /// A stall shape under today's writer, then under B1's budget, whose
+        /// floor ends lower (a stall releases at most the budget), then under
+        /// the budget with the stall classifier, which delivers fresh at least
+        /// 0.95 of what today's writer does (D46 item 11's bar), and last
+        /// under the classifier asking two releases, printed only.
         async fn stalls_against_today(today: Shape) {
-            let s = measured(&[today, budgeted(today)]).await;
+            let s = measured(&[today, as_b1(today), budgeted(today), after_two(today)]).await;
             print_fresh_ratio(&s[0].1, &s[1]);
+            print_fresh_ratio(&s[0].1, &s[2]);
+            print_fresh_ratio(&s[0].1, &s[3]);
             assert!(
                 s[1].1.floor < s[0].1.floor,
                 "{}: {:?} against {:?}",
                 s[1].0.shape.name(),
                 s[1].1,
+                s[0].1
+            );
+            assert!(
+                s[2].1.fresh_bps * 100 >= s[0].1.fresh_bps * 95,
+                "{}: {:?} against {:?}",
+                s[2].0.shape.name(),
+                s[2].1,
                 s[0].1
             );
         }
@@ -4828,6 +5176,95 @@ pub(crate) mod shaped_link {
             stalls_against_today(skipping(Shape {
                 offer_pct: 150,
                 ..stalled(OpenPath::InitAck)
+            }))
+            .await;
+        }
+
+        /// FR-148 D46 — as the path I cell above, on path C.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_under_stalls_at_1_5_x_2_mbps_path_c() {
+            stalls_against_today(skipping(Shape {
+                offer_pct: 150,
+                ..stalled(OpenPath::CookieEcho)
+            }))
+            .await;
+        }
+
+        /// FR-148 D46 — the outage cells' shape: the stall shape's link, but in
+        /// each of its stalls the link neither serializes nor delivers
+        /// ([`outaged`]), and drains what queued at its rate after it.
+        fn outage(path: OpenPath) -> Shape {
+            Shape {
+                offer_pct: 80,
+                outages: Some((STALL_EVERY, STALL_FOR)),
+                ..shape(2_000_000, DEEP, path)
+            }
+        }
+
+        /// FR-148 D46 — an outage shape under today's writer, B1's budget,
+        /// then the budget with the stall classifier, which holds through
+        /// each outage: after each, the link's queue and the transit are back
+        /// under [`BAR_MS`] within a second, and it delivers at least what
+        /// today's writer delivers fresh.
+        async fn outages_against_today(today: Shape) {
+            let s = measured(&[today, as_b1(today), budgeted(today)]).await;
+            for (r, _) in &s {
+                print_recoveries(r);
+            }
+            print_fresh_ratio(&s[0].1, &s[1]);
+            print_fresh_ratio(&s[0].1, &s[2]);
+            let (r, b) = (&s[2].0, &s[2].1);
+            let name = r.shape.name();
+            let back = recoveries(r);
+            assert!(
+                !back.is_empty(),
+                "{name}: no outage ended a second before the run"
+            );
+            for (release, queue, transit) in back {
+                assert!(
+                    queue < 1_000 && transit < 1_000,
+                    "{name}: the outage ending at {release} ms: the link queue stood at \
+                     {BAR_MS} ms {queue} ms after it, a transit {transit} ms after it"
+                );
+            }
+            assert!(
+                b.fresh_bps >= s[0].1.fresh_bps,
+                "{name}: {b:?} against {:?}",
+                s[0].1
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_through_outages_2_mbps_path_i() {
+            outages_against_today(outage(OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_through_outages_2_mbps_path_c() {
+            outages_against_today(outage(OpenPath::CookieEcho)).await;
+        }
+
+        /// Today's writer at 1.5 times the link is the VP9-444 pump's skip, as
+        /// under the stalls.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_through_outages_at_1_5_x_2_mbps_path_i() {
+            outages_against_today(skipping(Shape {
+                offer_pct: 150,
+                ..outage(OpenPath::InitAck)
+            }))
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_through_outages_at_1_5_x_2_mbps_path_c() {
+            outages_against_today(skipping(Shape {
+                offer_pct: 150,
+                ..outage(OpenPath::CookieEcho)
             }))
             .await;
         }

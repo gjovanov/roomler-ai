@@ -1924,6 +1924,8 @@ async fn connect_once(
     // rather than the root daemon's own `no-gui-session` for the 30 s until
     // the first beat, after every reconnect. Only a loop that holds the host
     // passes it: the primary, and on a one-row Mac every org (FR-43 P3b).
+    // Each such loop subscribes to what the worker says after the hello before
+    // the hello reads its words.
     let announcer = Announcer {
         agent_id: &cfg.agent_id,
         ssh_enabled: cfg.ssh_enabled,
@@ -1931,7 +1933,11 @@ async fn connect_once(
         is_primary: ctx.is_primary,
         survive,
     };
-    let (hello_words, hello_caps) = announcer.hello(delegation.host());
+    let announced::Hello {
+        caps: hello_caps,
+        last: hello_announced,
+        mut worker_news,
+    } = announcer.hello(delegation.host());
     let hello_permissions = hello_caps.permissions.clone();
     let hello_session_policy = hello_caps.session_policy;
     let (arch, arch_emulated) = crate::arch::native();
@@ -2052,8 +2058,9 @@ async fn connect_once(
     // carried, never a value read again afterwards, until a beat carries newer
     // ones. So the first beat sends no caps unless something changed since the
     // hello. Per CONNECTION, not per process: a reconnect's hello is built from
-    // a fresh read, and the server replaces what it held with it.
-    let mut last_announced = hello_words;
+    // a fresh read, and the server replaces what it held with it. Only a hello
+    // makes this value: there is no other to start from.
+    let mut last_announced = hello_announced;
     // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
     // connection; the sender is cloned so a delegated session can hold it.
     let (mut delegated_in, delegated_out) = match delegation.worker_mut() {
@@ -2613,6 +2620,17 @@ async fn connect_once(
                         .await?;
                     }
                 }
+                watchdog::tick(ctx.pump);
+            }
+            // #3992 — the attached worker said a word after the hello: its caps,
+            // the person's floor, or its leaving. The heartbeat announces it
+            // now, not within its 30 s. The beat decides what is sent, so a
+            // word that changes nothing the row says costs no caps. Never on a
+            // loop that does not hold the host.
+            Ok(()) = next_worker_news(&mut worker_news) => {
+                let _stage = watchdog::enter(ctx.pump, "worker.news");
+                debug!("the worker said a word after the hello; the heartbeat announces it now");
+                heartbeat.reset_immediately();
                 watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
@@ -6704,6 +6722,18 @@ async fn next_delegated(
     }
 }
 
+/// #3992 — the next word the attached worker says after the hello
+/// ([`crate::delegate::DelegateHost::news`]), or never on a loop that does not
+/// hold the host. Cancel-safe, as `changed` is.
+async fn next_worker_news(
+    news: &mut Option<tokio::sync::watch::Receiver<u64>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    match news {
+        Some(news) => news.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Send one reply for a session, to wherever that session's replies go.
 ///
 /// The WS path keeps its DIRECT write. That is not incidental: the outbound
@@ -7010,14 +7040,23 @@ impl Announcer<'_> {
         // #3280 — before the answer [`Self::caps`] reads: one adopted in
         // between is news on the next beat.
         let caps_generation = crate::encode::caps::generation();
+        // The worker's four words from ONE hold of its caps, so one
+        // announcement never pairs the words of two of its frames.
+        let (permissions, record, apps, audio) = match delegate.and_then(|d| d.worker_announced()) {
+            Some(w) => (
+                Some(w.permissions),
+                Some(w.record),
+                Some(w.apps),
+                Some(w.audio),
+            ),
+            None => (None, None, None, None),
+        };
         Announced {
             caps_generation,
-            permissions: delegate.and_then(|d| d.effective_permissions()),
-            record: delegate
-                .and_then(|d| d.effective_record())
-                .unwrap_or_else(record_caps),
-            apps: delegate.and_then(|d| d.effective_apps()),
-            audio: delegate.and_then(|d| d.effective_audio()),
+            permissions,
+            record: record.unwrap_or_else(record_caps),
+            apps,
+            audio,
             keep_busy: crate::keep_busy::advertised(),
             sas: sas_advertised(),
             desktop: crate::desktop_brief::current(),
@@ -7062,30 +7101,85 @@ impl Announcer<'_> {
         }
         caps
     }
+}
 
-    /// The hello's words and the caps that carry them. The words are what this
-    /// connection has announced until a beat carries newer ones.
-    fn hello(&self, delegate: Option<&crate::delegate::DelegateHost>) -> (Announced, AgentCaps) {
-        let words = self.now(delegate);
-        let caps = self.caps(&words);
-        (words, caps)
+/// #3992 — what a connection has announced starts from its hello, and from
+/// nothing else: [`LastAnnounced`]'s field is private to this module, so only
+/// [`Announcer::hello`] makes one and [`Announcer::beat`] takes no other.
+mod announced {
+    use super::{Announced, Announcer};
+    use crate::delegate::DelegateHost;
+    use roomler_ai_remote_control::models::AgentCaps;
+
+    /// The words a connection last announced: its hello's, until a beat
+    /// carries newer ones.
+    pub(super) struct LastAnnounced(Announced);
+
+    impl LastAnnounced {
+        #[cfg(test)]
+        pub(super) fn words(&self) -> &Announced {
+            &self.0
+        }
     }
 
-    /// A beat's caps: `None` while the words read now are `last`, the ones last
-    /// announced, and otherwise the caps that carry the new words, which become
-    /// `last`. Only a changed beat builds caps.
-    fn beat(
-        &self,
-        last: &mut Announced,
-        delegate: Option<&crate::delegate::DelegateHost>,
-    ) -> Option<AgentCaps> {
-        let now = self.now(delegate);
-        if now == *last {
-            return None;
+    /// A connection's hello.
+    pub(super) struct Hello {
+        /// What the hello carries.
+        pub(super) caps: AgentCaps,
+        /// What it announced, for the beats to compare with.
+        pub(super) last: LastAnnounced,
+        /// The wake for a word the worker says after the hello
+        /// ([`DelegateHost::news`]): `None` on a loop that does not hold the
+        /// host, which says our own words.
+        pub(super) worker_news: Option<tokio::sync::watch::Receiver<u64>>,
+    }
+
+    impl Announcer<'_> {
+        /// The hello: subscribed to the worker's news, then its words read, and
+        /// the caps that carry them.
+        pub(super) fn hello(&self, delegate: Option<&DelegateHost>) -> Hello {
+            self.hello_with(delegate, || {})
         }
-        let caps = self.caps(&now);
-        *last = now;
-        Some(caps)
+
+        /// [`Self::hello`], with `meanwhile` run after the subscription and
+        /// before the read: where a word the worker says must not fall through.
+        /// A test says one there.
+        pub(super) fn hello_with(
+            &self,
+            delegate: Option<&DelegateHost>,
+            meanwhile: impl FnOnce(),
+        ) -> Hello {
+            // Subscribed BEFORE the words are read, as `caps_news` is: a word
+            // stored before this is in the read, and one stored after it wakes
+            // the loop. Taken after the read, a word stored in between would
+            // reach the row only at the next beat, up to 30 s on.
+            let worker_news = delegate.map(DelegateHost::news);
+            meanwhile();
+            let words = self.now(delegate);
+            let caps = self.caps(&words);
+            Hello {
+                caps,
+                last: LastAnnounced(words),
+                worker_news,
+            }
+        }
+
+        /// A beat's caps: `None` while the words read now are `last`, the ones
+        /// last announced, and otherwise the caps that carry the new words,
+        /// which become `last`. Only a changed beat builds caps.
+        pub(super) fn beat(
+            &self,
+            last: &mut LastAnnounced,
+            delegate: Option<&DelegateHost>,
+        ) -> Option<AgentCaps> {
+            let now = self.now(delegate);
+            if now == last.0 {
+                return None;
+            }
+            let caps = self.caps(&now);
+            last.0 = now;
+            Some(caps)
+        }
     }
 }
 
@@ -10146,14 +10240,17 @@ mod exec_answer_tests {
 }
 
 /// #3992 — the hello and the heartbeat announce one snapshot: the words
-/// [`Announcer::now`] reads, in the caps [`Announcer::caps`] builds. Each test
-/// holds the probe's lock ([`crate::encode::caps::loop_fixture`]), so the
-/// answer's generation cannot move between two reads.
+/// [`Announcer::now`] reads, in the caps [`Announcer::caps`] builds. A word the
+/// worker says after the hello wakes the loop: the hello subscribes before it
+/// reads. Each test holds the probe's lock
+/// ([`crate::encode::caps::loop_fixture`]), so the answer's generation cannot
+/// move between two reads.
 #[cfg(test)]
 mod announce_tests {
     use super::Announcer;
     use crate::delegate::{DelegateHost, PersonFloor};
     use roomler_ai_remote_control::models::{AgentCaps, FeaturePolicy, SessionPolicy, VideoCell};
+    use std::time::Duration;
 
     /// A primary org's loop. No SYSTEM service is anchored for this id.
     fn primary() -> Announcer<'static> {
@@ -10187,13 +10284,29 @@ mod announce_tests {
         }
     }
 
+    /// The caps of a worker that holds the screen and not input.
+    fn screen_only() -> AgentCaps {
+        AgentCaps {
+            permissions: Some(vec!["screen-capture".into()]),
+            ..Default::default()
+        }
+    }
+
+    /// The loop's wake for the worker's news fires, within 5 s.
+    async fn woken(news: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+        tokio::time::timeout(Duration::from_secs(5), super::next_worker_news(news))
+            .await
+            .expect("the loop is woken")
+            .expect("the host lives");
+    }
+
     /// T1 — a worker that holds neither permission: the hello says `[]`, as
     /// the issue's Mac measured, never the root daemon's `no-gui-session`.
     #[test]
     fn the_hello_carries_a_worker_that_holds_neither_permission() {
         let _probe = crate::encode::caps::loop_fixture();
         let host = worker_said(&[], false);
-        let (_, hello) = primary().hello(Some(&host));
+        let hello = primary().hello(Some(&host)).caps;
         assert_eq!(hello.permissions, Some(Vec::new()));
         assert!(!hello.has_input_permission);
     }
@@ -10203,7 +10316,7 @@ mod announce_tests {
     fn the_hello_carries_a_worker_that_holds_both_permissions() {
         let _probe = crate::encode::caps::loop_fixture();
         let host = worker_said(&["screen-capture", "input"], true);
-        let (_, hello) = primary().hello(Some(&host));
+        let hello = primary().hello(Some(&host)).caps;
         assert_eq!(
             hello.permissions,
             Some(vec!["screen-capture".to_string(), "input".to_string()])
@@ -10216,10 +10329,10 @@ mod announce_tests {
     fn with_no_worker_the_hello_carries_our_own_permissions() {
         let _probe = crate::encode::caps::loop_fixture();
         let own = crate::encode::caps::answer_now();
-        let (words, hello) = primary().hello(None);
-        assert_eq!(words.permissions, None, "nothing to override");
-        assert_eq!(hello.permissions, own.permissions);
-        assert_eq!(hello.has_input_permission, own.has_input_permission);
+        let hello = primary().hello(None);
+        assert_eq!(hello.last.words().permissions, None, "nothing to override");
+        assert_eq!(hello.caps.permissions, own.permissions);
+        assert_eq!(hello.caps.has_input_permission, own.has_input_permission);
     }
 
     /// T4 — and so does one whose worker is attached but has sent no caps.
@@ -10229,34 +10342,44 @@ mod announce_tests {
         let own = crate::encode::caps::answer_now();
         let host = DelegateHost::new();
         let _frames = host.attach_for_test();
-        let (words, hello) = primary().hello(Some(&host));
-        assert_eq!(words.permissions, None, "nothing to override");
-        assert_eq!(hello.permissions, own.permissions);
-        assert_eq!(hello.has_input_permission, own.has_input_permission);
+        let hello = primary().hello(Some(&host));
+        assert_eq!(hello.last.words().permissions, None, "nothing to override");
+        assert_eq!(hello.caps.permissions, own.permissions);
+        assert_eq!(hello.caps.has_input_permission, own.has_input_permission);
     }
 
     /// T5 — one row, the person's floor stricter than the device's: the hello
-    /// carries the session policy a beat would send for the same inputs, with
-    /// the floor folded in as the `Request` arm enforces it.
+    /// carries the stricter of the two, feature by feature, as the `Request`
+    /// arm enforces it. Worked out here from the two inputs, not taken from a
+    /// beat, which builds its caps the same way.
     #[test]
-    fn on_one_row_the_hello_carries_the_persons_floor_as_a_beat_does() {
+    fn on_one_row_the_hello_carries_the_stricter_of_the_persons_floor_and_the_devices() {
         let _probe = crate::encode::caps::loop_fixture();
+        let device = crate::session_policy::device_policy();
+        let person = SessionPolicy {
+            clipboard: FeaturePolicy::Off,
+            files: FeaturePolicy::Ask,
+            audio: FeaturePolicy::On,
+        };
         let host = worker_said(&[], false);
         host.set_one_row();
         host.note_person_floor_for_test(PersonFloor {
             auto_grant_session: false,
-            session_policy: all_off(),
+            session_policy: person,
         });
-        let announcer = primary();
-        let (words, hello) = announcer.hello(Some(&host));
-        // A beat with news to tell builds its caps from the same inputs.
-        let mut older = words.clone();
-        older.caps_generation = older.caps_generation.wrapping_sub(1);
-        let beat = announcer
-            .beat(&mut older, Some(&host))
-            .expect("a beat with news carries caps");
-        assert_eq!(hello.session_policy, Some(all_off()));
-        assert_eq!(hello.session_policy, beat.session_policy);
+        let stricter = SessionPolicy {
+            clipboard: device.clipboard.stricter(person.clipboard),
+            files: device.files.stricter(person.files),
+            audio: device.audio.stricter(person.audio),
+        };
+        assert_eq!(stricter.clipboard, FeaturePolicy::Off, "the person's off");
+        let hello = primary().hello(Some(&host));
+        assert_eq!(hello.caps.session_policy, Some(stricter));
+        assert_eq!(
+            hello.last.words().session_policy,
+            Some(stricter),
+            "and what the hello announced"
+        );
     }
 
     /// T6 — with no person's floor, the device's own, as before: no host, a
@@ -10266,12 +10389,12 @@ mod announce_tests {
     fn with_no_persons_floor_the_hello_carries_the_devices_policy() {
         let _probe = crate::encode::caps::loop_fixture();
         let device = crate::session_policy::caps_policy();
-        let (_, no_host) = primary().hello(None);
+        let no_host = primary().hello(None).caps;
         assert_eq!(no_host.session_policy, device);
 
         let one_row = worker_said(&[], false);
         one_row.set_one_row();
-        let (_, quiet) = primary().hello(Some(&one_row));
+        let quiet = primary().hello(Some(&one_row)).caps;
         assert_eq!(quiet.session_policy, device);
 
         let two_rows = worker_said(&[], false);
@@ -10279,18 +10402,19 @@ mod announce_tests {
             auto_grant_session: false,
             session_policy: all_off(),
         });
-        let (_, ignored) = primary().hello(Some(&two_rows));
+        let ignored = primary().hello(Some(&two_rows)).caps;
         assert_eq!(ignored.session_policy, device);
     }
 
     /// T7 — after a hello that carried the worker's words, a beat with nothing
-    /// new carries no caps.
+    /// new carries no caps. What the loop compares with starts as the hello's:
+    /// only [`Announcer::hello`] makes it.
     #[test]
     fn a_beat_after_a_hello_with_the_workers_words_carries_none() {
         let _probe = crate::encode::caps::loop_fixture();
         let host = worker_said(&[], false);
         let announcer = primary();
-        let (mut last, _) = announcer.hello(Some(&host));
+        let mut last = announcer.hello(Some(&host)).last;
         assert!(announcer.beat(&mut last, Some(&host)).is_none());
     }
 
@@ -10302,7 +10426,7 @@ mod announce_tests {
         let host = DelegateHost::new();
         let _frames = host.attach_for_test();
         let announcer = primary();
-        let (mut last, _) = announcer.hello(Some(&host));
+        let mut last = announcer.hello(Some(&host)).last;
         assert!(
             announcer.beat(&mut last, Some(&host)).is_none(),
             "nothing yet"
@@ -10319,10 +10443,12 @@ mod announce_tests {
         assert!(announcer.beat(&mut last, Some(&host)).is_none(), "once");
     }
 
-    /// T9 — a worker's codecs, encoders and cells never reach the row: ours
-    /// do, the half that answers `rc:session.request` (the P2b-3 lesson).
+    /// T9 — what the daemon holds of its worker's caps is the worker's words
+    /// alone (the filter, `delegate::worker_words`): a worker's codecs,
+    /// encoders and cells never reach the row; ours do, the half that answers
+    /// `rc:session.request` (the P2b-3 lesson).
     #[test]
-    fn the_hello_keeps_our_codecs_encoders_and_cells() {
+    fn the_held_worker_words_bring_no_codecs_encoders_or_cells() {
         let _probe = crate::encode::caps::loop_fixture();
         let own = crate::encode::caps::answer_now();
         let host = DelegateHost::new();
@@ -10340,7 +10466,7 @@ mod announce_tests {
             has_input_permission: true,
             ..Default::default()
         });
-        let (_, hello) = primary().hello(Some(&host));
+        let hello = primary().hello(Some(&host)).caps;
         assert_eq!(hello.codecs, own.codecs);
         assert_eq!(hello.hw_encoders, own.hw_encoders);
         assert_eq!(hello.video_cells, own.video_cells);
@@ -10348,6 +10474,147 @@ mod announce_tests {
             hello.permissions,
             Some(vec!["screen-capture".to_string(), "input".to_string()]),
             "while its permissions do"
+        );
+    }
+
+    /// T9' — the builder ([`Announcer::caps`]) keeps our codecs, encoders and
+    /// cells whatever words it is given: here a worker's, taken from caps that
+    /// name others and never filtered, so the builder alone stands between
+    /// them and the row. The worker's own words are written in.
+    #[test]
+    fn the_builder_keeps_our_codecs_encoders_and_cells() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let own = crate::encode::caps::answer_now();
+        let worker = AgentCaps {
+            codecs: vec!["a worker's codec".into()],
+            hw_encoders: vec!["a worker's encoder".into()],
+            video_cells: vec![VideoCell {
+                codec: "a worker's codec".into(),
+                backend: "a worker's backend".into(),
+                chroma: vec!["yuv444".into()],
+                hw: true,
+            }],
+            permissions: Some(vec!["screen-capture".into(), "input".into()]),
+            has_input_permission: true,
+            apps: vec!["status".into()],
+            audio: vec!["opus".into()],
+            ..Default::default()
+        };
+        let announcer = primary();
+        let mut words = announcer.now(None);
+        words.permissions = Some((
+            worker.permissions.clone().unwrap_or_default(),
+            worker.has_input_permission,
+        ));
+        words.record = worker.record.clone();
+        words.apps = Some(worker.apps.clone());
+        words.audio = Some(crate::encode::caps::AudioWords::of(&worker));
+        let caps = announcer.caps(&words);
+        assert_eq!(caps.codecs, own.codecs);
+        assert_eq!(caps.hw_encoders, own.hw_encoders);
+        assert_eq!(caps.video_cells, own.video_cells);
+        assert_eq!(caps.permissions, worker.permissions, "the worker's words");
+        assert!(caps.has_input_permission);
+        assert_eq!(caps.apps, worker.apps);
+        assert_eq!(caps.audio, worker.audio);
+    }
+
+    /// W5 — a word the worker says between the hello's subscription and its
+    /// read: the hello carries it, and the beat its wake brings carries
+    /// nothing. With the read taken before the subscription, the hello missed
+    /// the word and nothing woke the loop: the row waited for the next beat.
+    #[tokio::test]
+    async fn a_word_said_while_the_hello_is_made_is_in_the_hello() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        let announcer = primary();
+        let mut hello = announcer.hello_with(Some(&host), || {
+            host.hold_worker_caps_for_test(screen_only())
+        });
+        assert_eq!(
+            hello.last.words().permissions,
+            Some((vec!["screen-capture".to_string()], false)),
+            "the hello carries the word"
+        );
+        assert_eq!(
+            hello.caps.permissions,
+            Some(vec!["screen-capture".to_string()])
+        );
+        woken(&mut hello.worker_news).await;
+        assert!(
+            announcer.beat(&mut hello.last, Some(&host)).is_none(),
+            "the woken beat carries nothing"
+        );
+    }
+
+    /// W6 — a worker that speaks after the hello wakes the loop: the woken
+    /// beat carries its words, and the beat after that nothing. Before, nothing
+    /// woke it, and the words waited for the next beat, up to 30 s.
+    #[tokio::test]
+    async fn a_worker_that_speaks_after_the_hello_wakes_the_loop() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        let announcer = primary();
+        let mut hello = announcer.hello(Some(&host));
+        let news = hello.worker_news.as_ref().expect("the loop holds the host");
+        assert!(!news.has_changed().unwrap(), "nothing said yet");
+        host.hold_worker_caps_for_test(screen_only());
+        woken(&mut hello.worker_news).await;
+        let beat = announcer
+            .beat(&mut hello.last, Some(&host))
+            .expect("the woken beat carries the words");
+        assert_eq!(beat.permissions, Some(vec!["screen-capture".to_string()]));
+        assert!(!beat.has_input_permission);
+        assert!(
+            announcer.beat(&mut hello.last, Some(&host)).is_none(),
+            "the beat after it nothing"
+        );
+    }
+
+    /// W7 — a loop that does not hold the host (off one row, a secondary
+    /// org's) takes no subscription and says our own words, and a host's news
+    /// never wakes it.
+    #[tokio::test]
+    async fn a_loop_without_the_host_says_our_words_and_is_never_woken() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let mut hello = primary().hello(None);
+        assert!(hello.worker_news.is_none(), "no subscription");
+        let words = hello.last.words();
+        assert_eq!(words.permissions, None);
+        assert_eq!(words.apps, None);
+        assert_eq!(words.audio, None);
+        assert_eq!(words.record, super::record_caps());
+        // The host another loop holds hears from its worker; this loop not.
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        host.hold_worker_caps_for_test(screen_only());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                super::next_worker_news(&mut hello.worker_news)
+            )
+            .await
+            .is_err(),
+            "nothing wakes it"
+        );
+    }
+
+    /// W8 — a worker that says again what it said: the beat its wake brings
+    /// costs no caps, since the beat decides what is sent.
+    #[tokio::test]
+    async fn a_word_that_changes_nothing_the_row_says_costs_no_caps() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        host.hold_worker_caps_for_test(screen_only());
+        let announcer = primary();
+        let mut hello = announcer.hello(Some(&host));
+        host.hold_worker_caps_for_test(screen_only());
+        assert!(
+            announcer.beat(&mut hello.last, Some(&host)).is_none(),
+            "nothing the row says changed"
         );
     }
 }

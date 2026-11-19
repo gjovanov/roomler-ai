@@ -622,6 +622,33 @@ fn worker_words(caps: AgentCaps) -> AgentCaps {
     kept
 }
 
+/// The permission pair a worker's held caps give the device
+/// ([`DelegateHost::effective_permissions`]). A worker that said no list says
+/// it holds neither permission: `[]`, never the root daemon's own words.
+fn permission_pair(caps: &AgentCaps) -> (Vec<String>, bool) {
+    (
+        caps.permissions.clone().unwrap_or_default(),
+        caps.has_input_permission,
+    )
+}
+
+/// #3992 — what the device announces of its attached worker, read in one hold
+/// of its caps ([`DelegateHost::worker_announced`]). Each word means what its
+/// `effective_*` reader returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerAnnounced {
+    /// [`DelegateHost::effective_permissions`]. `([], false)` says the worker
+    /// holds neither permission, and the row must read `[]`, never the root
+    /// daemon's `no-gui-session`.
+    pub permissions: (Vec<String>, bool),
+    /// [`DelegateHost::effective_record`].
+    pub record: Vec<String>,
+    /// [`DelegateHost::effective_apps`].
+    pub apps: Vec<String>,
+    /// [`DelegateHost::effective_audio`].
+    pub audio: crate::encode::caps::AudioWords,
+}
+
 /// FR-43 P3a — a worker's line as the daemon uploads it: trimmed, and marked as
 /// the worker's. The daemon sets the mark, so a worker cannot pass a line off
 /// as the daemon's own.
@@ -1030,6 +1057,11 @@ struct Inner {
     /// not find a window in which the person's "ask me" lapsed. The next
     /// worker's frame replaces it.
     person_floor: Mutex<Option<PersonFloor>>,
+    /// #3992 — wakes every connection that holds this host when a word the
+    /// worker says changes what the device announces ([`DelegateHost::news`]).
+    /// Built as [`crate::encode::caps::news`]'s is, and it lives as long as the
+    /// host: no connection sees it closed while the host lives.
+    news: std::sync::OnceLock<tokio::sync::watch::Sender<u64>>,
     /// The queue toward the attached worker. Set while a worker is attached,
     /// `None` otherwise — so "is anyone there?" and "where do I send it?" are
     /// one question with one answer, and cannot disagree.
@@ -1304,6 +1336,28 @@ impl DelegateHost {
         *self.inner.person_floor.lock().expect("person floor mutex")
     }
 
+    /// #3992 — wakes when a word the worker says changes what this device
+    /// announces: its caps held ([`DelegateFrame::WorkerCaps`]), the person's
+    /// floor kept ([`Self::person_floor`]), or its caps cleared with its
+    /// channel. A connection that holds this host subscribes BEFORE it reads
+    /// the words its hello carries, so a word said in between wakes it, and its
+    /// heartbeat announces the word at once rather than within its 30 s.
+    pub fn news(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.news_sender().subscribe()
+    }
+
+    fn news_sender(&self) -> &tokio::sync::watch::Sender<u64> {
+        self.inner
+            .news
+            .get_or_init(|| tokio::sync::watch::channel(0).0)
+    }
+
+    /// #3992 — what the device announces of its worker changed. Called once
+    /// the change is stored, so whoever wakes reads it.
+    fn words_moved(&self) {
+        self.news_sender().send_modify(|n| *n = n.wrapping_add(1));
+    }
+
     fn note_person_floor(&self, floor: PersonFloor) {
         if !self.one_row() {
             tracing::debug!(
@@ -1317,6 +1371,8 @@ impl DelegateHost {
             "delegation: the person's consent floor received"
         );
         *self.inner.person_floor.lock().expect("person floor mutex") = Some(floor);
+        // #3992 — kept: every connection that holds this host announces it now.
+        self.words_moved();
     }
 
     /// Hand a server message to the attached worker, for the org `org`
@@ -1615,11 +1671,22 @@ impl DelegateHost {
     /// identical codecs anyway (2026-09-01).
     pub fn effective_permissions(&self) -> Option<(Vec<String>, bool)> {
         let held = self.inner.worker_caps.lock().expect("worker caps mutex");
-        held.as_ref().map(|c| {
-            (
-                c.permissions.clone().unwrap_or_default(),
-                c.has_input_permission,
-            )
+        held.as_ref().map(permission_pair)
+    }
+
+    /// #3992 — the four words this device announces of its worker
+    /// ([`Self::effective_permissions`], [`Self::effective_record`],
+    /// [`Self::effective_apps`], [`Self::effective_audio`]) from ONE hold of
+    /// its caps, so one announcement never pairs the words of two of its
+    /// frames. `None` = no worker, or one that has not sent its caps: the
+    /// caller keeps its own four.
+    pub fn worker_announced(&self) -> Option<WorkerAnnounced> {
+        let held = self.inner.worker_caps.lock().expect("worker caps mutex");
+        held.as_ref().map(|c| WorkerAnnounced {
+            permissions: permission_pair(c),
+            record: c.record.clone(),
+            apps: c.apps.clone(),
+            audio: crate::encode::caps::AudioWords::of(c),
         })
     }
 
@@ -1840,6 +1907,9 @@ impl DelegateHost {
                         .worker_features
                         .lock()
                         .expect("worker features mutex") = features;
+                    // #3992 — held: every connection that holds this host
+                    // announces the words now, not at its next beat.
+                    self.words_moved();
                 }
                 Ok(
                     DelegateFrame::ToWorker { .. }
@@ -1874,7 +1944,17 @@ impl DelegateHost {
         // ⚠️ Clear the caps with the channel. Keeping them would leave the row
         // advertising a capture target that has gone, and the next session
         // would get the black screen P2b existed to fix.
-        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
+        let held = self
+            .inner
+            .worker_caps
+            .lock()
+            .expect("worker caps mutex")
+            .take();
+        // #3992 — and the row hears it now, not at the next beat. A worker that
+        // left without its caps changed nothing the row says.
+        if held.is_some() {
+            self.words_moved();
+        }
         // FR-92 — and the questions it will now never answer: dropping each
         // sender ends its caller's wait at once instead of at the timeout.
         self.inner
@@ -2035,11 +2115,12 @@ impl DelegateHost {
     }
 
     /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
-    /// brings, only its words ([`worker_words`]), for a test of what the daemon
-    /// announces with them.
+    /// brings, only its words ([`worker_words`]), and its news told, for a test
+    /// of what the daemon announces with them.
     #[cfg(test)]
     pub(crate) fn hold_worker_caps_for_test(&self, caps: AgentCaps) {
         *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(worker_words(caps));
+        self.words_moved();
     }
 
     /// #3992 — and the person's floor, as their worker's frame gives it.
@@ -2648,6 +2729,152 @@ mod tests {
             floor.session_policy.clipboard,
             roomler_ai_remote_control::models::FeaturePolicy::Off
         );
+    }
+
+    /// #3992 — a frame the worker sends, read: the daemon reads in order, so
+    /// its Pong to the ping after the frame means the frame was handled.
+    async fn worker_sends(
+        cwr: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        frame: &[u8],
+    ) {
+        cwr.write_all(frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(lines).await, DelegateFrame::Pong));
+    }
+
+    /// #3992 — a `worker_caps` frame that says the worker holds neither
+    /// permission.
+    fn caps_frame() -> Vec<u8> {
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                permissions: Some(Vec::new()),
+                ..Default::default()
+            }),
+            features: Vec::new(),
+        };
+        let mut line = serde_json::to_vec(&frame).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    /// #3992 W1 — the worker's caps, once held, are news to a connection that
+    /// subscribed, so its heartbeat announces them at once.
+    #[tokio::test]
+    async fn the_workers_caps_held_are_news() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let news = host.news();
+        assert!(!news.has_changed().unwrap(), "attaching says nothing");
+        worker_sends(&mut cwr, &mut lines, &caps_frame()).await;
+        assert_eq!(host.effective_permissions(), Some((Vec::new(), false)));
+        assert!(news.has_changed().unwrap(), "the caps held are news");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// #3992 W2 — on one row, the person's floor, once kept, is news.
+    #[tokio::test]
+    async fn on_one_row_the_persons_floor_kept_is_news() {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let news = host.news();
+        worker_sends(
+            &mut cwr,
+            &mut lines,
+            b"{\"t\":\"person_floor\",\"d\":{\"auto_grant_session\":false}}\n",
+        )
+        .await;
+        assert!(host.person_floor().is_some(), "kept");
+        assert!(news.has_changed().unwrap(), "and news");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// #3992 W3 — off one row the daemon ignores a person's floor, and an
+    /// ignored frame is no news.
+    #[tokio::test]
+    async fn off_one_row_an_ignored_floor_is_no_news() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let news = host.news();
+        worker_sends(
+            &mut cwr,
+            &mut lines,
+            b"{\"t\":\"person_floor\",\"d\":{\"auto_grant_session\":false}}\n",
+        )
+        .await;
+        assert_eq!(host.person_floor(), None, "ignored");
+        assert!(!news.has_changed().unwrap(), "no news");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// #3992 W4 — the channel ends while the worker's caps are held: they are
+    /// cleared, and that is news. A worker that leaves without having sent its
+    /// caps changed nothing the row says, and that is none.
+    #[tokio::test]
+    async fn a_channel_that_ends_with_the_caps_held_is_news() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        worker_sends(&mut cwr, &mut lines, &caps_frame()).await;
+        let news = host.news();
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert_eq!(host.effective_permissions(), None, "cleared");
+        assert!(news.has_changed().unwrap(), "the clear is news");
+
+        let quiet = DelegateHost::new();
+        let (task, lines, cwr) = attached_worker(&quiet).await;
+        let news = quiet.news();
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(
+            !news.has_changed().unwrap(),
+            "nothing held, nothing cleared"
+        );
+    }
+
+    /// #3992 L1 — the four words the device announces of its worker come from
+    /// one hold of its caps ([`DelegateHost::worker_announced`]) and are what
+    /// the four `effective_*` readers return. `Some([])` stays `[]`.
+    #[test]
+    fn the_workers_four_words_read_at_once_are_the_four_readers_words() {
+        let host = DelegateHost::new();
+        assert_eq!(host.worker_announced(), None, "no worker: our own four");
+        for caps in [
+            AgentCaps {
+                permissions: Some(Vec::new()),
+                ..Default::default()
+            },
+            AgentCaps {
+                record: vec!["remote".into()],
+                apps: vec!["status".into()],
+                audio: vec!["opus".into()],
+                permissions: Some(vec!["screen-capture".into(), "input".into()]),
+                has_input_permission: true,
+                ..Default::default()
+            },
+        ] {
+            let neither = caps.permissions == Some(Vec::new());
+            host.hold_worker_caps_for_test(caps);
+            let w = host
+                .worker_announced()
+                .expect("a worker that said its caps");
+            if neither {
+                assert_eq!(w.permissions, (Vec::new(), false), "`[]`, never ours");
+            }
+            assert_eq!(Some(w.permissions), host.effective_permissions());
+            assert_eq!(Some(w.record), host.effective_record());
+            assert_eq!(Some(w.apps), host.effective_apps());
+            assert_eq!(Some(w.audio), host.effective_audio());
+        }
     }
 
     /// Attach a fake worker and wait until the daemon's frame loop is up (its
