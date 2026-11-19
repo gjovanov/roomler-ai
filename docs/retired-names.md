@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2847`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2851`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 
