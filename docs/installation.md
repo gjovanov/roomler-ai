@@ -1943,7 +1943,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2357`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2374-2376`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -1955,12 +1955,18 @@ there, and re-running the install heals it.
 
 ```mermaid
 flowchart TD
-    A["dpkg -i pkg.deb"] -->|"the dependencies are here"| OK["installed, no mirror needed"]
+    A["dpkg --force-confold -i pkg.deb"] -->|"the dependencies are here"| OK["installed, no mirror needed"]
     A -->|"one is missing: dpkg leaves the package half-configured"| B["apt-get update<br/>(a failure only warns)"]
-    B --> C["apt-get install -y --fix-broken pkg.deb"]
+    B --> C["apt-get install -y --fix-broken<br/>-o Dpkg::Options::=--force-confold pkg.deb"]
     C -->|resolved| OK
     C -->|"cannot fetch it"| F["exit 100, and the script stops.<br/>Nothing is removed, and what dpkg unpacked stays"]
 ```
+
+Neither step asks anything. Both read `/dev/null` for stdin and hand dpkg `--force-confold`
+(#3926), so a configuration file a person edited or deleted stays as they left it, with the
+package's version beside it as `.dpkg-dist`. Only the companion's package ships one today, its
+login start. The daemon's updater and the CLI's `self-update` follow the same rule
+([linux-self-update.md](linux-self-update.md#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932)).
 
 ⚠️ **Never `apt-get -f install` with no package named.** When it cannot reach a
 dependency it "fixes" the host by removing the package it was meant to finish, and
@@ -3248,7 +3254,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3508`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3519`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.
