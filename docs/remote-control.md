@@ -1836,7 +1836,7 @@ The arbiter opens the OS injector at the first event, then keeps it. If no backe
 | macOS | the Accessibility grant, read live with `AXIsProcessTrusted` | once a second |
 | Elsewhere | nothing to ask: only opening one tells (a Linux daemon before its display or `/dev/uinput` exists) | after 1 s, doubling to once a minute |
 
-A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1345`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:584`).
+A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1419`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:639`).
 
 ⚠️ A root daemon with no `DISPLAY` can never open enigo, so since #3787 its open is not tried. With no `DISPLAY`, x11rb answers `DisplayNotSet` before any I/O, and enigo printed that and `no successful connection` at ERROR on every try. `agents/roomlerd/src/input/no_display.rs` says why instead, once a session:
 
@@ -1892,7 +1892,7 @@ desktop's generation (`x_follow::opened_under`,
 `x_generation`); an injector that is no X client of the desktop records none.
 Before each of the arbiter's three lazy opens (the warm-up, an event's
 injection and a keep-busy move), and as the last step before it,
-`follow_the_desktop` (`agents/roomlerd/src/input/arbiter.rs:1432`) asks the
+`follow_the_desktop` (`agents/roomlerd/src/input/arbiter.rs:1506`) asks the
 gate (`x_follow::gate_at`, `x_follow.rs:130`):
 
 | The desktop | The cached injector | What happens |
@@ -1936,13 +1936,13 @@ server.
   input would reach the desktop's X server is left behind, and any other marked
   session is taken back. Again at the injection point, on the OS injector's
   branch and only for an injector that is an X client of the desktop
-  (`arbiter.rs:1514`), because the regrant can swap the injector and a route
+  (`arbiter.rs:1588`), because the regrant can swap the injector and a route
   can come or go inside one command. And at a shared pipeline's join (§5.1a).
 - **What a mark never touches.** Input that goes elsewhere: a portal or
   compositor route into a person's real desktop, and uinput. That is decided
   again before every command.
 - **A session left behind** is a session without input (`leave_behind`,
-  `arbiter.rs:388`): its events are dropped before any injector, and said once
+  `arbiter.rs:394`): its events are dropped before any injector, and said once
   for the session at `INFO` until it closes. Its floor requests and grants,
   its mode, keep busy and layout switches are refused as for a session without
   an INPUT grant. What it holds is forgotten, releasing nothing: its presses
@@ -5479,10 +5479,10 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:2003`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1981`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
-encoder thread finish freeing (`encode/thread.rs:266` joins it), and sessions
+encoder thread finish freeing (`encode/thread.rs:283` joins it), and sessions
 ending together cost one trim. A trim takes each arena's lock in turn and nobody
 waits for it. "glibc holds" does not fall after a trim, because the pages are
 released with `MADV_DONTNEED` while the arena keeps the address space. RSS is the
@@ -6170,7 +6170,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 - **FR-97 P3e, on both platforms:** `rc:layout.set` goes through the input
   arbiter, which refuses a session that may not type, and in exclusive mode
   anyone but the floor holder, as keep busy's switch does
-  (`agents/roomlerd/src/input/arbiter.rs:962`). Before, a view-only session
+  (`agents/roomlerd/src/input/arbiter.rs:994`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
   the control DC opens (`agents/roomlerd/src/peer.rs:1279`): the emitter
   starts before the channel does, so the snapshot it starts with found no
@@ -6935,6 +6935,35 @@ its own 401 would drop every device's DERP floor on one database
 wobble. The uploader's own 401 now waits out its 60 s backoff, as
 its doc always said. Before, it set that backoff and went straight
 back to its 5 s tick.
+
+**A batch never rides a connection the server is closing** (#4067).
+The uploader keeps one HTTP client for the life of the process, and
+its pool kept an idle connection for reqwest's default 90 s. The
+server closes an idle HTTP/1.1 connection after 30 s (#4018 measured
+it for the self-view client,
+[desktop-companion.md](desktop-companion.md#the-companions-side)),
+and a batch goes out on the first 5 s tick that finds lines queued.
+So a batch six ticks after the last one rode a connection idle for
+about 30 s, just as the server closed it, and one written in the last
+few tens of milliseconds before the server's FIN got no answer.
+Nothing was lost: the batch was kept and sent again after the
+backoff, one backoff late.
+
+| What | Where (`crates/agent-core/src/logs_upload.rs`) | Why |
+|---|---|---|
+| The pool drops a connection idle for 10 s | `POOL_IDLE_TIMEOUT` (`:123`), set by `client_builder` (`:421`); a const assertion (`:124`) holds it at 20 s or less | a third of the server's close, and the self-view client's value: a batch after a quiet spell dials a new connection, while a busy log's batches, one per tick, still share one |
+| A failed POST is not asked again at once | `post_batch` (`:429`), called once per flush (`:373`) | the batch is already kept and sent again after the backoff. A front that closes idle connections sooner than 10 s still costs a batch one backoff, as before |
+
+A failed send writes `logs upload error` at DEBUG (target
+`roomlerd::logs_upload`, the cause in `e`). The line reaches the
+on-disk log only, and only when `RUST_LOG` enables DEBUG for that
+target: the upload layer skips its own target. Tested by
+`a_connection_idle_past_the_pool_timeout_never_carries_a_batch`: the
+uploader's own client and `post_batch` against a raw keep-alive
+server that answers as ours does (201, and a body the uploader never
+reads). Two batches 50 ms apart share one connection, and one sent
+after a 2 s idle timeout dials a new one. CI runs it on Linux
+(`rust-unit`) and on Windows (`windows-overlay-clippy`).
 
 ### 19.2 Update-path hardening (0.1.51)
 

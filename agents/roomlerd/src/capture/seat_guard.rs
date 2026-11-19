@@ -20,8 +20,8 @@
 //! ⚠️ Fail CLOSED. A reading older than [`STALE`] (the watcher died, logind
 //! went away) is `Away`, and so is a seat logind cannot vouch for.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::WaitFor;
@@ -171,7 +171,11 @@ pub(crate) struct ViewingMark(bool);
 
 impl Default for ViewingMark {
     fn default() -> Self {
-        LIVE.fetch_add(1, Ordering::Relaxed);
+        // #4069 — the live edge, told after the count, so the input arbiter's
+        // next read of `live` sees it.
+        if goes_live(LIVE.fetch_add(1, Ordering::Relaxed)) {
+            tell_live(&ON_LIVE);
+        }
         Self(false)
     }
 }
@@ -193,6 +197,37 @@ impl Drop for ViewingMark {
     fn drop(&mut self) {
         self.set(false);
         LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// #4069 — what an automatic capture's live edge runs: the input arbiter sets
+/// it as it starts, and its warm-up then opens the automatic uinput as the
+/// capture goes live, ahead of the first event. The input side sets it, so
+/// this module calls no input code. It runs on the capture's thread, inside
+/// the open, which may have no tokio runtime, so it must never block or start
+/// anything. With no arbiter in the process (a recorder, a smoke command)
+/// nothing is set, and the edge tells nobody.
+pub(crate) type LiveHook = Box<dyn Fn() + Send + Sync>;
+
+static ON_LIVE: OnceLock<LiveHook> = OnceLock::new();
+
+/// #4069 — set what the live edge runs, once for the process: the input
+/// arbiter, as it starts.
+pub(crate) fn on_live(hook: LiveHook) {
+    let _ = ON_LIVE.set(hook);
+}
+
+/// #4069 — whether a capture that found `alive` automatic captures alive is
+/// the live edge: the first one alive, and only that one. [`live`] is a bool,
+/// which a second capture beside the first does not change.
+fn goes_live(alive: usize) -> bool {
+    alive == 0
+}
+
+/// #4069 — the live edge, told to the hook `on` holds, or to nobody.
+fn tell_live(on: &OnceLock<LiveHook>) {
+    if let Some(hook) = on.get() {
+        hook();
     }
 }
 
@@ -436,5 +471,54 @@ mod tests {
         drop(a);
         assert_eq!(VIEWING.load(Ordering::Relaxed), view0);
         assert_eq!(LIVE.load(Ordering::Relaxed), live0);
+    }
+
+    /// #4069 — the live edge is the first automatic capture alive, and only
+    /// that one: [`live`] reads a bool, which a second capture beside the
+    /// first does not change. Asked as a pure function, because `LIVE` is the
+    /// process's and other tests make marks.
+    #[test]
+    fn the_live_edge_is_the_first_automatic_capture_alive() {
+        assert!(goes_live(0));
+        assert!(!goes_live(1));
+        assert!(!goes_live(4));
+    }
+
+    /// #4069 — with no input arbiter in the process nothing set the hook, and
+    /// the live edge tells nobody: it returns, on a thread with no tokio
+    /// runtime, as a capture's may be. Once a hook is set, each edge runs it
+    /// once. And this module's code names no input code, so the edge can never
+    /// be the call that starts the arbiter, whose start needs a runtime
+    /// (`input::arbiter::global`).
+    #[test]
+    fn with_no_arbiter_the_live_edge_tells_nobody_and_needs_no_runtime() {
+        let told = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = told.clone();
+        let a_capture_thread = std::thread::spawn(move || {
+            let no_runtime = tokio::runtime::Handle::try_current().is_err();
+            tell_live(&OnceLock::new());
+            let set = OnceLock::<LiveHook>::new();
+            let _ = set.set(Box::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            }));
+            tell_live(&set);
+            no_runtime
+        });
+        assert!(
+            a_capture_thread.join().expect("the live edge panicked"),
+            "the thread had a runtime"
+        );
+        assert_eq!(told.load(Ordering::Relaxed), 1, "a set hook runs once");
+        // A Windows checkout has CRLF line ends.
+        let src = include_str!("seat_guard.rs").replace("\r\n", "\n");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        for (i, line) in code.lines().enumerate() {
+            let line = line.split("//").next().unwrap_or("");
+            assert!(
+                !line.contains("input::"),
+                "seat_guard.rs:{}: input code on the capture's side",
+                i + 1
+            );
+        }
     }
 }

@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux. The tests that write the real clipboard or change an X display skip unless opted in ([below](#tests-that-change-a-real-desktop-3813)) |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2968`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2970`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
@@ -281,7 +281,7 @@ and passes.
 
 | Opt-in | Tests | What they do | CI step that sets it |
 |---|---|---|---|
-| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4350`](../agents/roomlerd/src/clipboard.rs#L4350)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3560`](../agents/roomlerd/src/clipboard.rs#L3560)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1676`](../.github/workflows/ci.yml#L1676), [`:2141`](../.github/workflows/ci.yml#L2141)) |
+| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4350`](../agents/roomlerd/src/clipboard.rs#L4350)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3560`](../agents/roomlerd/src/clipboard.rs#L3560)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1676`](../.github/workflows/ci.yml#L1676), [`:2143`](../.github/workflows/ci.yml#L2143)) |
 | `ROOMLERD_TEST_X11=1` | `capture::pointer::x11_tests` ([`pointer.rs:325`](../agents/roomlerd/src/capture/pointer.rs#L325)), `capture::x11_cursor::x11_tests` ([`x11_cursor.rs:422`](../agents/roomlerd/src/capture/x11_cursor.rs#L422)) and `input::layout_x11`'s `x11_real_switch_round_trip` ([`layout_x11.rs:838`](../agents/roomlerd/src/input/layout_x11.rs#L838)), which until #3813 ran on any display they reached; and, from before, `indicator::x11`, `capture::xwayland_probe_tests`, `keep_busy::host_x11` and `virtual_desktop`'s X tests | move the pointer, set the root cursor, replace the layouts with `setxkbmap` and leave `us` behind, send XTest input, put a window up | the Xvfb step, "The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11" ([`ci.yml:1224`](../.github/workflows/ci.yml#L1224)) |
 
 - **The gate.** A real-clipboard test calls `clipboard::real_clipboard_opted_in` first
@@ -300,7 +300,7 @@ and passes.
 - **One test at a time (#3876).** Both runs of each step pass `--test-threads=1`, so that each
   grep finds its line whole. The runs without the opt-in are
   [`ci.yml:1344`](../.github/workflows/ci.yml#L1344),
-  [`:1682`](../.github/workflows/ci.yml#L1682) and [`:2149`](../.github/workflows/ci.yml#L2149).
+  [`:1682`](../.github/workflows/ci.yml#L1682) and [`:2151`](../.github/workflows/ci.yml#L2151).
   A skip line is one `eprintln!` of four pieces, the variable's name and the test's among them
   ([`clipboard.rs:2610`](../agents/roomlerd/src/clipboard.rs#L2610)). Stderr is not buffered,
   so each piece is a write of its own. On several threads, libtest prints a finished test's
@@ -334,7 +334,7 @@ and passes.
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
 | **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002). Since #3813 a step of its own follows the suite with `clipboard` added, so the suite builds and runs as before: the clipboard module without the opt-in, with a sentinel on the runner's clipboard that must survive, then the round trip with it ([above](#tests-that-change-a-real-desktop-3813)) |
-| **The desktop companion on Windows** (#3940, `ci.yml` job `windows-overlay-clippy`, step "The desktop companion on Windows — clippy + unit tests (#3940)", [`ci.yml:2001`](../.github/workflows/ci.yml#L2001)) | `cargo clippy -p roomler-desktop --all-targets -- -D warnings`, then `cargo test -p roomler-desktop --bins`, natively on Windows and with no features, as the release builds the companion. Before it no lane compiled the companion's `#[cfg(windows)]` code: its unit tests ran on Linux (step "Test the desktop companion (roomler-desktop)") and macOS only `cargo check`ed it. So a Windows-only error or lint first showed up in the release build: in the login start (the Run key), the service start's spawn with no inherited handles, the panels' capture exclusion or the machine-wide config path. The step sits beside the setup wizard's, in a job whose cache already holds the wizard's Tauri 2 tree; the companion's adds `tray-icon` and `protocol-asset`. The job's cache cap rose to 11,000 MB with it ([build-caches.md](build-caches.md#4-growth-control-the-accretion-gc)) |
+| **The desktop companion on Windows** (#3940, `ci.yml` job `windows-overlay-clippy`, step "The desktop companion on Windows — clippy + unit tests (#3940)", [`ci.yml:2003`](../.github/workflows/ci.yml#L2003)) | `cargo clippy -p roomler-desktop --all-targets -- -D warnings`, then `cargo test -p roomler-desktop --bins`, natively on Windows and with no features, as the release builds the companion. Before it no lane compiled the companion's `#[cfg(windows)]` code: its unit tests ran on Linux (step "Test the desktop companion (roomler-desktop)") and macOS only `cargo check`ed it. So a Windows-only error or lint first showed up in the release build: in the login start (the Run key), the service start's spawn with no inherited handles, the panels' capture exclusion or the machine-wide config path. The step sits beside the setup wizard's, in a job whose cache already holds the wizard's Tauri 2 tree; the companion's adds `tray-icon` and `protocol-asset`. The job's cache cap rose to 11,000 MB with it ([build-caches.md](build-caches.md#4-growth-control-the-accretion-gc)) |
 | **The Windows jobs' shell** (#3352, [`scripts/windows-shell-guard.sh`](../scripts/windows-shell-guard.sh)) | Every `ci.yml` job on a Windows runner runs its `run:` steps in bash, which GitHub starts with `-eo pipefail`, so a step stops at its first failing command. Under the runner's default pwsh the LAST native command decided a step: six steps ran `cargo clippy … -D warnings` and then `cargo test`, and a lint was printed while the step passed with the tests. The default is set per job, because a workflow-wide bash would add `pipefail` to every Linux step. A guard in `rust-lint` fails a Windows job that leaves it out, after it has refused a planted workflow. A step that needs PowerShell says `shell: pwsh` and checks `$LASTEXITCODE` after each native command, which is also the rule in the release and installer workflows, whose Windows steps are PowerShell by design |
 
 Known environmental failures (conference specs without forwarded RTC ports,
@@ -889,24 +889,25 @@ cascades and `--name` are hardware by construction, so they always ask.
 - **One thread, holding its clock.** Every cell opens, encodes and is dropped on one thread of the
   bench's own, the way a session's encoder lives on its thread (`encode::thread`). So a
   thread-affine encoder (QSV) never changes threads between frames. That thread asks for its
-  clock first, as a session's encoder thread does
+  clock first, once for every row, as a session's software encoder thread does
   ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1, P3), and on Linux the
   threads an encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic
   encoder down until its work fills the frame period: the same OpenH264 frame took 6 ms back to
   back and 16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the
   thread got: `clamped` (Linux), `qos-user-interactive` (macOS), `unthrottled` (Windows),
   `refused:<errno>` (on Linux, a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit), `off`
-  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS and Windows, where the request is
-  [opt-in](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
+  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS, where the request is
+  [off by default](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
   OS). A paced row well above its back-to-back twin, on a host that answered `off` or `refused`,
-  is the CPU's clock, not the encoder.
+  is the CPU's clock, not the encoder. ⚠️ On Windows a session's hardware encoder thread does not
+  ask, so read a hardware row there at `ROOMLERD_ENCODER_CLOCK=0`.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
 - ⚠️ **One frame rate to a comparison, one row to a process, and on Windows past 10 s.** At
   `--bench-fps 60` a frame carries half the motion of one at 30, so it costs less whatever the
   clock does: set a paced row against a back-to-back row at the same `--bench-fps`. On a hybrid
   Windows laptop a process runs at full speed for its first 3–4 seconds and at half speed after,
-  at any cadence, unless `ROOMLERD_ENCODER_CLOCK=1`. So a row that starts late in its process reads
+  at any cadence, if `ROOMLERD_ENCODER_CLOCK=0`. So a row that starts late in its process reads
   twice as slow for that reason alone, and an arm of 150 frames ends before most of it shows: use
   `--bench-frames 300` at 30 fps or 600 at 60
   ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
