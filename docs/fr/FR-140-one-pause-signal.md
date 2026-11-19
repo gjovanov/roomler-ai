@@ -159,7 +159,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
 
 - **[R] The hook.** FR-55 P4's `sleep_notice` listens on all three OSes (`agents/roomlerd/src/sleep_notice.rs:46-51`):
   logind's `PrepareForSleep` on Linux, which needs D-Bus (`portal-capture`, `:26`, part of `full`,
-  `agents/roomlerd/Cargo.toml:756`) and logind at run time; `PowerRegisterSuspendResumeNotification` on Windows;
+  `agents/roomlerd/Cargo.toml:761`) and logind at run time; `PowerRegisterSuspendResumeNotification` on Windows;
   IOKit's `IORegisterForSystemPower` on macOS. It starts only while one of FR-55's two switches is on (`start`,
   `sleep_notice.rs:534-550`), and only the control WS's reconnect hold reads it (`hold_while_asleep`, called at
   `signaling.rs:1206`).
