@@ -1914,7 +1914,7 @@ records for its mode. CI runs it in the "macOS post-install roads" job (`.github
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
 container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
-`depends` is short (`agents/roomlerd/Cargo.toml:951`), and every name in it backs
+`depends` is short (`agents/roomlerd/Cargo.toml:956`), and every name in it backs
 a library the binary links directly:
 
 | `Depends` | Why it reads this way |
