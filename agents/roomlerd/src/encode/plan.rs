@@ -85,6 +85,18 @@
 //!   consult the controller before it opens, and the pump now does on a
 //!   persisted transport flip (the field's other finding).
 //!
+//! # A rebuild opens at the plan (M3a.4)
+//!
+//! The next week (AC10, 2026-11-11 to 18) found inline opens built at a size
+//! or a rate the plan no longer held, each in a burst where full rebuilds and
+//! M2 dims swaps ran within a second of each other. The open's size came from
+//! M2's pin, and its rate from the controller's target before the pass's tick.
+//! So the pump now asks [`frame_step`] whether a frame is served, dropped or
+//! opened for, and an open is at the plan's target and geometry, never the
+//! pin's. [`open_rate`] ticks the controller first on every rebuild, as M3a.3
+//! did for the flip. [`dims_move`] is M2's own decision, beside them, so one
+//! test rig drives all three in the pump's order.
+//!
 //! # Knobs are read once
 //!
 //! Every env/config knob the inline arithmetic reads per frame
@@ -98,6 +110,7 @@ use super::policy::{self, DimsInputs};
 use super::rate_profile;
 use super::resample;
 use super::{PriorityCaps, aimd};
+use crate::peer::TargetResolution;
 
 /// FR-70 M3 — everything the media loop is allowed to know. Computed by
 /// [`produce`], published whole, read once at the top of a pass (M3b).
@@ -845,6 +858,188 @@ impl Shadow {
     pub(crate) fn stale_swaps(&self) -> u32 {
         self.stale_swaps
     }
+}
+
+/// FR-70 M3a.4: what a pass does with the frame it captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameStep {
+    /// The live encoder takes the frame, resampled to this target: M2's pin
+    /// while a replacement opens, the plan's own otherwise.
+    Serve(TargetResolution),
+    /// The frame is dropped and nothing opens: the live encoder cannot take
+    /// it, and either it cannot be brought to the plan's geometry or a cap
+    /// change is still reaching the capture.
+    Skip,
+    /// A new encoder opens for the frame resampled to this target, the plan's
+    /// own. Any replacement still opening is superseded.
+    Open(TargetResolution),
+}
+
+impl FrameStep {
+    /// The target the frame is resampled to; `None` when it is dropped.
+    pub(crate) fn target(self) -> Option<TargetResolution> {
+        match self {
+            FrameStep::Serve(target) | FrameStep::Open(target) => Some(target),
+            FrameStep::Skip => None,
+        }
+    }
+}
+
+/// FR-70 M3a.4: the facts [`frame_step`] decides from, read after the capture.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameFacts {
+    /// The frame's dims as captured: a backend may already have scaled it.
+    pub dims: (u32, u32),
+    /// Its native dims (`Frame::native_dims`).
+    pub native: (u32, u32),
+    /// The resampler can scale it (BGRA); any other frame passes through.
+    pub scalable: bool,
+    /// A keepalive re-fed the last real frame: nothing new was captured.
+    pub keepalive: bool,
+    /// The plan's target for this frame (`policy::plan_dims`).
+    pub plan_target: TargetResolution,
+    /// M2's pin: the target the live encoder was built for, while its
+    /// replacement opens in the background.
+    pub pinned: Option<TargetResolution>,
+    /// The live encoder's dims; `None` = no encoder.
+    pub encoder: Option<(u32, u32)>,
+}
+
+/// FR-70 M3a.4: what the pump may drop after a capture-cap change before a
+/// frame the live encoder cannot take opens an encoder at its own size. A
+/// backend applies a cap from its next capture, so a frame or two are still in
+/// flight at the old dims; and a backend that scaled its last capture under the
+/// old cap re-feeds that capture on every keepalive until it captures again.
+/// Refilled at every cap change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StaleBudget {
+    frames: u32,
+    keepalives: u32,
+}
+
+impl StaleBudget {
+    /// No cap change waiting: the session's start.
+    pub(crate) const SPENT: Self = StaleBudget {
+        frames: 0,
+        keepalives: 0,
+    };
+    /// A cap just changed. Three frames, as before M3a.4; and 25 keepalives,
+    /// about 1.5 s at the pump's 60 ms keepalive, for a keepalive that cannot
+    /// reach the plan's geometry. That is longer than DXGI-direct took to
+    /// capture again after a cap lifted to none (about 0.4 s in the AC10 week)
+    /// and than DRM's idle gate holds a capture back (`drm_idle::MAX_SKIP`,
+    /// 1 s), and well inside the viewer's keyframe probe, sent after 6 s with
+    /// no frames (`RC_STALL_PROBE_TICKS`): a wait with no bound left a capture
+    /// that never comes back with no encoder.
+    pub(crate) const FULL: Self = StaleBudget {
+        frames: 3,
+        keepalives: 25,
+    };
+}
+
+/// The dims `resample::apply_target_resolution` gives a frame of `dims`.
+fn resampled(dims: (u32, u32), scalable: bool, target: TargetResolution) -> (u32, u32) {
+    if scalable {
+        resample::target_dims(dims, target)
+    } else {
+        dims
+    }
+}
+
+/// FR-70 M3a.4: serve the frame to the live encoder, drop it, or open a new
+/// encoder for it. A new encoder opens at the plan's geometry for this frame
+/// (`resample::target_dims` of its native dims under the plan's target), with
+/// the frame resampled to the plan's target, never to M2's pin. So it opens at
+/// neither the capture's native size while the plan caps it, nor the pinned
+/// size of a swap the plan has moved past.
+///
+/// The AC10 week (2026-11-11 to 18) found both. An AMF host at its lock
+/// screen flapped between one display (DXGI) and the virtual screen (GDI)
+/// every few seconds: the pin was `Native`, so the GDI frame passed the
+/// resampler uncapped and the inline open built at the virtual screen's native
+/// size while the plan held a capped one. An NVENC laptop adopted a dims swap
+/// up to its native size on an idle screen; the keepalive re-fed the last real
+/// frame, scaled by the capture backend under the old cap, until the stale-skip
+/// budget ran out and an inline open built at the old size.
+///
+/// A frame that cannot be brought to the plan's geometry (scaled under a cap
+/// since raised; the resampler never upscales) is stale. A keepalive of one is
+/// a copy of an old capture and says nothing about what the capture delivers
+/// now, so it waits for a fresh capture out of an allowance of its own
+/// ([`StaleBudget::FULL`]). A real one, and a keepalive past that allowance,
+/// spend the frame budget, and past it open at their own size, so a backend
+/// that never delivers the plan's geometry still gets an encoder (and the
+/// shadow counts its dims). A frame that does reach the plan's geometry spends
+/// the frame budget only while a live encoder serves, as before M3a.4.
+pub(crate) fn frame_step(facts: &FrameFacts, budget: &mut StaleBudget) -> FrameStep {
+    let serve = facts.pinned.unwrap_or(facts.plan_target);
+    if facts.encoder == Some(resampled(facts.dims, facts.scalable, serve)) {
+        return FrameStep::Serve(serve);
+    }
+    let reach = resampled(facts.dims, facts.scalable, facts.plan_target);
+    let stale = reach != resample::target_dims(facts.native, facts.plan_target);
+    if stale && facts.keepalive && budget.keepalives > 0 {
+        budget.keepalives -= 1;
+        return FrameStep::Skip;
+    }
+    if (stale || facts.encoder.is_some()) && budget.frames > 0 {
+        budget.frames -= 1;
+        return FrameStep::Skip;
+    }
+    FrameStep::Open(facts.plan_target)
+}
+
+/// FR-70 M2: the dims swap to open in the background, decided from the plan:
+/// the plan's geometry for this frame and its target, when the live encoder
+/// was built for another target and is not at that geometry already. `None`
+/// keeps the live encoder.
+pub(crate) fn dims_move(
+    native: (u32, u32),
+    plan_target: TargetResolution,
+    built: TargetResolution,
+    encoder: (u32, u32),
+) -> Option<((u32, u32), TargetResolution)> {
+    let dims = resample::target_dims(native, plan_target);
+    (plan_target != built && dims != encoder).then_some((dims, plan_target))
+}
+
+/// FR-70 M3a.4: the rate an inline open builds its encoder at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenRate {
+    pub bps: u32,
+    /// The controller ticked for this pass before the open; the pass's own
+    /// tick is skipped, one tick a pass.
+    pub ticked: bool,
+}
+
+/// FR-70 M3a.4: a rebuild (the controller already holds a target, or a
+/// persisted transport flip dropped the encoder) ticks the controller first,
+/// under the ceiling of the dims it opens at, and opens at the target it hands
+/// out (`tick` runs the pass's tick and returns `applied_bps` after it). The
+/// controller therefore cannot move between the open and the first frame the
+/// encoder encodes: opened before the tick, a rung the tick crossed re-rated
+/// the new encoder at once, a second open on a rebuild-bound backend. The
+/// session's first open has no controller yet: it opens at the remembered
+/// seed under the ceiling, and the pass's tick builds the controller from it.
+pub(crate) fn open_rate(
+    applied_bps: u32,
+    seed_bps: Option<u32>,
+    ceiling_bps: u32,
+    flip_pending: bool,
+    tick: impl FnOnce() -> u32,
+) -> OpenRate {
+    let first = || seed_bps.map_or(ceiling_bps, |s| ceiling_bps.min(s));
+    if !flip_pending && applied_bps == 0 {
+        return OpenRate {
+            bps: first(),
+            ticked: false,
+        };
+    }
+    let bps = match tick() {
+        0 => first(),
+        target => target,
+    };
+    OpenRate { bps, ticked: true }
 }
 
 #[cfg(test)]
@@ -1638,5 +1833,433 @@ mod tests {
             rate_profile::hrd_pct_for("hevc_qsv", k.direct_hrd_pct),
             k.direct_hrd_pct
         );
+    }
+
+    // FR-70 M3a.4: a rebuild opens at the plan's current size and rate.
+
+    /// A frame as the capture hands it to the pump.
+    #[derive(Debug, Clone, Copy)]
+    struct Shot {
+        dims: (u32, u32),
+        native: (u32, u32),
+        keepalive: bool,
+    }
+
+    impl Shot {
+        /// A capture the backend did not scale (GDI, or no cap).
+        fn native(native: (u32, u32)) -> Self {
+            Shot {
+                dims: native,
+                native,
+                keepalive: false,
+            }
+        }
+
+        /// A capture by a backend that scales before the readback under the
+        /// pump's cap (DXGI-direct's VideoProcessor): exactly the box, unless
+        /// the box covers the frame.
+        fn scaled(native: (u32, u32), cap: Option<(u32, u32)>) -> Self {
+            let dims = match cap {
+                Some((w, h)) if !(w >= native.0 && h >= native.1) => (w, h),
+                _ => native,
+            };
+            Shot {
+                dims,
+                native,
+                keepalive: false,
+            }
+        }
+
+        /// The idle keepalive's re-feed of this capture.
+        fn again(self) -> Self {
+            Shot {
+                keepalive: true,
+                ..self
+            }
+        }
+    }
+
+    /// Passes a background open takes before the loop top adopts it.
+    const OPEN_PASSES: u32 = 3;
+
+    /// The ceiling a geometry plans: a stand-in for `policy::rate_plan`, since
+    /// these cells are about which geometry the ceiling is asked for.
+    fn ceiling_of((w, h): (u32, u32)) -> u32 {
+        (w * h * 8).clamp(3_000_000, 48_000_000)
+    }
+
+    /// The controller's tick: an additive step under the ceiling it is handed.
+    fn tick(applied: u32, ceiling: u32) -> u32 {
+        (applied + 450_000).min(ceiling)
+    }
+
+    /// An inline open, beside the plan it was opened under.
+    #[derive(Clone, Copy)]
+    struct Opened {
+        pass: usize,
+        dims: (u32, u32),
+        /// The plan's geometry for the frame it opened on.
+        plan_dims: (u32, u32),
+        /// The rung it opened at, and the plan's rung when its first frame
+        /// encodes (after the pass's tick).
+        rung: u32,
+        plan_rung: u32,
+    }
+
+    impl Opened {
+        fn on_plan(&self) -> bool {
+            self.dims == self.plan_dims && self.rung == self.plan_rung
+        }
+
+        fn describe(&self) -> String {
+            format!(
+                "pass {}: {:?} at {} where the plan held {:?} at {}",
+                self.pass, self.dims, self.rung, self.plan_dims, self.plan_rung
+            )
+        }
+    }
+
+    /// The FFmpeg DC pump's frame path a pass at a time, in its order and
+    /// through the functions it calls: the loop top adopts a finished
+    /// background open, the shadow produces the pass's plan, the capture, M2's
+    /// make-before-break ([`dims_move`]) and its pin, the backend cap and the
+    /// stale-skip budget it resets, [`frame_step`], an inline open at
+    /// [`open_rate`], the controller's tick, the shadow's judgment.
+    struct Rig {
+        shadow: Shadow,
+        /// The control plane's long-edge cap (the merged Priority cap).
+        cap: Option<u32>,
+        /// The native dims the last frame carried (`capture_native_dims`).
+        last_native: (u32, u32),
+        encoder: Option<(u32, u32)>,
+        built: Option<TargetResolution>,
+        pending: Option<Opening>,
+        backend_cap: Option<(u32, u32)>,
+        budget: StaleBudget,
+        applied: u32,
+        pass: usize,
+        opened: Vec<Opened>,
+    }
+
+    /// M2's background open, as `PendingDimsOpen` carries it.
+    #[derive(Clone, Copy)]
+    struct Opening {
+        dims: (u32, u32),
+        target: TargetResolution,
+        /// The plan it was spawned under.
+        spawned: Option<SwapSpawn>,
+        rate: u32,
+        /// Passes left until it has opened.
+        left: u32,
+    }
+
+    impl Rig {
+        /// A session mid-flight: an encoder at `encoder`, built for `built`,
+        /// the backend capped to it, and the controller at `applied`.
+        fn live(
+            cap: Option<u32>,
+            native: (u32, u32),
+            encoder: (u32, u32),
+            built: TargetResolution,
+            applied: u32,
+        ) -> Self {
+            Rig {
+                shadow: Shadow::default(),
+                cap,
+                last_native: native,
+                encoder: Some(encoder),
+                built: Some(built),
+                pending: None,
+                backend_cap: match built {
+                    TargetResolution::Native => None,
+                    TargetResolution::Fixed { width, height } => Some((width, height)),
+                },
+                budget: StaleBudget::SPENT,
+                applied,
+                pass: 0,
+                opened: Vec::new(),
+            }
+        }
+
+        fn inputs(&self, native: (u32, u32)) -> DimsInputs {
+            DimsInputs {
+                merged_priority_cap: self.cap,
+                ..dims(native.0, native.1)
+            }
+        }
+
+        fn step(&mut self, shot: Shot) -> FrameStep {
+            self.pass += 1;
+            if let Some(o) = self.pending.as_mut() {
+                o.left = o.left.saturating_sub(1);
+                if o.left == 0 {
+                    let o = *o;
+                    self.pending = None;
+                    self.encoder = Some(o.dims);
+                    self.built = Some(o.target);
+                    let _ = self
+                        .shadow
+                        .note_dims_swap_adopted(o.rate, o.dims, o.spawned);
+                }
+            }
+            let _ = self.shadow.produce(
+                &PlanInputs {
+                    target_bps: self.applied,
+                    dims: self.inputs(self.last_native),
+                    ..direct(CEIL, 100)
+                },
+                &knobs(),
+            );
+            self.last_native = shot.native;
+            let inline = self.inputs(shot.native);
+            let plan_target = policy::plan_dims(&inline).effective_target;
+            let plan_dims = resample::target_dims(shot.native, plan_target);
+            let _ = self.shadow.check_dims(plan_dims, &inline);
+            if let (Some(built), None, Some(encoder)) = (self.built, self.pending, self.encoder)
+                && let Some((dims, target)) = dims_move(shot.native, plan_target, built, encoder)
+            {
+                self.pending = Some(Opening {
+                    dims,
+                    target,
+                    spawned: self.shadow.swap_spawn(),
+                    rate: policy::replacement_open_bps(ceiling_of(dims), self.applied, None),
+                    left: OPEN_PASSES,
+                });
+            }
+            let pinned = self.pending.and(self.built);
+            let cap = match pinned.unwrap_or(plan_target) {
+                TargetResolution::Native => None,
+                TargetResolution::Fixed { width, height } => Some((width, height)),
+            };
+            if cap != self.backend_cap {
+                self.backend_cap = cap;
+                self.budget = StaleBudget::FULL;
+            }
+            let facts = FrameFacts {
+                dims: shot.dims,
+                native: shot.native,
+                scalable: true,
+                keepalive: shot.keepalive,
+                plan_target,
+                pinned,
+                encoder: self.encoder,
+            };
+            let step = frame_step(&facts, &mut self.budget);
+            let Some(target) = step.target() else {
+                return step;
+            };
+            let encoded = resample::target_dims(shot.dims, target);
+            let ceiling = ceiling_of(encoded);
+            let mut ticked = false;
+            if step == FrameStep::Open(target) {
+                let open = open_rate(self.applied, None, ceiling, false, || {
+                    self.applied = tick(self.applied, ceiling);
+                    self.applied
+                });
+                ticked = open.ticked;
+                self.encoder = Some(encoded);
+                self.built = Some(target);
+                self.pending = None;
+                self.shadow.note_built(open.bps, encoded);
+                self.opened.push(Opened {
+                    pass: self.pass,
+                    dims: encoded,
+                    plan_dims,
+                    rung: ladder(open.bps),
+                    plan_rung: 0,
+                });
+            }
+            if !ticked {
+                self.applied = tick(self.applied, ceiling);
+            }
+            let _ = self.shadow.after_tick(self.applied, ceiling);
+            if let (FrameStep::Open(_), Some(o)) = (step, self.opened.last_mut()) {
+                o.plan_rung = ladder(self.applied);
+            }
+            step
+        }
+
+        /// The inline opens built off the plan's size or rate, described.
+        fn off_plan(&self) -> Vec<String> {
+            self.opened
+                .iter()
+                .filter(|o| !o.on_plan())
+                .map(Opened::describe)
+                .collect()
+        }
+    }
+
+    /// (a) A full rebuild racing an M2 dims swap: in flight, and just adopted.
+    #[test]
+    fn a_rebuild_racing_a_dims_swap_opens_at_the_plan_s_size_and_rate() {
+        // In flight: the plan caps a 2560x1600 desktop at 1280 (a Priority cap),
+        // the replacement opens behind a `Native` pin, and the display mode
+        // switches to 1920x1200 before it lands. The plan for the new mode is
+        // 1280x800; the live encoder cannot take the frame.
+        let (n0, n1) = ((2560, 1600), (1920, 1200));
+        let mut flight = Rig::live(None, n0, n0, TargetResolution::Native, 9_100_000);
+        flight.cap = Some(1280);
+        flight.step(Shot::native(n0));
+        let spawned = flight.pending.is_some();
+        for _ in 0..8 {
+            flight.step(Shot::native(n1));
+        }
+        // Just adopted: an idle screen capped at 1920x1200 by the capture
+        // backend; the cap lifts, the swap to native is adopted, and only the
+        // keepalive's re-feed of the last capture arrives until the backend
+        // delivers a native frame.
+        let n = (2560, 1600);
+        let capped = Shot::scaled(n, Some((1920, 1200)));
+        let box_target = TargetResolution::Fixed {
+            width: 1920,
+            height: 1200,
+        };
+        let mut adopted = Rig::live(Some(1920), n, (1920, 1200), box_target, 9_100_000);
+        adopted.cap = None;
+        for _ in 0..12 {
+            adopted.step(capped.again());
+        }
+        adopted.step(Shot::native(n));
+
+        let off: Vec<_> = flight
+            .off_plan()
+            .into_iter()
+            .chain(adopted.off_plan())
+            .collect();
+        let opens = flight.opened.len() + adopted.opened.len();
+        assert!(
+            off.is_empty(),
+            "{} of {opens} rebuilds opened off the plan: {off:?}",
+            off.len()
+        );
+        // And the races ran: the cap opened a replacement, the mode switch
+        // under its pin took an inline open, and the swap to native was
+        // adopted and serves the native frame with nothing reopened.
+        assert!(spawned);
+        assert_eq!(flight.opened.len(), 1);
+        assert_eq!(flight.encoder, Some((1280, 800)));
+        assert_eq!(adopted.encoder, Some(n));
+        assert!(adopted.opened.is_empty());
+    }
+
+    /// (b) A rebuild racing a native-geometry flap: the capture flips between
+    /// one display (DXGI, scaling under the cap) and the virtual screen (GDI,
+    /// never scaled) every 5 s, under a cap that binds only the virtual screen.
+    #[test]
+    fn a_rebuild_through_a_native_geometry_flap_opens_at_the_plan_s_size_and_rate() {
+        let (display, virtual_screen) = ((1920, 1080), (3840, 1080));
+        let mut rig = Rig::live(
+            Some(2560),
+            display,
+            display,
+            TargetResolution::Native,
+            9_100_000,
+        );
+        // 10 passes a second, five 5-second phases.
+        for phase in 0..5 {
+            for _ in 0..50 {
+                let shot = if phase % 2 == 0 {
+                    Shot::scaled(display, rig.backend_cap)
+                } else {
+                    Shot::native(virtual_screen)
+                };
+                rig.step(shot);
+            }
+        }
+        let off = rig.off_plan();
+        assert!(
+            off.is_empty(),
+            "{} of {} rebuilds opened off the plan: {off:?}",
+            off.len(),
+            rig.opened.len()
+        );
+        // The flap forced a rebuild each time the virtual screen came back.
+        assert_eq!(rig.opened.len(), 2);
+    }
+
+    /// (c) A rate move during an encoder open: the controller's next target
+    /// crosses a rung from the one it held when the rebuild began.
+    #[test]
+    fn an_inline_open_is_built_at_the_rate_the_plan_holds_when_its_first_frame_encodes() {
+        // (the target before the pass, the controller's next): up over a rung,
+        // down under one, up from the 8 M rung, and one that holds its rung.
+        let moves = [
+            (22_300_000, 22_750_000),
+            (20_000_000, 17_000_000),
+            (9_000_000, 10_200_000),
+            (15_000_000, 15_400_000),
+        ];
+        let mut s = Shadow::default();
+        let mut off = Vec::new();
+        for (before, next) in moves {
+            let _ = s.produce(
+                &PlanInputs {
+                    target_bps: before,
+                    ..direct(CEIL, 100)
+                },
+                &knobs(),
+            );
+            let applied = std::cell::Cell::new(before);
+            let open = open_rate(before, None, CEIL, false, || {
+                applied.set(next);
+                next
+            });
+            if !open.ticked {
+                applied.set(next);
+            }
+            s.note_built(open.bps, (1920, 1200));
+            let _ = s.after_tick(applied.get(), CEIL);
+            let (rung, plan_rung) = (ladder(open.bps), ladder(applied.get()));
+            if rung != plan_rung {
+                off.push((before, next, rung, plan_rung));
+            }
+        }
+        assert!(
+            off.is_empty(),
+            "{} of {} rebuilds opened off the plan's rate (before, next, opened rung, plan rung): {off:?}",
+            off.len(),
+            moves.len()
+        );
+        assert_eq!(s.counts().bitrate, 0);
+    }
+
+    /// (d) A capture that never delivers the plan's geometry still gets an
+    /// encoder: a swap up to a larger box is adopted on a still screen, and the
+    /// backend, which scaled the last capture under the old box, captures
+    /// nothing new (DXGI-direct redelivers only on a cap lifted to none). The
+    /// keepalives wait about 1.5 s for the plan's geometry, then one opens at
+    /// its own size, as before M3a.4, and the encoder serves the rest: the
+    /// viewer's keyframe probe (after 6 s of no frames) is answered.
+    #[test]
+    fn a_capture_that_never_reaches_the_plan_s_geometry_still_gets_an_encoder() {
+        let n = (2560, 1600);
+        let old_box = TargetResolution::Fixed {
+            width: 1280,
+            height: 800,
+        };
+        let mut rig = Rig::live(Some(1280), n, (1280, 800), old_box, 9_100_000);
+        rig.cap = Some(1920);
+        let stale = Shot::scaled(n, Some((1280, 800))).again();
+        let mut dropped = 0;
+        for _ in 0..80 {
+            if rig.step(stale) == FrameStep::Skip {
+                dropped += 1;
+            }
+        }
+        // The swap opened and was adopted while the old encoder served.
+        assert_eq!(
+            rig.built,
+            Some(TargetResolution::Fixed {
+                width: 1920,
+                height: 1200
+            })
+        );
+        // One open, at the capture's own size, after a bounded wait.
+        let opens: Vec<_> = rig.opened.iter().map(|o| (o.pass, o.dims)).collect();
+        assert_eq!(opens.len(), 1, "opens (pass, dims): {opens:?}");
+        assert_eq!(opens[0].1, (1280, 800));
+        // 25 keepalives and then the 3 every cap change allows, 60 ms apart.
+        assert_eq!(dropped, 28);
+        assert_eq!(rig.encoder, Some((1280, 800)));
     }
 }

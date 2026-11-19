@@ -3285,20 +3285,20 @@ mod tests {
 
     /// A person's half: T1 primary (the root holds it), T2 (it does not), T3
     /// (it does).
-    fn goran() -> AgentConfig {
+    fn casey() -> AgentConfig {
         let mut p = cfg("t1", "user-1", "user-token");
         p.overlay_wg_secret_key = Some("wg-user".to_string());
         p.overlay_wg_key_epoch = 2;
         p.auto_grant_session = false;
-        p.orgs.push(org("jovanov", "t2", "user-2", "user-token-2"));
+        p.orgs.push(org("contoso", "t2", "user-2", "user-token-2"));
         p.orgs.push(org("third", "t3", "user-3", "user-token-3"));
         p
     }
 
     #[test]
     fn retired_where_the_root_holds_the_org_and_moved_where_it_does_not() {
-        let home = Path::new("/Users/goran");
-        let people = vec![person("goran", 501, home, Some(goran()))];
+        let home = Path::new("/Users/casey");
+        let people = vec![person("casey", 501, home, Some(casey()))];
         let plan = plan(&root(), &people).unwrap();
         let fates: Vec<(Option<&str>, &Fate)> = plan
             .items
@@ -3310,9 +3310,9 @@ mod tests {
             vec![
                 (None, &Fate::Retired),
                 (
-                    Some("jovanov"),
+                    Some("contoso"),
                     &Fate::Moved {
-                        label: "jovanov".to_string()
+                        label: "contoso".to_string()
                     }
                 ),
                 (Some("third"), &Fate::Retired),
@@ -3323,12 +3323,12 @@ mod tests {
         // The root's own enrollments are untouched, so its row keeps its node.
         assert_eq!(after.agent_id, "root-1");
         assert_eq!(after.agent_token, "root-token");
-        let moved = after.find_org("jovanov").unwrap();
+        let moved = after.find_org("contoso").unwrap();
         // Token, agent id and WireGuard key unchanged: the same row.
         assert_eq!(moved.agent_token, "user-token-2");
         assert_eq!(moved.agent_id, "user-2");
         assert_eq!(moved.tenant_id, "t2");
-        assert_eq!(moved.overlay_wg_secret_key.as_deref(), Some("wg-jovanov"));
+        assert_eq!(moved.overlay_wg_secret_key.as_deref(), Some("wg-contoso"));
         assert_eq!(moved.overlay_wg_key_epoch, 3);
         assert_eq!(moved.advertise_routes, vec!["192.168.7.0/24".to_string()]);
         assert_eq!(moved.overlay_mode, OrgOverlayMode::Off);
@@ -3360,9 +3360,9 @@ mod tests {
         theirs.overlay_wg_key_epoch = 4;
         theirs.ws_url = Some("wss://roomler.example/ws".to_string());
         let people = vec![person(
-            "goran",
+            "casey",
             501,
-            Path::new("/Users/goran"),
+            Path::new("/Users/casey"),
             Some(theirs),
         )];
         let plan = plan(&root, &people).unwrap();
@@ -3417,9 +3417,9 @@ mod tests {
         let mut theirs = cfg("t2", "user-2", "token");
         theirs.ephemeral = true;
         let people = vec![person(
-            "goran",
+            "casey",
             501,
-            Path::new("/Users/goran"),
+            Path::new("/Users/casey"),
             Some(theirs),
         )];
         let e = plan(&root(), &people).unwrap_err().to_string();
@@ -3427,7 +3427,7 @@ mod tests {
         // One the root holds is retired, ephemeral or not.
         let mut held = cfg("t1", "user-1", "token");
         held.ephemeral = true;
-        let people = vec![person("goran", 501, Path::new("/Users/goran"), Some(held))];
+        let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(held))];
         assert_eq!(plan(&root(), &people).unwrap().items[0].fate, Fate::Retired);
     }
 
@@ -3440,7 +3440,7 @@ mod tests {
     #[test]
     fn a_person_with_nothing_enrolled_is_left_alone() {
         let blank = AgentConfig::for_person_with_no_enrollment("Mac").unwrap();
-        let people = vec![person("goran", 501, Path::new("/Users/goran"), Some(blank))];
+        let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(blank))];
         let plan = plan(&root(), &people).unwrap();
         assert!(plan.items.is_empty());
         assert!(plan.people_after.is_empty());
@@ -3466,9 +3466,9 @@ mod tests {
             org: None,
         }];
         let people = vec![person(
-            "goran",
+            "casey",
             501,
-            Path::new("/Users/goran"),
+            Path::new("/Users/casey"),
             Some(theirs),
         )];
         let notes = plan(&root, &people).unwrap().notes.join("\n");
@@ -3480,7 +3480,7 @@ mod tests {
 
     #[test]
     fn without_enrollments_keeps_every_other_key() {
-        let mut theirs = goran();
+        let mut theirs = casey();
         theirs.rc_max_sessions = Some(2);
         theirs.privacy_mode_allowed = true;
         let stripped = without_enrollments(&theirs);
@@ -3544,44 +3544,44 @@ mod tests {
     #[test]
     fn one_row_is_connected_every_moved_org_and_a_worker_that_can_see_the_screen() {
         let full = worker(true, true, Some(&["screen-capture", "input"]));
-        let moved = vec!["jovanov".to_string()];
-        let ok = status(true, Some(full.clone()), &[("jovanov", true)]);
+        let moved = vec!["contoso".to_string()];
+        let ok = status(true, Some(full.clone()), &[("contoso", true)]);
         assert_eq!(missing(&ok, &moved), None);
         let cases = [
             (
-                status(false, Some(full.clone()), &[("jovanov", true)]),
+                status(false, Some(full.clone()), &[("contoso", true)]),
                 "not connected",
             ),
             (
-                status(true, Some(full.clone()), &[("jovanov", false)]),
-                "`jovanov` is not connected",
+                status(true, Some(full.clone()), &[("contoso", false)]),
+                "`contoso` is not connected",
             ),
             (
                 status(true, Some(full.clone()), &[]),
-                "`jovanov` is not running",
+                "`contoso` is not running",
             ),
-            (status(true, None, &[("jovanov", true)]), "does not report"),
+            (status(true, None, &[("contoso", true)]), "does not report"),
             (
                 status(
                     true,
                     Some(worker(false, true, Some(&["screen-capture"]))),
-                    &[("jovanov", true)],
+                    &[("contoso", true)],
                 ),
                 "does not run one row",
             ),
             (
-                status(true, Some(worker(true, false, None)), &[("jovanov", true)]),
+                status(true, Some(worker(true, false, None)), &[("contoso", true)]),
                 "no GUI worker",
             ),
             (
-                status(true, Some(worker(true, true, None)), &[("jovanov", true)]),
+                status(true, Some(worker(true, true, None)), &[("contoso", true)]),
                 "not announced",
             ),
             (
                 status(
                     true,
                     Some(worker(true, true, Some(&["input"]))),
-                    &[("jovanov", true)],
+                    &[("contoso", true)],
                 ),
                 "no Screen Recording grant (it reports: input)",
             ),
@@ -3648,7 +3648,7 @@ mod tests {
             1 => status(
                 true,
                 Some(worker(true, true, Some(&["screen-capture", "input"]))),
-                &[("third", true), ("jovanov", true)],
+                &[("third", true), ("contoso", true)],
             ),
             _ => status(true, Some(worker(false, false, None)), &[("third", true)]),
         }
@@ -3659,7 +3659,7 @@ mod tests {
             1 => status(
                 true,
                 Some(worker(true, true, Some(&["input"]))),
-                &[("third", true), ("jovanov", true)],
+                &[("third", true), ("contoso", true)],
             ),
             _ => one_row_daemon(kicks),
         }
@@ -3670,11 +3670,11 @@ mod tests {
     }
 
     impl Fake {
-        /// Root's file, and goran's (uid 501, at the console, his agent
+        /// Root's file, and casey's (uid 501, at the console, their agent
         /// loaded) with its plist.
         fn new(daemon: fn(u32) -> NodeStatus) -> Self {
             let home = FakeHome {
-                config: Some((toml_of(&goran()), 0o600)),
+                config: Some((toml_of(&casey()), 0o600)),
                 plist: Some((b"<plist/>".to_vec(), 0o644)),
                 ..FakeHome::default()
             };
@@ -3682,7 +3682,7 @@ mod tests {
                 root: BTreeMap::from([(RootFile::Config, toml_of(&root()))]),
                 strays: BTreeSet::new(),
                 homes: BTreeMap::from([(501, home)]),
-                accounts: BTreeMap::from([(501, account(501, "goran"))]),
+                accounts: BTreeMap::from([(501, account(501, "casey"))]),
                 said: Vec::new(),
                 calls: Vec::new(),
                 counts: HashMap::new(),
@@ -3744,7 +3744,7 @@ mod tests {
         fn converted_by_an_older_release(&mut self) {
             let h = self.homes.get_mut(&501).unwrap();
             h.legacy_config = h.config.take();
-            h.config = Some((toml_of(&without_enrollments(&goran())), 0o600));
+            h.config = Some((toml_of(&without_enrollments(&casey())), 0o600));
             h.legacy_plist = h.plist.take();
             self.loaded.clear();
         }
@@ -4086,7 +4086,7 @@ mod tests {
         assert!(root_now.macos_supervise_gui_worker && root_now.macos_one_row);
         assert_eq!(root_now.agent_token, "root-token");
         assert_eq!(
-            root_now.find_org("jovanov").map(|o| o.agent_token.as_str()),
+            root_now.find_org("contoso").map(|o| o.agent_token.as_str()),
             Some("user-token-2")
         );
         let home = &mac.homes[&501];
@@ -4122,7 +4122,7 @@ mod tests {
             &format!("DELETE {SERVER}/api/tenant/t3/agent/user-3"),
             "live sessions end",
             // C8: each child's pid, uid, verb, exit, time and identity.
-            "goran's one-row-home convert: pid 4242, uid 501, exit 0, 0.3 s, it ran as uid=501 \
+            "casey's one-row-home convert: pid 4242, uid 501, exit 0, 0.3 s, it ran as uid=501 \
              gid=20 groups=[20], stderr \"said\\u{7} this\"",
         ] {
             assert!(said.contains(want), "{want:?} in {said}");
@@ -4371,8 +4371,8 @@ mod tests {
         assert_eq!(mac.root_bytes(), root_before, "root's file is not written");
     }
 
-    /// T3: an earlier revert put root's file and goran's files back, removed
-    /// his record, and stopped.
+    /// T3: an earlier revert put root's file and casey's files back, removed
+    /// their record, and stopped.
     #[tokio::test]
     async fn a_revert_resumes_from_records_after_roots_file_is_back() {
         let mut mac = Fake::new(one_row_daemon).with_ana();
@@ -4404,7 +4404,7 @@ mod tests {
         convert_now(&mut mac).await.unwrap();
         mac.accounts.get_mut(&502).unwrap().uuid = "UUID-someone-else".to_string();
         // Renamed, the same account: given back.
-        mac.accounts.get_mut(&501).unwrap().name = "goran2".to_string();
+        mac.accounts.get_mut(&501).unwrap().name = "casey2".to_string();
         let e = revert_now(&mut mac).await.unwrap_err().to_string();
         assert!(e.contains("ana"), "{e}");
         assert!(
@@ -4428,7 +4428,7 @@ mod tests {
         convert_now(&mut mac).await.unwrap();
         mac.scripts.insert((501, "put-back"), Script::Exit(4));
         let e = revert_now(&mut mac).await.unwrap_err().to_string();
-        assert!(e.contains("goran"), "{e}");
+        assert!(e.contains("casey"), "{e}");
         assert_eq!(mac.homes[&502], before.1[&502]);
         assert_eq!(mac.counts.get("kickstart"), Some(&2));
         let record = |uid| RootFile::Person {
@@ -4486,7 +4486,7 @@ mod tests {
         let before = mac.files();
         let e = revert_now(&mut mac).await.unwrap_err().to_string();
         assert!(
-            e.contains("goran") && !e.contains("nothing to revert"),
+            e.contains("casey") && !e.contains("nothing to revert"),
             "{e}"
         );
         assert_eq!(mac.files(), before);
@@ -4523,7 +4523,7 @@ mod tests {
         };
         mac.root.get_mut(&stored).unwrap().push(b'#');
         let e = revert_now(&mut mac).await.unwrap_err().to_string();
-        assert!(e.contains("goran"), "{e}");
+        assert!(e.contains("casey"), "{e}");
         assert!(
             mac.said()
                 .contains("are not the ones its record.json names")
@@ -4586,7 +4586,7 @@ mod tests {
                 read.people[0].has_plist = true;
             }),
             ("R4", |_, read| {
-                read.people[0].config = Some(without_enrollments(&goran()));
+                read.people[0].config = Some(without_enrollments(&casey()));
                 read.people[0].seen.folder.uid = Some(0);
             }),
             ("R5", |mac, read| {
@@ -4619,10 +4619,10 @@ mod tests {
     #[test]
     fn the_digest_is_what_the_plan_does() {
         let people = vec![person(
-            "goran",
+            "casey",
             501,
-            Path::new("/Users/goran"),
-            Some(goran()),
+            Path::new("/Users/casey"),
+            Some(casey()),
         )];
         let said = plan(&root(), &people).unwrap();
         assert_eq!(
@@ -4631,10 +4631,10 @@ mod tests {
             "the same files make the same plan"
         );
         // Another enrollment in the person's file is another plan.
-        let mut more = goran();
+        let mut more = casey();
         more.orgs
             .push(org("fourth", "t4", "user-4", "user-token-4"));
-        let other = vec![person("goran", 501, Path::new("/Users/goran"), Some(more))];
+        let other = vec![person("casey", 501, Path::new("/Users/casey"), Some(more))];
         assert_ne!(
             plan_digest(&said),
             plan_digest(&plan(&root(), &other).unwrap())
@@ -4643,7 +4643,7 @@ mod tests {
         let mut holds = root();
         holds
             .orgs
-            .push(org("jovanov", "t2", "root-2", "root-token-2"));
+            .push(org("contoso", "t2", "root-2", "root-token-2"));
         assert_ne!(
             plan_digest(&said),
             plan_digest(&plan(&holds, &people).unwrap())
@@ -4931,7 +4931,7 @@ mod tests {
     /// #3846's printing tests pass; each failing alone gives the words.
     #[test]
     fn sudo_line_only_where_it_fits() {
-        let a = account(501, "goran");
+        let a = account(501, "casey");
         let mut l_roots = seen(501);
         l_roots.agents_dir = Entry {
             kind: Kind::Dir,
@@ -4947,19 +4947,19 @@ mod tests {
         };
         let line_for = |path: &str| {
             format!(
-                "goran is an administrator of this Mac and can run this, then run `sudo roomlerd \
-                 one-row` again:\n    sudo chown -h 'goran' '{path}'"
+                "casey is an administrator of this Mac and can run this, then run `sudo roomlerd \
+                 one-row` again:\n    sudo chown -h 'casey' '{path}'"
             )
         };
         let config_path = format!(
             "{}/config.toml",
-            folder_display("/Users/goran", Segment::Current)
+            folder_display("/Users/casey", Segment::Current)
         );
         for (target, base, path) in [
             (
                 Target::AgentsDir,
                 &l_roots,
-                "/Users/goran/Library/LaunchAgents".to_string(),
+                "/Users/casey/Library/LaunchAgents".to_string(),
             ),
             (Target::Config, &config_roots, config_path),
         ] {
@@ -5018,12 +5018,12 @@ mod tests {
             // #3846's printing tests: the name, and a path that would not
             // survive `sh -c "…"` or not display as it runs.
             let odd = Account {
-                name: "go ran".into(),
+                name: "ca sey".into(),
                 ..a.clone()
             };
             let words = chown_words(&odd, base, target, ADMIN_AT_CONSOLE, "root");
             assert!(!words.contains("sudo chown"), "{words}");
-            for home in ["/Users/go$ran", "/Users/go\u{202E}ran"] {
+            for home in ["/Users/ca$sey", "/Users/ca\u{202E}sey"] {
                 let odd = Account {
                     home: home.into(),
                     ..a.clone()
@@ -5056,10 +5056,10 @@ mod tests {
         let mut s = l_roots.clone();
         s.agents_dir.uid = Some(501);
         s.agents_dir.mode = Some(0o555);
-        let words = chown_words(&a, &s, Target::AgentsDir, ADMIN_AT_CONSOLE, "goran");
+        let words = chown_words(&a, &s, Target::AgentsDir, ADMIN_AT_CONSOLE, "casey");
         assert!(!words.contains("sudo chown"), "{words}");
         assert!(
-            words.contains("is goran's own (uid 501, mode 555)"),
+            words.contains("is casey's own (uid 501, mode 555)"),
             "{words}"
         );
     }
@@ -5070,7 +5070,7 @@ mod tests {
     /// fits.
     #[test]
     fn the_folder_refusals_print_move_asides_own_text() {
-        let a = account(501, "goran");
+        let a = account(501, "casey");
         let mut r2 = seen(501);
         r2.folder = Entry {
             kind: Kind::Dir,
@@ -5078,15 +5078,15 @@ mod tests {
             mode: Some(0o755),
             writable: false,
         };
-        let folder = folder_display("/Users/goran", Segment::Current);
+        let folder = folder_display("/Users/casey", Segment::Current);
         assert_eq!(
             folder,
-            "/Users/goran/Library/Application Support/live.roomler.roomler"
+            "/Users/casey/Library/Application Support/live.roomler.roomler"
         );
         let words = folder_words(&a, &r2, ADMIN_AT_CONSOLE, "root", "20261119T060000Z");
         assert!(
             words.starts_with(&format!(
-                "{folder} (a folder) belongs to root (uid 0, mode 755), not to goran."
+                "{folder} (a folder) belongs to root (uid 0, mode 755), not to casey."
             )),
             "{words}"
         );

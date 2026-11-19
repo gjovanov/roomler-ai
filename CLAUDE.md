@@ -457,9 +457,10 @@ Fixed-and-shipped issues live in `git log` and the docs.
   (`docs/code-signing.md` §7b). A hostile manifest can therefore withhold an update
   but not downgrade one. The tunnel CLI has been key-pinned since `tunnel-v0.4.149`.
 - **[MEDIUM]** [2026-04-17, FR-27] **Host consent**: every `PromptSurface` is
-  field-verified except the **macOS native panel**. On Wayland the native panel is X11
-  through Xwayland, with no stacking guarantee (#2286). Invariants:
-  `.claude/rules/remote-desktop.md`.
+  field-verified except the **macOS native panel**, which since #4053 sends a question
+  to the app when its root daemon cannot reach the screen (started before login, or
+  after a log-out); lab-pending. On Wayland the native panel is X11 through Xwayland,
+  with no stacking guarantee (#2286). Invariants: `.claude/rules/remote-desktop.md`.
 - **[LOW]** [2026-08-03] Overlay ACL is not field-proven under `enforce`. Flip a
   tenant to `warn` and read `rx_denied` first.
 - **[LOW]** [2026-04-20] NVENC `ActivateObject` fails with 0x8000FFFF on RTX 5090

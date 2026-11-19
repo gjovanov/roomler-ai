@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; **M3a.3 — the week's documented lags and first-tick re-rates counted apart, and two more genuine findings fixed (the flip's open at the old profile's rate, a superseded held target flushed after the controller moved on), 2026-10-28**, §"M3a.3"; M3b not built)
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; **M3a — the plan in SHADOW — built 2026-10-18**, §"M3a — as built"; **M3a.1 — stale replacements counted apart, and the shadow's first genuine finding (a dims replacement opened at the old frame's rate), 2026-10-21**, §"M3a.1"; **M3a.2 — that replacement opens at the ceiling of its own dims, 2026-10-21**, §"M3a.2"; **M3a.3 — the week's documented lags and first-tick re-rates counted apart, and two more genuine findings fixed (the flip's open at the old profile's rate, a superseded held target flushed after the controller moved on), 2026-10-28**, §"M3a.3"; **M3a.4: a full rebuild opens at the plan's current size and rate, also while an M2 dims swap is in flight (the 2026-11-18 week's two shapes), 2026-11-19**, §"M3a.4"; M3b not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -109,12 +109,12 @@ HUD does not render the two new `HopWindow`s yet.
 
 Anchors verified against master `b4d12871`.
 
-**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4642–7379`,
+**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4648–7388`,
 27 await points) runs on a tokio worker and does everything in one loop: the
-budget gate and rate applies (`:5700`, `:6576`, `:6611`, `:6630`, `:6881`), pacing
+budget gate and rate applies (`:5700`, `:6576`, `:6611`, `:6630`, `:6887`), pacing
 (`:5736`), capture (`:5750`, already a handoff to capture's own thread), the
 encoder open (`:6174`, a `spawn_blocking` since FR-65), keyframe requests
-(`:6263`, `:6276`, `:6285`, `:6866`), the background rebuild's adoption
+(`:6263`, `:6276`, `:6285`, `:6872`), the background rebuild's adoption
 (`:5347`, `adopt_rebuilt`), **the encode itself as
 `tokio::task::block_in_place(|| enc.encode_sync(&frame))` (`:6649`)**, and the
 hand-off to the dedicated send task (`:6782`). Scaling is inside the encoder
@@ -526,7 +526,7 @@ thread behind a command channel (`encode::thread`: `encode`, `set_bitrate`,
 `request_keyframe`, `adopt_rebuilt`, `rebuild_spec{,_at_dims}`, `rate_stats`,
 `with`), and a replacement is built on that thread while the current one keeps
 producing. What did **not** move is the deciding. `media_pump_ffmpeg_dc`
-(`agents/roomlerd/src/peer.rs:4761–7807`) still computes, inside the frame path:
+(`agents/roomlerd/src/peer.rs:4767–7817`) still computes, inside the frame path:
 
 | what it decides | where | reads |
 |---|---|---|
@@ -619,12 +619,12 @@ Anchors re-verified against master `fb7c3079e`; the pump is now
 **1. There is no control-plane task to publish from.** The design says the plan
 is "computed by the control plane, published whole… on the tokio task that
 already runs the viewer window". That task does not exist: `tick_viewer_window`
-is called at **`peer.rs:7084`, inside the frame loop**, and self-limits to once
+is called at **`peer.rs:7090`, inside the frame loop**, and self-limits to once
 per `VIEWER_WINDOW` by returning `None`. M1 moved the ENCODER to its own thread;
 it did not move the deciding off the frame path, which is what M3 is for. So M3
 does not *publish across* an existing seam — it has to **create** the seam.
 
-**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7323`), not once per
+**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7331`), not once per
 window. A `Plan.bitrate_bps` recomputed per window therefore changes the
 rate-update cadence, which contradicts M3's own claim that "a plan whose fields
 are computed exactly as the pump computes them today produces byte-identical
@@ -701,6 +701,7 @@ inline one and compared, never read.
 | phase | what | kill switch | gate |
 |---|---|---|---|
 | **M3a** | `encode::plan`: the `Plan`, a pure producer, and a frame-cadence shadow comparison in `media_pump_ffmpeg_dc`; heartbeat `plan_divergences` + `plan_epoch` | **none, on purpose** — the shadow changes no decision, takes no await, adds no env read to the frame path, and logs at most seven lines per session; a switch would be the twelfth of the kill switches this FR exists to delete (AC4), guarding nothing | `plan_divergences` reads **zero on every field, fleet-wide**, over a week of sessions on the release carrying it; a non-zero field is a named, measured bug in the plan, fixed before M3b |
+| **M3a.4** | a full rebuild of `media_pump_ffmpeg_dc` opens at the plan's current size and rate, also while an M2 dims swap is in flight: `encode::plan::frame_step` serves, drops or opens for each frame, and an open is at the plan's target, never M2's pin; a keepalive of a capture scaled under a cap since raised waits for a fresh capture, about 1.5 s at most; `encode::plan::open_rate` ticks the controller first on every rebuild. Cells (a) `a_rebuild_racing_a_dims_swap_opens_at_the_plan_s_size_and_rate`, (b) `a_rebuild_through_a_native_geometry_flap_opens_at_the_plan_s_size_and_rate`, (c) `an_inline_open_is_built_at_the_rate_the_plan_holds_when_its_first_frame_encodes`, (d) `a_capture_that_never_reaches_the_plan_s_geometry_still_gets_an_encoder`, §"M3a.4" | none: it changes the size and rate an open takes and removes opens; the alarm is the shadow's own `dims` and `bitrate` fields, which judge every inline open | AC10's week read again on the release that carries it, bounded at both ends with the `remote_sessions` denominator: every `plan_divergences` field zero, and no full rebuild at a size or rate the plan had left |
 
 **The plan** (`agents/roomlerd/src/encode/plan.rs:70`): `bitrate_bps`, `dims`,
 `fps`, `queue_budget_bytes`, `queue_lag_bound_ms`, `epoch` as designed, plus
@@ -752,7 +753,7 @@ was:
 | `dims` | `policy::plan_dims` over the merged target, the merged dial cap, the slow-link cap, the refine state and the soft cap, reduced by `resample::target_dims`; `(0, 0)` before the first frame, when the native dims are unknown |
 | `bitrate_bps` | the governor's standing target — **the one input that is itself a decision the plan does not own yet.** The controller is stateful and ticks inside the pass; a shadow cannot tick it twice, and running a second governor is M4's "one controller", not M3. See the `bitrate` check below for what the shadow CAN prove about the rate |
 
-**Where the snapshot is taken, and why there** (`peer.rs:7478`, the block
+**Where the snapshot is taken, and why there** (`peer.rs:7487`, the block
 above it): once per pass, after the swap adoption and the transport recheck and
 before the byte gate — the point where M3b's loop will READ the plan. The inputs
 are the facts the pump has at that instant: the native dims from the atomic
@@ -772,7 +773,7 @@ value`, `peer.rs:9538`):
 
 | field | the plan's value vs | at | `plan.rs` |
 |---|---|---|---|
-| `budget`, `hard_budget`, `lag_bound` | the pump's `queue_budget`, `hard_budget`, and the lag bound its gate used (`(b, b, 0)` on a constrained path) | the gate, every pass (`peer.rs:7570`) | `check_budget` `:405` |
+| `budget`, `hard_budget`, `lag_bound` | the pump's `queue_budget`, `hard_budget`, and the lag bound its gate used (`(b, b, 0)` on a constrained path) | the gate, every pass (`peer.rs:7579`) | `check_budget` `:405` |
 | `gate` | the plan's triple through `direct_gate_trips` vs the verdict the pump's two arms reached from the same `inflight_now` and `measured_wait_ms` | the gate, every pass (`:7520`) | `check_gate_verdict` `:435` |
 | `fps` | `governor.paced_fps().unwrap_or(target_fps)` | the pacer, every pass that reaches it (`:7627`) | `check_fps` `:457` |
 | `dims` | `resample::target_dims(frame.native_dims(), plan_target)` — pin-independent | after capture, every frame (`:7942`); skipped while the plan has no geometry | `check_dims` `:468` |
@@ -940,7 +941,7 @@ viewer's Fit mode and the stage shrunk below the DPR-1.5 native box:
 | 11:03:04 | Priority Balanced → Smoother | `rc:priority updated`; no geometry move on a direct path with the dial's dims caps at their default (off); no divergence |
 
 **The plan held** through that 4 ms open — this is not a stale adoption. The dims
-replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8676`): the
+replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8688`): the
 **old** 1600×900 frame's ceiling and the applied 22.95 M, the 25 M rung. The plan
 already aimed at 1050×590. The controller's first tick after adoption clamped the
 target to the smaller frame's ceiling — 9.87 M, which is 0.43 × 23 M, the pixel
@@ -976,19 +977,19 @@ been lost.
 
 - `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
-  is now `(handle, spawn)` (`peer.rs:7683`), and `PendingDimsOpen` gains a fifth
-  field (`peer.rs:8703`).
+  is now `(handle, spawn)` (`peer.rs:7692`), and `PendingDimsOpen` gains a fifth
+  field (`peer.rs:6808`).
 - At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7634` and
-  `:7020`) asks one question: **did the plan move while it opened?**
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7643` and
+  `:7026`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
     controller's first target after adoption (`after_tick`, `plan.rs:527`).
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:10136`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:10203`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:10138`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:10205`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
@@ -1095,7 +1096,7 @@ sequenceDiagram
 | Where | What |
 |---|---|
 | `policy::replacement_open_bps` (`policy.rs:211`) | the applied rate (or, before the controller has applied one, the remembered seed), never above the ceiling of the dims the replacement is opened FOR |
-| the dims spawn (`peer.rs:8676`, the rate at `:8713`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8840`–`8230`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
+| the dims spawn (`peer.rs:8688`, the rate at `:8721`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8846`–`8230`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
 | `CeilingLearner::ceiling_for` (`ceiling_learn.rs:138`), `RateGovernor::ceiling_for` (`governor.rs:643`) | asks the learner instead of telling it: `effective_ceiling` without recording the nominal, so the learner's judgements stay on the frame actually encoded. `effective_ceiling` now delegates to it, so the two cannot drift |
 
 - **A move up changes nothing.** The applied rate already sits under the old
@@ -1192,7 +1193,7 @@ carried at least one divergence, in **66 first-divergence lines: 41 `dims`, 25
 | **D1** | FR-108's display match switched the host's mode under the live session, so the capture reopened at a new native. The plan's native dims are the LAST frame's, read from `capture_native_dims` at the top of the pass | #1, #6, #14, #15, #16, #19, #26 | "a native-dims change under a live session": a documented lag |
 | **D2** | an `rc:resolution` landed between the plan's snapshot and the inline read (#9: the update at `.341`, the divergence at `.346`) | #9, #25 | "a target_resolution write landing between the snapshot and the inline read": a documented lag |
 | **D3** | a follower joined a shared pipeline, so the merged target moved between the two reads | #7, #24 (its `dims` line) | the same lag class, through the merge |
-| **B1** | a persisted transport flip dropped the encoder. The inline open ran at `ceiling.min(applied_bps)`, and `applied_bps` was still the OLD profile's target. The same pass's tick, under the new ceiling, re-rated it: a second open on QSV | #10, #23 | **a genuine defect**: it breaks the open-rate comment's own claim (`peer.rs:8679`) |
+| **B1** | a persisted transport flip dropped the encoder. The inline open ran at `ceiling.min(applied_bps)`, and `applied_bps` was still the OLD profile's target. The same pass's tick, under the new ceiling, re-rated it: a second open on QSV | #10, #23 | **a genuine defect**: it breaks the open-rate comment's own claim (`peer.rs:8691`) |
 | **B2** | a rate replacement adopted while the plan held, then a congestion decrease on the controller's very next tick (#18: 16 M adopted, 2 M one tick later) | #2, #4, #5, #18, #22 | M3a.1's stale adoption, one tick later |
 | **B3** | a session that started relayed held its first target (1.5 M) under the relay's IDR thrift. Relay-escape lifted the clamp, and the next target (2 M) went out through the direct background swap, which left the old hold in place. Two seconds of quiet later the hold was flushed: a third encoder at 1.5 M, re-rated to 2 M on its first tick | #24 (its `bitrate` line, 17:49:08–17:49:16) | **a genuine defect**: a superseded target applied after the controller moved on |
 
@@ -1235,12 +1236,12 @@ flowchart TD
 | Where | What |
 |---|---|
 | `DimsInputs` gains `PartialEq` (`policy.rs:42`) | the shadow compares the inputs it was produced from with the ones the inline arithmetic read |
-| `Shadow::check_dims` takes the inline inputs (`plan.rs:604`), the pump passes them (`peer.rs:8533`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:375`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8500`), so the plan dims and the check read the same struct |
-| `Shadow::note_built` (`plan.rs:660`) | an inline open records whether it was built from moved inputs, so its dims at the tick are a lag too, not a divergence |
-| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9624`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
-| the heartbeat (`peer.rs:10244`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:10389`; `log_plan_lag`, `peer.rs:10413`) |
-| the flip's open (`flip_rebuild_pending`, `peer.rs:6636`, set at `:7768`; the open at `:8954`; the pass's tick at `:9473`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
-| the tick's direct background-swap arm (`peer.rs:9492`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:8163`; the send overflow, `:9933`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
+| `Shadow::check_dims` takes the inline inputs (`plan.rs:617`), the pump passes them (`peer.rs:8545`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:388`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8512`), so the plan dims and the check read the same struct |
+| `Shadow::note_built` (`plan.rs:673`) | an inline open records whether it was built from moved inputs, so its dims at the tick are a lag too, not a divergence |
+| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:696`, `peer.rs:9624`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:735`) |
+| the heartbeat (`peer.rs:10246`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:10391`; `log_plan_lag`, `peer.rs:10415`) |
+| the flip's open (`flip_rebuild_pending`, `peer.rs:6645`, set at `:7778`; the open at `:8959`; the pass's tick at `:9473`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
+| the tick's direct background-swap arm (`peer.rs:9492`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:8174`; the send overflow, `:9934`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
 
 - **Why only a replacement can be a stale tick.** The inline open runs in the
   same pass as the tick, so the loop can consult the controller before it
@@ -1373,6 +1374,138 @@ contain — a geometry dims swap on a QSV host and a Priority move on a relay
 it; the headless Linux hosts are `vaapi`). M3b does not start before the week
 holds.
 
+## M3a.4: a full rebuild opens at the plan's size and rate (2026-11-19)
+
+Anchors verified against branch `fr70-m3a4-rebuild` (master `58e0c603f` plus
+this change). An anchor marked "master" is to `58e0c603f`, before the change.
+
+### What the week found
+
+The week's read went red. It covered the sessions created from 2026-11-11
+00:51Z to 2026-11-18 00:36Z: **5 of 177 FFmpeg DC sessions diverged** (95,685
+heartbeats), all on agents 0.4.216 to 0.4.218. Each divergence came in a burst
+where full rebuilds and M2 dims swaps ran within a second of each other, and in
+each burst an encoder was built at a size or a rate the plan no longer held.
+M3a.3 counts a moved input apart as a lag, so under this spec's own rule each
+one is a bug.
+
+| Shape | What happened | Why (master) |
+|---|---|---|
+| **S1**, an AMF host at its lock screen (4 sessions) | the capture flapped between DXGI (one display) and GDI (the virtual screen) about every 5 s. Full rebuilds opened at the virtual screen's uncapped native size while the plan held a capped size, and an M2 dims swap followed. First-divergence lines: 3 `dims`, 2 `bitrate` (an encoder built at 20 Mbit/s where the plan said 25, one at 16 where it said 20) | the move to GDI moved the plan to a capped box, and M2 opened a replacement at it behind the live encoder's `Native` pin (`peer.rs:8810-8813`). Under that pin the GDI frame passed the resampler unscaled (`:8866-8870`) and fit neither encoder, so with no stale-skip budget left (`:8948-8955`) the inline open built at the frame's native size (`:9043`), set `built_target` to the pin (`:9147`) and dropped the replacement opening at the plan's size (`:9148`). The next pass swapped again. The same open was rated before the pass's tick (`:8984-8992`), and the tick then ran under that uncapped frame's ceiling and area floor (`:8914-8929`, `encode/aimd.rs:203-208`) and moved the target a rung, so the shadow judged the open off the plan's rate |
+| **S2**, an NVENC laptop (1 session) | an encode-bound cap relaxed on an idle screen, and 0.3 s after the M2 swap to the native 2560x1600 was adopted, a full rebuild opened at the old 1920x1200; the rebuild after it opened at 2560x1600 | the 60 ms keepalive re-fed the last real frame, which DXGI-direct had scaled to 1920x1200 under the old cap (`system_context/dxgi_direct.rs:742-790`); the resampler never upscales (`encode/resample.rs:446-449`). The adoption lifted the cap, which reset the stale-skip budget to 3 (`peer.rs:8825-8829`); the keepalives spent it, and the next one took the inline open at 1920x1200. The native frame that the lift's duplication recycle redelivers (`dxgi_direct.rs:1179-1185`) then forced a second open |
+
+Releases 0.4.219 to 0.4.224 then read zero over 98 sessions, which is not a
+fix: `encode/plan.rs` did not change from 0.4.216 to 0.4.224, no pump commit
+between them names the rebuild or the swap, and no AMF session ran in that
+window.
+
+### The change
+
+One rule: **an inline open is built at the plan's current target and geometry,
+at the rate the controller hands out when its first frame encodes.** M2's pin
+exists so the live encoder can be served while its replacement opens. An inline
+open replaces that encoder and supersedes that replacement, so the pin
+describes an encoder that is going away, and it no longer decides anything
+about the open.
+
+```mermaid
+flowchart TD
+  F["a captured frame, or a keepalive's re-feed"] --> SV{"does the live encoder take it,<br/>resampled to M2's pin or else the plan's target?"}
+  SV -->|yes| SERVE["serve it, as before"]
+  SV -->|no| RE{"can it reach the plan's geometry?<br/>the resampler never upscales"}
+  RE -->|"no, a real frame; or yes, with an encoder live"| BU{"frame budget left?<br/>3, refilled at each cap change"}
+  RE -->|"no, and it is a keepalive"| KA{"keepalive allowance left?<br/>25, about 1.5 s, refilled with it"}
+  KA -->|yes| WAIT["drop it, spend one (S2)"]
+  KA -->|no| BU
+  BU -->|yes| SKIP["drop it, spend one"]
+  BU -->|no| OPEN
+  RE -->|"yes, and no encoder"| OPEN["open for the frame resampled to the PLAN's target (S1)<br/>tick the controller first and open at its target<br/>a replacement still opening is superseded"]
+```
+
+| Where | What |
+|---|---|
+| `encode::plan::frame_step` (`plan.rs:974`), called before the resample (`peer.rs:8858`) | serve, drop or open, from the frame's dims and native dims, whether the resampler can scale it, whether it is a keepalive, the plan's target, M2's pin and the live encoder's dims (`FrameFacts`, `plan.rs:890`). A frame the live encoder takes is served as before. An open is `FrameStep::Open` with the plan's target (`plan.rs:865`), and the frame is resampled to it (`peer.rs:8883`), never to the pin: **S1's fix** |
+| the stale rule inside it, and `encode::plan::StaleBudget` (`plan.rs:915`), refilled at each cap change (`peer.rs:8819`) | a frame that cannot reach the plan's geometry (scaled under a cap since raised) is stale. A keepalive of one is a copy of an old capture and says nothing about what the capture delivers now, so it waits for a fresh capture out of an allowance of its own: 25 keepalives, about 1.5 s at the pump's 60 ms keepalive (`StaleBudget::FULL`, `plan.rs:934`). **S2's fix.** That is longer than DXGI-direct took to capture again after S2's cap lift (about 0.4 s) and than DRM's idle gate holds a capture back (1 s, `capture/drm_idle.rs:48`), and well inside the viewer's keyframe probe after 6 s with no frames (`ui/src/composables/useRemoteControl.ts:321`). A real stale frame, and a keepalive past its allowance, spend the three-frame budget and, past it, open at their own size, as before M3a.4, so a backend that never delivers the plan's geometry still gets an encoder and the shadow counts its dims. A frame that does reach the plan's geometry spends the budget only while an encoder is live, as before. A dropped frame pauses the frame-rate state and goes round (`peer.rs:8870`) |
+| `encode::plan::open_rate` (`plan.rs:1024`), at the open (`peer.rs:8959`) | every rebuild ticks the controller first, with the pass's own arguments under the ceiling of the dims it opens at, and opens at what it hands out; the pass's own tick is then skipped (`peer.rs:9473`). M3a.3 did this for a persisted flip only. The session's first open has no controller yet, and still opens at the remembered seed under the ceiling (FR-59 P8). A target held for the old encoder is cleared, as on the flip: the open supersedes it |
+| `built_target` (`peer.rs:9132`) | the plan's target the encoder was opened for, so the pin and the capture cap follow the plan from the next pass |
+| `encode::plan::dims_move` (`plan.rs:996`, called at `peer.rs:8709`) | M2's own decision, unchanged, moved out of the pump beside the two above, so one rig drives all three in the pump's order |
+
+- **Why the plan and not the pin.** Built at the pin, an inline open is at the
+  size of the encoder it replaces or, with a `Native` pin, at whatever the
+  capture delivered: S1's virtual screen. Built at the plan, it is at the size
+  the replacement it supersedes was opening for.
+- **Why tick first.** The open's rate and the plan's rate meet only when the
+  controller cannot move between the open and the open's first frame. Ticked
+  after the open, a rung crossed on that tick re-rated the new encoder at once,
+  a second open on a rebuild-bound backend. It also opens at the controller's
+  target rather than `ceiling.min(target)`: where the controller's floor lifts
+  it over the frame's ceiling (`aimd.rs:188-193`), the next tick would apply that
+  target anyway.
+- **What it costs, or still does.** (1) After an M2 swap to a larger geometry
+  is adopted on a still screen, on a backend that scaled the last frame and
+  does not capture again, the keepalives wait out their allowance and the frame
+  budget (28 of them, about 1.7 s, with nothing encoded), and then one opens an
+  encoder at the old size, as on master, which the shadow counts as a `dims`
+  divergence. DXGI-direct captures again only when a cap is lifted to none
+  (`dxgi_direct.rs:1179-1185`), so a cap raised to a larger box at rest is that
+  case: a Priority move that raises the cap, an encode-bound tier relaxed to a
+  box below native, or an idle refine bounded by `idle_refine_max_edge`. The
+  viewer keeps its picture through the wait. FR-135's ledger carries it as
+  `m3a4:STALE-1`, to retire when a growing cap makes the backend capture again.
+  (2) S1 still opens three encoders a flap cycle
+  where master opened four: on the pass the GDI frame arrives, M2 still opens a
+  replacement toward the plan's geometry, and the inline open on the same pass
+  supersedes it. (3) A dropped frame no longer runs what follows the resample:
+  the resample, `encoded_dims`, the learner's nominal (`effective_ceiling`,
+  `encode/governor.rs:662`) and `last_ceiling_bps`. None of those describes a
+  frame that was not encoded.
+- **No kill switch**, for M3a.3's reason: the change picks which size and rate
+  an open takes and removes opens, and the alarm for a regression is the
+  shadow's own `dims` and `bitrate` fields, which judge every inline open at
+  the tick after it. The pump lost 15 lines (`pump_lines_ffmpeg_dc` 3903 to
+  3888).
+
+### Verification
+
+- **`encode::plan`, four cells, through one rig** (`Rig`, `plan.rs:1928`). It
+  runs a pass in the pump's order through the functions the pump calls: the
+  loop top's adoption, the shadow's plan, M2's `dims_move` and its pin, the
+  backend cap and the budget it refills, `frame_step`, `open_rate`, the
+  controller's tick and the shadow's judgment. Cells (a) to (c) assert the
+  rule: every open's size and rung equal the plan's when its first frame
+  encodes. Cell (d) asserts its one exception's bound.
+
+| cell | holds | red: master's arithmetic | green |
+|---|---|---|---|
+| (a) `a_rebuild_racing_a_dims_swap_opens_at_the_plan_s_size_and_rate` (`plan.rs:2094`) | a full rebuild racing a dims swap: a display-mode switch while a swap toward a Priority cap opens, and an idle screen's keepalives after a swap up to native is adopted | **2 of 3** opens off the plan: 1920x1200 where the plan held 1280x800, and 1920x1200 where it held 2560x1600 | 1 open, on the plan; the adopted swap serves the next native frame with nothing reopened |
+| (b) `a_rebuild_through_a_native_geometry_flap_opens_at_the_plan_s_size_and_rate` (`plan.rs:2149`) | DXGI's one display against GDI's virtual screen, flipping every 5 s under a cap that binds only the virtual screen | **2 of 2** opens at 3840x1080 where the plan held 2560x720 | 2 opens, both on the plan |
+| (c) `an_inline_open_is_built_at_the_rate_the_plan_holds_when_its_first_frame_encodes` (`plan.rs:2183`) | a rate move during an open: the controller's next target crosses a rung up, down, from the bottom, or holds | **3 of 4** opens off the plan's rung | 4 of 4 on it, and the shadow's `bitrate` field reads 0 |
+| (d) `a_capture_that_never_reaches_the_plan_s_geometry_still_gets_an_encoder` (`plan.rs:2234`) | a swap up to a larger box adopted on a still screen whose backend never captures again: the keepalives wait a bounded time, then an encoder opens | with the keepalive's wait unbounded (this change's first form): **0 opens** in 80 keepalives (4.8 s), past the viewer's keyframe probe | 1 open, at the capture's own size, after 28 drops (about 1.7 s), and the encoder serves the rest |
+
+The red column of (a) to (c) ran the same cells with `frame_step` and
+`open_rate` holding master's inline arithmetic (the pin, the resample, the
+budget and the open rate at `peer.rs:8810-8813`, `:8866-8870`, `:8933-8955`
+and `:8969-8992`, master): neither function exists on master, so there is no
+other way to run them against it. Cell (d) guards the keepalive's allowance,
+so its red ran against the form of this change that dropped such a keepalive
+with no bound; on master's arithmetic it opens after 3 drops. The other 25
+`encode::plan` tests pass unchanged.
+
+- ⚠️ **No unit test reaches the pump's call sites.** The cells drive the
+  functions it calls, in its order; that it calls them there is read from the
+  diff, and the field verifies it.
+
+### For the gate (AC10)
+
+The week restarts on the release that carries M3a.4, read as §"M3a.3" set it:
+bounded at both ends, with the `remote_sessions` denominator, every
+`plan_divergences` field at zero. Owed with it: each shape driven on that
+release after failing on the one before it (S2 is drivable on a DXGI-direct
+host with an idle screen: lift a cap to native, and read for an inline open at
+the old size after the adoption; S1 needs an AMF host at a lock screen with
+nobody at it), and what §"The restarted week" still owes: B3's driven green and
+the two driven moves. M3b does not start before the week holds.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -1444,7 +1577,11 @@ holds.
       week, 46 of 46 FFmpeg DC sessions on 0.4.182–187 read zero on every field
       (the fleet is wholly on 0.4.187); the M3a.2 and B1 green checks the gate
       was owed are met, B3's and two driven moves are still owed, and the week
-      runs to 2026-11-04 17:04Z — §"The restarted week".)*
+      runs to 2026-11-04 17:04Z — §"The restarted week". 2026-11-18: the week
+      from 2026-11-11 read 5 of 177 FFmpeg DC sessions with a divergence, all on
+      0.4.216 to 0.4.218, every one a full rebuild built at a size or a rate the
+      plan had left while an M2 dims swap was in flight or just adopted. Fixed in
+      §"M3a.4"; the week restarts on the release that carries it.)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 

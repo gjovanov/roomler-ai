@@ -7,4 +7,4 @@ agent_env_reads=181 # p2:BUDGET-1: retires with FR-148 P5, when the in-flight bu
 viewer_knobs=33 # r0:CLOCK-1: retires after a week of field reads with the calibration on
 pump_lines_rtp=1312
 pump_lines_vp9_dc=1482 # p2:BUDGET-2: retires with FR-148 P5, when the one controller owns the budget or it is deleted
-pump_lines_ffmpeg_dc=3911 # p2:BUDGET-3: retires with FR-148 P5, when the one controller owns the budget or it is deleted
+pump_lines_ffmpeg_dc=3896 # p2:BUDGET-3: retires with FR-148 P5, when the one controller owns the budget or it is deleted

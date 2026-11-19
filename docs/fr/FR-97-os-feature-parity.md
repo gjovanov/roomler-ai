@@ -269,7 +269,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ✅ since P2d-2b: the main display, with one active display, at its scale and refresh rate; the mode reverts by itself if the process dies | `display_match.rs:1081`. *P3e-2:* `agents/roomlerd/src/display_match.rs:333` `x11_offered`; the viewer's toggle followed the OS until P3e-2. *P2d-2b:* `agents/roomlerd/src/display_match.rs:351` `mac_offered` | P2d, P3e |
 | R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ✅ since P2e-1, behind the pasteboard's change count | Forced off (`clipboard.rs:818-822` at master `c9fe4c391`, before P3e-3a) ✔ while advertised (`caps.rs:4411-4419`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:1319` `x11_gate`. *P2e-1:* `agents/roomlerd/src/clipboard.rs:1452` `mac_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:1740` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:12092-12095`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:12094-12097`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:431-437` at master `c9fe4c391`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:641` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | ✅ the computer's sound since P2a (the recorder child opens the session's own capture) and the microphone since P2f (cpal, once AVFoundation says the person has not turned it off) | Was: no SCK audio, and cpal was not a macOS dependency | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:248`) | D2 |
@@ -745,7 +745,7 @@ test of the SIGKILL property itself.
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
   on the main thread, which `viewer-indicator-macos` gives to AppKit for the daemon's life (P2b's release set has it),
-  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:123`), run by the
+  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:137`), run by the
   pump on its next pass. The list is the selectable keyboard sources (the input menu's); the token is the source ID's
   hash; the tag is BCP-47 for a layout the table knows, else the source's own name. Offered wherever the switch is
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says

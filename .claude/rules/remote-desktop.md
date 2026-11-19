@@ -129,6 +129,18 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   for that connection's life. A closed road keeps the floor (`no_prompt_surface` at
   the window's end), never an answer at once. Write nothing into the person's home
   for this: the announcement lives in the root's memory.
+  ⚠️ A **Mac's** native panel is a surface only while the window server serves its
+  process (#4053): a root daemon that launchd started before login is refused, and a
+  log-out detaches one that was served, each for the rest of its life. Then
+  `indicator::panel_gate` answers `false`, a taken panel's answer, and the question
+  goes to the app. Never turn that `false` into a deny or an accept, and never
+  restart the daemon to bring the panel back: a restart ends every live session on
+  the Mac. Drawing from the person's own session is FR-149 (#4054).
+  ⚠️ The console-session read is a **root process's only** (`reads_console_session`):
+  a root daemon's window-server connection belongs to the console session it started
+  in. A two-row Mac's per-user half has a GUI session of its own, which a fast user
+  switch away and back leaves alive, and the switch posts the same names: a read
+  there ends its panel at the first switch. Never give a per-user process the reader.
 <!-- RETIRED-NAME-ANCHOR: the env-var spelling on the line below carries a
      retired product name deliberately — it is what the daemon actually reads,
      so renaming it would silently disable every virtual-desktop host. FR-27. -->
