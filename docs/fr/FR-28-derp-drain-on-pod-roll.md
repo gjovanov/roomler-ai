@@ -1,7 +1,8 @@
 # FR-28: A pod roll freezes every relay-carried session
 
 Status: **P2 (a flat redial, default OFF) is in every agent since 0.4.200, and P3 (the image pre-pull) is in
-force since 2026-11-07. AC4 is met. It closes when AC3 and AC5 are field-verified; whether AC1 comes back is
+force since 2026-11-07. AC4 is met. With P3 alone a reattach takes p50 3.5 s and p90 4.0 s, against 7.8 s and
+8.8 s before it. It closes when AC3 and AC5 are field-verified with the switch on; whether AC1 comes back is
 open decision D1** ("Where it stands (2026-11-19)"). Tracking issue: `FR-28` (#865). Child of the RC-quality
 program; sibling of FR-18 (carrier queue discipline).
 
@@ -16,10 +17,10 @@ This section is the status. "Where it stands (2026-10-31)" below is the read beh
 | P3, the pre-pull | In force since the promote of 2026-11-07 01:54Z | #3320 and the deploy repo's DaemonSet; #865, comment 6700791629 |
 | AC1, no delivery gap above 500 ms | Moved out on 2026-11-02, for a reason FR-138 has since removed | Open decision D1, below |
 | AC2, `hard-errored` disappears | Retired on 2026-11-02 | "The decision" |
-| AC3, reattach below about 4 s | Open | "The field read" |
+| AC3, reattach below about 4 s | Open. Its control half is read: with P3 alone, p50 3.5 s and p90 4.0 s over 8 promotes, so the median is below the bar and the p90 is at it. The half with the switch on is owed | "The field read" |
 | AC4, the rollout not slower | **Met**: 25 s on the first roll with the pre-pull, against 33.9 s | #865, comment 6700791629; "AC4: the rolls since the pre-pull" |
-| AC5, two hosts or more in one roll | Open, with AC3 | "The field read" |
-| AC6, docs | AC4's numbers are in `docs/overlay-communication.md` and `docs/multi-pod-scale-out.md`. AC3's and AC5's come with their read | |
+| AC5, two hosts or more in one roll | Open, with AC3. The control half reads 7 to 10 hosts with an overlay a roll; two hosts with the switch on are owed | "The field read" |
+| AC6, docs | AC4's numbers and AC3's control half are in `docs/overlay-communication.md` and `docs/multi-pod-scale-out.md`. The switch-on half comes with its read | |
 
 ### What FR-138 changed
 
@@ -46,7 +47,9 @@ So a relay-carried session now outlives a roll, and the freeze this FR was opene
 What FR-138 did not change is the topology. Of the three reasons in "Why P1 as designed cannot work", the
 first (the session ends before `/derp` closes) is gone. The second (the tenant pin leaves no second pod to dial)
 and the third (DERP is pod-local, so one peer cannot move alone) still hold. On this topology the freeze shortens
-only as the replacement comes up sooner (P3) and as the `/derp` socket redials it sooner (P2).
+only as the replacement comes up sooner (P3) and as the `/derp` socket redials it sooner (P2). P3 has done its
+part: on 8 promotes a `/derp` socket was back p50 3.4 s after its cut, against 7.6 s in October ("The field
+read").
 
 ### Open decision D1: does AC1 come back here?
 
@@ -216,7 +219,7 @@ to being overturned (`docs/fr/FR-135-one-rc-media-pipeline.md` §10). That FR is
 | P1 | Make-before-break on `/derp` | agent and server | none | Rejected, 2026-11-02 |
 | P2 | Flat redial on a 502 | agent, both loops | `ws_flat_redial`, default OFF | In every agent since 0.4.200 (2026-11-04) |
 | P3 | Pre-pull before a roll | `promote.yml` (#3320) and the deploy repo | Delete the DaemonSet's file | In force since the promote of 2026-11-07 01:54Z |
-| Docs | `docs/overlay-communication.md`, `docs/multi-pod-scale-out.md`, `docs/deployment.md`, the index rows | docs | none | Written with each phase. AC4's numbers are in; AC3's and AC5's come with their read |
+| Docs | `docs/overlay-communication.md`, `docs/multi-pod-scale-out.md`, `docs/deployment.md`, the index rows | docs | none | Written with each phase. AC4's numbers and AC3's control half are in; the switch-on half comes with its read |
 
 ## P2: the flat redial
 
@@ -319,6 +322,10 @@ So neither lever alone is the whole answer, and that is an estimate until the fi
   slow. One that listens just past +3 s then costs the wait until +7 s, and the redial is what holds the number
   there.
 
+**Read on 2026-11-19** ("The field read"): the pre-pull alone put the replacement up about 1.5 to 2 s after the
+cut, and 80 of 84 reattaches landed on the ladder's +3 s dial, at 3.4 to 4.1 s. The estimate for P3 held. What is
+left for the redial is about 1 s a wave: from the +3 s dial to within a second of the replacement listening.
+
 ## The field read
 
 **RED, from production logs.** The roll of 2026-11-02 12:43Z (`hosted-20261102-b8c6d1b`), read from `agent_logs`
@@ -338,10 +345,40 @@ pre-pull").
 
 **AC3 and AC5 need** a roll with the switch on for at least 2 hosts (AC5) and the rest of the fleet as the
 control in the same roll. Every agent since 0.4.200 carries P2, and every promote since 2026-11-07 rolls with the
-pre-pull, so the fleet's own lines around those promotes are the control half: the ladder with P3 alone. The
-switch is a device-side key read at start, so the other half needs hosts set up for it before a promote. The read
-takes the same lines plus each host's `redialling flat` lines. The hosts are standing-consent devices and test
-guests, never a corporate laptop.
+pre-pull, so the fleet's own lines around those promotes are the control half: the ladder with P3 alone.
+
+**The control half is read** (2026-11-19): the 8 promotes of 2026-11-12 to 2026-11-16 that were still inside
+`agent_logs`' 7 days, 8 minutes from each dispatch. No host logged `redialling flat`, so none ran with the switch
+on, and every roll had the pre-pull.
+
+| Measure | 2026-11-02 12:43Z, before the pre-pull | 8 promotes with it |
+|---|---|---|
+| Control-socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (15) | p50 3.5 s, p90 4.0 s, max 4.1 s (84 sockets, 7 to 10 hosts a roll) |
+| Close to `rc:agent.hello sent`, overlay or not | Not read | p50 3.4 s, p90 3.7 s, max 5.5 s (180 sockets, 13 to 19 hosts a roll) |
+| `/derp` close to registered | p50 7.7 s, p90 8.1 s (23) | p50 3.4 s, p90 3.7 s, max 4.1 s (156) |
+| The dial that lands | +7 s, after 502s at +1 and +3 s | +3 s, after a 502 at +1 s: 80 of the 84 reattaches |
+| `relay carrier send hard-errored` | 45 lines on 16 hosts | 3 to 25 lines a roll on 2 to 12 hosts |
+
+One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and is left out of the figures above.
+
+- **The pre-pull moved the reattach from the ladder's +7 s dial to its +3 s dial.** The replacement now listens
+  about 1.5 to 2 s after the cut: the 11 sockets whose dial landed before the +3 s step were back 1.5 to 2.2 s
+  after their cut.
+- **With P3 alone, AC3's median is below the bar and its p90 is at it**, so this read does not tick AC3. The
+  switch-on half decides it: a flat redial lands within a second of the replacement listening, about 1 s a wave
+  sooner than the +3 s dial.
+- **A host's close stands for its pod's SIGTERM.** A pod's first act on SIGTERM is to cancel every agent socket
+  (`crates/api/src/main.rs:361-363`, `crates/api/src/state.rs:494-515`), so the close trails the signal by that
+  sweep and one network leg. Both ends of a measure come from the host's own clock, so clock offsets between
+  hosts do not enter it.
+- **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
+  (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
+  (`agents/roomlerd/src/app.rs:4715-4724`). Five such rows closed in both waves, about 12 s apart, because their
+  two organisations sit on different pods. Each socket is still cut once a roll.
+
+**The switch-on half is owed.** The switch is a device-side key read at start, so its hosts are set up before a
+promote. The read takes the same lines plus each host's `redialling flat` lines. The hosts are standing-consent
+devices and test guests, never a corporate laptop.
 
 ## The measurement
 
@@ -467,15 +504,15 @@ The operator's decision of 2026-11-02 changed the first two. AC3 to AC6 keep the
       6700791629). Five later promotes took 24 to 28 s.
 - [ ] Verified on ≥2 hosts in one roll, since the failure is fleet-wide by nature.
 - [~] Docs: `docs/overlay-communication.md` and `docs/multi-pod-scale-out.md` updated in the house
-      style, with the `docs/README.md` index row. AC4's numbers are in (2026-11-19); AC3's and AC5's come with
-      their read.
+      style, with the `docs/README.md` index row. AC4's numbers and AC3's control half are in (2026-11-19); the
+      switch-on half comes with its read.
 
 | AC | Today | What it takes |
 |---|---|---|
-| Under ~4 s to `control-WS reattached` | p50 7.8 s, p90 8.8 s on the 12:43Z roll | P2 with the switch on, and P3 ("What the two buy") |
+| Under ~4 s to `control-WS reattached` | With P3 alone, p50 3.5 s, p90 4.0 s on 8 promotes to 2026-11-16, against p50 7.8 s, p90 8.8 s on the 12:43Z roll before it | The switch-on half: P2 on for two hosts or more in one roll ("The field read") |
 | Rollout not slower | **Met**: 25 s on 2026-11-07, against the 33.9 s baseline; 24 to 28 s on five promotes since | Done. The pre-pull's 30 s comes before the first SIGTERM, with every pod serving |
-| ≥ 2 hosts | Read on 22 hosts with the switch off | Two hosts with the switch on, in one roll |
-| Docs | AC4's numbers are in | AC3's and AC5's, then ticked |
+| ≥ 2 hosts | Read with the switch off on 13 to 19 hosts a roll, 7 to 10 of them with an overlay | Two hosts with the switch on, in one roll |
+| Docs | AC4's numbers and AC3's control half are in | The switch-on half's, then ticked |
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
 only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:18`, warned at
@@ -502,6 +539,7 @@ only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:18`, 
 | 2026-11-07 | `hosted-20261106-a5cb4d4`, promote run 42326522934 | **AC4 met** on P3's first roll. The DaemonSet pulled the image on both nodes in 4.04 s and 3.61 s, and both held it 20 s before the app's roll began. Both replacements logged `Container image … already present on machine` and started 2 s after their SIGTERM (01:55:23Z → 01:55:25Z, 01:55:35Z → 01:55:37Z). First SIGTERM to second Ready: 25 s, against 33.9 s; each wave 12 s and 13 s. AC3 and AC5 were not read: no lab devices were up (#865, comment 6700791629). |
 | 2026-11-12 | agent 0.4.216, FR-138 on, window 60 s | FR-138's pod-delete roll with a `derp`-carried RC session: detached and resumed 3.1 s later on the same row, the DERP carrier rebuilt about 4 s after the cut, the picture frozen for about 3 s (#3604, comment 6834852470). The premise that moved AC1 out no longer holds: open decision D1. |
 | 2026-11-14 to 2026-11-16 | five promotes, `hosted-20261114-663bcd0` to `hosted-20261116-df905bb` | AC4 holds: 24 to 28 s each from the first SIGTERM to the second Ready, and each replacement Ready 10 to 12 s after it started. Read from the pods' times, polled every 2.1 s during FR-138's watch, so each roll's first SIGTERM is known to that poll. |
+| 2026-11-19 | agents 0.4.217 to 0.4.223; 8 promotes, 2026-11-12 22:58Z to `hosted-20261116-df905bb` | The control half of AC3 and AC5, read from `agent_logs` 8 minutes from each promote's dispatch, with no host on the switch: control-socket close to `control-WS reattached` p50 3.5 s, p90 4.0 s, max 4.1 s (84 sockets); close to hello p50 3.4 s, p90 3.7 s (180 sockets on 13 to 19 hosts a roll); `/derp` down p50 3.4 s, p90 3.7 s (156). 80 of 84 reattaches landed on the ladder's +3 s dial, against +7 s on 2026-11-02. AC3 is not ticked: the median is below the bar and the p90 is at it. One 0.4.48 host took 60 s on every roll. |
 
 ## P1 — concrete design (scoped, NOT implemented)
 

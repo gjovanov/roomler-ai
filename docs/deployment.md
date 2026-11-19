@@ -127,7 +127,7 @@ sequenceDiagram
 | A pull that fails or outlasts the wait | Today's roll: the pod pulls for itself. The runner cannot see the cluster, so nothing waits on the pull |
 | A manual bump, or the break-glass path | Moves `newTag` only, so it rolls without a pre-pull |
 | Reading it | The replacement pod's events say `Container image already present on machine`, and the promote's summary says `pre-pull: pushed` |
-| What it bought | On its first roll (2026-11-07) each replacement started 2 s after its SIGTERM, and the roll took 25 s from the first SIGTERM to the second Ready, against 33.9 s. Five promotes to 2026-11-16 took 24–28 s ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull), AC4) |
+| What it bought | On its first roll (2026-11-07) each replacement started 2 s after its SIGTERM, and the roll took 25 s from the first SIGTERM to the second Ready, against 33.9 s. Five promotes to 2026-11-16 took 24–28 s ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull), AC4). A device's sockets now land on their backoff's +3 s dial instead of +7 s: back p50 3.5 s after the cut, against 7.8 s ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#the-field-read)) |
 
 ⚠️ **It is not an ArgoCD sync wave, on purpose.** A wave would wait for the pull exactly, in
 one commit. But a DaemonSet that cannot get healthy, on a node that is down, would leave the
