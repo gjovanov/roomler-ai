@@ -3748,8 +3748,8 @@ fn validate_outgoing_path(input: &str) -> Result<PathBuf> {
     // Canonicalise to dereference symlinks + resolve `..` segments.
     // If canonicalize fails (path doesn't exist, permission denied),
     // surface a friendly error.
-    let canonical = std::fs::canonicalize(&path)
-        .with_context(|| format!("canonicalising {}", path.display()))?;
+    let canonical =
+        reads::resolve_path(&path).with_context(|| format!("canonicalising {}", path.display()))?;
 
     // Re-check the denylist on the canonical form so a symlink trick
     // can't bypass us.
@@ -4066,7 +4066,7 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
         let (canon, read) = tokio::time::timeout(
             std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
             who.run(move || {
-                let canon = std::fs::canonicalize(&asked)
+                let canon = reads::resolve_path(&asked)
                     .with_context(|| format!("canonicalising {}", asked.display()))?;
                 let read = folder_listing(&canon, checks)?;
                 Ok((canon, read))
@@ -4363,8 +4363,7 @@ where
     let root_canon = {
         let root = root.to_path_buf();
         who.run(move || {
-            std::fs::canonicalize(&root)
-                .with_context(|| format!("canonicalising {}", root.display()))
+            reads::resolve_path(&root).with_context(|| format!("canonicalising {}", root.display()))
         })
         .await?
     };
@@ -13794,3 +13793,6 @@ mod refused_begin_tests {
 /// #3682 — the drawer's reads to their edges: tests, and the seams they stand in.
 #[cfg(test)]
 mod drawer_edges;
+
+/// #3682 — the drawer's reads to their edges: what resolving a path answers.
+mod reads;
