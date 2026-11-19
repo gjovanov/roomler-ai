@@ -67,12 +67,15 @@ Read in the lab, a two-row Mac, 2026-11-19, on 0.4.227:
 
 | Read | What it gave |
 |---|---|
-| the owner of `/dev/console` (`stat`) | follows the console's person: root at the login window, the person after their login, the second account after a fast user switch to it |
-| the console records in utmpx (`who`) | both accounts' records after a second account signs in by fast user switching, so they cannot say who is at the console |
+| the owner of `/dev/console` (`stat`) | follows the console's person at every step: unchanged through a lock, a display sleep and the screen saver; root at a log-out, and whenever the login window held the console in a switch; then whoever signed in, the second account after a fast user switch to it |
+| the console records in utmpx (`who`) | the person's record kept while the login window held the console, and both accounts' records after a second account signed in by fast user switching |
 | notify(3), the two CoreGraphics names #4063 watches | nothing at a lock or an unlock, a display sleep or the screen saver. A log-out posts `GUIConsoleSessionChanged` 3 times and `GUISessionUserChanged` once, and a login `GUISessionUserChanged` once. A fast user switch posts `GUIConsoleSessionChanged` twice each way, and twice more at the password on the way back |
 
-So the owner of `/dev/console`, read when a question is asked, says who is at the console. utmpx does not, and the
-notify(3) names say that something changed, not who is there now.
+So the owner of `/dev/console`, read when a question is asked, says who is at the console. It is a stat of a device
+node: no window server, bootstrap or audit session is involved, so the way a worker is started (`launchctl asuser`,
+then `sudo`) cannot change it, and the supervisor and the person socket make the same read as root. utmpx is never
+used: it kept the person's record while the login window held the console. The notify(3) names say that something
+changed, not who is there now.
 
 ### The session processes start where the window server serves them
 
@@ -151,8 +154,9 @@ The root daemon asks as `ask_worker_keep_busy` does (`delegate.rs:1411-1449`): a
 up.
 
 **What the worker checks before it says `shown`.** Its gate is #4063's for a process that runs as the person: the
-window device alone. Its panel shows no other question (`mac.rs:167-169`). The id is a hex ObjectId, and time is
-left. Then one main-thread job (`on_main`, `mac.rs:123-138`) puts the panel up for that id and reads the panel's own
+window device alone. `/dev/console`'s owner is its own uid: the root daemon's read, made again, so a switch between
+the two reads gives `not_up`. Its panel shows no other question (`mac.rs:167-169`). The id is a hex ObjectId, and time
+is left. Then one main-thread job (`on_main`, `mac.rs:123-138`) puts the panel up for that id and reads the panel's own
 window number. The panel is made with `defer: false` (`mac.rs:481-487`), as #4063's probe is, so a number above 0 says
 the window server took it. Only then does the worker answer `shown`; a number of 0 or less takes the panel down and
 answers `not_up`. A healthy worker answers within a pump tick or two (the pump runs about eight times a second,
@@ -216,19 +220,27 @@ console-session read for a root process (its lab cells L9 and L10). FR-149 keeps
 - **The root daemon asks only the session process of the person at the console.** At each question it reads
   `/dev/console`'s owner, as the supervisor and the person socket do (`macos_supervisor.rs:1153-1156`,
   `person_socket.rs:441-454`), and asks the session panel only when that owner is the session process's person. The
-  read follows the console's person through a log-out, a login and a fast user switch, where utmpx keeps both
-  accounts' records (Evidence). A daemon cannot read CoreGraphics' session dictionary (#4053), so this is the root
-  daemon's read. A one-row Mac's worker is replaced within 5 s of a change of the console's person
-  (`macos_supervisor.rs:60`, `:1899-1910`), and a two-row Mac's per-user half lives on in a session switched away
-  from: in both, a question asked in between is not sent to a panel in a session nobody is looking at.
+  read follows the console's person through a lock, a log-out, the login window and a fast user switch, where utmpx
+  does not (Evidence). It is the one read used. CoreGraphics' session dictionary is `NULL` in a daemon (#4053) and has
+  never been read in a worker started this way, and one measured read is better than two that can disagree. A
+  one-row Mac's worker is replaced within 5 s of a change of the console's person (`macos_supervisor.rs:60`,
+  `:1899-1910`), and a two-row Mac's per-user half lives on in a session switched away from: in both, a question asked
+  in between is not sent to a panel in a session nobody is looking at. After a click to switch user, the person's
+  worker lives up to one 5 s poll while the login window holds the console; the read gives root there, so the worker
+  is not asked, and its own read answers `not_up` if the console changes between the two.
 - **The session process says `shown` only from its panel's own window** (above), so a window device lost after its
   gate's read gives `not_up`, never `native=true`.
 
-A lock posts neither notify(3) name (Evidence), and P0's C2 reads `/dev/console`'s owner while the screen is locked. A
-question asked while it is locked is then on the panel after the unlock, as #4063's L4 reads for the root daemon's
-panel today. The root daemon keeps #4063's read for its own panel: after a fast user switch away and back, a root
-daemon restarted while someone was signed in sends its questions to the app (L10). With FR-149 they go to the session
-panel of the person back at the console (C6).
+**`shown` means in front of the person's session, not seen.** On a locked screen the gate passes and the panel, at
+`NSScreenSaverWindowLevel` (`mac.rs:488`), sits under the lock screen, so `shown` and `native=true` come with nothing
+seen until an unlock. The root daemon's panel and the app behave the same on master, so this is no regression: the
+question waits on the panel for the unlock, within its window (D4), as #4063's L4 reads for the root daemon's panel
+today. Full-screen apps and other Spaces are covered: the panel joins every Space, stays put, and is a full-screen
+auxiliary (`mac.rs:492-496`); C4b reads it.
+
+The root daemon keeps #4063's read for its own panel: after a fast user switch away and back, a root daemon
+restarted while someone was signed in sends its questions to the app (L10). With FR-149 they go to the session panel
+of the person back at the console (C6).
 
 ### Two-row Mac: the per-user half, or the app (D1)
 
@@ -240,7 +252,7 @@ questions too (`delegable_inbound`, `delegate.rs:881`). Those questions are what
 |---|---|---|
 | draws with | the same `indicator::mac` panel and gate as the one-row worker | the app's prompt window: a webview kept on top with Tauri's `always_on_top` (`agents/roomler-desktop/src/panels.rs:347`). The app sets the screen-saver level and every Space only on its frame strips (`:613-618`), not on its prompt |
 | reaches the window server | a LaunchAgent started at the login, in the session by construction (#4063's L6) | the same, once it is running |
-| the question's road | new: a long-poll on the root half's person socket, on the connection that holds the person's `consent_relaying` (`crates/localapi/src/lib.rs:4061-4079`). The per-user half sends `ConsentPanelWait`; the root half answers it with a question (`ConsentPanelAsk`), a take-down (`ConsentPanelHide`), or nothing after 20 s; the per-user half then says `ConsentPanelTold { id, state }`. The three are admitted on the person socket for its own person only, never root, as `ConsentRelaying` is (`person_may`, `:3649-3754`), and taken only by a two-row Mac's root half (`localapi_state.rs:2257-2259`). On a supervised two-row Mac the worker's delegation channel can carry the one-row frames instead | the app already lists the root half's questions through the per-user half (#3967). It would add a word that its window shows one: the same new verbs, and one more hop |
+| the question's road | new: a long-poll on the root half's person socket, on the connection that holds the person's `consent_relaying` (`crates/localapi/src/lib.rs:4061-4079`). The per-user half sends `ConsentPanelWait`; the root half answers it with a question (`ConsentPanelAsk`), a take-down (`ConsentPanelHide`), or nothing after 20 s; the per-user half then says `ConsentPanelTold { id, state }`. The three are admitted on the person socket for its own person only, never root, as `ConsentRelaying` is (`person_may`, `:3649-3754`), and taken only by a two-row Mac's root half (`localapi_state.rs:2257-2259`), under the rules below. On a supervised two-row Mac the worker's delegation channel can carry the one-row frames instead | the app already lists the root half's questions through the per-user half (#3967). It would add a word that its window shows one: the same new verbs, and one more hop |
 | the answer's road | the app's road (#3967): `ConsentDecide` over the person socket, the seat asked again | the same |
 | costs | two person-socket verbs and their tests; a process of the person's account can offer the panel too (Authenticity) | a third process in the chain, whose first start takes about 2.5 s on a Mac (`agents/roomlerd/src/companion.rs:1290-1292`); a person can quit it; and its version is another to keep in step (FR-117). The panel and the companion become one surface, with no fallback between them |
 | mixed versions | the offer is a request of its own after `ConsentRelaying`, so an older root half answers it "unknown variant" and keeps the connection, as it does for the announcement (`docs/desktop-companion.md:2160-2169`); a newer root half beside an older per-user half gets no offer and keeps master's chain | an older app says nothing, and the root half's question is marked for it as today |
@@ -250,11 +262,28 @@ questions too (`delegable_inbound`, `delegate.rs:881`). Those questions are what
 The cost is two person-socket verbs. Leaving the root half's questions with the app, as #4053 does, is the baseline
 both options are measured against.
 
+**The long-poll's rules.** The person socket's server reads one request at a time on each connection, and what a
+connection holds belongs to that connection's loop (`crates/localapi/src/lib.rs:4028-4030`), so a parked
+`ConsentPanelWait` blocks only its own connection. On master that connection carries nothing but the announcement:
+`tell_and_hold` says `ConsentRelaying` once, then only reads to its end (`consent_relay.rs:765-830`). Lists and answers
+each take a connection of their own (`person_socket.rs:388`; `consent_relay.rs:117`), so the panel's Approve never
+queues behind a wait. Four rules keep it so:
+
+1. **Nothing else rides the polling connection.** Anything added there would queue behind a wait of up to 20 s.
+2. **The road lives and dies with the announcement.** Only the connection that holds the person's `consent_relaying`
+   may park a wait, one holder for each person, and the abort at a seat move ends it.
+3. **A `ConsentPanelTold` is taken only on the connection whose wait carried that id**, never on another connection of
+   the person's. Its test: `tests::a_panel_told_on_a_connection_that_did_not_wait_for_that_id_is_refused`.
+4. **An ask that finds no parked wait** (the per-user half is between a 20 s empty reply and its next wait) waits for
+   one within the same `PANEL_WITHIN`, or counts as `no_answer`. The per-user half's read of a wait has no bound under
+   20 s; `ANNOUNCE_ANSWER_WITHIN` (`consent_relay.rs:626`) stays on the announcement's first answer only (`:779`).
+
 ### `native` comes only from the session process's word
 
 - The session panel is `native` only when a `PanelTold` (one row) or a `ConsentPanelTold` (two rows) saying `shown`
   for that id arrives within `PANEL_WITHIN`. A worker attached, a word said, a seat read or a socket served never makes
-  it `native`: they only decide whether to ask.
+  it `native`: they only decide whether to ask. `shown` says that the panel is in front of the person's session, not
+  that anyone has seen it (above).
 - A session process that is not there, never said the word, answers `busy` or `not_up`, or does not answer in time
   leaves the session panel out, and the question goes to the app as #4053 does. A run of silent answers logs one WARN,
   and one INFO when the process answers again.
@@ -317,6 +346,9 @@ P1, unit tests with stood-in readers, so they run on every lane:
 | `indicator::session_panel::tests::only_the_person_at_the_console_is_asked` | a session process whose person does not own `/dev/console` at the question is not asked (`session_panel=not_asked why=not_at_the_console`), whatever it said before |
 | `indicator::session_panel::tests::a_busy_or_silent_session_panel_never_leads_to_a_second_panel` | the root daemon's own panel is not tried once the session panel was asked |
 | `indicator::session_panel::tests::a_late_shown_is_taken_down` | a `PanelTold` saying `shown` after its wait gets a `PanelHide` |
+| `indicator::session_panel::tests::a_session_processs_word_never_decides_a_question` | the invariant: no `PanelTold` or `ConsentPanelTold`, in any state, decides or ends a question; only an answer past the person socket's gates decides one |
+| `indicator::session_panel::tests::a_channel_ended_after_shown_sends_the_question_to_the_app` | by D4: a channel that ends after `shown` marks the question for the app for its remaining time |
+| `indicator::session_panel::tests::an_answer_for_a_decided_question_is_refused` | by D4: once the prompt's look has decided a question, a later answer for its id is refused, on the session panel's road as on the app's |
 | `localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road` | the worker's click on a root daemon's question goes to the root half; a click on its own question stays local; a click after the window is refused |
 | the LocalAPI's `tests::person_may_is_exactly_the_safety_surface`, and `localapi_state::tests::another_accounts_per_user_half_gets_no_root_questions` | unchanged, and passing |
 
@@ -326,11 +358,22 @@ step "cargo check + test the agent's Mac-only units", whose list of modules (`.g
 gains `indicator::session_panel::`. The worker's AppKit side compiles in "cargo check agent (viewer-indicator-macos —
 the AppKit panel + the main-thread swap)". The LocalAPI's run on a Mac in "cargo test the LocalAPI on a real Mac
 (#3736)" (`ci.yml:1714-1715`), where P2 adds the person-socket verbs' tests: `person_may` updated, an offer taken only
-from the socket's own person, and an offer that lives as long as its connection.
+from the socket's own person on the connection that holds its `consent_relaying`, an offer that lives as long as its
+connection, `tests::a_panel_told_on_a_connection_that_did_not_wait_for_that_id_is_refused` (rule 3), and
+`consent_relay::tests::an_ask_with_no_parked_wait_is_no_answer_within_the_bound` (rule 4).
 
 ### Lab cells
 
 Each is a read of behaviour on a Mac by the macOS lab. The pass lines use master's log fields and the ones above.
+
+**Where the lines are.** A one-row worker has no `--config` and resolves the person's own folders
+(`macos_supervisor.rs:1317-1323`), so it writes its own daily file as the person:
+`~/Library/Application Support/live.roomler.roomler/logs/roomlerd.log.<YYYY-MM-DD>` in the person's home
+(`crates/agent-core/src/logging.rs:31`, `:129`, `:234-237`). Its standard output is the root daemon's, whose launchd
+job names no file for it, so nothing lands there. With no enrollment, it also forwards its lines to the root daemon,
+which uploads them on its row (`app.rs:4698-4705`). So C1 and C2 can read the device's logs too, and when the person's
+folder is not theirs (#3802) that copy is the only one. A two-row Mac's per-user half writes the same path in its own
+home, and uploads on its own row.
 
 | Cell | Phase | Mac | Steps | Pass |
 |---|---|---|---|---|
@@ -338,16 +381,17 @@ Each is a read of behaviour on a Mac by the macOS lab. The pass lines use master
 | C2 | P0 | one row | log out and in; a fast user switch to a second account and back; lock the screen for a minute, then unlock | each new worker says `available window_number=<above 0>`; while the screen is locked, `/dev/console`'s owner is still the person, and the worker's pid is unchanged after the unlock |
 | C3 | P0 | two rows | reboot and sign in; log out and in; a fast user switch away and back (#4063's L9); lock, the person's own row asks, unlock | the per-user half says `available window_number=<above 0>` after each start. After the switch back its own row's next question is on its panel (`native=true`), as L9 reads; the question asked while locked is on its panel after the unlock |
 | C4 | P1 | one row | reboot, sign in, a viewer asks; Approve; then a fresh pair, Deny | the session panel shows it, `native=true panel=session`; `outcome=Granted` and the session connects; then `outcome=Denied`. The root daemon's pid is the one it has had since the boot |
+| C4b | P1 | one row | an app in full screen, on its own Space, in front; a viewer asks | the session panel over the full-screen app, `native=true panel=session`, answered there |
 | C5 | P1 | one row | log out, log in, then as C4 | as C4, on the new worker; the root daemon's pid unchanged |
 | C6 | P1 | one row | person A at the console; a fast user switch to person B; a viewer asks in the first seconds, then again after B's worker attaches; switch back to A and ask again. Then the same after #4063's L3 restart of the root daemon | the first question is on no session panel (`session_panel=not_asked`), and goes to the app or the floor; the second is on B's panel, answered by B; the third on A's new worker's panel. After the restart the same, where #4063 alone gives the app (L10) |
-| C7 | P1 | one row | lock the screen; a viewer asks; unlock within the window | the question is on the session panel after the unlock, as #4063's L4 reads for the root daemon's panel, and is answered there |
+| C7 | P1 | one row | lock the screen; a viewer asks; unlock within the window | the ask logs `native=true panel=session` while the screen is locked; the question is on the session panel after the unlock, as #4063's L4 reads for the root daemon's panel, and is answered there |
 | C8 | P1 | one row | viewer 2 asks while the session panel shows viewer 1's question | viewer 2's shows in the app, `native=false companion=Some(true) session_panel=busy`; never a second panel; both are answered |
 | C9 | P1 | one row | after a reboot, end the worker; a viewer asks before the new one attaches, and again after | first the app or the floor (`session_panel=not_asked why=no_worker`), never `native=true`; then the panel |
 | C10 | P1 | one row | `ROOMLERD_SESSION_PANEL=0` for the root daemon; reboot; ask. Then `ROOMLERD_PERSON_SOCKET=0` alone; ask | the first follows master's chain with #4063's gate (the app); the second logs `session_panel=not_asked why=person_socket` and follows master's chain from there |
 | C11 | P2 | two rows | reboot, sign in; an exec or SSH question for the `-daemon` row; Approve, then Deny | on the per-user half's panel (`native=true panel=session`); both outcomes |
 | C12 | P2 | two rows | log out, log in, then as C11 | as C11 |
 | C13 | P2 | two rows | A → B → A by fast user switching, a root-half question at each step | each on the panel of the person at the console, never on the panel of a session switched away from; A's own row's next question is on A's panel again |
-| C14 | P2 | two rows | lock, ask, unlock | as C7 |
+| C14 | P2 | two rows | lock; a root-half question; unlock within the window | as C7: `native=true panel=session` at the ask, the question on the per-user half's panel after the unlock |
 | C15 | P2 | two rows | the per-user half's own question on its panel, then a root-half question | the root half's in the app (`session_panel=busy`); never a second panel |
 | C16 | P2 | two rows | a newer root half beside an older per-user half, and the other way round | the first: no offer, master's chain; the second: the relay as on 0.4.224, the offer answered "unknown variant" |
 | C17 | P3 | one row | restart the root daemon while signed in (#4063's L3 step); ask with `ROOMLERD_SESSION_PANEL=0`, then without it | kept (D2): `panel=root` with the switch off, `panel=session` without it, never two panels. Removed: the app with the switch off, with no `panel=root` and no `macOS consent panel available` line from the root daemon; `panel=session` without it |
@@ -361,7 +405,7 @@ Each is a read of behaviour on a Mac by the macOS lab. The pass lines use master
 | P1 | one row: the frames and the word on the delegation channel; the root daemon's session-panel ask in `show_prompt` (async, `PANEL_WITHIN`), after its read of `/dev/console`'s owner; the worker's handling, with its click through the app's road; the take-down; the logs; the switch; the tests above | `ROOMLERD_SESSION_PANEL=0` on the root daemon: master's chain with #4063's gate | not started; after #4063 merges |
 | P2 | two rows, by D1: the per-user half's offer and its verbs on the person socket, or the app's word | the same switch on the root half; the verbs are additive, and an older root half refuses them | not started; waits for D1 |
 | P3 | the root daemon's own panel, by D2 | kept: nothing to switch. Removed: `ROOMLERD_ROOT_PANEL=1` restores it for one release | waits for D2, after P4's one-row read |
-| P4 | the field read: C4–C10 with P1's candidate, C11–C16 with P2's, C17 and C18 with P3's, then C4–C8 and C11–C14 on a released build | read only | not started |
+| P4 | the field read: C4–C10 (C4b among them) with P1's candidate, C11–C16 with P2's, C17 and C18 with P3's, then C4–C8 and C11–C14 on a released build | read only | not started |
 | Docs | the docs below, each in the pull request of the phase it describes | none | not started |
 
 - **P0 leaves** the facts P1 builds on: whether each session process's panel is served after a reboot, a log-out, a
@@ -391,15 +435,16 @@ The docs:
 - [ ] **AC2** (P1 tests): the tests above pass in CI on the lanes named;
   `native_comes_only_from_the_session_processs_word` and
   `a_session_panel_click_on_the_roots_question_takes_the_apps_road` are shown failing on master first.
-- [ ] **AC3** (P1, after a reboot and after a log-out): C4 and C5 pass. A question that finds the panel free shows on
-  the session panel and is answered there, Approve and Deny, with no restart of the root daemon.
+- [ ] **AC3** (P1, after a reboot and after a log-out): C4, C4b and C5 pass. A question that finds the panel free
+  shows on the session panel and is answered there, Approve and Deny, with no restart of the root daemon.
 - [ ] **AC4** (P1, a fast user switch and a locked screen): C6 and C7 pass.
 - [ ] **AC5** (P1, `native=false`): C8, C9 and C10 pass. A session process that is not up, busy or silent gives no
   session-panel `native=true`, and the question goes to the app as #4053 does.
 - [ ] **AC6** (authenticity): the root daemon reads "shown" only from the attached channel (one row) or from the
   socket's own person (two rows), and asks only the person who owns `/dev/console`; every answer the panel carries
-  passes the person socket's gates; and P1 and P2 add no verb that decides a question. The tests above pin each, and
-  each phase's review checks the Authenticity section against its code.
+  passes the person socket's gates; and P1 and P2 add no verb that decides a question
+  (`a_session_processs_word_never_decides_a_question`). The tests above pin each, and each phase's review checks the
+  Authenticity section against its code.
 - [ ] **AC7** (P2, by D1): C11 to C16 pass.
 - [ ] **AC8** (P3, by D2): C17 and C18 pass.
 - [ ] **AC9** (field, a released build): C4 to C8 and C11 to C14 pass again, and the Known Issues line on the macOS
@@ -410,7 +455,8 @@ The docs:
 
 ## Open decisions
 
-D1–D4 each carry a recommendation and await the operator.
+D1–D4 each carry a recommendation and await the operator. The macOS lab's review of this spec agreed with D1, D2 and
+D3, and with D4's first case.
 
 - **D1. Which process hosts the panel on a two-row Mac.** Recommended: the per-user half, through a long-poll on the
   root half's person socket (Design, the two-row table). Fallback: the app, with its costs. Either is measured against
@@ -426,10 +472,16 @@ D1–D4 each carry a recommendation and await the operator.
   end the worker, so that the next question goes to the app and is answered there; it buys little for a second answer
   road. (c) The person socket could check its caller's code signature, from the caller's audit token, for the app's
   answers too: its own issue if wanted, not this FR's.
-- **D4. A question whose session panel goes away before it is answered** (a log-out, or the worker ended).
-  Recommended: it waits out its window, as a question on the root daemon's panel does today when that panel goes.
-  Fallback: the root daemon marks it for the app within its window, with the rewrite #4000 uses for a notification
-  (`signaling.rs:4395-4426`).
+- **D4. A question whose session panel is not seen, or goes away, before it is answered.** Recommended, in two cases:
+  - **A panel that is up but not seen** (a locked screen, a display asleep, the screen saver): the question waits on
+    the panel for the rest of its window, as one on the root daemon's panel or in the app does today.
+  - **A channel that ends after `shown`** (a worker that crashed, its window gone with it; a log-out; a worker stopped
+    at a switch): the root daemon marks the question for the app for its remaining time, with the rewrite #4000 uses
+    for a notification (`signaling.rs:4395-4426`). Answers stay bound to the question's id, and once the prompt's look
+    has decided it, a later answer for that id is refused (`consent.rs:933-941`). P1 tests both halves.
+
+  Fallback: every such question waits out its window, as a question on the root daemon's panel does today when that
+  panel goes.
 
 ## Out of scope
 
@@ -446,4 +498,5 @@ D1–D4 each carry a recommendation and await the operator.
 | date | what | result |
 |---|---|---|
 | 2026-11-19 | claimed, from #4053's 0.4.226 read and the operator's ruling there; #4063 in review | spec only |
-| 2026-11-19 | the lab, a two-row Mac, 0.4.227: who is at the console, read with `stat /dev/console`, utmpx and notify(3) | the owner of `/dev/console` follows the console's person; utmpx keeps both accounts' records; notify(3) posts nothing at a lock (Evidence) |
+| 2026-11-19 | the lab, a two-row Mac, 0.4.227: who is at the console, read with `stat /dev/console`, utmpx and notify(3) | the owner of `/dev/console` follows the console's person through a lock, a log-out, the login window and a fast user switch; utmpx keeps records of people not at the console; notify(3) posts nothing at a lock (Evidence) |
+| 2026-11-19 | the macOS lab's review of this spec: the worker's log, the console read, drawing, the two-row long-poll | folded in: where the lines are (Lab cells), the read and why not utmpx, `shown` is not seen, C4b, the long-poll's four rules, D4's two cases |
