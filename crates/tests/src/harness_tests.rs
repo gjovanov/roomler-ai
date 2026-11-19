@@ -24,8 +24,68 @@
 //! protects that workflow. This one travels with the suite — build host, WSL,
 //! a laptop — wherever it is run.
 
-use crate::fixtures::test_app::TestApp;
+use crate::fixtures::test_app::{DropDatabase, TestApp};
 use mongodb::Client;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A `spawn*` that panics part-way must not leave its database behind.
+///
+/// The shape of the failure: the database has been written to (so it exists
+/// on the server), then setup panics before any `TestApp` exists to own the
+/// teardown, e.g. `ensure_indexes(..).expect(..)` on a mongod that stalled.
+/// The guard `spawn*` arms before its first write must drop it while the
+/// panic unwinds.
+#[tokio::test]
+async fn a_setup_that_panics_after_its_first_write_leaves_no_database() {
+    // Learn the test mongod's address the way every test does.
+    let uri = TestApp::spawn().await.settings.database.url.clone();
+    let name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
+
+    // On a thread of its own, so the panic unwinds there and this test can
+    // look at the server afterwards.
+    let existed = Arc::new(AtomicBool::new(false));
+    let (u, n, seen) = (uri.clone(), name.clone(), existed.clone());
+    let setup = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let _drop_db = DropDatabase::new(&u, &n);
+            let client = Client::with_uri_str(&u).await.expect("client");
+            client
+                .database(&n)
+                .collection::<bson::Document>("first_write")
+                .insert_one(bson::doc! { "x": 1 })
+                .await
+                .expect("the first write");
+            let names = client.list_database_names().await.expect("listDatabases");
+            seen.store(names.contains(&n), Ordering::SeqCst);
+            panic!("setup failed after its first write (deliberate, from this test)");
+        })
+    })
+    .join();
+    assert!(setup.is_err(), "the setup thread was meant to panic");
+    // ⚠️ Load-bearing, as in the test below: a database that never existed
+    // would satisfy the final assertion and prove nothing.
+    assert!(
+        existed.load(Ordering::SeqCst),
+        "precondition failed: {name} did not exist before the setup panicked"
+    );
+
+    let probe = Client::with_uri_str(&uri).await.expect("probe client");
+    let after = probe
+        .list_database_names()
+        .await
+        .expect("listDatabases should succeed");
+    assert!(
+        !after.iter().any(|x| x == &name),
+        "{name} survived a setup that panicked after its first write. Every \
+         `spawn*` must arm its `DropDatabase` BEFORE the first write, or each \
+         failed setup leaves one more database (and its WiredTiger files) behind."
+    );
+}
 
 /// `TestApp`'s teardown must actually drop the database, before `drop` returns.
 #[tokio::test]

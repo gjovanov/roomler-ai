@@ -9,6 +9,9 @@ use tokio::net::TcpListener;
 
 /// A running test application with its own MongoDB database.
 pub struct TestApp {
+    /// First, so the database goes before the rest of the app is dropped (the
+    /// order the old `impl Drop for TestApp` had).
+    _drop_db: DropDatabase,
     pub addr: SocketAddr,
     pub base_url: String,
     pub db: Database,
@@ -52,7 +55,7 @@ pub struct TestApp {
 /// 5 166 files for 21 databases is ~246 WiredTiger files per database (one
 /// per collection AND per index), so `fds ≈ 26 + 246 × databases` and the
 /// 64 000 `nofile` ceiling arrives at ~260 databases — mid-suite. The cause
-/// is the teardown that never ran; see `impl Drop for TestApp`.
+/// is the teardown that never ran; see `DropDatabase`.
 ///
 /// The cap stays because it is genuinely free: a test needs ~1 connection at
 /// a time, so 2 is generous. It is not a fix for anything.
@@ -102,6 +105,8 @@ impl TestApp {
             settings.redis.url = url;
         }
         settings.database.name = db_name.clone();
+        // Armed before the first write, so a panic anywhere below still drops it.
+        let drop_db = DropDatabase::new(&settings.database.url, &db_name);
 
         let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
@@ -151,6 +156,7 @@ impl TestApp {
             .expect("Failed to build HTTP client");
 
         Self {
+            _drop_db: drop_db,
             addr,
             base_url,
             db,
@@ -217,6 +223,9 @@ impl TestApp {
 
         // Apply caller's customizations
         mutator(&mut settings);
+        // After the mutator, which may point this app at another database
+        // (`spawn_pair`), and before the first write to it.
+        let drop_db = DropDatabase::new(&settings.database.url, &settings.database.name);
 
         let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
@@ -270,6 +279,7 @@ impl TestApp {
             .expect("Failed to build HTTP client");
 
         Self {
+            _drop_db: drop_db,
             addr,
             base_url,
             db,
@@ -297,6 +307,8 @@ impl TestApp {
             settings.redis.url = url;
         }
         settings.database.name = db_name.clone();
+        // Armed before the first write, so a panic anywhere below still drops it.
+        let drop_db = DropDatabase::new(&settings.database.url, &db_name);
 
         // Configure fake OAuth provider credentials
         settings.oauth.base_url = "http://localhost:5001".to_string();
@@ -361,6 +373,7 @@ impl TestApp {
             .expect("Failed to build HTTP client");
 
         Self {
+            _drop_db: drop_db,
             addr,
             base_url,
             db,
@@ -386,8 +399,35 @@ impl TestApp {
     }
 }
 
-impl Drop for TestApp {
-    /// Drop this test's database — **synchronously**.
+/// Drops one test database when it goes out of scope.
+///
+/// Every `spawn*` arms one as soon as its database's name is final, BEFORE the
+/// first write to it, and hands it to the `TestApp` it builds. So the database
+/// goes when its `TestApp` is dropped, and ALSO when `spawn*` panics part-way:
+/// `ensure_indexes`, `AppState::new` or a module's index plan failing used to
+/// leave a database behind that no `TestApp` existed yet to drop. Measured: a
+/// module run whose mongod stalled mid-setup failed four tests at
+/// `ensure_indexes(..).expect(..)` and left four databases of empty
+/// collections, each one more set of WiredTiger files for every later run.
+///
+/// `spawn_pair`'s two apps each hold one for the SAME database; the second
+/// drop finds nothing to drop, which is fine.
+pub(crate) struct DropDatabase {
+    uri: String,
+    name: String,
+}
+
+impl DropDatabase {
+    pub(crate) fn new(uri: &str, name: &str) -> Self {
+        Self {
+            uri: uri.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for DropDatabase {
+    /// Drop the database — **synchronously**.
     ///
     /// This used to be a detached `tokio::spawn`, which **never ran**. Every
     /// test here is a plain `#[tokio::test]` (all 291 of them), so the body is
@@ -404,14 +444,14 @@ impl Drop for TestApp {
     /// on fatal assertion 50853 — which surfaced as dozens of unrelated-looking
     /// tests failing on `Connection refused`.
     ///
-    /// ⚠️ The new client is **not** redundant with `self.db`, and reusing the
-    /// existing one deadlocks. We block this thread on `join()`, so the test's
-    /// runtime stops driving its IO driver — and `self.db`'s sockets are
+    /// ⚠️ The new client is **not** redundant with `TestApp::db`, and reusing
+    /// that one deadlocks. We block this thread on `join()`, so the test's
+    /// runtime stops driving its IO driver — and `TestApp::db`'s sockets are
     /// registered with exactly that driver, so their readiness would never be
     /// delivered. The cleanup must own every part of its own I/O.
     fn drop(&mut self) {
-        let uri = self.settings.database.url.clone();
-        let name = self.db.name().to_string();
+        let uri = self.uri.clone();
+        let name = self.name.clone();
         let _ = std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
