@@ -3572,3 +3572,84 @@ async fn test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting() -> Res
     );
     Ok(())
 }
+
+/// roomler (#4033): how long a lone packet's SACK may take, from its write.
+/// The receiver holds it one `ACK_INTERVAL` (200 ms), and the bridge's ticks
+/// and the scheduler add the rest: 277 to 296 ms on a Windows box, alone and
+/// in the whole suite, so this is 2.7 times the most (FR-148 D44). A lone
+/// packet whose ack timer was never armed is acknowledged only when the
+/// sender's T3-rtx retransmits it, at RTO.min (1 s) at the earliest, so a
+/// slow runner only takes that further over this.
+const LONE_PACKET_SACK_WITHIN: Duration = ACK_INTERVAL.saturating_add(Duration::from_millis(600));
+
+/// roomler (#4033): each lone packet is acknowledged within the delayed
+/// acknowledgement interval. `AckTimer::start` arms a timer only while the
+/// handle that `stop` empties is empty, and a timer that fired left it set, so
+/// after the first delayed acknowledgement the next lone packet armed none.
+/// Its SACK waited for another packet or for the sender's T3-rtx, which also
+/// cut the sender's congestion window to one packet (RFC 4960 §7.2.3). The
+/// session's first message is acknowledged by the timer; then two lone
+/// packets, each sent more than an interval after the last SACK, so that one
+/// of them meets a timer that fired however the one before it was
+/// acknowledged.
+#[tokio::test]
+async fn test_assoc_each_lone_packet_is_acknowledged_within_the_ack_interval() -> Result<()> {
+    const SI: u16 = 1;
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+
+    let mut findings: Vec<String> = Vec::new();
+    let outcome: Result<()> = async {
+        let (s0, _s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+        for i in 1..=2 {
+            tokio::time::sleep(ACK_INTERVAL + Duration::from_millis(100)).await;
+            let msg = Bytes::from(format!("lone packet {i}"));
+            let sent = tokio::time::Instant::now();
+            s0.write_sctp(&msg, PayloadProtocolIdentifier::Binary)
+                .await?;
+            while s0.buffered_amount() > 0 && sent.elapsed() < Duration::from_secs(5) {
+                br.tick().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let took = sent.elapsed();
+            println!(
+                "#4033: lone packet {i} acknowledged in {} ms",
+                took.as_millis()
+            );
+            if s0.buffered_amount() > 0 {
+                findings.push(format!("lone packet {i} was not acknowledged within 5 s"));
+            } else if took > LONE_PACKET_SACK_WITHIN {
+                findings.push(format!(
+                    "lone packet {i} was acknowledged in {} ms, over {} ms",
+                    took.as_millis(),
+                    LONE_PACKET_SACK_WITHIN.as_millis()
+                ));
+            }
+        }
+        let t3 = a0
+            .association_internal
+            .lock()
+            .await
+            .stats
+            .get_num_t3timeouts();
+        if t3 > 0 {
+            findings.push(format!(
+                "the sender's T3-rtx expired {t3} time(s), retransmitting a lone packet \
+                 and cutting its congestion window to one packet"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    outcome?;
+    assert!(
+        findings.is_empty(),
+        "#4033, a lone packet's SACK:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}
