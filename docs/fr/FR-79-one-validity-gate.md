@@ -226,7 +226,7 @@ fields). All five are constrained-only, so a direct window moves nothing.
 | **(b)** | A growing queue counts only while the sender offered more than arrived, two windows running. | `offered` (`governor.rs:1473`), `viewer_rate::OfferLoop` (`viewer_rate.rs:676`) | step 2, and with it step 3 |
 
 ⚠️ **(b) needed a second clause.** `bytes_written` counts what left the pump's own
-channel, and both pumps stamp a frame before it (`peer.rs:5306`, `:10033`), so a
+channel, and both pumps stamp a frame before it (`peer.rs:5306`, `:10035`), so a
 queue growing INSIDE that channel reads sent ≈ rx even though the encoder is
 overdriving. The classifier already calls that window `Overproduced`, so it counts
 as an offer. jupiter's two windows were `clear` in the field (`pipe_states` read
@@ -566,7 +566,7 @@ own starvation.
   3.0 → 0.68 M in 22 s at a paint age of 50–104 ms. V5 accounts for two of those
   cuts at most. The rest read `overproduced`, the classifier's verdict for the
   queue budget's gate, which is denominated in the same `pipe_bps`
-  (`peer.rs:8108`): the door FR-70 P1 was written for, opened this time by a
+  (`peer.rs:8118`): the door FR-70 P1 was written for, opened this time by a
   measurement rather than a seed. At 12:04:06 the shape repeated: one 106 ms
   block, 709,460, the arrival-rate clamp at 3.19 → 0.52 M, and 4.66 M delivered
   two seconds later. A does not touch this, because a blocked-send number is a
@@ -603,8 +603,8 @@ own starvation.
   So what cut the rate is the comparison reading the stand-in, and that is
   what V5b fixes. V5b does not remove the anchor. Until it climbs back, at
   ×1.1 per ten clean windows, `pipe_bps` still offers it to FR-59 P6's
-  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:8081`), the
-  queue budget (`peer.rs:8108`) and the write-back. V5b also still reads the
+  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:8091`), the
+  queue budget (`peer.rs:8118`) and the write-back. V5b also still reads the
   arrival rate itself for its 15 s TTL. That is why the onset decision may
   belong beside this one.
 

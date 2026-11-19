@@ -6822,11 +6822,8 @@ async fn media_pump_ffmpeg_dc(
     // dropped with the pump, so a session's end releases the GPU clock pin.
     let mut high_rate_pin: Option<crate::gpu_clock::HighRateGuard> = None;
     let mut dims_swaps: u32 = 0;
-    /// Frames the pump may skip after a capture-cap change before it treats
-    /// a dims mismatch as real: the backend applies a cap "from the next
-    /// frame", so one or two frames at the old dims are still in flight.
-    const STALE_FRAME_SKIPS: u32 = 3;
-    let mut stale_skips_left: u32 = 0;
+    // What a capture-cap change lets the pump drop (`encode::plan::StaleBudget`).
+    let mut stale_budget = crate::encode::plan::StaleBudget::SPENT;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
     // pacing clock + pump-side floor sleep were REMOVED: a floor on every
     // frame just halved fps and amplified idle Nones — that was the real
@@ -8708,19 +8705,15 @@ async fn media_pump_ffmpeg_dc(
             && pending_dims_open.is_none()
             && let Some(enc_dims) = encoder_dims
         {
-            let plan_dims = crate::encode::resample::target_dims(frame.native_dims(), plan_target);
-            let dims_move = plan_target != built && plan_dims != enc_dims;
+            let dims_move =
+                crate::encode::plan::dims_move(frame.native_dims(), plan_target, built, enc_dims);
             let fps_move = want_fps != encoder_fps
                 && fps_retry_at.is_none_or(|t| std::time::Instant::now() >= t);
-            let (to_dims, to_target) = if dims_move {
-                (plan_dims, plan_target)
-            } else {
-                (enc_dims, built)
-            };
+            let (to_dims, to_target) = dims_move.unwrap_or((enc_dims, built));
             // A dims move carries the wanted rate only when a frame-rate move
             // is due as well; otherwise the live encoder's, as before.
             let to_fps = if fps_move { want_fps } else { encoder_fps };
-            if (dims_move || fps_move)
+            if (dims_move.is_some() || fps_move)
                 && let Some(enc) = encoder.as_mut()
             {
                 // FR-70 M3a.2 — open the replacement at the ceiling of the
@@ -8770,7 +8763,7 @@ async fn media_pump_ffmpeg_dc(
                 let spec = enc.rebuild_spec_at(to_dims.0, to_dims.1, to_fps, bps).await;
                 PassWatch::stop(t, &mut enc_cmd_us);
                 if let Some(spec) = spec {
-                    if dims_move {
+                    if dims_move.is_some() {
                         info!(
                             %session_id,
                             codec_label,
@@ -8807,10 +8800,8 @@ async fn media_pump_ffmpeg_dc(
         // While a replacement opens, the capturer's cap and the resampler
         // stay on the dims the live encoder was built for; the plan's
         // target takes over at the swap.
-        let effective_target = match (&pending_dims_open, built_target) {
-            (Some(_), Some(pinned)) => pinned,
-            _ => plan_target,
-        };
+        let pinned = pending_dims_open.as_ref().and(built_target);
+        let effective_target = pinned.unwrap_or(plan_target);
         // Phase B — hand the effective box to the capture backend so a
         // GPU-capable one can scale BEFORE the readback (applies from the
         // next frame; the CPU resample below stays the fallback + truth).
@@ -8825,7 +8816,7 @@ async fn media_pump_ffmpeg_dc(
         if backend_cap != last_output_cap {
             last_output_cap = backend_cap;
             capturer.set_output_cap(backend_cap);
-            stale_skips_left = STALE_FRAME_SKIPS;
+            stale_budget = crate::encode::plan::StaleBudget::FULL;
         }
         // Quiet-tick eligibility (same terms as the keepalive arm, from the
         // SAME plan — see the post-encode site). Computed here where the
@@ -8858,16 +8849,38 @@ async fn media_pump_ffmpeg_dc(
             // FR-70 P1 — the badge carries the cap and its reason; refresh it.
             video_info_sent = false;
         }
+        // FR-70 M3a.4: serve the frame, drop it, or open an encoder for it,
+        // decided before the resample. An open is at the PLAN's geometry and
+        // target, never the pin's: built at the pin, a frame the backend left
+        // uncapped opened at native while the plan capped it, and a keepalive
+        // of a frame scaled under an old cap opened at the old size (the AC10
+        // week's two shapes, `encode::plan::frame_step`).
+        let step = crate::encode::plan::frame_step(
+            &crate::encode::plan::FrameFacts {
+                dims: (frame.width, frame.height),
+                native: frame.native_dims(),
+                scalable: frame.pixel_format == crate::capture::PixelFormat::Bgra,
+                keepalive: !is_real_frame,
+                plan_target,
+                pinned,
+                encoder: encoder_dims,
+            },
+            &mut stale_budget,
+        );
+        let Some(frame_target) = step.target() else {
+            // FR-119 P2b-2 — the pump's own drop, not the host's.
+            if let Some(state) = fps_state.as_mut() {
+                state.pause();
+            }
+            continue;
+        };
         // P7 — snapshot the native dims before the downscale shadows `frame`;
         // the CQ bias at the rebuild site is keyed on encode-vs-native area.
         let (native_w, native_h) = frame.native_dims();
         let pre_scale_dims = (frame.width, frame.height);
         let scale_start = std::time::Instant::now();
-        let frame = crate::encode::resample::apply_target_resolution(
-            &mut resampler,
-            frame,
-            effective_target,
-        );
+        let frame =
+            crate::encode::resample::apply_target_resolution(&mut resampler, frame, frame_target);
         scale_us += scale_start.elapsed().as_micros() as u64;
         // Phase A metric fix — average over REAL resamples only (see the
         // vp9 twin): pass-through frames used to dilute avg_scale_ms far
@@ -8930,66 +8943,40 @@ async fn media_pump_ffmpeg_dc(
         // Feed the direct byte gate's fallback reference (constrained uses the
         // fixed relay budget instead, so the split value here is harmless).
         last_ceiling_bps = ceiling;
-        let need_rebuild = match encoder_dims {
-            Some((ew, eh)) => ew != w || eh != h,
-            None => true,
-        };
-        // FR-70 M2 — a frame whose dims are not the live encoder's while a
-        // cap change is still propagating (a frame or two in flight at the
-        // old dims after a swap, an adoption, or any cap move) is STALE:
-        // skip it, never rebuild for it. Bounded by `stale_skips_left`
-        // (reset at every cap change), so a backend that rounds the box
-        // differently from the plan self-heals through the inline open
-        // below instead of starving the encoder. The make-before-break
-        // itself was decided from the plan above; what reaches the inline
-        // open here is the first encoder of the session, a backend that
-        // cannot rebuild off the frame path, or a host whose native dims
-        // changed under a live session.
-        if need_rebuild && encoder_dims.is_some() && stale_skips_left > 0 {
-            stale_skips_left -= 1;
-            // FR-119 P2b-2 — the pump's own drop, not the host's.
-            if let Some(state) = fps_state.as_mut() {
-                state.pause();
-            }
-            continue;
-        }
         // FR-70 M3a.3 — set when this pass's inline open already ticked the
         // controller, so the pass's own tick below is skipped: one tick a pass.
         let mut ticked_before_open = false;
-        if need_rebuild {
+        if let crate::encode::plan::FrameStep::Open(_) = step {
             let cq_bias = rate.cq_bias;
-            // FR-70 M3a.3 (the field's B1, AC10 cases #10 and #23) — a
-            // persisted transport flip dropped the encoder, and the controller
-            // has not ticked under the new transport yet: `applied_bps` is the
-            // OLD profile's target. An open at it was re-rated on the very next
-            // tick, under the new ceiling — a second open on QSV/AMF, a few ms
-            // after the first. So the controller ticks HERE, first, with the
-            // pass's own arguments, and the encoder opens at what it decides.
-            // A target held for the dropped encoder is superseded by the open.
-            if std::mem::take(&mut flip_rebuild_pending) {
-                let _ = governor.pre_encode_tick(
-                    ceiling,
-                    aimd_floor,
-                    constrained,
-                    send_tx.capacity(),
-                    std::time::Instant::now(),
-                );
-                ticked_before_open = true;
+            // FR-70 M3a.4: a rebuild ticks the controller FIRST, with the
+            // pass's own arguments under this open's ceiling, and opens at what
+            // it hands out: opened before the tick, a rung the tick crossed
+            // re-rated the new encoder at once, a second open on QSV/AMF. M3a.3
+            // did this for a persisted flip only (the field's B1, AC10 cases #10
+            // and #23). A target held for the old encoder is superseded by the
+            // open. FR-59 P8: the session's FIRST open has no controller yet and
+            // lands at the remembered rate under the ceiling.
+            let open = crate::encode::plan::open_rate(
+                governor.applied_bps(),
+                governor.open_at_bps(),
+                ceiling,
+                std::mem::take(&mut flip_rebuild_pending),
+                || {
+                    let _ = governor.pre_encode_tick(
+                        ceiling,
+                        aimd_floor,
+                        constrained,
+                        send_tx.capacity(),
+                        std::time::Instant::now(),
+                    );
+                    governor.applied_bps()
+                },
+            );
+            ticked_before_open = open.ticked;
+            if open.ticked {
                 deferred_bps = None;
             }
-            // Open at the AIMD's current target when it sits below the
-            // ceiling — a fresh encoder at the full ceiling would be
-            // rebuilt AGAIN one frame later by the governor's forced
-            // reapply (two QSV rebuilds back-to-back at a rung flip).
-            let open_rate = match governor.applied_bps() {
-                // FR-59 P8 — a remembered-slow pair's FIRST open lands at
-                // the remembered rate: the governor's first tick applies it
-                // one frame later, and an encoder opened at the ceiling
-                // would be rebuilt right there (a second blocking QSV open
-                // before the first frame).
-                0 => governor.open_at_bps().map_or(ceiling, |s| ceiling.min(s)),
-                applied => ceiling.min(applied),
-            };
+            let open_rate = open.bps;
             // FR-65 — the open is BLOCKING (0.62-0.73 s measured on Iris Xe at
             // session start, 2026-09-03) and this pump runs under
             // `tokio::spawn`, i.e. on a SHARED runtime worker. `roomlerd` is one
@@ -9136,15 +9123,13 @@ async fn media_pump_ffmpeg_dc(
                     // itself; the shadow judges both against the controller's
                     // next target and the plan after its tick below.
                     plan_shadow.note_built(open_rate, (w, h));
-                    // FR-70 M2 — this encoder was built for the target that
-                    // produced this frame's dims (the pinned one if a swap
-                    // was in flight, the plan's otherwise); the pin and the
-                    // capture cap follow it from here. An inline open also
-                    // supersedes any replacement still opening in the
-                    // background (the target moved again, or nothing was
-                    // live): dropping the handle detaches that task and its
-                    // result is never adopted.
-                    built_target = Some(effective_target);
+                    // FR-70 M2: this encoder was built for the plan's target
+                    // (M3a.4: never the pin's); the capture cap follows it
+                    // from here. An inline open also supersedes any
+                    // replacement still opening in the background: dropping
+                    // the handle detaches that task and its result is never
+                    // adopted.
+                    built_target = Some(frame_target);
                     pending_dims_open = None;
                     // Phase B — a fresh encoder starts at the full `ceiling`
                     // maxrate; force the AIMD to re-apply its current (possibly
@@ -9483,8 +9468,8 @@ async fn media_pump_ffmpeg_dc(
         // link down under congestion / back up on recovery. `set_bitrate`
         // coarsens the target to a ladder before reconfiguring, so applying it
         // every frame is cheap (a no-op unless the coarse bucket moved).
-        // FR-70 M3a.3 — skipped when the inline open above already ticked (a
-        // persisted flip's rebuild): the encoder was built at that target.
+        // FR-70 M3a.3: skipped when the inline open above already ticked
+        // (M3a.4: every rebuild): the encoder was built at that target.
         let tick = if ticked_before_open {
             None
         } else {
