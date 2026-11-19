@@ -613,7 +613,7 @@ pub fn gave_up_reason(
 /// entry named `config.toml` ([`FolderNotTheirs::holds_config`]): a move
 /// would set it aside with the folder, so the line names it instead, and
 /// still names the copies the revert reads there.
-fn move_aside(f: &FolderNotTheirs) -> String {
+pub(crate) fn move_aside(f: &FolderNotTheirs) -> String {
     if !f.is_dir {
         return "It is not a folder but a link or a file, so this line gives no command for it."
             .to_string();
@@ -869,7 +869,7 @@ pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
 /// isolates (U+2060 to U+2069), and the byte order mark (U+FEFF). None of
 /// them is a control character, and a command printed with one reads
 /// otherwise than it runs.
-fn path_displays_as_it_runs(path: &str) -> bool {
+pub(crate) fn path_displays_as_it_runs(path: &str) -> bool {
     !path.chars().any(|c| {
         matches!(
             c,
@@ -883,7 +883,7 @@ fn path_displays_as_it_runs(path: &str) -> bool {
 /// character, which a shell reads in its own way inside double quotes (or
 /// expands from its history). An apostrophe is fine: [`sh_quote`] writes it
 /// `'\''`, which double quotes leave alone.
-fn path_survives_double_quotes(path: &str) -> bool {
+pub(crate) fn path_survives_double_quotes(path: &str) -> bool {
     !path
         .chars()
         .any(|c| matches!(c, '"' | '$' | '`' | '\\' | '!') || c.is_control())
@@ -907,7 +907,7 @@ pub fn administrator_command(f: &FolderNotTheirs) -> Result<&str, NoCommand> {
 
 /// #3802 — an account name a give-up line may print in its sentence and
 /// hand to `dseditgroup`: one or more of `[A-Za-z0-9._-]`.
-fn plain_account_name(name: &str) -> bool {
+pub(crate) fn plain_account_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -952,7 +952,7 @@ pub fn path_reads_as_the_folder(
 
 /// #3802 — `s` as one word of a POSIX shell: in single quotes, with each `'`
 /// in it written `'\''`.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -1019,10 +1019,10 @@ pub struct KeptCopy {
     pub stat: Option<(u32, u32)>,
 }
 
-/// #3802 — the files `sudo roomlerd one-row --revert` reads back from the
-/// person's folder, and from nowhere else (`one_row::revert_plan`): the
-/// LaunchAgent plist the conversion moved there, and the copy of the person's
-/// config it kept beside their config. Names, inside that folder.
+/// #3802 — the copies an older conversion kept in the person's folder: the LaunchAgent plist
+/// it moved there and its copy of the person's config. Names, inside that folder. FR-147:
+/// root reads nothing in a home; `sudo roomlerd one-row --revert` starts the person's own
+/// `one-row-home put-back-legacy`, which renames these back (`one_row_home::Places`).
 pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
     use crate::one_row::{AGENT_PLIST, kept_path};
     [
@@ -3738,27 +3738,6 @@ mod tests {
             println!("GIVE-UP [{case}] {why}");
             assert_eq!(why, want, "{case}");
         }
-    }
-
-    /// #3802 — the names the give-up keeps are the paths the revert reads in
-    /// the person's folder (`one_row::revert_plan`).
-    #[test]
-    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
-        let dir = std::path::PathBuf::from("/u/F");
-        let person = crate::one_row::Person {
-            user: "p".into(),
-            uid: 501,
-            home: "/u".into(),
-            dir: dir.clone(),
-            config: None,
-            has_plist: true,
-        };
-        let [plist, config] = kept_for_revert();
-        assert_eq!(dir.join(plist), person.plist_aside());
-        assert_eq!(
-            dir.join(config),
-            crate::one_row::kept_path(&person.config_path())
-        );
     }
 
     /// FR-43 P3a — a worker with no enrollment cannot be missing one, so the

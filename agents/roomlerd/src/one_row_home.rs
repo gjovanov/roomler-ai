@@ -14,10 +14,10 @@
 //!
 //! | Verb | stdin | The reply's answer | Exit |
 //! |---|---|---|---|
-//! | `read` | none | `read`: the kind, owner and mode of the home (whether it is a plain absolute path, its device and inode), of `~/Library`, `~/Library/LaunchAgents` and the roomler folder (each also whether it can write there); the folder's segment; the config's and the LaunchAgent plist's bytes, owner and mode, or why not (a link reads as `not_regular`); the kind of what is at each name an older release kept a copy under | 0 |
+//! | `read` | none | `read`: the kind, owner and mode of the home (whether it is a plain absolute path, its device and inode), of `~/Library`, `~/Library/Application Support`, `~/Library/LaunchAgents` and the roomler folder (each also whether it can write there); the folder's segment; the config's and the LaunchAgent plist's bytes, owner and mode, or why not (a link reads as `not_regular`); the kind of what is at each name an older release kept a copy under | 0 |
 //! | `convert --expect-config <sha256\|none> --expect-plist <sha256\|none>` | none | `convert`: the new config's sha256 (of the bytes it wrote), whether the plist was removed | 0; 3 when either live file is not the bytes named, or is no longer a regular file (both are checked before either changes) |
 //! | `put-back` | [`Kept`]: the kept bytes and modes of both files | `put_back`: the sha256 of each file written | 0; 4 when a folder it writes is not writable |
-//! | `put-back-legacy` | none | `put_back_legacy`: which old copies it renamed back | 0; 4 as `put-back` |
+//! | `put-back-legacy` | none | `put_back_legacy`: which old copies it renamed back | 0; 3 when anything but a file is at an old copy's name; 4, naming the roomler folder, when an old copy's name could not be looked at, and as `put-back`; 3 and that first 4 before anything is renamed |
 //! | every verb | | | 2: usage, a failed check of itself, or another version; 4: not writable (stderr: the path, its owner and mode); 1: any other error |
 //!
 //! The reply is one JSON line on stdout, written only with exit 0: `"v":1`,
@@ -491,6 +491,9 @@ impl Reply {
 pub struct ReadAnswer {
     pub home: HomeEntry,
     pub library: Entry,
+    /// `~/Library/Application Support`: root's administrator's lines name
+    /// a path in it only when it reads as a folder of the person's own.
+    pub support: Entry,
     pub agents_dir: Entry,
     pub folder: Entry,
     pub segment: Segment,
@@ -918,6 +921,7 @@ fn read(at: &Places, fs: &impl Fs) -> ReadAnswer {
             ino: id.map(|(_, ino)| ino),
         },
         library: entry(fs, &at.library),
+        support: entry(fs, &at.support),
         agents_dir: entry(fs, &at.agents_dir),
         folder: entry(fs, &at.folder),
         segment: at.segment,
@@ -1586,6 +1590,17 @@ mod tests {
         writes_fail: bool,
     }
 
+    /// #3802, moved from `macos_supervisor`'s tests (FR-147): the names the
+    /// give-up keeps are the ones `put-back-legacy` renames back in the
+    /// person's folder.
+    #[test]
+    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
+        let at = Places::of(Path::new("/u"), &FakeFs::new());
+        let [plist, config] = crate::macos_supervisor::kept_for_revert();
+        assert_eq!(at.folder.join(plist), at.legacy_plist);
+        assert_eq!(at.folder.join(config), at.legacy_config);
+    }
+
     impl FakeFs {
         fn new() -> FakeFs {
             FakeFs {
@@ -2024,6 +2039,15 @@ mod tests {
             }
         );
         assert!(read.folder.writable);
+        assert_eq!(
+            read.support,
+            Entry {
+                kind: Kind::Dir,
+                uid: Some(UID),
+                mode: Some(0o755),
+                writable: true
+            }
+        );
         assert_eq!(read.home.kind, Kind::Dir);
         assert!(read.home.absolute);
         assert!(read.home.dev.is_some() && read.home.ino.is_some());
@@ -2765,7 +2789,12 @@ mod tests {
 
         /// A home as the package leaves it, on disk.
         fn a_home() -> (tempfile::TempDir, Places) {
-            let dir = tempfile::tempdir().unwrap();
+            a_home_in(&std::env::temp_dir())
+        }
+
+        /// [`a_home`], made under `root`.
+        fn a_home_in(root: &Path) -> (tempfile::TempDir, Places) {
+            let dir = tempfile::tempdir_in(root).unwrap();
             let at = Places::of(dir.path(), &RealFs);
             std::fs::create_dir_all(&at.folder).unwrap();
             std::fs::create_dir_all(&at.agents_dir).unwrap();
@@ -2907,7 +2936,10 @@ mod tests {
         /// `convert` over it is changed (3), not any other error (1).
         #[test]
         fn a_socket_at_the_config_is_not_regular() {
-            let (dir, at) = a_home();
+            // A socket's path holds at most 103 bytes on macOS (SUN_LEN), and
+            // the config's path under a Mac runner's `TMPDIR` is longer, so
+            // this home is made under `/tmp`.
+            let (dir, at) = a_home_in(Path::new("/tmp"));
             std::fs::remove_file(&at.config).unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(&at.config).unwrap();
             assert!(matches!(
