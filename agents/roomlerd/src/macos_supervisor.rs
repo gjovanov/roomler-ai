@@ -613,7 +613,7 @@ pub fn gave_up_reason(
 /// entry named `config.toml` ([`FolderNotTheirs::holds_config`]): a move
 /// would set it aside with the folder, so the line names it instead, and
 /// still names the copies the revert reads there.
-fn move_aside(f: &FolderNotTheirs) -> String {
+pub(crate) fn move_aside(f: &FolderNotTheirs) -> String {
     if !f.is_dir {
         return "It is not a folder but a link or a file, so this line gives no command for it."
             .to_string();
@@ -869,7 +869,7 @@ pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
 /// isolates (U+2060 to U+2069), and the byte order mark (U+FEFF). None of
 /// them is a control character, and a command printed with one reads
 /// otherwise than it runs.
-fn path_displays_as_it_runs(path: &str) -> bool {
+pub(crate) fn path_displays_as_it_runs(path: &str) -> bool {
     !path.chars().any(|c| {
         matches!(
             c,
@@ -883,7 +883,7 @@ fn path_displays_as_it_runs(path: &str) -> bool {
 /// character, which a shell reads in its own way inside double quotes (or
 /// expands from its history). An apostrophe is fine: [`sh_quote`] writes it
 /// `'\''`, which double quotes leave alone.
-fn path_survives_double_quotes(path: &str) -> bool {
+pub(crate) fn path_survives_double_quotes(path: &str) -> bool {
     !path
         .chars()
         .any(|c| matches!(c, '"' | '$' | '`' | '\\' | '!') || c.is_control())
@@ -907,7 +907,7 @@ pub fn administrator_command(f: &FolderNotTheirs) -> Result<&str, NoCommand> {
 
 /// #3802 — an account name a give-up line may print in its sentence and
 /// hand to `dseditgroup`: one or more of `[A-Za-z0-9._-]`.
-fn plain_account_name(name: &str) -> bool {
+pub(crate) fn plain_account_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -952,7 +952,7 @@ pub fn path_reads_as_the_folder(
 
 /// #3802 — `s` as one word of a POSIX shell: in single quotes, with each `'`
 /// in it written `'\''`.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

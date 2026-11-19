@@ -65,6 +65,178 @@ pub fn kept_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// FR-147 — root's own tree for the records of a conversion (D4): root:wheel
+/// 700, each file 600.
+pub const RECORDS: &str = "/etc/roomler/one-row";
+/// FR-147 — the command's log, beside the daemon's.
+pub const LOG: &str = "/var/log/roomler/one-row.log";
+/// FR-147 — the format of root's records. A self-update can land between a
+/// conversion and its revert, so a later release reads this one.
+pub const RECORD_FORMAT: u32 = 1;
+/// FR-147 — the section of the docs a refusal names where it prints no
+/// command, in the package's words (`packaging/macos/postinstall:259`).
+pub const INSTALL_DOC: &str =
+    "docs/installation.md, section \"Which account each step of the package's script writes as\"";
+
+/// FR-147 — a file of root's own that the command reads or writes. No
+/// variant leads into a home: [`root_path`] maps each one under
+/// `/etc/roomler` or `/var/log/roomler`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RootFile {
+    /// Root's file, [`ROOT_CONFIG`].
+    Config,
+    /// Root's file as it was before the conversion, beside it.
+    Kept,
+    /// `root.json`: what root's kept copy is ([`RootRecord`]).
+    RootRecord,
+    /// One of the files root keeps for a person, under their uid.
+    Person { uid: u32, part: Part },
+    /// The command's own log.
+    Log,
+}
+
+/// FR-147 — what root keeps of one person: the files of
+/// `/etc/roomler/one-row/<uid>/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Part {
+    /// The person's config, as their child read it.
+    Config,
+    /// The LaunchAgent plist's bytes.
+    Plist,
+    /// `record.json` ([`PersonRecord`]), written last: it commits the uid.
+    Record,
+    /// `after.json` ([`AfterRecord`]).
+    After,
+}
+
+impl Part {
+    pub const ALL: [Part; 4] = [Part::Config, Part::Plist, Part::Record, Part::After];
+
+    fn name(self) -> &'static str {
+        match self {
+            Part::Config => "config.toml",
+            Part::Plist => AGENT_PLIST,
+            Part::Record => "record.json",
+            Part::After => "after.json",
+        }
+    }
+}
+
+/// FR-147 — the one function that names a path for a [`RootFile`]: each is
+/// under `/etc/roomler` or `/var/log/roomler`, root's own tree.
+pub fn root_path(file: RootFile) -> PathBuf {
+    match file {
+        RootFile::Config => PathBuf::from(ROOT_CONFIG),
+        RootFile::Kept => kept_path(Path::new(ROOT_CONFIG)),
+        RootFile::RootRecord => Path::new(RECORDS).join("root.json"),
+        RootFile::Person { uid, part } => person_records(uid).join(part.name()),
+        RootFile::Log => PathBuf::from(LOG),
+    }
+}
+
+/// FR-147 — the folder of one person's records, `/etc/roomler/one-row/<uid>`.
+pub fn person_records(uid: u32) -> PathBuf {
+    Path::new(RECORDS).join(uid.to_string())
+}
+
+/// `bytes`' sha256, as 64 lowercase hex digits.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// FR-147 — `root.json`: what root's kept copy is, so a revert checks it
+/// before it puts it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootRecord {
+    pub v: u32,
+    pub kept_sha256: String,
+    pub kept_len: u64,
+    /// Root's `macos_supervise_gui_worker` before the conversion: whether
+    /// `--revert` bootstraps the console person's agent
+    /// ([`bootstrap_after_revert`]).
+    pub macos_supervise_gui_worker: bool,
+    /// The release that wrote it, and when (UTC).
+    pub release: String,
+    pub at: String,
+}
+
+/// FR-147 — one of a person's two files as Read found it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRecord {
+    pub existed: bool,
+    pub sha256: Option<String>,
+    pub len: Option<u64>,
+    /// Its permission bits, as the child read them.
+    pub mode: Option<u32>,
+}
+
+impl FileRecord {
+    /// A file of `bytes` and `mode`, or none.
+    pub fn of(file: Option<(&[u8], u32)>) -> FileRecord {
+        match file {
+            Some((bytes, mode)) => FileRecord {
+                existed: true,
+                sha256: Some(sha256_hex(bytes)),
+                len: Some(bytes.len() as u64),
+                mode: Some(mode),
+            },
+            None => FileRecord {
+                existed: false,
+                sha256: None,
+                len: None,
+                mode: None,
+            },
+        }
+    }
+
+    /// Whether `stored` is the file this records: there exactly when it
+    /// existed, with its length and sha256.
+    pub fn matches(&self, stored: Option<&[u8]>) -> bool {
+        match (self.existed, stored) {
+            (false, None) => true,
+            (true, Some(bytes)) => {
+                self.len == Some(bytes.len() as u64)
+                    && self.sha256.as_deref() == Some(sha256_hex(bytes).as_str())
+            }
+            _ => false,
+        }
+    }
+}
+
+/// FR-147 — `record.json`: one person's conversion. Written last of the
+/// uid's files, so a uid folder without one that parses is a Keep that never
+/// finished.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonRecord {
+    pub v: u32,
+    pub uid: u32,
+    /// The account's UUID: a revert gives back only to the account the files
+    /// were taken from (D7).
+    pub uuid: String,
+    /// The account's name then, for display.
+    pub name: String,
+    /// Which name the roomler folder had.
+    pub segment: crate::one_row_home::Segment,
+    pub config: FileRecord,
+    pub plist: FileRecord,
+    pub release: String,
+    pub at: String,
+}
+
+/// FR-147 — `after.json`: what `convert` wrote, so a revert says when the
+/// person changed it since.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AfterRecord {
+    pub v: u32,
+    /// The sha256 `convert` reported for the config it wrote.
+    pub config_sha256: Option<String>,
+}
+
 /// One account's half on this Mac, as Read found it.
 #[derive(Debug, Clone)]
 pub struct Person {
@@ -111,6 +283,116 @@ pub struct Read {
     pub status: NodeStatus,
     /// Whose session the worker serves, and the verify needs.
     pub console_uid: u32,
+}
+
+/// FR-147 — an account as root reads it in the account database. Its home is
+/// display text and an argument: root opens nothing in it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Account {
+    pub uid: u32,
+    /// `pw_gid`: the person's child runs with this group and no other.
+    pub gid: u32,
+    /// `pw_name`: for display, for `dseditgroup` and an administrator's line.
+    pub name: String,
+    /// `pw_dir`, as text.
+    pub home: String,
+    /// The account's UUID (`mbr_uid_to_uuid`), which decides whose a record
+    /// is (D7).
+    pub uuid: String,
+}
+
+/// FR-147 — an entry of `/Users` as root's `stat` reads it: links followed,
+/// nothing resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsersEntry {
+    pub name: String,
+    pub uid: u32,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// FR-147 — whom Read starts a child for, and whom it leaves alone.
+#[derive(Debug, Clone, Default)]
+pub struct Asked {
+    /// One account per distinct owner uid, in uid order.
+    pub accounts: Vec<Account>,
+    /// `(uid, line)`: an owner left alone, with why.
+    pub left_alone: Vec<(u32, String)>,
+}
+
+fn entry_names(entries: &[UsersEntry], uid: u32) -> String {
+    let names: Vec<String> = entries
+        .iter()
+        .filter(|e| e.uid == uid)
+        .map(|e| format!("/Users/{}", e.name))
+        .collect();
+    names.join(" and ")
+}
+
+/// FR-147 — the owners of `/Users`' entries that Read starts a `read` child
+/// for: one per distinct uid, in uid order. Left alone, and said: uid 0, a
+/// uid under 500, a uid with no account (D3: no process of a person's can be
+/// started for it), and an account whose primary group is 0. Pure over
+/// root's reads.
+pub fn accounts_to_ask(entries: &[UsersEntry], account: impl Fn(u32) -> Option<Account>) -> Asked {
+    let mut uids: Vec<u32> = entries.iter().map(|e| e.uid).collect();
+    uids.sort_unstable();
+    uids.dedup();
+    let mut asked = Asked::default();
+    for uid in uids {
+        let why = if uid == 0 {
+            "it is root's".to_string()
+        } else if uid < 500 {
+            format!("uid {uid} is under 500, a system account's")
+        } else {
+            match account(uid) {
+                None => format!(
+                    "no account has uid {uid}, so no process of a person's can be started for it"
+                ),
+                Some(a) if a.gid == 0 => {
+                    format!("{}'s primary group is 0 (wheel)", a.name)
+                }
+                Some(a) => {
+                    asked.accounts.push(a);
+                    continue;
+                }
+            }
+        };
+        asked.left_alone.push((
+            uid,
+            format!("left alone: {}: {why}", entry_names(entries, uid)),
+        ));
+    }
+    asked
+}
+
+/// FR-147 — whether any entry owned by `account` leads to the home its child
+/// reported (the device and inode root's `stat` read), and a line for each
+/// that does not, which is left alone. A link to a home on another volume
+/// leads there; an entry another account's folder sits behind does not.
+pub fn entries_of_home(
+    entries: &[UsersEntry],
+    account: &Account,
+    home: &crate::one_row_home::HomeEntry,
+) -> (bool, Vec<(u32, String)>) {
+    let id = home.dev.zip(home.ino);
+    let mut leads = false;
+    let mut alone = Vec::new();
+    for e in entries.iter().filter(|e| e.uid == account.uid) {
+        if id == Some((e.dev, e.ino)) {
+            leads = true;
+        } else {
+            alone.push((
+                account.uid,
+                format!(
+                    "left alone: /Users/{}: owned by {} (uid {}), but it does not lead to that \
+                     account's home, {}",
+                    e.name, account.name, account.uid, account.home
+                ),
+            ));
+        }
+    }
+    (leads, alone)
 }
 
 /// What happens to one of a person's enrollments.
@@ -541,6 +823,352 @@ pub fn missing(status: &NodeStatus, moved: &[String]) -> Option<String> {
         )),
         Some(_) => None,
     }
+}
+
+/// FR-147 — the roomler folder's path as the person's own agent names it:
+/// from `pw_dir` and the segment the child reported, never from the disk
+/// ([`crate::appdirs::macos_config_dir_in_home`] names the segment). Display
+/// text for the lines root prints, joined with `/` on every platform.
+pub fn folder_display(home: &str, segment: crate::one_row_home::Segment) -> String {
+    let at = Path::new(home);
+    let current = crate::appdirs::macos_config_dir_in_home(at, |_| false);
+    let folder = crate::appdirs::macos_config_dir_in_home(at, |p| {
+        segment == crate::one_row_home::Segment::Legacy && p != current
+    });
+    let name = folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{home}/Library/Application Support/{name}")
+}
+
+/// FR-147 — what root knows of a person beyond their child's report, for the
+/// administrator's lines: whether they are the person at the console, and
+/// whether `dseditgroup` says that account is an administrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rights {
+    pub at_console: bool,
+    pub administrator: bool,
+}
+
+/// FR-147 — what R1 and R3 are about: `~/Library/LaunchAgents`, or the
+/// config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    AgentsDir,
+    Config,
+}
+
+fn kind_words(kind: crate::one_row_home::Kind) -> &'static str {
+    use crate::one_row_home::Kind;
+    match kind {
+        Kind::Dir => "a folder",
+        Kind::File => "a file",
+        Kind::Link => "a link",
+        Kind::Other => "neither a file nor a folder",
+        Kind::Absent => "not there",
+    }
+}
+
+/// The path, kind, owner and mode the child reported for `target`.
+fn target_of(
+    account: &Account,
+    seen: &crate::one_row_home::ReadAnswer,
+    target: Target,
+) -> (String, crate::one_row_home::Kind, Option<u32>, Option<u32>) {
+    use crate::one_row_home::{Held, Kind, ReadError};
+    match target {
+        Target::AgentsDir => (
+            format!("{}/Library/LaunchAgents", account.home),
+            seen.agents_dir.kind,
+            seen.agents_dir.uid,
+            seen.agents_dir.mode,
+        ),
+        Target::Config => {
+            let path = format!(
+                "{}/config.toml",
+                folder_display(&account.home, seen.segment)
+            );
+            match &seen.config {
+                // `eacces` is read only of what `lstat` said is a regular file.
+                Held::Unreadable {
+                    error: ReadError::Eacces,
+                    uid,
+                    mode,
+                } => (path, Kind::File, *uid, *mode),
+                Held::Present { uid, mode, .. } => (path, Kind::File, Some(*uid), Some(*mode)),
+                Held::Unreadable { uid, mode, .. } => (path, Kind::Other, *uid, *mode),
+                Held::Absent => (path, Kind::Absent, None, None),
+            }
+        }
+    }
+}
+
+/// FR-147 — R1 and R3 (D2): what the child reported of the folder or file in
+/// the way, then `sudo chown -h '<name>' '<path>'` for an administrator where
+/// all four conditions hold, else the words with no command. The conditions
+/// (the package's `sudo_line_fits` and its owner test,
+/// `packaging/macos/postinstall:260-266`, `:301`): the home is the console
+/// person's; that person is an administrator; the child reports the home an
+/// absolute path to a folder and `~/Library` a folder of the person's; the
+/// target is a folder (R1) or a regular file (R3) of uid 0. And the line
+/// passes #3846's printing tests: the path survives `sh -c "…"` and displays
+/// as it runs, and the name is plain. `owner_name` is the owner's account
+/// name, as root reads it.
+pub fn chown_words(
+    account: &Account,
+    seen: &crate::one_row_home::ReadAnswer,
+    target: Target,
+    rights: Rights,
+    owner_name: &str,
+) -> String {
+    use crate::macos_supervisor::{
+        path_displays_as_it_runs, path_survives_double_quotes, plain_account_name, sh_quote,
+    };
+    use crate::one_row_home::Kind;
+    let (path, kind, uid, mode) = target_of(account, seen, target);
+    let name = &account.name;
+    let first = match (uid, mode) {
+        (Some(u), Some(m)) if u == account.uid => format!(
+            "{path} ({}) is {name}'s own (uid {u}, mode {m:03o}), but {name}'s account cannot \
+             change it.",
+            kind_words(kind)
+        ),
+        (Some(u), Some(m)) => format!(
+            "{path} ({}) belongs to {owner_name} (uid {u}, mode {m:03o}), not to {name}, so \
+             {name}'s account cannot change it.",
+            kind_words(kind)
+        ),
+        _ => format!("{path} could not be looked at by {name}'s account."),
+    };
+    let home_reads = seen.home.absolute
+        && seen.home.kind == Kind::Dir
+        && seen.library.kind == Kind::Dir
+        && seen.library.uid == Some(account.uid);
+    let roots = uid == Some(0)
+        && kind
+            == match target {
+                Target::AgentsDir => Kind::Dir,
+                Target::Config => Kind::File,
+            };
+    let printable = path_survives_double_quotes(&path)
+        && path_displays_as_it_runs(&path)
+        && plain_account_name(name);
+    if rights.at_console && rights.administrator && home_reads && roots && printable {
+        format!(
+            "{first}\n  {name} is an administrator of this Mac and can run this, then run `sudo \
+             roomlerd one-row` again:\n    sudo chown -h {} {}",
+            sh_quote(name),
+            sh_quote(&path)
+        )
+    } else {
+        format!(
+            "{first}\n  It has to be {name}'s own before `sudo roomlerd one-row` can make this \
+             Mac one row;\n  see {INSTALL_DOC}."
+        )
+    }
+}
+
+/// `lstat`'s answer (owner and full mode) for what the child reported: a kind
+/// and permission bits. Absent is "not there"; no owner or mode is a read
+/// that failed.
+fn reported(
+    kind: crate::one_row_home::Kind,
+    uid: Option<u32>,
+    mode: Option<u32>,
+) -> std::io::Result<(u32, u32)> {
+    use crate::one_row_home::Kind;
+    let ty = match kind {
+        Kind::Absent => return Err(std::io::ErrorKind::NotFound.into()),
+        Kind::Dir => 0o040000,
+        Kind::File => 0o100000,
+        Kind::Link => 0o120000,
+        Kind::Other => 0o010000,
+    };
+    match (uid, mode) {
+        (Some(uid), Some(mode)) => Ok((uid, ty | (mode & 0o7777))),
+        _ => Err(std::io::Error::other("it could not be looked at")),
+    }
+}
+
+/// FR-147 — `lstat` as the person's child reported it: the home, `~/Library`,
+/// `~/Library/Application Support`, the roomler folder and the names in it
+/// that the report covers. Any other path is an error, so the supervisor's
+/// readers ([`crate::macos_supervisor::read_person_folder`],
+/// [`crate::macos_supervisor::path_reads_as_the_folder`]) read nothing of a
+/// home themselves.
+fn reported_lstat<'a>(
+    account: &Account,
+    seen: &'a crate::one_row_home::ReadAnswer,
+) -> impl Fn(&Path) -> std::io::Result<(u32, u32)> + 'a {
+    use crate::one_row_home::{Held, Kind, ReadError};
+    let home = PathBuf::from(&account.home);
+    let library = PathBuf::from(format!("{}/Library", account.home));
+    let support = PathBuf::from(format!("{}/Library/Application Support", account.home));
+    let folder_text = folder_display(&account.home, seen.segment);
+    let folder = PathBuf::from(&folder_text);
+    let config = PathBuf::from(format!("{folder_text}/config.toml"));
+    let legacy_config = kept_path(&config);
+    let legacy_plist = PathBuf::from(format!("{folder_text}/{AGENT_PLIST}.{KEPT_EXT}"));
+    move |p: &Path| {
+        let entry = |e: &crate::one_row_home::Entry| reported(e.kind, e.uid, e.mode);
+        if p == home {
+            reported(seen.home.kind, seen.home.uid, seen.home.mode)
+        } else if p == library {
+            entry(&seen.library)
+        } else if p == support {
+            entry(&seen.support)
+        } else if p == folder {
+            entry(&seen.folder)
+        } else if p == legacy_config {
+            entry(&seen.legacy.config)
+        } else if p == legacy_plist {
+            entry(&seen.legacy.plist)
+        } else if p == config {
+            match &seen.config {
+                Held::Absent => Err(std::io::ErrorKind::NotFound.into()),
+                Held::Present { uid, mode, .. } => reported(Kind::File, Some(*uid), Some(*mode)),
+                Held::Unreadable {
+                    error: ReadError::Eacces,
+                    uid,
+                    mode,
+                } => reported(Kind::File, *uid, *mode),
+                Held::Unreadable { uid, mode, .. } => reported(Kind::Other, *uid, *mode),
+            }
+        } else {
+            Err(std::io::Error::other("not in the child's report"))
+        }
+    }
+}
+
+/// FR-147 — R2 and R4: the person's roomler folder is another account's.
+/// What the child reported of it, then #3846's own text
+/// ([`crate::macos_supervisor::move_aside`]), built from that report alone:
+/// an administrator's command where the package's rule fits (the console
+/// person, an administrator, a home whose paths read as the folder), else its
+/// words. A folder that holds a config never gets one, so R2 never does.
+/// `stamp` names what the command would make, as the supervisor's does.
+pub fn folder_words(
+    account: &Account,
+    seen: &crate::one_row_home::ReadAnswer,
+    rights: Rights,
+    owner_name: &str,
+    stamp: &str,
+) -> String {
+    use crate::macos_supervisor::{
+        NoCommand, move_aside, path_reads_as_the_folder, read_person_folder,
+    };
+    let folder = folder_display(&account.home, seen.segment);
+    let first = match (seen.folder.uid, seen.folder.mode) {
+        (Some(u), Some(m)) => format!(
+            "{folder} ({}) belongs to {owner_name} (uid {u}, mode {m:03o}), not to {}.",
+            kind_words(seen.folder.kind),
+            account.name
+        ),
+        _ => format!(
+            "{folder} could not be looked at by {}'s account.",
+            account.name
+        ),
+    };
+    let lstat = reported_lstat(account, seen);
+    let Some(mut f) = read_person_folder(PathBuf::from(&folder), account.uid, stamp, &lstat) else {
+        return format!("{first} No command fits it; see {INSTALL_DOC}.");
+    };
+    f.administrator = if !rights.at_console {
+        Err(NoCommand::NotRead)
+    } else if !path_reads_as_the_folder(
+        account.uid,
+        Path::new(&account.home),
+        Path::new(&folder),
+        &lstat,
+    ) {
+        Err(NoCommand::PathsDoNotRead)
+    } else if !rights.administrator {
+        Err(NoCommand::NotAdministrator(None))
+    } else {
+        Ok(account.name.clone())
+    };
+    format!("{first} {}", move_aside(&f))
+}
+
+/// FR-147 — R5: the console person's LaunchAgent is loaded, and this run
+/// does not convert them. The restarted daemon's worker would stand down for
+/// it, so the verify would fail. `why`: why they were left alone.
+pub fn r5_words(console_uid: u32, why: Option<&str>) -> String {
+    format!(
+        "the person at the console (uid {console_uid}) has com.roomler.agent loaded, and this run \
+         does not convert them{}: with that LaunchAgent loaded the restarted daemon's worker stands \
+         down, and the verify would fail. No command fits this; see {INSTALL_DOC}.",
+        why.map(|w| format!(" ({w})")).unwrap_or_default()
+    )
+}
+
+/// FR-147 D6 — what `launchctl` is given to load a person's LaunchAgent:
+/// today's root form, `bootstrap gui/<uid> <P>`, until lab cell C13 shows
+/// that the person's own `launchctl` loads it. The one place `<P>` is built:
+/// launchd opens it, never a process of ours running as root.
+pub fn bootstrap_argv(uid: u32, home: &str) -> Vec<String> {
+    vec![
+        "bootstrap".to_string(),
+        format!("gui/{uid}"),
+        format!("{home}/Library/LaunchAgents/{AGENT_PLIST}"),
+    ]
+}
+
+/// FR-147 D1 — the package's binary (`scripts/install.sh:134`): the program
+/// root starts as a person, whatever path the command was typed by.
+pub const PERSON_PROGRAM: &str = "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd";
+/// FR-147 — how long a person's child may take.
+pub const CHILD_DEADLINE: Duration = Duration::from_secs(30);
+/// FR-147 — the most stdout root reads of a child, and the most stdin it
+/// sends one.
+pub const CHILD_CAP: usize = 1024 * 1024;
+
+/// FR-147 D1 — how root starts a person's child: the package's binary, the
+/// child's arguments, no environment, `/` as its folder, and the account's
+/// uid and primary group, set by root's own hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPlan {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    /// Empty: the child reads no environment.
+    pub env: Vec<(String, String)>,
+    pub dir: &'static str,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// FR-147 D1 — the [`SpawnPlan`] for `verb` as `account`.
+pub fn spawn_plan(account: &Account, verb: crate::one_row_home::Verb) -> SpawnPlan {
+    SpawnPlan {
+        program: PERSON_PROGRAM,
+        args: crate::one_row_home::child_args(account.uid, account.gid, verb),
+        env: Vec::new(),
+        dir: "/",
+        uid: account.uid,
+        gid: account.gid,
+    }
+}
+
+/// FR-147 D1 — why root does not start [`PERSON_PROGRAM`], as `lstat` read it
+/// (owner and full mode): a link, not a regular file, not uid 0's, or
+/// writable by group or others. `None`: it may be started.
+pub fn program_refusal(lstat: std::io::Result<(u32, u32)>) -> Option<String> {
+    let (uid, mode) = match lstat {
+        Ok(stat) => stat,
+        Err(e) => return Some(format!("{PERSON_PROGRAM} could not be read: {e}")),
+    };
+    let why = match mode & 0o170000 {
+        0o120000 => "is a link".to_string(),
+        0o100000 if uid != 0 => format!("is uid {uid}'s, not root's"),
+        0o100000 if mode & 0o022 != 0 => "is writable by group or others".to_string(),
+        0o100000 => return None,
+        _ => "is not a regular file".to_string(),
+    };
+    Some(format!(
+        "{PERSON_PROGRAM} {why} (mode {:o}), so no process of a person's is started from it",
+        mode & 0o7777
+    ))
 }
 
 /// Every effect the command has, so the sequence runs against a fake in tests.
@@ -2423,5 +3051,473 @@ mod tests {
 
         let kept: Vec<String> = distinct_homes(found).into_iter().map(|h| h.user).collect();
         assert_eq!(kept, ["admin", "bob"]);
+    }
+
+    // ---- FR-147 P1: root's side, the pure core ----
+
+    use crate::one_row_home::{
+        Entry, Held, HomeEntry, Kind, LegacyEntries, ReadAnswer, ReadError, Segment, Verb,
+    };
+
+    fn account(uid: u32, name: &str) -> Account {
+        Account {
+            uid,
+            gid: 20,
+            name: name.to_string(),
+            home: format!("/Users/{name}"),
+            uuid: format!("UUID-{uid}"),
+        }
+    }
+
+    fn dir_of(uid: u32, mode: u32) -> Entry {
+        Entry {
+            kind: Kind::Dir,
+            uid: Some(uid),
+            mode: Some(mode),
+            writable: true,
+        }
+    }
+
+    const ABSENT: Entry = Entry {
+        kind: Kind::Absent,
+        uid: None,
+        mode: None,
+        writable: false,
+    };
+
+    /// A home as the package leaves it, every folder the person's, as the
+    /// child of `uid` reports it.
+    fn seen(uid: u32) -> ReadAnswer {
+        ReadAnswer {
+            home: HomeEntry {
+                kind: Kind::Dir,
+                uid: Some(uid),
+                mode: Some(0o750),
+                absolute: true,
+                dev: Some(1),
+                ino: Some(u64::from(uid)),
+            },
+            library: dir_of(uid, 0o700),
+            support: dir_of(uid, 0o755),
+            agents_dir: dir_of(uid, 0o755),
+            folder: dir_of(uid, 0o755),
+            segment: Segment::Current,
+            config: Held::Present {
+                bytes: b"x = 1\n".to_vec(),
+                uid,
+                mode: 0o600,
+            },
+            plist: Held::Present {
+                bytes: b"<plist/>".to_vec(),
+                uid,
+                mode: 0o644,
+            },
+            legacy: LegacyEntries {
+                config: ABSENT,
+                plist: ABSENT,
+            },
+        }
+    }
+
+    const ADMIN_AT_CONSOLE: Rights = Rights {
+        at_console: true,
+        administrator: true,
+    };
+
+    #[test]
+    fn root_path_maps_into_root_trees_only() {
+        let mut every = vec![
+            RootFile::Config,
+            RootFile::Kept,
+            RootFile::RootRecord,
+            RootFile::Log,
+        ];
+        for uid in [501, 0, u32::MAX] {
+            every.extend(Part::ALL.map(|part| RootFile::Person { uid, part }));
+        }
+        for file in every {
+            let path = root_path(file);
+            assert!(
+                path.starts_with("/etc/roomler") || path.starts_with("/var/log/roomler"),
+                "{file:?} -> {}",
+                path.display()
+            );
+            assert!(
+                path.components()
+                    .all(|c| !matches!(c, std::path::Component::ParentDir)),
+                "{file:?} -> {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            root_path(RootFile::Person {
+                uid: 501,
+                part: Part::Record
+            }),
+            Path::new(RECORDS).join("501").join("record.json")
+        );
+        assert_eq!(
+            root_path(RootFile::Kept),
+            Path::new("/etc/roomler/config.toml.pre-one-row")
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_its_owners_home_is_left_alone() {
+        // Another account's folder behind an entry owned by 501.
+        let entries = [UsersEntry {
+            name: "shadow".into(),
+            uid: 501,
+            dev: 1,
+            ino: 9999,
+        }];
+        let asked = accounts_to_ask(&entries, |uid| Some(account(uid, "a")));
+        assert_eq!(asked.accounts.len(), 1, "its owner's child reads the home");
+        let (leads, alone) = entries_of_home(&entries, &asked.accounts[0], &seen(501).home);
+        assert!(
+            !leads,
+            "no entry of 501 leads to 501's home: no person, no convert"
+        );
+        assert_eq!(alone.len(), 1);
+        assert!(alone[0].1.contains("/Users/shadow"), "{}", alone[0].1);
+        assert!(alone[0].1.contains("does not lead"), "{}", alone[0].1);
+    }
+
+    #[test]
+    fn two_entries_of_one_uid_are_one_person() {
+        // The tart image: `/Users/runner`, a link to `/Users/admin`, and an
+        // entry of the same uid that leads elsewhere.
+        let entries = [
+            UsersEntry {
+                name: "runner".into(),
+                uid: 501,
+                dev: 1,
+                ino: 501,
+            },
+            UsersEntry {
+                name: "admin".into(),
+                uid: 501,
+                dev: 1,
+                ino: 501,
+            },
+            UsersEntry {
+                name: "old".into(),
+                uid: 501,
+                dev: 1,
+                ino: 7,
+            },
+        ];
+        let asked = accounts_to_ask(&entries, |uid| Some(account(uid, "admin")));
+        assert_eq!(asked.accounts, vec![account(501, "admin")], "one child");
+        assert!(asked.left_alone.is_empty());
+        let (leads, alone) = entries_of_home(&entries, &asked.accounts[0], &seen(501).home);
+        assert!(leads);
+        let lines: Vec<&str> = alone.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("/Users/old"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_home_with_no_account_is_left_alone() {
+        let entry = |name: &str, uid: u32| UsersEntry {
+            name: name.into(),
+            uid,
+            dev: 1,
+            ino: u64::from(uid),
+        };
+        let entries = [
+            entry("ghost", 777),
+            entry("daemon", 300),
+            entry("wheelie", 502),
+            entry("root", 0),
+        ];
+        let asked = accounts_to_ask(&entries, |uid| match uid {
+            502 => Some(Account {
+                gid: 0,
+                ..account(502, "wheelie")
+            }),
+            300 => Some(account(300, "daemon")),
+            _ => None,
+        });
+        assert!(asked.accounts.is_empty(), "no child is started");
+        let said: Vec<(u32, &str)> = asked
+            .left_alone
+            .iter()
+            .map(|(uid, l)| (*uid, l.as_str()))
+            .collect();
+        assert_eq!(said.len(), 4, "{said:?}");
+        let line = |uid: u32| said.iter().find(|(u, _)| *u == uid).unwrap().1;
+        assert!(line(0).contains("root's"), "{said:?}");
+        assert!(line(300).contains("under 500"), "{said:?}");
+        assert!(line(502).contains("primary group is 0"), "{said:?}");
+        assert!(line(777).contains("no account has uid 777"), "{said:?}");
+        assert!(line(777).contains("/Users/ghost"), "{said:?}");
+    }
+
+    /// D2: an administrator's line only where all four conditions hold, and
+    /// #3846's printing tests pass; each failing alone gives the words.
+    #[test]
+    fn sudo_line_only_where_it_fits() {
+        let a = account(501, "goran");
+        let mut l_roots = seen(501);
+        l_roots.agents_dir = Entry {
+            kind: Kind::Dir,
+            uid: Some(0),
+            mode: Some(0o755),
+            writable: false,
+        };
+        let mut config_roots = seen(501);
+        config_roots.config = Held::Unreadable {
+            error: ReadError::Eacces,
+            uid: Some(0),
+            mode: Some(0o600),
+        };
+        let line_for = |path: &str| {
+            format!(
+                "goran is an administrator of this Mac and can run this, then run `sudo roomlerd \
+                 one-row` again:\n    sudo chown -h 'goran' '{path}'"
+            )
+        };
+        let config_path = format!(
+            "{}/config.toml",
+            folder_display("/Users/goran", Segment::Current)
+        );
+        for (target, base, path) in [
+            (
+                Target::AgentsDir,
+                &l_roots,
+                "/Users/goran/Library/LaunchAgents".to_string(),
+            ),
+            (Target::Config, &config_roots, config_path),
+        ] {
+            let words = chown_words(&a, base, target, ADMIN_AT_CONSOLE, "root");
+            assert!(words.contains(&line_for(&path)), "{words}");
+            assert!(
+                words.starts_with(&format!("{path} (")) && words.contains("uid 0, mode"),
+                "{words}"
+            );
+            let no_command = |words: &str, case: &str| {
+                assert!(!words.contains("sudo chown"), "{case}: {words}");
+                assert!(words.contains(INSTALL_DOC), "{case}: {words}");
+                assert!(words.contains("belongs to root (uid 0"), "{case}: {words}");
+            };
+            // 1. Not the console person's home.
+            let rights = Rights {
+                at_console: false,
+                ..ADMIN_AT_CONSOLE
+            };
+            no_command(
+                &chown_words(&a, base, target, rights, "root"),
+                "not at the console",
+            );
+            // 2. Not an administrator.
+            let rights = Rights {
+                administrator: false,
+                ..ADMIN_AT_CONSOLE
+            };
+            no_command(&chown_words(&a, base, target, rights, "root"), "not admin");
+            // 3. The home is no plain absolute folder, or its Library is not
+            // a folder of the person's.
+            let mut s = base.clone();
+            s.home.absolute = false;
+            no_command(
+                &chown_words(&a, &s, target, ADMIN_AT_CONSOLE, "root"),
+                "home not absolute",
+            );
+            let mut s = base.clone();
+            s.home.kind = Kind::Link;
+            no_command(
+                &chown_words(&a, &s, target, ADMIN_AT_CONSOLE, "root"),
+                "home a link",
+            );
+            let mut s = base.clone();
+            s.library.uid = Some(0);
+            no_command(
+                &chown_words(&a, &s, target, ADMIN_AT_CONSOLE, "root"),
+                "Library root's",
+            );
+            let mut s = base.clone();
+            s.library.kind = Kind::Link;
+            no_command(
+                &chown_words(&a, &s, target, ADMIN_AT_CONSOLE, "root"),
+                "Library a link",
+            );
+            // #3846's printing tests: the name, and a path that would not
+            // survive `sh -c "…"` or not display as it runs.
+            let odd = Account {
+                name: "go ran".into(),
+                ..a.clone()
+            };
+            let words = chown_words(&odd, base, target, ADMIN_AT_CONSOLE, "root");
+            assert!(!words.contains("sudo chown"), "{words}");
+            for home in ["/Users/go$ran", "/Users/go\u{202E}ran"] {
+                let odd = Account {
+                    home: home.into(),
+                    ..a.clone()
+                };
+                let words = chown_words(&odd, base, target, ADMIN_AT_CONSOLE, "root");
+                assert!(!words.contains("sudo chown"), "{home}: {words}");
+            }
+        }
+        // 4. The target is not root's, or not a folder (R1) or a file (R3).
+        let mut s = l_roots.clone();
+        s.agents_dir.uid = Some(502);
+        let words = chown_words(&a, &s, Target::AgentsDir, ADMIN_AT_CONSOLE, "bob");
+        assert!(!words.contains("sudo chown"), "{words}");
+        assert!(words.contains("belongs to bob (uid 502"), "{words}");
+        let mut s = l_roots.clone();
+        s.agents_dir.kind = Kind::Link;
+        let words = chown_words(&a, &s, Target::AgentsDir, ADMIN_AT_CONSOLE, "root");
+        assert!(!words.contains("sudo chown"), "{words}");
+        assert!(words.contains("(a link)"), "{words}");
+        let mut s = config_roots.clone();
+        s.config = Held::Unreadable {
+            error: ReadError::Eacces,
+            uid: Some(502),
+            mode: Some(0o600),
+        };
+        let words = chown_words(&a, &s, Target::Config, ADMIN_AT_CONSOLE, "bob");
+        assert!(!words.contains("sudo chown"), "{words}");
+        // The person's own folder, but not writable: no command, and never
+        // "belongs to".
+        let mut s = l_roots.clone();
+        s.agents_dir.uid = Some(501);
+        s.agents_dir.mode = Some(0o555);
+        let words = chown_words(&a, &s, Target::AgentsDir, ADMIN_AT_CONSOLE, "goran");
+        assert!(!words.contains("sudo chown"), "{words}");
+        assert!(
+            words.contains("is goran's own (uid 501, mode 555)"),
+            "{words}"
+        );
+    }
+
+    /// R2 and R4 (#3802): #3846's text, from the child's report alone. A
+    /// folder that holds a config (R2) never gets a command; one that does
+    /// not (R4) gets the administrator's `sudo mv` where the package's rule
+    /// fits.
+    #[test]
+    fn the_folder_refusals_print_move_asides_own_text() {
+        let a = account(501, "goran");
+        let mut r2 = seen(501);
+        r2.folder = Entry {
+            kind: Kind::Dir,
+            uid: Some(0),
+            mode: Some(0o755),
+            writable: false,
+        };
+        let folder = folder_display("/Users/goran", Segment::Current);
+        assert_eq!(
+            folder,
+            "/Users/goran/Library/Application Support/live.roomler.roomler"
+        );
+        let words = folder_words(&a, &r2, ADMIN_AT_CONSOLE, "root", "20261119T060000Z");
+        assert!(
+            words.starts_with(&format!(
+                "{folder} (a folder) belongs to root (uid 0, mode 755), not to goran."
+            )),
+            "{words}"
+        );
+        assert!(words.contains("an entry named config.toml"), "{words}");
+        assert!(
+            !words.contains("sudo mv"),
+            "R2 never gets a command: {words}"
+        );
+
+        let mut r4 = r2.clone();
+        r4.config = Held::Absent;
+        let words = folder_words(&a, &r4, ADMIN_AT_CONSOLE, "root", "20261119T060000Z");
+        assert!(words.contains("sudo mv"), "{words}");
+        assert!(
+            words.contains(&format!("{folder}.made-by-root-20261119T060000Z")),
+            "{words}"
+        );
+        // Not at the console, not an administrator, or Application Support
+        // not the person's own: the words, no command.
+        for (case, rights, support_uid) in [
+            (
+                "not at the console",
+                Rights {
+                    at_console: false,
+                    ..ADMIN_AT_CONSOLE
+                },
+                501,
+            ),
+            (
+                "not admin",
+                Rights {
+                    administrator: false,
+                    ..ADMIN_AT_CONSOLE
+                },
+                501,
+            ),
+            ("support root's", ADMIN_AT_CONSOLE, 0),
+        ] {
+            let mut s = r4.clone();
+            s.support.uid = Some(support_uid);
+            let words = folder_words(&a, &s, rights, "root", "20261119T060000Z");
+            assert!(!words.contains("sudo mv"), "{case}: {words}");
+            assert!(
+                words.contains("Only an administrator of this Mac can move it aside"),
+                "{case}: {words}"
+            );
+        }
+    }
+
+    #[test]
+    fn r5_says_why_the_console_person_was_left_alone() {
+        let words = r5_words(501, Some("no account has uid 501"));
+        assert!(words.contains("uid 501"), "{words}");
+        assert!(words.contains("no account has uid 501"), "{words}");
+        assert!(words.contains("the verify would fail"), "{words}");
+        assert!(!words.contains("sudo "), "no command: {words}");
+    }
+
+    #[test]
+    fn bootstrap_argv_is_todays_root_form() {
+        assert_eq!(
+            bootstrap_argv(501, "/Users/a"),
+            [
+                "bootstrap",
+                "gui/501",
+                "/Users/a/Library/LaunchAgents/com.roomler.agent.plist"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_spawn_plan_is_the_packages_binary_as_the_person() {
+        let a = account(501, "a");
+        for verb in [Verb::Read, Verb::PutBack, Verb::PutBackLegacy] {
+            let plan = spawn_plan(&a, verb);
+            assert_eq!(
+                plan.program,
+                "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
+            );
+            assert_eq!(
+                plan.args,
+                crate::one_row_home::child_args(501, 20, verb),
+                "child_args(uid, pw_gid, verb)"
+            );
+            assert!(plan.env.is_empty(), "an empty environment");
+            assert_eq!(plan.dir, "/");
+            assert_eq!((plan.uid, plan.gid), (501, 20));
+        }
+        // Started only when `lstat` reads a regular file of uid 0 that group
+        // and others cannot write.
+        assert_eq!(program_refusal(Ok((0, 0o100755))), None);
+        for (case, stat) in [
+            ("a link", Ok((0, 0o120755))),
+            ("not root's", Ok((501, 0o100755))),
+            ("group-writable", Ok((0, 0o100775))),
+            ("other-writable", Ok((0, 0o100757))),
+            ("a folder", Ok((0, 0o040755))),
+            (
+                "unread",
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ),
+        ] {
+            let why = program_refusal(stat);
+            assert!(why.is_some(), "{case} is refused");
+        }
     }
 }
