@@ -210,7 +210,7 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2345`](../agents/roomlerd/src/signaling.rs#L2345)). Then the run
+([`signaling.rs:2304`](../agents/roomlerd/src/signaling.rs#L2304)). Then the run
 loop holds every new dial until the wake
 ([`signaling.rs:1232`](../agents/roomlerd/src/signaling.rs#L1232),
 [`sleep_notice.rs:329`](../agents/roomlerd/src/sleep_notice.rs#L329)
