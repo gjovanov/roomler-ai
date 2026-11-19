@@ -312,3 +312,214 @@ async fn with_both_bounds_at_0_a_command_waits_as_before() {
     );
     assert_eq!(ps.connection().timeouts(), 0);
 }
+
+// ── Review item 2: a session frame whose relay Redis fails ──────────────────
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Every JSON frame a socket receives within `window`.
+async fn frames_within(ws: &mut Ws, window: Duration) -> Vec<serde_json::Value> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let until = tokio::time::Instant::now() + window;
+    let mut got = Vec::new();
+    loop {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    got.push(v);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+    got
+}
+
+fn kind(frame: &serde_json::Value) -> &str {
+    frame.get("t").and_then(|t| t.as_str()).unwrap_or("")
+}
+
+/// #3840, review item 2 (q2 = A). A controller on one pod runs a session
+/// with a device on the other pod through the relay. While the controller's
+/// pod gets no answer from Redis, the session frames it relays (`rc:sdp.offer`,
+/// `rc:ice`) fail on Redis, which says nothing about the owner pod: each is
+/// dropped, the controller is told nothing, and the route to the owner pod is
+/// kept, so a frame sent once Redis answers again reaches the device.
+/// `rc:terminate` rides along as a control: it is never relayed, because the
+/// hub of the controller's pod answers it Ok for a session it does not hold.
+#[tokio::test]
+async fn a_session_frame_redis_fails_to_relay_keeps_its_route_and_tells_the_controller_nothing() {
+    use futures::SinkExt;
+    use std::sync::atomic::Ordering;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let via = fwd.url_for(&test_redis_url());
+    // The device's pod reaches Redis directly, the controller's through the
+    // forwarder.
+    let (app1, app2) = TestApp::spawn_pair(move |s| {
+        if s.app
+            .pod_id
+            .as_deref()
+            .is_some_and(|p| p.starts_with("testpod2-"))
+        {
+            s.redis.url = via.clone();
+        }
+    })
+    .await;
+    let (Some(bus1), Some(bus2)) = (
+        app1.state.cluster_bus.clone(),
+        app2.state.cluster_bus.clone(),
+    ) else {
+        panic!("both pods reach Redis, the controller's through the forwarder");
+    };
+    let subscribing = Instant::now();
+    while !(bus1.sub_alive.load(Ordering::Relaxed) && bus2.sub_alive.load(Ordering::Relaxed)) {
+        assert!(subscribing.elapsed() < OUTER, "both pod buses subscribe");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The device on pod 1, the controller on pod 2.
+    let seeded = app1.seed_tenant("w14relay").await;
+    let (agent_id, agent_token) =
+        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-w14-relay").await;
+    let mut agent_ws = crate::agent_presence_tests::connect_agent(&app1, &agent_token).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let token = seeded
+        .admin
+        .access_token
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D");
+    let (mut ctrl_ws, _) = connect_async(format!("ws://{}/ws?token={token}", app2.addr))
+        .await
+        .expect("controller ws");
+    let _ = frames_within(&mut ctrl_ws, Duration::from_millis(200)).await;
+    let text = |v: &serde_json::Value| Message::Text(v.to_string().into());
+
+    // Control: the session is created through the relay, and the
+    // controller's pod holds a route to the device's pod.
+    ctrl_ws
+        .send(text(&serde_json::json!({
+            "t": "rc:session.request",
+            "agent_id": agent_id,
+            "permissions": "VIEW",
+        })))
+        .await
+        .expect("send the request");
+    let mut session_id = None;
+    let asked = Instant::now();
+    while session_id.is_none() && asked.elapsed() < OUTER {
+        for v in frames_within(&mut ctrl_ws, Duration::from_millis(500)).await {
+            match kind(&v) {
+                "rc:session.created" => session_id = v["session_id"].as_str().map(str::to_string),
+                "rc:error" => panic!("control: the relay creates the session, got {v}"),
+                _ => {}
+            }
+        }
+    }
+    let sid = session_id.expect("control: rc:session.created arrives through the relay");
+    let at_device = frames_within(&mut agent_ws, Duration::from_secs(2)).await;
+    assert!(
+        at_device.iter().any(|v| kind(v) == "rc:request"),
+        "control: the device got the relayed request"
+    );
+    let remote2 = app2
+        .state
+        .modules
+        .remote
+        .clone()
+        .expect("the remote module is mounted");
+    let pod1 = app1.state.pod.pod_id.clone();
+    let routes = || {
+        remote2
+            .remote_rc_conns
+            .iter()
+            .filter(|e| e.value().contains(&pod1))
+            .count()
+    };
+    assert_eq!(
+        routes(),
+        1,
+        "control: the controller's pod holds a route to the device's pod"
+    );
+
+    // Redis stops answering the controller's pod.
+    fwd.swallow();
+    let ice = serde_json::json!({
+        "t": "rc:ice",
+        "session_id": sid,
+        "candidate": { "candidate": "candidate:1 1 udp 1 192.0.2.1 9 typ host", "sdpMid": "0" },
+    });
+    let frames = [
+        serde_json::json!({ "t": "rc:sdp.offer", "session_id": sid, "sdp": "v=0" }),
+        ice.clone(),
+        serde_json::json!({ "t": "rc:terminate", "session_id": sid, "reason": "controller_hangup" }),
+    ];
+    let sent = Instant::now();
+    for frame in &frames {
+        ctrl_ws
+            .send(text(frame))
+            .await
+            .expect("send a session frame");
+    }
+    // The socket's frames run one after another, and each relayed one fails
+    // at the bound.
+    let told = frames_within(&mut ctrl_ws, 2 * BOUND + SLACK + Duration::from_secs(1)).await;
+    let errors: Vec<&serde_json::Value> = told.iter().filter(|v| kind(v) == "rc:error").collect();
+    let kept = routes();
+    eprintln!(
+        "W14-RESULT relayed frames while Redis is silent: the controller was told {} rc:error \
+         ({:?}) within {:?}; routes to the device's pod: {kept}",
+        errors.len(),
+        errors
+            .iter()
+            .map(|v| v["code"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        sent.elapsed()
+    );
+    assert!(
+        errors.is_empty(),
+        "W14-RED the controller was told {errors:?} for session frames whose relay Redis \
+         failed: a Redis error says nothing about the device's pod"
+    );
+    assert_eq!(
+        kept, 1,
+        "W14-RED the route to the device's pod was forgotten on a Redis failure"
+    );
+
+    // Redis answers again: the kept route carries the next frame to the
+    // device, once the shared connection is replaced.
+    fwd.pass();
+    let back = Instant::now();
+    let mut reached = false;
+    while !reached && back.elapsed() < RECOVERY + BOUND + SLACK {
+        ctrl_ws.send(text(&ice)).await.expect("send the ice again");
+        reached = frames_within(&mut agent_ws, Duration::from_secs(1))
+            .await
+            .iter()
+            .any(|v| kind(v) == "rc:ice");
+    }
+    eprintln!(
+        "W14-RESULT relay once Redis answers again: {} after {:?}",
+        if reached {
+            "the device got the ice"
+        } else {
+            "nothing reached the device"
+        },
+        back.elapsed()
+    );
+    assert!(
+        reached,
+        "the route kept through the silence carries a frame to the device once Redis answers \
+         again: nothing arrived within {:?}",
+        RECOVERY + BOUND + SLACK
+    );
+}
