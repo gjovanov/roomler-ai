@@ -4290,6 +4290,7 @@ async fn media_pump_vp9_444_dc(
         let send_errors = send_errors.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
+        let budget_bytes = delivery.pump_count(); // FR-148 D46
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
@@ -4303,6 +4304,7 @@ async fn media_pump_vp9_444_dc(
             while let Some(first) = send_rx.recv().await {
                 let mut next = Some(first);
                 while let Some(wire) = next.take() {
+                    let mut unsent = budget_bytes.unsent(wire.len()); // FR-148 D46
                     if let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let total = wire.len();
                         let ser_start = std::time::Instant::now();
@@ -4331,6 +4333,7 @@ async fn media_pump_vp9_444_dc(
                                 ok = false;
                                 break;
                             }
+                            unsent.sent(end - off); // FR-148 D46
                             off = end;
                         }
                         if ok {
@@ -4384,6 +4387,7 @@ async fn media_pump_vp9_444_dc(
         // construction); the ceiling is the lever that matters.
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
+            delivery.on_pair_check(&pc).await; // FR-148 D46
             if !crate::encode::transport_is_constrained() {
                 let relay_now = current_pair_is_relay(&pc, session_id, constrained_transport).await;
                 if let Some(relay) = relay_now
@@ -4499,6 +4503,7 @@ async fn media_pump_vp9_444_dc(
         }
         if send_tx.capacity() == 0 || pipeline.followers_congested() {
             frames_skipped_backpressure += 1;
+            delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
             // backpressure signal. Drive the multiplicative decrease HERE,
             // before the `continue`, so it runs DURING sustained congestion
@@ -4516,6 +4521,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
+        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
         // software encoder cannot hold the target, take frames on an even grid
@@ -5201,6 +5207,7 @@ async fn media_pump_vp9_444_dc(
             // Skip this frame entirely + ask the controller for a keyframe on
             // resume so the decoder doesn't choke on a delta-after-gap.
             frames_skipped_backpressure += packets.len() as u64;
+            delivery.note_watermark(); // FR-148 D46
             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
             crate::session_telemetry::counters(session_id).note_keyframe();
             continue;
@@ -5235,6 +5242,7 @@ async fn media_pump_vp9_444_dc(
             match send_tx.try_send(wire) {
                 Ok(()) => {
                     handed_bytes += wire_len;
+                    delivery.on_handed(wire_len); // FR-148 D46
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
@@ -5251,6 +5259,7 @@ async fn media_pump_vp9_444_dc(
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     frames_skipped_backpressure += 1;
+                    delivery.note_full(); // FR-148 D46
                     keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                     crate::session_telemetry::counters(session_id).note_keyframe();
                 }
@@ -7295,6 +7304,7 @@ async fn media_pump_ffmpeg_dc(
         let in_opener_grace = in_opener_grace.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
+        let budget_bytes = delivery.pump_count(); // FR-148 D46
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
@@ -7316,6 +7326,7 @@ async fn media_pump_ffmpeg_dc(
                 let mut next = Some(first);
                 while let Some((epoch, enqueued_at, wire)) = next.take() {
                     let total = wire.len();
+                    let mut unsent = budget_bytes.unsent(total); // FR-148 D46
                     // rc.445 — a frame from a PREVIOUS encoder epoch is stale
                     // motion the rebuild obsoleted; drop it so the fresh IDR
                     // behind it ships immediately (still settles the ledger).
@@ -7371,6 +7382,7 @@ async fn media_pump_ffmpeg_dc(
                                 ok = false;
                                 break;
                             }
+                            unsent.sent(end - off); // FR-148 D46
                             off = end;
                         }
                         if ok {
@@ -7708,6 +7720,7 @@ async fn media_pump_ffmpeg_dc(
         // matter). Also refresh the browser stats badge on every flip.
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
+            delivery.on_pair_check(&pc).await; // FR-148 D46
             if !crate::encode::transport_is_constrained() {
                 // FR-65 — a stats read, not a free predicate: it walks the
                 // stats graph under locks the ICE agent and SCTP association
@@ -8109,6 +8122,7 @@ async fn media_pump_ffmpeg_dc(
                 );
             }
             frames_skipped_backpressure += 1;
+            delivery.note_gate(send_tx.capacity() == 0, byte_gate); // FR-148 D46
             // FR-119 P2b-2 — a frame not taken for the link is no evidence
             // about this host's rate.
             if let Some(state) = fps_state.as_mut() {
@@ -8185,6 +8199,7 @@ async fn media_pump_ffmpeg_dc(
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
         PassWatch::stop(gate_start, &mut gate_us);
+        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -9922,6 +9937,7 @@ async fn media_pump_ffmpeg_dc(
                     // released by the send task once the frame leaves.
                     inflight_bytes.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
                     handed_bytes += wire_len as u64;
+                    delivery.on_handed(wire_len as u64); // FR-148 D46
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
@@ -9947,6 +9963,7 @@ async fn media_pump_ffmpeg_dc(
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     frames_dropped_backpressure += 1;
+                    delivery.note_full(); // FR-148 D46
                     kf_gate.note_resync_needed();
                     // Phase B — a full channel at try_send (a big IDR / motion
                     // frame the link can't drain) is a secondary congestion

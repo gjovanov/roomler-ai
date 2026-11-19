@@ -1219,6 +1219,13 @@ pub struct AgentConfig {
     /// `ROOMLERD_PATH_MODEL`, read once per session. Local only.
     #[serde(default)]
     pub path_model: Option<String>,
+    /// FR-148 D46 — the in-flight budget's switch: `off` (unset; the
+    /// default), `shadow` or `on`. `shadow` computes the budget on the
+    /// data-channel pumps and writes its fields on the `path delivery` line;
+    /// it holds nothing, and until D46's step B3 neither does `on`. Env
+    /// `ROOMLERD_INFLIGHT_BUDGET`, read once per session. Local only.
+    #[serde(default)]
+    pub inflight_budget: Option<String>,
     /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
     /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
     /// in the config surface.
@@ -3010,6 +3017,7 @@ pub fn test_fixture() -> AgentConfig {
         ice_relay_tcp: None,
         rc_carrier_rank: None,
         path_model: None,
+        inflight_budget: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -3449,6 +3457,10 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // FR-148 P1 — the path model's switch, read once per session.
     if let Some(v) = &cfg.path_model {
         fallbacks.insert("PATH_MODEL".to_string(), v.clone());
+    }
+    // FR-148 D46 — the in-flight budget's switch, read once per session.
+    if let Some(v) = &cfg.inflight_budget {
+        fallbacks.insert("INFLIGHT_BUDGET".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -4855,6 +4867,7 @@ mod tests {
         cfg.qsv_rate_mode = Some("qvbr".into());
         cfg.rc_carrier_rank = Some("prio".into());
         cfg.path_model = Some("on".into());
+        cfg.inflight_budget = Some("shadow".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -4867,6 +4880,7 @@ mod tests {
         assert_eq!(get("QSV_RATE_MODE"), Some("qvbr"));
         assert_eq!(get("RC_CARRIER_RANK"), Some("prio"));
         assert_eq!(get("PATH_MODEL"), Some("on"));
+        assert_eq!(get("INFLIGHT_BUDGET"), Some("shadow"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),
