@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+
 //! FR-148 P0, step 4a: the open-time train's reading, as a pure state machine.
 //!
 //! At a session's open the encoder takes 0.65 to 2.8 s to start. The train
