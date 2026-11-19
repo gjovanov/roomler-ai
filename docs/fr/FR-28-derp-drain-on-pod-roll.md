@@ -367,10 +367,11 @@ One host on 0.4.48 took 60 s on every roll, the shape of the oldest agents, and 
 - **With P3 alone, AC3's median is below the bar and its p90 is at it**, so this read does not tick AC3. The
   switch-on half decides it: a flat redial lands within a second of the replacement listening, about 1 s a wave
   sooner than the +3 s dial.
-- **A host's close stands for its pod's SIGTERM.** A pod's first act on SIGTERM is to cancel every agent socket
-  (`crates/api/src/main.rs:361-363`, `crates/api/src/state.rs:494-515`), so the close trails the signal by that
-  sweep and one network leg. Both ends of a measure come from the host's own clock, so clock offsets between
-  hosts do not enter it.
+- **A host's close stands for its pod's SIGTERM.** On SIGTERM a pod stops its modules at once: network hands back
+  its directory records, one or two Redis round trips each, and then fleet cancels every agent socket
+  (`crates/api/src/main.rs:361-363`, `crates/api/src/state.rs:494-515`). So the close trails the signal by those
+  round trips, the sweep and one network leg. Both ends of a measure come from the host's own clock, so clock
+  offsets between hosts do not enter it.
 - **A host can close in both waves.** A daemon with two enrollments runs one signaling loop for each
   (`agents/roomlerd/src/signaling.rs:632-636`) and uploads both loops' lines under its primary's row
   (`agents/roomlerd/src/app.rs:4715-4724`). Five such rows closed in both waves, about 12 s apart, because their
