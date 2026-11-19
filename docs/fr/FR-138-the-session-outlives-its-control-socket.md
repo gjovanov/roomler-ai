@@ -482,7 +482,7 @@ and to claim its session back.
   best-effort hangup stays, except before a redial of a session the server said is detached (D5 = A), and is no
   longer the only thing that frees the slot.
 - **A session on `derp` is kept when its DERP path returns in time, and redials otherwise.** Its pair rides the
-  overlay through the DERP floor (`agents/roomlerd/src/session_carrier.rs:69-70`), and `/derp` is pod-local, so a
+  overlay through the DERP floor (`agents/roomlerd/src/session_carrier.rs:77-78`), and `/derp` is pod-local, so a
   roll takes that path down until the overlay reattaches, and the pair's connectivity checks go unanswered
   meanwhile. When the mesh rebuilds its DERP carrier before ICE gives up on the pair, no transport signal fires and
   the session is kept like one on `direct` or `turn`: on 2026-11-12 a Windows session's carrier was back about 4 s

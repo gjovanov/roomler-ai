@@ -37,6 +37,17 @@
 //! old it is, and what FR-148 §4.1's model would hold beside them
 //! (`encode::pipe::PathView`). Also in shadow, also off with the switch; see
 //! `docs/rate-control.md` (§ Path numbers and their provenance).
+//!
+//! The delivery line also says whether a queue stood on the path: the
+//! classifier above cannot see one that a TCP carrier holds, since the queue
+//! of unsent chunks keeps running empty while seconds of bytes wait in the
+//! carrier (`shaped_link::tcp_shape`). SCTP's acknowledgement delay holds that
+//! wait: it is stamped when a chunk leaves that queue for the wire. The sampler takes
+//! the association's gauges (`RTCSctpTransport::gauges`) where each sample
+//! starts and closes, beside the clock: a sample whose least delay stands
+//! [`QUEUED_OVER_MS`] over the session's least is queued, when it acknowledged
+//! enough bytes for the delay to be its own ([`counts`]). Also in shadow, also
+//! off with the switch; see `docs/rate-control.md` (§ The standing queue).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -44,6 +55,7 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
+use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::pipe::{PathNumber, PathView};
 
@@ -55,6 +67,43 @@ pub const LINE_EVERY: Duration = Duration::from_secs(10);
 
 /// The line's message, which a field read greps for.
 pub const LINE: &str = "path delivery (FR-148 P0, shadow, ≈10s)";
+
+/// A sample whose least acknowledgement delay stands this far over the
+/// session's least is queued. In `shaped_link::tcp_shape`'s first runs, on a
+/// deep lossless queue (TURN over TCP's shape) every loaded second stood this
+/// far over it, 69 of 69, and on a queue that drops (TURN over UDP's) none
+/// did: 65 ms over it at most, in 80 seconds, the most of four runs.
+pub const QUEUED_OVER_MS: u64 = 250;
+
+/// The longest a receiver holds the SACK of a lone packet, ms: the vendored
+/// SCTP's `ACK_INTERVAL` (`timer/ack_timer.rs`), and the hold of Chrome's
+/// dcSCTP and of usrsctp (Firefox). See [`counts`].
+pub const DELAYED_ACK_MS: u64 = 200;
+
+/// Whether a sample's least acknowledgement delay counts: the sample
+/// acknowledged more than `max_payload × (ms / DELAYED_ACK_MS + 2)` bytes, the
+/// most that held SACKs alone acknowledge in `ms`.
+///
+/// A receiver acknowledges the second of two packets at once, and holds the
+/// SACK of a lone one for up to [`DELAYED_ACK_MS`], a wait its delay then
+/// carries. For every SACK of a sample to have been held, each packet must
+/// have come after the hold of the one before it ran out, so the SACKs left
+/// the receiver at least [`DELAYED_ACK_MS`] apart. While the way back varies
+/// by less than that, at most `ms / DELAYED_ACK_MS + 2` of them reach the agent
+/// in `ms`, and each acknowledges one packet of at most `max_payload` bytes of
+/// user data. A sample that acknowledged more had a SACK sent at once, whose
+/// delay holds no wait, so its least holds none either. A receiver that holds
+/// longer leaves fewer lone packets in a sample than this allows. `max_payload`
+/// 0 (no gauges stored yet) counts nothing.
+pub fn counts(ms: u64, bytes: u64, max_payload: u32) -> bool {
+    let lone = (ms / DELAYED_ACK_MS).saturating_add(2);
+    max_payload > 0 && bytes > u64::from(max_payload).saturating_mul(lone)
+}
+
+/// A delay in whole milliseconds, as the line writes it.
+pub fn ms_of(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// FR-148's switch, `ROOMLERD_PATH_MODEL` (D28): `off` is the release before
 /// P0 exactly (no delivery sample, no path memory, no line); `shadow` and `on`
@@ -119,12 +168,39 @@ pub enum Class {
     Stalled,
 }
 
-/// One delivery sample: its length, the bytes acknowledged in it, its class.
+/// One delivery sample: its length, the bytes acknowledged in it, its class,
+/// and what SCTP's gauges said over it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub ms: u64,
     pub bytes: u64,
     pub class: Class,
+    /// `None` when the gauges were not taken where the sample started and
+    /// where it closed.
+    pub queue: Option<QueueReading>,
+}
+
+/// What SCTP's gauges said over one sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueReading {
+    /// The least acknowledgement delay of the sample's SACKs, ms; `None` when
+    /// none gave one.
+    pub least_ms: Option<u64>,
+    /// How far that least stood over the session's least, ms; `None` when the
+    /// sample does not count ([`counts`]) or no SACK gave a delay.
+    pub standing_ms: Option<u64>,
+    /// The gauges at the sample's close.
+    pub gauges: Gauges,
+    /// Fast retransmissions and T3-rtx expiries in the sample.
+    pub loss: (u64, u64),
+}
+
+impl QueueReading {
+    /// A standing queue: the sample counts, and its least stood
+    /// [`QUEUED_OVER_MS`] or more over the session's least.
+    pub fn queued(&self) -> bool {
+        self.standing_ms.is_some_and(|s| s >= QUEUED_OVER_MS)
+    }
 }
 
 impl Sample {
@@ -139,7 +215,12 @@ impl Sample {
         } else {
             Class::Backlogged
         };
-        Self { ms, bytes, class }
+        Self {
+            ms,
+            bytes,
+            class,
+            queue: None,
+        }
     }
 
     /// The delivered rate, bit/s; `None` for a sample of no length.
@@ -164,6 +245,35 @@ pub struct LineReport {
     pub stalled_ms: u64,
     /// Bytes acknowledged over the line's samples.
     pub acked_bytes: u64,
+    /// The standing queue over the line's samples, from SCTP's gauges; `None`
+    /// when no sample of the line was read with them.
+    pub queue: Option<QueueLine>,
+}
+
+/// The standing queue over one line's samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueLine {
+    /// The least acknowledgement delay, ms: the session's least, and the
+    /// lowest and highest of the samples that count ([`counts`]). `None` when
+    /// none of the line's samples counts.
+    pub ack_ms: Option<(u64, u64, u64)>,
+    /// The lowest and highest standing over the session's least, ms, of those
+    /// samples.
+    pub standing_ms: Option<(u64, u64)>,
+    /// Of those samples, the queued ones ([`QueueReading::queued`]).
+    pub queued: u32,
+    /// The lowest and highest bytes in flight at a sample's close.
+    pub inflight: (u64, u64),
+    /// The lowest and highest congestion window at a sample's close.
+    pub cwnd: (u32, u32),
+    /// The slow start threshold at the last sample's close.
+    pub ssthresh: u32,
+    /// The lowest peer receive window at a sample's close.
+    pub rwnd_low: u32,
+    /// The most bytes waiting in SCTP's pending queue at a sample's close.
+    pub pending_high: u64,
+    /// Fast retransmissions and T3-rtx expiries over the line's samples.
+    pub loss: (u64, u64),
 }
 
 /// The samples of the line being built.
@@ -179,7 +289,49 @@ impl Fold {
         self.report.span_ms == 0 && self.report.samples == (0, 0, 0)
     }
 
+    /// One sample's gauges into the line.
+    fn add_queue(&mut self, q: &QueueReading) {
+        let g = q.gauges;
+        let line = self.report.queue.get_or_insert(QueueLine {
+            inflight: (g.inflight_bytes, g.inflight_bytes),
+            cwnd: (g.cwnd, g.cwnd),
+            rwnd_low: g.rwnd,
+            ..QueueLine::default()
+        });
+        line.inflight = (
+            line.inflight.0.min(g.inflight_bytes),
+            line.inflight.1.max(g.inflight_bytes),
+        );
+        line.cwnd = (line.cwnd.0.min(g.cwnd), line.cwnd.1.max(g.cwnd));
+        line.ssthresh = g.ssthresh;
+        line.rwnd_low = line.rwnd_low.min(g.rwnd);
+        line.pending_high = line.pending_high.max(g.pending_bytes);
+        line.loss = (
+            line.loss.0.saturating_add(q.loss.0),
+            line.loss.1.saturating_add(q.loss.1),
+        );
+        if let (Some(least), Some(standing)) = (q.least_ms, q.standing_ms) {
+            // The session's least as of the line's latest sample that counts:
+            // it only falls, until a new association starts it over.
+            let session = least.saturating_sub(standing);
+            line.ack_ms = Some(match line.ack_ms {
+                Some((_, lo, hi)) => (session, lo.min(least), hi.max(least)),
+                None => (session, least, least),
+            });
+            line.standing_ms = Some(match line.standing_ms {
+                Some((lo, hi)) => (lo.min(standing), hi.max(standing)),
+                None => (standing, standing),
+            });
+            if q.queued() {
+                line.queued = line.queued.saturating_add(1);
+            }
+        }
+    }
+
     fn add(&mut self, s: Sample) {
+        if let Some(q) = &s.queue {
+            self.add_queue(q);
+        }
         let r = &mut self.report;
         r.span_ms = r.span_ms.saturating_add(s.ms);
         r.acked_bytes = r.acked_bytes.saturating_add(s.bytes);
@@ -218,8 +370,13 @@ pub struct DeliverySampler {
     /// FR-148 P1 — the switch as this pump read it, for the pair memory.
     mode: Mode,
     clock: Option<DeliveryClock>,
-    /// The reading the next sample starts from.
-    base: Option<(Instant, Delivery)>,
+    /// The association's gauges, from the slot its clock came from.
+    gauges: Option<GaugeReader>,
+    /// The reading the next sample starts from, and the gauges taken there.
+    base: Option<(Instant, Delivery, Option<Gauges>)>,
+    /// The session's least acknowledgement delay, ms: the least of the
+    /// samples that counted ([`counts`]). A new association starts it over.
+    least_ms: Option<u64>,
     fold: Fold,
     line_since: Option<Instant>,
     /// Whose line a drop writes.
@@ -249,7 +406,9 @@ impl DeliverySampler {
             on,
             mode: if on { Mode::Shadow } else { Mode::Off },
             clock: None,
+            gauges: None,
             base: None,
+            least_ms: None,
             fold: Fold::default(),
             line_since: None,
             session: None,
@@ -258,12 +417,12 @@ impl DeliverySampler {
         }
     }
 
-    /// The pump's one call, at its heartbeat: read the association's clock,
-    /// close a sample when one is due, and write the line when it is due; and
-    /// take the path numbers from `view` (step 3), writing [`MODEL_LINE`] when
-    /// that is due. Never waits: before the association exists, or while its
-    /// transport's slot is held, the clock it already has answers, or nothing
-    /// does. Off, it calls neither.
+    /// The pump's one call, at its heartbeat: read the association's clock and
+    /// its gauges, close a sample when one is due, and write the line when it
+    /// is due; and take the path numbers from `view` (step 3), writing
+    /// [`MODEL_LINE`] when that is due. Never waits: before the association
+    /// exists, or while its transport's slot is held, the clock and gauges it
+    /// already has answer, or nothing does. Off, it calls none of them.
     pub fn heartbeat(
         &mut self,
         pc: &RTCPeerConnection,
@@ -272,48 +431,84 @@ impl DeliverySampler {
     ) {
         if self.on {
             let now = Instant::now();
-            self.observe(now, session_id, || pc.sctp().delivery_clock());
+            self.observe(
+                now,
+                session_id,
+                || pc.sctp().delivery_clock(),
+                || pc.sctp().gauges(),
+            );
             self.on_view(now, session_id, view);
         }
     }
 
-    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock`. Off,
-    /// it calls nothing and returns `None`.
+    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock` and
+    /// the gauges from `gauges`. The gauges are asked for only right after the
+    /// clock came, from the same slot, so they are its association's. Off, it
+    /// calls nothing and returns `None`.
     pub fn observe(
         &mut self,
         now: Instant,
         session_id: ObjectId,
         clock: impl FnOnce() -> Option<DeliveryClock>,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
     ) -> Option<Sample> {
         if !self.on {
             return None;
         }
         self.session = Some(session_id);
-        if let Some(fresh) = clock()
-            && !self.clock.as_ref().is_some_and(|c| c.same(&fresh))
-        {
-            // A first association, or a new one: no sample spans the two.
-            self.clock = Some(fresh);
-            self.base = None;
+        if let Some(fresh) = clock() {
+            if !self.clock.as_ref().is_some_and(|c| c.same(&fresh)) {
+                // A first association, or a new one: no sample spans the two,
+                // and the gauges and the least were the old one's.
+                self.clock = Some(fresh);
+                self.base = None;
+                self.gauges = None;
+                self.least_ms = None;
+            }
+            if self.gauges.is_none() {
+                self.gauges = gauges();
+            }
         }
         let reading = self.clock.as_ref()?.read();
-        let sample = self.on_reading(now, reading);
+        // FR-148 P0: the agent's one take of the gauges. A take resets the
+        // least acknowledgement delay, so a second reader that took would split
+        // each sample's least between the two, and neither would hold it. The
+        // sampler takes here only, where a sample starts and where it closes
+        // (`on_reading_with` calls `take` there and nowhere else), beside the
+        // clock reading, so a sample's least is the least of its own SACKs.
+        // Every other reader looks without taking (`GaugeReader::peek`: FR-148
+        // O10's open line), and the train takes only in its tests.
+        let reader = self.gauges.clone();
+        let sample = self.on_reading_with(now, reading, || reader.as_ref().map(GaugeReader::take));
         if let Some(line) = self.take_line(now) {
             emit(session_id, &line);
         }
         sample
     }
 
+    /// One reading of the clock at `now`, without gauges. See
+    /// [`Self::on_reading_with`].
+    pub fn on_reading(&mut self, now: Instant, reading: Delivery) -> Option<Sample> {
+        self.on_reading_with(now, reading, || None)
+    }
+
     /// One reading of the clock at `now`. The first sets where the next sample
     /// starts; one at least [`SAMPLE_MIN`] after it closes that sample, which it
-    /// returns; one sooner changes nothing. Off, it takes nothing.
-    pub fn on_reading(&mut self, now: Instant, reading: Delivery) -> Option<Sample> {
+    /// returns; one sooner changes nothing. `take` takes the gauges, and is
+    /// called where a sample starts and where it closes, and nowhere else. Off,
+    /// it takes nothing.
+    pub fn on_reading_with(
+        &mut self,
+        now: Instant,
+        reading: Delivery,
+        take: impl FnOnce() -> Option<Gauges>,
+    ) -> Option<Sample> {
         if !self.on {
             return None;
         }
         self.line_since.get_or_insert(now);
-        let Some((since, from)) = self.base else {
-            self.base = Some((now, reading));
+        let Some((since, from, from_gauges)) = self.base else {
+            self.base = Some((now, reading, take()));
             return None;
         };
         let span = now.saturating_duration_since(since);
@@ -321,10 +516,42 @@ impl DeliverySampler {
             return None;
         }
         let ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
-        let sample = Sample::between(from, reading, ms);
+        let to_gauges = take();
+        let mut sample = Sample::between(from, reading, ms);
+        sample.queue = self.judge(&sample, from_gauges, to_gauges);
         self.fold.add(sample);
-        self.base = Some((now, reading));
+        self.base = Some((now, reading, to_gauges));
         Some(sample)
+    }
+
+    /// What the gauges taken at a sample's start and close say over it. Both
+    /// takes are needed: the least covers the SACKs since the take before, so
+    /// it is the sample's own only when its start took too.
+    fn judge(
+        &mut self,
+        s: &Sample,
+        from: Option<Gauges>,
+        to: Option<Gauges>,
+    ) -> Option<QueueReading> {
+        let (from, to) = (from?, to?);
+        let least_ms = to.ack_delay_min.map(ms_of);
+        let standing_ms = match least_ms {
+            Some(least) if counts(s.ms, s.bytes, to.max_payload) => {
+                let session = self.least_ms.map_or(least, |l| l.min(least));
+                self.least_ms = Some(session);
+                Some(least.saturating_sub(session))
+            }
+            _ => None,
+        };
+        Some(QueueReading {
+            least_ms,
+            standing_ms,
+            gauges: to,
+            loss: (
+                to.fast_retransmits.saturating_sub(from.fast_retransmits),
+                to.t3_expiries.saturating_sub(from.t3_expiries),
+            ),
+        })
     }
 
     /// The line, once [`LINE_EVERY`] has passed since the last and it holds a
@@ -336,6 +563,12 @@ impl DeliverySampler {
         }
         self.line_since = Some(now);
         Some(std::mem::take(&mut self.fold).report)
+    }
+
+    /// The samples not written yet, as the drop writes them; `None` when there
+    /// are none.
+    pub fn take_rest(&mut self) -> Option<LineReport> {
+        (!self.fold.is_empty()).then(|| std::mem::take(&mut self.fold).report)
     }
 
     /// Step 3, [`Self::heartbeat`]'s path numbers at `now`: keep `view`'s as the
@@ -371,8 +604,8 @@ impl Drop for DeliverySampler {
         let Some(session_id) = self.session else {
             return;
         };
-        if !self.fold.is_empty() {
-            emit(session_id, &std::mem::take(&mut self.fold).report);
+        if let Some(rest) = self.take_rest() {
+            emit(session_id, &rest);
         }
         if let Some(view) = self.view.take() {
             emit_model(session_id, &view);
@@ -380,19 +613,42 @@ impl Drop for DeliverySampler {
     }
 }
 
-/// The line. Its field names are pinned by a test, since a field read greps
-/// for them.
+/// The line. Its field names and their order are pinned by a test, since a
+/// field read greps for them. The standing queue's fields follow when a
+/// sample of the line was read with SCTP's gauges, and are left out when none
+/// was.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
-    tracing::info!(
-        %session_id,
-        span_ms = line.span_ms,
-        delivery_samples = ?line.samples,
-        backlogged_bps = ?line.backlogged_bps,
-        app_limited_bps = ?line.app_limited_bps,
-        stalled_ms = line.stalled_ms,
-        acked_bytes = line.acked_bytes,
-        "{LINE}"
-    );
+    match &line.queue {
+        Some(q) => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            ack_ms = ?q.ack_ms,
+            standing_ms = ?q.standing_ms,
+            queued = q.queued,
+            inflight = ?q.inflight,
+            cwnd = ?q.cwnd,
+            ssthresh = q.ssthresh,
+            rwnd_low = q.rwnd_low,
+            pending_high = q.pending_high,
+            loss = ?q.loss,
+            "{LINE}"
+        ),
+        None => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            "{LINE}"
+        ),
+    }
 }
 
 /// FR-148 P0, step 3 — the path numbers' line, which a field read greps for.
@@ -475,7 +731,7 @@ mod tests {
 
     /// What `f` logs, as the daemon's log file writes it (`roomler_node_core::
     /// logging::init`'s file layer: time, level, message, fields; no target).
-    fn logged(f: impl FnOnce()) -> String {
+    pub(super) fn logged(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -584,6 +840,7 @@ mod tests {
                 app_limited_bps: Some(400_000),
                 stalled_ms: 2_000,
                 acked_bytes: 850_000,
+                queue: None,
             }
         );
         // The next line starts empty and comes ten seconds after this one.
@@ -660,34 +917,65 @@ mod tests {
     fn off_takes_no_sample_and_writes_no_line() {
         let t0 = Instant::now();
         let asked = Cell::new(false);
+        let gauged = Cell::new(false);
         let out = logged(|| {
             let mut s = DeliverySampler::new(false);
             for i in 0..30u64 {
-                let sample = s.observe(at(t0, i * 2_000), sid(), || {
-                    asked.set(true);
-                    None
-                });
+                let sample = s.observe(
+                    at(t0, i * 2_000),
+                    sid(),
+                    || {
+                        asked.set(true);
+                        None
+                    },
+                    || {
+                        gauged.set(true);
+                        None
+                    },
+                );
                 assert_eq!(sample, None);
                 assert_eq!(s.on_reading(at(t0, i * 2_000), r(i * 1_000, 1, 0)), None);
+                let take = || {
+                    gauged.set(true);
+                    Some(Gauges::default())
+                };
+                assert_eq!(s.on_reading_with(at(t0, i * 2_000), r(i, 1, 0), take), None);
                 assert_eq!(s.take_line(at(t0, i * 2_000)), None);
             }
             // Its drop writes nothing either.
         });
         assert!(!asked.get(), "off asked SCTP for its clock");
+        assert!(!gauged.get(), "off asked SCTP for its gauges");
         assert!(out.is_empty(), "off wrote {out:?}");
     }
 
-    #[test]
-    fn the_line_names_its_fields() {
-        let line = LineReport {
+    /// A line as a busy session on TURN over TCP writes it: two samples
+    /// queued of the five.
+    fn busy_line() -> LineReport {
+        LineReport {
             span_ms: 10_012,
             samples: (2, 3, 0),
             backlogged_bps: Some((2_390_112, 2_401_000, 2_410_334)),
             app_limited_bps: Some(310_112),
             stalled_ms: 0,
             acked_bytes: 3_012_345,
-        };
-        let out = logged(|| emit(sid(), &line));
+            queue: Some(QueueLine {
+                ack_ms: Some((61, 64, 1_318)),
+                standing_ms: Some((3, 1_257)),
+                queued: 2,
+                inflight: (1_200, 1_048_576),
+                cwnd: (4_380, 1_052_956),
+                ssthresh: 1_048_576,
+                rwnd_low: 0,
+                pending_high: 131_072,
+                loss: (0, 1),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_line_names_its_fields() {
+        let out = logged(|| emit(sid(), &busy_line()));
         let mut rest = out.as_str();
         for want in [
             " INFO ",
@@ -699,6 +987,16 @@ mod tests {
             "app_limited_bps=Some(310112)",
             "stalled_ms=0",
             "acked_bytes=3012345",
+            // FR-148 P0 — the standing queue, from SCTP's gauges.
+            "ack_ms=Some((61, 64, 1318))",
+            "standing_ms=Some((3, 1257))",
+            "queued=2",
+            "inflight=(1200, 1048576)",
+            "cwnd=(4380, 1052956)",
+            "ssthresh=1048576",
+            "rwnd_low=0",
+            "pending_high=131072",
+            "loss=(0, 1)",
         ] {
             let at = rest
                 .find(want)
@@ -706,7 +1004,8 @@ mod tests {
             rest = &rest[at + want.len()..];
         }
         assert_eq!(out.lines().count(), 1, "{out:?}");
-        // An idle screen's line: every sample application-limited.
+        // An idle screen's line: every sample application-limited, and none
+        // acknowledged enough bytes to count.
         let idle = LineReport {
             span_ms: 10_004,
             samples: (0, 5, 0),
@@ -714,20 +1013,309 @@ mod tests {
             app_limited_bps: Some(16_384),
             stalled_ms: 0,
             acked_bytes: 20_480,
+            queue: Some(QueueLine {
+                inflight: (0, 2_048),
+                cwnd: (4_380, 4_380),
+                ssthresh: 1_048_576,
+                rwnd_low: 1_046_528,
+                pending_high: 0,
+                ..QueueLine::default()
+            }),
         };
         let idle = logged(|| emit(sid(), &idle));
-        assert!(idle.contains("backlogged_bps=None"), "{idle:?}");
+        for want in [
+            "backlogged_bps=None",
+            "ack_ms=None",
+            "standing_ms=None",
+            "queued=0",
+        ] {
+            assert!(idle.contains(want), "{want:?} is not in {idle:?}");
+        }
+        // A line no sample of which was read with the gauges: the fields
+        // before them alone.
+        let bare = LineReport {
+            queue: None,
+            ..busy_line()
+        };
+        let bare = logged(|| emit(sid(), &bare));
+        assert!(bare.contains("acked_bytes=3012345"), "{bare:?}");
+        for gone in [
+            "ack_ms",
+            "standing_ms",
+            "queued",
+            "inflight",
+            "cwnd",
+            "ssthresh",
+            "rwnd_low",
+            "pending_high",
+            "loss",
+        ] {
+            assert!(!bare.contains(gone), "{gone:?} is in {bare:?}");
+        }
         // Its cost: at most one line a pump every LINE_EVERY, 360 a session
         // hour. A busy line has no field None.
         let per_hour = 3_600 / LINE_EVERY.as_secs();
-        for (what, l) in [("busy", &out), ("idle", &idle)] {
+        for (what, l) in [("busy", &out), ("idle", &idle), ("bare", &bare)] {
             println!(
                 "delivery line, {what}: {} bytes; {per_hour} lines and {} bytes a session hour",
                 l.len(),
                 l.len() as u64 * per_hour
             );
-            assert!(l.len() < 400, "{} bytes: {l:?}", l.len());
+            assert!(l.len() < 512, "{} bytes: {l:?}", l.len());
         }
+    }
+
+    /// Gauges as a take reads them: `least` is the least delay since the take
+    /// before, ms.
+    fn gauges(least: Option<u64>) -> Gauges {
+        Gauges {
+            max_payload: 1_200,
+            cwnd: 131_072,
+            ssthresh: 1_048_576,
+            rwnd: 1_000_000,
+            inflight_bytes: 60_000,
+            ack_delay: least.map(Duration::from_millis),
+            ack_delay_min: least.map(Duration::from_millis),
+            ..Gauges::default()
+        }
+    }
+
+    /// Feeds samples of (bytes, least ms) 2 s apart, after a reading that
+    /// starts the first, and returns what the gauges said over each.
+    fn feed(
+        s: &mut DeliverySampler,
+        t0: Instant,
+        samples: &[(u64, Option<u64>)],
+    ) -> Vec<QueueReading> {
+        assert_eq!(
+            s.on_reading_with(t0, r(0, 1, 0), || Some(gauges(None))),
+            None
+        );
+        let mut acked = 0;
+        let mut out = Vec::new();
+        for (i, &(bytes, least)) in samples.iter().enumerate() {
+            acked += bytes;
+            let now = at(t0, 2_000 * (i as u64 + 1));
+            let sample = s.on_reading_with(now, r(acked, 1, 0), || Some(gauges(least)));
+            out.push(
+                sample
+                    .and_then(|x| x.queue)
+                    .expect("a sample read with gauges"),
+            );
+        }
+        out
+    }
+
+    /// The byte rule at its edges: in a sample of `ms`, at most `ms / 200 + 2`
+    /// held SACKs, each for one packet of one DATA chunk's payload (1,200 bytes
+    /// on the vendored SCTP's 1,228-byte packets).
+    #[test]
+    fn a_sample_counts_past_what_lone_packets_could_carry() {
+        // 2 s, the FFmpeg pump's heartbeat: at most 12 packets.
+        assert!(!counts(2_000, 14_400, 1_200));
+        assert!(counts(2_000, 14_401, 1_200));
+        // 1.5 s, the shortest sample: 9.
+        assert!(!counts(1_500, 10_800, 1_200));
+        assert!(counts(1_500, 10_801, 1_200));
+        // A late heartbeat's 6 s: 32.
+        assert!(!counts(6_000, 38_400, 1_200));
+        assert!(counts(6_000, 38_401, 1_200));
+        // No gauges stored: nothing counts.
+        assert!(!counts(2_000, u64::MAX, 0));
+    }
+
+    /// Where the sampler takes the gauges: where a sample starts and where it
+    /// closes, and at no other reading.
+    #[test]
+    fn the_gauges_are_taken_where_a_sample_starts_and_closes_only() {
+        let t0 = Instant::now();
+        let takes = Cell::new(0u32);
+        let take = || {
+            takes.set(takes.get() + 1);
+            Some(gauges(Some(61)))
+        };
+        let mut s = DeliverySampler::new(true);
+        s.on_reading_with(t0, r(0, 1, 0), take);
+        s.on_reading_with(at(t0, 1_000), r(10_000, 1, 0), take);
+        assert_eq!(takes.get(), 1, "a reading sooner than SAMPLE_MIN took");
+        assert!(
+            s.on_reading_with(at(t0, 2_000), r(20_000, 1, 0), take)
+                .is_some()
+        );
+        s.on_reading_with(at(t0, 2_500), r(30_000, 1, 0), take);
+        assert!(
+            s.on_reading_with(at(t0, 3_500), r(40_000, 1, 0), take)
+                .is_some()
+        );
+        assert_eq!(takes.get(), 3);
+    }
+
+    /// A sample whose start took no gauges (none there yet) reads none: its
+    /// least would cover the SACKs before it too.
+    #[test]
+    fn a_sample_without_a_take_at_its_start_reads_no_gauges() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        s.on_reading_with(t0, r(0, 1, 0), || None);
+        let a = s
+            .on_reading_with(at(t0, 2_000), r(100_000, 1, 0), || Some(gauges(Some(61))))
+            .unwrap();
+        assert_eq!(a.queue, None, "{a:?}");
+        let b = s
+            .on_reading_with(at(t0, 4_000), r(200_000, 1, 0), || Some(gauges(Some(62))))
+            .unwrap();
+        assert_eq!(b.queue.and_then(|q| q.least_ms), Some(62), "{b:?}");
+        assert_eq!(b.queue.and_then(|q| q.standing_ms), Some(0), "{b:?}");
+    }
+
+    /// FR-148 P0 — the line folds its samples' gauges: the least and the standing
+    /// over the samples that count, the windows and the queue at each close,
+    /// the threshold last, and the losses in the line.
+    #[test]
+    fn the_line_folds_its_samples_gauges() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        let g = |inflight, cwnd, ssthresh, rwnd, pending, least: Option<u64>, fr, t3| Gauges {
+            inflight_bytes: inflight,
+            cwnd,
+            ssthresh,
+            rwnd,
+            pending_bytes: pending,
+            fast_retransmits: fr,
+            t3_expiries: t3,
+            ..gauges(least)
+        };
+        let start = g(0, 4_380, 1_048_576, 1_048_576, 0, None, 2, 1);
+        s.on_reading_with(t0, r(0, 1, 0), || Some(start));
+        let closes = [
+            (
+                200_000,
+                g(50_000, 60_000, 1_048_576, 900_000, 10_000, Some(70), 2, 1),
+            ),
+            (
+                200_000,
+                g(80_000, 90_000, 1_048_576, 700_000, 130_000, Some(64), 3, 1),
+            ),
+            (
+                150_000,
+                g(120_000, 128_000, 64_000, 800_000, 131_072, Some(500), 5, 2),
+            ),
+            // Stalled: no SACK, so no delay.
+            (0, g(120_000, 4_800, 64_000, 800_000, 131_072, None, 5, 3)),
+            // One lone packet: its delay does not count.
+            (
+                1_000,
+                g(1_000, 4_800, 64_000, 1_000_000, 0, Some(280), 5, 3),
+            ),
+        ];
+        let mut acked = 0;
+        let mut readings = Vec::new();
+        for (i, (bytes, close)) in closes.into_iter().enumerate() {
+            acked += bytes;
+            let now = at(t0, 2_000 * (i as u64 + 1));
+            let sample = s
+                .on_reading_with(now, r(acked, 1, 0), || Some(close))
+                .unwrap();
+            readings.push(sample.queue.unwrap());
+        }
+        let standing: Vec<_> = readings.iter().map(|q| q.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(0), Some(436), None, None]);
+        let line = s.take_line(at(t0, 10_000)).unwrap();
+        assert_eq!(
+            line.queue,
+            Some(QueueLine {
+                ack_ms: Some((64, 64, 500)),
+                standing_ms: Some((0, 436)),
+                queued: 1,
+                inflight: (1_000, 120_000),
+                cwnd: (4_800, 128_000),
+                ssthresh: 64_000,
+                rwnd_low: 700_000,
+                pending_high: 131_072,
+                loss: (3, 2),
+            })
+        );
+    }
+
+    /// FR-148 P0 — a queued sample stands [`QUEUED_OVER_MS`] or more over the
+    /// session's least, and one 1 ms short of it does not.
+    #[test]
+    fn a_sample_is_queued_250_ms_over_the_sessions_least() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                (200_000, Some(61)),
+                (200_000, Some(310)),
+                (200_000, Some(311)),
+            ],
+        );
+        let standing: Vec<_> = q.iter().map(|x| x.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(249), Some(250)]);
+        let queued: Vec<_> = q.iter().map(QueueReading::queued).collect();
+        assert_eq!(queued, [false, false, true]);
+    }
+
+    /// FR-148 P0 — a session that starts on a still screen, then loads, keeps the
+    /// least of a sample that counts. A small lone packet's delay carries no
+    /// full packet's serialisation, nor the second packet's that sends a SACK
+    /// at once, so it sits under what any loaded sample can read: measured
+    /// from it, every loaded sample would stand that much higher.
+    #[test]
+    fn the_session_least_comes_from_samples_that_count() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                // A still screen: a small message a second, its SACKs at once.
+                (400, Some(40)),
+                (400, Some(40)),
+                (400, Some(41)),
+                // Then loaded.
+                (200_000, Some(60)),
+                (200_000, Some(300)),
+                (200_000, Some(320)),
+            ],
+        );
+        for x in &q[..3] {
+            assert!(x.least_ms.is_some() && x.standing_ms.is_none(), "{q:?}");
+        }
+        let standing: Vec<_> = q[3..].iter().map(|x| x.standing_ms).collect();
+        assert_eq!(standing, [Some(0), Some(240), Some(260)], "{q:?}");
+        assert_eq!(s.least_ms, Some(60));
+        let line = s.take_rest().unwrap().queue.unwrap();
+        assert_eq!(line.ack_ms, Some((60, 60, 320)));
+        assert_eq!(line.standing_ms, Some((0, 260)));
+        assert_eq!(
+            line.queued, 1,
+            "from the still screen's least it would be 2"
+        );
+    }
+
+    /// FR-148 P0 — why the byte rule: a browser holds a lone packet's SACK for 200
+    /// ms, so on a still screen after a loaded spell every SACK waited, and a
+    /// path's jitter adds to that. Such a sample's least stands 260 ms over
+    /// the session's and does not count; the same least with a loaded
+    /// sample's bytes is queued.
+    #[test]
+    fn a_still_screens_held_sacks_never_read_queued() {
+        let mut s = DeliverySampler::new(true);
+        let q = feed(
+            &mut s,
+            Instant::now(),
+            &[
+                (200_000, Some(61)),
+                (2_400, Some(321)),
+                (2_400, Some(321)),
+                (200_000, Some(321)),
+            ],
+        );
+        assert_eq!(q[0].standing_ms, Some(0));
+        assert!(!q[1].queued() && !q[2].queued(), "{q:?}");
+        assert_eq!(q[3].standing_ms, Some(260));
+        assert!(q[3].queued(), "{q:?}");
     }
 
     #[test]
@@ -1390,11 +1978,12 @@ pub(crate) mod shaped_link {
         let mut sampler = DeliverySampler::new(true);
         let mut out = Vec::new();
         let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
         let start = Instant::now();
-        assert_eq!(sampler.observe(start, sid(), clock), None);
+        assert_eq!(sampler.observe(start, sid(), clock, gauges), None);
         for i in 1..=n as u32 {
             tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
-            if let Some(s) = sampler.observe(Instant::now(), sid(), clock) {
+            if let Some(s) = sampler.observe(Instant::now(), sid(), clock, gauges) {
                 out.push(s);
             }
         }
@@ -1528,12 +2117,13 @@ pub(crate) mod shaped_link {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let mut sampler = DeliverySampler::new(true);
         let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
         let start = Instant::now();
-        assert_eq!(sampler.observe(start, sid(), clock), None);
+        assert_eq!(sampler.observe(start, sid(), clock, gauges), None);
         let mut ends = Vec::new();
         for i in 1..=3u32 {
             tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
-            let sample = sampler.observe(Instant::now(), sid(), clock);
+            let sample = sampler.observe(Instant::now(), sid(), clock, gauges);
             // The clock first, then the viewer's count, which only grows.
             let acked = agent.delivery_clock().read().acked_bytes;
             let took = taken.load(Ordering::SeqCst);
@@ -1567,27 +2157,104 @@ pub(crate) mod shaped_link {
         let (second, second_viewer) = pair(Arc::new(a2), Arc::new(b2), w).await;
         assert!(first.delivery_clock().same(&first.delivery_clock()));
         assert!(!first.delivery_clock().same(&second.delivery_clock()));
+        assert!(first.gauges().same(&first.gauges()));
+        assert!(!first.gauges().same(&second.gauges()));
         let t0 = Instant::now();
         let mut s = DeliverySampler::new(true);
-        assert_eq!(s.observe(t0, sid(), || Some(first.delivery_clock())), None);
-        let x = s.observe(at(t0, 2_000), sid(), || Some(first.delivery_clock()));
-        assert_eq!(x.map(|x| x.ms), Some(2_000));
-        // The new association's first reading starts over...
+        let (one, two) = (|| Some(first.gauges()), || Some(second.gauges()));
         assert_eq!(
-            s.observe(at(t0, 4_000), sid(), || Some(second.delivery_clock())),
+            s.observe(t0, sid(), || Some(first.delivery_clock()), one),
             None
         );
-        // ...a held slot (no fresh clock) keeps reading the one it has...
-        assert_eq!(s.observe(at(t0, 5_000), sid(), || None), None);
+        let x = s.observe(at(t0, 2_000), sid(), || Some(first.delivery_clock()), one);
+        assert_eq!(x.map(|x| x.ms), Some(2_000));
+        s.least_ms = Some(1);
+        // The new association's first reading starts over, with its own
+        // gauges and its own least...
+        assert_eq!(
+            s.observe(at(t0, 4_000), sid(), || Some(second.delivery_clock()), two),
+            None
+        );
+        assert!(s.gauges.as_ref().is_some_and(|g| g.same(&second.gauges())));
+        assert_eq!(s.least_ms, None);
+        // ...a held slot (no fresh clock) keeps reading the one it has, and
+        // asks for no gauges...
+        let asked = std::cell::Cell::new(false);
+        let held = || {
+            asked.set(true);
+            None
+        };
+        assert_eq!(s.observe(at(t0, 5_000), sid(), || None, held), None);
+        assert!(!asked.get(), "gauges asked for with no clock from the slot");
         // ...and the next sample is the new association's alone.
-        let y = s.observe(at(t0, 6_000), sid(), || None);
+        let y = s.observe(at(t0, 6_000), sid(), || None, held);
         assert_eq!(y.map(|y| y.ms), Some(2_000));
+        assert!(y.is_some_and(|y| y.queue.is_some()), "{y:?}");
         for a in [&first, &second] {
             let _ = a.close().await;
         }
         for v in [&first_viewer, &second_viewer] {
             let _ = v.close().await;
         }
+    }
+
+    /// Writes 16 KiB and waits until all of it is acknowledged and a SACK's
+    /// delay is stored, so that no SACK with a delay comes after it returns.
+    async fn delivered(
+        agent: &Association,
+        stream: &webrtc::sctp::stream::Stream,
+        total: &mut u64,
+    ) {
+        let msg = Bytes::from(vec![0x11; 16 * 1024]);
+        stream.write(&msg).await.unwrap();
+        *total += msg.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.delivery_clock().read().acked_bytes < *total
+            || agent.gauges().peek().ack_delay_min.is_none()
+        {
+            assert!(Instant::now() < deadline, "16 KiB not acknowledged in 10 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// FR-148 P0 — the sampler is the agent's one reader that takes the
+    /// gauges. A reader that only looks (`GaugeReader::peek`, FR-148 O10's open
+    /// line) leaves a sample's least to the sampler's take; a reader that took
+    /// instead would leave the sample none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peek_leaves_the_least_to_the_samplers_take() {
+        let bps = 8_000_000;
+        let (a, b) = link(bps);
+        let (agent, viewer) = pair(Arc::new(a), Arc::new(b), rwnd(bps)).await;
+        let stream = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        let clock = || Some(agent.delivery_clock());
+        let gauges = || Some(agent.gauges());
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true);
+        let mut total = 0;
+        // The sample's start: the sampler takes.
+        assert_eq!(s.observe(t0, sid(), clock, gauges), None);
+        delivered(&agent, &stream, &mut total).await;
+        let peeked = agent.gauges().peek().ack_delay_min;
+        assert!(peeked.is_some(), "no SACK gave a delay");
+        assert_eq!(
+            agent.gauges().peek().ack_delay_min,
+            peeked,
+            "a peek took the least"
+        );
+        // The sample's close: the sampler's take reads what the peeks saw.
+        let x = s.observe(at(t0, 2_000), sid(), clock, gauges).unwrap();
+        assert_eq!(x.queue.and_then(|q| q.least_ms), peeked.map(ms_of), "{x:?}");
+        // A second reader that takes leaves the next sample no least.
+        delivered(&agent, &stream, &mut total).await;
+        assert!(agent.gauges().take().ack_delay_min.is_some());
+        let y = s.observe(at(t0, 4_000), sid(), clock, gauges).unwrap();
+        assert_eq!(y.queue.map(|q| q.least_ms), Some(None), "{y:?}");
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
     }
 
     fn at(t0: Instant, ms: u64) -> Instant {
@@ -1719,6 +2386,10 @@ pub(crate) mod shaped_link {
         /// run of two had none, and its floor ended at 1.08 times the link.
         const STALL_EVERY: Duration = Duration::from_millis(3_300);
         const STALL_FOR: Duration = Duration::from_millis(800);
+        /// FR-148 P0 — the still screen's message, one a second, and its
+        /// cells' length: five of the sampler's samples.
+        const SPARSE_LEN: usize = 200;
+        const SPARSE_SECONDS: u32 = 10;
 
         /// One cell at a time: the cells are timed.
         static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1735,6 +2406,11 @@ pub(crate) mod shaped_link {
             skip_over: bool,
             /// Head-of-line stalls on the agent's direction: how often, how long.
             stalls: Option<(Duration, Duration)>,
+            /// FR-148 P0 — a still screen: one [`SPARSE_LEN`] message a second
+            /// instead of the frames.
+            sparse: bool,
+            /// The run's length, in one-second rows.
+            seconds: u32,
         }
 
         impl Shape {
@@ -1757,6 +2433,12 @@ pub(crate) mod shaped_link {
                     Some((every, stall)) => format!(", a {stall:?} stall every {every:?}"),
                     None => String::new(),
                 };
+                if self.sparse {
+                    return format!(
+                        "{} Mbit/s, {queue} queue, path {path}, one {SPARSE_LEN}-byte message a second",
+                        self.bps as f64 / 1e6
+                    );
+                }
                 format!(
                     "{} Mbit/s, {queue} queue, path {path}, offer {} %{skip}{stalls}",
                     self.bps as f64 / 1e6,
@@ -1992,6 +2674,51 @@ pub(crate) mod shaped_link {
             b
         }
 
+        /// FR-148 P0 — the gauges the sampler takes, from the harness's own
+        /// takes. The table takes every second; this holds what it took since
+        /// the sampler's last take (the least of the leasts, the latest of
+        /// the rest), so the sampler reads what a take of its own would have.
+        #[derive(Debug, Default)]
+        struct Split(Option<Gauges>);
+
+        impl Split {
+            fn push(&mut self, g: Gauges) {
+                let least = match self.0.and_then(|p| p.ack_delay_min) {
+                    Some(p) => Some(g.ack_delay_min.map_or(p, |n| n.min(p))),
+                    None => g.ack_delay_min,
+                };
+                self.0 = Some(Gauges {
+                    ack_delay_min: least,
+                    ..g
+                });
+            }
+
+            fn take(&mut self) -> Option<Gauges> {
+                self.0.take()
+            }
+        }
+
+        /// One of the sampler's samples, and the run's rows it covers.
+        #[derive(Debug, Clone)]
+        struct Covered {
+            rows: std::ops::Range<usize>,
+            sample: Sample,
+        }
+
+        impl Covered {
+            /// Every second of the sample was loaded.
+            fn loaded(&self, rows: &[Second]) -> bool {
+                !self.rows.is_empty()
+                    && rows[self.rows.clone()]
+                        .iter()
+                        .all(|s| s.q_lo_ms > LOADED_MS)
+            }
+
+            fn queued(&self) -> bool {
+                self.sample.queue.is_some_and(|q| q.queued())
+            }
+        }
+
         #[derive(Debug)]
         struct TcpRun {
             shape: Shape,
@@ -2000,6 +2727,9 @@ pub(crate) mod shaped_link {
             belief: Belief,
             peak_queue: Duration,
             tail_drops: u64,
+            /// FR-148 P0 — the delivery sampler's samples and lines.
+            samples: Vec<Covered>,
+            lines: Vec<LineReport>,
         }
 
         fn us(d: Duration) -> u64 {
@@ -2165,9 +2895,13 @@ pub(crate) mod shaped_link {
                 let stream = Arc::clone(&stream);
                 let sink = sink.clone();
                 let frames = Arc::clone(&frames);
-                let len = shape.frame_len();
+                let (every, len) = if shape.sparse {
+                    (SAMPLE, SPARSE_LEN)
+                } else {
+                    (SAMPLE / FPS, shape.frame_len())
+                };
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(SAMPLE / FPS);
+                    let mut tick = tokio::time::interval(every);
                     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     let mut frame = vec![0x6b_u8; len];
                     loop {
@@ -2194,10 +2928,17 @@ pub(crate) mod shaped_link {
             let (mut seen_rx, mut seen_tx) = (0, 0);
             let mut last_transit: Option<u64> = None;
             let start = Instant::now();
-            let _ = gauges.take();
+            let first = gauges.take();
             let _ = sink.drain();
             let mut prev = (start, clock.read());
-            for i in 1..=SAMPLES {
+            // FR-148 P0 — the delivery sampler itself, on this run's clock and,
+            // through `Split`, on its gauges.
+            let mut sampler = DeliverySampler::new(true);
+            let mut split = Split::default();
+            let (mut samples, mut lines) = (Vec::new(), Vec::new());
+            let mut covered = 0;
+            assert_eq!(sampler.on_reading_with(start, prev.1, || Some(first)), None);
+            for i in 1..=shape.seconds {
                 let end = start + SAMPLE * i;
                 let (mut q_lo, mut q_hi) = (Duration::MAX, Duration::ZERO);
                 loop {
@@ -2214,6 +2955,7 @@ pub(crate) mod shaped_link {
                 let now = Instant::now();
                 let d = clock.read();
                 let g = gauges.take();
+                split.push(g);
                 let sample = Sample::between(prev.1, d, ms(now - prev.0));
                 let blocked = sink.drain();
                 let blocked_ms = ms(blocked.iter().map(|s| s.elapsed).sum::<Duration>());
@@ -2268,8 +3010,17 @@ pub(crate) mod shaped_link {
                     fast_rtx: g.fast_retransmits,
                     t3: g.t3_expiries,
                 });
+                if let Some(sample) = sampler.on_reading_with(now, d, || split.take()) {
+                    samples.push(Covered {
+                        rows: covered..rows.len(),
+                        sample,
+                    });
+                    covered = rows.len();
+                }
+                lines.extend(sampler.take_line(now));
                 prev = (now, d);
             }
+            lines.extend(sampler.take_rest());
             writer.abort();
             let peak_queue = a.peak_wait();
             let tail_drops = a.tail_drops();
@@ -2286,6 +3037,8 @@ pub(crate) mod shaped_link {
                 belief,
                 peak_queue,
                 tail_drops,
+                samples,
+                lines,
             }
         }
 
@@ -2412,6 +3165,26 @@ pub(crate) mod shaped_link {
                 opt(b.floor.map(|v| v / 1000)),
                 opt(b.capacity.map(|v| v / 1000)),
             );
+            // FR-148 P0 — the delivery sampler's samples, and its lines as the
+            // daemon writes them.
+            for c in &r.samples {
+                let q = c.sample.queue;
+                let class = format!("{:?}", c.sample.class);
+                println!(
+                    "   sampler: seconds {:>2}..={:<2} {class:<10} {:>7} B in {} ms, least {} ms, standing {} ms{}{}",
+                    c.rows.start + 1,
+                    c.rows.end,
+                    c.sample.bytes,
+                    c.sample.ms,
+                    opt(q.and_then(|q| q.least_ms)),
+                    opt(q.and_then(|q| q.standing_ms)),
+                    if c.loaded(&r.rows) { ", loaded" } else { "" },
+                    if c.queued() { ", queued" } else { "" },
+                );
+            }
+            for l in &r.lines {
+                print!("   {}", super::super::tests::logged(|| emit(sid(), l)));
+            }
         }
 
         fn print_windows(r: &TcpRun) {
@@ -2438,7 +3211,44 @@ pub(crate) mod shaped_link {
                 offer_pct: 150,
                 skip_over: false,
                 stalls: None,
+                sparse: false,
+                seconds: SAMPLES,
             }
+        }
+
+        /// FR-148 P0 — the delivery sampler's queued samples: at least half of
+        /// those whose seconds were all loaded.
+        fn sampler_reads_the_queue(r: &TcpRun) {
+            let name = r.shape.name();
+            let loaded: Vec<&Covered> = r.samples.iter().filter(|c| c.loaded(&r.rows)).collect();
+            let queued = loaded.iter().filter(|c| c.queued()).count();
+            assert!(
+                !loaded.is_empty(),
+                "{name}: no sample of the sampler's was loaded"
+            );
+            assert!(
+                queued * 2 >= loaded.len(),
+                "{name}: {queued} of {} loaded samples read queued",
+                loaded.len()
+            );
+        }
+
+        /// FR-148 P0 — the delivery sampler's lines carry the gauges and read
+        /// no queued sample.
+        fn sampler_reads_no_queue(r: &TcpRun) {
+            let name = r.shape.name();
+            assert!(!r.lines.is_empty(), "{name}: no line");
+            for l in &r.lines {
+                let q = l
+                    .queue
+                    .unwrap_or_else(|| panic!("{name}: a line without gauges: {l:?}"));
+                assert_eq!(q.queued, 0, "{name}: {l:?}");
+            }
+            assert!(
+                r.samples.iter().all(|c| !c.queued()),
+                "{name}: {:?}",
+                r.samples
+            );
         }
 
         /// The hypothesis: on the deep, lossless queue, fewer than half the
@@ -2486,6 +3296,7 @@ pub(crate) mod shaped_link {
                 shape.name(),
                 loaded.len()
             );
+            sampler_reads_the_queue(&r);
             // The hypothesis, last.
             assert!(
                 backlogged * 2 < loaded.len(),
@@ -2516,6 +3327,50 @@ pub(crate) mod shaped_link {
                 "{}: the acknowledgement delay rose {worst} ms over its least",
                 shape.name()
             );
+            sampler_reads_no_queue(&r);
+        }
+
+        /// FR-148 P0 — a still screen: one small message a second. Each
+        /// sample is two lone packets, whose SACKs the viewer may hold, and
+        /// none acknowledges enough bytes to count, so none is queued.
+        async fn sparse(queue: Duration) {
+            let shape = Shape {
+                sparse: true,
+                seconds: SPARSE_SECONDS,
+                ..shape(2_000_000, queue, OpenPath::InitAck)
+            };
+            let r = run(shape).await;
+            print_run(&r);
+            let name = shape.name();
+            assert!(r.samples.len() >= 4, "{name}: {:?}", r.samples);
+            for c in &r.samples {
+                let q = c
+                    .sample
+                    .queue
+                    .unwrap_or_else(|| panic!("{name}: a sample without gauges: {c:?}"));
+                assert!(
+                    !counts(c.sample.ms, c.sample.bytes, q.gauges.max_payload),
+                    "{name}: a still screen's sample counted: {c:?}"
+                );
+            }
+            assert!(
+                r.samples
+                    .iter()
+                    .any(|c| c.sample.queue.is_some_and(|q| q.least_ms.is_some())),
+                "{name}: no SACK gave a delay: {:?}",
+                r.samples
+            );
+            sampler_reads_no_queue(&r);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_still_screen_on_the_deep_queue_reads_no_queue() {
+            sparse(DEEP).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_still_screen_on_the_shallow_queue_reads_no_queue() {
+            sparse(SHALLOW).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

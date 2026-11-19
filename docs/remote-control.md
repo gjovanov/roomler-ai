@@ -3540,6 +3540,10 @@ so `mark_ended`'s whole-`stats` write cannot reset it, only when the value is a 
 device is the only writer). Absent is unknown, never direct. The P9a freeze splits the day's
 Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
 the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
+Since FR-148 P0 the agent's carrier line also names what carries its own TURN allocation,
+`relay_transport` (`udp`, `tcp`, `tls`, `none` or `unknown`). It is a log field only, never sent
+on `rc:session.stats`
+([rate-control.md § The standing queue](rate-control.md#the-standing-queue-what-a-tcp-carrier-holds)).
 
 **When it reaches the server (FR-102 P9d).** The observation lands ~2.5–6 s after `Connected`
 (`NOMINATION_WAIT` 3 s + `SETTLE` 2 s + the LocalAPI budget). P9c sent the carrier only on the
