@@ -48,7 +48,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use drm::buffer::DrmFourcc;
-use drm::control::{crtc, framebuffer, plane, property};
+use drm::control::{GetPlanarFramebufferError, crtc, framebuffer, plane, property};
 
 use super::drm_cursor::{self, CursorSnapshot, PlaneKind};
 use super::drm_idle::{self, IdleGate};
@@ -127,11 +127,12 @@ struct Cached {
 }
 
 /// What a worker keeps between grabs: the CPU mapping of the last buffer
-/// (the idle check reads it, and the CPU path repacks from it), and the GPU
-/// path's state (FR-107 P3).
+/// (the idle check reads it, and the CPU path repacks from it), the GPU
+/// path's state (FR-107 P3), and the grabs that lost their framebuffer (#4035).
 struct ReadCache {
     mapping: Option<Cached>,
     gpu: GpuState,
+    freed: FreedRun,
 }
 
 /// FR-107 P3 — whether this worker reads the scanout through the GPU.
@@ -816,6 +817,10 @@ enum Grabbed {
     Frame(Box<Frame>),
     /// FR-93 P3d — the same picture as the last frame delivered.
     Unchanged,
+    /// #4035 — the compositor freed the primary plane's framebuffer between
+    /// the plane read and GETFB2 ([`FreedRun`]): no frame this tick. Waited
+    /// out as `Unchanged` is, and the next grab reads the plane again.
+    Raced,
     /// Nothing is scanned out (a mode change, a blanked panel).
     Nothing,
     /// FR-93 P3e — nothing is scanned out because the display is off: a
@@ -1061,6 +1066,7 @@ fn worker(
         } else {
             GpuState::Off
         },
+        freed: FreedRun::default(),
     };
     // FR-93 P3d — the frame skip for an unchanged screen: a Wayland seat's,
     // or (FR-113 P1) an X11 seat's, which samples dense rows.
@@ -1120,6 +1126,13 @@ fn worker(
     if cursor.is_some() {
         drm_cursor::publish(None);
     }
+    // #4035 — what freed framebuffers cost this capture, for a field read.
+    if cache.freed.skipped > 0 {
+        info!(
+            skipped = cache.freed.skipped,
+            "drm capture: ticks skipped because the compositor freed their framebuffer mid-grab (#4035)"
+        );
+    }
 }
 
 /// `None` means "the driver did not report a modifier", which the kernel uses
@@ -1146,6 +1159,72 @@ fn unreadable(buffers: [Option<drm::buffer::Handle>; 4]) -> Option<&'static str>
         "reading the scanout needs CAP_SYS_ADMIN (root), which this daemon lacks: on a per-user \
          install run roomler config clear drm_capture",
     )
+}
+
+/// #4035 — the longest run of grabs that find their framebuffer freed: each one
+/// before the last skips its tick, and the last fails the grab. A third of a
+/// second at 30 fps, a sixth at 60.
+const FREED_RUN_MAX: u32 = 10;
+
+/// #4035 — the grabs whose framebuffer the compositor freed under them.
+///
+/// [`grab`] reads the primary plane's framebuffer id, then asks the kernel for
+/// that framebuffer (GETFB2). A compositor that flips to a new buffer and frees
+/// the old one in between makes the kernel answer ENOENT for an id that was on
+/// screen a moment before. That is a lost race, not a broken capture: the next
+/// grab reads the plane again and finds the buffer that replaced it. Until
+/// #4035 it failed the grab, and every pump rebuilt the capturer; the VP9 4:4:4
+/// and RTP pumps dropped their encoder with it, so the viewer got a keyframe
+/// and a gap.
+///
+/// So an ENOENT costs its grab a tick ([`Grabbed::Raced`]), and any other
+/// answer ends the run. The [`FREED_RUN_MAX`]th in a row fails the grab with
+/// its count, and the pump rebuilds as before, which reads the planes again: a
+/// plane that goes on naming a framebuffer the kernel cannot find has not lost
+/// a race, and skipping it for good would freeze the picture with nothing to
+/// recover it. Any other failure fails the grab at once, as before: a refused
+/// permission (EPERM, EACCES) among them. A grab that finds nothing scanned out
+/// asks no GETFB2 and leaves the run as it is.
+#[derive(Debug, Default)]
+struct FreedRun {
+    /// ENOENTs since the last other answer.
+    in_a_row: u32,
+    /// Ticks skipped over this capture's life.
+    skipped: u64,
+}
+
+impl FreedRun {
+    /// This grab's GETFB2 answer: `Ok(Some(info))` reads on, `Ok(None)` skips
+    /// the tick, and `Err` fails the grab.
+    fn judge<T>(&mut self, getfb2: Result<T, GetPlanarFramebufferError>) -> Result<Option<T>> {
+        let e = match getfb2 {
+            Ok(info) => {
+                self.in_a_row = 0;
+                return Ok(Some(info));
+            }
+            Err(e) => e,
+        };
+        if !freed(&e) {
+            self.in_a_row = 0;
+            return Err(anyhow!("drmModeGetFB2: {e}"));
+        }
+        self.in_a_row += 1;
+        if self.in_a_row >= FREED_RUN_MAX {
+            let n = std::mem::take(&mut self.in_a_row);
+            return Err(anyhow!(
+                "drmModeGetFB2: {e}, {n} grabs in a row: the primary plane names a framebuffer \
+                 the kernel cannot find (#4035)"
+            ));
+        }
+        self.skipped += 1;
+        Ok(None)
+    }
+}
+
+/// #4035 — whether GETFB2 failed because the framebuffer is gone: ENOENT, read
+/// from the error's errno and never from its text.
+fn freed(e: &GetPlanarFramebufferError) -> bool {
+    matches!(e, GetPlanarFramebufferError::Io(io) if io.raw_os_error() == Some(libc::ENOENT))
 }
 
 fn grab(
@@ -1176,9 +1255,18 @@ fn grab(
     if let Some(reader) = cursor {
         drm_cursor::publish(reader.read(card, planes, crtc));
     }
-    let info = card
-        .get_planar_framebuffer(fb)
-        .map_err(|e| anyhow!("drmModeGetFB2: {e}"))?;
+    // #4035 — a framebuffer freed since the plane read costs this tick, up to
+    // `FREED_RUN_MAX` in a row; any other failure fails the grab, as before.
+    let Some(info) = cache.freed.judge(card.get_planar_framebuffer(fb))? else {
+        if cache.freed.skipped == 1 {
+            info!(
+                "drm capture: the compositor freed the primary plane's framebuffer mid-grab \
+                 (ENOENT): the tick is skipped, and {FREED_RUN_MAX} in a row rebuild the \
+                 capture (#4035)"
+            );
+        }
+        return Ok(Grabbed::Raced);
+    };
     // ⚠️ A NAMED binding: `let _ = …` would drop the guard — and close the
     // handle — before the export below could use it. It closes at the end of
     // this frame, on every return path including the bails.
@@ -1512,7 +1600,9 @@ impl ScreenCapture for DrmCapture {
                 // pump answers each "nothing this tick" with a keepalive
                 // re-encode of its last frame, so a "nothing" every frame
                 // period would cost more encodes than the frames it saved.
-                WorkerReply::Grabbed(Grabbed::Unchanged) => {
+                // #4035 — a grab that lost its framebuffer waits the same way:
+                // the pump never hears of it, and the next grab reads again.
+                WorkerReply::Grabbed(Grabbed::Unchanged | Grabbed::Raced) => {
                     if started.elapsed() >= drm_idle::IDLE_WAIT {
                         return Ok(None);
                     }
@@ -1975,5 +2065,177 @@ mod tests {
         let shown = format!("drm_capture is on, but DRM capture could not open: {why}");
         let max = crate::capture::CaptureUnavailable::DETAIL_MAX;
         assert!(shown.chars().count() <= max, "{shown}");
+    }
+
+    /// GETFB2's answer for an errno, as drm-rs hands it back: an `io::Error`
+    /// carrying the kernel's code.
+    fn errno(code: i32) -> std::result::Result<u32, GetPlanarFramebufferError> {
+        Err(GetPlanarFramebufferError::Io(
+            std::io::Error::from_raw_os_error(code),
+        ))
+    }
+
+    fn enoent() -> std::result::Result<u32, GetPlanarFramebufferError> {
+        errno(libc::ENOENT)
+    }
+
+    /// #4035 — the compositor freed the framebuffer between the plane read and
+    /// GETFB2, once, between two good grabs: that tick is skipped with no
+    /// error, and the next grab delivers.
+    #[test]
+    fn a_framebuffer_freed_between_two_good_grabs_costs_one_tick() {
+        let mut run = FreedRun::default();
+        assert_eq!(run.judge(Ok(1)).unwrap(), Some(1));
+        assert_eq!(
+            run.judge(enoent())
+                .expect("a freed framebuffer is no error"),
+            None,
+            "its tick is skipped"
+        );
+        assert_eq!(run.judge(Ok(2)).unwrap(), Some(2), "the next grab delivers");
+        assert_eq!(run.skipped, 1);
+    }
+
+    /// #4035 — a run of ENOENTs is bounded: each grab before the last skips
+    /// its tick, and the last fails, saying how long the run was, so the pump
+    /// rebuilds and a field read tells a run's end from the race. The error
+    /// still starts as it did, so a read for the old line finds this one too.
+    #[test]
+    fn a_run_of_freed_framebuffers_fails_on_its_last_grab_and_names_its_length() {
+        let run_at_30_fps = Duration::from_secs(1) / 30 * FREED_RUN_MAX;
+        assert!(
+            run_at_30_fps <= Duration::from_secs(1),
+            "a short run: {run_at_30_fps:?} at 30 fps"
+        );
+        let mut run = FreedRun::default();
+        for i in 1..FREED_RUN_MAX {
+            assert_eq!(run.judge(enoent()).unwrap(), None, "ENOENT {i} skips");
+        }
+        let e = run.judge(enoent()).expect_err("the run's last grab fails");
+        let e = format!("{e:#}");
+        assert!(
+            e.starts_with("drmModeGetFB2: No such file or directory"),
+            "{e}"
+        );
+        assert!(
+            e.contains(&format!("{FREED_RUN_MAX} grabs in a row")),
+            "{e}"
+        );
+        assert_eq!(run.skipped, u64::from(FREED_RUN_MAX - 1));
+    }
+
+    /// #4035 — a good grab ends the run: ENOENT and success in turn, or runs
+    /// one short of the bound with a success between them, never fail.
+    #[test]
+    fn a_good_grab_ends_the_run_so_freed_framebuffers_with_gaps_never_fail() {
+        let mut run = FreedRun::default();
+        for _ in 0..3 * FREED_RUN_MAX {
+            assert_eq!(run.judge(enoent()).unwrap(), None);
+            assert_eq!(run.judge(Ok(7)).unwrap(), Some(7));
+        }
+        for _ in 0..3 {
+            for _ in 1..FREED_RUN_MAX {
+                assert_eq!(run.judge(enoent()).unwrap(), None);
+            }
+            assert_eq!(run.judge(Ok(8)).unwrap(), Some(8));
+        }
+    }
+
+    /// #4035 — only ENOENT is a race. A refused permission (EPERM, EACCES),
+    /// any other errno, a fourcc drm-rs does not know, and an error that only
+    /// reads like ENOENT fail the first grab, as before. One of them inside a
+    /// run of ENOENTs fails too, and ends the run.
+    #[test]
+    fn any_other_getfb2_failure_fails_at_once() {
+        for code in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENODEV] {
+            let e = FreedRun::default()
+                .judge(errno(code))
+                .expect_err("fails at once");
+            let e = format!("{e:#}");
+            assert!(e.starts_with("drmModeGetFB2: "), "{e}");
+            assert!(!e.contains("in a row"), "{e}");
+        }
+        let fourcc = GetPlanarFramebufferError::UnrecognizedFourcc(
+            drm::buffer::UnrecognizedFourcc(0x2020_2020),
+        );
+        assert!(FreedRun::default().judge(Err::<u32, _>(fourcc)).is_err());
+        // The errno decides, never the text.
+        let lookalike = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let lookalike = GetPlanarFramebufferError::Io(lookalike);
+        assert!(FreedRun::default().judge(Err::<u32, _>(lookalike)).is_err());
+
+        let mut run = FreedRun::default();
+        for _ in 1..FREED_RUN_MAX {
+            assert_eq!(run.judge(enoent()).unwrap(), None);
+        }
+        assert!(run.judge(errno(libc::EPERM)).is_err());
+        assert_eq!(run.judge(enoent()).unwrap(), None, "a new run");
+    }
+
+    /// A capture whose worker answers each ask with the next of `replies`.
+    fn answering(replies: Vec<WorkerReply>) -> DrmCapture {
+        let (cmd_tx, cmd_rx) = std_mpsc::channel::<FrameRequest>();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok(tx) = cmd_rx.recv() else { return };
+                let _ = tx.send(reply);
+            }
+        });
+        DrmCapture {
+            cmd_tx,
+            width: 2,
+            height: 2,
+            target_frame_period: Duration::from_millis(1),
+            last_frame_at: None,
+            refresh_hz: None,
+            unchanged: Arc::default(),
+            dark: false,
+            guard: None,
+            output_cap: Arc::default(),
+        }
+    }
+
+    /// #4035 — a raced grab is waited out inside `next_frame`, as an unchanged
+    /// one is: the pump never hears of it, gets the next grab's frame, and
+    /// counts no still screen. A run's last grab still reaches the pump as the
+    /// error it rebuilds on.
+    #[tokio::test]
+    async fn a_raced_grab_costs_the_pump_nothing_and_a_runs_end_reaches_it() {
+        let frame = Frame {
+            width: 2,
+            height: 2,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra,
+            data: vec![0u8; 16].into(),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        };
+        let mut capture = answering(vec![
+            WorkerReply::Grabbed(Grabbed::Raced),
+            WorkerReply::Grabbed(Grabbed::Frame(Box::new(frame))),
+        ]);
+        let got = capture.next_frame().await.expect("a race is no error");
+        assert!(got.is_some(), "the next grab's frame");
+        assert_eq!(capture.frames_unchanged(), 0);
+        assert!(capture.waits_for().is_none());
+
+        let mut run = FreedRun::default();
+        for _ in 1..FREED_RUN_MAX {
+            assert_eq!(run.judge(enoent()).unwrap(), None);
+        }
+        let end = run.judge(enoent()).expect_err("the run's end");
+        let mut capture = answering(vec![
+            WorkerReply::Grabbed(Grabbed::Raced),
+            WorkerReply::Failed(format!("{end:#}")),
+        ]);
+        let Err(e) = capture.next_frame().await else {
+            panic!("the run's end reaches the pump as an error");
+        };
+        assert!(format!("{e:#}").contains("grabs in a row"), "{e:#}");
     }
 }
