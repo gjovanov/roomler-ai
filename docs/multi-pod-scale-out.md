@@ -188,7 +188,7 @@ bounded passive staleness; (4) pod-alive → advisory only.
 "no record" ⇒ rc/tunnel answer pod-local (= today), rehome/nudge
 suppressed, media falls back to the S6 belt (logged
 `media_belt_fallback_total`). On recovery, heartbeats re-assert every
-record within one beat and the fold rule resolves any belt-era splits. A Redis that stops answering without a reset degrades the same way, within the response timeout ([below](#a-redis-that-stops-answering-3840)).
+record within one beat and the fold rule resolves any belt-era splits. A Redis that refuses, restarts or stops answering without a reset reaches these paths within the response timeout ([below](#a-redis-that-stops-answering-3840)).
 
 ### A live RC session through its pod's death (FR-138)
 
@@ -218,28 +218,49 @@ what an operator reads before and after a roll, are in
 
 Every Redis command the server sends, except a subscription, goes through ONE multiplexed
 connection: the fan-out publisher, the presence registries, the ownership directory, the bus and
-the session slots all hold clones of it (`RedisConnection`, `crates/core/src/ws/redis_conn.rs:150`,
-made at `crates/api/src/state.rs:140`). A Redis lost without a TCP reset (a dropped path, a frozen
-machine, an address left black-holed by a failover) gives the client no error at all. Before the
-bound, every command in flight waited for as long as the kernel kept the socket, about 15 minutes
-with data in flight and for ever while the peer's kernel still acknowledged, and so did every
-request that awaited one. Now each command answers or fails within the response timeout, and the
-error takes the path "Redis down" always took.
+the session slots all hold clones of it (`RedisConnection`, `crates/core/src/ws/redis_conn.rs:144`,
+made at `crates/api/src/state.rs:140`). The crate's default connection, which both settings at 0
+restore, turns two kinds of outage into a wait instead of an error:
+
+- **A Redis lost without a TCP reset** (a dropped path, a frozen machine, an address left
+  black-holed by a failover) gives the client no error at all. Every command in flight waits for as
+  long as the kernel keeps the socket: about 15 minutes with data in flight, and for ever while the
+  peer's kernel still acknowledges.
+- **A Redis that refuses or restarts** makes the crate reconnect, and every command sent meanwhile
+  waits for that reconnect: the first attempt, then six more, the first 1 to 2 s later and the
+  others 60 to 120 s apart. A restart longer than about 2 s holds those commands for one to two
+  minutes.
+
+With the bound, each command answers or fails within the response timeout, so both outages reach
+the "Redis down" paths ([above](#failure-model)) on every Redis restart longer than about 2 s and
+on every pause longer than the bound. A Redis error says nothing about the other pod, so where a
+caller would end, reap, release or forget something on one error, it reads the error as
+"unknown" and asks again: the relay, the session slots and the DERP and tunnel registrations in
+the table below.
 
 | Setting | Default | What it bounds | 0 |
 |---|---|---|---|
-| `ROOMLER__REDIS__RESPONSE_TIMEOUT_MS` | 3000 | one command or pipeline, end to end: the queue in front of the socket, the wait for a reconnect, the reply (`redis_conn.rs:191-212`) | no bound |
+| `ROOMLER__REDIS__RESPONSE_TIMEOUT_MS` | 3000 | one command or pipeline, end to end: the queue in front of the socket, the wait for a reconnect, the reply (`redis_conn.rs:286-312`) | no bound |
 | `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS` | 3000 | one connection attempt: TCP connect and the handshake the crate sends (`CLIENT SETINFO`) | no bound |
 
-Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no replacement: the
-behaviour before the bound, restored by a setting on the deployment and a restart, with no new
-image (`crates/config/src/settings.rs:1296-1304`).
+A value from 1 to 999 is used as 1000 (`BOUND_FLOOR_MS`, `redis_conn.rs:62`), and the pod says so
+once at boot, at warn: `redis: a timeout setting under 1000 ms is used as 1000 ms`, with `setting`,
+`given_ms` and `used_ms` (`redis_conn.rs:480-491`). A bound under a second would fail commands on a
+Redis that answers: a value of 3, meant as seconds, would put both pods into "Redis down" at once.
+Linux also sends its first SYN retransmission after 1 s, so a connection timeout under 1 s fails a
+connection that one lost packet only delays. No value refuses boot: a pod that will not start
+holds a roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no
+replacement, restored by a setting on the deployment and a restart, with no new image
+(`crates/config/src/settings.rs:1296-1304`). The boot line `Redis Pub/Sub publisher connected`
+names the bounds in use, `response_timeout_ms` and `connection_timeout_ms` (0 is no bound), and
+`addr`, Redis's host and port (`crates/core/src/ws/redis_pubsub.rs:452-466`).
 
 The crate's own response timeout does not cover the wait for a reconnect or the queue in front of
 the socket, so each call runs under an outer timeout of the same length. A timed-out command does
 not make the crate reconnect, so a timeout starts ONE background replacement
-(`redis_conn.rs:216`), built like the first connection and swapped in only once Redis has answered
-its handshake:
+(`redis_conn.rs:319-373`). Each attempt first makes one plain connection, so a Redis that refuses
+fails the attempt at once instead of inside the crate's own retries; then it builds the connection
+like the first one, and swaps it in only once Redis has answered its handshake:
 
 ```mermaid
 sequenceDiagram
@@ -254,6 +275,7 @@ sequenceDiagram
     RC-->>C: Err (io TimedOut) after 3 s
     Note over RC: warn "redis: no answer within the timeout"
     loop one attempt at a time, each at most 3 s, then 1, 2, 4, 5, 5 … s apart
+        RC->>R: one plain connection (a refusal ends the attempt at once)
         RC->>New: connect + handshake
         New->>R: TCP + CLIENT SETINFO
     end
@@ -264,30 +286,33 @@ sequenceDiagram
 | Bound | Value | Where it comes from |
 |---|---|---|
 | a command, whatever the connection does | ≤ 3 s | the outer timeout; measured 3.0 s (`crates/tests/src/redis_bound_tests.rs`) |
+| commands queued in front of a socket Redis stopped reading | ≤ 3 s each | the outer timeout counts the queue; measured: 160 queued writes all failed after 3.0 s |
+| a script that Redis lost in a restart | ≤ 3 × 3 s | the crate sends `EVALSHA`, and on `NOSCRIPT` sends `SCRIPT LOAD` and `EVALSHA` again, each bounded |
+| `claim_nx` | ≤ 4 × 3 s | `SET NX` then `GET`, sent once more when the holder vanished in between (`crates/core/src/cluster/directory.rs:116`) |
 | a request that awaits k commands one after another | ≤ k × 3 s | the paths below that loop |
 | a bus request | ≤ 3 s + its deadline (2 s, 5 s for a router-creating media op) | the request PUBLISH (`crates/core/src/cluster/bus.rs:225`) is awaited before the deadline starts (`:236`) |
-| Redis answering again → the server using it again | ≤ 8 s | an attempt in flight ends at its 3 s bound, then at most a 5 s wait (`REPLACE_WAIT_MAX`, `redis_conn.rs:59`); measured 2.8 s |
+| Redis answering again → the server using it again | ≤ 8 s | an attempt in flight ends at its 3 s bound, then at most a 5 s wait (`REPLACE_WAIT_MAX`, `redis_conn.rs:67`); measured 2.8 s |
+| Redis listening again after a refusal → the server using it again | ≤ 5 s + one attempt | a refused attempt fails at once, then at most a 5 s wait |
 
 Why 3 s, for both:
 
-- A Redis that answers answers every command the server sends in well under a millisecond: each is
-  O(1) or small (the largest are the presence sweep's MGET over a fleet's agent keys, `SCAN COUNT
-  100` and short Lua scripts). A timeout that fires on such a Redis would turn a healthy cluster's
-  work into errors, so the bound sits far from it.
-- The longest stall a Redis that is up imposes by design is the write delay of up to 2 s under
-  `appendfsync everysec` when its disk falls behind; 3 s is above it.
-- `/health/ready` already takes a pod out of rotation after 2 s without a PING answer
-  (`crates/api/src/lib.rs:485`), so a command never fails before the probe could.
-- The shorter bounds some callers keep fire first and are unchanged: `CLAIM_RELEASE_BOUND` 2 s
-  (`crates/modules/conference/src/media_cluster.rs:481`), the 200 ms and 250 ms reads of a listing
-  or a route, the 2 s read of `close-dead`. The room delete's `ROOM_REMOVED_BOUND` (5 s,
-  `crates/modules/chat/src/room.rs:342`) bounds several commands in a row, each now at most 3 s.
+- A Redis that answers answers every command the server sends in about a millisecond. Each is
+  O(1) or small: the largest are the presence sweep's `MGET` over a fleet's agent keys,
+  `SCAN COUNT 100` and short Lua scripts, and an `MGET` of 10 000 keys took 1.2 to 2.1 ms inside
+  Redis. 3 s sits three orders of magnitude above the slowest of them, so the bound fires on a
+  Redis that does not answer, not on one that is busy.
+- The callers that keep a shorter bound of their own keep it, and it fires first: the bus deadline
+  (`RPC_DEADLINE`, 2 s, `crates/core/src/cluster/bus.rs:41`), `CLAIM_RELEASE_BOUND` (2 s,
+  `crates/modules/conference/src/media_cluster.rs:481`), the 200 ms and 250 ms reads of a listing
+  or a route, and the 2 s read of `close-dead`. What they do is as it was.
+- The room delete's `ROOM_REMOVED_BOUND` (5 s, `crates/modules/chat/src/room.rs:342`) bounds
+  several commands in a row. One that gets no answer now fails inside it, at 3 s.
 
 **A timeout means the reply was lost, not that the write was.** A write may be applied behind a
-timed-out command. What each Redis user does with the error, which is what it did when Redis was
-down, and what heals a write applied behind it:
+timed-out command. What each Redis user does with an error, whatever its cause, and what heals a
+write applied behind a lost reply:
 
-| Redis user | Commands | On a timeout | A write applied behind the lost reply |
+| Redis user | Commands | On an error | A write applied behind the lost reply |
 |---|---|---|---|
 | Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:57`, `:85`, `:139`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
 | Online registry (`crates/core/src/ws/redis_pubsub.rs:109`, `:128`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:443`) writes it again | the 90 s TTL |
@@ -298,9 +323,13 @@ down, and what heals a write applied behind it:
 | Relay load baseline (`crates/core/src/relay_load.rs:521`) | advance_baseline (Lua) | logged, the poll goes on | **lasting**: that delta is never booked |
 | OAuth attribution (`crates/core/src/attribution.rs:298`, `:313`) | SET EX 600; GET + DEL in MULTI | own 250 ms bound first; sign-in goes on without it | the take: **lasting**, that sign-up is not attributed |
 | Relay allowance (`crates/modules/network/src/relay_allowance.rs:260`, `:265`, `:282`) | DEL, SET EX 900, GET | a failed read is an empty set: throttles lift (fails open, as the code intends) | the previous set until the next job (300 s) |
-| Ownership directory (`crates/core/src/cluster/directory.rs`) | GET, SET (NX) EX, Lua refresh and release, SCAN | "no record": rc and tunnels answer pod-local, media serves the join here (the belt) | records are re-asserted within one beat or end by TTL; a DERP node whose claim failed stays out of convergence until it reconnects (`crates/modules/network/src/derp_cluster.rs:85`) |
+| Ownership directory (`crates/core/src/cluster/directory.rs`) | GET, SET (NX) EX, Lua refresh and release, SCAN | "no record": rc and tunnels answer pod-local, media serves the join here (the belt) | records are re-asserted within one beat or end by TTL |
+| Media claim-or-route (`crates/modules/conference/src/media_cluster.rs:62`, `:226`, `:624`) | GET, Lua claim and refresh, bus requests | a join whose claim cannot be read is served here (the belt), and the orphan pass folds it ≤ 10 s after Redis answers; a media command whose bus request fails prunes the owner's record as a deadline does, and a join that claims the room meanwhile makes the owner fold its room at its next refresh (≤ 10 s): every participant rejoins once; a member's removal whose claim read fails counts the room as this pod's, closes nothing here and reports 0 seats, and the serving pod's seat check ends the seat within 30 s (`crates/modules/conference/src/revoke.rs:322`) | the claim's 30 s TTL |
+| DERP registration (`crates/modules/network/src/derp_cluster.rs:72`, `:352`) | Lua LWW claim, SADD, convergence reads | the registration keeps its token whatever the claim answered, and its socket goes on; `finish_registration` writes what the error left owed once Redis answers, 1 s apart doubling to 30 s: the record by `claim_if_newer`, which never takes it from a later registration; the index member; a convergence sweep (measured: settled 9.2 s after Redis answered) | the record holds this registration's own token: the heartbeat refreshes it |
+| Tunnel ownership record (`crates/modules/network/src/tunnel.rs:800-815`) | Lua LWW claim | the session keeps its token whatever the claim answered; the 30 s heartbeat re-sets an absent record (`refresh_if_mine`, `crates/modules/network/src/lib.rs:382-393`); only the split-evidence probe reads it | the record holds the session's own token: the heartbeat refreshes it |
 | Pod bus (`bus.rs:225`, `:317`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
-| Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error lets the session proceed uncounted (fails open, as the code intends); renew and release log | a lease lapses in 90 s |
+| Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A deadline, or the owner's answer (`alive: false`, a NACK), still reaps a proxy or forgets a route | nothing is written |
+| Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error, or a set full only by stale leases Redis did not let go (`crates/modules/remote/src/slots.rs:206-210`), lets the session proceed uncounted (fails open, as the code intends); a keep is tried again 1, 2, 4, 8, 16 s apart while its lease can still exist (`keep_retrying`, `session_slots.rs:417`); renew and release log | a lease lapses in 90 s; a keep only lengthens a live lease, so trying it again is harmless |
 | Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:1984`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
 
 Paths that wait more than one bound, because they await Redis once per item: a call start (two
@@ -309,13 +338,27 @@ commands per member, `notify.rs:270`), a post with mentions (two per mention), a
 passes (per record), and the shutdown release loops (per record, with no overall bound). Each step
 is bounded; the sum is k × 3 s.
 
-**Not covered: the subscriptions.** The `roomler:ws` and bus subscribers hold their own connections
-(`redis_pubsub.rs:427`, `bus.rs:258`), which nothing bounds yet: a subscriber whose Redis went silent
-stays subscribed to nothing until the kernel gives the socket up.
+**Not covered: the subscriptions** (#3952). The `roomler:ws` and bus subscribers hold their own
+connections (`redis_pubsub.rs:427`, `bus.rs:258`), which nothing bounds yet: a subscriber whose
+Redis went silent stays subscribed to nothing until the kernel gives the socket up.
 
-**Field read.** Every timeout, of a command or of a replacement's connection attempt, logs one warn
-line in one wording: `redis: no answer within the timeout`. On a healthy pod its count is 0. A
-replacement that succeeds logs `redis: the shared connection was replaced after a timeout` at info.
+**Field read.** Each wording below is one fixed line at warn, written at most once a second per
+pod, with `suppressed`, the lines held back since the one before it (`LineBound`,
+`redis_conn.rs:419`); the counters behind them count every event, so the events a line stands for
+are 1 + `suppressed`. On a healthy pod every count is 0.
+
+| Wording | What it says | Fields |
+|---|---|---|
+| `redis: no answer within the timeout` (`redis_conn.rs:71`) | Redis took the bytes and said nothing: a command, or a replacement's connection attempt (`command="connect"`), got no answer within its bound | `command`, `timeout_ms`, `timeouts`, `suppressed` |
+| `redis: no connection could be made` (`redis_conn.rs:77`) | Redis refused or closed the connection: a replacement's attempt failed for another reason than a timeout (`error`, `retry_in_ms`), or a command timed out while it waited for the crate's reconnect after one (`command`, `waited_ms`) | those, `connect_failures`, `suppressed` |
+| `rc relay: frame dropped, Redis failed its relay` (`crates/modules/remote/src/relay.rs:648`) | a session frame the relay could not publish; the route is kept | `frame`, `session`, `suppressed` |
+| `rc relay: sweep stopped, Redis failed a probe` (`relay.rs:652`) | a janitor sweep that Redis stopped; its proxies are kept and asked about at the next sweep | `unsettled` |
+
+A replacement that succeeds logs `redis: the shared connection was replaced after a timeout` at
+info. A pod whose own runtime stalls for longer than the bound (a blocked executor, a starved or
+paused machine) times out the commands it had in flight on a Redis that is healthy: the timer
+fires when the runtime runs again, before the reply is read. `redis: no answer within the timeout`
+then points at the pod, not at Redis; the other pod, on the same Redis, logs nothing.
 
 ## Stages
 
