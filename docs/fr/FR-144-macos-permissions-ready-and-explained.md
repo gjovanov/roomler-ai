@@ -57,9 +57,9 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —
   the remote screen will be blank", "Accessibility — remote keyboard and mouse will do nothing"), an Open
   Settings button each, and Restart roomlerd (`agents/roomler-desktop/src/front/index.html:102-130`), re-read on
-  window focus (`overview.js:653-675`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2417-2424`,
+  window focus (`overview.js:656-678`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2402-2409`,
   `agents/roomlerd/src/localapi_state.rs:460-473`). Its Screen Recording read is not live: it stays false after
-  the grant until a restart (`crates/localapi/src/lib.rs:545-557`). No row for prompts 4 or 5, no stale state, no
+  the grant until a restart (`crates/localapi/src/lib.rs:537-549`). No row for prompts 4 or 5, no stale state, no
   "Allowed" state. For its first 30 s after the install it says "Not enrolled yet" (#3700).
 - **The Devices page** (code): "No screen access" and "No input access" chips (`ui/src/components/admin/agentCodecChips.ts:92-115`)
   from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4450-4479`).
@@ -129,7 +129,7 @@ per permission `roomlerd` needs:
 
 | Row, as the person reads it | Without it | Live state from | Button |
 |---|---|---|---|
-| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:545-557`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
+| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:537-549`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
 | **Control the mouse and keyboard** — Device Control and Data Access (macOS 27), Accessibility (earlier) | "Clicks and keys from the controller do nothing." | `AXIsProcessTrusted`, live (`tcc.rs:69-71`) | "Open Device Control and Data Access" |
 | **Reach this network** — Local Network | "A controller on the same network connects through the internet or a relay instead of directly." | the agent's own sends: the last result of a multicast or local-address send | "Ask now", then "Open Local Network" once answered |
 | **Show the screen without a monthly question** — the screen-capture reminder | "macOS asks again about every 30 days, and the question covers the screen until someone answers it." | the agent's own record of when it last saw the reminder answered (replayd's own record, if a process of ours may read it: to verify in the field) | "Ask now" (one capture) |
@@ -143,7 +143,7 @@ what is missing.
   section heads the Overview: "Remote control of this Mac is not ready: <the row's name>." It is computed from the
   rows, so it goes away the moment the last one is Allowed.
 - **The restart is ours.** When See the screen turns on, Roomler restarts `roomlerd` itself through the LocalAPI
-  `RestartDaemon` verb the card already uses (`overview.js:705-724`), at once when no session is live, and
+  `RestartDaemon` verb the card already uses (`overview.js:708-727`), at once when no session is live, and
   otherwise after asking: "Restart roomlerd now? It ends the current remote session." What restarts is the
   process that holds the grant, the person's half: on a Mac with a root half, that half and its private network
   stay up (which process the verb restarts on a one-row Mac is to verify in P1). "Live" counts everything the

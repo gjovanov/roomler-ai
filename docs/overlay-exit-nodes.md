@@ -335,11 +335,11 @@ sequenceDiagram
 | Rule | Where | Why |
 |---|---|---|
 | The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:402`, `:418`, called at `agents/roomlerd/src/app.rs:4224` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
-| Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:889` (`purge_exit_dns_within`), `:1272` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
-| Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:625` (`run_cmd`), `:1314` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
-| A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1256` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
-| With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:1296` | The purge is load-bearing and the bound is not |
-| The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:835` | A child that outlives its waiter must not hold pipes to it |
+| Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:860` (`purge_exit_dns_within`), `:1243` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
+| Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:1285` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
+| A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1227` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
+| With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:1267` | The purge is load-bearing and the bound is not |
+| The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:806` | A child that outlives its waiter must not hold pipes to it |
 | The route purges stay synchronous | `agents/roomlerd/src/lib.rs:418` | They are typed IP Helper calls, with no child to wait for |
 
 What the bound leaves as it was:
@@ -402,12 +402,12 @@ sequenceDiagram
 | Rule | Where | Why |
 |---|---|---|
 | The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:454`, `:488`, called at `agents/roomlerd/src/watchdog.rs:700`, `:793` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
-| A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:923` (`purge_exit_dns_before_exit`), `:1074` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
-| If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:923` | The bound is only safe with the handoff |
-| The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:994`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |
-| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:954` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:421` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
-| An entry is live only if its pid runs and was created when the entry says | `crates/tunnel-core/src/overlay/dns.rs:1043` (`open_running`) | A pid is reused; an ended process stays openable while a handle to it is held |
-| The live entries stay in the record, the newest 16 | `crates/tunnel-core/src/overlay/dns.rs:954`, `:996` | A second stall before the first purge ends hands both over |
+| A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:894` (`purge_exit_dns_before_exit`), `:1045` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
+| If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:894` | The bound is only safe with the handoff |
+| The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:965`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |
+| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:925` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:421` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
+| An entry is live only if its pid runs and was created when the entry says | `crates/tunnel-core/src/overlay/dns.rs:1014` (`open_running`) | A pid is reused; an ended process stays openable while a handle to it is held |
+| The live entries stay in the record, the newest 16 | `crates/tunnel-core/src/overlay/dns.rs:925`, `:967` | A second stall before the first purge ends hands both over |
 | `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:459` | The kill switch |
 
 What it leaves as it was:
@@ -741,7 +741,7 @@ flowchart LR
 | DNS | never steered | below |
 
 `roomler status` says so, from `ExitNodeStatus.socks5_port`
-([`lib.rs:111`](../crates/localapi/src/lib.rs#L111)):
+([`lib.rs:103`](../crates/localapi/src/lib.rs#L103)):
 
 ```text
   exit node   <exit> (active for SOCKS5 clients of 127.0.0.1:1080 only — IPv4 destinations; nothing else on this host uses it)

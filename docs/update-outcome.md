@@ -101,7 +101,7 @@ sequenceDiagram
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:484`), a `LastInstallStatus` (`:581`) whose
+(`crates/localapi/src/lib.rs:476`), a `LastInstallStatus` (`:573`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` log line spell them so
 one grep finds all three surfaces (locked by
@@ -120,7 +120,7 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:620`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:612`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
 a record older than that (`never_reported`, `:622`).

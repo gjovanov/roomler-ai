@@ -280,7 +280,7 @@ refusal would race it.
   ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2692-2714`](../agents/roomler-cli/src/localclient.rs#L2692-L2714)):
+  ([`localclient.rs:2703-2725`](../agents/roomler-cli/src/localclient.rs#L2703-L2725)):
 
   ```
     overlay ip  —
@@ -293,7 +293,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:297`](../crates/localapi/src/lib.rs#L297)), and then nothing is printed, never a
+  ([`lib.rs:289`](../crates/localapi/src/lib.rs#L289)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 

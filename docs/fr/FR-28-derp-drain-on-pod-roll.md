@@ -414,7 +414,7 @@ it in advance, so the sequence is: pod dies → agent keeps handing frames to a 
 socket → a send hard-errors → `DeathReason::HardDead`
 (`crates/tunnel-core/src/overlay/runtime/establish.rs:734-754`) → carrier rebuild →
 `MuxEvent::Recovered` opens the fast-walk window
-(`crates/tunnel-core/src/overlay/runtime.rs:2701-2704`).
+(`crates/tunnel-core/src/overlay/runtime.rs:2661-2664`).
 
 That recovery path has already been optimised once (#28: `DERP_RECOVERY_WALK_WINDOW`
 + `DERP_RECOVERY_RECHECK`, after a field case where "the WS returned in 1.5 s and the
