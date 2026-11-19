@@ -26,9 +26,10 @@
 # (which runs nothing but `test`, a question), dpkg, apt-get, systemctl,
 # installer, launchctl, uname, hostname, the daemon and the tunnel CLI, and
 # they record every call; a case can make one of their calls read its stdin
-# first, as a binary could. A running daemon's own image, /proc/$pid/exe, cannot
-# be a stand-in (a script's is its interpreter), so where a case has one
-# running, systemctl names a MainPID that leads /proc/$pid/exe to a stand-in.
+# first, as a binary could, or fail, as dpkg -i does where a dependency is
+# missing. A running daemon's own image, /proc/$pid/exe, cannot be a stand-in
+# (a script's is its interpreter), so where a case has one running, systemctl
+# names a MainPID that leads /proc/$pid/exe to a stand-in.
 # Each case checks the lines, the exit code, and that no control byte but
 # newline and tab reached its output (stdout and stderr). The cases of one mode
 # must record the same calls, byte for byte, whatever the feed's tag or the
@@ -75,7 +76,7 @@ if [ "${1:-}" != --in-container ]; then
                 shift 2 ;;
             --keep) keep="$2"; shift 2 ;;
             --rewrite-calls) rewrite=1; shift ;;
-            -h|--help) sed -n '3,58p' "$0"; exit 0 ;;
+            -h|--help) sed -n '3,59p' "$0"; exit 0 ;;
             *) script="$1"; shift ;;
         esac
     done
@@ -208,6 +209,12 @@ esac
 # call of this name whose line holds the words in stdin.<name>.
 if [ -f "$C/stdin.$me" ]; then
     case "$line" in *"$(cat "$C/stdin.$me")"*) cat >/dev/null ;; esac
+fi
+# #3926 — and make one call fail, as `dpkg -i` does where a dependency is
+# missing, which sends the script on to apt-get: the call of this name whose
+# line holds the words in fails.<name>.
+if [ -f "$C/fails.$me" ]; then
+    case "$line" in *"$(cat "$C/fails.$me")"*) exit 1 ;; esac
 fi
 case "$me" in
     uname)
@@ -370,7 +377,8 @@ SH=""
 # that --version read its stdin first. CLI=<answer> is what the tunnel CLI
 # prints to --version, and CLI_READS_STDIN=<n> makes its nth --version read
 # its stdin first. READS='<stand-in> <words>' makes that stand-in read its
-# stdin first in the call whose line holds the words. HAS_CONFIG=1 puts an
+# stdin first in the call whose line holds the words; FAILS, in the same
+# form, makes it exit 1 in that call. HAS_CONFIG=1 puts an
 # earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
 # half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
 # as root, as a privileged half runs. The records land in $RUNS/$SH/CASE.
@@ -402,6 +410,7 @@ run() {
     [ -z "${CLI+set}" ] || printf '%s' "$CLI" >"$C/cli.out"
     [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
     [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
+    [ -z "${FAILS:-}" ] || printf '%s' "${FAILS#* }" >"$C/fails.${FAILS%% *}"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -511,6 +520,18 @@ for SH in $SHELLS; do
     # sudo, reads its stdin: the script gives it none, and still ends.
     READS='sudo [enroll]' run deb-system/reads-stdin-enroll Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
     says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    # #3926 — the package install, dpkg through sudo, reads its stdin, as its
+    # configuration-file question would: the script gives it none, and still
+    # ends.
+    READS='sudo [dpkg]' run deb-system/reads-stdin-dpkg Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    # #3926 — dpkg fails (a dependency is missing) and apt-get installs the
+    # package, its dpkg asking the same question; then apt-get reads its stdin.
+    FAILS='sudo [dpkg]' run deb-system-apt/normal Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    FAILS='sudo [dpkg]' READS='sudo [apt-get] [install]' \
+        run deb-system-apt/reads-stdin Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
     # The per-user install, the desktop default, and a Mac's.
     run deb-user/match Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
     says agent-v0.4.221 0.4.221 0; done_case
@@ -591,6 +612,11 @@ for SH in $SHELLS; do
     AS_ROOT=1 HAS_CONFIG=1 READS='roomlerd [adopt-enrollment] [--from]' \
         run deb-privileged/reads-stdin-fold Linux x86_64 1 normal "$new" 0 "${priv[@]}"
     says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    # #3926 — as root the package install runs dpkg itself, and it reads its
+    # stdin.
+    AS_ROOT=1 HAS_CONFIG=1 READS='dpkg [-i]' \
+        run deb-privileged/reads-stdin-dpkg Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
     # #3925 — a Mac given its root half as a second row (--daemon-token): that
     # half's enrollment, through sudo, reads its stdin.
     two=(--role daemon --token check-token --daemon-token check-token-2)
@@ -626,6 +652,15 @@ for SH in $SHELLS; do
     CLI_READS_STDIN=1 run tunnel/reads-stdin-runs Linux x86_64 1 normal '' 0 --role tunnel
     lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
     CLI_READS_STDIN=3 run tunnel/reads-stdin-names Linux x86_64 1 normal '' 0 --role tunnel
+    lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
+    # #3926 — the CLI's package install, dpkg through sudo, reads its stdin.
+    READS='sudo [dpkg]' run tunnel/reads-stdin-dpkg Linux x86_64 1 normal '' 0 --role tunnel
+    lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
+    # #3926 — dpkg fails and `apt-get -f install` runs, its dpkg asking the
+    # same question; then apt-get reads its stdin.
+    FAILS='sudo [dpkg]' run tunnel-apt/normal Linux x86_64 1 normal '' 0 --role tunnel
+    lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
+    FAILS='sudo [dpkg]' READS='sudo [apt-get]' run tunnel-apt/reads-stdin Linux x86_64 1 normal '' 0 --role tunnel
     lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
     # #3925 — given a token the CLI enrolls, and its enroll reads its stdin.
     tun="==> enrolling this tunnel client as 'check-host' against https://roomler.example (token is single-use, never echoed)"
