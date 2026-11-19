@@ -1456,10 +1456,10 @@ start goes on without it.
 
 Where neither the native panel nor the tray can show a remote-control question (no tray
 installed, its start failed, or no marker for it to read), FR-93 P6f puts it up as a desktop
-notification (`docs/remote-control.md`, "Prompt surfaces"). The session helper that posts it
-runs as the person at the screen, so its start asks logind for the graphical session
-(`loginctl list-sessions`, then `show-session` for each), the account database for the
-person's account, and the person's session bus. Until #3857 the org's WS loop waited for all
+notification ([remote-control.md §11.2](remote-control.md#112-consent), "Prompt surfaces"). The
+session helper that posts it runs as the person at the screen, so its start asks logind for the
+graphical session (`loginctl list-sessions`, then `show-session` for each), the account database
+for the person's account, and the person's session bus. Until #3857 the org's WS loop waited for all
 of that inline, and the session walk had no bound: with logind stopped, every `loginctl` waits
 out its D-Bus timeout, about 25 s. No async worker was held (the show ran on the blocking
 pool), but that org's control channel read no frame meanwhile: another viewer's request, a live
@@ -2361,7 +2361,7 @@ at most 480 × 240 logical.
 
 | Daemon panel | Size | Where |
 |---|---|---|
-| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:72`, `:477` |
+| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:86`, `:511` |
 | X11 | 480 × 236 at the desktop's scale | `agents/roomlerd/src/indicator/x11.rs:67`, `:299` |
 | Windows | 460 × 232 physical px, no larger in logical units | `agents/roomlerd/src/indicator/win.rs:135`, `:611` |
 
