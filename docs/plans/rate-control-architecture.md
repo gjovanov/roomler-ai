@@ -229,7 +229,7 @@ before B2: done in #4061).
    (`vendored/webrtc/src/api/setting_engine/mod.rs:198–200`, evaluated per address in
    `webrtc-ice/src/util/mod.rs:129–132`) with the addresses **on our own adapters**, not a CIDR:
    `if_addrs::get_if_addrs()` filtered by `is_overlay_iface(name)` on Windows/Linux, plus LocalAPI
-   `status().overlay_ip/ip6` (`localapi/src/lib.rs:93–97`) for macOS `utunN`. An ISP CGNAT
+   `status().overlay_ip/ip6` (`localapi/src/lib.rs:190–194`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:341–344`.
 2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:797–831`) — a 3-line
