@@ -834,12 +834,26 @@ under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), th
 (3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:50`), which is
 why per-roll medians land on 7.5, 15 and 25 s.
 
+**Since the pre-pull** (2026-11-07, the second lever below), the image is on both nodes before the roll
+begins ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull)):
+
+| Measure | October 2026 | Since the pre-pull |
+|---|---|---|
+| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` |
+| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 |
+| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s |
+
+What is left of a wave is the old pod's exit, the scheduling and the start (about 2 s), then 10–12 s until
+Kubernetes marks the replacement Ready, which releases the second wave. That paces the roll, not the reattach:
+the front nginx sends to the node's address and never sees readiness, so a socket can land as soon as the
+binary listens.
+
 **Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
 
 | Lever | What it changes | Switch |
 |---|---|---|
-| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
-| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200; its field read (FR-28's AC3) is owed | `ws_flat_redial`, default OFF |
+| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)). In force since 2026-11-07: a roll takes 25 s instead of 33.9 s (the table above) | The deploy repo's DaemonSet file |
 
 ⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
 502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,

@@ -181,7 +181,7 @@ bounded passive staleness; (4) pod-alive → advisory only.
 |---|---|---|
 | Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect), except those FR-138 keeps: a live session on `direct` or `turn` whose device is in the resume scope with its switch on goes on peer to peer and is claimed back on the pod the redial reaches, about 3 s later in the field ([below](#a-live-rc-session-through-its-pods-death-fr-138)); listing stale ≤90 s |
 | Tunnel session | **data plane survives outright** (P2P); new opens rehome | bookkeeping blip only |
-| DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor. `ws_flat_redial` (default OFF) redials that 502 flat instead of climbing the ladder (FR-28) | ~7.6 s of WG loss (p50 over 14 rolls, FR-28); corp pairs re-handshake |
+| DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor. `ws_flat_redial` (default OFF) redials that 502 flat instead of climbing the ladder (FR-28) | ~7.6 s of WG loss (p50 over 14 rolls in October, FR-28). Since the image pre-pull (2026-11-07) a replacement starts 2 s after its SIGTERM instead of 5–6 s, and a whole roll takes 25 s instead of 33.9 s; corp pairs re-handshake |
 | Media room | claim gone (graceful: zero window; crash: ≤30 s TTL) ⇒ rejoin claims a live pod | one conference, ≤30 s gap on crash |
 
 **Redis-down degradation (hard requirement)**: directory ops fail soft to
