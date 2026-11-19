@@ -5479,10 +5479,10 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1792`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1981`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
-encoder thread finish freeing (`encode/thread.rs:266` joins it), and sessions
+encoder thread finish freeing (`encode/thread.rs:278` joins it), and sessions
 ending together cost one trim. A trim takes each arena's lock in turn and nobody
 waits for it. "glibc holds" does not fall after a trim, because the pages are
 released with `MADV_DONTNEED` while the arena keeps the address space. RSS is the

@@ -68,14 +68,19 @@ flowchart LR
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
 
-⚠️ **Measured: on a software-only host, a session beside a recording costs it ticks.** On a 4-vCPU guest with
-no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
-ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
-the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
-count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
-bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
-AC1's bound is held to hosts with a hardware encoder (decided 2026-11-05). Giving the recorder the CPU first on a
-host with no GPU is [#3492](https://github.com/gjovanov/roomler-ai/issues/3492).
+⚠️ **Measured: on a software-only host, a recording can lose ticks in a desktop's first half hour, and the
+session beside it is not the cause.** On a 4-vCPU guest with no GPU (release 0.4.199, FR-85's field log), a 1080p30
+recording over a small moving region dropped 0.72 % of its ticks alone, and about 3.1 % while a session's software
+VP9-444 encoder ran beside it. The frames stayed native and the file kept time, because a missed tick is the
+previous frame lasting longer. The sidecar's `late_ticks` is that count, and AC1 bounds it at 0.5 %. With 8 vCPUs
+(2026-11-04) the moving region alone dropped 0.32 %, and 1.62 % with the session beside it, read back to back in one
+window. On release 0.4.227 (2026-11-19, 8 vCPUs, a relay-capped session beside each recording) the same cell read
+0.69 % nine minutes after the guest booted and 0.011 % 78 minutes later, with nothing changed. The recorder raised to
+nice −10 on all its threads read 0.78 % in that early window, and the CPU stayed about 85 % idle throughout
+([the cells](https://github.com/gjovanov/roomler-ai/issues/3492#issuecomment-7013382966)). So the session's encoder
+does not take the recorder's CPU, and [#3492](https://github.com/gjovanov/roomler-ai/issues/3492), which would have
+given the recorder the CPU first, was closed as not reproduced in steady state. AC1's bound is held to hosts with a
+hardware encoder (decided 2026-11-05).
 
 ⚠️ **Measured: on a Mac, the recorder's own disk check cost a tick every 5 s.** On a MacBook (Apple M5 Pro,
 release 0.4.200, FR-85's field log), a 3024×1964 recording on `h264_videotoolbox` read 0.63 % late ticks with a
