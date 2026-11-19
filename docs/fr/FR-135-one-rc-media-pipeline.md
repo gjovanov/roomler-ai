@@ -1268,7 +1268,7 @@ Viewer switches are stored per browser, following `roomler-rc-*`: `roomler-rc-de
 | FR-74 P5 | **Moves with the controller** | No separate work here |
 | FR-16, `roomler-rc-bench` | **Build on** | Levels and the bench stay. N0 brings the outside scripts into the repo |
 | FR-22 | **Leave alone, it owns a row** | §3.5's first-frame row is FR-22's. Its part 5, killing a half-open control socket in seconds, is proposed and not built. N16 reports `ttff` by cell |
-| FR-28 | **Build on, a new FR beside it (D15)** | Its lever table already names "an RC session survives a control-WS loss" as a new FR (`docs/fr/FR-28-derp-drain-on-pod-roll.md:116`), and S19 reads that lever at 10 sessions a week. Its other levers, a flat redial on a 502 and a pre-pull, put a reattach near 3 s and do not save the session |
+| FR-28 | **Build on, a new FR beside it (D15)** | Its lever table already names "an RC session survives a control-WS loss" as a new FR (`docs/fr/FR-28-derp-drain-on-pod-roll.md:191`), and S19 reads that lever at 10 sessions a week. Its other levers, a flat redial on a 502 and a pre-pull, put a reattach near 3 s and do not save the session |
 | FR-112, FR-121, FR-128, FR-134 | **Leave alone** | Carriers and host health under or beside this path. R14's setting is per association and does not touch them |
 
 ### 7.3 The sequence
