@@ -104,6 +104,24 @@
 #     least acknowledgement delay to the reader that takes it.
 #     src/association/association_internal/association_internal_test.rs
 #     holds its test (a peek between two SACKs, then a take).
+#   - src/association/association_internal.rs (#4033): `on_ack_timeout`
+#     stops the delayed acknowledgement timer that fired. Its task left
+#     `close_tx` set, and `AckTimer::start` arms nothing while it is, so
+#     after one delayed SACK the next lone DATA packet armed no timer: its
+#     SACK waited for another packet or for the sender's T3-rtx (this
+#     crate's at 1 s at the earliest), whose expiry also cuts the sender's
+#     congestion window to one packet (RFC 4960 §7.2.3). It reached every
+#     association this crate receives on: what a viewer sends the agent
+#     (input, clipboard, uploads) and tunnel bytes on webrtc-dc-v1. A late
+#     timeout (its timer stopped, and another armed, while it waited for the
+#     association's lock) stops that other timer too, and the SACK that one
+#     was for goes at once: none is lost, and the timer is never left
+#     unarmed for good. Upstream's timer is the same in 0.17.3, and its
+#     `on_ack_timeout` in 0.17.0.
+#     src/association/association_test.rs and
+#     src/association/association_internal/association_internal_test.rs
+#     hold its tests (two lone packets, each acknowledged within the
+#     interval; a late timeout delivered in the race's order).
 
 [package]
 edition = "2021"
