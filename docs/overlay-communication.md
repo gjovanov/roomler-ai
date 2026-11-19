@@ -580,15 +580,15 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2166`](../crates/tunnel-core/src/overlay/runtime.rs#L2166),
+  ([`runtime.rs:2167`](../crates/tunnel-core/src/overlay/runtime.rs#L2167),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
-  ([`lib.rs:116`](../crates/localapi/src/lib.rs#L116)), parsed from
+  ([`lib.rs:124`](../crates/localapi/src/lib.rs#L124)), parsed from
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3220`](../agents/roomler-cli/src/localclient.rs#L3220)):
+  reaches ([`localclient.rs:3209`](../agents/roomler-cli/src/localclient.rs#L3209)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -771,7 +771,7 @@ also named a `dropped_full` counter, and it was never built.
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
 (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
-`crates/tunnel-core/src/overlay/runtime.rs:2584`), so that DERP can carry every
+`crates/tunnel-core/src/overlay/runtime.rs:2624`), so that DERP can carry every
 fresh pair from birth while better tiers upgrade over it. A server's force-DERP
 push can open it mid-run too. The lazy rule below is what a node does with the
 floor switched off.
