@@ -93,12 +93,13 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:2141-2150`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2422-2431`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:2072-2086`).
+(`linux_install_candidates`, `updater.rs:2367-2382`). Every rung hands dpkg the options in
+[Every package install keeps an edited configuration file and asks nothing](#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -550,9 +551,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3450`) | after every check that installs nothing; at the start after an update (`:3338`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3389`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4018`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3267`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3461`) | after every check that installs nothing; at the start after an update (`:3349`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3400`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4029`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3278`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
@@ -565,21 +566,84 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
   binding. A refusal discards the download, and the companion keeps its version. FR-117 adds the
   `.rpm` reader (`rpm -qp --qf %{VERSION}`, `verify_rpm`, `artifact_version.rs:343`).
 - **The host's package manager installs it** (`install_commands`,
-  `companion/package_sync.rs:134`): `apt-get` with `--no-remove` (a dependency change that would
-  remove a package aborts instead) and `-o DPkg::Lock::Timeout=60` (unattended-upgrades holds the
-  lock for minutes); for an `.rpm`, the first of `dnf`, `zypper` and `yum`, `install.sh`'s order.
-  Each run is bounded at 10 minutes.
+  `companion/package_sync.rs:138`): `apt-get` with `--no-remove` (a dependency change that would
+  remove a package aborts instead), `-o DPkg::Lock::Timeout=60` (unattended-upgrades holds the
+  lock for minutes) and `-o Dpkg::Options::=--force-confold` (the package's login start is a
+  configuration file, [below](#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932));
+  for an `.rpm`, the first of `dnf`, `zypper` and `yum`, `install.sh`'s order. Each run is
+  bounded at 10 minutes.
 - ⚠️ **No `dpkg --install` fallback**, unlike the daemon's own ladder. The companion has real
   dependencies (webkit2gtk, GTK, the tray library). dpkg with one of them unmet leaves the package
   half-configured, and that breaks apt for the whole host, the daemon's own next update included.
   A refusal costs one tick instead.
-- ⚠️ **`NEEDRESTART_SUSPEND=1`** on every run (`INSTALL_ENV`, `package_sync.rs:175`). Ubuntu's
+- ⚠️ **`NEEDRESTART_SUSPEND=1`** on every run (`INSTALL_ENV`, `package_sync.rs:180`). Ubuntu's
   needrestart runs after every apt transaction and, non-interactive, restarts the services it
   finds on stale libraries. This daemon is one of them, so the companion's install would end in a
   restart of the very process that ran it, cutting every session.
 - **Never a downgrade, never a new install**, and the kill switch `ROOMLERD_COMPANION_SYNC=0`.
   Details and the restart of a running companion:
   [desktop-companion.md §13](desktop-companion.md#13-one-version-the-companion-follows-the-daemon-fr-117).
+
+## Every package install keeps an edited configuration file and asks nothing (#3932)
+
+When the host's copy of a package's configuration file was edited or deleted, and the new
+package carries a different version of it, dpkg asks which one to keep and reads the answer
+from stdin. `apt-get -y` does not answer that question, and `DEBIAN_FRONTEND=noninteractive`
+does not reach it: that variable is debconf's. With nothing on stdin dpkg stops at the
+question (`end of file on stdin at conffile prompt`), exits 1 (`apt-get`: 100), and leaves the
+package unpacked and not configured (`iU`), with its new file beside the old one as
+`.dpkg-new`. The companion's package ships such a file, its login start
+`/etc/xdg/autostart/roomler-desktop.desktop`, and editing or deleting that file is how a person
+turns the login start off. The daemon's package and the CLI's ship none (read on 0.4.225 and
+tunnel-v0.4.215, amd64 and arm64). They take the same rule, so a file added later is covered.
+
+**The rule.** Every `.deb` install we run hands dpkg `--force-confold`, defined once as
+`tunnel_core::dpkg::OPTIONS` (`crates/tunnel-core/src/dpkg.rs:30`): to `dpkg` before its
+action, because dpkg stops reading options at its first argument that is not one, and to
+`apt-get` as `-o Dpkg::Options::=--force-confold`. And no install reads a question's answer from
+our stdin.
+
+| Road | Command | stdin |
+|---|---|---|
+| the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2367-2382`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2564`) |
+| the daemon's own package, not root | `pkexec`, then `sudo -n`, in front of the same `apt-get` | `/dev/null` |
+| the companion's package (`install_commands`, `agents/roomlerd/src/companion/package_sync.rs:138`) | `apt-get install -y --no-remove -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold <deb>`, with `INSTALL_ENV` | `/dev/null` (`run_bounded`) |
+| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
+| `install.sh`'s `deb_install` (#3926, [installation.md](installation.md)) | `dpkg --force-confold -i`, then `apt-get … -o Dpkg::Options::=--force-confold` | `/dev/null` |
+
+**What a person finds afterwards:** their file as they left it, a deleted one still deleted,
+and the package's version beside it as `<file>.dpkg-dist`. The install's output says so in
+dpkg's words, ` ==> Using current old file as you requested.` A file nobody edited takes the
+package's version, as it always did. The daemon's installer reads its own `/dev/null`, keeps the
+daemon's stdout and stderr, and nothing else of the daemon's (`inherit_only_stdio`). Before
+#3932 it kept the daemon's stdin, which is a person's terminal for a daemon or a
+`roomlerd self-update` started by hand.
+
+⚠️ **Not `--force-confdef`:** for an edited file it adds nothing to `--force-confold`, and on
+its own it still asks where there is no default. **Not `--force-confnew`:** it would undo what a
+person chose.
+
+Measured on a real dpkg 1.21.23 and apt 2.6.2 (a `debian:12` container with no network, a
+package in two versions whose configuration file differs, the installed copy edited or
+deleted):
+
+| Run | Exit | Package | The person's file |
+|---|---|---|---|
+| the daemon's root ladder before #3932, stdin `/dev/null` | `apt-get` 100, then `dpkg` 1 | `iU` | in place, the new version beside it as `.dpkg-new` |
+| the companion's run before #3932, the file edited or deleted | 100 | `iU` | in place, `.dpkg-new` beside it |
+| the CLI's `dpkg -i` before #3932, a terminal that answers `Y` | 0 | `ii` | **replaced**, the edit moved to `.dpkg-old` |
+| each command in the table above, a stdin that would answer `Y` | 0 | `ii` | kept, `.dpkg-dist` beside it, all 6 bytes of stdin unread |
+
+**A package an older daemon left at the question** stays `iU`, and the old command fails the
+same way each time it runs. The companion's sync does not count a package in that state as
+installed (`dpkg_installed_version`, `package_sync.rs:56`), so it neither retries it nor
+reports a companion version for the device. The first `apt-get` run that carries the option
+finishes it, because apt configures every package left unconfigured in the same run, with the
+same options. On such a host that run is the daemon's own update by a daemon that has this
+change, so the companion is finished one release after the change arrives. Measured: the old
+root ladder's `apt-get` installed the daemon's package and then exited 100 on the companion's
+question, and only its `dpkg --install` rung got the update through; the new ladder's `apt-get`
+exited 0, with both packages `ii` and the person's file kept.
 
 ## Deliberately out of scope
 

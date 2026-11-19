@@ -2913,10 +2913,22 @@ flowchart TD
 - **Never a downgrade, never a new install** (`plan`, `package_sync.rs:79`). A companion newer
   than the daemon is someone's deliberate install, and the next daemon update catches up. A host
   with no companion stays without one.
+- **How it installs:** with the host's package manager, one command, never a ladder
+  (`install_commands`, `package_sync.rs:138`; the commands are in
+  [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117)).
+  ⚠️ The `.deb` ships one configuration file, the login start
+  `/etc/xdg/autostart/roomler-desktop.desktop`, and editing or deleting it is how a person turns
+  that start off. So `apt-get` hands dpkg `--force-confold` (`-o Dpkg::Options::=--force-confold`,
+  #3932): the file stays as the person left it, the package's version lands beside it as
+  `.dpkg-dist`, and nothing asks on stdin. Without the option dpkg asked, read end of file, and
+  left the package unpacked and not configured (`iU`). A package in that state does not count as
+  installed (above), so the sync leaves it alone; the daemon's next update, by a daemon with the
+  option, finishes it
+  ([linux-self-update.md](linux-self-update.md#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932)).
 - ⚠️ **The picker is a positive match** on `roomler-desktop-…-unknown-linux-gnu.<deb|rpm>`
   (`pick_asset`, `package_sync.rs:103`), the mirror of the daemon picker's `is_daemon_asset`. So
   the two can never take each other's package (§10.1's freeze, one axis over).
-- **A running companion is restarted** (`restart_replaced`, `package_sync.rs:412`). The package
+- **A running companion is restarted** (`restart_replaced`, `package_sync.rs:417`). The package
   manager renames the new binary over the old, so a running companion's `/proc/<pid>/exe` reads
   `… (deleted)` (`is_replaced_companion`). Those are stopped, and a new one starts in the
   graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
@@ -3289,7 +3301,7 @@ A companion the desktop starts (its autostart entry) has all of these. One the *
 did not. A root daemon starts it on three roads, and all three build the same unit
 (`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4416`): the tray's start for a
 prompt (`start_tray`, `companion.rs:2299`, §10.2), FR-117's restart after an update
-(`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
+(`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:417`) and the post-install
 first run (`agents/roomlerd/src/companion/launch_once.rs:585`), the last two through
 `systemd_run_command` (`agents/roomlerd/src/companion.rs:4239`). For a root daemon that is a
 transient **system** unit, which inherits nothing of the desktop; its environment was logind's
@@ -3469,7 +3481,7 @@ scope, 10 helpers in the companion's unit). A companion the desktop autostarted 
 `Type=simple` service when its main process exits, and under the default `KillMode=control-group`
 kills everything left in its cgroup. Quitting the companion, a crash, and FR-117's restart after
 **every** update (`restart_replaced` sends the old companion SIGTERM,
-`agents/roomlerd/src/companion/package_sync.rs:418`) each killed those helpers, and the browser
+`agents/roomlerd/src/companion/package_sync.rs:423`) each killed those helpers, and the browser
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`

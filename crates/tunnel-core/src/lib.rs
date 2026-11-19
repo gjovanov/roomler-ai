@@ -40,6 +40,9 @@ pub mod child;
 /// ever waits on a resolver that has stopped answering for a name it has
 /// resolved before.
 pub mod ctl_dns;
+/// #3932 — the options every `.deb` install of ours hands dpkg (the daemon's
+/// own package, the companion's, the CLI's `self-update`), defined once.
+pub mod dpkg;
 /// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
 /// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
 pub mod driver;

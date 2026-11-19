@@ -479,7 +479,13 @@ Then it installs by host:
 |---|---|
 | Windows | the zip's `roomler.exe` replaces the running exe |
 | macOS, and Linux where no package owns the binary | the tarball's `roomler`, written beside the running binary and renamed over it, so the swap is atomic |
-| Linux where the binary came from the `.deb` (`install.sh --role tunnel` on Debian and Ubuntu) | `dpkg -i` of the verified `.deb`, so dpkg's record names the version on disk |
+| Linux where the binary came from the `.deb` (`install.sh --role tunnel` on Debian and Ubuntu) | `dpkg --force-confold -i` of the verified `.deb`, so dpkg's record names the version on disk |
+
+dpkg asks nothing during that install, not even in your terminal: a configuration file you
+edited stays as it is, with the package's version beside it as `<file>.dpkg-dist`
+(`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`, #3932). The CLI's package ships
+no such file today. The option is there because every package install of ours takes it
+([linux-self-update.md](linux-self-update.md#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932)).
 
 A binary in a root-owned directory needs root to replace, and `dpkg -i` always
 does: run `sudo roomler self-update`. Under `sudo` it reads the server from your
