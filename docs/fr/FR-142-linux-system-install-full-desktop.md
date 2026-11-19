@@ -237,7 +237,7 @@ picks.
 ### Capability changes while connected
 
 Caps travel once in `rc:agent.hello`; after it the heartbeat carries a change, and only a change, for the
-permission words, `record`, Remote Apps, audio and keep busy (`signaling.rs:2641-2680`), the path FR-43's
+permission words, `record`, Remote Apps, audio and keep busy (`signaling.rs:7009-7040`), the path FR-43's
 `WorkerCaps` takes on a Mac (code). Nothing carries a clipboard, layout or display-match change after the hello.
 P1 adds those three to the heartbeat's change set, computed as root's own gate AND the worker's features, so a
 worker that attaches, dies or comes back reaches the row within a beat (inferred design). An open viewer: not

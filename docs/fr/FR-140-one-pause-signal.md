@@ -49,7 +49,7 @@ A pause of the process means the same thing to every loop that reads it, on ever
 | judge | where | its rule | a sleep the awake clock leaves out (Linux on hardware, macOS) | a sleep the awake clock counts (Windows; a VM guest's suspend, §2.3) | a freeze, any OS | a forward wall step of 300 s |
 |---|---|---|---|---|---|---|
 | the overlay's P8 | `crates/tunnel-core/src/overlay/runtime.rs:571`, used at `:3088` | wall clock minus monotonic over 120 s, between two 5 s ticks | the clean slate if 120 s or more, nothing below | never | never | the clean slate, falsely |
-| the control WS's A5 | `agents/roomlerd/src/signaling.rs:600`, used at `:2342` | the same, at the 25 s keepalive | cycles as `ResumeFromSuspend` if 120 s or more | never: the 80 s RX deadline (`:2357`) trips at the first keepalive after a pause of more than about 55 s, as `RxDeadline`, with the "did not run" wording | as the column before | cycles as `ResumeFromSuspend`, falsely |
+| the control WS's A5 | `agents/roomlerd/src/signaling.rs:600`, used at `:2301` | the same, at the 25 s keepalive | cycles as `ResumeFromSuspend` if 120 s or more | never: the 80 s RX deadline (`:2316`) trips at the first keepalive after a pause of more than about 55 s, as `RxDeadline`, with the "did not run" wording | as the column before | cycles as `ResumeFromSuspend`, falsely |
 | the `/derp` WS's A5 | `agents/roomlerd/src/derp.rs:429` | the same, inline | cycles if 120 s or more | never: its own RX deadline (`:437`) | as the column before | cycles, falsely |
 | the async watchdog | `agents/roomlerd/src/watchdog.rs:561` | a scan more than 5 + 60 s late resets every pump | nothing: neither the scan nor the pumps' ages saw the sleep | past 65 s every pump is reset; under it the pause counts against each pump's age | as the column before | nothing |
 | the watchdog-of-watchdog | `watchdog.rs:624` | a sleep that came back more than 10 s late takes a new baseline | nothing | a new baseline | a new baseline | nothing |
@@ -66,7 +66,7 @@ Four things follow.
   (`agents/roomlerd/src/session_table.rs:171-172`): every peer closes.
 - **A Windows sleep with no goodbye keeps the sessions FR-138 would close.** Where FR-55 said no goodbye (its
   announcement off, or a sleep the OS did not announce), the control WS ends at the RX deadline as `RxDeadline`
-  (`signaling.rs:2357-2390`), however long the sleep. With FR-138's keep switch on (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`,
+  (`signaling.rs:2316-2349`), however long the sleep. With FR-138's keep switch on (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`,
   off by default, `session_table.rs:73-76`) that exit keeps every session. FR-138's owner found it in the review of
   FR-138 P2a (its finding M2), and FR-138 plans the fix as P2a-2 (§4).
 
@@ -193,7 +193,7 @@ pump's age, still catch a real stall at most one scan later, and pin both with a
 
 - P8's doc comment says QPC stops across a sleep (`runtime.rs:559-562`). It counts it. P2 corrects the comment.
 - `ConnExit::ResumeFromSuspend`'s doc says "at least `RESUME_SKEW_MIN` napped" (`session_table.rs:99`). P3 rewords it.
-- `docs/remote-control.md` cited `RESUME_SKEW_MIN` at `signaling.rs:599` (`:5308`); it is at `:600`. Fixed in the
+- `docs/remote-control.md` cited `RESUME_SKEW_MIN` at `signaling.rs:599` (`:5174`); it is at `:600`. Fixed in the
   commit that adds this spec.
 - FR-55's `HOLD_MAX` doc says the sleep stops its clock on Linux and macOS (`sleep_notice.rs:300-303`). It does not on
   Windows, nor in FR-55's lab guest. Both paths reconnect, so it stays out of scope (§9).
@@ -248,7 +248,7 @@ Slept and frozen can both be non-zero in one interval. "The awake clock" is `Ins
 unbiased interrupt time on Windows, where `Instant` counts the sleep.
 
 **The nudge.** `pause::woke()` moves a `watch` channel that every reader selects on. A reader that sees it runs its
-tick at once (tokio's `Interval::reset_immediately`, already used at `signaling.rs:2541`), so it acts at the wake,
+tick at once (tokio's `Interval::reset_immediately`, already used at `signaling.rs:2500`), so it acts at the wake,
 not up to a period later (5 s for the overlay, 25 s for the WS loops). A nudge that finds nothing measured does
 nothing: a cancelled sleep, or Windows' second resume message.
 
@@ -286,7 +286,7 @@ reader expected.
 | reader | where | today | a sleep | a freeze | a step | the nudge |
 |---|---|---|---|---|---|---|
 | the overlay | `runtime.rs:3067-3125`, before the sweep at `:3218`, as today | P8's skew rule | from D2's bar: P8's clean slate, all four parts (§2.2), one line naming the source and the seconds | D3 | one line, nothing dropped (D5) | the fallback tick at once |
-| the control WS | `signaling.rs:2338-2356` | A5's skew rule | from `RESUME_SKEW_MIN` (120 s), FR-138's line: end at once as `ResumeFromSuspend`, which closes every session FR-138 keeps. Under it nothing new: the RX deadline decides, as `RxDeadline`, which keeps them | today's RX deadline, `RxDeadline` | nothing | the keepalive at once |
+| the control WS | `signaling.rs:2297-2315` | A5's skew rule | from `RESUME_SKEW_MIN` (120 s), FR-138's line: end at once as `ResumeFromSuspend`, which closes every session FR-138 keeps. Under it nothing new: the RX deadline decides, as `RxDeadline`, which keeps them | today's RX deadline, `RxDeadline` | nothing | the keepalive at once |
 | the control WS's gap, while FR-138 keeps sessions and no connection exists | `run`'s backoff wait and its dial; FR-55's hold is read only before a dial (`signaling.rs:1206-1218`) | nothing: a sleep that starts in the gap closes nothing | an announced sleep closes the kept sessions as `Sleep`; a wake measured from `RESUME_SKEW_MIN` closes them as `ResumeFromSuspend` | nothing: kept | nothing | the gap reads the wake at once |
 | the `/derp` WS | `derp.rs:421-436` | A5's skew rule | from D2's bar: cycle at once | today's RX deadline | nothing | the keepalive at once |
 | the async watchdog | `watchdog.rs:537-577` | every pump reset past 65 s | the scan's own lateness, from `LATE_MIN`, taken off every pump's age | the same | nothing: it reads `Instant` | — |
@@ -296,7 +296,7 @@ reader expected.
   sleep and a freeze alike on every OS, so it shares `LATE_MIN` with the module rather than the module itself. A pump
   still stuck after the pause exits at its own threshold, one scan later at most.
 - **The control WS ends a slept connection at FR-138's line, not at D2's.** After a sleep FR-55 announced it seldom
-  has a socket: the goodbye ended it at the sleep (`ConnExit::Sleep`, `signaling.rs:2292`), and the reconnect waits in
+  has a socket: the goodbye ended it at the sleep (`ConnExit::Sleep`, `signaling.rs:2251`), and the reconnect waits in
   the hold. Its new arm matters where no goodbye was said: the announcement off, no hook, or a sleep the OS did not
   announce. There a measured sleep of at least `RESUME_SKEW_MIN` ends the connection as `ResumeFromSuspend`, and a
   shorter one leaves the RX deadline to decide, as today. The line is FR-138's (§4): under it FR-138 keeps a session
