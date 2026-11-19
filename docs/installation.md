@@ -2362,7 +2362,7 @@ flowchart TB
 |---|---|---|
 | Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
-| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else at once when it speaks, since its word wakes the heartbeat; `no-gui-session` again at once when the worker leaves |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
 | The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
