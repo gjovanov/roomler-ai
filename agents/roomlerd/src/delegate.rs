@@ -2034,6 +2034,20 @@ impl DelegateHost {
         self.records_channel_ended("closed");
     }
 
+    /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
+    /// brings, only its words ([`worker_words`]), for a test of what the daemon
+    /// announces with them.
+    #[cfg(test)]
+    pub(crate) fn hold_worker_caps_for_test(&self, caps: AgentCaps) {
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(worker_words(caps));
+    }
+
+    /// #3992 — and the person's floor, as their worker's frame gives it.
+    #[cfg(test)]
+    pub(crate) fn note_person_floor_for_test(&self, floor: PersonFloor) {
+        self.note_person_floor(floor);
+    }
+
     /// Put a worker's reply on the control WS — if the whitelist allows it.
     ///
     /// ⚠️ The check is HERE, not at the worker, and that is the whole point:

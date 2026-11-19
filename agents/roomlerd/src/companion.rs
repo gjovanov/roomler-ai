@@ -790,25 +790,40 @@ impl ExeVersions {
     /// starts, unless one is running, and its answer is kept as it ends.
     fn now(&'static self, dir: &std::path::Path) -> Option<Option<String>> {
         let stamp = Stamp::of(dir);
-        let last = self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some((read_for, stated)) = last
-            && read_for == stamp
-        {
+        if let Some(stated) = self.stated_for(&stamp) {
             return Some(stated);
         }
+        self.read_unless_running(dir, stamp);
+        None
+    }
+
+    /// The last read's answer, when it was made for `stamp`'s files.
+    fn stated_for(&self, stamp: &Stamp) -> Option<Option<String>> {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(read_for, _)| read_for == stamp)
+            .map(|(_, stated)| stated.clone())
+    }
+
+    /// The read of the EXE in `dir` for `stamp`'s files, started unless a
+    /// read is running. #4009: a caller that found no answer for them can
+    /// find, as it goes on to start this, that the read which answered them
+    /// ended in between. The read it starts then finds that answer and reads
+    /// nothing, so the same files are read once, not twice.
+    fn read_unless_running(&'static self, dir: &std::path::Path, stamp: Stamp) {
         let (read, exe) = (self.read, dir.join(DESKTOP_EXE));
         self.reads.start_unless_running(move || {
+            if self.stated_for(&stamp).is_some() {
+                return;
+            }
             let stated = read(&exe);
             *self
                 .last
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, stated));
         });
-        None
     }
 
     /// Once the read running now, if any, has ended: a test's folder is
@@ -7201,8 +7216,8 @@ mod version_resource_tests {
 /// companion's version by the refresh's rule ([`known_version`], #3850): the
 /// marker when it names this daemon's version, else what the EXE states in
 /// its own version resource, else the marker's words. Each test has a folder
-/// of its own with a real EXE in it: a copy of this test's own executable,
-/// given the version resource the test needs with `UpdateResourceW`.
+/// of its own with a real EXE in it: a copy of `cmd.exe`, given the version
+/// resource the test needs with `UpdateResourceW`.
 ///
 /// Red before #3908: both read the marker alone.
 #[cfg(all(test, target_os = "windows"))]
@@ -7248,10 +7263,14 @@ mod beside_version_tests {
             self.dir.path()
         }
 
-        /// The EXE: a copy of this test's executable whose one resource is
-        /// `res`, as its version resource, written beside and renamed into
-        /// place as a swap puts one there. Stamped with its own last write: a
-        /// copy keeps the source's.
+        /// The EXE: a copy of `cmd.exe` whose one resource is `res`, as its
+        /// version resource, written beside and renamed into place as a swap
+        /// puts one there. Stamped with its own last write: a copy keeps the
+        /// source's. #4009: not a copy of this test's own executable, the
+        /// whole test binary. A read maps the EXE as an image, and the first
+        /// map of a big file written moments before takes time in step with
+        /// its size: with the tests in parallel on a runner's disk, longer
+        /// than [`LAND`].
         fn exe(&self, res: &[u8]) -> PathBuf {
             use std::os::windows::ffi::OsStrExt;
             use windows_sys::Win32::System::LibraryLoader::{
@@ -7260,8 +7279,10 @@ mod beside_version_tests {
             use windows_sys::Win32::UI::WindowsAndMessaging::RT_VERSION;
 
             let staged = self.path().join("staged.exe");
-            let this = std::env::current_exe().expect("this test's executable");
-            std::fs::copy(this, &staged).expect("copy this test's executable");
+            let cmd =
+                PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+                    .join(r"System32\cmd.exe");
+            std::fs::copy(cmd, &staged).expect("copy cmd.exe");
             let wide: Vec<u16> = staged
                 .as_os_str()
                 .encode_wide()
@@ -7548,6 +7569,36 @@ mod beside_version_tests {
         assert_eq!(beside.settled(), settled(OWN));
         assert_eq!(beside.too_old(), None);
         assert_eq!(BEGAN.load(SeqCst), 1, "and none after it");
+    }
+
+    /// #4009 — the same files are read once. A caller that looks for their
+    /// answer just before the read for them stores it, and that finds no
+    /// read running when it goes on to start one, starts a read that finds
+    /// the answer and reads nothing. Before, it read the EXE again: the test
+    /// above counted 2 once on CI.
+    #[test]
+    fn a_read_that_ends_while_a_caller_looks_is_not_made_again() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(exe: &Path) -> Option<String> {
+            READS.fetch_add(1, SeqCst);
+            super::exe_version(exe)
+        }
+        let beside = Beside::new(counted);
+        beside.exe(&resource(&[("ProductVersion", EARLIER)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+
+        // The caller's look, before the read another caller started for
+        // these files lands.
+        let looked = Stamp::of(beside.path());
+        assert_eq!(beside.settled(), settled(EARLIER));
+        beside.versions.drained();
+        assert_eq!(READS.load(SeqCst), 1, "one read for these files");
+
+        // It goes on to start one, and no read runs by then.
+        beside.versions.read_unless_running(beside.path(), looked);
+        beside.versions.drained();
+        assert_eq!(READS.load(SeqCst), 1, "the same files are not read again");
+        assert_eq!(beside.installed(), settled(EARLIER));
     }
 
     /// #3908 — the refresh swaps the EXE and cannot write the marker

@@ -63,7 +63,7 @@ Hash routes in `src/front/app.js`; one `<section id="view-*">` per page. The ins
 | Recordings | `#/recordings` | local and remote screen recordings (FR-85) | FR-85's verbs | on entry |
 | Routes | `#/tunnels` | declared routes (`[[tunnel_routes]]`) and live forwards, with add / edit / enable / disable / remove | `RouteList` + `Flows` on **one** connection; `RouteAdd` / `RouteUpdate` / `RouteSetEnabled` / `RouteRemove` | 2 s while visible |
 | Settings | `#/settings` | the config surface, grouped (§5); device name; service; the log | `ConfigGet` / `ConfigSet`, `SetDeviceName`, `TailLog` | on entry |
-| Onboarding | `#/onboarding` | enrol (server, name, token) or re-enrol | in-process enrolment | — |
+| Onboarding | `#/onboarding` | enrol (server, name, token) or re-enrol; it waits while the enrollment is not known (§3.2) | in-process enrolment | — |
 | Welcome | `#/welcome` | the first-run tour — see §10 | `Status`, `ConfigSet`, `RestartDaemon`, the files commands | while a step waits |
 
 ## 3. The LocalAPI, and why the Routes page used to blink
@@ -74,9 +74,9 @@ while the prompt window asks a question:
 
 | Poller | Where | Interval | Connections per tick |
 |---|---|---|---|
-| service status | `src/front/app.js:190` | 10 s | 0 (reads config, runs `roomlerd service status`) |
-| device view (`Status` + `Peers`) | `src/front/app.js:192` → `cmd_device_view`, `src/commands.rs:338` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:2972` | 2 s, visible only | 1 |
+| service status | `src/front/app.js:192` | 10 s | 0 (reads config, `stat`s the service's own (§3.2), runs `roomlerd service status`) |
+| device view (`Status` + `Peers`) | `src/front/app.js:194` → `cmd_device_view`, `src/commands.rs:505` | 2 s | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:3139` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:200` | 1.5 s | 1 |
 | consent watcher (Rust; a failed read keeps the screen, §10.9.2) | `src/main.rs:320` | 750 ms, each poll 5 s at most | 1 |
 | consent (the prompt window, §10.9) | `src/front/panel-consent.js:210` | 750 ms | 1 |
@@ -132,7 +132,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`explain_route_edit_error`, `src/commands.rs:3021`), never as a blank page.
+service predates route editing"* (`explain_route_edit_error`, `src/commands.rs:3188`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -159,15 +159,15 @@ with its last endpoint's error: the system socket's `PermissionDenied`, in a fol
 may enter (§10.9.2). The pages took only `NotFound` for "not running", so in the 0.4.225 lab the
 Overview's encoders and files cards read **Error** and "Could not read the encoders: connect:
 Permission denied …", where they mean **Offline** and "The device service is not running."
-(`src/front/overview.js:381-387`, `:581-588`).
+(`src/front/overview.js:394-400`, `:594-601`).
 
 Every connect of the companion whose error is read now goes through `connect_service`
-(`src/commands.rs:2894`), the proof §10.9.2 made for the prompt, the banner and the tray's red:
+(`src/commands.rs:3061`), the proof §10.9.2 made for the prompt, the banner and the tray's red:
 a connect that failed while this person's own endpoint is gone is `NotFound`, no service.
 
 | | Through `connect_service` | Plain: nothing reads the error |
 |---|---|---|
-| the pages' reads | the device view (`cmd_device_view`, `src/commands.rs:338`), the encoders card (`cmd_encoder_caps`, `:1365`), the files card (`cmd_files_dir_view`, `:1501`), and the Routes, Recordings and Devices pages (`cmd_tunnels_view`, `cmd_recordings_view`, `cmd_devices`, `cmd_mesh`) | `daemon_node_status` (the config file's word stands), `cmd_tail_log` (the log file, read directly), the start folder of `cmd_pick_files_dir` (the picker opens without one) |
+| the pages' reads | the device view (`cmd_device_view`, `src/commands.rs:505`), the encoders card (`cmd_encoder_caps`, `:1532`), the files card (`cmd_files_dir_view`, `:1668`), and the Routes, Recordings and Devices pages (`cmd_tunnels_view`, `cmd_recordings_view`, `cmd_devices`, `cmd_mesh`) | `daemon_node_status` (the files' word stands: not enrolled, or not known, §3.2), `cmd_tail_log` (the log file, read directly), the start folder of `cmd_pick_files_dir` (the picker opens without one) |
 | actions | Ping, the files card's buttons, Restart, the route and recording verbs, the Edit view's folder (`editor.rs`), the banner's Disconnect, the stale-config cleanup, and the tray's keep-busy and recording toggles. An error shown as text keeps its words, and a stopped service now reads as not running in it | `cmd_config_entries` and `cmd_config_set` (the root half on a Mac, else the config file), `cmd_set_device_name` (the config file, written directly) |
 | the tray and a start | the recording watch (since #3998) | the keep-busy item's watch (the item reads off), and `first_run.rs`'s two asks at a start (the tour shows as always; the login-start switch counts as on) |
 
@@ -183,6 +183,88 @@ changes on Windows, where the pipe is the only endpoint and its `NotFound` alrea
     right-hand column above, so a read that adds one fails it.
 - **Field cell:** a Linux system install and a Mac, the service stopped: the Overview's encoders
   and files cards read **Offline** and "The device service is not running."
+
+### 3.2 An enrollment the companion cannot read is not "Not enrolled" (#4020)
+
+§3.1 fixed the cards that read the daemon. The device card's chip and the page's banner read
+the status report instead (`cmd_status`, `src/commands.rs:74`), whose `enrolled` came from the
+config file this person reads and, failing that, from the daemon's word (#1701). Two reads in the
+0.4.226 lab showed what that left:
+
+- **A Linux system install, its service stopped for 30 s.** The chip read **Not enrolled** and
+  the banner "Not enrolled — This device isn't part of a Roomler network yet … Set up this
+  device". The companion never looked at the root unit's `/etc/roomler/config.toml`: as the
+  person, `default_config_path` is their own profile's, which a system install does not have.
+- **A one-row Mac, its person socket to the root daemon cut for 5 s.** The Welcome's "This
+  device" switched to "Not enrolled yet … Enroll this device…", with no WARN and no ERROR. The
+  person's file holds no enrollment there (FR-43 P3a), so `enrolled` rested on the daemon's
+  answer alone, and the screen worker answered with no name while the root half did not answer
+  it (`person_socket::with_machine_identity`).
+
+Since #4020 the report tells "no config", which is not enrolled, from "a config this person may
+not read, and no service that names it", where the enrollment is not known. When the person's
+own config holds no enrollment, the status poll `stat`s the device service's own config
+(`ServiceConfig::of`, `src/commands.rs:315`). It never reads it: the file holds the agent token.
+Which config, and when (`enrollment_held_at`, `:280`):
+
+| OS | The config looked for | When | What the person's `stat` answers |
+|---|---|---|---|
+| Linux | `/etc/roomler/config.toml` | the root unit is registered (`systemDaemon`) | there: `Ok`, a `0600` file in a `0755` folder, as `roomlerd enroll` and `install.sh` make them; not there: `NotFound`; a folder closed to the person (`0700`): `PermissionDenied` either way |
+| macOS | `/etc/roomler/config.toml`, the root half's | the person's own file is there and holds no enrollment: the one-row layout | as on Linux |
+| Windows | the machine-global `config.toml` | the machine-wide service is registered (`scmService`), as `active_config_path` reads it | there: `PermissionDenied`, since its folder is SYSTEM's and the Administrators'; not there: `NotFound` (measured with a basic-user token in such a folder) |
+
+`PermissionDenied` counts as there, because each path that closes `/etc/roomler` comes with a
+config: the legacy-config migration makes it `0700` as it moves one in, and a restrictive umask
+applies to `enroll`'s own folder. The report then carries `enrollment_unknown: true`, with
+`enrolled: false`, until a service names the device (`take_daemon_word`, `:93`):
+
+```mermaid
+flowchart TD
+    A["the config this person reads<br/>holds an enrollment?"] -->|yes| E["Enrolled"]
+    A -->|no| B["the daemon names the device?"]
+    B -->|yes| E
+    B -->|"no answer, or no name"| C["the service's own config,<br/>looked for as the table above says"]
+    C -->|"there, or its folder does not say"| U["not known: Offline,<br/>no set-up offer"]
+    C -->|"not there, or not looked for"| N["Not enrolled:<br/>set-up offered"]
+```
+
+| Page | Not enrolled | Not known (`enrollment_unknown`) |
+|---|---|---|
+| Overview, the device card | chip **Not enrolled**; the banner "Not enrolled … Set up this device" | chip **Offline** and "The device service is not running.", the encoders and files cards' words, or "The device service did not answer." while it runs; no banner (`src/front/overview.js:21-52`) |
+| the sidebar | Onboarding spotlighted | no spotlight (`src/front/app.js:156`) |
+| Welcome, This device | "Not enrolled yet … Enroll this device…" | "Enrollment not known yet", with no enroll offer (`src/front/welcome.js:168-171`) |
+| Onboarding | the form | the form waits, with a note (`src/front/onboarding.js:131-140`) |
+
+- ⚠️ **A registered service that is not running is no sign of an enrollment.** A daemon with no
+  config exits ("no config found … Run 'roomlerd enroll' first"), so a fresh system install's
+  service is registered and stopped. Only the config being there decides: a host with none
+  still reads "Not enrolled" and is offered set-up. A per-user install is never asked about the
+  service's config, not even a machine-wide copy left behind.
+- **Nothing is remembered.** A one-row Mac is told by its person's file with no enrollment
+  beside the root half's config, both read afresh on every poll. The next answer that names the
+  device ends "not known", and an un-enrollment that takes the root config away (an uninstall)
+  reads "Not enrolled" at the next poll. A two-row Mac whose per-user half is not enrolled has
+  no person file, and is still offered set-up.
+- Nothing is logged: the `stat` runs on the 10 s status poll.
+- **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)", in "The desktop
+  companion on Windows — clippy + unit tests (#3940)", and on a Mac in the macOS job's "cargo
+  test the companion's enrollment status on a real Mac (#4020)", by `commands::tests::enrollment`:
+  - `an_enrolled_system_install_with_its_service_stopped_is_not_known` (Linux and Windows);
+  - `a_system_install_never_enrolled_still_reads_not_enrolled`, the trap: running or not, no
+    config there is "Not enrolled";
+  - `a_per_user_install_not_enrolled_reads_not_enrolled_as_before`;
+  - `a_service_that_answers_reads_enrolled_as_before`;
+  - `a_one_row_mac_that_misses_an_answer_is_not_offered_to_enroll`: the worker's answer with no
+    name, and none at all, are not known; the next answer that names the device, and an
+    uninstall, end it;
+  - `a_stat_tells_a_config_there_from_none_and_logs_nothing`: a real file this process may not
+    read is there, a folder closed to it does not say, and nothing is logged;
+  - `the_root_config_is_the_root_daemons` and
+    `the_pages_read_an_unknown_enrollment_as_offline_with_no_setup_offer`.
+- **Field cell:** a Linux system install with its service stopped: the device card reads
+  **Offline** and "The device service is not running.", with no banner. A one-row Mac with its
+  person socket cut for 5 s shows no "Not enrolled yet". A fresh system install before its
+  enroll still reads "Not enrolled".
 
 ## 4. Polling rules every page follows
 
@@ -234,23 +316,23 @@ compile.
   | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
   | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
 
-  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:679`) builds the rows —
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:846`) builds the rows —
   machine-side keys from the root half's listing, in the worker's order — and
-  `cmd_config_set` (`:861`) sends a machine-side key to the root half
-  (`root_half_config_set_beside`, `:786`), whose answer is final: the worker's copy of
+  `cmd_config_set` (`:1039`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:964`), whose answer is final: the worker's copy of
   such a key is a file the Mac's device never reads, so it is not written. The worker's
   own copies of machine keys stay reachable with `roomler config …` in a terminal, and
   the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
   the root half forwards its own value of a few session knobs to the worker as a floor
   (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
   halves' configs, so the worker's copy — the one this edits — can only tighten the
-  root's. The banner (`cmd_config_target`, `:1220`; `two_halves_note`, `:1040`) names both
+  root's. The banner (`cmd_config_target`, `:1398`; `two_halves_note`, `:1218`) names both
   halves' files and says which rows change here. It is shown only when the reached daemon
   says it runs unprivileged AND a root daemon of another identity answers `Status` over the
-  person socket (`two_halves`, `:1023`) — one daemon behind both sockets, a root daemon's
+  person socket (`two_halves`, `:1201`) — one daemon behind both sockets, a root daemon's
   legacy per-user bind, is not two halves. A root half older than design A still refuses
   the listing; the rows are then the worker's alone and the banner carries the #2879 words
-  (`two_halves_legacy_note`, `:1061`): the root half's switches are
+  (`two_halves_legacy_note`, `:1239`): the root half's switches are
   `sudo roomler config set <key> <value>`.
 - **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
   daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
@@ -262,20 +344,20 @@ compile.
   written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
   refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
   falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1186`). Since design A the same socket serves the
-  listing, marked: `cmd_config_target` (`:1220`) reports `root_only` (`root_daemon_only`,
-  `:1086`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  `agents/roomler-desktop/src/commands.rs:1353`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1398`) reports `root_only` (`root_daemon_only`,
+  `:1264`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
   are editable, and the rest — the device-owned gates, the network, SSH, the updater, the
   recordings folder — show the root daemon's value with "administrator's" and
   `sudo roomler config set <key> <value>`
-  (`settings.js`, the `read_only` row; `root_only_note`, `:1080`). From a daemon older than
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1291`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
-  (`root_only_legacy_note`, `:1102`).
+  (`root_only_legacy_note`, `:1313`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:3447`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3944`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -285,20 +367,21 @@ compile.
   `KeyMeta` entry, the `current_value` / `apply` arms, and a set/echo test.
 - **No config file is a normal state for the companion (#3996).** The companion never runs on
   a config; the device service does. So every read it makes of one goes through
-  `load_if_there` (`agents/roomler-desktop/src/commands.rs:3667`): no file is no config, with
+  `load_if_there` (`agents/roomler-desktop/src/commands.rs:3834`): no file is no config, with
   nothing logged. A file that is there goes through `config::load`, so a broken one still logs
   `config unreadable and no usable previous copy — the host must be re-enrolled` at ERROR and
   is recovered from its `.prev` (`config::read_if_present` would hide it, FR-66). A one-row
-  Mac's person never has a file (FR-43), a host not enrolled yet has none, and the person at a
-  Windows background-service install cannot see the machine-wide one.
+  Mac's person has none until the screen worker writes one with no enrollment in it at its
+  first start (FR-43 P3a), a host not enrolled yet has none, and the person at a Windows
+  background-service install cannot see the machine-wide one.
 
   | Read | With no file | Where |
   |---|---|---|
-  | the configuration listing, when no service answers it; the Welcome reads it as it opens | "There is no configuration file at … yet, and the device service did not answer." | `entries_from_file`, `agents/roomler-desktop/src/commands.rs:639` |
+  | the configuration listing, when no service answers it; the Welcome reads it as it opens | "There is no configuration file at … yet, and the device service did not answer." | `entries_from_file`, `agents/roomler-desktop/src/commands.rs:806` |
   | a setting's or the device name's direct write, when no service takes it | the same words, and nothing is written | `config_set_blocking`, `set_device_name_blocking` |
-  | Open Roomler and View screen | no enrollment: the daemon's server and tenant, as for a one-row Mac's file (FR-43 P3a) | `server_origin_from`, `agents/roomler-desktop/src/commands.rs:1908`; `cmd_open_remote` |
-  | a re-enroll | the device service holds the enrollment, and the administrator's command | `enrollment_elsewhere`, `agents/roomler-desktop/src/commands.rs:474` |
-  | the Overview's status | not enrolled by the file, so the daemon is asked (#1701), as before | `load_optional_config`, `agents/roomler-desktop/src/commands.rs:3648` |
+  | Open Roomler and View screen | no enrollment: the daemon's server and tenant, as for a one-row Mac's file (FR-43 P3a) | `server_origin_from`, `agents/roomler-desktop/src/commands.rs:2075`; `cmd_open_remote` |
+  | a re-enroll | the device service holds the enrollment, and the administrator's command | `enrollment_elsewhere`, `agents/roomler-desktop/src/commands.rs:641` |
+  | the Overview's status | not enrolled by the file, so the daemon is asked (#1701), as before; with no answer that names the device and the service's own config there, the enrollment is not known (§3.2) | `load_optional_config`, `agents/roomler-desktop/src/commands.rs:3815`; `status_report_from`, `:113` |
 
   Until #3996 most of these went straight to `config::load`. A start with no service
   answering logged that ERROR about a healthy one-row Mac: each start of its script install,
@@ -385,15 +468,15 @@ sequenceDiagram
   moved every row down by its height, about 69 pt on a Mac, while a person aimed at one: in
   the 0.4.225 lab two "View screen" clicks landed on row padding, and with rows of another
   height a click lands on another device's. They now share one slot two lines tall, there
-  whether a line shows or not (`dv-notes`, `src/front/index.html:316`; `.dv-notes`,
+  whether a line shows or not (`dv-notes`, `src/front/index.html:318`; `.dv-notes`,
   `src/front/styles.css:489`). `paintNotes` (`src/front/devices.js:751`) shows and hides the
   lines, never the slot. A longer line is cut with "…" and reads whole on hover; with both up,
   one line each. The slot is reserved in the flow rather than drawn over it: at the narrowest
   window (640 px, a card about 400 px wide) a stale line runs to two or three lines, and a band
   out of the flow would have to cover the toolbar or the rows to show them, or be cut to one
   line. The cost is a blank band two lines tall above the table while nothing is wrong. Still
-  in the flow: the Routes page's `tn-stale` (`src/front/index.html:378`) and the Recordings
-  page's `rec-banner`, `rec-unavailable` and `rec-folder-reason` (`:474`, `:484`, `:520`).
+  in the flow: the Routes page's `tn-stale` (`src/front/index.html:380`) and the Recordings
+  page's `rec-banner`, `rec-unavailable` and `rec-folder-reason` (`:476`, `:486`, `:522`).
   Pinned by `a_note_above_the_device_list_moves_no_row`, in the two lanes §3.1 names.
 - **Older sides still work.** A daemon that predates the verbs, or a server without the
   routes, gets the pre-FR-84 peers table with a one-line note to update. `overlay:
@@ -548,7 +631,7 @@ sequenceDiagram
   ago (`RESTART_MIN_INTERVAL`, persisted next to the config, so it also bounds a loop across
   processes), and on the macOS supervisor a worker younger than 30 s.
 - **"Back" means a new process.** The companion waits for a different pid **and** start time
-  (`cmd_restart_wait`, `src/commands.rs:2361`) — the leaving process keeps answering for a
+  (`cmd_restart_wait`, `src/commands.rs:2528`) — the leaving process keeps answering for a
   moment, and Windows can hand the relaunched daemon the old pid.
 - ⚠️ **This is local only.** Remote configuration never restarts a daemon: a server push is
   persisted and reported as *applied-pending-restart*, and there is no server message that
@@ -600,8 +683,8 @@ struck through, and how long the probe took.
   to this device's administrator." (`root_only`). Only an *answer* that refuses reads that way,
   and only from a root daemon that this unprivileged app reached, which one `Status` on the
   same connection confirms (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1186`, the test the config verbs use, #2891; the
-  decision is `encoder_caps_view`, `:1382`). No answer at all (a failed write or read, a closed
+  `agents/roomler-desktop/src/commands.rs:1353`, the test the config verbs use, #2891; the
+  decision is `encoder_caps_view`, `:1569`). No answer at all (a failed write or read, a closed
   connection) stays **Error**, with its stage. Windows serves the verb to every interactive
   user (the pipe's `IU` ace), and a Mac's companion asks its per-user half, which answers from
   its own probe.
@@ -823,8 +906,8 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who reads | `FsAs::for_read` (`:478`) → `linux_fs_as` (`:949`), the function `FsAs::now` (`:447`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:856`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:4643`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:872`): that account's rights are not the person's |
-| The lookup | `seat_within` (`:1059`), `SEAT_LOOKUP_WAIT` (`:1028`), `FsAs::CannotTell` (`:331`), `linux_fs_as_within` (`:1001`), one lookup in flight `SEAT0` (`:1037`, `OneInFlight`, `agents/roomlerd/src/one_in_flight.rs:72`) | logind and the account database are other processes: the lookup runs on a thread of its own, never a stalled async worker, and each caller waits for it 1.5 s. #3796 — one lookup at a time, on a thread named `seat0-lookup`: a caller who asks while one runs waits on it, within its own 1.5 s, and starts none of its own, so retries during a hang hold one thread, not one each. A caller takes only the answer of a lookup that began at or after it asked (the list below says why). A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:4764`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:4679`), or systemd did not boot the host (`loginctl_failed`, `:4695`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:850`): the read is refused with its own text either way, logged |
+| Who reads | `FsAs::for_read` (`:478`) → `linux_fs_as` (`:949`), the function `FsAs::now` (`:447`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:856`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:4658`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:872`): that account's rights are not the person's |
+| The lookup | `seat_within` (`:1059`), `SEAT_LOOKUP_WAIT` (`:1028`), `FsAs::CannotTell` (`:331`), `linux_fs_as_within` (`:1001`), one lookup in flight `SEAT0` (`:1037`, `OneInFlight`, `agents/roomlerd/src/one_in_flight.rs:72`) | logind and the account database are other processes: the lookup runs on a thread of its own, never a stalled async worker, and each caller waits for it 1.5 s. #3796 — one lookup at a time, on a thread named `seat0-lookup`: a caller who asks while one runs waits on it, within its own 1.5 s, and starts none of its own, so retries during a hang hold one thread, not one each. A caller takes only the answer of a lookup that began at or after it asked (the list below says why). A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:4779`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:4694`), or systemd did not boot the host (`loginctl_failed`, `:4710`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:850`): the read is refused with its own text either way, logged |
 | A received file's lookup (#3711) | `FsAs::for_write` (`:499`), from `FilesHandler::begin` (`:2421`), `FilesHandler::resume_incoming` (`:3188`) and `sweep_orphans` (`:1760`) | the same path as a read's, with the same wait. These three asked inline on the async worker, with no time limit, so a slow account database (SSSD or LDAP refreshing a large group list) stalled that worker for as long as the lookup took, and the startup sweep, which signalling waits for, held the daemon's start as long. What a received file takes with each answer is in the list below |
 | A files folder's set (#3769) | `FilesDirSet` (`files.rs:1371`): `check` (`:1385`), `saved` (`:1415`), `refresh_status` (`:1425`), from `config_set` (`agents/roomlerd/src/localapi_state.rs:1435`) | a `ConfigSet` of `files_dir` asks who a drop would be written as once, as a received file asks it, and runs §9's set-time check for and as that person before it takes the config write lock (`:1455`, the lock `:1462`). Under the lock are only the load, the change, the save and the live folder. The status answer is recomputed for the same person after the lock (`:1536`), and published only while what the set saved is still the configured value (`publish_effective`, `files.rs:1270`), so an earlier set's late answer never shows after a later set. Both checks used to ask under the lock with no time limit, so a slow logind or account database held every other config read and write behind it. What a set answers is in the list below |
 | The person socket's check (#3796) | `person_socket::at_the_seat_now` (`agents/roomlerd/src/person_socket.rs:489`), its own lookup in flight `PERSON_AT_SEAT0` (`:502`), from the dispatch (`crates/localapi/src/lib.rs:4131`) | before it applies a `ConfigSet`, the person-at-the-device socket asks again whether its caller is still the person at seat0 (#2871's review). That is logind's answer, so it is asked as a received file's is: one lookup in flight (`seat0-person`), 1.5 s at most. It used to wait as long as logind took, a blocking thread for each request. With no answer in time the set is refused with "Could not tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`, `crates/localapi/src/lib.rs:3839`), the text a read or a received file gets then, never "the seat changed". #3845 — the socket's 5 s poll, which moves it to whoever is at the seat, now asks through the same lookup in flight, 5 s at most. A look that cannot tell keeps the socket where it is, and a consent answer is checked as a set is (§12.3) |
@@ -1165,7 +1248,7 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12893`), asked as the channel opens (`files_channel_here`, `:12902`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3930`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4808`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12893`), asked as the channel opens (`files_channel_here`, `:12902`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3796`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4674`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12928`), `attach_files_declined` (`:12951`), `declined_reply` (`:12982`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12861`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
@@ -1242,6 +1325,9 @@ flowchart LR
 - Every refusal from the daemon — Apply now's, `files_dir`'s — is shown verbatim, and a
   service too old for a step says so and points at the manual way instead.
 - The tour can be reopened from the tray and from Settings.
+- **This device** reads "enrolled as … on …", or "Not enrolled yet" with **Enroll this
+  device…**. While the device service holds an enrollment this app cannot read and no service
+  names it, it reads "Enrollment not known yet", with no enroll offer (§3.2).
 - The whole device can opt out: `companion_autostart = false` stops the post-install launch
   and removes the Windows login start. On a multi-user server that is the switch to use —
   the machine-wide login start opens a companion in every interactive session.
@@ -1292,7 +1378,7 @@ flowchart LR
 
 The tray is the surface a "Prompt on host" device asks through when the daemon draws no panel of
 its own (a root daemon has no display), so a consent prompt starts it when it is not running
-(`ensure_running`, [`companion.rs:1158`](../agents/roomlerd/src/companion.rs#L1158)). On Linux that
+(`ensure_running`, [`companion.rs:1173`](../agents/roomlerd/src/companion.rs#L1173)). On Linux that
 start asks four other processes: logind for the graphical session (`loginctl`), the process list
 for the person's tray (`pgrep -u`), the person's user manager for the session's environment (a
 root daemon reads it as them, which looks their account up in the account database), and
@@ -1318,11 +1404,11 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the start, off the worker | `ensure_running_inner`, [`companion.rs:1785`](../agents/roomlerd/src/companion.rs#L1785) (one for Linux, Windows and macOS since #3858, §10.4); `TrayStarts::start`, [`:2166`](../agents/roomlerd/src/companion.rs#L2166) | the prompt's task awaits the start; it never runs a step itself |
-| one start in flight | `TRAY_STARTS`, [`companion.rs:2140`](../agents/roomlerd/src/companion.rs#L2140), a `one_in_flight::OneInFlight` on a thread named `tray-start` | while a step hangs, every prompt that asks waits on that one start and starts none of its own, so a hang holds one thread however often a viewer asks. A start that began before an ask is waited out, and the ask then starts afresh: the person at the screen may have changed meanwhile |
-| the steps | `TraySteps`, [`companion.rs:2251`](../agents/roomlerd/src/companion.rs#L2251); `start_tray`, [`:2299`](../agents/roomlerd/src/companion.rs#L2299) | in the order the start always took them, each recorded as it begins (`TrayStep`, [`:2185`](../agents/roomlerd/src/companion.rs#L2185)). Who the tray is for (logind's active graphical session, `pgrep -u` per uid), the user manager for a per-user daemon and the system manager as the person for a root one, #2713's environment and #2729's `KillMode=process` are as before. Since #3887 the companion's argv carries `--for-prompt` (§10.6), and since #3973 a root daemon's unit carries the session's `DISPLAY` when logind has none (§14.1.1) |
-| the bound | `TRAY_START_WAIT`, [`companion.rs:2357`](../agents/roomlerd/src/companion.rs#L2357): 2.5 s | under the callers' 3 s, so the start's own reason lands before their fallback fires (with equal timers the hub's fallback fired first, FR-27). A start that works takes tens to a few hundred milliseconds, under half the wait, which one start in flight needs to answer an ask that comes just after another began |
-| the failure | `started_in_time`, [`companion.rs:2223`](../agents/roomlerd/src/companion.rs#L2223) | a start's own failure keeps its words (`finding a graphical login session: …`, `systemd-run failed: …`); no answer in time is `the tray's start did not finish within 2.5s: it was still waiting on logind (…)`, naming the step. `ensure_running` logs either as `could not start the desktop companion` and the prompt has no surface, as for any failed start. The start goes on on its thread: if it later brings the tray up, the tray reads the `.pending` marker and shows the question. Since #3884 that verdict stands 2 s, not 20 s, so the next prompt asks again (§10.5) |
+| the start, off the worker | `ensure_running_inner`, [`companion.rs:1800`](../agents/roomlerd/src/companion.rs#L1800) (one for Linux, Windows and macOS since #3858, §10.4); `TrayStarts::start`, [`:2181`](../agents/roomlerd/src/companion.rs#L2181) | the prompt's task awaits the start; it never runs a step itself |
+| one start in flight | `TRAY_STARTS`, [`companion.rs:2155`](../agents/roomlerd/src/companion.rs#L2155), a `one_in_flight::OneInFlight` on a thread named `tray-start` | while a step hangs, every prompt that asks waits on that one start and starts none of its own, so a hang holds one thread however often a viewer asks. A start that began before an ask is waited out, and the ask then starts afresh: the person at the screen may have changed meanwhile |
+| the steps | `TraySteps`, [`companion.rs:2266`](../agents/roomlerd/src/companion.rs#L2266); `start_tray`, [`:2314`](../agents/roomlerd/src/companion.rs#L2314) | in the order the start always took them, each recorded as it begins (`TrayStep`, [`:2200`](../agents/roomlerd/src/companion.rs#L2200)). Who the tray is for (logind's active graphical session, `pgrep -u` per uid), the user manager for a per-user daemon and the system manager as the person for a root one, #2713's environment and #2729's `KillMode=process` are as before. Since #3887 the companion's argv carries `--for-prompt` (§10.6), and since #3973 a root daemon's unit carries the session's `DISPLAY` when logind has none (§14.1.1) |
+| the bound | `TRAY_START_WAIT`, [`companion.rs:2372`](../agents/roomlerd/src/companion.rs#L2372): 2.5 s | under the callers' 3 s, so the start's own reason lands before their fallback fires (with equal timers the hub's fallback fired first, FR-27). A start that works takes tens to a few hundred milliseconds, under half the wait, which one start in flight needs to answer an ask that comes just after another began |
+| the failure | `started_in_time`, [`companion.rs:2238`](../agents/roomlerd/src/companion.rs#L2238) | a start's own failure keeps its words (`finding a graphical login session: …`, `systemd-run failed: …`); no answer in time is `the tray's start did not finish within 2.5s: it was still waiting on logind (…)`, naming the step. `ensure_running` logs either as `could not start the desktop companion` and the prompt has no surface, as for any failed start. The start goes on on its thread: if it later brings the tray up, the tray reads the `.pending` marker and shows the question. Since #3884 that verdict stands 2 s, not 20 s, so the next prompt asks again (§10.5) |
 
 The session's environment is read as the person through `exec::drop_to_std`, whose account lookup
 is bounded too (1.5 s, `docs/roomler-ssh.md`, "The blocking callers"); a lookup that does not answer
@@ -1339,7 +1425,7 @@ start goes on without it.
   stopped, the WS loop waited out `loginctl`'s own D-Bus timeout (~25 s) there. #3857 takes
   the notification off the loop and bounds the walk (§10.3).
 - Tested with the steps stood in for each test's own tasks (`tray_start_tests`,
-  [`companion.rs:2482`](../agents/roomlerd/src/companion.rs#L2482); rust-agent's "Test agent under
+  [`companion.rs:2497`](../agents/roomlerd/src/companion.rs#L2497); rust-agent's "Test agent under
   vp9-444"): with logind, the environment or systemd-run held, a start fails within 2.5 s naming
   the step; a 10 ms timer on a two-worker runtime stays on time while prompts ask; asks at once
   and in a row share one start; and a start in time does what it always did, the argv included.
@@ -1381,9 +1467,9 @@ sequenceDiagram
 
 | Piece | Where | What |
 |---|---|---|
-| the start | `notification_for_rc`, [`signaling.rs:7611`](../agents/roomlerd/src/signaling.rs#L7611); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
-| the consent task | `rc_surfaces_up`, [`signaling.rs:7548`](../agents/roomlerd/src/signaling.rs#L7548); `notification_shown`, [`:7626`](../agents/roomlerd/src/signaling.rs#L7626) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
-| the session walk | `graphical_session_within`, [`companion.rs:8604`](../agents/roomlerd/src/companion.rs#L8604); `SESSION_WALKS`, [`:8632`](../agents/roomlerd/src/companion.rs#L8632) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:8588`](../agents/roomlerd/src/companion.rs#L8588)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:8645`](../agents/roomlerd/src/companion.rs#L8645)), never "nobody at the screen" |
+| the start | `notification_for_rc`, [`signaling.rs:7638`](../agents/roomlerd/src/signaling.rs#L7638); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
+| the consent task | `rc_surfaces_up`, [`signaling.rs:7575`](../agents/roomlerd/src/signaling.rs#L7575); `notification_shown`, [`:7653`](../agents/roomlerd/src/signaling.rs#L7653) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
+| the session walk | `graphical_session_within`, [`companion.rs:8655`](../agents/roomlerd/src/companion.rs#L8655); `SESSION_WALKS`, [`:8683`](../agents/roomlerd/src/companion.rs#L8683) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:8639`](../agents/roomlerd/src/companion.rs#L8639)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:8696`](../agents/roomlerd/src/companion.rs#L8696)), never "nobody at the screen" |
 | a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:358`](../agents/roomlerd/src/indicator/notify.rs#L358); `launch`, [`:505`](../agents/roomlerd/src/indicator/notify.rs#L505) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
 
 Every caller of the portal's session helper takes the walk through `helper_session`
@@ -1593,7 +1679,7 @@ The same start runs off the async worker on Windows and macOS. Until #3858 their
 `ensure_running_inner` was what §10.2 describes on Linux before #3855: an async function that never
 awaited, so the process list, `CreateProcessAsUserW`, `pgrep`, `stat`, `id -u` and `launchctl` ran
 on the worker that polled it, and the callers' 3 s budget could not fire. There is now one
-`ensure_running_inner` for the three OSes ([`companion.rs:1785`](../agents/roomlerd/src/companion.rs#L1785)), over §10.2's start in flight (`TRAY_STARTS`,
+`ensure_running_inner` for the three OSes ([`companion.rs:1800`](../agents/roomlerd/src/companion.rs#L1800)), over §10.2's start in flight (`TRAY_STARTS`,
 a thread named `tray-start`), its 2.5 s wait (`TRAY_START_WAIT`) and its failure
 (`started_in_time`: `the tray's start did not finish within 2.5s: it was still waiting on <step>`).
 Each OS has only its own steps: `TrayStep` (what a refusal names), `TraySteps` (the seams a test
@@ -1611,11 +1697,11 @@ flowchart LR
 
 | OS | Step, in order | What runs | A refusal out of time names |
 |---|---|---|---|
-| Windows: `start_tray`, [`companion.rs:1883`](../agents/roomlerd/src/companion.rs#L1883); `TrayStep`, [`:1800`](../agents/roomlerd/src/companion.rs#L1800) | the tray check | `desktop_running`: `win_service::companion_procs::find`, a process snapshot, then each candidate's loaded image (#1686) | `the process list (…)` |
+| Windows: `start_tray`, [`companion.rs:1898`](../agents/roomlerd/src/companion.rs#L1898); `TrayStep`, [`:1815`](../agents/roomlerd/src/companion.rs#L1815) | the tray check | `desktop_running`: `win_service::companion_procs::find`, a process snapshot, then each candidate's loaded image (#1686) | `the process list (…)` |
 | | the install path | `installed_desktop`: the companion beside the daemon | `the companion's install path` |
 | | the daemon's own token | `respawn_context_for_self`: is this the SYSTEM service? | `the daemon's own token (…)` |
 | | the start | `start_desktop`, #3848's, with its session choice: the SYSTEM service starts the tray in the console session as its person (`WTSQueryUserToken`, `CreateEnvironmentBlock`, `CreateProcessAsUserW`), the person's own daemon a plain `CreateProcessW` in its session; since #3887 with `--for-prompt` (§10.6) | `the start in the console session (…)`, or `the start in the daemon's own session (…)` |
-| macOS: `start_tray`, [`companion.rs:2040`](../agents/roomlerd/src/companion.rs#L2040); `TrayStep`, [`:1957`](../agents/roomlerd/src/companion.rs#L1957) | the app | `/Applications/Roomler.app` exists | `the companion's app bundle (…)` |
+| macOS: `start_tray`, [`companion.rs:2055`](../agents/roomlerd/src/companion.rs#L2055); `TrayStep`, [`:1972`](../agents/roomlerd/src/companion.rs#L1972) | the app | `/Applications/Roomler.app` exists | `the companion's app bundle (…)` |
 | | the tray check | `pgrep -x roomler-desktop` | `the process list (pgrep)` |
 | | the console's owner | `console_user_name`: `stat -f %Su /dev/console`, the way the pkg's postinstall reads it | `the console's owner (stat /dev/console)` |
 | | the uid | `account_uid`: `id -u <user>`, from the account database | `the account database (id -u, …)` |
@@ -1635,7 +1721,7 @@ flowchart LR
   stands 2 s, §10.5).
 - `one_in_flight` compiles on Windows for this; its per-key lookups (`OneInFlightPerKey`) stay
   Unix-only.
-- Tested in `tray_start_tests` ([`companion.rs:2482`](../agents/roomlerd/src/companion.rs#L2482)), now one module for the three OSes: a shared harness
+- Tested in `tray_start_tests` ([`companion.rs:2497`](../agents/roomlerd/src/companion.rs#L2497)), now one module for the three OSes: a shared harness
   and three tests that run on each OS against its own stood-in steps (`on_linux`, `on_windows`,
   `on_mac`): a held step fails the start within 2.5 s naming it, a 10 ms timer on a two-worker
   runtime stays on time while prompts ask, and asks at once and in a row share one start. Each OS
@@ -1651,18 +1737,18 @@ flowchart LR
 Two things about the tray's start for a remote-control prompt (§10.2, §10.4) changed together.
 
 **A failure stands 2 s, not 20 s (#3884).** `ensure_running`
-([`companion.rs:1158`](../agents/roomlerd/src/companion.rs#L1158)) keeps its verdict so that a burst of
+([`companion.rs:1173`](../agents/roomlerd/src/companion.rs#L1173)) keeps its verdict so that a burst of
 prompts does not become a burst of starts. Until #3884 every verdict stood 20 s, a failure
 included. But a start that ran out of its 2.5 s goes on on its thread and may bring the tray up a
 moment later, and a person may sign in at the screen meanwhile. The prompt the refusal invited was
 answered "no surface" from the cache, with no look, for up to 20 s. Now each verdict stands for as
-long as it can stay true (`EnsureVerdicts`, [`companion.rs:1221`](../agents/roomlerd/src/companion.rs#L1221)):
+long as it can stay true (`EnsureVerdicts`, [`companion.rs:1236`](../agents/roomlerd/src/companion.rs#L1236)):
 
 | Verdict | Stands | Why |
 |---|---|---|
-| the tray is up (`AlreadyRunning`, `Started`) | 20 s, `ENSURE_COOLDOWN` ([`companion.rs:1204`](../agents/roomlerd/src/companion.rs#L1204)) | a tray that started is visible within a second |
+| the tray is up (`AlreadyRunning`, `Started`) | 20 s, `ENSURE_COOLDOWN` ([`companion.rs:1219`](../agents/roomlerd/src/companion.rs#L1219)) | a tray that started is visible within a second |
 | no companion on this host (`Unsupported`) | 20 s | it changes only with an install, so no prompt in those 20 s starts anything |
-| the start failed, or ran out of its wait | 2 s, `ENSURE_RETRY_AFTER_ERROR` ([`companion.rs:1215`](../agents/roomlerd/src/companion.rs#L1215)) | it can change at once: a late tray, a person who signed in. Still a rate limit: the prompts in those 2 s are answered from it with no start of their own, and one that asks while a start still hangs joins that start (`TRAY_STARTS`, one in flight), never a second |
+| the start failed, or ran out of its wait | 2 s, `ENSURE_RETRY_AFTER_ERROR` ([`companion.rs:1230`](../agents/roomlerd/src/companion.rs#L1230)) | it can change at once: a late tray, a person who signed in. Still a rate limit: the prompts in those 2 s are answered from it with no start of their own, and one that asks while a start still hangs joins that start (`TRAY_STARTS`, one in flight), never a second |
 
 A start that ran out of time answers 2.5 s after its prompt, and its verdict stands until 4.5 s,
 so a prompt 5 s after that one asks afresh. A short hold was chosen over a look at whether the
@@ -1702,8 +1788,8 @@ window runs from the request").
 
 | Piece | Where | What |
 |---|---|---|
-| the loop's side | `start_for_prompt`, [`companion.rs:1308`](../agents/roomlerd/src/companion.rs#L1308); the hand-off, [`signaling.rs:4536`](../agents/roomlerd/src/signaling.rs#L4536) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1326`](../agents/roomlerd/src/companion.rs#L1326)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7520`](../agents/roomlerd/src/signaling.rs#L7520)) |
-| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7548`](../agents/roomlerd/src/signaling.rs#L7548), called at [`:7663`](../agents/roomlerd/src/signaling.rs#L7663) on the task `rc_consent_task` spawns ([`:7702`](../agents/roomlerd/src/signaling.rs#L7702)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:7805`](../agents/roomlerd/src/signaling.rs#L7805)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
+| the loop's side | `start_for_prompt`, [`companion.rs:1323`](../agents/roomlerd/src/companion.rs#L1323); the hand-off, [`signaling.rs:4402`](../agents/roomlerd/src/signaling.rs#L4402) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1341`](../agents/roomlerd/src/companion.rs#L1341)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7547`](../agents/roomlerd/src/signaling.rs#L7547)) |
+| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7575`](../agents/roomlerd/src/signaling.rs#L7575), called at [`:7690`](../agents/roomlerd/src/signaling.rs#L7690) on the task `rc_consent_task` spawns ([`:7729`](../agents/roomlerd/src/signaling.rs#L7729)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:7832`](../agents/roomlerd/src/signaling.rs#L7832)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
 | a question that ends while the start runs | `ConsentBroker::is_asking`, [`consent.rs:853`](../agents/roomlerd/src/consent.rs#L853) | a `Terminate` the loop reads meanwhile takes the question off the broker's books and finds no notification to take down. The consent task starts none for a question off the books, or whose socket closed, and takes down one started just as it was withdrawn |
 
 - **The bound is as before:** the start's 2.5 s and the 3 s budget, on the start's own task and
@@ -1717,20 +1803,20 @@ window runs from the request").
   never waited on the start), and a recording's and an SSH session's `Companion::up`, which keep
   their own bounded wait. Each benefits from the 2 s verdict all the same.
 - **Tested** in `companion::tray_start_tests`
-  ([`companion.rs:2482`](../agents/roomlerd/src/companion.rs#L2482)) against each OS's stood-in
-  host (`Host`, [`:2766`](../agents/roomlerd/src/companion.rs#L2766), and `host_steps` in
+  ([`companion.rs:2497`](../agents/roomlerd/src/companion.rs#L2497)) against each OS's stood-in
+  host (`Host`, [`:2781`](../agents/roomlerd/src/companion.rs#L2781), and `host_steps` in
   `on_linux`, `on_windows`, `on_mac`): a prompt a few seconds after a start that ran out of time
   finds the tray that start brought up
-  ([`:2812`](../agents/roomlerd/src/companion.rs#L2812)); a failed start is asked again 2 s on,
+  ([`:2827`](../agents/roomlerd/src/companion.rs#L2827)); a failed start is asked again 2 s on,
   not per prompt, and finds a person who signed in
-  ([`:2860`](../agents/roomlerd/src/companion.rs#L2860)); no companion, and a tray that is up,
+  ([`:2875`](../agents/roomlerd/src/companion.rs#L2875)); no companion, and a tray that is up,
   stand with no start per prompt (the control,
-  [`:2889`](../agents/roomlerd/src/companion.rs#L2889)); while the start is held the loop handles a
-  frame within 0.5 s ([`:2942`](../agents/roomlerd/src/companion.rs#L2942)); a start that failed
+  [`:2904`](../agents/roomlerd/src/companion.rs#L2904)); while the start is held the loop handles a
+  frame within 0.5 s ([`:2957`](../agents/roomlerd/src/companion.rs#L2957)); a start that failed
   or ran out of time is still `no_prompt_surface`, and one that worked is the person's timeout
-  ([`:3010`](../agents/roomlerd/src/companion.rs#L3010)); and on Linux a question withdrawn while
+  ([`:3025`](../agents/roomlerd/src/companion.rs#L3025)); and on Linux a question withdrawn while
   the start is held gets no notification
-  ([`:3366`](../agents/roomlerd/src/companion.rs#L3366)). They run in rust-agent's "Test agent
+  ([`:3381`](../agents/roomlerd/src/companion.rs#L3381)). They run in rust-agent's "Test agent
   under vp9-444", in "Agent unit tests on Windows (the whole --lib suite)" and in the macOS job's
   "cargo check + test the agent's Mac-only units" (`companion::tray_start_tests::`).
 - **Field cells:** a Linux system install whose tray start is held by a paused logind, where the
@@ -1750,8 +1836,8 @@ Now the start says what it is for, and the tour waits for the person's own start
 
 | The start | Made by | Its argument | The tour, while it is not done |
 |---|---|---|---|
-| for a question or a banner, Windows and Linux | the daemon's `start_tray`: Windows [`companion.rs:1902`](../agents/roomlerd/src/companion.rs#L1902), Linux [`:2326`](../agents/roomlerd/src/companion.rs#L2326) | `--for-prompt` (`FOR_PROMPT_ARG`, `crates/agent-core/src/companion_autostart.rs:36`) | held back: the companion stays in the tray, and the question's or the banner's own window shows as before |
-| for a question, macOS | the daemon's `launchctl kickstart` ([`companion.rs:2040`](../agents/roomlerd/src/companion.rs#L2040)) | none: launchd's start carries none | the companion asks the daemon why it came (below), and holds the tour back when there is a question |
+| for a question or a banner, Windows and Linux | the daemon's `start_tray`: Windows [`companion.rs:1917`](../agents/roomlerd/src/companion.rs#L1917), Linux [`:2341`](../agents/roomlerd/src/companion.rs#L2341) | `--for-prompt` (`FOR_PROMPT_ARG`, `crates/agent-core/src/companion_autostart.rs:36`) | held back: the companion stays in the tray, and the question's or the banner's own window shows as before |
+| for a question, macOS | the daemon's `launchctl kickstart` ([`companion.rs:2055`](../agents/roomlerd/src/companion.rs#L2055)) | none: launchd's start carries none | the companion asks the daemon why it came (below), and holds the tour back when there is a question |
 | at login | the `Run` value, the XDG entry, the LaunchAgent | `--autostart` (macOS: none) | shows |
 | after install | `launch_once` | `--first-run` | shows |
 | a person's own | a double-click, the Start or applications menu, Finder | none | shows |
@@ -1786,9 +1872,9 @@ flowchart TD
   the `--autostart` restart of a tray the refresh lost, and the restart of a companion a Linux
   package update stopped (`companion/package_sync.rs`).
 - **Every caller of the start is a question or a banner:** the remote-control prompt
-  (`start_for_prompt`, `companion.rs:1308`, from `signaling.rs:4536`), the exec prompt
-  (`exec_surfaces_up`, `signaling.rs:7774`), a recording's and an SSH session's question (`Companion::up`,
-  `companion.rs:1370`), and Linux's being-viewed banner (`indicator/notify.rs:727`). The other
+  (`start_for_prompt`, `companion.rs:1323`, from `signaling.rs:4402`), the exec prompt
+  (`exec_surfaces_up`, `signaling.rs:7801`), a recording's and an SSH session's question (`Companion::up`,
+  `companion.rs:1385`), and Linux's being-viewed banner (`indicator/notify.rs:727`). The other
   callers are `tray_start_tests`' own.
 - **Tested:** the companion's `first_run::tests` (`startup_table`, the forwarded launches, the
   held tour offered once, `--for-prompt` read by equality, which starts ask on a Mac and what
@@ -1872,7 +1958,7 @@ relay can work:
 | the screen worker's answers | an answer to a question its own broker is not asking goes to the root half, 5 s at most (`DECIDE_WITHIN`). The root half's refusal comes back in its own words, and no answer is refused with a try-again. Since #4027 an answer the root half took (`ConsentDecided { ok: true }`) takes its question off the kept list at once, so the misses after it no longer list it. The root half's `ok: false`, its refusal and no answer leave that list as it was (below) | `consent_decide_view`, [`localapi_state.rs:2241`](../agents/roomlerd/src/localapi_state.rs#L2241); `Relay::decided`, [`consent_relay.rs:226`](../agents/roomlerd/src/consent_relay.rs#L226), which takes the question off (`answer_taken`, [`:338`](../agents/roomlerd/src/consent_relay.rs#L338)); `decided`, [`:359`](../agents/roomlerd/src/consent_relay.rs#L359) |
 | the worker's word | `relay-consent` in its caps frames, the first and the one it sends again when the person's recording gates change, said only by a worker with no enrollment. The daemon keeps it as a known word, and it goes with the channel | [`delegate_worker.rs:428`](../agents/roomlerd/src/delegate_worker.rs#L428), [`:611`](../agents/roomlerd/src/delegate_worker.rs#L611); `worker_features`, [`delegate.rs:233`](../agents/roomlerd/src/delegate.rs#L233); `relays_consent`, [`:1955`](../agents/roomlerd/src/delegate.rs#L1955) |
 | the LocalAPI | a list and an answer are the daemon's views, `consent_pending_view` and `consent_decide_view`, on its own endpoint and on the person socket alike, after the same gates. Their defaults are the daemon's own lists | [`crates/localapi/src/lib.rs:4054`](../crates/localapi/src/lib.rs#L4054), [`:4153`](../crates/localapi/src/lib.rs#L4153), [`:4172`](../crates/localapi/src/lib.rs#L4172); the defaults, [`:3050`](../crates/localapi/src/lib.rs#L3050) and [`:3058`](../crates/localapi/src/lib.rs#L3058) |
-| the root daemon's verdict | the app is a question's surface only while the road is open: a worker is attached that said `relay-consent`, its account is known, and the person socket for that account answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (#3983, below) | `reaches_the_tray`, [`companion.rs:2369`](../agents/roomlerd/src/companion.rs#L2369), from `ensure_running` (`:1159`) and `up_for_a_question` (`:1284`); `reach_from`, [`consent_relay.rs:418`](../agents/roomlerd/src/consent_relay.rs#L418); the host is registered by `set_one_row`, [`delegate.rs:1288`](../agents/roomlerd/src/delegate.rs#L1288) |
+| the root daemon's verdict | the app is a question's surface only while the road is open: a worker is attached that said `relay-consent`, its account is known, and the person socket for that account answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (#3983, below) | `reaches_the_tray`, [`companion.rs:2384`](../agents/roomlerd/src/companion.rs#L2384), from `ensure_running` (`:1174`) and `up_for_a_question` (`:1299`); `reach_from`, [`consent_relay.rs:418`](../agents/roomlerd/src/consent_relay.rs#L418); the host is registered by `set_one_row`, [`delegate.rs:1288`](../agents/roomlerd/src/delegate.rs#L1288) |
 
 ```mermaid
 sequenceDiagram
@@ -1916,16 +2002,16 @@ sequenceDiagram
   gives the tray's start 3 s, `COMPANION_START_BUDGET`
   ([`signaling.rs:341`](../agents/roomlerd/src/signaling.rs#L341)). The road is asked after that
   budget, within its own 1 s (`RELAY_WITHIN`), not inside it: `up_for_a_question`,
-  [`companion.rs:1280`](../agents/roomlerd/src/companion.rs#L1280), from `start_for_prompt`
-  ([`:1308`](../agents/roomlerd/src/companion.rs#L1308)) and `Companion::up`
-  ([`:1370`](../agents/roomlerd/src/companion.rs#L1370)). Until #3983 the 3 s held both. The
+  [`companion.rs:1295`](../agents/roomlerd/src/companion.rs#L1295), from `start_for_prompt`
+  ([`:1323`](../agents/roomlerd/src/companion.rs#L1323)) and `Companion::up`
+  ([`:1385`](../agents/roomlerd/src/companion.rs#L1385)). Until #3983 the 3 s held both. The
   start waits up to 2.5 s (`TRAY_START_WAIT`) and the road up to 1 s, so a slow first start and a
   person socket slow to answer ran out of the budget. The question then read as having no surface,
   though the tray came up and the road was open.
 
   | Host | The wait before the window starts (#3888) |
   |---|---|
-  | a Mac's root daemon: one row, or a two-row Mac's root half | at most 4 s, the start's 3 s budget and then the road's 1 s. In practice 3.5 s, since a start that works answers within its own 2.5 s. Both are under the 5 s that the hub gives the agent's verdict past the window (`CONSENT_VERDICT_GRACE`, `crates/remote_control/src/consent.rs:149`), and a compile-time assertion keeps the budget and the road under it ([`companion.rs:1293`](../agents/roomlerd/src/companion.rs#L1293)) |
+  | a Mac's root daemon: one row, or a two-row Mac's root half | at most 4 s, the start's 3 s budget and then the road's 1 s. In practice 3.5 s, since a start that works answers within its own 2.5 s. Both are under the 5 s that the hub gives the agent's verdict past the window (`CONSENT_VERDICT_GRACE`, `crates/remote_control/src/consent.rs:149`), and a compile-time assertion keeps the budget and the road under it ([`companion.rs:1308`](../agents/roomlerd/src/companion.rs#L1308)) |
   | Linux, Windows, a Mac's per-user daemon | the start's alone, as before: the road is `Direct` there and answers at once |
 
   An exec question waits for neither: its surfaces go up beside its window, and `ensure_running`
@@ -2027,7 +2113,7 @@ says so to the root half. The root half counts the app only while that announcem
 | the per-user half's list and answers | as §10.8's worker: its own questions, then the root half's, over the root half's person socket for this person, 1 s at most. Since #4011 a list the root half misses keeps the root half's last list, 10 s from its answer at most, and one that proves it gone or refuses takes those questions off at once (§10.8). An answer to an id its own broker is not asking goes to the root half, 5 s at most, and since #4027 one the root half took takes its question off that kept list at once (§10.8). Every Mac daemon that runs as a person relays: a one-row Mac's worker and a two-row Mac's per-user half | `relays_the_root_half`, [`localapi_state.rs:711`](../agents/roomlerd/src/localapi_state.rs#L711); `consent_pending_view`, [`:2229`](../agents/roomlerd/src/localapi_state.rs#L2229); `consent_decide_view`, [`:2241`](../agents/roomlerd/src/localapi_state.rs#L2241) |
 | the announcement | a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) says `consent_relaying` over the root half's person socket for its person, then holds that connection. It dials again after the connection ends or a dial finds no socket: 1 s, doubling to 5 s while the root half is out of reach. A root half that refused, and whose connection then ended within 30 s (`HELD_STEADY`), is dialled on that backoff too: at an update the per-user half restarts about 3 s before the root half and meets the old one. Only a second such refusal in a row, with no take between them, waits a minute (`ANNOUNCE_AFTER_A_REFUSAL`, [`consent_relay.rs:639`](../agents/roomlerd/src/consent_relay.rs#L639); the dial's end, [`:685`](../agents/roomlerd/src/consent_relay.rs#L685)). Each change of state is logged once, never a retry | `keep_telling`, [`consent_relay.rs:663`](../agents/roomlerd/src/consent_relay.rs#L663); `tell_the_root_half`, [`:857`](../agents/roomlerd/src/consent_relay.rs#L857); started by `person_socket::run`, [`person_socket.rs:669`](../agents/roomlerd/src/person_socket.rs#L669), for `announces_consent_relay`, [`localapi_state.rs:2264`](../agents/roomlerd/src/localapi_state.rs#L2264) |
 | what the root half keeps | the announcement, in memory, for as long as that connection stays open. It is taken only on the person socket and only from that socket's own person, never root. The connection's loop holds it, and it ends when the per-user half closes the connection (it stopped or restarted), or when the listener stops serving the connection (the seat changed, or the daemon is stopping) | `Request::ConsentRelaying`, [`crates/localapi/src/lib.rs:1460`](../crates/localapi/src/lib.rs#L1460); the dispatcher's arm, [`:4061`](../crates/localapi/src/lib.rs#L4061); `HeldForTheConnection`, [`:2966`](../crates/localapi/src/lib.rs#L2966); `Announcements`, [`consent_relay.rs:544`](../agents/roomlerd/src/consent_relay.rs#L544); `consent_relaying`, [`localapi_state.rs:2257`](../agents/roomlerd/src/localapi_state.rs#L2257) |
-| the root half's verdict | the app is a question's surface only while an announcement is live for the person at the screen and that person's socket answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (§10.8, #3983) | `reach`, [`consent_relay.rs:472`](../agents/roomlerd/src/consent_relay.rs#L472); `reach_two_rows`, [`:522`](../agents/roomlerd/src/consent_relay.rs#L522); `reaches_the_tray`, [`companion.rs:2369`](../agents/roomlerd/src/companion.rs#L2369) |
+| the root half's verdict | the app is a question's surface only while an announcement is live for the person at the screen and that person's socket answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (§10.8, #3983) | `reach`, [`consent_relay.rs:472`](../agents/roomlerd/src/consent_relay.rs#L472); `reach_two_rows`, [`:522`](../agents/roomlerd/src/consent_relay.rs#L522); `reaches_the_tray`, [`companion.rs:2384`](../agents/roomlerd/src/companion.rs#L2384) |
 
 ```mermaid
 sequenceDiagram
@@ -2206,10 +2292,10 @@ sequenceDiagram
 
 | Piece | Where | What |
 |---|---|---|
-| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2712`](../agents/roomler-desktop/src/commands.rs#L2712) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
-| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2676`](../agents/roomler-desktop/src/commands.rs#L2676): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
+| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2879`](../agents/roomler-desktop/src/commands.rs#L2879) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
+| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2843`](../agents/roomler-desktop/src/commands.rs#L2843): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
 | the page | `decide`, [`panel-consent.js:138`](../agents/roomler-desktop/src/front/panel-consent.js#L138); `paintButtons`, [`:71`](../agents/roomler-desktop/src/front/panel-consent.js#L71); `PAGE_LIMIT_MS`, [`:54`](../agents/roomler-desktop/src/front/panel-consent.js#L54); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it, with how long its question has been shown (`shown`, #3987). The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
-| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2809`](../agents/roomler-desktop/src/commands.rs#L2809) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
+| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2976`](../agents/roomler-desktop/src/commands.rs#L2976) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
 | the fallback modal | `decide`, [`consent.js:70`](../agents/roomler-desktop/src/front/consent.js#L70) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
 
 - **The WARN at every start** (`refresh failed surface="encoder_caps" … person-at-the-device
@@ -2415,10 +2501,10 @@ flowchart TD
 |---|---|---|
 | the watch | one poll at a time, each list its own answer, and a list that failed keeps the last answer's | `SessionWatch::poll`, [`main.rs:459`](../agents/roomler-desktop/src/main.rs#L459) |
 | the poll's bound | 5 s for the connect and both lists (`WATCH_READ_WITHIN`, `main.rs:361`). A poll past it is a failed one. Until #3998 nothing bounded it, and a read that never ended stopped the watch with whatever it showed | `read_within`, [`main.rs:377`](../agents/roomler-desktop/src/main.rs#L377) |
-| the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged). Since #4020 every connect of the app whose error is read goes through it (§3.1) | `connect_service` and `proven`, [`commands.rs:2894`](../agents/roomler-desktop/src/commands.rs#L2894), [`:2908`](../agents/roomler-desktop/src/commands.rs#L2908) |
+| the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged). Since #4020 every connect of the app whose error is read goes through it (§3.1) | `connect_service` and `proven`, [`commands.rs:3061`](../agents/roomler-desktop/src/commands.rs#L3061), [`:3075`](../agents/roomler-desktop/src/commands.rs#L3075) |
 | the tray's red | the same answer as the banner (`tray_answer`, `main.rs:396`). The recording watch connects through the same proof, so the red comes down with a stopped daemon on every host | `spawn_recording_watch`, `tray.rs:438` |
-| the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:2873`](../agents/roomler-desktop/src/commands.rs#L2873); `poll`, `panel-viewing.js:68` |
-| a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2767`](../agents/roomler-desktop/src/commands.rs#L2767) |
+| the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:3040`](../agents/roomler-desktop/src/commands.rs#L3040); `poll`, `panel-viewing.js:68` |
+| a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2934`](../agents/roomler-desktop/src/commands.rs#L2934) |
 
 - **Logs.** A run of failed reads with something on the screen is logged once, at INFO:
   `session watch: a read of the device service failed; the screen keeps what its last answer said`,
@@ -2786,7 +2872,7 @@ Who calls them, and how each is read:
 
 | Caller | Runs | Taken as |
 |---|---|---|
-| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2627`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2923`) | as the person, in their session | the screen's session |
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2794`) and the banner's Disconnect (`cmd_rc_disconnect`, `:3090`) | as the person, in their session | the screen's session |
 | `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2507`; `rc_cmd`, `:2404`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
@@ -2858,7 +2944,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:4840`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:93`), within minutes while the tray is too old to connect (§13.2), and within a minute while a tray it stopped is not running again (§13.3). It goes by the EXE's own version when the marker does not name the daemon's (§13.4), and starts the tray again in each session it stopped one in (§13.5) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:4855`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:93`), within minutes while the tray is too old to connect (§13.2), and within a minute while a tray it stopped is not running again (§13.3). It goes by the EXE's own version when the marker does not name the daemon's (§13.4), and starts the tray again in each session it stopped one in (§13.5) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -2906,7 +2992,7 @@ flowchart TD
   a password. That is a system install's root daemon, or a per-user install's root update
   helper (FR-96). A per-user daemon that sees the skew wakes its helper. Mechanics:
   [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117).
-- **What it reads:** `installed_package` (`companion.rs:1509`) asks dpkg, then rpm. ⚠️ dpkg's
+- **What it reads:** `installed_package` (`companion.rs:1524`) asks dpkg, then rpm. ⚠️ dpkg's
   answer counts only for an INSTALLED package (`dpkg_installed_version`,
   `companion/package_sync.rs:56`). `dpkg-query -W` also answers, with a version, for one that was
   removed with its config kept, and a companion a person removed must stay removed.
@@ -2934,7 +3020,7 @@ flowchart TD
   graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
   swap does (#1686). A companion that was not running stays stopped.
 - **The grid catches up at once:** the sync drops `installed_version`'s 10-minute cache
-  (`forget_installed_version`, `companion.rs:1446`).
+  (`forget_installed_version`, `companion.rs:1461`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
   the Windows retry (§13.2's faster one with it). Windows' refresh at start is older and stays.
 
@@ -2963,11 +3049,11 @@ sequenceDiagram
 |---|---|---|
 | the tray's half | `check_updates`, `src/tray.rs:603` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
 | the event and the flag | `tray_check_update_js`, `src/tray.rs:589` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
-| one check | `runUpdateCheck`, `src/front/overview.js:184` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
-| a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
-| into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
-| the ring | `flashUpdates`, `src/front/overview.js:220`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
-| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2161` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+| one check | `runUpdateCheck`, `src/front/overview.js:197` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
+| a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:186` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
+| into view | `scrollToUpdates`, `src/front/overview.js:227`; `revealUpdates`, `:247` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
+| the ring | `flashUpdates`, `src/front/overview.js:233`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2328` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
 **Install update** queues the root update helper (FR-27).
@@ -3062,11 +3148,11 @@ flowchart TD
 
 | Piece | Where | Why |
 |---|---|---|
-| the order | `swap`, `agents/roomlerd/src/companion.rs:5178`, over `SwapOps`, `:5043`; on disk `FsSwap`, `:5576` | NTFS renames a running image aside, while it refuses a delete of that file or a replace onto it (`a_running_program_is_found_by_its_started_from_path_and_stopped_by_pid`, `agents/roomlerd/src/win_service/companion_procs.rs:496`). So the rename aside and the promote both run while the tray runs, and the tray is stopped only after both worked. What refuses the rename is an ACL, a handle opened without `FILE_SHARE_DELETE` (a scanner's, #3005's err 32) or endpoint protection: each now leaves the tray running, and the retry tries again |
-| a tray that would not stop | `swap`'s branch, `companion.rs:5213` | it keeps the single-instance lock, so a new tray could not take over. The old EXE goes back over the new one, which nothing runs, what was stopped is started again, and the marker stays as it was, so the retry tries again |
-| a name for the copy | `free_aside_name`, `companion.rs:5548`; `ASIDE_NAMES`, `:5540`; the sweep, `FsSwap::remove_old`, `:5657`, with `is_aside_name`, `:5564` | a copy an earlier swap left that is still mapped (a tray that would not stop) or held (a scanner) refuses a delete and a replace onto it alike, and used to fail the next swap's rename. The copy now takes the first free name of `.exe.old`, `.exe.old.1` … `.exe.old.8`, and a swap that lands removes every one it can. The sweep takes nothing else: never the marker (`.exe.version`) or the staged `.exe.new` |
-| the line | `refresh_line`, `companion.rs:5414`, logged by `log_refresh`, `:4956` | one renderer, tested: "respawned" only after a start that worked, and a start that failed is a warning with its error. The prefixes are the ones the lab kits read |
-| the consent prompt's start | `started_outcome`, `companion.rs:1928` | FR-27's `ensure_running` was told the tray started even when its start had failed, so the prompt waited out its window for nobody. It now reports `no_prompt_surface` then |
+| the order | `swap`, `agents/roomlerd/src/companion.rs:5193`, over `SwapOps`, `:5058`; on disk `FsSwap`, `:5591` | NTFS renames a running image aside, while it refuses a delete of that file or a replace onto it (`a_running_program_is_found_by_its_started_from_path_and_stopped_by_pid`, `agents/roomlerd/src/win_service/companion_procs.rs:496`). So the rename aside and the promote both run while the tray runs, and the tray is stopped only after both worked. What refuses the rename is an ACL, a handle opened without `FILE_SHARE_DELETE` (a scanner's, #3005's err 32) or endpoint protection: each now leaves the tray running, and the retry tries again |
+| a tray that would not stop | `swap`'s branch, `companion.rs:5228` | it keeps the single-instance lock, so a new tray could not take over. The old EXE goes back over the new one, which nothing runs, what was stopped is started again, and the marker stays as it was, so the retry tries again |
+| a name for the copy | `free_aside_name`, `companion.rs:5563`; `ASIDE_NAMES`, `:5555`; the sweep, `FsSwap::remove_old`, `:5672`, with `is_aside_name`, `:5579` | a copy an earlier swap left that is still mapped (a tray that would not stop) or held (a scanner) refuses a delete and a replace onto it alike, and used to fail the next swap's rename. The copy now takes the first free name of `.exe.old`, `.exe.old.1` … `.exe.old.8`, and a swap that lands removes every one it can. The sweep takes nothing else: never the marker (`.exe.version`) or the staged `.exe.new` |
+| the line | `refresh_line`, `companion.rs:5429`, logged by `log_refresh`, `:4971` | one renderer, tested: "respawned" only after a start that worked, and a start that failed is a warning with its error. The prefixes are the ones the lab kits read |
+| the consent prompt's start | `started_outcome`, `companion.rs:1943` | FR-27's `ensure_running` was told the tray started even when its start had failed, so the prompt waited out its window for nobody. It now reports `no_prompt_surface` then |
 
 The refresh's lines, message first, then its fields:
 
@@ -3104,11 +3190,11 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the flag | `TrayLost`, `companion.rs:5335`, one per process (`TRAY_LOST`, `:5394`), set and cleared by `start_stopped`, `:5238` | set when a swap stopped the tray and its start did not bring it back; cleared when a start works or a tray is seen running. In memory only: after a restart the sign-in start owns the tray |
-| when it is tried | `refresh_if_stale`, `companion.rs:4840`; `bring_back_lost_tray`, `:4979`; `restore_lost_tray`, `:5488` | after every pass that stopped no tray: nothing to swap (the marker reads current, the case after a swap whose start failed), a swap with none running, one that gave up before any stop, or a failed download. A pass that stopped a tray has tried its own start already |
-| how it is started | `start_lost_tray`, `companion.rs:5877`; `signed_in_session`, `:5911`; `set_to_start_at_sign_in`, `:5928` | in the session it was lost in, while its person is signed in there (#3844), or, for a tray whose session was not known, where someone is signed in (the console session's person, for the service); no tray runs in that session, and the tray is set to start at sign-in: the `Roomler Desktop` Run value, in `HKLM` for a machine-wide install (present while the device's switch is on) or in `HKCU` for a per-user one (gone once its person opted out). With `--autostart`, the sign-in start's argument, so a person who switched that off sees nothing (`decide_startup` exits) |
+| the flag | `TrayLost`, `companion.rs:5350`, one per process (`TRAY_LOST`, `:5409`), set and cleared by `start_stopped`, `:5253` | set when a swap stopped the tray and its start did not bring it back; cleared when a start works or a tray is seen running. In memory only: after a restart the sign-in start owns the tray |
+| when it is tried | `refresh_if_stale`, `companion.rs:4855`; `bring_back_lost_tray`, `:4994`; `restore_lost_tray`, `:5503` | after every pass that stopped no tray: nothing to swap (the marker reads current, the case after a swap whose start failed), a swap with none running, one that gave up before any stop, or a failed download. A pass that stopped a tray has tried its own start already |
+| how it is started | `start_lost_tray`, `companion.rs:5892`; `signed_in_session`, `:5926`; `set_to_start_at_sign_in`, `:5943` | in the session it was lost in, while its person is signed in there (#3844), or, for a tray whose session was not known, where someone is signed in (the console session's person, for the service); no tray runs in that session, and the tray is set to start at sign-in: the `Roomler Desktop` Run value, in `HKLM` for a machine-wide install (present while the device's switch is on) or in `HKCU` for a per-user one (gone once its person opted out). With `--autostart`, the sign-in start's argument, so a person who switched that off sees nothing (`decide_startup` exits) |
 | the retry | `LOST_TRAY_WAITS`, `companion.rs:135`; `RefreshSchedule::next`, `:463` | a lost tray is tried again within a minute, then at 5 and 15 min, then at the next refresh or sign-in. While it is lost the loop waits 1, 5 and 15 minutes (§13.2's wait when that is shorter), then its usual period, and each refresh tries the start |
-| the lines | `bring_back_lost_tray`, `companion.rs:4979` | `desktop companion is back after a refresh stopped it`, with `session=` and `how=` (INFO); `desktop companion is still not running after a refresh stopped it; it is tried again`, with `session=` and `why=`: WARN for the first try that did not bring it back, DEBUG for the rest; `desktop companion is not started again after a refresh stopped it: nobody is signed in to that session any more …` (INFO, #3844) |
+| the lines | `bring_back_lost_tray`, `companion.rs:4994` | `desktop companion is back after a refresh stopped it`, with `session=` and `how=` (INFO); `desktop companion is still not running after a refresh stopped it; it is tried again`, with `session=` and `why=`: WARN for the first try that did not bring it back, DEBUG for the rest; `desktop companion is not started again after a refresh stopped it: nobody is signed in to that session any more …` (INFO, #3844) |
 
 - While a lost tray is being retried, a tray the person quits within those minutes can be started
   once more.
@@ -3117,7 +3203,7 @@ flowchart TD
 - Each place is tried on its own (#3844, §13.5): the session the tray was lost in, or, for a tray
   whose session could not be read, the console session as before. One verdict per pass: its first
   try that did not bring a tray back is the WARN.
-- The tests (`swap_tests`, `companion.rs:5949`) drive the order through a fake swap and start that
+- The tests (`swap_tests`, `companion.rs:5964`) drive the order through a fake swap and start that
   fail on cue: a refused rename or promote stops nothing, a tray that would not stop gets the old
   EXE back, a start that failed is never "respawned" and marks the tray lost, the next pass starts
   it, and a tray the person quit, or a first run, gets none.
@@ -3149,9 +3235,9 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the decision | `installed_state`, [`agents/roomlerd/src/companion.rs:216`](../agents/roomlerd/src/companion.rs#L216); read by `look_beside`, [`:957`](../agents/roomlerd/src/companion.rs#L957), on a blocking thread, `LOOK_WAIT` (10 s) at most | the marker first; only when it does not name the daemon's version, the EXE's. An EXE at the daemon's version is current: no download, no swap, no stop of the tray. A version that cannot be read is not known, which is stale, as before: the refresh swaps |
-| the EXE's version | `exe_version`, [`:886`](../agents/roomlerd/src/companion.rs#L886); `version_resource_version`, [`:305`](../agents/roomlerd/src/companion.rs#L305) | the EXE is mapped as data and as an image resource only (`LoadLibraryExW`), so nothing in it runs, and it is freed on every path. Its `VS_VERSIONINFO` gives `ProductVersion`, else `FileVersion`. Through kernel32, which the daemon already imports: `GetFileVersionInfoW` would add `version.dll` to what the SYSTEM service loads. Every offset and length is checked against its block, and a malformed resource is not known. The release's companion carries the workspace version there, as its marker does: the 0.4.221 tray reads `0.4.221` |
-| the marker written again | `look_beside`; `MarkerWrites`, [`:252`](../agents/roomlerd/src/companion.rs#L252), one per process (`MARKER_WRITES`, [`:295`](../agents/roomlerd/src/companion.rs#L295)); `log_marker_line`, [`:987`](../agents/roomlerd/src/companion.rs#L987) | a marker that does not name the version of an EXE that does is written again, once a pass. The swap's own write and the passes after it share one latch: the first failure in a process is a WARN, the rest DEBUG, and a write that works after one that did not is an INFO |
+| the decision | `installed_state`, [`agents/roomlerd/src/companion.rs:216`](../agents/roomlerd/src/companion.rs#L216); read by `look_beside`, [`:972`](../agents/roomlerd/src/companion.rs#L972), on a blocking thread, `LOOK_WAIT` (10 s) at most | the marker first; only when it does not name the daemon's version, the EXE's. An EXE at the daemon's version is current: no download, no swap, no stop of the tray. A version that cannot be read is not known, which is stale, as before: the refresh swaps |
+| the EXE's version | `exe_version`, [`:901`](../agents/roomlerd/src/companion.rs#L901); `version_resource_version`, [`:305`](../agents/roomlerd/src/companion.rs#L305) | the EXE is mapped as data and as an image resource only (`LoadLibraryExW`), so nothing in it runs, and it is freed on every path. Its `VS_VERSIONINFO` gives `ProductVersion`, else `FileVersion`. Through kernel32, which the daemon already imports: `GetFileVersionInfoW` would add `version.dll` to what the SYSTEM service loads. Every offset and length is checked against its block, and a malformed resource is not known. The release's companion carries the workspace version there, as its marker does: the 0.4.221 tray reads `0.4.221` |
+| the marker written again | `look_beside`; `MarkerWrites`, [`:252`](../agents/roomlerd/src/companion.rs#L252), one per process (`MARKER_WRITES`, [`:295`](../agents/roomlerd/src/companion.rs#L295)); `log_marker_line`, [`:1002`](../agents/roomlerd/src/companion.rs#L1002) | a marker that does not name the version of an EXE that does is written again, once a pass. The swap's own write and the passes after it share one latch: the first failure in a process is a WARN, the rest DEBUG, and a write that works after one that did not is an INFO |
 | the fast waits | `known_version`, [`:181`](../agents/roomlerd/src/companion.rs#L181); `sibling_version`, [`:745`](../agents/roomlerd/src/companion.rs#L745) | §13.2's "too old" reads the same version, off the async worker: the marker when it names the daemon's, else the EXE's, else the marker's own words. An EXE of a known version from 0.4.216 on is not too old, whatever its marker reads |
 
 The lines, message first:
@@ -3170,10 +3256,10 @@ INFO desktop companion is stale/missing — refreshing own="0.4.223" recorded="0
   `known_version` and the same read of the EXE (#3908, below). Before, both read the marker alone:
   with a marker that cannot be written beside a current EXE, status called the tray too old to
   connect, and the device list showed the version the marker names.
-- Tests, in `swap_tests` ([`companion.rs:5949`](../agents/roomlerd/src/companion.rs#L5949)):
+- Tests, in `swap_tests` ([`companion.rs:5964`](../agents/roomlerd/src/companion.rs#L5964)):
   `a_marker_that_cannot_be_written_is_no_reason_to_swap_again` (no second swap, one WARN, no fast
   waits) and its control `the_version_check_swaps_what_it_always_did`; in `version_resource_tests`
-  ([`:6956`](../agents/roomlerd/src/companion.rs#L6956)) a good
+  ([`:6971`](../agents/roomlerd/src/companion.rs#L6971)) a good
   resource, a truncated, garbage or lying one, and on Windows a real EXE's read, freed afterwards.
 
 #### Status and the heartbeat (#3908)
@@ -3193,23 +3279,27 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the readers | `too_old_beside`, [`:694`](../agents/roomlerd/src/companion.rs#L694); `installed_beside`, [`:1471`](../agents/roomlerd/src/companion.rs#L1471); both through `known_beside`, [`:866`](../agents/roomlerd/src/companion.rs#L866) | status's and the heartbeat's cores, over the folder beside the daemon: the marker, then `known_version` with the EXE's answer for the files there now. With no EXE there is no tray to refuse or report, and nothing is read |
-| the read and its answer | `ExeVersions`, [`:770`](../agents/roomlerd/src/companion.rs#L770), one for the process (`EXE_VERSIONS`, [`:761`](../agents/roomlerd/src/companion.rs#L761)); `Stamp`, [`:830`](../agents/roomlerd/src/companion.rs#L830) | `exe_version` on a thread of its own, through `OneInFlight::start_unless_running` ([`one_in_flight.rs:222`](../agents/roomlerd/src/one_in_flight.rs#L222)): one read at a time, so a read that a filter driver holds keeps one thread however often status is asked. Its answer stands while the marker's last write and the EXE's last write and size are what they were when it was read. The EXE's part covers a swap whose marker write failed, which changes the EXE and not the marker |
-| a cold read | `known_beside`; `BesideNow`, [`:854`](../agents/roomlerd/src/companion.rs#L854) | no answer yet for the files there now (a daemon that just started, or a swap since the last read): the marker's words, not settled, and the read starts. The next ask has the EXE's answer |
-| the heartbeat's cache | `kept_version`, [`:1420`](../agents/roomlerd/src/companion.rs#L1420) | `installed_version` keeps an answer for 10 minutes, and only a settled one: an answer from the marker while the read runs goes out once, and the next heartbeat, 30 s later, reads again. The first heartbeat after a connect starts the read, so a `roomler status` a minute after a start has the EXE's answer |
+| the readers | `too_old_beside`, [`:694`](../agents/roomlerd/src/companion.rs#L694); `installed_beside`, [`:1486`](../agents/roomlerd/src/companion.rs#L1486); both through `known_beside`, [`:881`](../agents/roomlerd/src/companion.rs#L881) | status's and the heartbeat's cores, over the folder beside the daemon: the marker, then `known_version` with the EXE's answer for the files there now. With no EXE there is no tray to refuse or report, and nothing is read |
+| the read and its answer | `ExeVersions`, [`:770`](../agents/roomlerd/src/companion.rs#L770), one for the process (`EXE_VERSIONS`, [`:761`](../agents/roomlerd/src/companion.rs#L761)); `Stamp`, [`:845`](../agents/roomlerd/src/companion.rs#L845) | `exe_version` on a thread of its own, through `OneInFlight::start_unless_running` ([`one_in_flight.rs:222`](../agents/roomlerd/src/one_in_flight.rs#L222)): one read at a time, so a read that a filter driver holds keeps one thread however often status is asked. Its answer stands while the marker's last write and the EXE's last write and size are what they were when it was read. The EXE's part covers a swap whose marker write failed, which changes the EXE and not the marker. A read that finds an answer for its files already stored reads nothing (#4009). Before, a caller that looked just before a read stored its answer, and found that read ended when it went on to start one, read the same files a second time |
+| a cold read | `known_beside`; `BesideNow`, [`:869`](../agents/roomlerd/src/companion.rs#L869) | no answer yet for the files there now (a daemon that just started, or a swap since the last read): the marker's words, not settled, and the read starts. The next ask has the EXE's answer |
+| the heartbeat's cache | `kept_version`, [`:1435`](../agents/roomlerd/src/companion.rs#L1435) | `installed_version` keeps an answer for 10 minutes, and only a settled one: an answer from the marker while the read runs goes out once, and the next heartbeat, 30 s later, reads again. The first heartbeat after a connect starts the read, so a `roomler status` a minute after a start has the EXE's answer |
 
 - On a machine-wide install the worker answers status and sends the heartbeat, so the two share one
   answer. The refresh runs in the service host and reads the EXE itself (`sibling_version`,
   `look_beside`), uncached.
-- Tests, in `beside_version_tests` ([`companion.rs:7209`](../agents/roomlerd/src/companion.rs#L7209)),
-  each on a real EXE in a folder of its own (a copy of the test's own executable, given a version
-  resource with `UpdateResourceW`): the issue's case, a read-only old marker beside a current EXE,
-  read as the EXE (`a_read_only_old_marker_beside_a_current_exe_reads_as_the_exe`); a marker naming
-  the daemon's version, and no EXE, as before, the EXE not read; a malformed resource, by the marker
-  as before; a cold read that answers from the marker while the read is held, one read however
-  often asked; and an EXE swapped under a marker that cannot be written, read again. In
+- Tests, in `beside_version_tests` ([`companion.rs:7224`](../agents/roomlerd/src/companion.rs#L7224)),
+  each on a real EXE in a folder of its own (a copy of `cmd.exe`, given a version resource with
+  `UpdateResourceW`; until #4009 a copy of the whole test binary, whose first read, with the tests in
+  parallel on a CI runner's disk, could outlast the tests' 20 s wait): the issue's case, a read-only
+  old marker beside a current EXE, read as the EXE
+  (`a_read_only_old_marker_beside_a_current_exe_reads_as_the_exe`); a marker naming the daemon's
+  version, and no EXE, as before, the EXE not read; a malformed resource, by the marker as before; a
+  cold read that answers from the marker while the read is held, one read however often asked; a
+  read that ends while a caller looks, not made again
+  (`a_read_that_ends_while_a_caller_looks_is_not_made_again`); and an EXE swapped under a marker
+  that cannot be written, read again. In
   `version_tests`, `the_heartbeat_keeps_only_a_settled_answer`
-  ([`:1589`](../agents/roomlerd/src/companion.rs#L1589)).
+  ([`:1604`](../agents/roomlerd/src/companion.rs#L1604)).
 
 ### 13.5 The tray starts again in each session it was stopped in (Windows, #3844)
 
@@ -3233,12 +3323,12 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the plan | `restart_plan`, [`companion.rs:5266`](../agents/roomlerd/src/companion.rs#L5266), over `swap`'s stopped trays, [`:5178`](../agents/roomlerd/src/companion.rs#L5178) | for the service, once in each session a stopped tray ran in, in order, and nowhere else. A tray whose session could not be read starts where the start has always gone, the console session's person. A per-user install's daemon starts one, in its own session, as before. None stopped, none started |
-| the start | `start_desktop_in_session`, [`:5780`](../agents/roomlerd/src/companion.rs#L5780); `query_session_user_token`, [`win_service/supervisor.rs:218`](../agents/roomlerd/src/win_service/supervisor.rs#L218) | that session's own person's token (`WTSQueryUserToken`), its environment, and `CreateProcessAsUserW` on `winsta0\default`, as the console start does. No token (`ERROR_NO_TOKEN`), or no such session any more (`ERROR_CTX_WINSTATION_NOT_FOUND`), is a person who signed out: nothing is created. A disconnected Remote Desktop session still has its person, so the tray starts there and waits for them |
-| the bound | `start_again`, [`:5835`](../agents/roomlerd/src/companion.rs#L5835); `start_within`, [`:5855`](../agents/roomlerd/src/companion.rs#L5855); `RESPAWN_WAIT`, [`:5823`](../agents/roomlerd/src/companion.rs#L5823) | each start runs on the thread of the one start in flight for its session (`RESPAWNS`, threads named `tray-respawn`, `one_in_flight`'s rules), and the refresh waits 10 s at most for it. A start that hangs fails in time, saying so, holds that session alone, and the next session's start goes ahead. Never on the async worker: the swap and the lost-tray retry run on the blocking pool |
-| the line | `refresh_line`, [`:5414`](../agents/roomlerd/src/companion.rs#L5414); `TrayRestart`, [`:5088`](../agents/roomlerd/src/companion.rs#L5088) | one part per session, `; ` between them: `respawned (pid …, session …)`, `session 3: nobody is signed in to that session any more, so none was started`, or `session 3: ` and why the start failed. INFO when every session got its tray back or has nobody to get one; WARN `…could not be started again` when a start failed |
-| a tray lost | `TrayLost`, [`:5335`](../agents/roomlerd/src/companion.rs#L5335); `start_lost_tray`, [`:5877`](../agents/roomlerd/src/companion.rs#L5877) | per session: §13.3's retry goes to the session the tray was lost in, while its person is signed in there, never to the console, whose person may be someone else. A session signed out of since is forgotten, with an INFO line |
-| unchanged | `start_desktop`, [`:5736`](../agents/roomlerd/src/companion.rs#L5736) | the console start of the consent prompt (§10.4) when no tray runs, and a per-user daemon's start in its own session |
+| the plan | `restart_plan`, [`companion.rs:5281`](../agents/roomlerd/src/companion.rs#L5281), over `swap`'s stopped trays, [`:5193`](../agents/roomlerd/src/companion.rs#L5193) | for the service, once in each session a stopped tray ran in, in order, and nowhere else. A tray whose session could not be read starts where the start has always gone, the console session's person. A per-user install's daemon starts one, in its own session, as before. None stopped, none started |
+| the start | `start_desktop_in_session`, [`:5795`](../agents/roomlerd/src/companion.rs#L5795); `query_session_user_token`, [`win_service/supervisor.rs:218`](../agents/roomlerd/src/win_service/supervisor.rs#L218) | that session's own person's token (`WTSQueryUserToken`), its environment, and `CreateProcessAsUserW` on `winsta0\default`, as the console start does. No token (`ERROR_NO_TOKEN`), or no such session any more (`ERROR_CTX_WINSTATION_NOT_FOUND`), is a person who signed out: nothing is created. A disconnected Remote Desktop session still has its person, so the tray starts there and waits for them |
+| the bound | `start_again`, [`:5850`](../agents/roomlerd/src/companion.rs#L5850); `start_within`, [`:5870`](../agents/roomlerd/src/companion.rs#L5870); `RESPAWN_WAIT`, [`:5838`](../agents/roomlerd/src/companion.rs#L5838) | each start runs on the thread of the one start in flight for its session (`RESPAWNS`, threads named `tray-respawn`, `one_in_flight`'s rules), and the refresh waits 10 s at most for it. A start that hangs fails in time, saying so, holds that session alone, and the next session's start goes ahead. Never on the async worker: the swap and the lost-tray retry run on the blocking pool |
+| the line | `refresh_line`, [`:5429`](../agents/roomlerd/src/companion.rs#L5429); `TrayRestart`, [`:5103`](../agents/roomlerd/src/companion.rs#L5103) | one part per session, `; ` between them: `respawned (pid …, session …)`, `session 3: nobody is signed in to that session any more, so none was started`, or `session 3: ` and why the start failed. INFO when every session got its tray back or has nobody to get one; WARN `…could not be started again` when a start failed |
+| a tray lost | `TrayLost`, [`:5350`](../agents/roomlerd/src/companion.rs#L5350); `start_lost_tray`, [`:5892`](../agents/roomlerd/src/companion.rs#L5892) | per session: §13.3's retry goes to the session the tray was lost in, while its person is signed in there, never to the console, whose person may be someone else. A session signed out of since is forgotten, with an INFO line |
+| unchanged | `start_desktop`, [`:5751`](../agents/roomlerd/src/companion.rs#L5751) | the console start of the consent prompt (§10.4) when no tray runs, and a per-user daemon's start in its own session |
 
 The lines, message first:
 
@@ -3253,22 +3343,22 @@ INFO desktop companion is not started again after a refresh stopped it: nobody i
   `a_session_signed_out_of_since_gets_no_start_and_the_line_says_so`,
   `where_no_session_is_known_the_start_goes_where_it_always_went` and
   `a_lost_tray_is_tried_again_in_the_session_it_was_lost_in`; in `start_within_tests`
-  ([`:7581`](../agents/roomlerd/src/companion.rs#L7581))
+  ([`:7632`](../agents/roomlerd/src/companion.rs#L7632))
   `a_start_that_hangs_holds_its_session_alone`. They run in the Windows agent unit lane
   (`windows-agent-sessions`, step "Agent unit tests on Windows (the whole --lib suite)") and in the
   Linux lanes that run the agent's whole `--lib` suite.
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 
-**View screen** on the Devices page (`cmd_open_remote`, `src/commands.rs:1957`), **Open Roomler**
+**View screen** on the Devices page (`cmd_open_remote`, `src/commands.rs:2124`), **Open Roomler**
 on the Overview page and the tray all open a link through one function, `open_web_or_browser`
-(`src/commands.rs:1732`):
+(`src/commands.rs:1899`):
 
 | OS | Where the link opens | When nothing can open it |
 |---|---|---|
 | Windows | the in-app WebView2 window (Chromium: the full viewer works), else the default browser | the browser fallback's error |
 | macOS | the default browser (`open`) | the shell's error |
-| Linux | **the app registered for the link's scheme**, through GIO, with an activation token that brings a running browser forward (`open_in_browser`, `src/commands.rs:1782`; §14.2) | a dialog and the button's error as its tooltip: *No web browser is set up on this computer…*, until the next success puts the button's own back (`src/front/devices.js:261`, #2729) |
+| Linux | **the app registered for the link's scheme**, through GIO, with an activation token that brings a running browser forward (`open_in_browser`, `src/commands.rs:1949`; §14.2) | a dialog and the button's error as its tooltip: *No web browser is set up on this computer…*, until the next success puts the button's own back (`src/front/devices.js:261`, #2729) |
 
 ⚠️ **Linux never uses `xdg-open` for this.** When no app claims a link's scheme, xdg-open (GNOME:
 `gio open`) falls back to the link's **content** type: it fetches the page, sees `text/html` and
@@ -3299,11 +3389,11 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not. A root daemon starts it on three roads, and all three build the same unit
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4416`): the tray's start for a
-prompt (`start_tray`, `companion.rs:2299`, §10.2), FR-117's restart after an update
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4431`): the tray's start for a
+prompt (`start_tray`, `companion.rs:2314`, §10.2), FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:417`) and the post-install
 first run (`agents/roomlerd/src/companion/launch_once.rs:585`), the last two through
-`systemd_run_command` (`agents/roomlerd/src/companion.rs:4239`). For a root daemon that is a
+`systemd_run_command` (`agents/roomlerd/src/companion.rs:4254`). For a root daemon that is a
 transient **system** unit, which inherits nothing of the desktop; its environment was logind's
 four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`, `WAYLAND_DISPLAY`) and nothing
 else.
@@ -3311,15 +3401,15 @@ else.
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:4341`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:4267`;
-parsing in `session_env_pairs`, `companion.rs:4293`):
+`companion.rs:4356`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:4282`;
+parsing in `session_env_pairs`, `companion.rs:4308`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
   business in a process the daemon starts, and the bus and runtime dir keep coming from logind.
   So does `DISPLAY` when logind has one. When it has none, the session's own is taken (§14.1.1).
 - ⚠️ A value systemd had to shell-escape (`KEY=$'…'`), an empty one, or one with a control
-  character is skipped, never decoded (`plain_value`, `companion.rs:4312`). Nothing on the
+  character is skipped, never decoded (`plain_value`, `companion.rs:4327`). Nothing on the
   allowlist needs one.
 - A per-user daemon's `systemd-run --user` unit inherits the manager's environment already, so it
   reads nothing. When the manager's environment cannot be read, the companion starts as it always
@@ -3347,8 +3437,8 @@ install, at 1280 × 800:
 
 Since #3973, when logind gives the session no `Display`, a root daemon takes the session's own from
 the person's user manager. That is the environment it already reads for the allowlist. It passes
-the value on as `--setenv=DISPLAY=…` (`systemd_run_command_with`, `companion.rs:4442`;
-`session_display`, `companion.rs:4326`):
+the value on as `--setenv=DISPLAY=…` (`systemd_run_command_with`, `companion.rs:4457`;
+`session_display`, `companion.rs:4341`):
 
 ```mermaid
 flowchart TD
@@ -3363,7 +3453,7 @@ flowchart TD
 
 - **logind's value wins** when it has one, and `DISPLAY` is set once.
 - **Only the `DISPLAY` key**, by the allowlist's own value checks (`plain_value`,
-  `companion.rs:4312`). Never `GNOME_SETUP_DISPLAY`, the second display GNOME sets
+  `companion.rs:4327`). Never `GNOME_SETUP_DISPLAY`, the second display GNOME sets
   (`:1` beside `DISPLAY=:0` in the real GNOME session's environment the tests below read), and
   never an empty, shell-escaped or control-character value. `SESSION_ENV_KEYS` is unchanged.
 - **Only a root daemon's roads change**, all three of them: the start for a prompt, the restart
@@ -3396,7 +3486,7 @@ session's `DISPLAY`, as it does from a sign-in start.
   not at the work area's top-left.
 - **Tested** in "Agent tests (vp9-444, overlay, kernel TUN)", step "Test agent under vp9-444":
   `a_prompts_start_on_wayland_gives_the_companion_the_sessions_display`
-  ([`companion.rs:3567`](../agents/roomlerd/src/companion.rs#L3567): the start for a prompt, its
+  ([`companion.rs:3582`](../agents/roomlerd/src/companion.rs#L3582): the start for a prompt, its
   whole argv, for a root and a per-user daemon),
   `a_root_daemons_companion_takes_the_sessions_display_when_logind_has_none` (also on the real
   GNOME session's environment), `loginds_display_wins_over_the_sessions`,
@@ -3414,8 +3504,8 @@ With the browser already open behind the companion, a launch without a token ope
 left the window where it was. GNOME's focus-stealing prevention does not raise a window for a
 request that names no user action, so to the person View screen did nothing. The companion now
 asks GDK for an **activation token** tied to the click and hands it to the browser
-(`launch_default_handler`, `src/commands.rs:1821`; the token, `activation_token`,
-`src/commands.rs:1840`):
+(`launch_default_handler`, `src/commands.rs:1988`; the token, `activation_token`,
+`src/commands.rs:2007`):
 
 ```mermaid
 sequenceDiagram
@@ -3453,7 +3543,7 @@ sequenceDiagram
   plain one `None`.
 - ⚠️ **GTK main thread only.** The token comes from GDK, while View screen and Open Roomler are
   async commands on Tauri's runtime, so the launch hops to the main thread and waits for the
-  answer (`on_main_thread`, `src/commands.rs:1854`). The tray's Open Roomler is already there,
+  answer (`on_main_thread`, `src/commands.rs:2021`). The tray's Open Roomler is already there,
   and Tauri runs a main-thread task in place for a caller on the main thread, so the wait cannot
   deadlock.
 - Best-effort: with no GDK display, or off its thread, there is no token and the link opens as
@@ -3485,7 +3575,7 @@ kills everything left in its cgroup. Quitting the companion, a crash, and FR-117
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4428`), in a root daemon's system
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4443`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
 Its own helpers were expected to end with it, since WebKit's web and network processes exit when
 their UI process's connection closes. ⚠️ Not on every host: on the 0.4.221 lab's Ubuntu VM (software

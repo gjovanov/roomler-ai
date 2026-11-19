@@ -1609,7 +1609,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1930`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1941`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7816`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7849`)
 pin the role per command and the end line of a failure.
@@ -1908,7 +1908,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3120-3127`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3131-3138`).
 
 ### What a bare host needs (#3204)
 
@@ -2362,7 +2362,7 @@ flowchart TB
 |---|---|---|
 | Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
-| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions: in the hello when the worker has already told the daemon (on a reconnect, and on a restart of the daemon when the worker speaks first), else on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
 | The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
@@ -2406,6 +2406,16 @@ that asks, each reply goes back on that org's connection, and no org reaches a s
 another org opened. A person's own `auto_grant_session = false` and their `rc_*` keys
 still bind every session on that Mac: the worker hands them to the daemon, which takes
 the stricter of the person's and its own.
+
+Each org's row says what the worker has told the daemon from the connection's first
+message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
+permissions, what it can record, its Remote Apps words and its audio, and the stricter
+`rc_*` floor ([`signaling.rs:7009`](../agents/roomlerd/src/signaling.rs#L7009)), built
+into the caps by one function ([`:7048`](../agents/roomlerd/src/signaling.rs#L7048)).
+So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
+restarts of the daemon measured in #3992, is on the row at once, rather than the root's
+own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
+the hello, or changes later, reaches the row on the next heartbeat.
 
 The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
 ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
@@ -3245,7 +3255,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3118-3119`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3129-3130`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 
