@@ -775,14 +775,16 @@ pub fn describe(read: &Read, plan: &Plan) -> Vec<String> {
 }
 
 /// What an earlier conversion left, which a new one would start over: root's
-/// kept copy, `root.json`, every uid folder under [`RECORDS`], and every old
-/// copy a person's child reports. A refusal, before anything changes: they
-/// are the only way back from that conversion. FR-147: root opens nothing in
-/// a home for it.
+/// kept copy, `root.json`, every uid folder and any other entry under
+/// [`RECORDS`] (a temporary file a power loss left), and every old copy a
+/// person's child reports. A refusal, before anything changes: they are the
+/// only way back from that conversion, and `--revert` clears each of them.
+/// FR-147: root opens nothing in a home for it.
 pub fn leftover_copies(
     kept: bool,
     root_record: bool,
     record_uids: &[u32],
+    strays: &[String],
     people: &[Person],
 ) -> Vec<String> {
     use crate::one_row_home::Kind;
@@ -794,6 +796,7 @@ pub fn leftover_copies(
         out.push(format!("{RECORDS}/root.json"));
     }
     out.extend(record_uids.iter().map(|uid| format!("{RECORDS}/{uid}")));
+    out.extend(strays.iter().map(|name| format!("{RECORDS}/{name}")));
     for p in people {
         let folder = folder_display(&p.account.home, p.seen.segment);
         if p.seen.legacy.config.kind != Kind::Absent {
@@ -1330,7 +1333,7 @@ async fn ask<H: Host>(
 /// account [`accounts_to_ask`] names, in uid order, and a person is an
 /// account with a config, a plist or an old copy. Converting, a child that
 /// does not answer, or a config that does not parse, stops Read; a revert
-/// names that account and goes on.
+/// counts that account as one it could not give back (D5) and goes on.
 pub struct Found {
     pub people: Vec<Person>,
     pub left_alone: Vec<(u32, String)>,
@@ -1533,6 +1536,13 @@ pub trait Host: Send {
     fn record_uids(&self) -> Result<Vec<u32>>;
     /// `/etc/roomler/one-row/<uid>/` removed, with all it holds.
     fn remove_records_of(&mut self, uid: u32) -> Result<()>;
+    /// Every other name directly under [`RECORDS`] than `root.json` and the
+    /// uid folders: a temporary file a power loss left between its write and
+    /// its rename.
+    fn record_strays(&self) -> Result<Vec<String>>;
+    /// `/etc/roomler/one-row/<name>` removed, `name` one of
+    /// [`Host::record_strays`].
+    fn remove_record_stray(&mut self, name: &str) -> Result<()>;
     /// Root's file, as the daemon reads it.
     fn load_root(&self) -> Result<AgentConfig>;
     /// Root's file written over by [`crate::config::save`], which is atomic.
@@ -1613,6 +1623,7 @@ pub async fn migrate<H: Host>(
         host.read_root(RootFile::Kept)?.is_some(),
         host.read_root(RootFile::RootRecord)?.is_some(),
         &host.record_uids()?,
+        &host.record_strays()?,
         &read.people,
     );
     if !leftovers.is_empty() {
@@ -1693,7 +1704,7 @@ pub fn revert_digest(r: &Revert) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
     r.root_kept.as_deref().map(sha256_hex).hash(&mut h);
-    (r.supervised, &r.unfinished).hash(&mut h);
+    (r.supervised, &r.unfinished, &r.strays).hash(&mut h);
     for p in &r.people {
         p.uid.hash(&mut h);
         match &p.back {
@@ -2116,13 +2127,31 @@ pub struct Revert {
     /// Uid folders with no `record.json` that parses: a Keep that never
     /// finished, removed first.
     pub unfinished: Vec<u32>,
-    /// `(name, why)`: an account whose own process gave no answer.
-    pub unread: Vec<(String, String)>,
+    /// [`Host::record_strays`]: temporary files a power loss left, removed
+    /// first.
+    pub strays: Vec<String>,
+    /// `(uid, name, why)`: an account whose own process gave no answer. Each
+    /// fails (D5): named, any record of theirs kept for the next run, the
+    /// command ending in exit 1. Only that process sees the copies an older
+    /// release kept in their folder, so a revert without it is not complete.
+    pub unread: Vec<(u32, String, String)>,
     pub console_uid: Option<u32>,
 }
 
+impl Revert {
+    /// Nothing to put back or clear: only people whose process gave no answer.
+    fn only_unread(&self) -> bool {
+        self.root_kept.is_none()
+            && self.root_record.is_none()
+            && self.people.is_empty()
+            && self.unfinished.is_empty()
+            && self.strays.is_empty()
+    }
+}
+
 /// `None` when nothing is left to revert: no kept copy, no `root.json`, no
-/// uid folder, and no old copy any person's child reports.
+/// uid folder or other entry under [`RECORDS`], no old copy any person's
+/// child reports, and nobody whose child gave no answer.
 pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
     let root_kept = host.read_root(RootFile::Kept)?;
     let root_record = match host.read_root(RootFile::RootRecord)? {
@@ -2153,10 +2182,21 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
             _ => unfinished.push(uid),
         }
     }
+    let mut strays = host.record_strays()?;
+    strays.sort();
     let found = find_people(host, false).await?;
+    let unread: Vec<(u32, String, String)> = found
+        .unread
+        .into_iter()
+        .map(|(a, why)| (a.uid, a.name, why))
+        .collect();
     let mut people = Vec::new();
     for (record, after) in records {
         let uid = record.uid;
+        if unread.iter().any(|(u, ..)| *u == uid) {
+            // Their record stays: they fail, and the next run tries again.
+            continue;
+        }
         let seen = found
             .people
             .iter()
@@ -2191,7 +2231,13 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
     }
     // Uid order; a uid's record before its old copies (`sort_by_key` is stable).
     people.sort_by_key(|p| p.uid);
-    if root_kept.is_none() && root_record.is_none() && people.is_empty() && unfinished.is_empty() {
+    if root_kept.is_none()
+        && root_record.is_none()
+        && people.is_empty()
+        && unfinished.is_empty()
+        && strays.is_empty()
+        && unread.is_empty()
+    {
         return Ok(None);
     }
     let (supervised, supervised_from) = match (&root_record, &root_kept) {
@@ -2217,11 +2263,8 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
         supervised_from,
         people,
         unfinished,
-        unread: found
-            .unread
-            .into_iter()
-            .map(|(a, why)| (a.name, why))
-            .collect(),
+        strays,
+        unread,
         console_uid: host.console_uid(),
     }))
 }
@@ -2240,6 +2283,11 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
     for uid in &r.unfinished {
         out.push(format!(
             "{RECORDS}/{uid} is removed: a keep that never finished"
+        ));
+    }
+    for name in &r.strays {
+        out.push(format!(
+            "{RECORDS}/{name} is removed: a temporary file an interrupted write left"
         ));
     }
     if r.root_kept.is_some() {
@@ -2268,10 +2316,11 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             }
         ));
     }
-    for (name, why) in &r.unread {
+    for (uid, name, why) in &r.unread {
         out.push(format!(
-            "left alone: {name}'s own process gave no answer ({why}); copies of an earlier \
-             conversion in that home are not seen"
+            "not given back: {name} (uid {uid}): their own process gave no answer ({why}), and \
+             only it sees what an earlier conversion left in their folder. Root keeps any record \
+             of theirs, and the command ends in exit 1"
         ));
     }
     out.push(
@@ -2423,6 +2472,13 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
             "removed: {RECORDS}/{uid}, a keep that never finished"
         ));
     }
+    for name in &r.strays {
+        host.remove_record_stray(name)
+            .with_context(|| format!("removing {RECORDS}/{name}"))?;
+        host.say(&format!(
+            "removed: {RECORDS}/{name}, a temporary file an interrupted write left"
+        ));
+    }
     if let Some(kept) = &r.root_kept {
         if let Some(record) = &r.root_record
             && (record.kept_len != kept.len() as u64 || record.kept_sha256 != sha256_hex(kept))
@@ -2437,7 +2493,14 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         host.say(&format!("put back: {ROOT_CONFIG}"));
     }
     let bootstrap_for = bootstrap_after_revert(r.supervised, r.console_uid);
+    // (uid, name): one who fails is named and the others go on (D5).
     let mut failed = Vec::new();
+    for (uid, name, why) in &r.unread {
+        host.say(&format!(
+            "not given back: {name} (uid {uid}): their own process gave no answer: {why}"
+        ));
+        failed.push((*uid, name.clone()));
+    }
     let mut given_back = Vec::new();
     for p in &r.people {
         match give_back(host, p, bootstrap_for).await {
@@ -2451,10 +2514,13 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
                     "not given back: {} (uid {}): {why}",
                     p.name, p.uid
                 ));
-                failed.push(p.name.clone());
+                failed.push((p.uid, p.name.clone()));
             }
         }
     }
+    failed.sort_unstable();
+    failed.dedup();
+    let failed: Vec<String> = failed.into_iter().map(|(_, name)| name).collect();
     host.say("restarting the daemon onto the files put back: live sessions end now");
     let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
     let back = match host.kickstart() {
@@ -2518,6 +2584,16 @@ pub async fn revert_main<H: Host>(
     };
     for line in describe_revert(&r) {
         host.say(&line);
+    }
+    if r.only_unread() {
+        // Nothing to put back, so nothing to restart onto; and no claim that
+        // nothing is left, which only their own process could make.
+        let names: Vec<&str> = r.unread.iter().map(|(_, name, _)| name.as_str()).collect();
+        bail!(
+            "not given back: {} (above). Nothing has changed; `sudo roomlerd one-row --revert` \
+             tries again",
+            names.join(", ")
+        );
     }
     if dry_run {
         host.say("--dry-run: nothing has changed");
@@ -2975,7 +3051,7 @@ mod mac {
 mod tests {
     use super::*;
     use crate::one_row_home::Reply;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use tunnel_core::localapi::{GuiWorkerStatus, OrgStatus};
 
     const SERVER: &str = "https://roomler.example";
@@ -3373,6 +3449,8 @@ mod tests {
     /// The daemon answers depend on how often it was restarted.
     struct Fake {
         root: BTreeMap<RootFile, Vec<u8>>,
+        /// Other names directly under `/etc/roomler/one-row`.
+        strays: BTreeSet<String>,
         homes: BTreeMap<u32, FakeHome>,
         accounts: BTreeMap<u32, Account>,
         said: Vec<String>,
@@ -3433,6 +3511,7 @@ mod tests {
             };
             Self {
                 root: BTreeMap::from([(RootFile::Config, toml_of(&root()))]),
+                strays: BTreeSet::new(),
                 homes: BTreeMap::from([(501, home)]),
                 accounts: BTreeMap::from([(501, account(501, "goran"))]),
                 said: Vec::new(),
@@ -3651,6 +3730,14 @@ mod tests {
             self.root
                 .retain(|f, _| !matches!(f, RootFile::Person { uid: u, .. } if *u == uid));
             self.calls.push(format!("remove records {uid}"));
+            Ok(())
+        }
+        fn record_strays(&self) -> Result<Vec<String>> {
+            Ok(self.strays.iter().cloned().collect())
+        }
+        fn remove_record_stray(&mut self, name: &str) -> Result<()> {
+            self.strays.remove(name);
+            self.calls.push(format!("remove stray {name}"));
             Ok(())
         }
         fn load_root(&self) -> Result<AgentConfig> {
@@ -4007,6 +4094,33 @@ mod tests {
         assert_eq!(mac.files(), before);
     }
 
+    /// T8b: a temporary file a power loss left directly under the records'
+    /// folder, between its write and its rename, is refused and cleared as T8's
+    /// unfinished keep is.
+    #[tokio::test]
+    async fn a_stray_temporary_file_is_a_leftover_the_revert_removes() {
+        let mut mac = Fake::new(one_row_daemon);
+        let before = mac.files();
+        mac.strays.insert(".root.json.tmp".to_string());
+        let e = convert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(
+            e.contains("earlier migration")
+                && e.contains("/etc/roomler/one-row/.root.json.tmp")
+                && e.contains("--revert"),
+            "{e}"
+        );
+        assert!(!mac.wrote());
+        revert_now(&mut mac).await.unwrap();
+        assert!(
+            mac.said()
+                .contains("removed: /etc/roomler/one-row/.root.json.tmp, a temporary file"),
+            "{}",
+            mac.said()
+        );
+        assert!(mac.strays.is_empty());
+        assert_eq!(mac.files(), before);
+    }
+
     #[tokio::test]
     async fn a_mac_that_is_one_row_already_is_left_alone() {
         let mut mac = Fake::new(one_row_daemon);
@@ -4157,6 +4271,61 @@ mod tests {
         revert_now(&mut mac).await.unwrap();
         assert_eq!(mac.files(), before);
         assert_eq!(mac.counts.get("kickstart"), Some(&3));
+    }
+
+    /// D5 in a revert, as ruled: a person whose own process gives no answer
+    /// fails, named; the others go on; their record stays for the next run.
+    #[tokio::test]
+    async fn a_person_whose_read_gives_no_answer_fails_the_revert() {
+        let mut mac = Fake::new(one_row_daemon).with_ana();
+        let before = mac.files();
+        convert_now(&mut mac).await.unwrap();
+        let converted = mac.homes[&502].clone();
+        mac.scripts.insert((502, "read"), Script::Garbage);
+        let e = revert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(e.contains("ana"), "{e}");
+        assert!(
+            mac.said()
+                .contains("not given back: ana (uid 502): their own process gave no answer"),
+            "{}",
+            mac.said()
+        );
+        assert_eq!(mac.homes[&501], before.1[&501]);
+        assert_eq!(mac.homes[&502], converted);
+        assert!(calls_of(&mac, &["put-back 502"]).is_empty());
+        let record = |uid| RootFile::Person {
+            uid,
+            part: Part::Record,
+        };
+        assert!(mac.root.contains_key(&record(502)) && !mac.root.contains_key(&record(501)));
+        assert!(
+            mac.root.contains_key(&RootFile::RootRecord) && mac.root.contains_key(&RootFile::Kept)
+        );
+        mac.scripts.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.files(), before);
+    }
+
+    /// The same with nothing else left (a Mac an older release converted):
+    /// nothing changes and nothing restarts, and the command names the
+    /// person, never "nothing to revert".
+    #[tokio::test]
+    async fn a_revert_that_reads_nobody_changes_nothing() {
+        let mut mac = Fake::new(one_row_daemon);
+        mac.converted_by_an_older_release();
+        mac.scripts.insert((501, "read"), Script::Exit(3));
+        let before = mac.files();
+        let e = revert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(
+            e.contains("goran") && !e.contains("nothing to revert"),
+            "{e}"
+        );
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote());
+        assert_eq!(mac.counts.get("kickstart"), None);
+        mac.scripts.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(calls_of(&mac, &["put-back-legacy 501"]).len(), 1);
     }
 
     /// T6: the deadline stopped ana's `convert` after it changed her files.
@@ -4341,6 +4510,7 @@ mod tests {
             supervised_from: "root.json",
             people: Vec::new(),
             unfinished: Vec::new(),
+            strays: Vec::new(),
             unread: Vec::new(),
             console_uid: Some(501),
         };
@@ -4348,6 +4518,9 @@ mod tests {
         assert_eq!(revert_digest(&r), revert_digest(&r2));
         r2.unfinished.push(501);
         assert_ne!(revert_digest(&r), revert_digest(&r2));
+        let mut r3 = r.clone();
+        r3.strays.push(".root.json.tmp".to_string());
+        assert_ne!(revert_digest(&r), revert_digest(&r3));
     }
 
     #[test]
