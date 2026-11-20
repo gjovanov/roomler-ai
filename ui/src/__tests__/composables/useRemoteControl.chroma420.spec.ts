@@ -234,34 +234,23 @@ describe('#3651 AC1 — "Standard (4:2:0)" stays chosen: after the choice, after
     })
   }
 
-  it('hevc: the per-browser default holds it too — a device with no override of its own opens on HEVC + Standard (4:2:0)', async () => {
-    const first = page()
-    first.choose('hevc', 'yuv420')
+  // #4101 — H.264 as well as HEVC. Until #4101 the per-browser transport read
+  // `data-channel-h264` back as `auto`, so a device with no override of its
+  // own opened on codec Auto; only the 4:2:0, a key of its own, survived.
+  for (const { codec, transport } of PAIRS) {
+    it(`${codec}: the per-browser default holds it too — a device with no override of its own opens on ${codec} + Standard (4:2:0)`, async () => {
+      const first = page()
+      first.choose(codec, 'yuv420')
 
-    const elsewhere = page(OTHER)
-    expect(elsewhere.shown()).toEqual({ codec: 'hevc', chroma: 'yuv420' })
-    elsewhere.dial('sharper')
-    const req = await elsewhere.request()
-    expect(elsewhere.shown()).toEqual({ codec: 'hevc', chroma: 'yuv420' })
-    expect(req.preferred_transport).toBe('data-channel-hevc')
-    expect(req).not.toHaveProperty('chroma_pref')
-  })
-
-  it('h264: the per-browser default keeps its 4:2:0; its codec reads back as Auto (class row 3, left for a decision)', async () => {
-    // `readStoredVideoTransport` has no `data-channel-h264` in its allow-list,
-    // so every H.264 per-browser default (plain, 4:4:4, and this one) reads
-    // back as the transport `auto` on a device with no override of its own.
-    // The chroma is a key of its own and survives: such a device runs the
-    // auto rank pinned to 4:2:0, never 4:4:4.
-    const first = page()
-    first.choose('h264', 'yuv420')
-
-    const elsewhere = page(OTHER)
-    expect(elsewhere.shown()).toEqual({ codec: 'auto', chroma: 'yuv420' })
-    elsewhere.dial('sharper')
-    const req = await elsewhere.request()
-    expect(req).not.toHaveProperty('chroma_pref')
-  })
+      const elsewhere = page(OTHER)
+      expect(elsewhere.shown()).toEqual({ codec, chroma: 'yuv420' })
+      elsewhere.dial('sharper')
+      const req = await elsewhere.request()
+      expect(elsewhere.shown()).toEqual({ codec, chroma: 'yuv420' })
+      expect(req.preferred_transport).toBe(transport)
+      expect(req).not.toHaveProperty('chroma_pref')
+    })
+  }
 })
 
 describe('#3651 AC2 — on Sharper, a pair that can do 4:4:4 asks for 4:2:0 when 4:2:0 was chosen', () => {
