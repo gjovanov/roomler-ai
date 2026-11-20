@@ -5603,8 +5603,8 @@ mod supervise_tests {
     /// Review R1-1: the window manager goes first, and the keeper is
     /// signalled only once it has collected the window manager's exit, before
     /// it knows of the stop: that order made certain, not timed (review
-    /// R2-8). The keeper must not warn that the desktop runs on without a
-    /// window manager, then or ever. The server still runs then, so nothing
+    /// R2-8). The keeper must not warn of the window manager's exit, then
+    /// or ever. The server still runs then, so nothing
     /// else could keep the keeper quiet; it gets its SIGTERM with the
     /// daemon's own stop, the rest of the unit's. (The server's own exit in a
     /// stop is the supervisor's to report: #3671.)
@@ -5674,7 +5674,7 @@ mod supervise_tests {
     /// Review R1-1 — an X server's death ends its clients, the window manager
     /// among the first, and the supervisor's teardown then ends the rest.
     /// The keeper collects the window manager's exit before it learns of the
-    /// death, and must not warn that the desktop runs on without one: by the
+    /// death, and must not warn of it: by the
     /// time the notice is due, the daemon's teardown has cleared it, or the
     /// server (the desktop's group leader) is a zombie, which is not running.
     #[test]
@@ -5719,8 +5719,10 @@ mod supervise_tests {
     /// Review R2-2 — the notice the two tests above keep quiet is still said
     /// when it is true. A window manager that exits while its X server runs
     /// is collected by the keeper and reported with its pid once the exit is
-    /// the keeper's `NOTICE_DELAY` (2 s) old, and the desktop runs on without
-    /// it: collected and logged, nothing restarted (#3665, B2).
+    /// the keeper's `NOTICE_DELAY` (2 s) old, with the delay after which it
+    /// is started again (#4099; [`plan`]'s hour here, so nothing starts in
+    /// this test). The line said that the desktop runs on without one until
+    /// #4099 decided otherwise (#3665's B2 collected and logged only).
     #[test]
     fn a_window_manager_that_exits_while_its_server_runs_is_reported() {
         let dir = scratch("wm-exits");
@@ -5762,7 +5764,10 @@ mod supervise_tests {
             line.contains(&format!("the window manager ({})", wm.pid)),
             "the notice does not name the window manager's pid: {line}"
         );
-        assert!(line.contains("runs on without one"), "{line}");
+        assert!(
+            line.contains("— it is started again 3600s after its exit"),
+            "{line}"
+        );
         assert!(
             after >= Duration::from_secs(2),
             "said {after:?} after the signal, before the notice was due: {line}"
