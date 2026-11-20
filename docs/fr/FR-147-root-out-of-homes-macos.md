@@ -114,16 +114,16 @@ working two-row.
 
 ### Who does what
 
-| Step | Root (`sudo roomlerd one-row`, `migrate`, `one_row.rs:1642`; `revert_main`, `:2604`) | The person's child (`roomlerd one-row-home <verb>`, one per uid) |
+| Step | Root (`sudo roomlerd one-row`, `migrate`, `one_row.rs:1651`; `revert_main`, `:2725`) | The person's child (`roomlerd one-row-home <verb>`, one per uid) |
 |---|---|---|
-| Read | lists `/Users` and `stat`s each entry for owner, device and inode (`scan_users`, `:2655`, with no `canonicalize`); reads the account, `appdirs::account_entry(uid)` (new beside `account_home`, `appdirs.rs:872`: `pw_name`, `pw_gid`, `pw_dir`), and its UUID; reads its own file and status as today | `read`: its home's identity; the owner, mode and kind of `<H>`, `<H>/Library`, `<L>` and `<F>`; its config and plist bytes; the names of any copies an older release kept |
+| Read | lists `/Users` and `stat`s each entry for owner, device and inode (`scan_users`, `:2776`, with no `canonicalize`); reads the account, `appdirs::account_entry(uid)` (new beside `account_home`, `appdirs.rs:872`: `pw_name`, `pw_gid`, `pw_dir`), and its UUID; reads its own file and status as today | `read`: its home's identity; the owner, mode and kind of `<H>`, `<H>/Library`, `<L>` and `<F>`; its config and plist bytes; the names of any copies an older release kept |
 | Plan, `--dry-run` | `plan` stays pure (`one_row.rs:569`), over configs parsed from the child's bytes. `Person` (`:259`) keeps the uid, the gid, the name and the home as display text, with no `dir` and no path method | nothing |
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
-| LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as before (`bootout_agent`, `:3150`) | the plist is removed by `convert` |
+| LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as before (`bootout_agent`, `:3274`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
 | People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:554`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
-| Restart, verify, report | as before (`wait_for_new_daemon`, `:2022`; `verify`, `:2052`; `report`, `:2070`) | nothing |
-| Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then the bootstrap (D6) |
+| Restart, verify, report | as before (`wait_for_new_daemon`, `:2049`; `verify`, `:2160`; `report`, `:2178`) | nothing |
+| Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then, once the restart has answered, the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by any release before root's side |
 
 ```mermaid
@@ -141,9 +141,11 @@ sequenceDiagram
     C-->>R: the new config's sha256, the plist removed
     R->>R: restart and verify
     alt a step or the verify fails
+        R->>R: root's file back
         R->>C: put-back, the kept bytes
-        R->>D: bootstrap gui/uid (D6)
-        R->>R: root's file back, restart, then the records go
+        R->>R: the restart, if the conversion restarted, until it answers
+        R->>D: bootstrap gui/uid (D6) once the old screen worker is gone, then kickstart without -k
+        R->>R: then the records go
     end
 ```
 
@@ -210,7 +212,7 @@ with "nothing has changed" (exit 1).
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
 hold (the package's `sudo_line_fits`, `postinstall:260-266`, and its owner test, `:301`):
 
-1. The home is the console person's (`console_uid()`, `one_row.rs:3129`).
+1. The home is the console person's (`console_uid()`, `one_row.rs:3253`).
 2. That person is an administrator: `/usr/sbin/dseditgroup -o checkmember -m <name> admin` exits 0
    (`postinstall:261`), a question to the account database.
 3. The child reports that the home is an absolute path to a folder, not a link, and that `<H>/Library` is a folder
@@ -228,13 +230,13 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2628`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:2698`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:960`) and `folder_words` (`:1093`), with `r5_words` (`:1139`); `refusals` (`:1481`) says them.
 
 ### Root's records
 
 Each file is written as a temporary file in the same folder, `fsync`, `rename`, then an `fsync` of the folder.
-The macOS host's `write_root` (`one_row.rs:3016`) does this for every `RootFile`, which `root_path` (`:143`) maps
+The macOS host's `write_root` (`one_row.rs:3140`) does this for every `RootFile`, which `root_path` (`:143`) maps
 under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was written in place, at its final name.
 
 | Path | Owner, mode | Holds |
@@ -256,9 +258,9 @@ under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was 
   is for display; a renamed account keeps its uid and UUID.
 - **`leftover_copies`** (`:798`) lists root's kept copy, `root.json`, any entry under `/etc/roomler/one-row/`
   and every old copy a child reports. It asks nothing of a path in a home. Any of them refuses a new conversion.
-- **`revert_plan`** (`:2185`) is `Some` when root's kept copy, `root.json`, a committed record or an old copy that
+- **`revert_plan`** (`:2293`) is `Some` when root's kept copy, `root.json`, a committed record or an old copy that
   a child reports exists, or when a person's `read` gives no answer. Before P1 it was `None` without root's kept copy.
-- **Removed by root only, and only after the restart answered** (`wait_for_new_daemon`, `:2022`), in the undo and in
+- **Removed by root only, and only after the restart answered** (`wait_for_new_daemon`, `:2049`), in the undo and in
   `--revert`: each uid's folder, then `root.json`, then root's kept copy last, so a stop part-way leaves what the
   next `--revert` needs.
 - The records hold tokens and WireGuard keys, the same class as root's own file beside them. The uninstall's
@@ -299,30 +301,40 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   that step's error, and the undo runs. Exit 3 reads "this Mac changed after the plan was said". The child's stderr
   is quoted, trimmed and control-escaped into the command's output and `/var/log/roomler/one-row.log`, which also
   records each child's pid, uid, verb, exit and run time.
-- **The plan's digest** (`plan_digest`, `one_row.rs:1704`) also hashes each person's config and plist sha256, so the
-  detached copy (`go_ahead`, `:2721`; `hand_over`, `:2762`) applies only the bytes it showed.
+- **The plan's digest** (`plan_digest`, `one_row.rs:1713`) also hashes each person's config and plist sha256, so the
+  detached copy (`go_ahead`, `:2845`; `hand_over`, `:2886`) applies only the bytes it showed.
 
 ### Order, failure and undo
 
-The conversion keeps its shape from before P1: `apply` (`one_row.rs:1752`), then `steps` (`:1779`), then the verify,
-and any error runs `undo` (`:1922`), with `Done` (`:1609`) recording what to put back.
+The conversion keeps its shape from before P1: `apply` (`one_row.rs:1761`), then `steps` (`:1788`), then the verify,
+and any error runs `undo` (`:1933`), with `Done` (`:1618`) recording what to put back.
 
 | # | Step (who) | On disk if it stops there | Undo |
 |---|---|---|---|
 | R | `read` per person (child) | nothing changed | none: stop |
 | K1 | root's kept copy, then `root.json` (root) | a temporary file at most | remove them |
 | K2 | `/etc/roomler/one-row/<uid>/` per person, `record.json` last (root) | the uids before it, and one unfinished folder | remove them |
-| L | bootout by label of each loaded agent (root, `:3150`) | the job may still drain | bootstrap it back (D6) for every uid booted out |
+| L | bootout by label of each loaded agent (root, `:3274`) | the job may still drain | bootstrap it back (D6) for every uid booted out |
 | W | root's file (root; `config::save` is atomic) | root's file, old or new | root's file back as a copy of its kept copy |
 | C | `convert` per person (child) | that person's plist gone or not, the config old or new, each atomically | `put-back` for every person `convert` was started for, answered or not |
-| S, V | restart, verify (root) | the new files and the restarted daemon | everything above, then the restart onto it (`:1977-1978`) |
+| S, V | restart, verify (root) | the new files and the restarted daemon | everything above, the bootstraps last: the restart onto it (`:1986-1987`), then, once it has answered, the bootstraps |
 
 - A `convert` that the deadline kills after its `rename` has changed the file without answering, so "answered"
   cannot be the test. `put-back` writes the kept bytes whatever is there, so a person never written gets their own
-  bytes back. `Done` has `started`, pushed before each `convert` is spawned (`:1862`), and the undo puts back
-  every person in it (`:1942`).
-- The undo's order is the one from before P1 (`undo`, `:1922`): the files, then the bootstraps, then the restart. Each failure is
-  said, and the rest still run.
+  bytes back. `Done` has `started`, pushed before each `convert` is spawned (`:1871`), and the undo puts back
+  every person in it (`:1953`).
+- The undo's order (`undo`, `:1933`): root's file, then each person's files, then the restart if the conversion
+  had restarted, then the bootstraps. Each failure is said, and the rest still run.
+- **The bootstraps come after that restart's answer (#4092).** Until then the one-row daemon's screen worker runs
+  as the person and holds their single-instance lock, and an agent that finds the lock held exits 0, which
+  `KeepAlive{SuccessfulExit=false}` never starts again. Before #4092 the bootstraps came first, and lab cell C4
+  read just that: the job loaded, the worker stopped 4 ms after the bootstrap, and the agent's lock exit followed.
+  Now the undo waits for that worker to stop, at most `WORKER_GONE_WITHIN` (20 s, `:2087`), and never stops it.
+  Then it bootstraps and runs `launchctl kickstart gui/<uid>/com.roomler.agent` without `-k`, the supervisor's
+  own hand-back (`start_agent`, `:2130`). With supervision on in root's file put back there is no wait: the
+  restarted daemon's own supervisor hands the agent back. A conversion that stopped before its restart ran no
+  one-row worker, so the bootstraps run at once, each with its kickstart. A restart that does not answer loads no
+  agent, and the undo names it.
 - The records and root's kept copy go only after the undo's restart answered. If it does not answer they stay, the
   command says so, and `--revert` finishes the job.
 - `--expect-*` makes `convert` act only on the bytes root kept, so the undo puts back exactly what was replaced. The
@@ -333,20 +345,25 @@ and any error runs `undo` (`:1922`), with `Done` (`:1609`) recording what to put
 ### `--revert`
 
 1. **Plan**: `revert_plan`, as above. Unfinished uid folders are removed.
-2. **The switch** that `bootstrap_after_revert` reads (`one_row.rs:2306`), before P1 from root's kept copy
+2. **The switch** that `bootstrap_after_revert` reads (`one_row.rs:2414`), before P1 from root's kept copy
    alone, comes from `root.json` when present, else from root's kept copy, else from root's live file. The last
    case is an older revert that put root's file back and stopped, so the live file holds the kept bytes.
 3. **Root's file** goes back as a copy of its kept bytes (temporary file, `fsync`, `rename`), checked against
    `root.json` when present; the kept copy stays. Without a kept copy (a resumed older revert) this step is skipped.
-   Root's file goes first, as before P1 (`revert`, `:2497`), so a person whose put-back fails is a row nobody serves, never two
+   Root's file goes first, as before P1 (`revert`, `:2595`), so a person whose put-back fails is a row nobody serves, never two
    processes on one enrollment.
-4. **Per person**, in uid order: the UUID check, the stored-file checks, then `put-back` (or `put-back-legacy`),
-   then the console person's bootstrap where `bootstrap_after_revert` says so. A person who fails keeps their record
-   and is named; the others go on. Another person who was signed in when L booted them out gets their agent at
-   their next login, as today.
-5. **Restart** (`:2556-2557`) and `wait_for_new_daemon`.
-6. **Only after the restart answered**: the records of the people who succeeded go, then, if nobody failed,
-   `root.json` and root's kept copy. Exit 1 if anyone failed.
+4. **Per person**, in uid order: the UUID check, the stored-file checks, then `put-back` (or `put-back-legacy`).
+   A person who fails keeps their record and is named; the others go on. Another person who was signed in when L
+   booted them out gets their agent at their next login, as today.
+5. **Restart** (`:2663-2664`) and `wait_for_new_daemon`. One that does not answer loads no LaunchAgent, and the
+   command says so: until it answers, the daemon may still run the one-row file, whose moved enrollments the
+   person's file holds again, and that would be two processes on one enrollment.
+6. **Only after the restart answered**: the console person's bootstrap where `bootstrap_after_revert` says so,
+   once the one-row daemon's screen worker has stopped, then `kickstart` without `-k` (#4092, `start_agent`, as in
+   the undo above). Then the records of the people who succeeded go, then, if nobody failed, `root.json` and
+   root's kept copy. Exit 1 if anyone failed. Before #4092 the bootstrap was step 4's, and lab cell C2 on 0.4.228's
+   candidate read what followed: the agent logged `single-instance lock held by another process; exiting`, the
+   worker stopped 55 ms later with the restart, and the row stayed offline until the next login.
 
 A second `--revert` redoes steps 3 to 6: every put-back and copy is idempotent, and the leftover check bars a
 conversion in between (D5). Before P1 the first failure stopped the revert.
@@ -354,7 +371,7 @@ conversion in between (D5). Before P1 the first failure stopped the revert.
 A person whose `read` gives no answer during `--revert` fails as in step 4 (named with the reason, any record kept,
 the others go on, exit 1; ruled 2026-11-19), since on an older Mac only that `read` sees their old copies. When
 nobody's `read` answers and nothing else is left to put back, `--revert` exits 1 before it asks, naming them, and
-restarts nothing: a revert that changes nothing has nothing to restart onto (`revert_main`, `:2604`, its
+restarts nothing: a revert that changes nothing has nothing to restart onto (`revert_main`, `:2725`, its
 `only_unread` branch, ruled 2026-11-19). A temporary file a power loss left directly under `/etc/roomler/one-row/`
 refuses a new conversion as a leftover, and `--revert` removes it and says so, as it does an unfinished uid folder.
 
@@ -377,7 +394,7 @@ Root copies back only its own kept copy, so a revert of an older Mac writes noth
 | Question | Answer |
 |---|---|
 | Who takes it away | root boots the job out by label; the person's child removes `<P>` in `convert`, after checking its bytes |
-| Where its bytes are kept | `/etc/roomler/one-row/<uid>/com.roomler.agent.plist`, root's, 600, written by root from the child's `read`. It no longer moves into the person's folder, and root writes it with `write_root` (`one_row.rs:3016`) |
+| Where its bytes are kept | `/etc/roomler/one-row/<uid>/com.roomler.agent.plist`, root's, 600, written by root from the child's `read`. It no longer moves into the person's folder, and root writes it with `write_root` (`one_row.rs:3140`) |
 | Who puts it back | the person's child, in `put-back`: a temporary file in `<L>`, `fsync`, `rename`, the mode as above. It makes `<L>` 0755 as the person when missing, and refuses (exit 4) where `<L>` is not writable |
 | What `launchctl bootstrap` loads | the file at `<P>`, which launchd opens by path in every form, the person's own login included. No process of ours running as root opens it: `<P>` is only an argument, built by one function, `bootstrap_argv`. Who sends it is D6 |
 | Precedent | the package's login-item file writes are the person's (`as_person`, `postinstall:237-239`, `:366`); its bootstrap is root's, by path (`replace_launchd_service`, `postinstall:145-163`, called at `:401` and `:486`) |
@@ -459,6 +476,8 @@ exists only as an argument list, built by `bootstrap_argv`.
 | `revert_plan_counts_legacy_names_alone`, `resumed_revert_reads_the_bit_without_a_kept_copy`, `a_revert_resumes_from_records_after_roots_file_is_back`, `a_record_whose_account_uuid_changed_is_not_given_back` | `--revert`, of older Macs and resumed |
 | `sudo_line_only_where_it_fits` | one case per condition; each failing alone prints the no-command text |
 | `an_unfinished_keep_is_dropped`, `a_stored_file_that_does_not_match_fails_its_uid`, `records_go_only_after_the_restart_answers` | root's records, in the undo and the revert |
+| `revert_starts_the_agent_once_the_restart_has_answered`, `revert_waits_for_the_old_screen_worker_to_stop`, `revert_bootstraps_after_the_bound_and_leaves_the_worker_alone`, `revert_starts_only_the_console_persons_agent`, `revert_with_supervision_on_starts_no_agent`, `a_person_whose_give_back_fails_gets_no_agent_start` | #4092 in `--revert`: the bootstrap after the restart's answer and after the one-row screen worker has gone, then `kickstart` without `-k`; the bound's line, and nothing stopped; the rules for whom, unchanged |
+| `an_undo_after_the_restart_starts_the_agent_once_the_worker_is_gone`, `an_undo_before_the_restart_starts_the_agent_at_once`, `an_undo_onto_supervision_on_waits_for_no_worker`, `a_restart_that_never_answers_starts_no_agent` | #4092 in the undo: the same order after a restart, at once without one, no wait where the restarted daemon supervises; no agent beside a restart that never answered |
 | `put_back_writes_0644_and_makes_agents_dir_0755` | the modes |
 | `a_fed_child_with_a_chatty_stderr_does_not_deadlock`, `an_oversize_reply_is_refused`, `a_child_that_hangs_is_killed_and_the_step_fails` | the transport's bounds and deadline; the undo runs |
 | `an_entry_that_is_not_its_owners_home_is_left_alone`, `two_entries_of_one_uid_are_one_person`, `a_home_with_no_account_is_left_alone` | which homes are people |
@@ -472,9 +491,9 @@ where macOS does not. Cell C8 reads it.
 | Cell | Pass line |
 |---|---|
 | C1 two-row, one person at the console, then `one-row --yes` | `<F>`, `config.toml` and `config.toml.prev` are the person's; `find /Users -name '*.pre-one-row'` is empty; `/etc/roomler/one-row/<uid>` is root's 700 with files 600; `gui_worker attached: true` and `screen-capture` |
-| C2 then `--revert` | config and plist sha256 as before C1; owners the person's; plist mode 644; `launchctl print gui/<uid>/com.roomler.agent` loaded where the kept root file had supervision off; the records gone; two rows online |
+| C2 then `--revert` | config and plist sha256 as before C1; owners the person's; plist mode 644; `launchctl print gui/<uid>/com.roomler.agent` loaded where the kept root file had supervision off; the records gone; two rows online. Since #4092, twice: both rows online within 60 s with no login, the person's agent running with no `single-instance lock held` line in its log, and `bootstrapped:` after the restart's line in `one-row.log` |
 | C3 a second person, enrolled, not signed in | their file blanked and still theirs after C1, restored by C2; no bootstrap for them |
-| C4 a failed conversion (no Screen Recording grant) | the undo: `config.toml` and the plist byte-identical and owned as before; no record left |
+| C4 a failed conversion (no Screen Recording grant) | the undo: `config.toml` and the plist byte-identical and owned as before; no record left. Since #4092 (a failed conversion after its restart): the person's agent running after the undo, with no `single-instance lock held` line |
 | C5 a Mac converted by 0.4.219, then the candidate's `--revert` | the old copies back, owners as before |
 | C6 a #3763 Mac (`<L>` root's), the console person an administrator; then a standard person | refused, nothing changed; the first prints `sudo chown -h '<name>' '<L>'`, the second the no-command text |
 | C7 every run of C1 to C5 | `eslogger` (create, rename, unlink, setowner, setmode, write), or `fs_usage -w -f filesys` joined to `one-row.log`'s pid and uid lines: no event under `/Users` from a roomlerd process with effective uid 0 |
@@ -511,12 +530,12 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2409`, its sequence at `:2437`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2443`, its sequence at `:2471`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2628`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2698`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:2678-2767`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:2755-2846`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:3-51` (the step table) and `one_row_home.rs:3-60`.
 - `docs/README.md`: the `installation.md` row names the rule.
@@ -595,3 +614,4 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 
 | date | what | result |
 |---|---|---|
+| 2026-11-20 | #4092, read by the release lab on 0.4.228's candidate. C2: `--revert` bootstrapped the person's agent before its restart; the agent logged `single-instance lock held by another process; exiting` and exited 0, the one-row screen worker stopped 55 ms later with the restart, and the row stayed offline until the next login. C4, a failed conversion's undo: the job loaded but not running, the worker stopped 4 ms after the bootstrap. The fix loads the agent only once the restart has answered and that worker has stopped (at most 20 s, nothing stopped), then runs `kickstart` without `-k` | both RED on master in the fake's order tests, GREEN with the fix; C2 and C4 are owed on the next candidate |
