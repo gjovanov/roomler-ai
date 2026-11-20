@@ -1222,10 +1222,10 @@ guard, above), which is why a mesh with peers kept working.
 
 The bring-up now gives the first address the shape wg-quick gives a utun on
 macOS, routes the block on it while the gate below allows it, and reads both
-back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:7691`, called
+back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:7696`, called
 from `up_with` at `tun.rs:5247`). Every route-guard wave then decides the
 block's route again, with the function the bring-up used
-(`decide_utun_block`, `tun.rs:7602`):
+(`decide_utun_block`, `tun.rs:7607`):
 
 ```mermaid
 flowchart TD
@@ -1261,8 +1261,8 @@ fails withholds (`utun_block_gate`, `tun.rs:804`).
 
 | Input | Read from | Withholds when |
 |---|---|---|
-| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:7548`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:950`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
-| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:7566`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:837`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
+| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:7553`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:950`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
+| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:7571`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:837`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
 
 "Ours" is never a name prefix: another product's utun is named the same way.
 A sibling org's utun carries an address inside this one's block whenever the
@@ -1336,7 +1336,7 @@ add would start the next wave every time.
   is its own peer and the block routes on it`. macOS `route` exits 0 when the
   kernel refuses a write (`route: writing to routing socket: File exists`,
   measured), so the read-back decides, never an exit status (`run_bringup`,
-  `tun.rs:7650`).
+  `tun.rs:7655`).
 * **Another product may route the CGNAT range.** Another mesh on the same Mac
   can hold `100.64.0.0/10`. A per-org block is usually narrower than that, so
   its route is added beside the other one and wins by longest prefix. A route
@@ -1362,16 +1362,16 @@ overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:8988`) | the shape |
-| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:9061`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
-| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:9147`) | 0.4.228's shape, and no wave routes the block |
-| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:9199`) | a peer's `/32` beside the block |
-| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:9260`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
-| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:9311`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
-| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:9375`) | a deleted block route is back after one wave |
-| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:9422`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
-| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:9541`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
-| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:9584`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
+| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:9429`) | the shape |
+| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:9502`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
+| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:9588`) | 0.4.228's shape, and no wave routes the block |
+| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:9640`) | a peer's `/32` beside the block |
+| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:9701`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
+| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:9752`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
+| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:9816`) | a deleted block route is back after one wave |
+| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:9863`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
+| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:9982`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
+| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:10025`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
 
 The parsers, the argv builders, the gate and the decision are pure and tested
 on every platform (`utun_shape_tests`, `tun.rs:971`; `utun_block_gate_tests`,
@@ -1392,9 +1392,10 @@ packet through their kernel's local route for the address, and the daemon
 never sees it.
 
 The utun's read path now hands such a packet back to the OS. It writes the
-packet back into the same utun as it came, and the kernel takes it as inbound
-and delivers it, as it delivers a peer's packet (`past_own_packets`,
-`crates/tunnel-core/src/overlay/tun.rs:7514`, called from `read_packet` at
+packet back into the same utun, unchanged but for the checksum of an IPv6 TCP
+or UDP packet (below), and the kernel takes it as inbound and delivers it, as
+it delivers a peer's packet (`past_own_packets`,
+`crates/tunnel-core/src/overlay/tun.rs:7516`, called from `read_packet` at
 `tun.rs:5562`). A reply to it is a packet to the same address, so it takes the
 same way back:
 
@@ -1403,7 +1404,7 @@ flowchart TD
     app["a program on the Mac sends to the node's own overlay address, such as ping or a lookup at the resolver"] --> utun["the kernel sends it into the utun, by the address's host route"]
     utun --> read["the utun's read path reads it"]
     read --> own{"is the destination this utun's own address?"}
-    own -- yes --> back["written back into the utun, as it came"]
+    own -- yes --> back["written back into the utun, an IPv6 TCP or UDP checksum finished first"]
     back --> deliver["the kernel takes it as inbound and delivers it"]
     back --> next["the read goes on to the next packet"]
     next --> read
@@ -1412,11 +1413,11 @@ flowchart TD
 
 | Rule | What the read path does |
 |---|---|
-| Which packets | those whose destination is the utun's own address (`utun_hands_back`, `tun.rs:8536`), read as `Router::dst_of_ip_packet` reads it (`crates/tunnel-core/src/overlay/router.rs:475`): an IPv4 destination, or the IPv4 a derived overlay IPv6 carries. So the node's derived IPv6 is handed back too, and no other IPv6 is |
-| As it came | no TTL or hop-limit change and no new checksum: the node is not routing it |
+| Which packets | those whose destination is the utun's own address (`utun_hands_back`, `tun.rs:8541`), read as `Router::dst_of_ip_packet` reads it (`crates/tunnel-core/src/overlay/router.rs:475`): an IPv4 destination, or the IPv4 a derived overlay IPv6 carries. So the node's derived IPv6 is handed back too, and no other IPv6 is |
+| As it came | no TTL or hop-limit change: the node is not routing it. The one change is the checksum of an IPv6 TCP or UDP packet, finished before the write (below) |
 | Never forwarded | a handed-back packet never reaches the outbound path |
 | A failed write | drops the packet, and it is never written again. The write is the device's own non-blocking one, without the wait for writability that the write of a peer's packet has, so a write the kernel does not take at once fails as well, and a hand-back never holds up the read. A DEBUG line, at most once a minute, reads `overlay: a packet to this node's own overlay address could not be handed back to the OS; dropped`, with the count of failed writes |
-| Cost | one comparison per packet read, with no allocation and no lock |
+| Cost | one comparison per packet read, with no allocation and no lock. A handed-back IPv6 TCP or UDP packet is also summed once, for its checksum |
 | Platforms | macOS only. Linux and Windows read as before |
 
 * **The utun's own address** is the one it was brought up with, read once, at
@@ -1429,11 +1430,23 @@ flowchart TD
   #4117's code, a datagram the Mac sent to it was read from the utun and never
   delivered (measured on a macOS 26 CI runner). The same comparison covers it,
   so it is handed back like the IPv4 address and never reaches the outbound
-  path. macOS does not deliver a UDP datagram handed back to that address,
-  though (measured on the same runner), so such a datagram still gets no
-  answer. The IPv4 address, where MagicDNS listens and where macOS sends the
-  overlay zone, is not affected.
-* **The count.** `SystemTun::self_delivered` (`tun.rs:7535`) counts the packets
+  path.
+* **The IPv6 checksum.** On this path macOS leaves the checksum of an IPv6
+  TCP or UDP packet for the network device to finish, and a utun finishes
+  nothing. Measured on the same runner: a UDP datagram's checksum field holds
+  the pseudo-header's sum alone, and written back as it came the datagram is
+  dropped and counted `with bad checksum`; a TCP connection whose segments
+  are written back as they came gets no answer. The hand-back therefore
+  computes that checksum again, in full, before the write
+  (`finish_v6_transport_checksum`, `tun.rs:8564`, called at
+  `tun.rs:7521`): an IPv6 packet whose Next Header is TCP or UDP and whose
+  lengths agree gets it over the pseudo-header and the whole segment with the
+  field zeroed, and a UDP checksum of 0 is written as `0xffff`. A complete
+  checksum computes to itself, so there is no test for "unfinished". Anything
+  else goes back as it came: ICMPv6, whose checksum the kernel computes
+  itself, a packet with an extension header, and every IPv4 packet, whose
+  checksum macOS finishes (measured).
+* **The count.** `SystemTun::self_delivered` (`tun.rs:7540`) counts the packets
   a utun has handed back. The first one logs ONE INFO, `overlay: a packet to
   this node's own overlay address was handed back to the OS; the next ones are
   counted, not logged`. There is no line per packet.
@@ -1452,16 +1465,21 @@ utun in #4117's shape, in the CI step `macOS overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10391`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
-| `a_ping_to_its_own_address_is_answered` (`tun.rs:10430`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
-| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10471`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
-| `the_kill_switch_hands_nothing_back` (`tun.rs:10543`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
-| `a_datagram_to_its_own_derived_v6_is_handed_back_once_and_never_read` (`tun.rs:10599`) | the same datagram to the derived IPv6: one hand-back, it never comes out of the read, and nothing more comes into the utun in the 2 s after. Whether macOS delivers it, and what `ping6 -c 3` to the address gets, are printed |
-| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:10686`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
-| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:10766`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10832`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
+| `a_ping_to_its_own_address_is_answered` (`tun.rs:10871`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
+| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10912`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
+| `the_kill_switch_hands_nothing_back` (`tun.rs:10984`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
+| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:11039`) | the same datagram to the derived IPv6 reaches a socket bound to `[<self v6>]:53`, and its reply comes back. The route macOS answers for the address, and what `ping6 -c 3` to it gets, are printed |
+| `a_handed_back_v6_datagram_is_delivered_once_and_never_read_again` (`tun.rs:11120`) | for that datagram, one hand-back and one more for its reply; no packet to the address comes out of the read, and nothing more comes into the utun in the 2 s after |
+| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:11193`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
+| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:11273`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+| `a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways` (`tun.rs:11421`) | a TCP connection from the Mac to a listener on the derived IPv6 carries a few bytes each way, and its segments are handed back. How much of a 64 KiB write arrives within 3 s is printed |
+| `a_tcp_connection_to_its_own_address_carries_bytes_both_ways` (`tun.rs:11451`) | the same over the IPv4 address, as a control |
 
-The rule is pure and tested on every platform (`utun_self_delivery_tests`,
-`tun.rs:8541`).
+The rules are pure and tested on every platform: the hand-back's
+(`utun_self_delivery_tests`, `tun.rs:8613`), and the checksum's, against
+checksums the tests compute another way (`v6_transport_checksum_tests`,
+`tun.rs:8730`).
 
 ---
 

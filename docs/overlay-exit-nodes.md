@@ -591,7 +591,7 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:5425`, `current_uplink` `tun.rs:7767`, `bsd_default_uplink` `tun.rs:322` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Capture the uplink per family, re-read before every pin | `tun.rs:5425`, `current_uplink` `tun.rs:7772`, `bsd_default_uplink` `tun.rs:322` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
 | Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:368`, `bsd_pin_row` `tun.rs:404`, `bsd_pin_holds` `tun.rs:417`, `bsd_table` `tun.rs:7295` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
 | Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:6340` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
 | Re-check the pins | `stale_host_exemptions` `tun.rs:6428`, the gate `route_guard.rs:600` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |

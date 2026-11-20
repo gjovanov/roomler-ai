@@ -7499,11 +7499,13 @@ mod system {
     #[cfg(target_os = "macos")]
     impl SystemTun {
         /// #4125 — while the packet in `buf[..n]` is for this utun's own
-        /// address ([`super::utun_hands_back`]), write it back into the utun
-        /// as it came (no TTL or hop-limit change, no new checksum), and read
-        /// the next packet into `buf`. Returns the length of the first packet
-        /// that is not, which [`TunIo::read_packet`] returns as before: a
-        /// handed-back packet never reaches the outbound path.
+        /// address ([`super::utun_hands_back`]), write it back into the utun,
+        /// and read the next packet into `buf`. No TTL or hop-limit change:
+        /// the one change is an IPv6 TCP or UDP checksum, which is finished
+        /// first ([`super::finish_v6_transport_checksum`]). Returns the
+        /// length of the first packet that is not, which
+        /// [`TunIo::read_packet`] returns as before: a handed-back packet
+        /// never reaches the outbound path.
         ///
         /// The write is the device's own, the one under
         /// [`TunIo::write_packet`], without the wait for writability that
@@ -7514,6 +7516,9 @@ mod system {
         async fn past_own_packets(&self, buf: &mut [u8], mut n: usize) -> std::io::Result<usize> {
             let sd = &self.self_delivery;
             while super::utun_hands_back(&buf[..n], sd.own) {
+                // An IPv6 TCP or UDP checksum macOS left for the device to
+                // finish is finished here, or the kernel drops the packet.
+                super::finish_v6_transport_checksum(&mut buf[..n]);
                 let device: &tun::Device = &self.dev;
                 match device.send(&buf[..n]) {
                     Ok(_) => sd.note_handed_back(&self.if_name),
@@ -8537,6 +8542,73 @@ pub(crate) fn utun_hands_back(packet: &[u8], own: Option<std::net::Ipv4Addr>) ->
     own.is_some_and(|own| crate::overlay::router::Router::dst_of_ip_packet(packet) == Some(own))
 }
 
+/// #4125 — finish, in place, the TCP or UDP checksum of an IPv6 packet the
+/// utun's read path hands back ([`utun_hands_back`]). On a packet to the
+/// node's own derived IPv6, macOS leaves that checksum for the network
+/// device to finish (the field holds the pseudo-header's sum alone), a utun
+/// finishes nothing, and the kernel drops the packet when it comes back in.
+/// One rule, with no test for "unfinished", because a complete checksum
+/// computes to itself:
+///
+/// * an IPv6 packet whose Next Header, right after the fixed header, is TCP
+///   (6) or UDP (17);
+/// * whose payload length is the rest of `packet` and holds the TCP or UDP
+///   header, and, for UDP, equals the UDP length field;
+/// * gets its checksum computed again, in full, over the pseudo-header
+///   (source, destination, upper-layer length, next header) and the whole
+///   segment with the field zeroed. A UDP checksum of 0 is written as
+///   `0xffff` (RFC 8200 §8.1); a TCP one stays 0.
+///
+/// Anything else, IPv4 included, is left as it came. No allocation.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn finish_v6_transport_checksum(packet: &mut [u8]) {
+    /// The fixed IPv6 header.
+    const FIXED: usize = 40;
+    /// `bytes` as 16-bit big-endian words, an odd last byte padded with a
+    /// zero, added to `sum` and not folded. A payload length is 16 bits, so
+    /// a packet this rule takes has at most 32 Ki words: a `u32` holds them.
+    fn add_words(bytes: &[u8], mut sum: u32) -> u32 {
+        let mut words = bytes.chunks_exact(2);
+        for w in &mut words {
+            sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+        }
+        if let [last] = words.remainder() {
+            sum += u32::from(*last) << 8;
+        }
+        sum
+    }
+
+    if packet.len() < FIXED || packet[0] >> 4 != 6 {
+        return;
+    }
+    let plen = u16::from_be_bytes([packet[4], packet[5]]);
+    if FIXED + usize::from(plen) != packet.len() {
+        return;
+    }
+    let next = packet[6];
+    let field = match next {
+        6 if plen >= 20 => FIXED + 16,
+        17 if plen >= 8 && u16::from_be_bytes([packet[FIXED + 4], packet[FIXED + 5]]) == plen => {
+            FIXED + 6
+        }
+        _ => return,
+    };
+    packet[field] = 0;
+    packet[field + 1] = 0;
+    // The pseudo-header: the source and destination addresses, then the
+    // upper-layer length and the next header, each in a 32-bit word.
+    let pseudo = add_words(&packet[8..FIXED], u32::from(plen) + u32::from(next));
+    let mut sum = add_words(&packet[FIXED..], pseudo);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = match !(sum as u16) {
+        0 if next == 17 => 0xffff,
+        c => c,
+    };
+    packet[field..field + 2].copy_from_slice(&checksum.to_be_bytes());
+}
+
 #[cfg(test)]
 mod utun_self_delivery_tests {
     use super::utun_hands_back;
@@ -8671,9 +8743,10 @@ mod v6_transport_checksum_tests {
     const UDP_FIELD: usize = 6;
     const TCP_FIELD: usize = 16;
 
-    /// The rule under test. Red: a stand-in that changes nothing, until the
-    /// fix points this at the hand-back's own function.
-    fn finish(_packet: &mut [u8]) {}
+    /// The rule under test: the hand-back's own function.
+    fn finish(packet: &mut [u8]) {
+        super::finish_v6_transport_checksum(packet)
+    }
 
     /// The 16-bit ones'-complement sum of `bytes`, padded with a zero to an
     /// even length, summed in 64 bits and folded.
@@ -11111,10 +11184,11 @@ mod macos_kernel_tests {
     /// #4125 — what the utun reads for a datagram the Mac sends to its own
     /// derived IPv6, with the hand-back off so that it comes out of the read,
     /// and which of its variants macOS delivers when it is written back in:
-    /// as read (what the hand-back writes), with its UDP checksum finished,
+    /// as read, with its UDP checksum finished (what the hand-back writes),
     /// and a datagram from a peer's derived address with a checksum computed
-    /// here. The IPv4 datagram's checksum is read too, for comparison. It
-    /// measures: it asserts only that both datagrams are read.
+    /// here. The IPv4 datagram's checksum is read too, for comparison. It is
+    /// the record of why the hand-back finishes an IPv6 checksum, and it
+    /// asserts only that both datagrams are read.
     #[tokio::test]
     async fn measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6() {
         if !cfg!(target_os = "macos") {
