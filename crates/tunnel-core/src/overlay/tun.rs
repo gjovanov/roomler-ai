@@ -7651,6 +7651,16 @@ mod macos_kernel_tests {
         )
     }
 
+    /// The interface a route for exactly `net/plen` is on, if one exists.
+    /// With none, the block's own lookup answers `not in table` or, as this
+    /// runner did right after the block's route was deleted, the default
+    /// route: both read `None` here.
+    fn held_exactly(net: &str, plen: u8) -> Option<String> {
+        let got = block_route(net, plen)?;
+        let on = got.interface.clone()?;
+        super::bsd_route_is_ours(Some(&got), net.parse().unwrap(), plen, &on).then_some(on)
+    }
+
     /// One block of `route -n monitor` output is a table write.
     fn is_write(block: &str) -> bool {
         let kind = block.lines().find(|l| l.starts_with("RTM_")).unwrap_or("");
@@ -8248,8 +8258,9 @@ mod macos_kernel_tests {
         tun.defend_block_floor().await;
         tun.defend_block_floor().await;
         drop(guard);
-        assert!(
-            block_route("100.65.0.0", 22).is_none(),
+        assert_eq!(
+            held_exactly("100.65.0.0", 22),
+            None,
             "the next wave deletes our block route: {:?}\n{}",
             block_route("100.65.0.0", 22),
             sh("netstat", &["-rn", "-f", "inet"])
@@ -8317,8 +8328,9 @@ mod macos_kernel_tests {
                 "22",
             ],
         );
-        assert!(
-            block_route("100.65.0.0", 22).is_none(),
+        assert_eq!(
+            held_exactly("100.65.0.0", 22),
+            None,
             "staging the reap failed: {:?}",
             block_route("100.65.0.0", 22)
         );
@@ -8386,6 +8398,43 @@ mod macos_kernel_tests {
             "the stand-in for another product must hold the block first: {:?}",
             block_route("100.65.0.0", 22)
         );
+        // Printed, not asserted: does an add the kernel refuses reach the
+        // routing socket's listeners? netstate's monitor counts an `RTM_ADD`
+        // header whatever its errno, so a wave that tried to add over a held
+        // block would arm the next wave. The wave never adds then.
+        {
+            let mut mon = std::process::Command::new("route")
+                .args(["-n", "monitor"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("route monitor");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            sh(
+                "route",
+                &[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "100.65.0.0",
+                    "-prefixlen",
+                    "22",
+                    "-interface",
+                    "lo0",
+                ],
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = mon.kill();
+            let out = mon.wait_with_output().expect("route monitor output");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let refused: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("RTM_ADD") && !l.contains("errno 0,"))
+                .collect();
+            eprintln!(
+                "measure: a refused add of the held block, as route -n monitor saw it: {refused:?}"
+            );
+        }
 
         let tun =
             SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
