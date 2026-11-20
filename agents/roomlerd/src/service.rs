@@ -367,6 +367,21 @@ pub fn stop(config_path: &Path) -> Result<String> {
     }
 }
 
+/// FR-150 P1a — `service stop --for-upgrade`, the per-user MSI's
+/// `StopOldDaemon`: [`stop`], except that on Windows nothing left to stop is
+/// the step done rather than a failure (`windows::stop_for_upgrade`). Only the
+/// per-user MSI runs it.
+pub fn stop_for_upgrade(config_path: &Path) -> Result<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::stop_for_upgrade(config_path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        stop(config_path)
+    }
+}
+
 /// FR-93 P5 (#2144) — at start, a per-user Linux daemon whose unit file wants it
 /// by `graphical-session.target` as well, while only `default.target` links to
 /// it (it was enabled before that target joined the unit's `[Install]`), enables
@@ -1063,6 +1078,27 @@ mod windows {
                 ))
             }
         }
+    }
+
+    /// FR-150 P1a — `service stop --for-upgrade`, the per-user MSI's
+    /// `StopOldDaemon`: [`stop`], unless there is nothing to stop
+    /// (`user_task::nothing_to_stop`). On a per-user update the old product's
+    /// `UnregisterAutostart` has ended and deleted the task before this step,
+    /// so [`stop`]'s hard stop finds no task to end and fails, and the
+    /// person's log, which records each step since P1a, would read every
+    /// healthy update as a failed one (#4128's C10). The MSI ignores this
+    /// step's exit code either way.
+    pub fn stop_for_upgrade(config_path: &Path) -> Result<String> {
+        use crate::win_service::stop_event::{user_stop_event_held, user_stop_event_name};
+        let name = user_stop_event_name(&crate::instance_lock::instance_id(config_path));
+        if user_task::nothing_to_stop(&Schtasks, &own_account()?, user_stop_event_held(&name)) {
+            return Ok(
+                "No daemon for this config holds a stop event this process can see, and this \
+                 account has no task to end: nothing to stop before the upgrade."
+                    .into(),
+            );
+        }
+        stop(config_path)
     }
 
     /// The Terminal Services session this process runs in. 0 is the services

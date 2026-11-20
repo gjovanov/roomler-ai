@@ -22,7 +22,7 @@
 //! | Path | What it acts on |
 //! |---|---|
 //! | `service install` (the MSI's `RegisterAutostart`, the tray, by hand) | registers [`autostart`] with a security descriptor of the account's own (FR-150), then deletes a legacy task that is its own, never before the new one is registered ([`register`]). An elevated run registers again a task its account cannot replace; a replace refused over a task that is there leaves [`start_task`] |
-//! | `service start` (the wizard, a restart by the tray or `roomler restart`, the updater's watcher after a failed install, the Start menu entry) and the hard stop's `schtasks /End` | its own task, else a legacy one that is its own ([`own_autostart`]) |
+//! | `service start` (the wizard, a restart by the tray or `roomler restart`, the updater's watcher after a failed install, the Start menu entry) and the hard stop's `schtasks /End` | its own task, else a legacy one that is its own ([`own_autostart`]). With neither, and no daemon holding its stop event, the MSI's `StopOldDaemon` has nothing to stop ([`nothing_to_stop`]) |
 //! | `service status` | the same, read without acting ([`status`]) |
 //! | `service uninstall` (the MSI's `UnregisterAutostart`) | its own tasks, its start task, and the legacy ones that are its own ([`unregister`]) |
 //! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session, each ended and then deleted, and then that account's daemon still running (`install_cleanup.rs`, #3885) |
@@ -176,6 +176,19 @@ pub(crate) fn own_autostart(lib: &impl Library, sid: &str) -> Option<String> {
         .into_iter()
         .find(|name| is_own(lib, name, sid))
         .map(str::to_string)
+}
+
+/// FR-150 P1a — does `service stop --for-upgrade`, the per-user MSI's
+/// `StopOldDaemon`, find nothing to stop for the account `sid`? Yes when no
+/// daemon of its config holds a stop event this process can see
+/// (`event_held` false) and the account has no task to end
+/// ([`own_autostart`]). On a per-user update the old product's
+/// `UnregisterAutostart` has ended and deleted the task before this step
+/// (#4128's C10), so the hard stop the step falls back to would fail for want
+/// of a task, and the person's log would read every healthy update as a failed
+/// step.
+pub(crate) fn nothing_to_stop(lib: &impl Library, sid: &str, event_held: bool) -> bool {
+    !event_held && own_autostart(lib, sid).is_none()
 }
 
 /// `service status` for the account `sid`: its own task, else a legacy one
@@ -1177,5 +1190,38 @@ mod tests {
         assert_eq!(console_text(text.as_bytes()), text);
         assert_eq!(console_text(b""), "");
         assert!(is_sid(A) && !is_sid("DOMAIN\\a") && !is_sid("S-1-") && !is_sid(""));
+    }
+
+    /// FR-150 P1a (#4128's C10) — on a per-user update the old product's
+    /// `UnregisterAutostart` ends and deletes the task before the new one's
+    /// `StopOldDaemon` runs. With no daemon holding its stop event and no task
+    /// to end, the step has nothing to stop; a daemon still holding its event,
+    /// or a task of the account's own, locked or legacy, is stopped as before.
+    #[test]
+    fn the_upgrade_stop_after_the_old_uninstall_has_nothing_to_stop() {
+        let after_the_uninstall = Fake::new(A, false);
+        assert!(nothing_to_stop(&after_the_uninstall, A, false));
+        assert!(
+            !nothing_to_stop(&after_the_uninstall, A, true),
+            "a daemon holds its stop event"
+        );
+        let cases = [
+            ("its task", Fake::new(A, false).with(&named(A), Some(A))),
+            (
+                "its locked task",
+                Fake::new(A, false).with_locked(&named(A), A),
+            ),
+            ("its legacy task", Fake::new(A, false).with(SHARED, Some(A))),
+        ];
+        for (case, lib) in cases {
+            assert!(!nothing_to_stop(&lib, A, false), "{case} is there to end");
+        }
+        let others = Fake::new(A, false)
+            .with_seen_by_all(SHARED, Some(B))
+            .with(&named(B), Some(B));
+        assert!(
+            nothing_to_stop(&others, A, false),
+            "another account's tasks are not this one's to end"
+        );
     }
 }

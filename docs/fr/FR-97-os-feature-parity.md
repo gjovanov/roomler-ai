@@ -1059,7 +1059,7 @@ test of the SIGKILL property itself.
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
   reaches (`app.rs:3768-3783`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
-    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:1009`).
+    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:1024`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
     until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
     loaded.

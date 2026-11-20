@@ -131,8 +131,8 @@ offline, cannot happen on master for the same reason.
 
 ### P1a: the task names its own security descriptor
 
-`render_task_xml` (`service.rs:1507-1571`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
-Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:736-738`), the account
+`render_task_xml` (`service.rs:1543-1607`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
+Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:751-753`), the account
 the task runs as:
 
 ```text
@@ -159,7 +159,7 @@ P0 read what Task Scheduler does with it (the field log has each cell):
 | elevated, P1a, a new task | the account (C3) | full | yes |
 | elevated, P1a, over a task an elevated master registered | Administrators: the replace keeps it (C5) | read | not until the repair below |
 
-**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1532-1538`). At
+**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1568-1574`). At
 medium, Task Scheduler refuses a document at `HighestAvailable` (C4), and one whose principal is SYSTEM or another
 account, as a new task and over a task the account has full access to (C4b). So full access gives the account nothing
 beyond what every medium registration gives it today.
@@ -172,16 +172,16 @@ cannot replace it, `register` deletes the task and registers it again, and the d
 the agent does not carry; the delete and the create go through the `Library` seam `register` already uses
 (`user_task.rs:115-158`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
 finds the instance lock held (`instance_lock.rs`) and exits. `register` then deletes the account's legacy `Roomler`
-too (`user_task.rs:233-244`), which no medium process can.
+too (`user_task.rs:246-257`), which no medium process can.
 
 **A self-update over a task its account cannot replace still comes back.** The update's `RegisterAutostart` runs the
 new package's launcher (`main.wxs:403-409`), so the first hop onto P1a already runs P1a's `service install`. At medium
 its replace is refused, but a medium process may still run that task (C2) and register a task of its own. So
 `service install` then registers `Roomler start-<SID>`, a task of the account's own:
 
-- the same three one-shots as the task's own (`service.rs:1403`), each with an end boundary an hour after the
+- the same three one-shots as the task's own (`service.rs:1439`), each with an end boundary an hour after the
   registration, so a sleep inside that hour keeps them (`StartWhenAvailable`);
-- one action, the launcher with `service start` (`service.rs:977-997`): a `/Run` of the account's task, so the daemon
+- one action, the launcher with `service start` (`service.rs:992-1012`): a `/Run` of the account's task, so the daemon
   runs under its own task, and its `IgnoreNew` drops the later starts (C6b);
 - `DeleteExpiredTaskAfter`, so it deletes itself once it has expired (C6b, C6c).
 
@@ -236,9 +236,9 @@ flowchart TD
     W4 -- no --> R5["daemon: not running, with each rung's answer"]
 ```
 
-- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:1010-1014`, FR-97 P4d). The
+- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:1025-1029`, FR-97 P4d). The
   daemon creates it at start, in the person's session, where the watcher runs too.
-- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1403`), with room for
+- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1439`), with room for
   a slow guest.
 - **The first update onto P1b runs the old release's watcher.** `post_install.rs:703-705` says the same of #3292. So
   P1b protects the hops after it, and P1a protects the first one: through the task's own one-shots where the account
