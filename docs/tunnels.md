@@ -394,10 +394,10 @@ runtime of its own, what the receiver gets):
 
 | Test | Holds | Before the fix |
 |---|---|---|
-| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:353`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
-| `a_healthy_close_still_takes_milliseconds` (`:421`) | the same close with the path alive | passes, 1 ms here |
-| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:462`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
-| `many_writers_share_one_ordered_channel` (`:578`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:358`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:426`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:522`) | the caller polls `peer_close::close` once and drops it while the close is held at its first step, then lets the close go on; nothing is left | an inline close cut the same way leaves 14 tasks alive, in 10 runs of 10 |
+| `many_writers_share_one_ordered_channel` (`:652`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
 
 The stand-in viewer runs on a runtime of its own (`on_viewer`, `:95`), so the agent's runtime
 counts the agent's tasks alone. The viewer's peer, the one that offers, now and then keeps two
@@ -421,6 +421,19 @@ a probe:
 
 The task count is asserted before the wire. When packets went out, it says whether the close
 left something running (a leak) or a last send landed late.
+
+**How the caller-stopped test holds its close.** A close that has already ended when its caller
+stops waiting proves nothing, and the test's own guard says so. Before #4086 the test took that
+precondition from one poll: `peer_close::close` spawns `pc.close()`, and the runtime's other
+worker could run the whole close before the poll, about one CI run in 100. Now the agent's peer
+has one test interceptor ahead of the session's (`CloseGate`, `:466`), whose close waits until
+the test opens the gate. `RTCPeerConnection::close` closes its interceptors before it stops
+anything else (`crates/vendored/webrtc/src/peer_connection/mod.rs:1950`). So a close held at the
+gate has stopped nothing yet, its first poll is Pending on any scheduler, and the test opens the
+gate only after it has dropped the close. Exactly two tasks over the baseline at the end is
+another failure, #4103's: a closed peer can keep two of its tasks for good, with the gate or
+without it, about one run in 1,500 under load. The test does not tolerate it, and its message
+names it.
 
 The reset's order has a unit test of its own, on one thread:
 `test_stream_reset_waits_for_a_write_turn`
