@@ -377,8 +377,9 @@ The docs:
 
 ## Acceptance criteria
 
-- [ ] **AC1** (P0): C1–C6 are read, the field log says what each read, and P1a's descriptor gives the account the
-  owner and the full access C1 reads a medium registration gives it.
+- [x] **AC1** (P0): C1–C6 are read, the field log says what each read, and P1a's descriptor gives the account the
+  owner and the full access C1 reads a medium registration gives it. Read 2026-11-20, with C1b–C6d and C3c:
+  [#4128's P0 comment](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7035472044) and the field log.
 - [ ] **AC2** (#3507 RED): C7 fails on the current release: a self-update of a per-user install registered from an
   elevated token leaves no daemon at +10 min while the record reads success.
 - [ ] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
