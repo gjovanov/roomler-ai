@@ -403,6 +403,15 @@ pub enum InstallTokens {
 }
 
 impl InstallTokens {
+    /// The layout these tokens make: the one the pairing held, or the paste's.
+    pub fn layout(&self) -> Layout {
+        match self {
+            Self::Device(_) => Layout::Device,
+            Self::TwoRows { .. } => Layout::TwoRows,
+            Self::OneRow { .. } => Layout::OneRow,
+        }
+    }
+
     /// The token of an install that makes one device of the role's own kind
     /// (the tunnel client, every Windows install, a Mac's screen alone).
     /// Refused for a Mac's two-row or one-row tokens, which only the macOS

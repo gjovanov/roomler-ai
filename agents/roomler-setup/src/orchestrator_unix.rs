@@ -38,6 +38,16 @@
 //! 5. `--user-steps --role daemon` (`--system` answers "no user half"), as
 //!    the person: the systemd user unit, the LaunchAgent kickstart.
 //!
+//! **A one-row Mac** (FR-141 P2, [`Layout::OneRow`]; FR-43) takes steps 1-3
+//! alone. The preflight reads the one-row form again
+//! ([`crate::one_row_form::read_here`]) and makes the person's folders as the
+//! person (D5-A, [`ud::make_person_folders`]), both before the token is spent.
+//! Step 2 enrolls ROOT's config with the one token, under the device's own
+//! name and with the two one-row switches; step 3 places it with
+//! `--one-row` before the one package run, whose guard starts root's service.
+//! There is no person's enrollment and no user half: the root service starts
+//! the screen worker, and nothing here starts a LaunchAgent beside it (#4092).
+//!
 //! **Secrets.** The tokens stay in this process: never in argv, never in a
 //! URL, never in a line. The root-owned config file holds the agent JWT and
 //! the WireGuard key; it is shredded the moment the privileged half has
@@ -66,7 +76,8 @@ use crate::commands::{DoneReport, RootHalfReport};
 use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code};
 use crate::failure::{Failure, Said};
 use crate::orchestrator_agent::AdvancedOptions;
-use crate::role::{HostOs, Role, Scope, scope_for};
+use crate::pairing::InstallTokens;
+use crate::role::{HostOs, Layout, Role, Scope, scope_for};
 use crate::steps::{OrFail, StepId, Steps};
 use crate::unix_daemon::{self as ud, Half, HalfOutcome, KeptEnrollment, Scratch, Tool};
 
@@ -77,14 +88,13 @@ pub const ROOT_HALF_PRINCIPAL_KIND: &str = "agent_root_half";
 /// Drive a full daemon install on Linux or macOS. Streams ProgressEvent
 /// over the channel; mirrors every emit into the replay log.
 ///
-/// `root_token` (FR-129 B2): the macOS root half's own enrollment token —
-/// the pairing's second, or the second one pasted — when this install adds
-/// the root half beside the person's; `None` otherwise.
+/// `tokens` hold the install's [`Layout`]: one device's token, or on a Mac
+/// the root half's beside the person's (FR-129 B2: the pairing's second, or
+/// the second one pasted), or a one-row Mac's one token, root's (FR-141 P2).
 pub async fn run_install(
     role: Role,
     server: String,
-    token: String,
-    root_token: Option<String>,
+    tokens: InstallTokens,
     device_name: String,
     advanced: AdvancedOptions,
     on_event: Channel<ProgressEvent>,
@@ -95,22 +105,16 @@ pub async fn run_install(
     replay_log().reset();
 
     Diagnostics::global().server_known(&crate::orchestrator_agent::diagnostics_server(&server));
-    // #3590: the steps every run takes; the enrolls get their rows when they begin.
-    Steps::global().started(
-        &[StepId::Preflight, StepId::Package, StepId::UserSteps],
-        Some(crate::steps::to_page(&on_event)),
-    );
+    // #3590: the steps every run takes; the enrolls get their rows when they
+    // begin. A one-row Mac has no user half (FR-141 P2).
+    let plan: &[StepId] = if tokens.layout() == Layout::OneRow {
+        &[StepId::Preflight, StepId::Package]
+    } else {
+        &[StepId::Preflight, StepId::Package, StepId::UserSteps]
+    };
+    Steps::global().started(plan, Some(crate::steps::to_page(&on_event)));
 
-    let outcome = run_install_inner(
-        role,
-        server,
-        token,
-        root_token,
-        device_name,
-        advanced,
-        &on_event,
-    )
-    .await;
+    let outcome = run_install_inner(role, server, tokens, device_name, advanced, &on_event).await;
 
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
 
@@ -202,10 +206,11 @@ struct Resume {
 }
 
 /// Is a finished privileged half's work still in place? The daemon binary,
-/// and for a system scope or a root half the placed config.
-fn privileged_work_in_place(os: HostOs, scope: Scope, root_half: bool) -> bool {
+/// and for a system scope or a Mac's root config (the root half's, or a
+/// one-row Mac's) the placed config.
+fn privileged_work_in_place(os: HostOs, scope: Scope, root_config: bool) -> bool {
     ud::daemon_binary(os).is_file()
-        && ((scope == Scope::PerUser && !root_half) || ud::system_config_path().is_file())
+        && ((scope == Scope::PerUser && !root_config) || ud::system_config_path().is_file())
 }
 
 /// F5 — read what was kept, against what is on disk now (`in_place`:
@@ -260,16 +265,15 @@ fn enrollment_in(cfg: Option<&roomlerd::config::AgentConfig>, agent_id: &str) ->
 struct Made {
     /// The system scope's device, or the person's.
     ids: Option<(String, String)>,
-    /// FR-129 B2: the macOS root half's.
+    /// The macOS root half's: beside the person's (FR-129 B2), or the Mac's
+    /// one row (FR-141 P2).
     root_half_ids: Option<(String, String)>,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_install_inner(
     role: Role,
     server: String,
-    token: String,
-    root_token: Option<String>,
+    tokens: InstallTokens,
     device_name: String,
     advanced: AdvancedOptions,
     on_event: &Channel<ProgressEvent>,
@@ -277,6 +281,21 @@ async fn run_install_inner(
     emit(on_event, ProgressEvent::Started);
     let steps = Steps::global();
     let os = HostOs::current();
+    // The install's layout, and its tokens: the device's own (the person's
+    // or a system scope's), and root's on a Mac.
+    let layout = tokens.layout();
+    let (token, root_token) = match tokens {
+        InstallTokens::Device(token) => (token, None),
+        InstallTokens::TwoRows { person, root } => (person, Some(root)),
+        // FR-141 P2: no person's enrollment, so no token of its own.
+        InstallTokens::OneRow { root } => (String::new(), Some(root)),
+    };
+    // FR-129 B2: the root half beside the person's device.
+    let root_half = layout == Layout::TwoRows;
+    // FR-141 P2: root's service is this Mac's one row.
+    let one_row = layout == Layout::OneRow;
+    // Either way this install enrolls a root-owned config on a Mac.
+    let root_config = root_half || one_row;
 
     // --- Step 1: preflight -----------------------------------------------
     steps.begin(StepId::Preflight);
@@ -288,8 +307,7 @@ async fn run_install_inner(
     let scope = scope_for(os, role)
         .ok_or_else(|| Said(format!("role {role:?} installs no daemon on {}", os.wire())))
         .or_fail(ErrorCode::UnsupportedPlatform)?;
-    let root_half = root_token.is_some();
-    if root_half && !(os == HostOs::Macos && scope == Scope::PerUser) {
+    if root_config && !(os == HostOs::Macos && scope == Scope::PerUser) {
         return Err(steps.fail(
             ErrorCode::UnsupportedPlatform,
             Said(format!(
@@ -350,6 +368,24 @@ async fn run_install_inner(
     ) {
         return Err(steps.fail(ErrorCode::Preflight, Said(stop)));
     }
+    if one_row {
+        // FR-141 P2 — the one-row form read again, on the answer this install
+        // runs under, before the one token is spent: a form closed since the
+        // page (or the pairing) read it makes nothing.
+        if let Err(closed) =
+            crate::one_row_form::read_here(&server, features, ud::kept_one_row(&server)).await
+        {
+            return Err(steps.fail(
+                ErrorCode::Preflight,
+                Said(crate::one_row_form::closed_since_read(&closed)),
+            ));
+        }
+        // D5-A — the person's folders, made by this process as the person
+        // before root's enroll: nothing as root makes one in a home (FR-147).
+        ud::make_person_folders()
+            .map_err(Said)
+            .or_fail(ErrorCode::ConfigWrite)?;
+    }
     steps.ok();
 
     // Between two steps, so a failure here is the preflight's (#3432), and
@@ -371,9 +407,9 @@ async fn run_install_inner(
     };
     // F5 — an earlier attempt's work, for the same server, name and scope.
     let (resume, resume_note) = resume_from(
-        ud::take_kept(scope, &server, &device_name, root_half),
+        ud::take_kept(scope, &server, &device_name, layout),
         scope,
-        privileged_work_in_place(os, scope, root_half),
+        privileged_work_in_place(os, scope, root_config),
     );
     if let Some(message) = resume_note {
         warn(on_event, message);
@@ -382,10 +418,11 @@ async fn run_install_inner(
     if skip_privileged {
         warn(
             on_event,
-            match (scope, root_half) {
+            match (scope, layout) {
                 (Scope::System, _) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed and this device enrolled, its service running), so neither the password nor the token is asked for again.",
-                (Scope::PerUser, true) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed and the private network's root half enrolled, its service running), so neither the password nor that half's token is asked for again.",
-                (Scope::PerUser, false) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed), so the password is not asked for again.",
+                (Scope::PerUser, Layout::TwoRows) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed and the private network's root half enrolled, its service running), so neither the password nor that half's token is asked for again.",
+                (Scope::PerUser, Layout::OneRow) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed and this Mac enrolled as one device, its root service running), so neither the password nor the token is asked for again.",
+                (Scope::PerUser, Layout::Device) => "Picking up the previous attempt: its administrator steps already ran to the end (the package is installed), so the password is not asked for again.",
             }
             .to_string(),
         );
@@ -403,7 +440,7 @@ async fn run_install_inner(
                 scope,
                 server: server.clone(),
                 device_name: device_name.clone(),
-                root_half,
+                layout,
                 ids: made.ids.clone(),
                 root_half_ids: made.root_half_ids.clone(),
                 config_path: config_path.clone(),
@@ -417,7 +454,7 @@ async fn run_install_inner(
             scope,
             server: server.clone(),
             device_name: device_name.clone(),
-            root_half,
+            layout,
             ids: made.ids.clone(),
             root_half_ids: made.root_half_ids.clone(),
             config_path: config_path.clone(),
@@ -427,10 +464,11 @@ async fn run_install_inner(
     };
 
     // --- Step 2: a root-owned config — enroll in-process, into the scratch
-    //     file: the Linux system scope's, or the macOS root half's ---------
+    //     file: the Linux system scope's, the macOS root half's, or a
+    //     one-row Mac's -------------------------------------------------------
     let mut scratch: Option<Scratch> = None;
     let mut take: Vec<String> = Vec::new();
-    if (scope == Scope::System || root_half) && !skip_privileged {
+    if (scope == Scope::System || root_config) && !skip_privileged {
         steps.begin(if root_half {
             StepId::RootHalf
         } else {
@@ -446,16 +484,16 @@ async fn run_install_inner(
         }
         emit(on_event, ProgressEvent::EnrollStarted);
         // The kept enrollment for THIS config: the system device's, or the
-        // root half's.
-        let kept_root_ids = if root_half {
+        // root half's (a one-row Mac's included).
+        let kept_root_ids = if root_config {
             made.root_half_ids.clone()
         } else {
             kept_ids.clone()
         };
-        let root_options = if root_half {
-            root_half_options(&advanced)
-        } else {
-            advanced.clone()
+        let root_options = match layout {
+            Layout::TwoRows => root_half_options(&advanced),
+            Layout::OneRow => one_row_options(&advanced),
+            Layout::Device => advanced.clone(),
         };
         let enrolled = match (kept_scratch, kept_root_ids) {
             (Some(s), Some((agent_id, tenant_id))) if s.config_from().is_file() => {
@@ -471,13 +509,14 @@ async fn run_install_inner(
                 (s, (agent_id, tenant_id))
             }
             _ => {
-                let (s, ids) = if root_half {
+                let (s, ids) = if root_config {
                     enroll_root_half(
                         &server,
                         root_token.as_deref().unwrap_or_default(),
                         &device_name,
                         install_info(Scope::System),
                         &root_options,
+                        one_row,
                         on_event,
                     )
                     .await?
@@ -498,14 +537,24 @@ async fn run_install_inner(
             }
         };
         let (s, ids) = enrolled;
-        if root_half {
-            emit_enrolled(on_event, ROOT_HALF_PRINCIPAL_KIND, &ids.0, &ids.1);
+        if root_config {
+            // A one-row Mac's root service is the device itself.
+            let kind = if one_row {
+                "agent"
+            } else {
+                ROOT_HALF_PRINCIPAL_KIND
+            };
+            emit_enrolled(on_event, kind, &ids.0, &ids.1);
             made.root_half_ids = Some(ids);
         } else {
             emit_enrolled(on_event, "agent", &ids.0, &ids.1);
             made.ids = Some(ids);
         }
-        take = root_options.touched_keys();
+        // A one-row Mac's config is placed whole: nothing to fold (the
+        // script refuses `--config-take` beside `--one-row`).
+        if !one_row {
+            take = root_options.touched_keys();
+        }
         scratch = Some(s);
         steps.ok();
     }
@@ -530,12 +579,13 @@ async fn run_install_inner(
             scope,
             config_from: config_from.as_deref(),
             take: &take,
+            one_row,
         });
         let done = {
             // The window refuses to close while this runs: the wizard's exit
             // would remove the scratch directory from under it.
             let _running = ud::PrivilegedRunning::begin();
-            run_privileged(tool, &args, &scratch, os, scope, root_half, on_event).await
+            run_privileged(tool, &args, &scratch, os, scope, root_config, on_event).await
         };
         let done = match done {
             Ok(done) => done,
@@ -562,8 +612,37 @@ async fn run_install_inner(
         // it ran to its end, and the install stops here, saying so.
         if done.cancelled_late || cancel_requested() {
             keep_after_privileged(&made);
-            return Err(steps.cancelled_with(cancelled_after_privileged(scope, root_half)));
+            return Err(steps.cancelled_with(cancelled_after_privileged(scope, layout)));
         }
+    }
+
+    // --- FR-141 P2: a one-row Mac is done here ------------------------------
+    // No person's enrollment and no user half: the package's guard started
+    // root's service, which starts the screen worker in the person's session,
+    // and a LaunchAgent started beside it would serve the row twice (#4092).
+    if one_row {
+        let (agent_id, tenant_id) = made
+            .root_half_ids
+            .clone()
+            .ok_or_else(|| {
+                Said(
+                    "this Mac's root service was not enrolled (a bug: the one-row install \
+                     reached its end without it)"
+                        .to_string(),
+                )
+            })
+            .or_fail(ErrorCode::Other)?;
+        return Ok(finish_install(
+            on_event,
+            os,
+            role,
+            scope,
+            (agent_id, tenant_id),
+            ud::SYSTEM_CONFIG.to_string(),
+            None,
+            true,
+            scratch,
+        ));
     }
 
     // --- Step 4 (per-user): enroll in-process, as the person -------------
@@ -781,8 +860,46 @@ async fn run_install_inner(
     steps.ok();
 
     // --- Done ------------------------------------------------------------
+    let root_half_report = made
+        .root_half_ids
+        .map(|(principal_id, tenant_id)| RootHalfReport {
+            principal_id,
+            tenant_id,
+            name: crate::role::root_half_name(&device_name),
+            config_path: ud::SYSTEM_CONFIG.to_string(),
+        });
+    Ok(finish_install(
+        on_event,
+        os,
+        role,
+        scope,
+        (agent_id, tenant_id),
+        config_path.display().to_string(),
+        root_half_report,
+        false,
+        scratch,
+    ))
+}
+
+/// The end of an install that ran to it: the page told, the steps closed,
+/// nothing kept for a Retry, and the report. `principal` is the device the
+/// install made: the person's or a system scope's, or a one-row Mac's root
+/// service (FR-141 P2, `one_row`), whose config is root's and whose flavour
+/// is the system's; `root_half` is FR-129 B2's second device.
+#[allow(clippy::too_many_arguments)]
+fn finish_install(
+    on_event: &Channel<ProgressEvent>,
+    os: HostOs,
+    role: Role,
+    scope: Scope,
+    (principal_id, tenant_id): (String, String),
+    config_path: String,
+    root_half: Option<RootHalfReport>,
+    one_row: bool,
+    scratch: Scratch,
+) -> DoneReport {
     emit(on_event, ProgressEvent::Done);
-    steps.done();
+    Steps::global().done();
     ud::clear_kept();
     let binary = ud::daemon_binary(os);
     let tag = ud::installed_version(&binary)
@@ -794,31 +911,26 @@ async fn run_install_inner(
         _ => None,
     };
     drop(scratch);
+    let flavour = if one_row { Scope::System } else { scope };
 
-    Ok(DoneReport {
+    DoneReport {
         warnings: Steps::global().warnings(),
         principal_kind: "agent".to_string(),
-        principal_id: agent_id,
+        principal_id,
         tenant_id,
         tag,
         role,
-        flavour: Some(scope.wire().to_string()),
+        flavour: Some(flavour.wire().to_string()),
         binary_path: cli.map(|p| p.display().to_string()),
-        config_path: Some(config_path.display().to_string()),
+        config_path: Some(config_path),
         path_updated: None,
         shortcut_created: None,
         cli_included,
         desktop_installed: Some(ud::companion_present(os)),
         anchored: None,
-        root_half: made
-            .root_half_ids
-            .map(|(principal_id, tenant_id)| RootHalfReport {
-                principal_id,
-                tenant_id,
-                name: crate::role::root_half_name(&device_name),
-                config_path: ud::SYSTEM_CONFIG.to_string(),
-            }),
-    })
+        root_half,
+        one_row,
+    }
 }
 
 /// Step 2 for a Linux system scope: the enroll B1 made, into a fresh scratch
@@ -882,12 +994,19 @@ async fn enroll_system(
 /// reads or copies the person's config: the two halves never share a key
 /// (`wg_key_taken_by_other` would refuse the second), and the root daemon
 /// mints its own at its first start.
+///
+/// FR-141 P2 — `one_row`: root's daemon is the Mac's ONE row, so it enrolls
+/// with the install's one token under the device's own name (D9-A, as the
+/// terminal's `install.sh --one-row` names it) and its config carries the two
+/// one-row switches ([`root_half_config`]); the machine id is the root
+/// half's, from the hardware, for the same reasons.
 async fn enroll_root_half(
     server: &str,
     token: &str,
     device_name: &str,
     install: roomlerd::enrollment::InstallInfo,
     options: &AdvancedOptions,
+    one_row: bool,
     on_event: &Channel<ProgressEvent>,
 ) -> Result<(Scratch, (String, String)), Failure> {
     let steps = Steps::global();
@@ -903,18 +1022,26 @@ async fn enroll_root_half(
     if let Some(note) = &id.note {
         warn(on_event, note.clone());
     }
-    let name = crate::role::root_half_name(device_name);
+    let name = if one_row {
+        device_name.to_string()
+    } else {
+        crate::role::root_half_name(device_name)
+    };
     let crate::enroll_step::Enrolled { cfg, .. } =
         crate::enroll_step::enroll_fresh_as(server, token, &name, &id.machine_id, install)
             .await
             .map_err(|e| {
                 let advice = enroll_advice(&e, false);
-                steps
-                    .fail(enroll_error_code(&e), e)
-                    .advise(advice)
-                    .advise(ROOT_HALF_STOPPED)
+                let failed = steps.fail(enroll_error_code(&e), e).advise(advice);
+                // A one-row Mac's enroll is the install's only one: no half
+                // of it came first or comes after (rule 5).
+                if one_row {
+                    failed
+                } else {
+                    failed.advise(ROOT_HALF_STOPPED)
+                }
             })?;
-    let cfg = root_half_config(cfg, options)
+    let cfg = root_half_config(cfg, options, one_row)
         .map_err(Said)
         .or_fail(ErrorCode::AdvancedOptions)?;
     roomlerd::config::save(&s.config_from(), &cfg)
@@ -930,9 +1057,15 @@ async fn enroll_root_half(
 /// WireGuard key; the key is minted by the root daemon at its first
 /// overlay-enabled start (or kept from the root half's own previous config by
 /// the fold in the privileged half).
+///
+/// FR-141 P2 — `one_row` adds what `roomlerd enroll --one-row` writes beside
+/// the enrollment (FR-43 P3d), so root's first start is already the Mac's
+/// one row: its supervisor on (`macos_supervise_gui_worker`) and the worker
+/// holding no enrollment of its own (`macos_one_row`).
 fn root_half_config(
     fresh: roomlerd::config::AgentConfig,
     options: &AdvancedOptions,
+    one_row: bool,
 ) -> Result<roomlerd::config::AgentConfig, String> {
     let mut cfg = fresh;
     crate::enroll_step::finish(
@@ -942,7 +1075,23 @@ fn root_half_config(
         options,
         Some(true),
     )?;
+    if one_row {
+        cfg.macos_supervise_gui_worker = true;
+        cfg.macos_one_row = true;
+    }
     Ok(cfg)
+}
+
+/// FR-141 P2 — the Advanced options for a one-row Mac's root service: ALL of
+/// them, since it is the one device (the session consent and the tunnel
+/// mesh's subnets with the overlay's), and the overlay on, the reason the
+/// form exists. B2 split them between two devices
+/// ([`device_options`], [`root_half_options`]).
+pub fn one_row_options(advanced: &AdvancedOptions) -> AdvancedOptions {
+    AdvancedOptions {
+        overlay_enabled: Some(true),
+        ..advanced.clone()
+    }
 }
 
 /// 32 bytes from the OS's generator, for a one-time machine id: two v4 UUIDs
@@ -981,11 +1130,13 @@ fn placement_problem(enrolled_root_config: bool, placed: bool) -> Option<String>
 
 /// F1 — the install stopped by a cancel that came after the administrator
 /// steps had started: they ran to the end, and this says what that left.
-pub fn cancelled_after_privileged(scope: Scope, root_half: bool) -> String {
-    match (scope, root_half) {
+pub fn cancelled_after_privileged(scope: Scope, layout: Layout) -> String {
+    match (scope, layout) {
         (Scope::System, _) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this device is enrolled, its service running. Nothing else was done. Retry finishes the install without asking for the password or a token again.".to_string(),
-        (Scope::PerUser, true) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac's private network (its root half) is enrolled, its service running, but the screen half is not enrolled yet. Retry finishes the install without asking for the password or the private network's token again.".to_string(),
-        (Scope::PerUser, false) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again.".to_string(),
+        (Scope::PerUser, Layout::TwoRows) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac's private network (its root half) is enrolled, its service running, but the screen half is not enrolled yet. Retry finishes the install without asking for the password or the private network's token again.".to_string(),
+        // FR-141 P2: those steps were the whole install.
+        (Scope::PerUser, Layout::OneRow) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac is enrolled as one device, its root service running. Nothing else was left to do. Retry finishes the install without asking for the password or the token again.".to_string(),
+        (Scope::PerUser, Layout::Device) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again.".to_string(),
     }
 }
 
@@ -1033,7 +1184,7 @@ async fn run_privileged(
     scratch: &Scratch,
     os: HostOs,
     scope: Scope,
-    root_half: bool,
+    root_config: bool,
     on_event: &Channel<ProgressEvent>,
 ) -> Result<PrivilegedDone, Failure> {
     let files = scratch.half_files();
@@ -1081,7 +1232,7 @@ async fn run_privileged(
             let message = if cancelled_late || cancel_requested() {
                 format!(
                     "Cancelled while the administrator steps were running — a step running as root cannot be stopped from here — and they failed (exit {code}): see the lines above. Retry runs them again{}.",
-                    if scope == Scope::System || root_half {
+                    if scope == Scope::System || root_config {
                         " with the same enrollment"
                     } else {
                         ""
@@ -1108,7 +1259,7 @@ async fn run_privileged(
             ))
         }
         HalfOutcome::Unavailable(reason) => {
-            terminal_fallback(args, reason, os, scope, root_half, on_event)
+            terminal_fallback(args, reason, os, scope, root_config, on_event)
                 .await
                 .map(|()| PrivilegedDone {
                     cancelled_late: false,
@@ -1125,7 +1276,7 @@ async fn terminal_fallback(
     reason: String,
     os: HostOs,
     scope: Scope,
-    root_half: bool,
+    root_config: bool,
     on_event: &Channel<ProgressEvent>,
 ) -> Result<(), Failure> {
     let steps = Steps::global();
@@ -1180,7 +1331,7 @@ async fn terminal_fallback(
             )),
         ));
     }
-    if (scope == Scope::System || root_half) && !ud::system_config_path().is_file() {
+    if (scope == Scope::System || root_config) && !ud::system_config_path().is_file() {
         return Err(steps.fail(
             ErrorCode::Other,
             Said(format!(
@@ -1551,7 +1702,7 @@ mod tests {
         fresh.agent_id = "aid-root".into();
         fresh.overlay_enabled = false;
         fresh.overlay_wg_secret_key = None;
-        let root = root_half_config(fresh, &root_half_options(&all)).unwrap();
+        let root = root_half_config(fresh, &root_half_options(&all), false).unwrap();
         assert!(root.overlay_enabled);
         assert_eq!(root.overlay_advertised_routes, vec!["192.168.7.0/24"]);
         assert_eq!(
@@ -1559,6 +1710,39 @@ mod tests {
             "minted by the root daemon"
         );
         assert_ne!(root.agent_id, person.agent_id);
+        assert!(
+            !root.macos_supervise_gui_worker && !root.macos_one_row,
+            "B2's root half is a row of its own"
+        );
+    }
+
+    /// FR-141 P2 — a one-row Mac's root config: its own fresh enrollment with
+    /// the overlay on, ALL the Advanced options (it is the one device), and
+    /// the two switches `roomlerd enroll --one-row` writes, so its first start
+    /// is one row. No WireGuard key: the root daemon mints it.
+    #[test]
+    fn a_one_row_macs_root_config_is_the_whole_device() {
+        let all = AdvancedOptions {
+            overlay_enabled: None,
+            auto_grant_session: Some(true),
+            ..advanced(&["auto_grant_session"])
+        };
+        let options = one_row_options(&all);
+        assert_eq!(options.overlay_enabled, Some(true), "the reason it exists");
+        assert_eq!(options.auto_grant_session, Some(true), "not split off");
+        assert_eq!(options.advertise_routes, all.advertise_routes);
+        assert_eq!(options.touched, all.touched);
+
+        let mut fresh = roomlerd::config::test_fixture();
+        fresh.agent_id = "aid-one".into();
+        fresh.overlay_enabled = false;
+        fresh.overlay_wg_secret_key = None;
+        let cfg = root_half_config(fresh, &options, true).unwrap();
+        assert!(cfg.macos_supervise_gui_worker && cfg.macos_one_row);
+        assert!(cfg.overlay_enabled);
+        assert_eq!(cfg.overlay_advertised_routes, vec!["192.168.7.0/24"]);
+        assert_eq!(cfg.overlay_wg_secret_key, None);
+        assert_eq!(cfg.agent_id, "aid-one");
     }
 
     fn kept(scope: Scope, privileged_done: bool, scratch: Option<Scratch>) -> KeptEnrollment {
@@ -1566,7 +1750,7 @@ mod tests {
             scope,
             server: "https://example.invalid".into(),
             device_name: "lab".into(),
-            root_half: false,
+            layout: Layout::Device,
             ids: Some(("aid".into(), "tid".into())),
             root_half_ids: None,
             config_path: std::path::PathBuf::from(ud::SYSTEM_CONFIG),
@@ -1580,7 +1764,7 @@ mod tests {
             scope: Scope::PerUser,
             server: "https://example.invalid".into(),
             device_name: "lab".into(),
-            root_half: true,
+            layout: Layout::TwoRows,
             ids: None,
             root_half_ids: Some(("aid-root".into(), "tid".into())),
             config_path: std::path::PathBuf::from("/Users/lab/config.toml"),
@@ -1697,23 +1881,55 @@ mod tests {
         assert_eq!(resume.ids, Some(("aid".into(), "tid".into())));
     }
 
+    /// FR-141 P2 — F5 for a one-row Mac: one enrollment, root's, kept as the
+    /// root half's is. Its unplaced config goes to the Retry with its device;
+    /// after the privileged half nothing is run again; with the work removed
+    /// the spent token is said, and no person's enrollment is handed on (there
+    /// is none). Its work in place is the binary AND root's config.
+    #[test]
+    fn a_retry_of_a_one_row_mac_reposts_no_token() {
+        let one_row = |privileged_done, scratch| KeptEnrollment {
+            layout: Layout::OneRow,
+            ..kept_root_half(privileged_done, scratch)
+        };
+        let scratch = Scratch::create().unwrap();
+        std::fs::write(scratch.config_from(), "agent_id = \"aid-root\"").unwrap();
+        let (resume, note) =
+            resume_from(Some(one_row(false, Some(scratch))), Scope::PerUser, false);
+        assert!(note.is_none() && !resume.privileged_done);
+        assert_eq!(
+            resume.root_half_ids,
+            Some(("aid-root".into(), "tid".into()))
+        );
+        assert!(resume.scratch.expect("kept").config_from().is_file());
+
+        let (resume, note) = resume_from(Some(one_row(true, None)), Scope::PerUser, true);
+        assert!(note.is_none() && resume.privileged_done);
+        assert!(resume.ids.is_none(), "no person's enrollment");
+
+        let (resume, note) = resume_from(Some(one_row(true, None)), Scope::PerUser, false);
+        assert!(!resume.privileged_done && resume.ids.is_none() && resume.root_half_ids.is_none());
+        let note = note.expect("said");
+        assert!(note.contains("already used"), "{note}");
+    }
+
     /// F1 — what a cancel after the start reports: never "nothing was
     /// installed"; the state the half left, per scope, and that a Retry does
     /// not ask again.
     #[test]
     fn a_late_cancel_says_what_the_half_left() {
-        let system = cancelled_after_privileged(Scope::System, false);
+        let system = cancelled_after_privileged(Scope::System, Layout::Device);
         assert!(system.contains("ran to the end"), "{system}");
         assert!(system.contains("enrolled"), "{system}");
         assert!(!system.contains("nothing was installed"), "{system}");
         assert!(system.contains("password or a token"), "{system}");
-        let per_user = cancelled_after_privileged(Scope::PerUser, false);
+        let per_user = cancelled_after_privileged(Scope::PerUser, Layout::Device);
         assert!(per_user.contains("not enrolled yet"), "{per_user}");
         assert!(!per_user.contains("nothing was installed"), "{per_user}");
         // FR-129 B2: a Mac's root half was placed by that half; the screen
         // half was not enrolled yet, and neither the password nor the root
         // half's token is asked again.
-        let mac = cancelled_after_privileged(Scope::PerUser, true);
+        let mac = cancelled_after_privileged(Scope::PerUser, Layout::TwoRows);
         assert!(
             mac.contains("private network") && mac.contains("is enrolled"),
             "{mac}"
@@ -1723,6 +1939,14 @@ mod tests {
             mac.contains("password or the private network's token"),
             "{mac}"
         );
+        // FR-141 P2: a one-row Mac's administrator steps are its whole
+        // install, and it is one device (rule 5).
+        let one = cancelled_after_privileged(Scope::PerUser, Layout::OneRow);
+        assert!(one.contains("enrolled as one device"), "{one}");
+        assert!(one.contains("password or the token"), "{one}");
+        for half in ["half", "two devices", "second"] {
+            assert!(!one.contains(half), "{half}: {one}");
+        }
     }
 
     /// F5 — a kept enrollment is reused when its device is still in the

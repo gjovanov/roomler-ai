@@ -39,6 +39,9 @@ pub mod launch;
 /// role's machine enrollment is written by an administrator's process, the
 /// elevated wizard or the step that ran the installer.
 pub mod machine_write;
+/// FR-141 P2 — a new Mac made ONE device row from one token, and whether
+/// that form is open on this Mac for this server.
+pub mod one_row_form;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded

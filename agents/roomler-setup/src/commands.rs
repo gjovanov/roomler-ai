@@ -93,6 +93,16 @@ pub struct AgentDetect {
     /// on from it, and nothing is preselected. `None` off macOS, with the
     /// server's guard off, and whenever the root daemon could not say.
     pub one_row_stop: Option<String>,
+    /// FR-141 P2 — the macOS daemon card with "Join the overlay network"
+    /// ticked makes this Mac ONE device ([`crate::one_row_form`]): the server
+    /// offers it, the Mac is enrolled nowhere, and the release knows it.
+    /// `false` everywhere else, and on a Mac that is one row already.
+    pub one_row_open: bool,
+    /// FR-141 P2 — why that form is closed on this Mac, in the words the page
+    /// shows beside the card ([`crate::one_row_form::Closed::note`]): `None`
+    /// when it is open, or when nothing changes for the person (the server's
+    /// switch is off, or this is not a Mac).
+    pub one_row_note: Option<String>,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -133,7 +143,22 @@ pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, 
                 crate::features::ask(&server),
                 crate::reinstall_guard::one_row_here()
             );
-            detect_unix(os, &server, asked, tunnel.installed, one_row.as_ref())
+            // FR-141 P2 — the one-row form on that answer: off macOS, or with
+            // the switch off, it asks nothing more; the release last.
+            let form = crate::one_row_form::read_here(
+                &server,
+                asked.features,
+                crate::unix_daemon::kept_one_row(&server),
+            )
+            .await;
+            detect_unix(
+                os,
+                &server,
+                asked,
+                tunnel.installed,
+                one_row.as_ref(),
+                &form,
+            )
         }
     };
     Ok(DetectResult { agent, tunnel })
@@ -179,6 +204,8 @@ fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
         tunnel_offered: true,
         default_role: None,
         one_row_stop: None,
+        one_row_open: false,
+        one_row_note: None,
     };
     match detect_existing_install() {
         ExistingInstall::Clean => base,
@@ -233,13 +260,16 @@ fn read_system_context_switch() -> crate::role::SystemContextSwitch {
 /// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
 /// and the server's switch for this OS — a card is shown only on its `true`.
 /// FR-141 P3: `one_row` is the root daemon's word that this Mac is one row
-/// already ([`crate::reinstall_guard::one_row_here`]).
+/// already ([`crate::reinstall_guard::one_row_here`]). FR-141 P2: `form` is
+/// whether a new one-row install is open here
+/// ([`crate::one_row_form::read_here`]).
 fn detect_unix(
     os: crate::role::HostOs,
     server: &str,
     asked: crate::features::Asked,
     tunnel_installed: bool,
     one_row: Option<&crate::reinstall_guard::OneRowMac>,
+    form: &Result<(), crate::one_row_form::Closed>,
 ) -> AgentDetect {
     let d = crate::unix_daemon::detect(os);
     let roles = crate::role::daemon_roles(os);
@@ -289,6 +319,16 @@ fn detect_unix(
                 read_system_context_switch,
             )
         },
+        // FR-141 P2: a Mac that is one row already installs nothing, so no
+        // form is open or explained there.
+        one_row_open: one_row_stop.is_none() && form.is_ok(),
+        one_row_note: if one_row_stop.is_some() {
+            None
+        } else {
+            form.as_ref()
+                .err()
+                .and_then(crate::one_row_form::Closed::note)
+        },
         one_row_stop,
     }
 }
@@ -297,12 +337,22 @@ fn detect_unix(
 /// changes, the SPA asks here whether the daemon role it holds is still
 /// offered there, on this OS (B1-s2: `daemonOffered`, the per-OS rule applied
 /// here, not in the page). Never cached; anything but a JSON `true` is
-/// `false`.
+/// `false`. FR-141 P2: and whether that server's one-row form is open on
+/// this Mac, with the note when it is closed, as `cmd_detect_install` says.
 #[tauri::command]
 pub async fn cmd_setup_features(server: String) -> crate::features::FeaturesView {
-    crate::features::ask(&server)
-        .await
-        .view(crate::role::HostOs::current())
+    let asked = crate::features::ask(&server).await;
+    let form = crate::one_row_form::read_here(
+        &server,
+        asked.features,
+        crate::unix_daemon::kept_one_row(&server),
+    )
+    .await;
+    crate::features::FeaturesView {
+        one_row_open: form.is_ok(),
+        one_row_note: form.err().and_then(|closed| closed.note()),
+        ..asked.view(crate::role::HostOs::current())
+    }
 }
 
 /// FR-129 B1 — the terminal fallback's "I've run it": the privileged half
@@ -683,6 +733,11 @@ pub struct DoneReport {
     /// Done page lists them.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// FR-141 P2 — the install made this Mac ONE device: the principal is
+    /// root's service, which runs its screen sharing, remote control and
+    /// private network. `false` everywhere else.
+    #[serde(default)]
+    pub one_row: bool,
 }
 
 /// FR-129 B2 — the device the macOS root half enrolled as, for the Done page.
@@ -729,6 +784,13 @@ pub struct RootHalfReport {
 /// also installs the ROOT HALF, a second device with a token of its own: the
 /// pairing's second token, or on the pasted path `rootToken`, the second
 /// token the person pasted (required then, and never the first one again).
+///
+/// FR-141 P2 — the one-row form is read again here, before anything is
+/// spent ([`crate::one_row_form::layout_for`]): where it is open, the box
+/// makes ONE device, with the one token as root's. `oneRow` is the form the
+/// page showed: on the pasted path the page is the approval, so an install
+/// whose fresh read differs is refused, as a pairing's layout refuses
+/// another (`shown_form_holds`).
 #[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_install(
@@ -739,16 +801,15 @@ pub async fn cmd_install(
     device_name: String,
     advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
     use_paired: Option<bool>,
+    one_row: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, crate::failure::Failure> {
     refuse_a_role_this_run_cannot_install(role).map_err(refused_before_the_run)?;
     let store = crate::pairing::PairStore::global();
-    let layout = crate::role::layout(
-        crate::role::HostOs::current(),
-        role,
-        advanced.as_ref().and_then(|a| a.overlay_enabled),
-        false,
-    );
+    let overlay_box = advanced.as_ref().and_then(|a| a.overlay_enabled);
+    let layout = crate::one_row_form::layout_for(&server, role, overlay_box).await;
+    shown_form_holds(use_paired.unwrap_or(false), one_row, layout)
+        .map_err(refused_before_the_run)?;
     let (tokens, paired) =
         resolve_install_tokens(store, role, &server, token, root_token, use_paired, layout)
             .map_err(refused_before_the_run)?;
@@ -776,20 +837,10 @@ pub async fn cmd_install(
                 )
                 .await
             } else {
-                let (token, root_token) = match tokens {
-                    crate::pairing::InstallTokens::Device(token) => (token, None),
-                    crate::pairing::InstallTokens::TwoRows { person, root } => (person, Some(root)),
-                    crate::pairing::InstallTokens::OneRow { .. } => {
-                        return Err(refused_before_the_run(
-                            "this wizard cannot make a Mac one device yet".to_string(),
-                        ));
-                    }
-                };
                 crate::orchestrator_unix::run_install(
                     role,
                     server,
-                    token,
-                    root_token,
+                    tokens,
                     device_name,
                     advanced.unwrap_or_default(),
                     on_event,
@@ -802,6 +853,29 @@ pub async fn cmd_install(
         store.finish();
     }
     report
+}
+
+/// FR-141 P2 — on the pasted path the page is the approval: the form it
+/// showed (`shown`, one device or not; `None` from a page that did not say)
+/// must be the layout this install makes, read afresh. A paired install is
+/// held by its pairing instead (rule 2, [`crate::pairing::PairStore::tokens_for`]).
+fn shown_form_holds(paired: bool, shown: Option<bool>, layout: Layout) -> Result<(), String> {
+    let makes_one = layout == Layout::OneRow;
+    match shown {
+        // Only a Mac's daemon with the box ticked has two forms to tell apart.
+        Some(shown) if !paired && layout != Layout::Device && shown != makes_one => Err(format!(
+            "This Mac's form changed since the page showed it: this install would make it {}, \
+             and the page said {}. Nothing was installed, and no token was used: go back to the \
+             first page, which reads this Mac again.",
+            if makes_one {
+                "one device"
+            } else {
+                "two devices"
+            },
+            if shown { "one" } else { "two" },
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// #3432 — `cmd_install` refused before any step ran (a role this run cannot
@@ -958,6 +1032,10 @@ pub enum PairStartView {
         verification_uri: String,
         expires_in: u64,
         interval: u64,
+        /// FR-141 P2 — the approval makes this Mac ONE device
+        /// ([`Layout::OneRow`]), as this start read the form: the page's
+        /// approval summary says what the pairing holds, not its own guess.
+        one_row: bool,
     },
     Unavailable,
 }
@@ -970,7 +1048,10 @@ pub enum PairStartView {
 /// `rootHalf` (FR-129 B2) is the private-network box as the SPA shows it:
 /// on macOS the daemon role with it ticked adds the root half, so the
 /// pairing asks for `halves: 2` — one approval, two tokens. Anywhere else it
-/// changes nothing ([`crate::role::wants_root_half`]).
+/// changes nothing ([`crate::role::wants_root_half`]). FR-141 P2: with the
+/// one-row form open on this Mac ([`crate::one_row_form::layout_for`], read
+/// here) the ticked box makes ONE device instead, `halves: 1`, and the
+/// pairing holds that layout for the install (rule 2).
 ///
 /// The verification URI must be a web address: the wizard opens it with
 /// the shell plugin, and a server that answered anything else is refused
@@ -988,7 +1069,7 @@ pub async fn cmd_pair_start(
     if let Some(stop) = crate::reinstall_guard::stop_for(role, &server).await {
         return Err(stop);
     }
-    let layout = crate::role::layout(crate::role::HostOs::current(), role, root_half, false);
+    let layout = crate::one_row_form::layout_for(&server, role, root_half).await;
     let request = StartRequest {
         machine_name: device_name,
         os: host_os(),
@@ -1015,6 +1096,7 @@ pub async fn cmd_pair_start(
         verification_uri: started.verification_uri.clone(),
         expires_in: started.expires_in,
         interval: started.interval,
+        one_row: layout == Layout::OneRow,
     };
     crate::pairing::PairStore::global().begin(server, role, layout, started);
     Ok(view)
@@ -1089,6 +1171,102 @@ fn open_in_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// FR-141 P2 — the one-row form as a server with the switch off leaves
+    /// it: every detect before P2 read this.
+    const NOT_OFFERED: Result<(), crate::one_row_form::Closed> =
+        Err(crate::one_row_form::Closed::NotOffered);
+
+    /// FR-141 P2 — the Welcome page's one-row form: open on a new Mac, with
+    /// no note; closed on an enrolled one with its own road named; with the
+    /// switch off nothing changes and nothing is said; and a Mac that is one
+    /// row already has no form at all, only P3's stop.
+    #[test]
+    fn the_welcome_page_says_whether_a_new_mac_is_one_device() {
+        use crate::features::{Asked, SetupFeatures};
+        use crate::one_row_form::Closed;
+        use crate::role::HostOs;
+        let said = Asked {
+            features: SetupFeatures {
+                pairing: true,
+                wizard_macos_daemon: true,
+                wizard_macos_one_row: true,
+                ..SetupFeatures::default()
+            },
+            answered: true,
+        };
+        let server = "https://a.invalid";
+        let d = detect_unix(HostOs::Macos, server, said, false, None, &Ok(()));
+        assert!(d.one_row_open && d.one_row_note.is_none());
+        assert_eq!(
+            d.default_role,
+            Some(Role::DaemonUser),
+            "the card is still preselected"
+        );
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#""oneRowOpen":true"#), "{json}");
+
+        let d = detect_unix(
+            HostOs::Macos,
+            server,
+            said,
+            false,
+            None,
+            &Err(Closed::RootEnrolled),
+        );
+        assert!(!d.one_row_open);
+        let note = d.one_row_note.expect("the enrolled Mac's road");
+        assert!(note.contains("sudo roomlerd one-row"), "{note}");
+
+        let d = detect_unix(HostOs::Macos, server, said, false, None, &NOT_OFFERED);
+        assert!(
+            !d.one_row_open && d.one_row_note.is_none(),
+            "nothing changes"
+        );
+
+        let mac = crate::reinstall_guard::OneRowMac {
+            name: "Studio Mac".into(),
+        };
+        let d = detect_unix(HostOs::Macos, server, said, false, Some(&mac), &Ok(()));
+        assert!(d.one_row_stop.is_some());
+        assert!(
+            !d.one_row_open && d.one_row_note.is_none(),
+            "P3's stop alone"
+        );
+    }
+
+    /// FR-141 P2 — on the pasted path the page is the approval: an install
+    /// whose fresh read makes the Mac otherwise than the page showed is
+    /// refused before anything is spent. The pairing holds its own layout,
+    /// and a screen-only or off-macOS install has one form only.
+    #[test]
+    fn a_pasted_install_makes_the_form_the_page_showed() {
+        assert!(shown_form_holds(false, Some(true), Layout::OneRow).is_ok());
+        assert!(shown_form_holds(false, Some(false), Layout::TwoRows).is_ok());
+        let closed = shown_form_holds(false, Some(true), Layout::TwoRows).unwrap_err();
+        assert!(
+            closed.contains("make it two devices, and the page said one"),
+            "{closed}"
+        );
+        assert!(closed.contains("no token was used"), "{closed}");
+        let opened = shown_form_holds(false, Some(false), Layout::OneRow).unwrap_err();
+        assert!(
+            opened.contains("make it one device, and the page said two"),
+            "{opened}"
+        );
+        assert!(
+            shown_form_holds(true, Some(false), Layout::OneRow).is_ok(),
+            "the pairing's"
+        );
+        assert!(
+            shown_form_holds(false, Some(true), Layout::Device).is_ok(),
+            "one form"
+        );
+        assert!(
+            shown_form_holds(false, None, Layout::OneRow).is_ok(),
+            "not said"
+        );
+    }
+
     // Synthetic JWTs mirroring the server's emitted shape (snake_case
     // `token_type` claim, NO `aud`). Header + signature are
     // placeholder segments (introspection doesn't validate them);
@@ -1134,6 +1312,8 @@ mod tests {
                 tunnel_offered: true,
                 default_role: Some(Role::DaemonUser),
                 one_row_stop: None,
+                one_row_open: false,
+                one_row_note: None,
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -1195,8 +1375,10 @@ mod tests {
             wizard_macos_daemon: true,
             wizard_unix_daemon: true,
             reinstall_guard_off: false,
+            wizard_macos_one_row: false,
         });
-        let detect_unix = |os, server, asked| detect_unix(os, server, asked, false, None);
+        let detect_unix =
+            |os, server, asked| detect_unix(os, server, asked, false, None, &NOT_OFFERED);
         // FR-129 C1 — the default follows the same switch; the kind is
         // whatever this box has, so the expectation is per kind.
         let clean_or_none = |d: &AgentDetect, clean: Option<Role>| {
@@ -1276,7 +1458,14 @@ mod tests {
         };
         let server = "https://a.invalid";
 
-        let d = detect_unix(HostOs::Macos, server, said(on), false, Some(&mac));
+        let d = detect_unix(
+            HostOs::Macos,
+            server,
+            said(on),
+            false,
+            Some(&mac),
+            &NOT_OFFERED,
+        );
         let stop = d.one_row_stop.as_deref().expect("the stop");
         assert!(stop.contains("«Studio Mac»"), "{stop}");
         assert!(d.supported, "the card stays, under the note");
@@ -1289,7 +1478,7 @@ mod tests {
 
         // Before the stop, a Mac with a card preselects it: the stop is what
         // takes the preselection away.
-        let unknown = detect_unix(HostOs::Macos, server, said(on), false, None);
+        let unknown = detect_unix(HostOs::Macos, server, said(on), false, None, &NOT_OFFERED);
         assert_eq!(unknown.one_row_stop, None, "unknown is never one row");
         assert_eq!(unknown.default_role, Some(Role::DaemonUser));
 
@@ -1297,18 +1486,39 @@ mod tests {
             reinstall_guard_off: true,
             ..on
         };
-        let d = detect_unix(HostOs::Macos, server, said(guard_off), false, Some(&mac));
+        let d = detect_unix(
+            HostOs::Macos,
+            server,
+            said(guard_off),
+            false,
+            Some(&mac),
+            &NOT_OFFERED,
+        );
         assert_eq!(d.one_row_stop, None, "the operator's off");
         assert_eq!(d.default_role, Some(Role::DaemonUser));
 
         // No answer from the server keeps the guard on (and the card off).
-        let d = detect_unix(HostOs::Macos, server, Asked::default(), false, Some(&mac));
+        let d = detect_unix(
+            HostOs::Macos,
+            server,
+            Asked::default(),
+            false,
+            Some(&mac),
+            &NOT_OFFERED,
+        );
         assert!(
             d.one_row_stop.is_some(),
             "an unanswered server keeps the guard"
         );
 
-        let d = detect_unix(HostOs::Linux, server, said(on), false, Some(&mac));
+        let d = detect_unix(
+            HostOs::Linux,
+            server,
+            said(on),
+            false,
+            Some(&mac),
+            &NOT_OFFERED,
+        );
         assert_eq!(d.one_row_stop, None, "a Mac's guard");
     }
 
@@ -1324,7 +1534,15 @@ mod tests {
         use crate::role::HostOs;
         let server = "https://a.invalid";
         let supported = |os, body: &[u8]| {
-            detect_unix(os, server, read_answer(200, body), false, None).supported
+            detect_unix(
+                os,
+                server,
+                read_answer(200, body),
+                false,
+                None,
+                &NOT_OFFERED,
+            )
+            .supported
         };
 
         let linux_only = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": false, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
@@ -1381,8 +1599,11 @@ mod tests {
                 name: "lab-daemon".to_string(),
                 config_path: "/etc/roomler/config.toml".to_string(),
             }),
+            one_row: false,
         };
         let json = serde_json::to_string(&r).unwrap();
+        // FR-141 P2: the one-row flag binds camelCase.
+        assert!(json.contains(r#""oneRow":false"#), "{json}");
         // FR-129 B2: the root half's report binds camelCase too.
         assert!(
             json.contains(r#""rootHalf":{"principalId":"507f1f77bcf86cd799439012""#),
@@ -1718,8 +1939,10 @@ mod tests {
             verification_uri: "https://roomler.ai/pair".into(),
             expires_in: 900,
             interval: 5,
+            one_row: true,
         };
         let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""oneRow":true"#), "{json}");
         assert!(json.contains(r#""kind":"started""#), "{json}");
         assert!(json.contains(r#""userCode":"BCDF-GHJK""#), "{json}");
         assert!(

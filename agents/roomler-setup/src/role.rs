@@ -171,8 +171,8 @@ impl Layout {
 /// with the private-network box ticked (the macOS default) is one row when
 /// `one_row_open` (the server's `wizard_macos_one_row` switch, on a Mac that
 /// is not enrolled, with a release that can make one row:
-/// `crate::reinstall_guard::one_row_open`), else B2's two rows; unticked it
-/// is the screen alone. Every other install is one device.
+/// [`crate::one_row_form::decide`]), else B2's two rows; unticked it is the
+/// screen alone. Every other install is one device.
 pub fn layout(os: HostOs, role: Role, overlay_box: Option<bool>, one_row_open: bool) -> Layout {
     if !wants_root_half(os, role, overlay_box) {
         Layout::Device

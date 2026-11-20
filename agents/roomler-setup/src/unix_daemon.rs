@@ -70,7 +70,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
-use crate::role::{HostOs, Scope};
+use crate::role::{HostOs, Layout, Scope};
 
 /// `scripts/install.sh`, verbatim. The server serves its own copy
 /// (`crates/modules/fleet/src/setup_release.rs`), which changes with a promote,
@@ -244,6 +244,80 @@ pub fn make_unit_folders() -> Result<(), String> {
     Ok(())
 }
 
+/// FR-141 P2 (D5-A) — before a one-row Mac's root enroll spends the token:
+/// [`unit_folders`] for the person running the wizard, made by THIS process,
+/// as the person, and each one written to. The screen worker root's service
+/// starts runs as the person and keeps its files there, and nothing running as
+/// root makes or chowns a folder in a person's home (FR-147). A folder this
+/// person cannot make or write stops the install, naming it and its owner.
+pub fn make_person_folders() -> Result<(), String> {
+    let dirs = roomlerd::appdirs::project_dirs()
+        .ok_or_else(|| "resolve your Roomler folders: no home directory".to_string())?;
+    make_writable_folders(&unit_folders(&dirs))
+}
+
+/// [`make_person_folders`] over `dirs`: each made, and a file made and gone
+/// in it (`tempfile_in`), which is the write the worker will do.
+pub fn make_writable_folders(dirs: &[PathBuf]) -> Result<(), String> {
+    for dir in dirs {
+        if let Err(e) =
+            std::fs::create_dir_all(dir).and_then(|()| tempfile::tempfile_in(dir).map(drop))
+        {
+            return Err(unwritable_folder(dir, owner_of(dir), &e));
+        }
+    }
+    Ok(())
+}
+
+/// The folder nearest to `dir` that exists — `dir` itself, or the parent that
+/// refused it — and who owns it, as the account database names them.
+fn owner_of(dir: &Path) -> Option<(PathBuf, String)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (at, uid) = dir.ancestors().find_map(|p| {
+            std::fs::metadata(p)
+                .ok()
+                .map(|m| (p.to_path_buf(), m.uid()))
+        })?;
+        let name = roomlerd::appdirs::account_entry(uid)
+            .map(|a| a.name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("uid {uid}"));
+        Some((at, name))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// D5-A's stop, in the person's words: the folder, its owner, and the fix.
+fn unwritable_folder(
+    dir: &Path,
+    owner: Option<(PathBuf, String)>,
+    error: &std::io::Error,
+) -> String {
+    let owned = match &owner {
+        Some((at, name)) if at == dir => format!(", and it belongs to {name}"),
+        Some((at, name)) => format!(", and {} belongs to {name}", at.display()),
+        None => String::new(),
+    };
+    let fix = match &owner {
+        Some((at, _)) => format!(
+            "give it back to your account (sudo chown \"$USER\" '{}') or remove it",
+            at.display()
+        ),
+        None => "give it back to your account or remove it".to_string(),
+    };
+    format!(
+        "Your account cannot make or write {} ({error}){owned}. This Mac's screen sharing runs \
+         as you and keeps its files there, and Roomler Setup changes nothing in your home as \
+         root: {fix}, then retry. Nothing was enrolled, and the token is not spent.",
+        dir.display()
+    )
+}
+
 /// `roomlerd --version` → `0.4.181`, or nothing.
 pub fn installed_version(binary: &Path) -> Option<String> {
     let out = std::process::Command::new(binary)
@@ -299,6 +373,9 @@ pub struct PrivilegedSpec<'a> {
     pub config_from: Option<&'a Path>,
     /// The config keys the person set by hand, for `--config-take`.
     pub take: &'a [String],
+    /// FR-141 P2 — `config_from` is a Mac's one row: `--one-row`, and no
+    /// `--config-take` (the script places that config whole and refuses it).
+    pub one_row: bool,
 }
 
 /// `/bin/sh <script> --privileged-steps --role daemon --server … --name …
@@ -309,7 +386,8 @@ pub struct PrivilegedSpec<'a> {
 /// config the wizard enrolled: the Linux system scope's (with `--system`), or
 /// — FR-129 B2 — the macOS root half's, where it also requests the root half
 /// (the marker before the `.pkg`, as `--daemon-token` does on a terminal) and
-/// there is no `--system` (the script refuses it on macOS).
+/// there is no `--system` (the script refuses it on macOS). FR-141 P2: a
+/// one-row Mac's adds `--one-row` before it, and never `--config-take`.
 pub fn privileged_args(spec: &PrivilegedSpec<'_>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         OsString::from("/bin/sh"),
@@ -327,9 +405,12 @@ pub fn privileged_args(spec: &PrivilegedSpec<'_>) -> Vec<OsString> {
         args.push(OsString::from("--system"));
     }
     if let Some(from) = spec.config_from {
+        if spec.one_row {
+            args.push(OsString::from("--one-row"));
+        }
         args.push(OsString::from("--config-from"));
         args.push(from.as_os_str().to_os_string());
-        if !spec.take.is_empty() {
+        if !spec.take.is_empty() && !spec.one_row {
             args.push(OsString::from("--config-take"));
             args.push(OsString::from(spec.take.join(",")));
         }
@@ -708,17 +789,21 @@ fn shred(path: &Path) {
 /// with two tokens — the root half's before the privileged half (as a Linux
 /// system scope's), the person's after it — and keeps each on its own, so a
 /// Retry reuses whichever was already made, never re-posting either token.
+/// FR-141 P2: a one-row Mac's attempt makes ONE, root's, kept as the root
+/// half's is.
 #[derive(Debug)]
 pub struct KeptEnrollment {
     pub scope: Scope,
     pub server: String,
     pub device_name: String,
-    /// FR-129 B2: the attempt adds the macOS root half.
-    pub root_half: bool,
+    /// What the attempt makes of the machine: a Retry of another layout
+    /// has no use for it (FR-129 B2's root half, FR-141 P2's one row).
+    pub layout: Layout,
     /// The device the server now holds for this machine, `(agent, tenant)`,
     /// when the attempt enrolled: the system scope's, or the person's.
     pub ids: Option<(String, String)>,
-    /// FR-129 B2: the macOS root half's device, once it was enrolled.
+    /// The macOS root half's device, once it was enrolled: beside the
+    /// person's (FR-129 B2), or the Mac's one row (FR-141 P2).
     pub root_half_ids: Option<(String, String)>,
     pub config_path: PathBuf,
     /// The privileged half NOT run to its end: the enrolled root-owned config
@@ -739,31 +824,43 @@ pub fn keep(kept: KeptEnrollment) {
     *g = Some(kept);
 }
 
-/// Take the kept enrollment, if it is for this scope, server and name, with
-/// or without the root half as this attempt is — anything else is dropped
-/// (and its config shredded), because a different server or name needs a new
-/// enrollment, and an attempt that no longer adds the root half has no use
-/// for one.
+/// Take the kept enrollment, if it is for this scope, server, name and
+/// layout — anything else is dropped (and its config shredded), because a
+/// different server or name needs a new enrollment, and an attempt that makes
+/// the machine another way (with or without the root half, one row or two)
+/// has no use for one.
 pub fn take_kept(
     scope: Scope,
     server: &str,
     device_name: &str,
-    root_half: bool,
+    layout: Layout,
 ) -> Option<KeptEnrollment> {
     let mut g = KEPT.lock().unwrap_or_else(|p| p.into_inner());
     let kept = g.take()?;
     if kept.scope == scope
         && kept.server == server
         && kept.device_name == device_name
-        && kept.root_half == root_half
+        && kept.layout == layout
     {
         Some(kept)
     } else {
         tracing::info!(
-            "a kept enrollment is for another server, name, scope or set of halves; dropping it"
+            "a kept enrollment is for another server, name, scope or layout; dropping it"
         );
         None
     }
+}
+
+/// FR-141 P2 — is a one-row attempt for `server` kept for a Retry? Then
+/// root's config on this Mac may be that attempt's own, and it does not close
+/// the one-row form ([`crate::one_row_form::read_here`]): the form opened
+/// with no root config there, and the privileged half keeps one only when it
+/// holds this attempt's `agent_id` (`install.sh`,
+/// `install_macos_one_row_half`). A look, never a take.
+pub fn kept_one_row(server: &str) -> bool {
+    let g = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .is_some_and(|k| k.layout == Layout::OneRow && k.server == server)
 }
 
 /// Drop whatever is kept: the wizard's exit, a success.
@@ -1249,6 +1346,7 @@ mod tests {
             scope,
             config_from,
             take,
+            one_row: false,
         }
     }
 
@@ -1416,6 +1514,114 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--system"));
+
+        // FR-141 P2 — a one-row Mac: `--one-row --config-from`, and never
+        // `--config-take`, which the script refuses beside `--one-row`.
+        let one_row = PrivilegedSpec {
+            one_row: true,
+            ..spec(script, Scope::PerUser, Some(from), &take)
+        };
+        let args = privileged_args(&one_row);
+        let as_str: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            &as_str[10..],
+            &[
+                "--one-row",
+                "--config-from",
+                "/tmp/roomler-setup-x/config.toml"
+            ]
+        );
+        assert_eq!(as_str[8], HOSTILE, "the device's own name, one element");
+    }
+
+    /// FR-141 P2 — the one-row half the wizard runs, as the embedded script
+    /// has it: the refusals that keep its argv honest, and the order root's
+    /// config, the one package run and the belt come in, with no LaunchAgent
+    /// kickstarted (#4092: a person's agent beside a one-row worker serves the
+    /// row twice).
+    #[test]
+    fn the_embedded_script_places_a_one_row_mac_before_its_one_package_run() {
+        for refusal in [
+            "error: a one-row Mac has no user half",
+            "error: --privileged-steps --one-row places the root config its caller enrolled: pass --config-from FILE",
+            "error: --one-row places the root config whole and folds nothing into it: run it without --config-take",
+        ] {
+            assert!(INSTALL_SH.contains(refusal), "{refusal}");
+        }
+        assert!(INSTALL_SH.contains(
+            "if [ \"$PRIV_STEPS\" = 1 ]; then\n            install_macos_one_row_half \"$pkg\" \"$daemon_bin\""
+        ));
+        let start = INSTALL_SH
+            .find("install_macos_one_row_half() {")
+            .expect("the half");
+        let body = &INSTALL_SH[start..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let marker = at("as_root touch \"$MACOS_DAEMON_MARKER\"");
+        let config =
+            at("as_root install -m 600 -o root -g 0 \"$CONFIG_FROM\" \"$MACOS_DAEMON_CONFIG\"");
+        let package = at("as_root installer -pkg \"$pkg\" -target /");
+        let belt = at("enroll --help");
+        assert!(marker < config && config < package && package < belt);
+        assert_eq!(body.matches("installer -pkg").count(), 1, "one package run");
+        assert!(
+            !body.contains("kickstart"),
+            "no LaunchAgent is started beside a one-row worker"
+        );
+        assert!(
+            body.contains("sudo roomlerd one-row"),
+            "a root half that is a row of its own is offered the person's own command"
+        );
+    }
+
+    /// FR-141 P2 (D5-A) — the person's folders are made by this process and
+    /// written to; one that cannot be made stops the install, naming the
+    /// folder and who owns the place that refused it.
+    #[test]
+    fn the_persons_folders_are_made_and_written_or_named() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("Library/Application Support/x/config");
+        let data = home.path().join("Library/Application Support/x/data");
+        make_writable_folders(&[config.clone(), data.clone()]).unwrap();
+        assert!(config.is_dir() && data.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&config).unwrap().count(),
+            0,
+            "the probe leaves nothing"
+        );
+
+        // A file where a folder belongs: nothing can make the folder below it.
+        let blocked = home.path().join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        let under = blocked.join("config");
+        let said = make_writable_folders(&[under.clone()]).unwrap_err();
+        assert!(said.contains(&under.display().to_string()), "{said}");
+        assert!(said.contains("the token is not spent"), "{said}");
+        #[cfg(unix)]
+        assert!(
+            said.contains(&blocked.display().to_string()),
+            "the owner's place: {said}"
+        );
+    }
+
+    /// D5-A's words name the owner of the folder itself, or of the parent
+    /// that refused it, and give the fix for that place.
+    #[test]
+    fn an_unwritable_folder_is_named_with_its_owner() {
+        let dir = Path::new("/Users/p/Library/Application Support/live.x");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let own = unwritable_folder(dir, Some((dir.to_path_buf(), "root".into())), &denied);
+        assert!(own.contains("and it belongs to root"), "{own}");
+        assert!(own.contains("sudo chown \"$USER\" '/Users/p/Library/Application Support/live.x'"));
+        let parent = Path::new("/Users/p/Library");
+        let up = unwritable_folder(dir, Some((parent.to_path_buf(), "root".into())), &denied);
+        assert!(up.contains("and /Users/p/Library belongs to root"), "{up}");
+        let unknown = unwritable_folder(dir, None, &denied);
+        assert!(!unknown.contains("belongs to"), "{unknown}");
+        for said in [own, up, unknown] {
+            assert!(said.contains("Nothing was enrolled"), "{said}");
+            assert!(!said.contains("two devices"), "rule 5: {said}");
+        }
     }
 
     /// FR-129 B2 — the script the wizard embeds takes `--config-from` on
@@ -1701,47 +1907,79 @@ mod tests {
     }
 
     /// A kept enrollment is handed back only to the attempt it was made for —
-    /// the same scope, server and name, and (FR-129 B2) with the root half
-    /// or without it, as it was.
+    /// the same scope, server and name, and the same layout: (FR-129 B2) with
+    /// the root half or without it, and (FR-141 P2) one row or two. The only
+    /// test that touches the process's one kept enrollment, so no other test
+    /// races it.
     #[test]
-    fn a_kept_enrollment_matches_scope_server_and_name() {
+    fn a_kept_enrollment_matches_scope_server_name_and_layout() {
+        const SERVER: &str = "https://example.invalid";
         clear_kept();
-        let kept = |root_half: bool| KeptEnrollment {
+        let kept = |layout: Layout| KeptEnrollment {
             scope: Scope::System,
-            server: "https://example.invalid".into(),
+            server: SERVER.into(),
             device_name: "lab".into(),
-            root_half,
+            layout,
             ids: Some(("aid".into(), "tid".into())),
-            root_half_ids: root_half.then(|| ("aid-root".into(), "tid".into())),
+            root_half_ids: (layout != Layout::Device).then(|| ("aid-root".into(), "tid".into())),
             config_path: PathBuf::from("/etc/roomler/config.toml"),
             scratch: None,
             privileged_done: true,
         };
-        keep(kept(false));
-        assert!(take_kept(Scope::PerUser, "https://example.invalid", "lab", false).is_none());
-        keep(kept(false));
-        assert!(take_kept(Scope::System, "https://other.invalid", "lab", false).is_none());
-        keep(kept(false));
-        assert!(take_kept(Scope::System, "https://example.invalid", "lab-2", false).is_none());
-        keep(kept(false));
+        keep(kept(Layout::Device));
+        assert!(take_kept(Scope::PerUser, SERVER, "lab", Layout::Device).is_none());
+        keep(kept(Layout::Device));
         assert!(
-            take_kept(Scope::System, "https://example.invalid", "lab", true).is_none(),
+            take_kept(
+                Scope::System,
+                "https://other.invalid",
+                "lab",
+                Layout::Device
+            )
+            .is_none()
+        );
+        keep(kept(Layout::Device));
+        assert!(take_kept(Scope::System, SERVER, "lab-2", Layout::Device).is_none());
+        keep(kept(Layout::Device));
+        assert!(
+            take_kept(Scope::System, SERVER, "lab", Layout::TwoRows).is_none(),
             "an attempt that adds the root half reuses no attempt that did not"
         );
-        keep(kept(true));
+        keep(kept(Layout::TwoRows));
         assert!(
-            take_kept(Scope::System, "https://example.invalid", "lab", false).is_none(),
+            take_kept(Scope::System, SERVER, "lab", Layout::Device).is_none(),
             "nor the other way round"
         );
-        keep(kept(false));
-        let got = take_kept(Scope::System, "https://example.invalid", "lab", false).unwrap();
+        keep(kept(Layout::Device));
+        let got = take_kept(Scope::System, SERVER, "lab", Layout::Device).unwrap();
         assert_eq!(got.ids, Some(("aid".into(), "tid".into())));
         assert!(got.privileged_done);
         // Taken once.
-        assert!(take_kept(Scope::System, "https://example.invalid", "lab", false).is_none());
-        keep(kept(true));
-        let got = take_kept(Scope::System, "https://example.invalid", "lab", true).unwrap();
+        assert!(take_kept(Scope::System, SERVER, "lab", Layout::Device).is_none());
+        keep(kept(Layout::TwoRows));
+        let got = take_kept(Scope::System, SERVER, "lab", Layout::TwoRows).unwrap();
         assert_eq!(got.root_half_ids, Some(("aid-root".into(), "tid".into())));
+
+        // FR-141 P2 — a one-row attempt is seen (never taken) by the form's
+        // read for its own server only, and only a one-row Retry takes it.
+        assert!(!kept_one_row(SERVER), "nothing kept");
+        keep(kept(Layout::TwoRows));
+        assert!(!kept_one_row(SERVER), "two rows are not one");
+        keep(kept(Layout::OneRow));
+        assert!(
+            kept_one_row(SERVER) && kept_one_row(SERVER),
+            "a look, not a take"
+        );
+        assert!(!kept_one_row("https://other.invalid"));
+        assert!(
+            take_kept(Scope::System, SERVER, "lab", Layout::TwoRows).is_none(),
+            "two rows cannot finish a one-row attempt"
+        );
+        assert!(!kept_one_row(SERVER), "dropped by that take");
+        keep(kept(Layout::OneRow));
+        let got = take_kept(Scope::System, SERVER, "lab", Layout::OneRow).unwrap();
+        assert_eq!(got.layout, Layout::OneRow);
+        clear_kept();
     }
 
     /// The terminal confirm wakes exactly one waiter, and refuses when none
