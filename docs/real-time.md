@@ -91,7 +91,10 @@ target directive loses to a span-scoped one such as `[org]=trace`, which
 `EnvFilter` lets win.
 
 Delivery across pods: WS sessions are pod-local; chat, presence, and notification
-events fan out through Redis pub/sub so every pod pushes to its own sockets.
+events fan out through Redis pub/sub so every pod pushes to its own sockets. Each pod's
+subscriber probes its own connection, so one that a lost Redis left deaf is found and subscribes
+again within a minute of Redis answering, losing the events in between (at-most-once)
+([multi-pod-scale-out.md](multi-pod-scale-out.md#the-subscriptions-3952)).
 
 ## User plane (browser)
 
@@ -499,7 +502,7 @@ sequenceDiagram
   it over the bus: `media.close_room` with `reason: "room_deleted"` (`media_cluster.rs:397`
   `close_room_everywhere`, handled at `:898`). The hook awaits one directory read, at most
   one request whose reply waits at most `RPC_DEADLINE`, 2 s
-  (`crates/core/src/cluster/bus.rs:41`), a second read and a release when no reply comes,
+  (`crates/core/src/cluster/bus.rs:42`), a second read and a release when no reply comes,
   and one update of the stats record.
 - **The delete waits a bounded time.** The hook runs in a task of its own, and the delete
   waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:342`),
@@ -579,7 +582,7 @@ the call's owner pod is counted once, where it came in.
 |---|---|
 | is not run, and the socket hears `media:error` with `code: "rate_limited"`, `retry_after_ms` (the time until the bucket holds a frame again) and a `message` | `crates/modules/conference/src/frame_limit.rs:48` `refused` |
 | leaves the socket open: a client that overruns loses that frame, never its socket or its call | the same |
-| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:36`, `crates/api/src/cluster/metrics.rs:63` |
+| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:38`, `crates/api/src/cluster/metrics.rs:63` |
 | is logged: the socket's first refusal at warn, and its total at info when it closes | `frame_limit.rs:48`, `:85` `socket_closed` |
 
 **How deep, measured.** The deepest burst a real client sends is a join into a large
@@ -762,7 +765,7 @@ more packets than one worker carries without it.
 
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
-(`crates/api/src/cluster/metrics.rs:88`, from `MediaGauges::video_paused_total`,
+(`crates/api/src/cluster/metrics.rs:96`, from `MediaGauges::video_paused_total`,
 `crates/modules/conference/src/lib.rs:128`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the

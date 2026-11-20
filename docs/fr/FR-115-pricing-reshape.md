@@ -130,7 +130,7 @@ landed yet is computed at one seat, the floor, so a missing number can only unde
 Every org is created on `free` (`crates/services/src/dao/tenant.rs:316`), on every server.
 On the hosted service that is a plan; on a self-hosted server it is only the absence of
 one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where the hosted
-`saas` module is compiled in and switched on (`crates/api/src/state.rs:323`). The published
+`saas` module is compiled in and switched on (`crates/api/src/state.rs:327`). The published
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
@@ -522,7 +522,7 @@ sequenceDiagram
 |---|---|
 | The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
 | The PoP's store and its collector | `crates/derp-relay/src/main.rs:262` (`TurnUsage`), `:388` (the subscription to `TURN_STATS_REDIS`) |
-| The PoP's endpoint | `crates/derp-relay/src/main.rs:618` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:646` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
 | The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
 | The pull | `crates/core/src/relay_load.rs:314` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:186`) |
 | The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |
