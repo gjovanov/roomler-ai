@@ -480,6 +480,16 @@ pub struct RelayCoordinator {
     /// (client ignores the pin, server refuses TURN grants for the pin's
     /// TTL). Cleared the moment any mux registers successfully.
     derp_mux_failed: bool,
+    /// #2992 — the central `/derp` mux's opener (the agent's factory), held
+    /// here so that every DERP verdict that finds no mux can open one: the P7
+    /// push, the server's stamp on a live TURN pair, and the stamp at
+    /// establishment. `FnOnce`, so the node opens at most one central mux;
+    /// `None` once it is used, or when this node has no `/derp` at all.
+    derp_opener: Option<crate::overlay::runtime::DerpMuxFactory>,
+    /// #2992 — per-peer throttle for the line a DERP verdict logs while it
+    /// waits on the mux, or falls back to a relay request because the mux will
+    /// not come: `(last_logged, reason_code)`, as `floor_withheld_log`.
+    derp_wait_log: HashMap<ObjectId, (Instant, u8)>,
     /// U2 — our own `OVERLAY_SERVER_RELAY_STRATEGY` opt-in, read once at
     /// construction (like `derp`/`single_relay`). When on, and the server
     /// stamped a per-edge verdict (`PeerConfig::relay_strategy`, which it
@@ -604,6 +614,8 @@ impl RelayCoordinator {
             refresh_ctx: HashMap::new(),
             death_streaks: HashMap::new(),
             derp_mux_failed: false,
+            derp_opener: None,
+            derp_wait_log: HashMap::new(),
             server_strategy: super::direct::server_relay_strategy_enabled(),
             warm_leg: None,
             warm_committed: None,
@@ -778,6 +790,133 @@ impl RelayCoordinator {
         self.derp_mux_failed = false;
     }
 
+    /// #2992 — hand the coordinator the central `/derp` mux's opener (the
+    /// agent's factory). The runtime calls this once, right after it builds
+    /// the coordinator; [`open_derp_mux_at_start`](Self::open_derp_mux_at_start)
+    /// and [`open_derp_mux_for_verdict`](Self::open_derp_mux_for_verdict) are
+    /// then the only two ways a central mux is opened.
+    pub fn set_derp_opener(&mut self, opener: Option<crate::overlay::runtime::DerpMuxFactory>) {
+        self.derp_opener = opener;
+    }
+
+    /// Open the central mux at start, for a UDP-blocked node (its srflx gather
+    /// found nothing) or one with `overlay_derp_floor` on. The same open the
+    /// runtime made itself before #2992: the mux is born alive, so floors are
+    /// built at birth and queue until the WS registers. Returns whether a mux
+    /// exists now.
+    pub fn open_derp_mux_at_start(&mut self) -> bool {
+        if self.derp_mux.is_none()
+            && let Some(open) = self.derp_opener.take()
+        {
+            self.set_derp_mux(open());
+        }
+        self.derp_mux.is_some()
+    }
+
+    /// #2992 — a DERP verdict found no central mux: open it now, once.
+    ///
+    /// Three verdicts reach here: the server's force-DERP push (P7), its DERP
+    /// stamp on a pair that rides TURN ([`stamp_to_derp`](Self::stamp_to_derp)),
+    /// and the same stamp when the pair is (re)established
+    /// ([`request`](Self::request)). Before #2992 only the first could open
+    /// one, through an opener the runtime loop kept for that arm alone. So on a
+    /// node whose DERP floor is off and whose STUN works, the other two did
+    /// nothing: the stamp's probe never started, and an establishing pair
+    /// parked in `derping` with no carrier and no deadline.
+    ///
+    /// The mux starts CONNECTING ([`DerpMux::begin_connecting`]). Every DERP
+    /// build waits for its WS to register, the registration wakes the walk
+    /// (`MuxEvent::Recovered`), and a WS that never registers reads down from
+    /// this moment: after [`DERP_WS_DOWN_EVIDENCE`] the verdict is one this
+    /// node cannot serve ([`derp_servable`](Self::derp_servable)), and its
+    /// relay requests report `derp_mux_failed`. With no opener (this node has
+    /// no `/derp`) that report is latched at once. Returns whether a mux
+    /// exists now.
+    pub fn open_derp_mux_for_verdict(&mut self, node_id: &ObjectId, verdict: &str) -> bool {
+        if self.derp_mux.is_some() {
+            return true;
+        }
+        let Some(open) = self.derp_opener.take() else {
+            if !self.derp_mux_failed {
+                warn!(peer = %node_id, verdict,
+                    "overlay relay: a DERP verdict, but this node cannot open /derp — reporting derp_mux_failed on its relay requests");
+            }
+            self.derp_mux_failed = true;
+            return false;
+        };
+        let mux = open();
+        // The sink before the connecting state: the registration this waits
+        // for must find it armed, or the walk it wakes never runs.
+        Self::arm_event_sink(&self.event_sink, &mux);
+        mux.begin_connecting();
+        info!(peer = %node_id, verdict,
+            "overlay relay: a DERP verdict found no /derp mux — opening it now; the verdict waits until it registers");
+        self.set_derp_mux(mux);
+        true
+    }
+
+    /// #2992 — can this node serve a DERP verdict for `node_id`? It has the
+    /// mux that serves the peer, or failing that an opener that can make one,
+    /// and the central mux has not been down for [`DERP_WS_DOWN_EVIDENCE`] (a
+    /// mux opened on demand counts as down until it registers).
+    ///
+    /// The bound is exactly what [`derp_evidence_failed`](Self::derp_evidence_failed)
+    /// reports, so the moment a verdict stops being servable here is the
+    /// moment this node's relay requests start saying so. That is also why it
+    /// reads the CENTRAL mux only: a peer bound to a regional mux by a P7 pin
+    /// keeps the pin through a regional outage, as before #2992, because
+    /// falling through without the evidence would only have the server push
+    /// the pin again on the pair's next request.
+    fn derp_servable(&self, node_id: &ObjectId) -> bool {
+        match self.mux_for(node_id) {
+            Some(m) if self.derp_mux.as_ref().is_some_and(|c| Arc::ptr_eq(c, m)) => {
+                !m.down_for().is_some_and(|d| d >= DERP_WS_DOWN_EVIDENCE)
+            }
+            Some(_) => true,
+            None => self.derp_opener.is_some(),
+        }
+    }
+
+    /// #2992 — does a verdict ask this pair for DERP, whatever the mux's
+    /// state? In [`relay_strategy`](Self::relay_strategy)'s order: a live P7
+    /// pin, then a live org-relay session (which outranks the stamp), then the
+    /// server's stamp. A peer that cannot speak DERP is never asked.
+    fn verdict_asks_derp(&self, node_id: &ObjectId, peer: &PeerConfig) -> bool {
+        if !peer.supports_derp {
+            return false;
+        }
+        if self.forced_derp_active(node_id) {
+            return true;
+        }
+        if self.org_relay
+            && self
+                .org_sessions
+                .get(node_id)
+                .is_some_and(|s| s.is_live(Instant::now()))
+        {
+            return false;
+        }
+        self.server_strategy && peer.relay_strategy == Some(RelayStrategyWire::Derp)
+    }
+
+    /// #2992 — report a DERP verdict that waits on the mux, or that this node
+    /// cannot serve: one line per peer per (changed) reason or per 5 minutes,
+    /// as [`note_floor_withheld`](Self::note_floor_withheld) does. Silence here
+    /// is the state #2992 was filed from: a stamped pair that never moved, and
+    /// not one line to say why.
+    fn note_derp_wait(&mut self, node_id: ObjectId, code: u8, reason: &str) {
+        const QUIET: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let fresh = match self.derp_wait_log.get(&node_id) {
+            Some((at, c)) => *c != code || now.duration_since(*at) >= QUIET,
+            None => true,
+        };
+        if fresh {
+            self.derp_wait_log.insert(node_id, (now, code));
+            info!(peer = %node_id, "overlay relay: DERP verdict — {reason}");
+        }
+    }
+
     /// Phase A1 — the DERP-failure evidence that rides every relay request
     /// (`OverlayRelayRequest.derp_mux_failed`). Two producers:
     /// * the sticky open-failure latch (`derp_mux_failed` — a force-derp push
@@ -861,9 +1000,11 @@ impl RelayCoordinator {
     /// its next (re)establishment cycle, which the health sweep drives within
     /// ~15 s for a dead carrier.
     ///
-    /// The caller must ensure a `/derp` mux exists first ([`has_derp_mux`] /
-    /// [`set_derp_mux`]); without one the pin is refused (a pinned peer with
-    /// no mux would park in `derping` unreachable until expiry).
+    /// The runtime opens the central mux first
+    /// ([`open_derp_mux_for_verdict`](Self::open_derp_mux_for_verdict), #2992);
+    /// without one the pin is refused (a pinned peer with no mux would park in
+    /// `derping` unreachable until expiry). A mux opened for the pin starts
+    /// connecting, so the build below waits for its WS to register.
     pub fn force_derp(
         &mut self,
         node_id: ObjectId,
@@ -1052,8 +1193,9 @@ impl RelayCoordinator {
     /// live org-relay session or a force-DERP pin still decides first. A peer
     /// mid-establishment is left to `maybe_complete`'s recompute. `None` = no
     /// probe: not stamped DERP, a recent probe went unanswered, the peer can't
-    /// speak DERP, or no live mux serves it (`follow_peer_to_derp` decides that
-    /// before touching anything).
+    /// speak DERP, or the mux is not up. #2992 — a node with no mux opens one
+    /// here ([`open_derp_mux_for_verdict`](Self::open_derp_mux_for_verdict)),
+    /// and the walk its registration wakes starts the probe.
     pub fn stamp_to_derp(
         &mut self,
         node_id: ObjectId,
@@ -1063,9 +1205,7 @@ impl RelayCoordinator {
         if !self.server_strategy || peer.relay_strategy != Some(RelayStrategyWire::Derp) {
             return None;
         }
-        if !matches!(self.relay_strategy(&node_id, &peer), RelayStrategy::Derp)
-            || self.is_tracking(&node_id)
-        {
+        if !self.verdict_asks_derp(&node_id, &peer) || self.is_tracking(&node_id) {
             return None;
         }
         if self
@@ -1073,6 +1213,30 @@ impl RelayCoordinator {
             .get(&node_id)
             .is_some_and(|&t| now.saturating_duration_since(t) < STAMP_PROBE_BACKOFF)
         {
+            return None;
+        }
+        // #2992 — no mux (a node whose DERP floor is off and whose STUN works
+        // never opened one): open it, and probe once it registers. Field
+        // 2026-10-27 on 0.4.177: without this the stamp did nothing at all,
+        // with no line in either agent's log, and the pair kept TURN.
+        if self.mux_for(&node_id).is_none()
+            && !self
+                .open_derp_mux_for_verdict(&node_id, "the server's DERP stamp on a live TURN pair")
+        {
+            return None;
+        }
+        if !matches!(self.relay_strategy(&node_id, &peer), RelayStrategy::Derp) {
+            return None;
+        }
+        // The probe waits for the WS, as `try_build_derp` does: a carrier built
+        // over a WS that is not up is born dead. TURN keeps the traffic, and
+        // the registration's `Recovered` wakes the walk that probes.
+        if !self.mux_for(&node_id).is_some_and(|m| m.is_alive()) {
+            self.note_derp_wait(
+                node_id,
+                1,
+                "the server stamps this TURN pair DERP and its /derp mux is not up yet (connecting, or reconnecting) — the probe waits for it, and TURN keeps the traffic",
+            );
             return None;
         }
         self.follow_peer_to_derp(node_id, peer)
@@ -1162,10 +1326,12 @@ impl RelayCoordinator {
         // tier while unexpired (checked FIRST so the strategy-flip recompute
         // in `maybe_complete` can't thrash a pinned pair back onto the
         // broken TURN tier). Still gated on the peer's `supports_derp` and a
-        // live mux — the server only escalates when both ends advertised
-        // support, so these normally hold; they keep a stale pin harmless.
-        if self.forced_derp_active(node_id) && self.mux_for(node_id).is_some() && peer.supports_derp
-        {
+        // mux this node can serve it on — the server only escalates when both
+        // ends advertised support, so these normally hold; they keep a stale
+        // pin harmless. #2992 — "can serve" is `derp_servable`: a mux down past
+        // `DERP_WS_DOWN_EVIDENCE` falls through, so the pair asks for a relay
+        // and its `derp_mux_failed` lets the server's U1 healer clear the pin.
+        if self.forced_derp_active(node_id) && self.derp_servable(node_id) && peer.supports_derp {
             return RelayStrategy::Derp;
         }
         // FR-19 P4b — a live org-relay session for this pair is the answer,
@@ -1197,7 +1363,16 @@ impl RelayCoordinator {
             match w {
                 RelayStrategyWire::SingleRelayAnchor => return RelayStrategy::SingleRelay(true),
                 RelayStrategyWire::SingleRelayDialer => return RelayStrategy::SingleRelay(false),
-                RelayStrategyWire::Derp => return RelayStrategy::Derp,
+                // #2992 — taken only when this node can serve it (a mux, or an
+                // opener that `request` uses before it gets here). A mux that
+                // has stayed down past `DERP_WS_DOWN_EVIDENCE` falls through
+                // to the local derivation below: the tier the pair would have
+                // had without the stamp. Its relay request then reports
+                // `derp_mux_failed`, and the server stops stamping the pair.
+                RelayStrategyWire::Derp if self.derp_servable(node_id) => {
+                    return RelayStrategy::Derp;
+                }
+                RelayStrategyWire::Derp => {}
                 RelayStrategyWire::BothAllocate => return RelayStrategy::BothAllocate,
                 // FR-19 — an org-relay verdict. This build cannot ride one yet
                 // (the client carrier is P4), so it is treated exactly as an
@@ -1284,7 +1459,11 @@ impl RelayCoordinator {
     /// `roles` survives the build (only `forget` clears it), so it still holds
     /// the strategy the link was established with — that is the comparison
     /// point. A force-DERP pin keeps this false for free: `relay_strategy`
-    /// checks the pin FIRST and keeps returning `Derp`.
+    /// checks the pin FIRST and keeps returning `Derp` — while this node can
+    /// serve it. #2992: once the central `/derp` WS has been down for
+    /// [`DERP_WS_DOWN_EVIDENCE`] the DERP link is dead anyway, the pin and the
+    /// server's DERP stamp both fall through, and the regrade's relay request
+    /// carries the `derp_mux_failed` that lets the server let go of the pair.
     ///
     /// ⚠️ The regrade is **break-before-make** (same as the P7 force-DERP
     /// teardown/rebuild it mirrors): the caller drops a WORKING carrier to
@@ -1475,13 +1654,64 @@ impl RelayCoordinator {
         // no-wire strategies below send nothing, and stale evidence must not
         // linger to be replayed by a later, unrelated request).
         let refresh = self.refresh_ctx.remove(&node_id);
+        // #2992 — a DERP verdict that finds no mux opens it here, before the
+        // strategy is read: a mux that opens is one the verdict can wait on
+        // (it parks in `derping` until the WS registers), and a node that
+        // cannot open one latches `derp_mux_failed` for the request below.
+        let asks_derp = self.verdict_asks_derp(&node_id, &peer);
+        if asks_derp && self.mux_for(&node_id).is_none() {
+            self.open_derp_mux_for_verdict(&node_id, "the server's DERP verdict at establishment");
+        }
         // Compute the strategy ONCE and remember it, so `maybe_complete` can
         // detect a later flip (the peer's srflx propagating) and re-establish —
         // see `roles`.
         let strat = self.relay_strategy(&node_id, &peer);
+        let unservable_derp = asks_derp && strat != RelayStrategy::Derp;
+        if unservable_derp {
+            self.note_derp_wait(
+                node_id,
+                3,
+                "this node cannot serve it (its /derp mux has been down for 60 s or more, or it cannot open one) — asking for a relay instead, and the request reports derp_mux_failed",
+            );
+        }
+        // U1 — the refresh evidence + the sticky mux-failure flag the request
+        // carries.
+        let (current_kind, reason) = match refresh {
+            Some((kind, reason)) => (
+                kind.map(|k| {
+                    match k {
+                        RelayKind::Turn => "turn",
+                        RelayKind::Derp => "derp",
+                        RelayKind::Org => "org",
+                    }
+                    .to_string()
+                }),
+                Some(reason.to_string()),
+            ),
+            None => (None, None),
+        };
         match strat {
             RelayStrategy::SingleRelay(false) => {
                 debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
+                // #2992 — a dialer asks the server for nothing (its anchor
+                // does), so a DERP verdict it cannot serve would never reach
+                // the server, which would go on stamping the pair DERP: the
+                // anchor, whose `/derp` works, stays on DERP and never
+                // allocates the `R` this end waits for, and the pair has no
+                // carrier. Report it the way the warm leg reports its fast
+                // path (PR-B2): one fire-and-forget request, whose grant
+                // `grant_accept` drops, since this peer is not in `pending`.
+                if unservable_derp {
+                    let _ = self
+                        .outbound
+                        .send(ClientMsg::OverlayRelayRequest {
+                            peer_node_id: node_id,
+                            current_kind,
+                            reason,
+                            derp_mux_failed: self.derp_evidence_failed(),
+                        })
+                        .await;
+                }
                 self.roles.insert(node_id, strat);
                 self.dialing.insert(node_id, peer);
                 return;
@@ -1500,21 +1730,6 @@ impl RelayCoordinator {
             }
             RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
-        // U1 — attach the refresh evidence + the sticky mux-failure flag.
-        let (current_kind, reason) = match refresh {
-            Some((kind, reason)) => (
-                kind.map(|k| {
-                    match k {
-                        RelayKind::Turn => "turn",
-                        RelayKind::Derp => "derp",
-                        RelayKind::Org => "org",
-                    }
-                    .to_string()
-                }),
-                Some(reason.to_string()),
-            ),
-            None => (None, None),
-        };
         // C4 stage 2 (PR-B) — single-relay ANCHOR with a live warm leg: commit
         // the standing allocation NOW instead of the request→grant→allocate
         // round-trips (each of which can take seconds — or forever, when this
@@ -1944,8 +2159,13 @@ impl RelayCoordinator {
         // pair stays tracked in `derping`, and the install_peers walk (netmap
         // + the 30 s reupgrade tick) builds it the moment the mux is back.
         if !mux.is_alive() {
-            debug!(peer = %node_id,
-                   "overlay relay: DERP mux down (reconnecting) — withholding the DERP link");
+            // #2992 — reported, not `debug!`: a pair parked here has no
+            // carrier, and this is the line that says why.
+            self.note_derp_wait(
+                *node_id,
+                2,
+                "its /derp mux is not up (connecting, or reconnecting) — the DERP link waits for it; a mux still down after 60 s makes the pair ask for a relay instead",
+            );
             return None;
         }
         let derp_conn = mux.conn_for(peer.public_key);
@@ -4413,6 +4633,318 @@ mod tests {
             !coord.stamp_probe_failed.contains_key(&peer2),
             "a promoted probe clears the backoff"
         );
+    }
+
+    /// #2992 — the agent's `/derp` factory, played by a test: it hands out
+    /// `mux` and counts its calls (the coordinator may make one, ever).
+    fn counting_opener(
+        mux: &Arc<DerpMux>,
+    ) -> (
+        crate::overlay::runtime::DerpMuxFactory,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (m, c) = (Arc::clone(mux), Arc::clone(&calls));
+        let open: crate::overlay::runtime::DerpMuxFactory = Box::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            m
+        });
+        (open, calls)
+    }
+
+    fn opened(calls: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// #2992 — a floor-off node whose STUN works: UDP-capable, no mux at
+    /// start, the server's verdicts taken, and the agent's opener handed over
+    /// as the runtime does.
+    fn floor_off_coord(
+        tx: mpsc::Sender<ClientMsg>,
+        mux: &Arc<DerpMux>,
+    ) -> (RelayCoordinator, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        coord.single_relay = true;
+        coord.derp = true;
+        coord.server_strategy = true;
+        let (open, calls) = counting_opener(mux);
+        coord.set_derp_opener(Some(open));
+        (coord, calls)
+    }
+
+    /// A UDP-capable peer whose pair the server stamps DERP (FR-115 P4c-1).
+    fn stamped_derp_peer(public_key: [u8; 32]) -> PeerConfig {
+        PeerConfig {
+            public_key,
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            relay_strategy: Some(RelayStrategyWire::Derp),
+            ..base_peer()
+        }
+    }
+
+    /// The `derp_mux_failed` of the next relay request on the wire, if any.
+    fn next_relay_request(rx: &mut mpsc::Receiver<ClientMsg>) -> Option<bool> {
+        while let Ok(m) = rx.try_recv() {
+            if let ClientMsg::OverlayRelayRequest {
+                derp_mux_failed, ..
+            } = m
+            {
+                return Some(derp_mux_failed);
+            }
+        }
+        None
+    }
+
+    /// #2992 AC1 — on a floor-off node whose STUN works, the server's DERP
+    /// stamp on a live TURN pair found no mux and did nothing at all (field
+    /// 2026-10-27, agent 0.4.177: no probe, no line, the pair kept TURN).
+    /// Now the stamp opens the central mux, once. The probe waits while the
+    /// WS connects, TURN keeping the traffic; the WS's first registration
+    /// wakes the walk, and the walk's stamp builds the probe.
+    #[tokio::test]
+    async fn a_stamp_with_no_mux_opens_it_and_probes_once_it_is_up() {
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let (mut coord, calls) = floor_off_coord(tx, &mux);
+        let (ev_tx, mut ev_rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        coord.set_event_sink(ev_tx);
+        let node = ObjectId::new();
+        let peer = stamped_derp_peer([0xFFu8; 32]);
+        // Established on TURN, ours the anchor.
+        coord.roles.insert(node, RelayStrategy::SingleRelay(true));
+        coord.advertised.insert(node, "203.0.113.1:3478".into());
+        let on_turn = |c: &RelayCoordinator| {
+            c.roles.get(&node) == Some(&RelayStrategy::SingleRelay(true))
+                && c.advertised.contains_key(&node)
+                && !c.is_tracking(&node)
+        };
+        let now = Instant::now();
+
+        assert!(
+            coord.stamp_to_derp(node, peer.clone(), now).is_none(),
+            "no probe while the WS connects"
+        );
+        assert_eq!(opened(&calls), 1, "the stamp opened the central mux");
+        assert!(coord.has_derp_mux());
+        assert!(
+            !coord.derp_ws_alive(),
+            "a mux opened on demand is down until its WS registers"
+        );
+        assert!(
+            on_turn(&coord),
+            "waiting moves nothing: TURN keeps the pair"
+        );
+        assert!(coord.stamp_to_derp(node, peer.clone(), now).is_none());
+        assert_eq!(opened(&calls), 1, "never a second open");
+
+        // The WS registers: its first `mark_up` wakes the runtime's walk...
+        mux.mark_up();
+        assert_eq!(ev_rx.try_recv().ok(), Some(MuxEvent::Recovered));
+        // ...whose stamp builds the probe.
+        let link = coord
+            .stamp_to_derp(node, peer, now)
+            .expect("the probe starts once the mux is up");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert!(on_turn(&coord), "only the probe's commit moves the pair");
+        assert_eq!(opened(&calls), 1);
+    }
+
+    /// #2992 AC2 — the same stamp when the pair (re)establishes, read from
+    /// the code: the verdict parked the pair in `derping` with no mux, no
+    /// carrier and no deadline. Now the establishment opens the mux, the pair
+    /// waits in `derping` (asking the server for nothing: over its allowance
+    /// the org gets no TURN grant anyway), and the walk the registration
+    /// wakes builds the DERP link.
+    #[tokio::test]
+    async fn a_stamped_establishment_with_no_mux_opens_it_instead_of_parking_the_pair() {
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let (mut coord, calls) = floor_off_coord(tx, &mux);
+        let (ev_tx, mut ev_rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        coord.set_event_sink(ev_tx);
+        let node = ObjectId::new();
+        let peer = stamped_derp_peer([0xFFu8; 32]);
+
+        coord.request(node, peer.clone()).await;
+        assert_eq!(opened(&calls), 1, "the establishment opened the mux");
+        assert!(coord.is_derping(&node));
+        assert_eq!(
+            next_relay_request(&mut rx),
+            None,
+            "a DERP link asks the server for nothing"
+        );
+        assert!(
+            coord.maybe_complete(node, &peer).is_none(),
+            "the link waits for the WS"
+        );
+        assert!(coord.is_derping(&node), "waiting, not forgotten");
+
+        mux.mark_up();
+        assert_eq!(ev_rx.try_recv().ok(), Some(MuxEvent::Recovered));
+        let link = coord
+            .maybe_complete(node, &peer)
+            .expect("the DERP link builds once the WS is up");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert_eq!(opened(&calls), 1);
+    }
+
+    /// #2992 AC3 — a DERP verdict this node cannot serve leaves `derping` and
+    /// asks for a relay, and the request reports `derp_mux_failed`, which the
+    /// server's P4c-1 pin then respects: (a) a node with no `/derp` to open,
+    /// at once; (b) a mux whose WS has not come up within
+    /// `DERP_WS_DOWN_EVIDENCE`, on the first walk past the bound; (c) the same
+    /// as a single-relay DIALER, which otherwise asks the server for nothing,
+    /// so the server would never hear it.
+    #[tokio::test]
+    async fn a_derp_verdict_this_node_cannot_serve_is_reported() {
+        // Ours is the smaller key: we anchor.
+        let peer = stamped_derp_peer([0xFFu8; 32]);
+
+        // (a) No opener: this node cannot open `/derp` at all.
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(8);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        coord.single_relay = true;
+        coord.derp = true;
+        coord.server_strategy = true;
+        let node = ObjectId::new();
+        coord.request(node, peer.clone()).await;
+        assert!(!coord.is_derping(&node), "never parked without a mux");
+        assert_eq!(
+            next_relay_request(&mut rx),
+            Some(true),
+            "the anchor's request reports it"
+        );
+
+        // (b) A mux whose WS never comes up.
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let (mut coord, _calls) = floor_off_coord(tx, &mux);
+        let node = ObjectId::new();
+        coord.request(node, peer.clone()).await;
+        assert!(coord.is_derping(&node));
+        mux.backdate_down_since(DERP_WS_DOWN_EVIDENCE - Duration::from_secs(1));
+        assert!(coord.maybe_complete(node, &peer).is_none());
+        assert!(coord.is_derping(&node), "inside the bound, the pair waits");
+        assert_eq!(next_relay_request(&mut rx), None);
+        mux.backdate_down_since(Duration::from_secs(2));
+        assert!(coord.maybe_complete(node, &peer).is_none());
+        assert!(
+            !coord.is_tracking(&node),
+            "past the bound, the pair leaves derping"
+        );
+        coord.request(node, peer.clone()).await;
+        assert!(!coord.is_derping(&node), "and asks for a relay");
+        assert_eq!(
+            next_relay_request(&mut rx),
+            Some(true),
+            "whose request reports derp_mux_failed"
+        );
+
+        // (c) The same as the dialer: ours is the larger key.
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(8);
+        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], true, vec![], None);
+        coord.single_relay = true;
+        coord.derp = true;
+        coord.server_strategy = true;
+        let node = ObjectId::new();
+        coord.request(node, stamped_derp_peer([0x01u8; 32])).await;
+        assert!(coord.dialing.contains_key(&node), "we dial the anchor's R");
+        assert_eq!(
+            next_relay_request(&mut rx),
+            Some(true),
+            "a dialer reports it too, or its anchor stays on DERP and never allocates"
+        );
+    }
+
+    /// #2992 AC5 — a floor-on node (or a UDP-blocked one) opens its one mux
+    /// at start, born alive as before, so its floors queue until the WS is
+    /// up; and no verdict ever opens a second: not the stamp at
+    /// establishment, not the stamp on a live pair, not a P7 pin.
+    #[tokio::test]
+    async fn a_floor_on_node_opens_one_mux_at_start_and_never_a_second() {
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let (mut coord, calls) = floor_off_coord(tx, &mux);
+        assert!(coord.open_derp_mux_at_start());
+        assert_eq!(opened(&calls), 1);
+        assert!(coord.derp_ws_alive(), "the start mux is born alive");
+
+        let peer = stamped_derp_peer([0xFFu8; 32]);
+        let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        coord.request(a, peer.clone()).await;
+        assert!(coord.is_derping(&a));
+        coord.roles.insert(b, RelayStrategy::SingleRelay(true));
+        assert!(coord.stamp_to_derp(b, peer, Instant::now()).is_some());
+        assert!(coord.open_derp_mux_for_verdict(&c, "a test's force-DERP pin"));
+        // Stamp-only: `c` holds no slot.
+        assert!(coord.force_derp(c, Duration::from_secs(60), None).is_none());
+        assert!(coord.forced_derp_active(&c));
+        assert!(
+            coord.open_derp_mux_at_start(),
+            "a second start finds the mux"
+        );
+        assert_eq!(opened(&calls), 1, "one mux, opened at start");
+        assert!(coord.mux_for(&a).is_some_and(|m| Arc::ptr_eq(m, &mux)));
+    }
+
+    /// #2992 — the bound on a mux that is not up reads the CENTRAL mux only,
+    /// the one `derp_mux_failed` reports on. A pair a P7 pin bound to a
+    /// regional relay keeps its pin through a regional outage, as before:
+    /// falling through without the evidence would only have the server push
+    /// the pin again. A centrally pinned pair keeps its pin through a
+    /// reconnect blip, falls through once the central WS has been down for
+    /// `DERP_WS_DOWN_EVIDENCE`, and its request says why.
+    #[tokio::test]
+    async fn only_the_central_mux_bounds_a_derp_verdict() {
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(8);
+        let central = DerpMux::new([9u8; 32]).0;
+        let regional = DerpMux::new([8u8; 32]).0;
+        let mut coord =
+            RelayCoordinator::new(tx, [0u8; 32], true, vec![], Some(Arc::clone(&central)));
+        coord.single_relay = true;
+        coord.derp = true;
+        let url = "wss://derp-region.example/derp";
+        coord.set_regional_mux(url, Arc::clone(&regional));
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let (in_region, central_pin) = (ObjectId::new(), ObjectId::new());
+        coord.force_derp(in_region, Duration::from_secs(600), Some(url));
+        coord.force_derp(central_pin, Duration::from_secs(600), None);
+
+        regional.mark_down();
+        regional.backdate_down_since(DERP_WS_DOWN_EVIDENCE + Duration::from_secs(1));
+        assert_eq!(
+            coord.relay_strategy(&in_region, &peer),
+            RelayStrategy::Derp,
+            "a regional outage is not reported, so its pin holds"
+        );
+        assert_eq!(
+            coord.relay_strategy(&central_pin, &peer),
+            RelayStrategy::Derp
+        );
+
+        central.mark_down();
+        assert_eq!(
+            coord.relay_strategy(&central_pin, &peer),
+            RelayStrategy::Derp,
+            "a reconnect blip keeps the pin"
+        );
+        central.backdate_down_since(DERP_WS_DOWN_EVIDENCE + Duration::from_secs(1));
+        assert_eq!(
+            coord.relay_strategy(&central_pin, &peer),
+            RelayStrategy::SingleRelay(true),
+            "past the bound the pin falls through to the pair's own tier"
+        );
+        assert_eq!(coord.relay_strategy(&in_region, &peer), RelayStrategy::Derp);
+        coord.request(central_pin, peer).await;
+        assert_eq!(next_relay_request(&mut rx), Some(true));
     }
 
     #[tokio::test]

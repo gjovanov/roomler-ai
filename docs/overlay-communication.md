@@ -580,7 +580,7 @@ does instead:
 
 - The overlay runtime asks firewalld, then ufw, what governs its adapter,
   once the adapter is up and every ten minutes
-  ([`runtime.rs:2166`](../crates/tunnel-core/src/overlay/runtime.rs#L2166),
+  ([`runtime.rs:2169`](../crates/tunnel-core/src/overlay/runtime.rs#L2169),
   [`hostfw.rs:220`](../crates/tunnel-core/src/overlay/hostfw.rs#L220)), off
   the run loop.
 - The answer is `HostFirewallStatus`
@@ -711,7 +711,7 @@ flowchart LR
 |---|---|---|
 | Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:511` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
 | Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:77`), called once per connect (`:392`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:40`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:416`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:479`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:421`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:479`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
@@ -771,10 +771,10 @@ also named a `dropped_full` counter, and it was never built.
 
 ⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
 (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
-`crates/tunnel-core/src/overlay/runtime.rs:2584`), so that DERP can carry every
-fresh pair from birth while better tiers upgrade over it. A server's force-DERP
-push can open it mid-run too. The lazy rule below is what a node does with the
-floor switched off.
+`crates/tunnel-core/src/overlay/runtime.rs:2592`), so that DERP can carry every
+fresh pair from birth while better tiers upgrade over it. A DERP verdict from the
+server opens it mid-run too (below). The lazy rule below is what a node does with
+the floor switched off.
 
 DERP is default-ON, but the `/derp` WS is opened **only when the node is itself
 UDP-blocked** — that is, when its own srflx gather came back empty, the same
@@ -793,6 +793,55 @@ flowchart TD
 
 A reconnect re-runs the decision against a fresh gather, so a host that *becomes*
 UDP-blocked — moving onto a restrictive network — opens `/derp` at that point.
+
+**A DERP verdict opens it on a node that has none (#2992).** The server asks a
+UDP-capable node for DERP in three ways: a force-DERP pin (P7), a DERP stamp on a
+pair that rides TURN (FR-115 P4c-1's, which #2820 moves a live pair on), and the same
+stamp when a pair is established. Before #2992 only the pin could open the socket, so
+with the floor off the other two did nothing: the stamp's probe never started, and an
+establishing pair waited in `derping` with no carrier and no deadline. The relay
+coordinator now holds the opener, and the first DERP verdict that finds no mux opens
+it, once (`RelayCoordinator::open_derp_mux_for_verdict`,
+`crates/tunnel-core/src/overlay/relay_link.rs:835`).
+
+```mermaid
+flowchart TD
+    V["a DERP verdict<br/>and no /derp mux"] --> O{"an opener?"}
+    O -->|"no: this node has no /derp"| F["derp_mux_failed"]
+    O -->|"yes"| C["open /derp once<br/>the mux reads down until it registers"]
+    C -->|"it registers"| U["Recovered wakes the walk<br/>the pair builds or probes DERP"]
+    C -->|"still down after 60 s"| F
+    F --> R["the pair asks for a relay instead<br/>and its requests carry derp_mux_failed"]
+    R --> S["over the allowance, the server<br/>grants TURN and stops stamping DERP"]
+    style U fill:#d7f8d7
+    style F fill:#fde8e8
+```
+
+- **The mux starts connecting, not alive** (`DerpMux::begin_connecting`,
+  `crates/tunnel-core/src/transport/derp.rs:640`). No carrier is built on it until its
+  WS registers, and the registration wakes the walk (`MuxEvent::Recovered`), so a
+  stamped pair moves within a tick of `/derp` coming up. The startup mux is unchanged:
+  it is born alive, and floors are built at birth.
+- **A WS that never registers reads down from the moment it was opened.** After
+  `DERP_WS_DOWN_EVIDENCE` (60 s, `relay_link.rs:118`) the verdict is one this node
+  cannot serve (`derp_servable`, `:870`): the pair takes the tier it would have had
+  without the verdict, and its relay requests report `derp_mux_failed`
+  (`derp_evidence_failed`, `:930`). A single-relay dialer asks the server for nothing
+  (its anchor does), so it sends one request only to report (`request`, `:1704`). The
+  grant that answers it is dropped, as PR-B2's warm leg drops its own; the re-stamp is
+  what moves the anchor back to TURN, and the dialer dials the anchor's relayed address
+  as before.
+- **The server listens.** A pair with an end that reported it cannot hold `/derp`
+  keeps TURN and its capability verdict while its org is over the relay allowance, and
+  the report re-stamps that node's pairs at once
+  ([plans-and-limits.md](plans-and-limits.md), *The relay allowance*).
+- **Only the central mux is bounded.** A pair pinned to a regional relay keeps the pin
+  through a regional outage, as before: falling back without the evidence would only
+  make the server push the pin again.
+- **Each wait says why**, one line a peer per reason per 5 minutes
+  (`note_derp_wait`, `:907`): the stamp waits on the mux, a carrier build is withheld
+  until it registers, or the node cannot serve the verdict. Before #2992 a stamped pair
+  that never moved logged nothing.
 
 ### Deployment shape
 
@@ -905,7 +954,7 @@ them when the rule is compiled
 ([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)).
 Each compile (a node's netmap, a delta fan, the DERP allow table, an org-relay
 decision) reads the org's role ids once and reuses them for every node it resolves
-(`CompileRoles`, `crates/modules/network/src/overlay.rs:2516`), so a role the org
+(`CompileRoles`, `crates/modules/network/src/overlay.rs:2541`), so a role the org
 has deleted, or one of another org, never matches.
 
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
