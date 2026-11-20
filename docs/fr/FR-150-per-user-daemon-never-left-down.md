@@ -1,6 +1,6 @@
 # FR-150: A per-user daemon is never left down by its own update or by a crash
 
-**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day, nothing built yet. P1a, P1b and P2 follow, each its own pull request
+**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a in review (#4135). P1b and P2 follow, each its own pull request
 **Absorbs:** [#3507](https://github.com/gjovanov/roomler-ai/issues/3507) (the update path) and [#3295](https://github.com/gjovanov/roomler-ai/issues/3295) (the crash path), with the 2026-11-08 triage's re-spec of both
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
@@ -187,7 +187,8 @@ its replace is refused, but a medium process may still run that task (C2) and re
 
 It adds no custom action and no relaunch owner: the one-shots stay `service install`'s, in a task the account may
 write. The step still fails, so the person's log says why (below), and the next elevated `service install` repairs the
-task and deletes this one.
+task and deletes this one. Any refused replace of a task that is there leaves it, on an enrolled device only (a config
+exists); the step names the repair only where the account cannot replace its task.
 
 **The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor from the task's file
 under `%SystemRoot%\System32\Tasks` (the scheduler's copy in the registry is not readable at medium, C6) and checks it
@@ -206,9 +207,10 @@ stderr away. The per-user steps keep the profile's log (`app.rs:1430-1436`) and 
 registration leaves nothing but the MSI log's `returned actual error code 1`.
 
 P1a gives the per-user steps the same record, in the person's own log, the dated file the daemon writes:
-`service install`, `service uninstall`, `service stop` with and without `--for-upgrade`, and `cleanup-legacy-install
---target-flavour perUser`. They get it through a predicate of their own, so that `is_installer_step` and #3702's
-migration rule (`app.rs:1560-1571`) are unchanged. A person who runs the same verb by hand gets the same two lines.
+`service install`, `service uninstall`, `service start` (what `Roomler start-<SID>` runs), `service stop` with and
+without `--for-upgrade`, and `cleanup-legacy-install --target-flavour perUser`. They get it through a predicate of
+their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1560-1571`) are unchanged. A person who
+runs the same verb by hand gets the same two lines.
 
 ### P1b: the watcher owns the per-user relaunch
 
@@ -287,7 +289,7 @@ launcher then waits once and leaves with the daemon's code, as on master.
 | P1a | `the_task_names_its_own_descriptor` | the SDDL in the rendered XML, built from the account's SID, in `<RegistrationInfo>` after `<URI>` |
 | P1a | `the_switch_registers_masters_task` | `ROOMLERD_TASK_SD=0`: master's XML, no repair, no `Roomler start-<SID>` |
 | P1a | `an_elevated_install_registers_a_locked_task_again` | over the fake library, where a replace keeps a task's descriptor (C5): elevated, the task deleted and registered again; at medium, the replace refused and the task left |
-| P1a | `a_refused_replace_leaves_a_start_of_the_accounts_own` | `Roomler start-<SID>` registered only when the replace was refused, the account cannot replace the task and a config exists; deleted by a later `register` that succeeds and by `unregister` |
+| P1a | `a_refused_replace_leaves_a_start_of_the_accounts_own` | `Roomler start-<SID>` registered when a replace of the account's task, which is there, was refused on an enrolled device (a config exists), the repair named only where the account cannot replace the task; none without a config, for a task that is not there, or with `ROOMLERD_TASK_SD=0`; a later refused update replaces it; deleted by a later `register` that succeeds and by `unregister`, even where the task itself cannot be deleted |
 | P1a | `the_start_task_runs_the_launchers_start_and_goes_by_itself` | its XML: the one-shots with their end boundaries, `DeleteExpiredTaskAfter`, the launcher with `service start`, no logon or boot trigger |
 | P1a | `every_per_user_msi_step_writes_its_record` | every per-user custom action of `main.wxs` is a step that writes the record, as `the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones |
 | P1a | `a_task_the_account_cannot_replace_is_named_at_start` | the access check's answer, with a medium copy of the test's own token, over C2's descriptor (no), C1's and P1a's (yes) |
@@ -348,7 +350,7 @@ the release owner names.
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
-| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | not started; after P0 |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | in review (#4135) |
 | P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | not started; after P1a |
 | P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | not started; after P1a, independent of P1b |
 | Field | each phase's cells on its candidates, then C19 on the release | read only | not started |
