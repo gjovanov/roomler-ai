@@ -34,12 +34,12 @@
 //!
 //! Root's records go only after a restart answered, so a stop part-way leaves
 //! what the next `--revert` reads; an undo that could not put root's file back
-//! starts no agent and keeps them all. `--revert` puts root's file back first,
-//! then each person in uid order, through `put-back` from the records, or
-//! `put-back-legacy` on a Mac an older release converted. One who fails is
-//! named and keeps their record, the others go on, and it exits 1; when nobody's
-//! `read` answers and nothing else is left, it exits 1 before it asks and
-//! restarts nothing.
+//! starts no agent, keeps them all, and past the Restart step leaves the Mac
+//! converted. `--revert` puts root's file back first, then each person in uid
+//! order, through `put-back` from the records, or `put-back-legacy` on a Mac an
+//! older release converted. One who fails is named and keeps their record, the
+//! others go on, and it exits 1; when nobody's `read` answers and nothing else
+//! is left, it exits 1 before it asks and restarts nothing.
 //!
 //! The command cannot delete a row: a device holds no user credential, and
 //! `POST /api/agent/self/unenroll` refuses a permanent row on purpose. A row it
@@ -2146,8 +2146,14 @@ pub fn before_any_change(exit: crate::one_row_home::Exit) -> bool {
 /// [`start_agent`]; at once where none was needed). Each failure is said and
 /// the rest still run. Root's records go only once that restart answered (or
 /// none was needed): until then they are how `--revert` finishes the job.
-/// When root's file did not go back, no LaunchAgent starts and every record
-/// stays (#4097).
+///
+/// #4097 — when root's file did not go back, no LaunchAgent starts and every
+/// record stays. Where the conversion had restarted, which it does only once
+/// every `convert` answered, nothing else is undone either: nobody's files go
+/// back and nothing restarts again, so the Mac stays converted, one row,
+/// rather than holding each moved enrollment twice, in root's file and in a
+/// person's put back. Where it had not, a person may be half converted: their
+/// files still go back, and nothing restarts.
 async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
     let mut problems = Vec::new();
     let mut root_back = true;
@@ -2166,6 +2172,20 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                 ));
             }
         }
+    }
+    // #4097 — root's file is still the converted one, and the conversion had
+    // restarted, which it does only once every `convert` answered: every
+    // person is converted, and root's `[[orgs]]` hold their enrollments, one
+    // row. A person's files put back would hold those enrollments as well, and
+    // their next login would load the plist put back beside root's daemon. So
+    // nothing more is undone, and every record stays for `--revert`.
+    if !root_back && done.restarted {
+        host.say(&format!(
+            "{ROOT_CONFIG} did not go back after the restart, so the Mac stays converted (one \
+             row): nobody's files are put back, no LaunchAgent starts, and every record stays in \
+             {RECORDS}; `sudo roomlerd one-row --revert` finishes the job"
+        ));
+        return problems;
     }
     let mut not_back = Vec::new();
     for &index in &done.started {
@@ -2201,6 +2221,29 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                 not_back.push(p.account.uid);
             }
         }
+    }
+    // #4097 — root's file may still be the converted one, and the conversion
+    // stopped before its restart: at root's file, at a person's `convert` or
+    // at their `after.json`, so a person may be half converted, and their files
+    // went back above. Root's `[[orgs]]` would hold the enrollments moved out
+    // of them: an agent started on one of those would run it beside root's
+    // daemon once that daemon starts on root's file. So none starts, nothing
+    // restarts, and every record stays for `--revert`, the console person's
+    // bootstrap included.
+    if !root_back {
+        for &index in &done.booted_out {
+            problems.push(format!(
+                "gui/{}/com.roomler.agent: not bootstrapped, as {ROOT_CONFIG} did not go back",
+                read.people[index].account.uid
+            ));
+        }
+        host.say(&format!(
+            "{ROOT_CONFIG} did not go back, so no LaunchAgent starts and every record stays in \
+             {RECORDS}. At the daemon's next start (a reboot or an update) it reads {ROOT_CONFIG} \
+             as it is now, which may still be the converted one, so run `--revert` before then: \
+             `sudo roomlerd one-row --revert` finishes the job"
+        ));
+        return problems;
     }
     let mut answered = true;
     // #4092 — the LaunchAgents go last. After the conversion's restart the
@@ -2243,26 +2286,6 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
         // No restart, so no one-row worker ran: they load at once.
         Some(false)
     };
-    // #4097 — root's file is still the converted one, whose `[[orgs]]` hold the
-    // enrollments moved out of the people's files put back: an agent started
-    // on one of those would run it beside root's daemon. So none starts, and
-    // every record stays for `--revert`, the console person's bootstrap
-    // included.
-    if !root_back {
-        if start.is_some() {
-            for &index in &done.booted_out {
-                problems.push(format!(
-                    "gui/{}/com.roomler.agent: not bootstrapped, as {ROOT_CONFIG} did not go back",
-                    read.people[index].account.uid
-                ));
-            }
-        }
-        host.say(&format!(
-            "{ROOT_CONFIG} did not go back, so no LaunchAgent starts and every record stays in \
-             {RECORDS}: `sudo roomlerd one-row --revert` finishes the job"
-        ));
-        return problems;
-    }
     if let Some(wait) = start {
         for &index in &done.booted_out {
             let a = &read.people[index].account;
@@ -5490,10 +5513,13 @@ mod tests {
         }
     }
 
-    /// #4097 T6: root's file does not go back in the undo. No agent is
-    /// bootstrapped or kickstarted, every record stays, and the command names
-    /// `--revert`, which then finishes: root's file back, the person back, the
-    /// restart, then the console person's agent.
+    /// #4097 T6: root's file does not go back in the undo after the
+    /// conversion's restart, which comes only once every `convert` answered:
+    /// the Mac stays converted, one row. Nobody's files are put back, nothing
+    /// restarts again, no agent is bootstrapped or kickstarted, every record
+    /// stays, and the command names `--revert`, which then finishes: root's
+    /// file back, the person back, the restart, then the console person's
+    /// agent.
     #[tokio::test]
     async fn an_undo_whose_root_file_did_not_go_back_starts_no_agent() {
         let mut mac = Fake::new(no_grant_daemon);
@@ -5504,6 +5530,16 @@ mod tests {
         let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
         assert!(e.contains("could not be put back"), "{e}");
         assert!(
+            calls_of(&mac, &["put-back"]).is_empty(),
+            "nobody's files are put back: {:?}",
+            mac.calls
+        );
+        assert_eq!(
+            calls_of(&mac, &["kickstart"]),
+            ["kickstart"],
+            "the conversion's restart alone"
+        );
+        assert!(
             calls_of(&mac, &["bootstrap", "agent kickstart"]).is_empty(),
             "{:?}",
             mac.calls
@@ -5513,29 +5549,110 @@ mod tests {
             mac.root_cfg().macos_one_row,
             "root's file is the converted one"
         );
-        for file in [
-            RootFile::Kept,
-            RootFile::RootRecord,
-            RootFile::Person {
-                uid: 501,
-                part: Part::Record,
-            },
-            RootFile::Person {
+        let after: AfterRecord = serde_json::from_slice(
+            &mac.root[&RootFile::Person {
                 uid: 501,
                 part: Part::After,
-            },
-        ] {
+            }],
+        )
+        .unwrap();
+        let home = &mac.homes[&501];
+        assert_eq!(
+            after.config_sha256,
+            Some(sha256_hex(&home.config.as_ref().unwrap().0)),
+            "casey's config is as `convert` left it"
+        );
+        assert!(home.plist.is_none(), "and their plist stays removed");
+        for file in [RootFile::Kept, RootFile::RootRecord]
+            .into_iter()
+            .chain(Part::ALL.map(|part| RootFile::Person { uid: 501, part }))
+        {
             assert!(mac.root.contains_key(&file), "{file:?} stays");
         }
         let said = mac.said();
         assert!(
-            said.contains("`sudo roomlerd one-row --revert` finishes the job"),
+            said.contains(
+                "/etc/roomler/config.toml did not go back after the restart, so the Mac stays \
+                 converted (one row): nobody's files are put back, no LaunchAgent starts, and \
+                 every record stays in /etc/roomler/one-row; `sudo roomlerd one-row --revert` \
+                 finishes the job"
+            ),
             "{said}"
         );
+        assert!(!said.contains("not bootstrapped"), "{said}");
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.files(), before);
+        assert!(mac.loaded.contains(&501));
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "write Config",
+                    "put-back",
+                    "kickstart",
+                    "bootstrap",
+                    "agent kickstart"
+                ]
+            ),
+            [
+                "write Config",
+                "put-back 501",
+                "kickstart",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+    }
+
+    /// #4097 T8: root's file does not go back in the undo, and the conversion
+    /// had not restarted: a `convert` failed, perhaps after it changed
+    /// something, so a person may be half converted. Their files are put back,
+    /// nothing restarts, no agent is bootstrapped or kickstarted, every record
+    /// stays, and the command says what the daemon's next start reads. Then
+    /// `--revert` finishes: root's file back, the person back, the restart,
+    /// then the console person's agent.
+    #[tokio::test]
+    async fn an_undo_before_the_restart_whose_root_file_did_not_go_back_puts_the_people_back() {
+        let mut mac = Fake::new(one_row_daemon);
+        let before = mac.files();
+        mac.scripts
+            .insert((501, "convert"), Script::FailedAfterActing);
+        // Root's copy, `root.json`, casey's config, plist and `record.json`;
+        // their `convert` fails, so no `after.json`: the undo's write of
+        // root's file is the sixth.
+        mac.fail = Some(("write_root", 6));
+        let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+        assert!(e.contains("could not be put back"), "{e}");
+        assert_eq!(calls_of(&mac, &["put-back"]), ["put-back 501"]);
         assert!(
-            said.contains("gui/501/com.roomler.agent: not bootstrapped, as /etc/roomler/config.toml did not go back"),
-            "{said}"
+            calls_of(&mac, &["kickstart", "bootstrap", "agent kickstart"]).is_empty(),
+            "{:?}",
+            mac.calls
         );
+        assert!(!mac.loaded.contains(&501));
+        assert!(
+            mac.root_cfg().macos_one_row,
+            "root's file is the converted one"
+        );
+        assert_eq!(mac.homes[&501], before.1[&501], "casey's files are back");
+        for file in [RootFile::Kept, RootFile::RootRecord].into_iter().chain(
+            [Part::Config, Part::Plist, Part::Record]
+                .map(|part| RootFile::Person { uid: 501, part }),
+        ) {
+            assert!(mac.root.contains_key(&file), "{file:?} stays");
+        }
+        let said = mac.said();
+        for want in [
+            "gui/501/com.roomler.agent: not bootstrapped, as /etc/roomler/config.toml did not go \
+             back",
+            "/etc/roomler/config.toml did not go back, so no LaunchAgent starts and every record \
+             stays in /etc/roomler/one-row. At the daemon's next start (a reboot or an update) it \
+             reads /etc/roomler/config.toml as it is now, which may still be the converted one, so \
+             run `--revert` before then: `sudo roomlerd one-row --revert` finishes the job",
+        ] {
+            assert!(said.contains(want), "{want:?} in {said}");
+        }
         mac.calls.clear();
         revert_now(&mut mac).await.unwrap();
         assert_eq!(mac.files(), before);
