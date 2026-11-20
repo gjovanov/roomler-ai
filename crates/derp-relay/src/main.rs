@@ -389,11 +389,39 @@ async fn collect_turn_usage(url: String, usage: Arc<TurnUsage>) {
     }
 }
 
+/// #3952 — the most the statistics subscription waits for this PoP's Redis
+/// to answer its connect (TCP and the handshake) or one PSUBSCRIBE: the
+/// server's own defaults for #3840's two bounds. The relay has no Redis
+/// settings. A Redis that takes the connection and never answers then costs
+/// this and a retry, never a subscriber parked for as long as the socket
+/// lives. Unlike the server's subscribers, this one does not probe its own
+/// connection: its Redis runs on the same host, so a connection gone deaf
+/// there is a frozen Redis, which coturn cannot publish to either.
+const STATS_REDIS_BOUND: Duration = Duration::from_secs(3);
+
+/// `fut` within [`STATS_REDIS_BOUND`]; elapsed, an io `TimedOut` error that
+/// names the step, so the failed line says what got no answer.
+async fn within_stats_bound<T>(
+    step: &str,
+    fut: impl std::future::Future<Output = redis::RedisResult<T>>,
+) -> redis::RedisResult<T> {
+    match tokio::time::timeout(STATS_REDIS_BOUND, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "no answer within {} ms ({step})",
+                STATS_REDIS_BOUND.as_millis()
+            ),
+        ))),
+    }
+}
+
 async fn subscribe_turn_usage(url: &str, usage: &TurnUsage) -> Result<(), redis::RedisError> {
     let client = redis::Client::open(url)?;
-    let mut pubsub = client.get_async_pubsub().await?;
+    let mut pubsub = within_stats_bound("connect", client.get_async_pubsub()).await?;
     for channel in turn_stats::CHANNELS {
-        pubsub.psubscribe(channel).await?;
+        within_stats_bound(&format!("PSUBSCRIBE {channel}"), pubsub.psubscribe(channel)).await?;
     }
     info!("derp-relay: subscribed to coturn's statistics");
     let mut stream = pubsub.on_message();
