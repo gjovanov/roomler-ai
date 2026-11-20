@@ -874,7 +874,8 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       *(2026-11-19: regressed in the 0.4.228 lab, in both halves of this criterion. After
       `--revert`, and after the undo of a failed verify, the person's LaunchAgent is bootstrapped
       while the worker still holds the single-instance lock, exits 0 on it and is not retried,
-      so the person's row stays offline until their next login. Fix in #4092.)*
+      so the person's row stays offline until their next login. Fixed by #4092's PR #4104, which
+      rides 0.4.229; the re-read is owed on 0.4.229.)*
 - [x] P3a: a one-row Mac's worker logs reach `agent_logs`, on the row.
       *(2026-11-05, released 0.4.200, tart Mac. RED: before the switch-on, no line on the daemon's
       row came from the worker, and on the Mac's two-row layout that day none of its 510 did. GREEN: from the switch-on at 02:40:57Z, 159 lines marked

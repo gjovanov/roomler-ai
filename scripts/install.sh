@@ -1054,11 +1054,11 @@ as_account() {
     if [ "$(id -un)" = "$acct" ]; then "$@"; else sudo -H -u "$acct" "$@"; fi
 }
 
-# FR-43 — whether ACCOUNT's per-user config holds an enrollment, in the tree
-# the daemon resolves (live.roomler.roomler) or the one from before the rename
-# (live.roomler.roomler-agent), read as that account. The safe side is
-# enrolled: a home that cannot be found, or a config there that its own
-# account cannot read, keeps the Mac's layout.
+# FR-43 — whether ACCOUNT's per-user config holds an enrollment, read as that
+# account. The safe side is enrolled: a home that cannot be found, or a config
+# there that its own account cannot read, keeps the Mac's layout.
+# RETIRED-NAME-ANCHOR(4): the trees the daemon resolves, new first (appdirs.rs
+# OLD_APP): live.roomler.roomler, then live.roomler.roomler-agent, pre-rename.
 person_enrolled() {
     home="$(home_of "$1")"
     [ -n "$home" ] || return 0

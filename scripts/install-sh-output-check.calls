@@ -169,6 +169,7 @@ pkg-default-per-user roomlerd: roomlerd [enroll] [--server] [https://roomler.exa
 pkg-default-per-user roomlerd: roomlerd [--version]
 pkg-default-per-user rc: 0
 pkg-default-root calls: sudo [-H] [-u] [tester] [test] [-e] [/home/tester/Library/Application Support/live.roomler.roomler/config.toml]
+# RETIRED-NAME-ANCHOR: install.sh reads this pre-rename tree, which the daemon still resolves (appdirs.rs OLD_APP).
 pkg-default-root calls: sudo [-H] [-u] [tester] [test] [-e] [/home/tester/Library/Application Support/live.roomler.roomler-agent/config.toml]
 pkg-default-root calls: installer [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]
 pkg-default-root calls: installer [-pkg] [/tmp/roomler-install.000001/roomlerd.pkg] [-target] [/]

@@ -2597,7 +2597,7 @@ ahead where only the person's half was enrolled.
 What "enrolled" reads, each file as its owner: root's `/etc/roomler/config.toml` as
 root, where both switches on are one row and any other root config is a row of its own,
 as the package's guard reads it; and the person's own config, in both trees
-(`live.roomler.roomler`, and `live.roomler.roomler-agent` from before the rename), as
+(`live.roomler.roomler`, and `live.roomler.roomler-agent` from before the rename), as <!-- RETIRED-NAME-ANCHOR: the pre-rename tree, which the daemon still resolves (appdirs.rs OLD_APP), so the script reads it too. -->
 that person, never with root's rights (FR-147). The person is the console user, and the
 caller too when the script runs as another person. A home the account database does not
 name, or a config there that its own person cannot read, counts as enrolled: the safe

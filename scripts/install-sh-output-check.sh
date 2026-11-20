@@ -807,6 +807,16 @@ for SH in $SHELLS; do
     done
 done
 
+# A call that reads the person's config from before the rename names that
+# tree, and scripts/name-audit.sh counts every line that names it, a record's
+# too. So the record writes the audit's marker above each such call, and a
+# rewrite keeps it. The text it writes is, to the audit, the marker of the line
+# under it too: the line that names the tree here.
+mark_pre_rename_tree() {
+    awk -v mark="# RETIRED-NAME-ANCHOR: install.sh reads this pre-rename tree, which the daemon still resolves (appdirs.rs OLD_APP)." \
+        'index($0, "/live.roomler.roomler-agent/") { print mark } { print }'
+}
+
 # Every mode's calls as one record: its first case's (the check above holds
 # the others to it), one line a call, each led by its mode and its log.
 record() (
@@ -822,7 +832,7 @@ record() (
             sed "s|^|${mode##*/} $f: |" "$c/$f.log"
         done
         echo "${mode##*/} rc: $(cat "$c/rc")"
-    done
+    done | mark_pre_rename_tree
 )
 for SH in $SHELLS; do record "$SH" >"$S/calls.$SH"; done
 if [ "$REWRITE" = 1 ]; then
