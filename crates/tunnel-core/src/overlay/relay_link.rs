@@ -870,7 +870,7 @@ impl RelayCoordinator {
     fn derp_servable(&self, node_id: &ObjectId) -> bool {
         match self.mux_for(node_id) {
             Some(m) if self.derp_mux.as_ref().is_some_and(|c| Arc::ptr_eq(c, m)) => {
-                !m.down_for().is_some_and(|d| d >= DERP_WS_DOWN_EVIDENCE)
+                m.down_for().is_none_or(|d| d < DERP_WS_DOWN_EVIDENCE)
             }
             Some(_) => true,
             None => self.derp_opener.is_some(),
