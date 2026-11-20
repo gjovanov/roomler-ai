@@ -137,12 +137,12 @@ flowchart TB
 - **Its supervisor is the virtual desktop's, not a new `Supervision` row** (code, corrected after review): the
   daemon already keeps a child alive on Linux for its whole life, the virtual desktop's X server: a thread waits for
   its exit, marks the desktop down first, kills and reaps the tree, and waits before the next start, 1 s doubling to
-  300 s, a run of 60 s resetting it (`virtual_desktop.rs:2005-2070`, `:984-996`, `Backoff` `:2147`). The worker's
+  300 s, a run of 60 s resetting it (`virtual_desktop.rs:2295-2360`, `:1061-1073`, `Backoff` `:2437`). The worker's
   supervisor reuses that loop and its `Backoff`, with the worker's own floor and ceiling (2 s to 60 s, five fast
   exits). `Supervision` names what restarts the DAEMON (`supervision.rs:240-253`); the worker is a subcommand that
   never takes `run`'s restart path, so it needs no row there.
 - **A host whose only desktop is the virtual one gets no worker** (code and inferred): the daemon started that X
-  server and holds `DISPLAY` itself (`apps/linux.rs:502-508`), display match has its own path there
+  server and holds `DISPLAY` itself (`apps/linux.rs:584-590`), display match has its own path there
   (`display_match.rs:224`), and no logind session sits on seat0 for a worker to join. The key changes nothing there.
 - **What it owns, per session type** (code for what each reaches, inferred for the split):
 
@@ -173,7 +173,7 @@ flowchart TB
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
     guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-27`, `:353-379`),
     used today by exec (`exec.rs:2434-2439`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
-    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2753`, `:2766`). It marks every
+    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:3043`, `:3056`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
     The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:3374-3377`), so it holds
     nothing of the daemon's either way.
@@ -225,7 +225,7 @@ test of root or of a display variable (code):
 | display match | a person's X11 display | no (the virtual desktop has its own path) | `encode/caps.rs:2828-2832`, `display_match.rs:326-339` | yes, X11 |
 | desktops served | any the cascade reaches | GNOME and KDE, unlocked; other X11 desktops `x11_not_enabled` | `capture/mod.rs:755`, `:1255` | no: P2, after a lock signal (D1) |
 | the computer's sound | Pulse, directly | yes, through the session helper the released build carries (`portal-capture` is in `full`) | `audio_source.rs:210`, `:228-245`; `agents/roomlerd/Cargo.toml:744`, `:757` | left out: it already works |
-| Remote Apps | yes | yes, run as whoever is at the screen | `apps/linux.rs:502-508`, `apps/mod.rs:396-404` | left out: same answer |
+| Remote Apps | yes | yes, run as whoever is at the screen | `apps/linux.rs:584-590`, `apps/mod.rs:398-406` | left out: same answer |
 | files | as the person | writes as seat0's person; reads are #3688's subject | `files.rs:343-378` | left out: same feature |
 | cursor shape | XFixes | the DRM arm's cursor plane | `capture/x11_cursor.rs:3-11`, `capture/cursor.rs:27-28` | left out: same answer |
 | consent prompt | the companion or the desktop's own | the companion, by design | `.claude/rules/remote-desktop.md` | left out |
