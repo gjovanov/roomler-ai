@@ -77,9 +77,9 @@ pub async fn one_row_here() -> Option<OneRowMac> {
 
 #[cfg(target_os = "macos")]
 async fn query_macos() -> Option<OneRowMac> {
-    // SAFETY: getuid never fails.
-    let uid = unsafe { libc::getuid() };
-    let path = roomler_localapi::person_socket_path(uid);
+    // The person socket root serves THIS account (the companion's and the
+    // CLI's own road to it); `None` as root, who has none to ask.
+    let path = roomler_localapi::own_person_socket_path()?;
     // Only a socket ROOT serves: a per-user daemon of this person, or anyone
     // else, would be speaking for itself, not for the machine.
     let mut client = roomler_localapi::connect_unix_served_by_root(path)

@@ -121,12 +121,9 @@ tempfile = { workspace = true }
 # links the same one.
 # FR-141 P3 — and on a Mac, the root daemon's word on whether this Mac is one
 # row already, over the person socket it serves the console user
-# (`reinstall_guard.rs`); `libc` for this process's own uid, which names it.
+# (`reinstall_guard.rs`, through `own_person_socket_path`).
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 roomler-localapi = { path = "../../crates/localapi" }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 # `config::test_fixture()` for the orchestrator's config-shaping tests — the
