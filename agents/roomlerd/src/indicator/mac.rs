@@ -401,14 +401,6 @@ fn process_path(pid: i32) -> Option<String> {
 pub fn run_main_loop() -> ! {
     let mtm = MainThreadMarker::new()
         .expect("indicator::mac::run_main_loop must be called on the main thread");
-    // #4119 — the exit net, armed before this thread's first window call, in
-    // a root process only (`exit_net::arms_in`): an exit AppKit starts inside
-    // one of our window calls or the event fetch below, on this thread, which
-    // our code did not choose, leaves with the restart code.
-    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
-    if exit_net::arms_in(unsafe { libc::geteuid() }) {
-        exit_net::arm();
-    }
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     // #3164 — before `finishLaunching`, so AppKit consults it from the first
@@ -430,6 +422,14 @@ pub fn run_main_loop() -> ! {
     // ⚠️ `finishLaunching` is what `run()` would have called. Skipping it
     // leaves NSApplication half-initialised and windows behave erratically.
     app.finishLaunching();
+
+    // #4119 — the exit net (`exit_net`), in a root process only: armed before
+    // this thread's first window call (the reads below), and after launching,
+    // as `exit` runs the last-registered hook first: ahead of any launching made.
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    if exit_net::arms_in(unsafe { libc::geteuid() }) {
+        exit_net::arm();
+    }
 
     // #4053 — the panel's first reads, after `finishLaunching` and never
     // before it: whether the window server serves this process, and the

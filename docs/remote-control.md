@@ -2720,7 +2720,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
 
    **The exit net (#4119).** A root process registers an `atexit` hook when
    the pump starts (`indicator/exit_net.rs:82`, armed at
-   `indicator/mac.rs:410`). The main thread marks itself while it is inside
+   `indicator/mac.rs:431`). The main thread marks itself while it is inside
    one of the panel's AppKit calls: the probe window, the panel's window, and
    the event fetch and dispatch (`indicator/mac.rs:912`, `:474`, `:446`). An
    exit that begins on that thread inside such a call, and that our code did
