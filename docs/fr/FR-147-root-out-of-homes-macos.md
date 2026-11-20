@@ -228,7 +228,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2628`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:2647`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:960`) and `folder_words` (`:1093`), with `r5_words` (`:1139`); `refusals` (`:1481`) says them.
 
 ### Root's records
@@ -511,7 +511,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2409`, its sequence at `:2437`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2428`, its sequence at `:2456`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:2628`): one-row's row, and
