@@ -284,18 +284,20 @@ pub(super) async fn roots(lane: &Lane, who: &FsAs, by: Instant) -> Result<DirLis
         path: super::roots_label(),
         parent: None,
         entries,
+        capped: false,
     })
 }
 
 /// The entries of the folder `read` lists, `at` being its resolved path:
 /// where a test stands in a share whose entries do not come
-/// (`drawer_edges::seams::hold_entries`).
-pub(super) fn read_entries(at: &Path, read: std::fs::ReadDir) -> Vec<super::DirEntryView> {
+/// (`drawer_edges::seams::hold_entries`). With them, whether the folder held
+/// more than a listing takes (#4121).
+pub(super) fn read_entries(at: &Path, read: std::fs::ReadDir) -> (Vec<super::DirEntryView>, bool) {
     #[cfg(test)]
     super::drawer_edges::seams::entries_wait(at);
     #[cfg(not(test))]
     let _ = at;
-    super::collect_dir_entries(read)
+    super::collect_dir_entries(read, super::DIR_ENTRIES_MAX)
 }
 
 impl super::FilesHandler {

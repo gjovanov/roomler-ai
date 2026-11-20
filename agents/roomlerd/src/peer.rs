@@ -12969,7 +12969,7 @@ pub(crate) fn attach_files_declined(
                 return; // a chunk for a transfer that was never accepted
             }
             if let Some(reply) = declined_reply(&msg.data, why) {
-                let _ = dc.send_text(reply).await;
+                let _ = send_files_frame(&dc, reply).await;
             }
         })
     }));
@@ -12982,7 +12982,7 @@ pub(crate) fn attach_files_declined(
 /// settles on its `req_id`), `files:error` for anything else (a transfer's
 /// waiter settles on its `id`). A frame that does not parse is answered with
 /// no id, as the FILES-denied channel answers it. Pure.
-fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
+fn declined_reply(frame: &[u8], why: &str) -> Option<crate::files::FilesFrame> {
     let parsed = std::str::from_utf8(frame)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
@@ -13000,15 +13000,17 @@ fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         == Some("files:dir");
     let reply = if listing {
-        serde_json::to_string(&crate::files::FilesOutgoing::DirError {
+        crate::files::FilesOutgoing::DirError {
             req_id: &field("req_id"),
             message: why,
-        })
+        }
+        .frame()
     } else {
-        serde_json::to_string(&crate::files::FilesOutgoing::Error {
+        crate::files::FilesOutgoing::Error {
             id: &field("id"),
             message: why,
-        })
+        }
+        .frame()
     };
     reply.ok()
 }
@@ -13306,7 +13308,11 @@ async fn handle_files_control(
                 }
             }
         }
-        crate::files::FilesIncoming::Dir { req_id, path } => {
+        crate::files::FilesIncoming::Dir {
+            req_id,
+            path,
+            paged,
+        } => {
             if !crate::files::is_remote_browse_enabled() {
                 info!(%session_id, ?req_id, path = ?path, "files: dir refused — remote browse disabled");
                 send_files_json(
@@ -13321,7 +13327,7 @@ async fn handle_files_control(
             }
             // #3682 (D1-B) — never awaited here: this loop reads the
             // channel's next message only once this one is handled.
-            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path, paged);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13379,8 +13385,11 @@ fn spawn_dir_listing(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
-    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+    tokio::spawn(answer_dir_listing(
+        dc, handler, session_id, req_id, path, paged,
+    ));
 }
 
 /// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
@@ -13395,6 +13404,7 @@ async fn answer_dir_listing<S: DownloadSink>(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
     let closed = handler.listings_closed();
     let listed = tokio::select! {
@@ -13412,14 +13422,11 @@ async fn answer_dir_listing<S: DownloadSink>(
                 entries = listing.entries.len(),
                 "files: dir listed"
             );
-            let parent_owned = listing.parent.clone();
-            let msg = crate::files::FilesOutgoing::DirList {
-                req_id: &req_id,
-                path: &listing.path,
-                parent: parent_owned.as_deref(),
-                entries: &listing.entries,
-            };
-            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+            for frame in crate::files::dir_pages::answer(&req_id, &listing, paged) {
+                if !matches!(or_stopped(&closed, dc.send_frame(frame)).await, Ok(Ok(()))) {
+                    return;
+                }
+            }
         }
         Err(e) => {
             warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
@@ -13840,9 +13847,21 @@ async fn handle_files_chunk(
 }
 
 async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutgoing<'_>) {
-    if let Ok(s) = serde_json::to_string(msg) {
-        let _ = dc.send_text(s).await;
+    if let Ok(frame) = msg.frame() {
+        let _ = send_files_frame(dc, frame).await;
     }
+}
+
+/// #4121 — every answer on the files channel goes out here, a listing's
+/// pages among them, and the send's result comes back.
+async fn send_files_frame(
+    dc: &RTCDataChannel,
+    frame: crate::files::FilesFrame,
+) -> anyhow::Result<()> {
+    dc.send_text(frame.text)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
 }
 
 /// #1730 — what a download pump needs of its data channel: the channel
@@ -13858,6 +13877,12 @@ trait DownloadSink: Send + Sync {
         &self,
         msg: &crate::files::FilesOutgoing<'_>,
     ) -> impl std::future::Future<Output = ()> + Send;
+    /// #4121 — one frame, as serialized, and whether it went: a listing's
+    /// pages stop at the first that did not.
+    fn send_frame(
+        &self,
+        frame: crate::files::FilesFrame,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     /// Closed, or begun to ([`channel_gone`]).
     fn gone(&self) -> bool;
 }
@@ -13874,6 +13899,9 @@ impl DownloadSink for Arc<RTCDataChannel> {
     }
     async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
         send_files_json(self, msg).await
+    }
+    async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+        send_files_frame(self, frame).await
     }
     fn gone(&self) -> bool {
         channel_gone(self.ready_state())
@@ -16440,6 +16468,9 @@ mod download_stop_tests {
             std::future::pending().await
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16459,6 +16490,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16477,6 +16511,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16631,6 +16668,10 @@ pub(crate) mod folder_download_as_the_person_tests {
         async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
             let json = serde_json::to_string(msg).expect("a message as JSON");
             self.said.lock().unwrap().push(json);
+        }
+        async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.said.lock().unwrap().push(frame.text);
+            Ok(())
         }
         fn gone(&self) -> bool {
             false
@@ -16977,6 +17018,9 @@ pub(crate) mod files_log_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17097,7 +17141,7 @@ mod files_channel_tests {
     /// The declined channel's answer to one control frame, as JSON.
     fn reply_to(frame: &[u8]) -> Value {
         let reply = declined_reply(frame, WHY).expect("a declined frame is answered");
-        serde_json::from_str(&reply).expect("the answer is JSON")
+        serde_json::from_str(&reply.text).expect("the answer is JSON")
     }
 
     /// A listing's answer is the drawer's: `files:dir-error` on its `req_id`.
@@ -17272,6 +17316,14 @@ mod files_channel_tests {
                 }
             }
             got
+        }
+
+        /// #4121 — the next frame the viewer hears within `wait`, as sent.
+        pub(super) async fn next_within(&mut self, wait: Duration) -> Option<String> {
+            tokio::time::timeout(wait, self.heard.recv())
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Anything more the viewer hears within `wait`.
@@ -17918,6 +17970,10 @@ mod dir_listing_tests {
             self.parked.notify_one();
             std::future::pending().await
         }
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17939,6 +17995,7 @@ mod dir_listing_tests {
             bson::oid::ObjectId::new(),
             "parks".to_string(),
             temp.path().to_string_lossy().into_owned(),
+            false,
         ));
         let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
         handler.end_session().await;
