@@ -133,13 +133,13 @@ one row does not hold, the switch stays off and the wizard installs today's two 
   it) is 0.4.201 or later. That floor (D4-A) is the first release whose served `install.sh --one-row` made a fresh Mac
   one row (FR-43 P3d, field-verified 2026-11-05) and whose `roomlerd enroll --help` lists `--one-row`. An older one
   would stop only after the token is spent, so the wizard compares first, and the script's own `enroll --help` check
-  stays as the belt (`scripts/install.sh:1164`). Closed, the page says why under the card and the box makes today's
+  stays as the belt (`scripts/install.sh:1166`). Closed, the page says why under the card and the box makes today's
   two rows: a Mac whose root is enrolled is pointed to `sudo roomlerd one-row` (D1), and one with a person's
   enrollment to the install script's `--one-row` with a new token. Open, the box makes one device. One token, pasted
   or paired (`halves: 1`), enrolls root's config under the device's own name (D9-A, no `-daemon`), with the overlay on
   and both FR-43 switches. The privileged half, `install.sh --privileged-steps --one-row --config-from FILE`, places
   that config before the one package run, whose guard removes the LaunchAgent and starts root
-  (`scripts/install.sh:1126-1169`), and no person's enrollment and no user half run. Before root's enroll the wizard
+  (`scripts/install.sh:1126-1171`), and no person's enrollment and no user half run. Before root's enroll the wizard
   makes the person's folders as the person and writes into each (D5-A); one it cannot write stops the run, naming the
   folder and its owner, with nothing enrolled and the token not spent. Nothing as root makes or changes a folder in a
   home (FR-147). On the pasted path the page sends the form it showed, and an install whose fresh read differs is

@@ -1154,7 +1154,9 @@ install_macos_one_row_half() {
     fi
 
     say "installing roomlerd (.pkg — its guard reads the switch, removes the per-user LaunchAgent and starts the root half)"
-    as_root installer -pkg "$pkg" -target /
+    # Stdin from /dev/null: in a piped run, stdin is the rest of this script,
+    # and bash, macOS's /bin/sh, reads it a line at a time.
+    as_root installer -pkg "$pkg" -target / </dev/null
     [ -x "$daemon_bin" ] || {
         echo "error: the package did not install $daemon_bin" >&2
         exit 1
