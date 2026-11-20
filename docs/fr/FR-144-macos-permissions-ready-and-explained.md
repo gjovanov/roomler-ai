@@ -51,7 +51,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 
 - **The wizard** (code): one paragraph on Done, "One manual step remains: macOS grants Screen Recording and
   Accessibility by hand…", which also says to choose Quit & Reopen and to allow the local-network prompt
-  (`agents/roomler-setup/src/front/app.js:1930-1934`). No live state, no button, nothing about prompt 4. Field
+  (`agents/roomler-setup/src/front/app.js:1947-1951`). No live state, no button, nothing about prompt 4. Field
   (11 Nov, 0.4.211): it names "Accessibility", which macOS 27 calls "Device Control and Data Access", and it says
   the same after a re-install with both grants on.
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —
@@ -76,7 +76,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - TCC binds a grant to the app's code requirement. When the signing identity changed on 2026-09-08, `tccd` logged
   `Failed to match existing code requirement for subject com.roomler.agent and service kTCCServiceScreenCapture`
   while the entry stayed listed and on (`docs/fr/FR-80-a-session-with-no-pixels-says-why.md:27-33`). A release's
-  Developer ID signature keeps the grants across our updates (`docs/installation.md:2245-2247`; field: no prompt
+  Developer ID signature keeps the grants across our updates (`docs/installation.md:2720-2722`; field: no prompt
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an

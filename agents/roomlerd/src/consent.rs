@@ -1073,17 +1073,41 @@ impl SentinelKind {
     }
 }
 
+/// #4140 — why no surface showed a question that stood its window, as far as
+/// the device found it: the cause [`nobody_could_be_asked`] words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoSurface {
+    /// Nothing was up to show it: no native panel, no companion up with the
+    /// marker to read, no notification. FR-27's words, which guess why.
+    NothingUp,
+    /// #3864, #3967 — the companion was up with the marker to read, and a
+    /// Mac's road from this daemon's question to it was closed: a one-row
+    /// Mac's screen worker, or a two-row Mac's per-user half, did not relay
+    /// it ([`crate::companion::TrayVerdict::RoadClosed`]).
+    RoadClosed,
+}
+
 /// #3982 — what a caller is told when its question stood its window and no
-/// surface could show it: no native panel, no companion up to read the
-/// marker, no notification. SSH's words since FR-27, and an exec command's
+/// surface could show it. SSH's words since FR-27, and an exec command's
 /// since #3982: one text, so the two cannot drift. `policy` names the device
-/// policy that would skip the question: `SSH`, `execution`.
-pub(crate) fn nobody_could_be_asked(policy: &str) -> String {
-    format!(
-        "nobody could be asked at this device — it has no prompt surface (no one at its \
-         screen and the Roomler desktop app is not running); answer with `roomlerd \
-         consent` there, start the desktop app, or set this device's {policy} policy to auto"
-    )
+/// policy that would skip the question: `SSH`, `execution`. #4140 — `why`
+/// picks the words: nothing up keeps FR-27's, and a closed road says that the
+/// question could not reach the desktop app, never that the app is not
+/// running or that nobody is at the screen.
+pub(crate) fn nobody_could_be_asked(policy: &str, why: NoSurface) -> String {
+    match why {
+        NoSurface::NothingUp => format!(
+            "nobody could be asked at this device — it has no prompt surface (no one at its \
+             screen and the Roomler desktop app is not running); answer with `roomlerd \
+             consent` there, start the desktop app, or set this device's {policy} policy to auto"
+        ),
+        NoSurface::RoadClosed => format!(
+            "nobody could be asked at this device — the question could not reach the Roomler \
+             desktop app there (the app gets this device's questions through a part of Roomler \
+             in the person's session, and that part is not running or did not answer); answer \
+             with `roomlerd consent` there, or set this device's {policy} policy to auto"
+        ),
+    }
 }
 
 impl ConsentBroker {
@@ -2628,18 +2652,72 @@ mod cli_name_tests {
 }
 
 /// #3982 — the words a caller reads when nobody could be asked
-/// ([`nobody_could_be_asked`]): one text for SSH and an exec command.
+/// ([`nobody_could_be_asked`]): one text for SSH and an exec command. #4140 —
+/// for each cause the device found ([`NoSurface`]).
 #[cfg(test)]
 mod no_surface_words_tests {
-    use super::nobody_could_be_asked;
+    use super::{NoSurface, nobody_could_be_asked};
 
     /// SSH's sentence, word for word, as it read before the text was shared:
-    /// an edit to the shared text cannot drift it.
+    /// an edit to the shared text cannot drift it. #4140 — still the words
+    /// for nothing up to show the question.
     #[test]
     fn sshs_no_surface_sentence_is_pinned() {
         assert_eq!(
-            nobody_could_be_asked("SSH"),
+            nobody_could_be_asked("SSH", NoSurface::NothingUp),
             "nobody could be asked at this device — it has no prompt surface (no one at its screen and the Roomler desktop app is not running); answer with `roomlerd consent` there, start the desktop app, or set this device's SSH policy to auto"
         );
+    }
+
+    /// #4140 — an exec command's sentence for nothing up, word for word: SSH's,
+    /// naming the execution policy, as #3982 made it.
+    #[test]
+    fn execs_no_surface_sentence_is_pinned() {
+        assert_eq!(
+            nobody_could_be_asked("execution", NoSurface::NothingUp),
+            "nobody could be asked at this device — it has no prompt surface (no one at its screen and the Roomler desktop app is not running); answer with `roomlerd consent` there, start the desktop app, or set this device's execution policy to auto"
+        );
+    }
+
+    /// #4140 — a closed road's sentence, word for word, for SSH and exec. It
+    /// says the question could not reach the app, and why. It never says that
+    /// the app is not running or anything about the screen, and it drops
+    /// "start the desktop app", which cannot help an app that runs. Answering
+    /// with `roomlerd consent` and the policy switch stay.
+    ///
+    /// Red before #4140: there was one sentence, which said "no one at its
+    /// screen and the Roomler desktop app is not running".
+    #[test]
+    fn a_closed_roads_sentence_is_pinned_and_names_neither_guess() {
+        assert_eq!(
+            nobody_could_be_asked("SSH", NoSurface::RoadClosed),
+            "nobody could be asked at this device — the question could not reach the Roomler desktop app there (the app gets this device's questions through a part of Roomler in the person's session, and that part is not running or did not answer); answer with `roomlerd consent` there, or set this device's SSH policy to auto"
+        );
+        assert_eq!(
+            nobody_could_be_asked("execution", NoSurface::RoadClosed),
+            "nobody could be asked at this device — the question could not reach the Roomler desktop app there (the app gets this device's questions through a part of Roomler in the person's session, and that part is not running or did not answer); answer with `roomlerd consent` there, or set this device's execution policy to auto"
+        );
+        for policy in ["SSH", "execution"] {
+            let words = nobody_could_be_asked(policy, NoSurface::RoadClosed);
+            for guess in ["app is not running", "screen", "start the desktop app"] {
+                assert!(
+                    !words.contains(guess),
+                    "{policy}: a closed road's words say {guess:?}: {words}"
+                );
+            }
+            assert!(
+                words.contains("answer with `roomlerd consent` there"),
+                "{policy}: {words}"
+            );
+            assert!(
+                words.ends_with(&format!("set this device's {policy} policy to auto")),
+                "{policy}: {words}"
+            );
+            assert_ne!(
+                words,
+                nobody_could_be_asked(policy, NoSurface::NothingUp),
+                "{policy}: one text for both causes"
+            );
+        }
     }
 }

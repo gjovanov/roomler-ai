@@ -1780,7 +1780,9 @@ async fn daemon_main() -> Result<()> {
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
-        Command::AdoptEnrollment { from, take } => adopt_enrollment_cmd(&config_path, &from, &take),
+        Command::AdoptEnrollment { from, take } => {
+            adopt_enrollment_cmd(&config_path, &from, &take).map(|line| println!("{line}"))
+        }
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
             let action = match action {
@@ -3114,12 +3116,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 ///
 /// A `FILE` that does not parse is a refusal before anything is written, and
 /// so is a `--take` key outside the config surface. A `TARGET` that exists but
-/// does not load is not a refusal either — nothing can read it anyway — but it
-/// is never silently "absent": its last good copy (`.prev`) is folded into
-/// when that one loads, as the daemon itself would recover at its next start,
-/// the damaged file is kept as `.unreadable`, and both are said on stderr,
-/// which the setup wizard streams to the person
-/// ([`config::read_merge_base`]).
+/// does not load is not a refusal — nothing can read it anyway — but it is
+/// never silently "absent": its last good copy (`.prev`) is folded into when
+/// that one loads, as the daemon would at its next start, and the damaged file
+/// is kept as `.unreadable`; both are said on stderr, which the wizard streams
+/// ([`config::read_merge_base`]). The last line, returned, says what was there.
 ///
 /// The person's process enrolled with a machine id derived from the host
 /// name, since it could not read this file. When the server answered that
@@ -3128,7 +3129,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 /// and the overlay join refuses to share — is retired, so the daemon mints a
 /// fresh one, and the previous row is named for the operator
 /// ([`enrollment::retire_key_of_previous_row`]).
-fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
+fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<String> {
     let from_path = from.to_path_buf();
     let Some(fresh) = config::read_if_present(&from_path) else {
         bail!(
@@ -3152,15 +3153,15 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         taken.push((key.to_string(), entry.value));
     }
     let target = config_path.to_path_buf();
-    let existing = match config::read_merge_base(&target) {
-        config::MergeBase::Absent => None,
-        config::MergeBase::Loaded(cfg) => Some(cfg),
+    let (found, existing) = match config::read_merge_base(&target) {
+        config::MergeBase::Absent => (adopt_line::Found::Absent, None),
+        config::MergeBase::Loaded(cfg) => (adopt_line::Found::Loaded, Some(cfg)),
         config::MergeBase::Unreadable { reason, recovered } => {
             let kept = config::keep_unreadable(&target).map_err(|e| e.to_string());
             let said = config::describe_unreadable(&target, &reason, recovered.is_some(), &kept);
             tracing::warn!(path = %target.display(), %reason, recovered = recovered.is_some(), "adopt-enrollment: {said}");
             eprintln!("WARNING: {said}");
-            recovered
+            (adopt_line::Found::unreadable(&recovered, &kept), recovered)
         }
         // #3116 — closed to this process, not damaged: folding into nothing
         // would write a fresh config over the device's settings.
@@ -3175,7 +3176,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             let said = config::describe_not_private(&target, &reason);
             tracing::warn!(path = %target.display(), %reason, "adopt-enrollment: {said}");
             eprintln!("WARNING: {said}");
-            None
+            (adopt_line::Found::NotPrivate, None)
         }
     };
     let previous = existing.clone();
@@ -3223,7 +3224,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
     }
     .context("saving the adopted config")?;
     let what = match &outcome {
-        EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
+        EnrollOutcome::FreshPrimary => adopt_line::fresh_primary(&found),
         EnrollOutcome::RefreshedPrimary => {
             "folded into the existing config (same server + org; operator settings kept)"
                 .to_string()
@@ -3235,7 +3236,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         }
     };
     tracing::info!(path = %target.display(), ?outcome, taken = taken.len(), "enrollment adopted");
-    println!(
+    Ok(format!(
         "Enrollment adopted: {what}{}. Config written to: {}",
         if taken.is_empty() {
             String::new()
@@ -3251,8 +3252,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             )
         },
         target.display()
-    );
-    Ok(())
+    ))
 }
 
 /// rc.53 Phase 7 predicate: should the `--machine-global` enroll
@@ -9137,3 +9137,6 @@ mod no_enrollment_exit_tests {
         );
     }
 }
+
+/// #3589 — what the last line of `adopt-enrollment` says was at the target.
+mod adopt_line;

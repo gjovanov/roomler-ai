@@ -343,7 +343,7 @@ printed `undefined` and NaN for it.
 |---|---|---|
 | Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. The wrapper refuses anything else, and `--json`, before it looks at the target: an option given twice, and a window end that is not `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.sss]]` with `Z` or `+HH:MM` (JavaScript would read a time without a zone in the zone of the machine running the read). The read checks the same pattern, and every value bound for `--mars`'s remote command line is plain characters only | `scripts/rc-path-report.sh:160`, `:124`, `:168`, `scripts/rc-path-timeline.cjs:1077` |
 | Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:1090` |
-| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:871`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:945` |
+| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:872`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:945` |
 | Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date. A line whose batch was stored outside that range, uploaded over 10 min late or stamped by a clock over 10 min fast, is not read and leaves no mark, so the report's header prints the range read (`batches read: stored … -> …`) | `scripts/rc-path-timeline.cjs:896`, `:910`, `:808` |
 | Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group` | `scripts/rc-path-timeline.cjs:885` |
 | Time | `maxTimeMS` 240,000 | `scripts/rc-path-timeline.cjs:945` |
@@ -362,7 +362,10 @@ pump doubles the heartbeats.
 What the lines cannot tell:
 
 - **Why a target moved.** The governor sets the applied target in `record_applied`
-  (`agents/roomlerd/src/encode/governor.rs:2060`) and no line says why, so a move prints
+  (`agents/roomlerd/src/encode/governor.rs:2213`). An agent with FR-148 P0's move causes writes
+  why on the pump's own target lines (`why`) and counts the moves in its heartbeat
+  (`target_moves`, [Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)),
+  but this read takes neither field yet and an older agent writes neither, so a move prints
   "reason: not logged".
 - **Which session owns a line that names none.** The encoder lines and the rate-memory line carry
   no session id. Such a line goes to the session whose lines span its time, from 10 s before the

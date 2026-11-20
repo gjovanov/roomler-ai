@@ -97,9 +97,15 @@ case "$TARGET" in
     command -v roomler >/dev/null || die "roomler is not on PATH"
     # One `roomler ssh`, carrying the files on stdin: a device has a ceiling on
     # SSH requests per caller, and four in a row meet it.
+    # Quote PASS only when it holds something. printf runs its format once even
+    # with no arguments, so `printf '%q '` of nothing is `''`: one empty argument,
+    # which the remote run refuses as an unknown one. That stopped the plain
+    # `--mars --yes` read before it reached the database (FR-65 AC7, 2026-11-20).
+    OPTS=""
+    [ "${#PASS[@]}" = 0 ] || OPTS="$(printf '%q ' "${PASS[@]}")"
     rc=0
     tar -C "$HERE" -cf - fr65-stall-census.cjs fr65-stall-census.sh prod-mongo-read.sh |
-      roomler ssh mars -- "D=\$(mktemp -d ~/fr65-census.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/fr65-stall-census.sh\" --kubectl --yes $(printf '%q ' "${PASS[@]+"${PASS[@]}"}"); rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
+      roomler ssh mars -- "D=\$(mktemp -d ~/fr65-census.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/fr65-stall-census.sh\" --kubectl --yes $OPTS; rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
     exit "$rc"
     ;;
 esac

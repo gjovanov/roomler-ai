@@ -81,16 +81,16 @@ ahead) used to refuse tokens the server would still accept. The server verifies 
 token at enrollment either way.
 
 - **The reading** is the `Date` header of the server's answer to the setup-features
-  request the page sends when it opens (`agents/roomler-setup/src/features.rs:242`). It
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:259`). It
   counts only when the answer is the server's own: a 2xx JSON object from the origin that
-  was asked (`agents/roomler-setup/src/features.rs:197`, `tells_the_servers_clock`). The
+  was asked (`agents/roomler-setup/src/features.rs:214`, `tells_the_servers_clock`). The
   target of a redirect to another origin, a proxy's or a captive portal's page, and an
   older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
   arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
   clock, so a wall-clock step does not move it. It is used for 5
   minutes by either clock; after that the check asks the server again
   (`agents/roomler-setup/src/server_clock.rs:112`).
-- **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
+- **The verdict** (`agents/roomler-setup/src/commands.rs:548`, `judge_expiry`):
 
 | The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
 |---|---|---|---|
@@ -98,7 +98,7 @@ token at enrollment either way.
 | unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
 
 A token with no `exp` blocks, as before. The macOS second token follows the same rule
-(`agents/roomler-setup/src/front/app.js:1030`, `rootTokenProblem`). The expiry the page shows
+(`agents/roomler-setup/src/front/app.js:1047`, `rootTokenProblem`). The expiry the page shows
 ("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
 
 ### The install page: a list of steps, and a failure that says why (#3432, #3590)
@@ -138,8 +138,8 @@ did not apply. After every change the tracker sends the whole checklist as one
 `ProgressEvent::Steps { rows }` snapshot
 (`crates/roomler-setup-core/src/progress.rs:227`, each row a
 `StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
-the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1671`;
-`renderInstall`, `app.js:1750`).
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1688`;
+`renderInstall`, `app.js:1767`).
 
 | Row state | When | The page shows |
 |---|---|---|
@@ -163,12 +163,12 @@ panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
 in a person's words (`label_existing`, `orchestrator_agent.rs:1881`,
-`orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
+`orchestrator_unix.rs:1236`; `orchestrator_tunnel.rs:410`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
 `steps.rs:479`, into `DoneReport.warnings`,
-`agents/roomler-setup/src/commands.rs:662`; `renderDone`, `app.js:1839`): the
+`agents/roomler-setup/src/commands.rs:685`; `renderDone`, `app.js:1856`): the
 anchor's note there carries only its manual command.
 
 **The failure.** An error site hands over the error itself (`.or_fail(code)`
@@ -182,7 +182,7 @@ site's say. One function sends the terminal
 `ProgressEvent::Error { step, kind, status, words, chain }`
 (`progress.rs:216`) to the page and the replay log and writes the same line to
 the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
-failed at: ‹the failed row's label›" (`app.js:1793`), shows the words, and keeps
+failed at: ‹the failed row's label›" (`app.js:1810`), shows the words, and keeps
 the whole chain under Details.
 
 The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and
@@ -1599,7 +1599,7 @@ What a step writes, in order. Its own lines have the target `roomler_node_core::
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
-exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2281`).
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2283`).
 
 One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1437`). It gives the role to `service install` and
@@ -2029,7 +2029,7 @@ the loader check is all a bare image can ask of it.
 | Lane | What goes through it |
 |---|---|
 | `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
-| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190, for that reason. A container that cannot refresh its index from the mirror is not a package failure: it prints `MIRROR UNREACHABLE` and the script exits 3, while a package that does not start prints `DOES NOT START: <package>` and exits 1. In CI, `ci-apt.sh reach --containers` runs first, so a dead runner resolver fails over before any container starts ([build-caches.md](build-caches.md#5-how-apt-reaches-the-mirrors), #3710) |
 
 ⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
 not the package. Its package list is written by hand, so it named the real ALSA
@@ -2094,7 +2094,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:77-83`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:84-90`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
@@ -2154,6 +2154,25 @@ sequenceDiagram
     (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
     into its last good copy (`config.toml.prev`) when that one loads, and keeps
     the damaged file as `config.toml.unreadable`.
+  - `adopt-enrollment`'s **last line says what was at the target** (#3589). The
+    outcome alone cannot: a target that was not there and one that was there
+    and held no enrollment both end as a fresh primary, so the verb records what
+    its merge-base read found and words only that arm from it. What is written
+    and kept is the same on every row; only the words differ.
+
+    | At the target | The last line says | Where |
+    |---|---|---|
+    | nothing | *"written fresh (no config was here)"* | `agents/roomlerd/src/app/adopt_line.rs:54` |
+    | a config that loads and holds no enrollment | *"written into the config here, which held no enrollment (its settings kept)"* | `:55-57` |
+    | a config that does not load, with no usable `.prev` | *"written fresh: the config here could not be read and had no usable last good copy (kept as …`.unreadable`)"* | `:58-65` |
+    | a config that does not load, whose `.prev` loads and holds no enrollment | *"written into the config's last good copy, which held no enrollment (its settings kept); the config here could not be read (kept as …`.unreadable`)"* | `:66-73` |
+    | Windows, the machine-global config, not private to its administrators (#3609) | *"written fresh: the config here was not private to this computer's administrators, so nothing of it was carried over"* | `:74-76` |
+    | an enrolled config | the words it always had: refreshed, replaced, refreshed org, appended | `agents/roomlerd/src/app.rs:3228-3235` |
+
+    The record is made where the read is matched
+    (`agents/roomlerd/src/app.rs:3156-3181`) and the words are chosen at
+    `:3227`. A copy that could not be kept says why instead of where, and the
+    WARNING above it is unchanged.
   - A system scope's machine id is **derived from the host name** (the person
     cannot read the one in root's config). On a renamed host, or a VM cloned
     together with its config, the server therefore enrolls a **new device**: the
@@ -2458,8 +2477,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7039`](../agents/roomlerd/src/signaling.rs#L7039)), built
-into the caps by one function ([`:7087`](../agents/roomlerd/src/signaling.rs#L7087)).
+`rc_*` floor ([`signaling.rs:7040`](../agents/roomlerd/src/signaling.rs#L7040)), built
+into the caps by one function ([`:7088`](../agents/roomlerd/src/signaling.rs#L7088)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
@@ -3497,7 +3516,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2243`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2245`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

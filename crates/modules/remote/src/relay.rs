@@ -22,15 +22,15 @@
 //!    <-- global channel conn-envelope <-- proxy pump <- ClientTx
 //! ```
 //!
-//! Lifecycle: the owner pod keeps ONE proxy controller (Hub
-//! registration + pump task) per origin `conn`, created lazily on the
-//! first `rc.cmd`. It dies on: the origin pod's WS-close notice
-//! (`rc.conn_closed` - the primary path, mirroring C-4's
-//! `remote_media_conns` forwarding), or the janitor sweep discovering
-//! the origin conn gone / origin pod dead (`rc.conn_alive` probe, the
-//! belt for a crashed origin pod that could never send the notice).
-//! The rc.185 orphan reap in `create_session` remains the last-resort
-//! braces.
+//! Lifecycle: the owner pod keeps ONE proxy controller (Hub registration + pump task) per
+//! origin `conn`, created lazily on the first `rc.cmd`. It dies on: the origin pod's WS-close
+//! notice (`rc.conn_closed` - the primary path, mirroring C-4's `remote_media_conns`
+//! forwarding), or the janitor sweep discovering the origin conn gone / origin pod dead
+//! (`rc.conn_alive` probe, the belt for a crashed origin pod that could never send the
+//! notice). The rc.185 orphan reap in `create_session` remains the last-resort braces. A
+//! viewer's hang-up (`rc:terminate`) of a session its own pod's hub does not hold goes over
+//! `rc.cmd` to every owner pod the socket's route names, at every resume window (#4042,
+//! [`dispatch`]): a hub answers the terminate of a session it does not hold `Ok`.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -754,8 +754,8 @@ where
     0
 }
 
-/// The relay of one session frame (`rc:sdp.offer`, `rc:ice`) to every owner
-/// pod its socket's route names, when none of them dispatched it.
+/// The relay of one session frame (`rc:sdp.offer`, `rc:ice`, a hang-up) to the
+/// owner pods its socket's route names: the refusal one sent, and a Redis loss.
 #[derive(Debug, Default)]
 pub struct Scoped {
     refusal: Option<(String, String)>,
@@ -810,6 +810,144 @@ pub fn frame_tag(frame: &serde_json::Value) -> (&str, &str) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     (kind, sid.get(sid.len().saturating_sub(6)..).unwrap_or(""))
+}
+
+// ── #4042 — a viewer's hang-up of a session another pod holds ───────────────
+//
+// A hub answers the terminate of a session it does not hold with `Ok`, on
+// purpose: the agent's teardown races rely on it. So on the viewer's pod the
+// hang-up of a relayed session never errs, and the session-scoped relay in
+// `controller.rs` never sees it. And every owner pod answers it `dispatched`,
+// the one that held the session and every other one, so it goes to each owner
+// the socket's route names, never only to the first.
+
+/// The one wording of a viewer's hang-up relayed to the owner pods its socket's
+/// route names, at info, once a hang-up: the short session id, how many owner
+/// pods it went to, how many took it, and whether one refused it.
+pub const HANGUP_RELAYED_LINE: &str = "rc relay: hang-up relayed to the socket's owner pods";
+
+/// What the relay of one hang-up to its socket's owner pods came to.
+#[derive(Debug, Default)]
+pub struct HungUp {
+    /// The owner pods that took it (`dispatched`): the one that held the
+    /// session ended it, and each other one answered it as a hub answers a
+    /// session it does not hold.
+    pub took: usize,
+    /// What the rest said: a refusal, and a relay Redis lost.
+    pub said: Scoped,
+}
+
+/// Relay one hang-up to every owner pod in turn, and fold what each said. No
+/// answer stops the walk: an owner answers `dispatched` whether or not it held
+/// the session, so one answer says nothing of where the session was.
+pub async fn hang_up_to_each<R, F>(owners: Vec<String>, mut relay: R) -> HungUp
+where
+    R: FnMut(String) -> F,
+    F: std::future::Future<Output = Result<Option<(String, String)>, RelayFailed>>,
+{
+    let mut hung_up = HungUp::default();
+    for owner in owners {
+        match relay(owner).await {
+            Ok(None) => hung_up.took += 1,
+            Ok(Some(refusal)) => hung_up.said.refused(refusal),
+            Err(failed) => hung_up.said.failed(failed),
+        }
+    }
+    hung_up
+}
+
+/// The controller's dispatch of one frame: the hub's, and the relay of the
+/// hang-up the hub cannot carry. An `rc:terminate` of a session this pod's hub
+/// does not hold goes over `rc.cmd` to every owner pod its socket's route
+/// names, at every resume window. With the window on it follows the
+/// `controller_terminate` that `row_end::controller_end` published, and either
+/// one ends the session on the pod that holds it; the other finds it gone.
+///
+/// The relay is awaited, so that pod has ended the session before this socket's
+/// next frame is read: a Connect right after it gets a new session. An owner's
+/// refusal reaches the viewer in the words it reads on one pod. A relay Redis
+/// lost is dropped, as one lost in flight (#3840). An owner that gives no answer
+/// costs the deadline once, and its route is forgotten.
+pub async fn dispatch(
+    state: &RemoteState,
+    ctx: &DispatchCtx,
+    msg: ClientMsg,
+    text: &str,
+    conn: &str,
+) -> roomler_ai_remote_control::Result<()> {
+    let hub = &state.fleet.rc_hub;
+    let not_held_here = matches!(
+        &msg,
+        ClientMsg::Terminate { session_id, .. } if hub.session_snapshot(*session_id).is_none()
+    );
+    let dispatched = hub.dispatch(ctx, msg);
+    if !not_held_here || dispatched.is_err() {
+        return dispatched;
+    }
+    // Collected before the first await: no route guard is held across one.
+    let owners: Vec<String> = state
+        .remote_rc_conns
+        .get(conn)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let Some(user_id) = ctx.user_id else {
+        return Ok(());
+    };
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(());
+    };
+    let frame = &frame;
+    let name = ctx.controller_name.as_deref().unwrap_or_default();
+    let asked = owners.len();
+    let mut hung_up = hang_up_to_each(owners, |owner| async move {
+        relay_rc_frame(
+            state,
+            &owner,
+            conn,
+            user_id,
+            name,
+            ctx.consent_mode,
+            &ctx.override_reason,
+            ctx.input_mode,
+            &ctx.tenant_name,
+            ctx.may_record,
+            ctx.rc_overlay,
+            ctx.session_policy,
+            ctx.max_duration,
+            ctx.idle_secs,
+            ctx.lock_on_end,
+            ctx.org_session_cap,
+            frame,
+        )
+        .await
+    })
+    .await;
+    // `session_id` null, as a refusal of a hang-up reads on one pod.
+    let refusal = hung_up.said.refusal(None);
+    let (_, session) = frame_tag(frame);
+    info!(
+        session,
+        owners = asked,
+        took = hung_up.took,
+        refused = refusal.is_some(),
+        "{HANGUP_RELAYED_LINE}"
+    );
+    match refusal {
+        Some(refusal) => {
+            if let Some(tx) = &ctx.controller_tx {
+                let _ = tx.try_send(refusal);
+            }
+        }
+        // #3840: when Redis lost it on the way and no owner refused it, it
+        // is dropped with its line, the route kept and the viewer told nothing.
+        None => {
+            let _ = hung_up.said.dropped(frame);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1143,9 +1281,10 @@ mod relay_failure_tests {
 
     const SID: &str = "6738f0a1b2c3d4e5f6a7b8c9";
 
-    /// The two session frames the relay carries for a controller. Its
-    /// `rc:terminate` is never relayed: the hub of the controller's pod
-    /// answers one for a session it does not hold with Ok (`Hub::dispatch`).
+    /// The two session frames the session-scoped relay carries for a
+    /// controller. Its `rc:terminate` never errs there: the hub of the
+    /// controller's pod answers one for a session it does not hold with Ok
+    /// (`Hub::dispatch`), and `dispatch` relays it (#4042).
     fn relayed_frames() -> [serde_json::Value; 2] {
         [
             serde_json::json!({ "t": "rc:sdp.offer", "session_id": SID, "sdp": "v=0" }),
@@ -1231,5 +1370,108 @@ mod relay_failure_tests {
             ("rc:ice", "abc")
         );
         assert_eq!(frame_tag(&json!({ "session_id": 7 })), ("?", ""));
+    }
+}
+
+#[cfg(test)]
+mod hang_up_relay_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    type Answer = Result<Option<(String, String)>, RelayFailed>;
+
+    fn hang_up() -> serde_json::Value {
+        serde_json::json!({
+            "t": "rc:terminate",
+            "session_id": "6738f0a1b2c3d4e5f6a7b8c9",
+            "reason": "controller_hangup",
+        })
+    }
+
+    /// Runs the walk with scripted answers: which owner pods it asked, in
+    /// turn, and what the hang-up came to.
+    async fn walk(pods: &[&str], answers: Vec<Answer>) -> (Vec<String>, HungUp) {
+        let script = Mutex::new(answers.into_iter().collect::<VecDeque<_>>());
+        let asked = Mutex::new(Vec::new());
+        let owners = pods.iter().map(|p| p.to_string()).collect();
+        let hung_up = hang_up_to_each(owners, |owner| {
+            asked.lock().unwrap().push(owner);
+            let answer = script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted answer for every owner asked");
+            async move { answer }
+        })
+        .await;
+        (asked.into_inner().unwrap(), hung_up)
+    }
+
+    /// Every owner pod is asked, whatever the one before it answered: each
+    /// takes it, the one that held the session and the rest, so the first
+    /// answer says nothing of where the session was.
+    #[tokio::test]
+    async fn a_hang_up_asks_every_owner_whatever_the_one_before_it_said() {
+        let (asked, mut hung_up) = walk(
+            &["pod-a", "pod-b", "pod-c"],
+            vec![Ok(None), Ok(None), Err(RelayFailed::OwnerGone)],
+        )
+        .await;
+        assert_eq!(asked, ["pod-a", "pod-b", "pod-c"]);
+        assert_eq!(hung_up.took, 2);
+        assert!(hung_up.said.refusal(None).is_none(), "nobody refused it");
+        assert!(
+            !hung_up.said.dropped(&hang_up()),
+            "an owner gone is not a relay Redis lost"
+        );
+    }
+
+    /// An owner's refusal (another member's hang-up) reaches the viewer in the
+    /// words the same refusal reads on one pod, whatever another relay did.
+    #[tokio::test]
+    async fn an_owners_refusal_of_a_hang_up_reads_as_on_one_pod() {
+        let e = roomler_ai_remote_control::Error::PermissionDenied("not a party to this session");
+        let said = (crate::controller::error_code(&e).to_string(), e.to_string());
+        let (asked, mut hung_up) = walk(
+            &["pod-a", "pod-b"],
+            vec![Err(RelayFailed::Unknown), Ok(Some(said))],
+        )
+        .await;
+        assert_eq!(asked, ["pod-a", "pod-b"]);
+        assert_eq!(hung_up.took, 0);
+        let on_one_pod = ServerMsg::Error {
+            session_id: None,
+            code: crate::controller::error_code(&e).to_string(),
+            message: e.to_string(),
+            open_nonce: None,
+        };
+        let refusal = hung_up.said.refusal(None).expect("the owner's refusal");
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            serde_json::to_value(&on_one_pod).unwrap()
+        );
+    }
+
+    /// A hang-up Redis lost on its way, which no owner refused, is dropped as
+    /// a frame lost in flight: the viewer is told nothing.
+    #[tokio::test]
+    async fn a_hang_up_redis_lost_is_dropped_and_the_viewer_is_told_nothing() {
+        let (asked, mut hung_up) = walk(&["pod-a"], vec![Err(RelayFailed::Unknown)]).await;
+        assert_eq!(asked, ["pod-a"]);
+        assert_eq!(hung_up.took, 0);
+        assert!(hung_up.said.refusal(None).is_none());
+        assert!(hung_up.said.dropped(&hang_up()));
+    }
+
+    /// Control: with no owner pod in the socket's route nothing is asked.
+    #[tokio::test]
+    async fn a_hang_up_with_no_owner_asks_nothing() {
+        let (asked, mut hung_up) = walk(&[], Vec::new()).await;
+        assert!(asked.is_empty());
+        assert_eq!(hung_up.took, 0);
+        assert!(hung_up.said.refusal(None).is_none());
+        assert!(!hung_up.said.dropped(&hang_up()));
     }
 }

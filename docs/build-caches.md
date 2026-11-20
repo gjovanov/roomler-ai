@@ -21,6 +21,8 @@ run page rather than silently going cold. The program's full history, wave by wa
 | `release-setup.yml`, 4 build jobs | `seed-cache` release assets | `seed-setup-<platform>-…` | non-tag runs |
 | `integration-tests.yml`'s shards, `installer-smoke.yml`, every cargo cache in `ci.yml` (its Linux lanes since wave 34) | `seed-cache` release assets (`ci-<family>-…`, through `ci-seed-restore` / `ci-seed-save`) | one per lane; the two recorder lanes share one | master only |
 | `ci.yml`'s apt and bun sets | the Actions cache | one per package set | any run |
+| `release-agent.yml`'s apt set, shared by `build-linux` and `build-linux-companion` | the Actions cache (cache-apt-pkgs-action) | `release-linux-u2204-v1`, plus a hash of the versions the index names (§5) | any run of either job |
+| `release-setup.yml`'s Linux apt packages | `seed-cache` release assets (`apt-seed-install` / `apt-seed-save`) | `apt-<family>-<ID><VERSION_ID>-<arch>.tar.zst`, e.g. `apt-setup-linux-ubuntu26.04-X64` | non-tag runs |
 
 **Why a release and not the Actions cache.** The 10 GB cache pool kept evicting the seeds.
 LRU dropped a *verified* save 29 minutes after it landed (rc.472), and saves made from a tag
@@ -220,7 +222,168 @@ The GC line reports the cap in effect and the disk left on the volume:
 ~40 GB free, Linux 84–109 GB, Windows 147–222 GB. A compressed seed is 535–818 MiB, far under
 GitHub's 2 GiB limit per asset.
 
-## 5. Reading a release run
+## 5. How apt reaches the mirrors
+
+Every apt step in CI and the Linux release lanes goes through one helper,
+[`ci-apt.sh`](../.github/actions/ci-linux-system-deps/ci-apt.sh) (#3698, #3710), or is
+left for a stated reason (below). The helper exists because of the 2026-11-11 outage. The
+runners' resolver (systemd-resolved's stub, forwarding to the runner's upstream) stopped
+answering for `*.ubuntu.com` while public resolvers still did. `apt-get update` then exits
+**0** with only `W:` lines after 2–5 minutes, and every package of the install that follows
+waits about 20 s on the resolver. No timeout inside apt covers that wait, so a lane hung
+until its job ceiling.
+
+```mermaid
+flowchart TD
+    A["probe the names apt's sources use<br/>getent, in parallel (:275)"] -->|all resolve| R
+    A -->|a required name fails| B{"does 1.1.1.1 or 8.8.8.8<br/>answer every name? (dig, :308)"}
+    B -->|yes| C["resolvectl dns on the default link,<br/>flush, probe again (:338)<br/>::warning apt mirror DNS"]
+    C -->|resolves now| R
+    C -->|still fails| X["put the link back"]
+    B -->|no| X
+    X --> N{"subcommand"}
+    N -->|prepare| W["::warning apt mirrors unreachable<br/>refresh skipped, step passes"]
+    N -->|install| O["offline install from the local archive (:460)<br/>else ONE ::error Ubuntu mirrors unreachable"]
+    N -->|reach| E["ONE ::error apt mirrors unreachable"]
+    R["dpkg --configure -a, bounded refresh (:417)"] --> I["download phase, bounded<br/>then install phase, bounded (:436)<br/>the caller's apt options on both"]
+```
+
+**The names.** They come from apt's own sources (`derive_hosts`, `ci-apt.sh:239`): one-line
+`.list` files, deb822 `.sources` and the list a `mirror+file:` URI names. The Ubuntu archive
+hosts are **required** (`ci-apt.sh:136`). Any other repository, such as
+`packages.microsoft.com`, is probed with a shorter wait and only reported, so a dead
+third-party name never blocks an install from the archive. Until #3710 only
+`/etc/apt/apt-mirrors.txt` was read. The arm64 image carries that file, but none of its
+sources names it: they name `ports.ubuntu.com` directly. So the probe tested the amd64 trio,
+passed, and the install waited on a name that did not resolve. `reach --containers` adds the
+container images' mirrors (`ci-apt.sh:133-134`).
+
+**The failover never weakens apt's verification.** No `--allow-unauthenticated`, no
+`[trusted=yes]`. Every index is checked against Ubuntu's signing keys and every package
+against the index, so a DNS answer can make a download fail but never install a wrong
+package.
+
+**Containers get the switch passed in; they do not always inherit it.** Docker gives a
+container the host's resolv.conf without its loopback entries. Where `/etc/resolv.conf`
+links to the stub, Docker reads `/run/systemd/resolve/resolv.conf` instead, which the
+switch rewrites, so the container inherits the switch. The 11-20 self-test measured that on
+ubuntu-latest and ubuntu-22.04 (D2 of #3710). Some ubuntu-22.04-arm runners have a static
+`/etc/resolv.conf` instead, per runner and not per image: an egress proxy on `127.0.0.100`, the stub, then the
+Azure upstream. A container's copy then holds only the upstream the switch went around,
+and its `apt-get update` timed out after the failover. So a switch that helped also writes
+its resolvers to `/tmp/ci-apt.docker-dns` as `docker run` arguments (`--dns`, then an
+address, one per line; `ci-apt.sh:171`). Every container step passes them:
+`deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns`, and the two bundle checks read the
+file into an array on their `reach` line. With no failover there is no file, and a
+container starts exactly as before.
+
+| Runner image | `/etc/resolv.conf` | A container after the switch, by itself | With the helper's arguments |
+|---|---|---|---|
+| ubuntu-latest (26.04), ubuntu-22.04 | link to the stub | reaches its mirror | reaches its mirror |
+| ubuntu-22.04-arm, some runners (seen on image 20261116.196.1) | static file, written by `repoint-resolv-conf` | `apt-get update` times out | reaches its mirror in about 3 s |
+
+### The subcommands and where each runs
+
+| Subcommand | Does | Callers |
+|---|---|---|
+| `prepare [BOUND...]` (`:544`) | probe and failover, a bounded refresh, the apt-fast stand-in. It never fails the step | the composite (`ci-linux-system-deps/action.yml:63`); `ffmpeg-encoder-check` (`ci.yml:2340`); `recording-ffmpeg` (`ci.yml:2517`); release-agent's `build-linux` and `build-linux-companion`, before their cached steps (`release-agent.yml:313`, `:793`) |
+| `fallback PKG...` (`:614`) | bounded install, `--no-install-recommends`; with no resolver, one `::error` | the composite's verify steps (`action.yml:130`, `:186`); `ci.yml:2364`, `:2525` |
+| `install [BOUND...] [OPT...] -- PKG...` (`:634`) | `dpkg --configure -a`, probe and failover, bounded refresh, bounded two-phase install with exactly the caller's options. It adds no option, so recommends stay wherever the step had them | the recorder-audio lane's xvfb and xclip (`ci.yml:1301`, `:1337`, `:1445`); release-agent's fallbacks (`:364`, `:826`), `rpm` (`:884`), and the arm64 installs (`:972`, `:1107`); `apt-seed-install` (`action.yml:69`); release-tunnel (`:166`) |
+| `reach [--containers] [HOST...]` (`:672`) | probe and failover alone, for apt that runs elsewhere; one `::error` when the names do not resolve | `ui-phone-smoke.yml:78` (Playwright's `--with-deps` runs apt itself); the bundle checks' containers (`release-agent.yml:665`, `:1240`); every `deb-bare-check.sh` run (`release-agent.yml:1358`, `release-tunnel.yml:334`, `deb-bare-image.yml:78`) |
+| the stand-in (`:575`) | what cache-apt-pkgs-action's cold path runs as `apt-fast`: the bounded two-phase install. On failure it removes `~/cache-apt-pkgs`, so the action saves no empty set | every cached-apt step after a `prepare` |
+
+**Left, and why.**
+
+| Site | Reason |
+|---|---|
+| `vendor-ffmpeg-windows.yml`'s two apt steps | Dispatch-only. The FR-24 gate hashes the file whole (`release-agent.yml:506-510`), so one byte turns every release-agent run red until `lgpl-source-offer.yml` is re-dispatched |
+| `Dockerfile:29`, `:135` | Debian mirrors inside a buildx build of the server image: a different resolver path |
+| `scripts/install.sh` | Product code on customers' hosts |
+| `install-sh-output-check.sh`, `macos-postinstall-check.sh` | Their containers run `--network none` |
+
+### Bounds
+
+All of them are in seconds (`ci-apt.sh:141-152`). Each phase runs under its own `timeout`,
+inside its own process tree. A step-level `timeout-minutes` kills nothing below the step,
+and a composite step cannot carry one at all.
+
+| Phase | Default | Release lanes | Why |
+|---|---|---|---|
+| probe (`getent`) | 25 (5 for a name that is only reported) | same | a dead resolver fails a name in ~10 s |
+| refresh | 90 | 300 | healthy 3–7 s |
+| download | 300 | 600 on an `install`; 120 for the stand-in | a 5–10 minute Azure mirror stall stays a slow success on a release job |
+| install (dpkg) | 600 | 180 for the stand-in | ends a hung maintainer script only |
+| kill after SIGTERM | 30 | same | |
+
+The stand-in's bounds come from `prepare --download-bound 120 --install-bound 180`. `prepare`
+records them in `/usr/local/etc/ci-apt.bounds`, and the stand-in reads that file without
+sourcing it (`:508`). This keeps a failover (~85 s), the download, the install and the
+action's own work inside release-agent's 8-minute cached step, so that step's timeout can
+never land inside dpkg. The defaults (300 + 600 s) would not fit there.
+
+### What a run log says
+
+| Title | Kind | What it asks of you |
+|---|---|---|
+| `apt mirror DNS` | warning | Nothing: the runner's resolver failed and the job now uses a public one. Look at the job if it repeats on every run |
+| `apt index` | warning | The refresh did not complete, so the image's older index is in use and a cached set can MISS (below) |
+| `apt mirrors unreachable` | warning from `prepare`; error from `reach` | No resolver resolves the mirrors. `prepare` goes on (a cache HIT needs no mirror); `reach` stops the step. Re-run later |
+| `apt cold path` | warning | The cached set missed and its install was not attempted or failed; the verify step decides |
+| `apt-fast stand-in` | warning | The stand-in could not be installed, so the cached action's cold path is unbounded |
+| `apt offline install` | warning | No resolver, but the restored seed held every package, which installed offline |
+| `Ubuntu mirrors unreachable` | error | `install` or `fallback` with no resolver and no local copy. Re-run later |
+| `apt install failed` | error | The names resolved and apt still failed: read apt's output above it |
+| `bare-image check: mirror unreachable` | error | A `deb-bare-check.sh` container could not refresh its index (exit 3). That says nothing about the package: re-run |
+
+`deb-bare-check.sh` keeps the coupling's two readings apart (ship-it). A container whose
+refresh cannot resolve its mirror, or waits out its 240 s bound, prints
+`MIRROR UNREACHABLE` and exits 3 (`scripts/deb-bare-check.sh:47`). A package that does not
+start prints `DOES NOT START: <package>` and exits 1 (`:113`, `:156`). `deb-bare-image.yml`'s
+control accepts only the second.
+
+### The cache-key risk that stays
+
+Every cached-apt set (cache-apt-pkgs-action) keys on the versions the local index names.
+When the refresh fails, the image's older index stays in use, the key moves, and a set that
+would have hit misses.
+- **Only the runner's resolver dead:** the failover repairs the refresh, and the set still
+  hits.
+- **Every resolver dead:** the refresh is skipped and the set misses. A CI lane then fails
+  in about 70 s with one `::error`. A release job fails within its bounds instead of running
+  to its 60-minute ceiling.
+
+A key that does not depend on the index is a redesign, out of #3710's scope.
+
+### The self-test
+
+[`ci-apt-selftest.yml`](../.github/workflows/ci-apt-selftest.yml) runs on a PR or master push
+that touches the helper's directory, `apt-seed-install`, `deb-bare-check.sh`, the three
+release workflows or itself. It has two jobs:
+- **Offline:** `ci-apt.test.sh` (stub binaries, fixtures of the three images' sources, a
+  case count it checks), shellcheck, and actionlint (pinned by version and sha256) over
+  every workflow that calls the helper, the release workflows included, which no PR runs.
+- **Fault cells:** `ubuntu-latest`, `ubuntu-22.04` and `ubuntu-22.04-arm` × `healthy`,
+  `runner-dead`, `all-dead`, plus `arm64-names` on arm64. Each cell is a fresh job.
+  `ci-apt-fault.sh` is a functional resolver-fault control on the job's own throwaway
+  runner. It drops DNS answers that carry the mirror names (an iptables string match in
+  the raw table), from the runner's own upstream (read from `resolvectl`, never hard-coded)
+  or from every source, and nothing else, so the runner's connection to GitHub keeps
+  working.
+- **Proof that the fault applied:** each fault cell checks that the fault took effect
+  before its result counts (`getent` fails, `dig @1.1.1.1` answers, github.com resolves),
+  and checks at the end that the DROP rules matched packets.
+- **The runner-dead cells** also run a negative control (today's bare `apt-get` must fail
+  or hang), a container before and after the failover (D2), and `deb-bare-check.sh` on an
+  empty package (exit 3 under the fault, a pass after it). After the failover the cell
+  measures a container started bare, then requires one started with the helper's
+  `/tmp/ci-apt.docker-dns` arguments to reach its mirror. Every cell logs the runner image
+  and whether `/etc/resolv.conf` is a link, because the images change between pushes.
+- **The healthy cells** require that no `/tmp/ci-apt.docker-dns` exists, so a healthy job
+  starts its containers as before.
+- **The all-dead cells** read the cached action in front of a failing stand-in, and
+  `apt-seed-install`'s offline path.
+
+## 6. Reading a release run
 
 Cargo prints `Compiling\x1b[0m <crate>`, so a raw grep for `Compiling <crate>` counts 0 even
 when the crate compiled. Strip the colour codes first, and check every zero against a
@@ -246,7 +409,7 @@ grep -oE 'target is [0-9]+ MB.*' job.log                          # GC line, non
 A failed rehearsal opens a GitHub issue (`release-agent.yml:3848`), and the next green one
 closes it (`:3912`).
 
-## 6. The waves that built this
+## 7. The waves that built this
 
 | Wave | Change | Effect |
 |---|---|---|
