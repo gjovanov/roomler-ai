@@ -64,8 +64,8 @@ pub const PROBE_CHANNEL_PREFIX: &str = "roomler:sub-probe:";
 /// on a Redis that answers its count is 0.
 pub const DEAF_LINE: &str = "redis: a subscriber stopped hearing its probe; subscribing again";
 
-/// Redis answered the probe channel with an error (an ACL that does not
-/// admit it): one WARN line, and the rest of that lifetime runs unprobed.
+/// Redis refused the probe channel (`NOPERM`: an ACL that does not admit
+/// it): one WARN line, and the rest of that lifetime runs unprobed.
 pub const REFUSED_LINE: &str =
     "redis: a subscriber's probe channel was refused; this subscription runs unprobed";
 
@@ -449,9 +449,9 @@ impl Prober {
                         ProbeCounters::bump(&counters.unknown);
                     }
                     if let (Reply::Refused, Err(e)) = (reply, &result) {
-                        // Redis answered the probe with an error: the rest
-                        // of this lifetime runs unprobed, so a refusal that
-                        // stays (an ACL) is said once and asked no more.
+                        // An ACL refused the probe channel: the rest of this
+                        // lifetime runs unprobed, so a refusal that stays is
+                        // said once and asked no more.
                         warn!(subscriber = name, error = %e, "{REFUSED_LINE}");
                         tick = None;
                         continue;
@@ -543,12 +543,13 @@ fn judged(
 pub enum Reply {
     /// Redis took it and counted this many receivers.
     Receivers(i64),
-    /// No answer within the bound, or the connection failed or was being
-    /// replaced: it says nothing about the subscriber.
+    /// No answer within the bound, a connection that failed or was being
+    /// replaced, or an error reply that passes (a script holding the server
+    /// answers `BUSY`): it says nothing about the subscriber.
     Unknown,
-    /// Redis answered with an error (an ACL that does not admit the probe
-    /// channel, a script that holds the server): it says nothing about the
-    /// subscriber either, and the rest of the lifetime runs unprobed.
+    /// Redis refused the probe channel with `NOPERM`, as an ACL that does not
+    /// admit it does. It says nothing about the subscriber either, and as it
+    /// does not pass, the rest of the lifetime runs unprobed.
     Refused,
 }
 
@@ -556,8 +557,11 @@ impl Reply {
     pub fn of(result: &RedisResult<i64>) -> Self {
         match result {
             Ok(n) => Self::Receivers(*n),
-            Err(e) if e.is_io_error() => Self::Unknown,
-            Err(_) => Self::Refused,
+            // Only an ACL's refusal lasts. Any other error turns the probe
+            // off for nothing: a lifetime that outlived one `BUSY` would
+            // run unprobed for days.
+            Err(e) if e.code() == Some("NOPERM") => Self::Refused,
+            Err(_) => Self::Unknown,
         }
     }
 }
@@ -897,8 +901,23 @@ mod tests {
         assert_eq!(Reply::of(&Err(timed_out)), Reply::Unknown);
         let reset = RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert_eq!(Reply::of(&Err(reset)), Reply::Unknown);
-        let answered = RedisError::from((redis::ErrorKind::ResponseError, "NOPERM"));
-        assert_eq!(Reply::of(&Err(answered)), Reply::Refused);
+        // Error replies as Redis writes them, parsed the way a reply is.
+        let reply = |wire: &[u8]| {
+            redis::parse_redis_value(wire)
+                .and_then(redis::Value::extract_error)
+                .expect_err("an error reply")
+        };
+        let acl = reply(b"-NOPERM no permissions to access the 'c' channel\r\n");
+        assert_eq!(acl.code(), Some("NOPERM"));
+        assert_eq!(Reply::of(&Err(acl)), Reply::Refused);
+        let busy = reply(b"-BUSY Redis is busy running a script.\r\n");
+        assert_eq!(
+            Reply::of(&Err(busy)),
+            Reply::Unknown,
+            "a busy script passes"
+        );
+        let err = reply(b"-ERR some other trouble\r\n");
+        assert_eq!(Reply::of(&Err(err)), Reply::Unknown);
     }
 
     #[test]

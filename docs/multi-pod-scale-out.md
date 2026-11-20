@@ -358,8 +358,9 @@ each subscriber proves its own connection, end to end (`crates/core/src/ws/sub_p
   nonce for every subscription, so a registration Redis still holds for a dead connection is never
   counted as a receiver. Every `SUBSCRIBER_PROBE_MS` it PUBLISHes a sequence number there over the
   shared command connection, which the two bounds above cover.
-- **The verdict** (`Verdict`, `sub_probe.rs:586`; each tick, `:632`). A PUBLISH that fails or gets
-  no answer is unknown: it neither counts nor resets. A reply of 0 receivers is a miss at once, and
+- **The verdict** (`Verdict`, `sub_probe.rs:590`; each tick, `:636`). A PUBLISH that fails, gets
+  no answer or gets an error reply other than an ACL's `NOPERM` (a script holding Redis answers
+  `BUSY`) is unknown: it neither counts nor resets. A reply of 0 receivers is a miss at once, and
   so is a reply of 1 or more with nothing heard by the next tick. Any probe heard resets the count,
   and two misses in a row (`DEAF_AFTER`, `:54`) are deaf. A tick that finds a PUBLISH still out
   waits for it.
@@ -400,7 +401,7 @@ Why a Redis that answers, however slowly, does not trip it:
 
 1. Redis queues a message to its subscribers while it serves the PUBLISH, before it replies, so a
    healthy subscriber hears its probe within network time of the reply: measured from 35 µs before
-   it to 183 µs after it, over four runs of 20. 15 s is about 10⁵ times that.
+   it to 183 µs after it, over five runs of 20. 15 s is about 10⁵ times that.
 2. A PUBLISH slower than the response timeout is unknown, never a miss.
 3. It takes two misses in a row: one late arrival, or one stall of the pod's own runtime, costs at
    most one.
@@ -421,7 +422,7 @@ milliseconds on a Redis that answers. After an outage the command connection ans
 after Redis does (the bounds table above), so at the default a deaf subscriber hears again at most about
 55 s after Redis answers. Measured with a 1 s interval (`crates/tests/src/redis_subscriber_tests.rs`):
 the fan-out heard a post 6.4 s after Redis answered again, the bus answered a ping at 6.8 s and TURN
-usage booked a total at 7.1 s; a subscribe to a listener that never answers gave up after 3 s and
+usage booked a total at 7.0 s; a subscribe to a listener that never answers gave up after 3 s and
 connected 3 times in 10 s, and the relay's gave up after 3.0 s.
 
 **What a subscribing again costs, and what readiness says.**
@@ -461,7 +462,7 @@ count is 0.
 | `rc relay: frame dropped, Redis failed its relay` (`crates/modules/remote/src/relay.rs:648`) | a session frame the relay could not publish; the route is kept | `frame`, `session`, `suppressed` |
 | `rc relay: sweep stopped, Redis failed a probe` (`relay.rs:652`) | a janitor sweep that Redis stopped; its proxies are kept and asked about at the next sweep | `unsettled` |
 | `redis: a subscriber stopped hearing its probe; subscribing again` (`crates/core/src/ws/sub_probe.rs:65`) | a subscriber missed two of its own probes in a row: its subscription is dropped and made again ([the subscriptions](#the-subscriptions-3952)). With Redis healthy and `receivers` 1 or more, it points at the pod's own runtime or at a path that lost that one connection | `subscriber` (`fanout`, `bus`, `turn`), `missed`, `receivers` (the last reply's count), `probe_ms` |
-| `redis: a subscriber's probe channel was refused; this subscription runs unprobed` (`sub_probe.rs:69`) | Redis refused the probe's PUBLISH, as an ACL that does not allow the channel would: that subscription runs unprobed until it ends | `subscriber`, `error` |
+| `redis: a subscriber's probe channel was refused; this subscription runs unprobed` (`sub_probe.rs:69`) | Redis refused the probe's PUBLISH with `NOPERM`, as an ACL that does not allow the channel does: that subscription runs unprobed until it ends. Any other error reply is unknown, like no answer | `subscriber`, `error` |
 | `subscribe failed` with `no answer within 3000 ms (<step>)` (`sub_probe.rs:213`) | a subscribe got no answer within its bound, and is tried again. The step is `connect`, `SUBSCRIBE <channel>` or `PSUBSCRIBE <pattern>`. The lines: `Redis Pub/Sub subscribe failed` (the fan-out, the error in the text), `pod bus subscribe failed`, `turn usage: subscribe failed`, and at the relay `derp-relay: subscribing to coturn's statistics failed` | the error |
 | `turn usage: a total was not recorded: the recorder is behind (under-reports)` (`crates/modules/network/src/turn_usage.rs:85`) | 4096 totals were waiting for MongoDB, and this one is not booked; at most once a second | `dropped`, `suppressed` |
 
