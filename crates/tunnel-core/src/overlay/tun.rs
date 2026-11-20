@@ -8654,6 +8654,374 @@ mod utun_self_delivery_tests {
     }
 }
 
+#[cfg(test)]
+mod v6_transport_checksum_tests {
+    //! #4125 — the hand-back's checksum rule for a packet to the node's own
+    //! derived IPv6, against checksums computed here another way: the
+    //! pseudo-header written out in full and every 16-bit word summed in 64
+    //! bits.
+    use crate::overlay::router::derive_overlay_v6;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const OWN: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 5);
+    const PEER: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 9);
+    const UDP: u8 = 17;
+    const TCP: u8 = 6;
+    /// Where each checksum field sits in its segment.
+    const UDP_FIELD: usize = 6;
+    const TCP_FIELD: usize = 16;
+
+    /// The rule under test. Red: a stand-in that changes nothing, until the
+    /// fix points this at the hand-back's own function.
+    fn finish(_packet: &mut [u8]) {}
+
+    /// The 16-bit ones'-complement sum of `bytes`, padded with a zero to an
+    /// even length, summed in 64 bits and folded.
+    fn sum64(bytes: &[u8]) -> u16 {
+        let mut sum: u64 = bytes
+            .chunks(2)
+            .map(|w| (u64::from(w[0]) << 8) | u64::from(w.get(1).copied().unwrap_or(0)))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// The IPv6 pseudo-header, written out: source, destination, the
+    /// upper-layer length in 32 bits, three zero bytes and the next header.
+    fn pseudo(src: Ipv6Addr, dst: Ipv6Addr, len: usize, next: u8) -> Vec<u8> {
+        let mut p = Vec::with_capacity(40);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(&(len as u32).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, next]);
+        p
+    }
+
+    /// The checksum `segment` should carry, its field (at `field`) taken
+    /// as zero: the complement of the sum over the pseudo-header and the
+    /// segment. A UDP 0 is `0xffff` (RFC 8200 §8.1).
+    fn reference(src: Ipv6Addr, dst: Ipv6Addr, next: u8, segment: &[u8], field: usize) -> u16 {
+        let mut bytes = pseudo(src, dst, segment.len(), next);
+        let at = bytes.len();
+        bytes.extend_from_slice(segment);
+        bytes[at + field] = 0;
+        bytes[at + field + 1] = 0;
+        match !sum64(&bytes) {
+            0 if next == UDP => 0xffff,
+            c => c,
+        }
+    }
+
+    /// What macOS leaves in the field for the device to finish: the
+    /// pseudo-header's sum alone.
+    fn unfinished(src: Ipv6Addr, dst: Ipv6Addr, next: u8, segment: &[u8]) -> u16 {
+        sum64(&pseudo(src, dst, segment.len(), next))
+    }
+
+    /// Whether an IPv6 packet's TCP or UDP checksum is valid: the sum over
+    /// the pseudo-header and the whole segment, its field included, is
+    /// `0xffff`.
+    fn valid(packet: &[u8]) -> bool {
+        let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+        let mut bytes = pseudo(src, dst, packet.len() - 40, packet[6]);
+        bytes.extend_from_slice(&packet[40..]);
+        sum64(&bytes) == 0xffff
+    }
+
+    /// An IPv6 packet from `src` to `dst` whose Next Header is `next`.
+    fn v6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0];
+        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        p.extend_from_slice(&[next, 64]);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// An IPv4 packet from `src` to `dst` whose protocol is `proto`.
+    fn v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0x45, 0];
+        p.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0x40, 0, 64, proto, 0, 0]);
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// A UDP header from port 53000 to 53 and `payload`, its checksum field
+    /// holding `field`.
+    fn udp(payload: &[u8], field: u16) -> Vec<u8> {
+        let mut s = Vec::with_capacity(8 + payload.len());
+        s.extend_from_slice(&53000u16.to_be_bytes());
+        s.extend_from_slice(&53u16.to_be_bytes());
+        s.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        s.extend_from_slice(&field.to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    /// A 20-byte TCP header (PSH and ACK, from port 53000 to 8080) and
+    /// `payload`, its checksum field holding `field`.
+    fn tcp(payload: &[u8], field: u16) -> Vec<u8> {
+        let mut s = vec![0u8; 20];
+        s[0..2].copy_from_slice(&53000u16.to_be_bytes());
+        s[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        s[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        s[8..12].copy_from_slice(&0x0a0b_0c0du32.to_be_bytes());
+        s[12] = 5 << 4;
+        s[13] = 0x18;
+        s[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        s[16..18].copy_from_slice(&field.to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    /// The checksum field of an IPv6 packet's segment.
+    fn field_of(packet: &[u8], field: usize) -> u16 {
+        u16::from_be_bytes([packet[40 + field], packet[41 + field]])
+    }
+
+    /// `packet` after the rule, asserting that no byte outside the checksum
+    /// field changed.
+    fn finished(packet: &[u8], field: usize) -> Vec<u8> {
+        let mut p = packet.to_vec();
+        finish(&mut p);
+        assert_eq!(p.len(), packet.len());
+        let f = 40 + field;
+        assert_eq!(p[..f], packet[..f], "a byte before the field changed");
+        assert_eq!(
+            p[f + 2..],
+            packet[f + 2..],
+            "a byte after the field changed"
+        );
+        p
+    }
+
+    /// Payloads of an even and an odd length, empty and up to the overlay's
+    /// MTU.
+    fn payloads() -> Vec<Vec<u8>> {
+        [0usize, 1, 5, 6, 512, 1232 - 20]
+            .iter()
+            .map(|&n| (0..n).map(|i| (i * 7 + 3) as u8).collect())
+            .collect()
+    }
+
+    #[test]
+    fn udp_with_the_pseudo_header_sum_alone_is_finished() {
+        let own6 = derive_overlay_v6(OWN);
+        for (src, dst) in [(own6, own6), (derive_overlay_v6(PEER), own6)] {
+            for payload in payloads() {
+                let mut seg = udp(&payload, 0);
+                let left = unfinished(src, dst, UDP, &seg);
+                seg[UDP_FIELD..UDP_FIELD + 2].copy_from_slice(&left.to_be_bytes());
+                let p = finished(&v6(src, dst, UDP, &seg), UDP_FIELD);
+                let want = reference(src, dst, UDP, &seg, UDP_FIELD);
+                assert_eq!(
+                    field_of(&p, UDP_FIELD),
+                    want,
+                    "{} bytes from {src}: field {left:#06x} not finished",
+                    payload.len()
+                );
+                assert!(valid(&p), "{} bytes from {src}", payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_with_the_pseudo_header_sum_alone_is_finished() {
+        let own6 = derive_overlay_v6(OWN);
+        for (src, dst) in [(own6, own6), (derive_overlay_v6(PEER), own6)] {
+            for payload in payloads() {
+                let mut seg = tcp(&payload, 0);
+                let left = unfinished(src, dst, TCP, &seg);
+                seg[TCP_FIELD..TCP_FIELD + 2].copy_from_slice(&left.to_be_bytes());
+                let p = finished(&v6(src, dst, TCP, &seg), TCP_FIELD);
+                let want = reference(src, dst, TCP, &seg, TCP_FIELD);
+                assert_eq!(
+                    field_of(&p, TCP_FIELD),
+                    want,
+                    "{} bytes from {src}: field {left:#06x} not finished",
+                    payload.len()
+                );
+                assert!(valid(&p), "{} bytes from {src}", payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn any_other_value_in_the_field_is_computed_over_too() {
+        let own6 = derive_overlay_v6(OWN);
+        for value in [0x0000, 0x1234, 0xffff] {
+            let seg = udp(b"query", value);
+            let p = finished(&v6(own6, own6, UDP, &seg), UDP_FIELD);
+            assert!(valid(&p), "UDP, field {value:#06x}");
+            let seg = tcp(b"query", value);
+            let p = finished(&v6(own6, own6, TCP, &seg), TCP_FIELD);
+            assert!(valid(&p), "TCP, field {value:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_complete_checksum_is_left_byte_for_byte() {
+        let own6 = derive_overlay_v6(OWN);
+        for payload in payloads() {
+            let mut seg = udp(&payload, 0);
+            let sum = reference(own6, own6, UDP, &seg, UDP_FIELD);
+            seg[UDP_FIELD..UDP_FIELD + 2].copy_from_slice(&sum.to_be_bytes());
+            let p = v6(own6, own6, UDP, &seg);
+            assert!(valid(&p));
+            let mut again = p.clone();
+            finish(&mut again);
+            assert_eq!(again, p, "UDP, {} bytes", payload.len());
+
+            let mut seg = tcp(&payload, 0);
+            let sum = reference(own6, own6, TCP, &seg, TCP_FIELD);
+            seg[TCP_FIELD..TCP_FIELD + 2].copy_from_slice(&sum.to_be_bytes());
+            let p = v6(own6, own6, TCP, &seg);
+            assert!(valid(&p));
+            let mut again = p.clone();
+            finish(&mut again);
+            assert_eq!(again, p, "TCP, {} bytes", payload.len());
+        }
+    }
+
+    /// A packet whose checksum comes out 0, the field holding what macOS
+    /// leaves in it: the segment's last two payload bytes (a whole 16-bit
+    /// word) are set so that the sum over the pseudo-header and the segment
+    /// is `0xffff`.
+    fn summing_to_zero(next: u8, field: usize) -> Vec<u8> {
+        let own6 = derive_overlay_v6(OWN);
+        let mut seg = if next == UDP {
+            udp(b"query\0\0\0", 0)
+        } else {
+            tcp(b"query\0\0\0", 0)
+        };
+        let n = seg.len();
+        let mut bytes = pseudo(own6, own6, n, next);
+        bytes.extend_from_slice(&seg);
+        let fill = !sum64(&bytes);
+        seg[n - 2..].copy_from_slice(&fill.to_be_bytes());
+        let mut bytes = pseudo(own6, own6, n, next);
+        bytes.extend_from_slice(&seg);
+        assert_eq!(!sum64(&bytes), 0, "the segment's checksum comes out 0");
+        let left = unfinished(own6, own6, next, &seg);
+        seg[field..field + 2].copy_from_slice(&left.to_be_bytes());
+        v6(own6, own6, next, &seg)
+    }
+
+    #[test]
+    fn a_udp_checksum_of_zero_is_written_as_ffff_and_a_tcp_one_stays_zero() {
+        let p = finished(&summing_to_zero(UDP, UDP_FIELD), UDP_FIELD);
+        assert_eq!(
+            field_of(&p, UDP_FIELD),
+            0xffff,
+            "UDP over IPv6 never carries 0"
+        );
+        assert!(valid(&p));
+        let p = finished(&summing_to_zero(TCP, TCP_FIELD), TCP_FIELD);
+        assert_eq!(field_of(&p, TCP_FIELD), 0x0000, "TCP keeps its computed 0");
+        assert!(valid(&p));
+    }
+
+    /// `packet` is left exactly as it came.
+    fn left_alone(packet: &[u8], what: &str) {
+        let mut p = packet.to_vec();
+        finish(&mut p);
+        assert_eq!(p, packet, "{what}");
+    }
+
+    #[test]
+    fn ipv4_of_any_kind_is_left_as_it_came() {
+        let unfinished_udp = udp(b"query", 0x7d48);
+        let unfinished_tcp = tcp(b"query", 0x7d48);
+        let icmp = [8u8, 0, 0x12, 0x34, 0, 1, 0, 1];
+        for (proto, seg) in [
+            (UDP, &unfinished_udp[..]),
+            (TCP, &unfinished_tcp[..]),
+            (1, &icmp[..]),
+        ] {
+            left_alone(
+                &v4(OWN, OWN, proto, seg),
+                &format!("IPv4, protocol {proto}"),
+            );
+            left_alone(
+                &v4(PEER, OWN, proto, seg),
+                &format!("IPv4 from a peer, protocol {proto}"),
+            );
+        }
+    }
+
+    #[test]
+    fn icmpv6_and_any_other_next_header_are_left_as_they_came() {
+        let own6 = derive_overlay_v6(OWN);
+        let echo = [128u8, 0, 0x12, 0x34, 0, 1, 0, 1, 1, 2, 3, 4];
+        left_alone(&v6(own6, own6, 58, &echo), "ICMPv6");
+        // An extension header first, a UDP datagram after it.
+        let seg = udp(b"query", 0x7d48);
+        for next in [0u8, 43, 44, 50, 51, 59, 60, 135] {
+            let mut payload = vec![UDP, 0, 0, 0, 0, 0, 0, 0];
+            payload.extend_from_slice(&seg);
+            left_alone(
+                &v6(own6, own6, next, &payload),
+                &format!("Next Header {next}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_that_does_not_hold_leaves_it_as_it_came() {
+        let own6 = derive_overlay_v6(OWN);
+        for (next, seg) in [(UDP, udp(b"query", 0x7d48)), (TCP, tcp(b"query", 0x7d48))] {
+            let p = v6(own6, own6, next, &seg);
+            // Cut short: every length below the whole packet.
+            for len in 0..p.len() {
+                left_alone(
+                    &p[..len],
+                    &format!("Next Header {next}, cut to {len} bytes"),
+                );
+            }
+            // A payload length one more, or one less, than the buffer holds.
+            let plen = seg.len() as u16;
+            for wrong in [plen + 1, plen - 1, 0, u16::MAX] {
+                let mut q = p.clone();
+                q[4..6].copy_from_slice(&wrong.to_be_bytes());
+                left_alone(&q, &format!("Next Header {next}, payload length {wrong}"));
+            }
+            // A byte more in the buffer than the payload length says.
+            let mut q = p.clone();
+            q.push(0);
+            left_alone(&q, &format!("Next Header {next}, a byte past the payload"));
+        }
+        // A UDP length field that is not the payload length.
+        let seg = udp(b"query", 0x7d48);
+        let ulen = seg.len() as u16;
+        for wrong in [ulen + 1, ulen - 1, 0, u16::MAX] {
+            let mut s = seg.clone();
+            s[4..6].copy_from_slice(&wrong.to_be_bytes());
+            left_alone(&v6(own6, own6, UDP, &s), &format!("UDP length {wrong}"));
+        }
+        // A segment shorter than its header, its lengths consistent.
+        left_alone(&v6(own6, own6, UDP, &[0u8; 7]), "UDP, 7 bytes");
+        left_alone(&v6(own6, own6, TCP, &[0u8; 19]), "TCP, 19 bytes");
+    }
+
+    #[test]
+    fn a_packet_of_another_version_is_left_as_it_came() {
+        let own6 = derive_overlay_v6(OWN);
+        let p = v6(own6, own6, UDP, &udp(b"query", 0x7d48));
+        for version in [0u8, 4, 5, 7, 15] {
+            let mut q = p.clone();
+            q[0] = version << 4;
+            left_alone(&q, &format!("version {version}"));
+        }
+    }
+}
+
 /// macOS overlay networking against a REAL utun.
 ///
 /// Everything in the macOS arms — address aliasing, peer `/32`s, subnet
@@ -10587,16 +10955,15 @@ mod macos_kernel_tests {
         );
     }
 
-    /// #4125 (e) — the same datagram to the node's derived IPv6. macOS routes
-    /// that address as a local one, and still, on #4117's code, a datagram to
-    /// it was read from the utun and never delivered (measured on the CI
-    /// runner). So it is handed back too: once, never out of the read, and
-    /// nothing more comes into the utun for two seconds after. Whether macOS
-    /// then delivers it is printed, not asserted: on the macOS 26 runner it
-    /// did not (see the measurement below). So is what `ping6` gets, and the
-    /// route macOS answers for the address.
+    /// #4125 (e) — the same exchange with the node's derived IPv6: a UDP
+    /// datagram the Mac sends to `[<own v6>]:53` reaches a socket bound
+    /// there, and its reply comes back. On #4117's code it was read from the
+    /// utun and never delivered. macOS leaves its checksum for the network
+    /// device to finish (the measurement below), so the hand-back finishes
+    /// it before the write. The route macOS answers for the address, and
+    /// what `ping6` gets, are printed.
     #[tokio::test]
-    async fn a_datagram_to_its_own_derived_v6_is_handed_back_once_and_never_read() {
+    async fn a_datagram_to_its_own_derived_v6_is_delivered_and_answered() {
         if !cfg!(target_os = "macos") {
             eprintln!("skipping: macOS-only (utun)");
             return;
@@ -10630,26 +10997,23 @@ mod macos_kernel_tests {
         client.send_to(b"query", to).await.expect("send");
         let mut buf = [0u8; 64];
         let got = tokio::time::timeout(WAIT, server.recv_from(&mut buf)).await;
-        let read = reads_to(&mut reads, own);
-        let first = handed_back(&tun) - before;
-        eprintln!(
-            "measure (#4125 v6): the datagram to {to}: delivered={}, read from the utun={read}, \
-             handed back={first}",
-            matches!(got, Ok(Ok(_)))
-        );
-        assert_eq!(read, 0, "a packet to {own_v6} came out of read_packet");
-        assert_eq!(first, 1, "one datagram, one hand-back");
-        tokio::time::sleep(QUIET).await;
-        assert_eq!(
-            handed_back(&tun) - before,
-            1,
-            "nothing came back into the utun for {QUIET:?}"
-        );
-        assert_eq!(
-            reads_to(&mut reads, own),
-            0,
-            "and nothing to {own_v6} was read"
-        );
+        let (n, from) = got
+            .unwrap_or_else(|_| {
+                panic!(
+                    "a datagram to {to} is not delivered within {WAIT:?} (handed back {}, read \
+                     from the utun {})",
+                    handed_back(&tun) - before,
+                    reads_to(&mut reads, own)
+                )
+            })
+            .unwrap();
+        assert_eq!(&buf[..n], b"query");
+        server.send_to(b"answer", from).await.unwrap();
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the reply from {to} to {from} never comes back"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"answer");
 
         // `ping6`: the kernel computes an ICMPv6 checksum itself.
         let before = handed_back(&tun);
@@ -10672,6 +11036,75 @@ mod macos_kernel_tests {
             echoes_received(&text),
             handed_back(&tun) - before,
             reads_to(&mut reads, own)
+        );
+    }
+
+    /// #4125 (g) — (e)'s count, as (c) reads it for IPv4: the datagram to
+    /// the derived IPv6 is one hand-back and its reply one more, no packet
+    /// to the address comes out of the read, and nothing more comes into the
+    /// utun in the two seconds after.
+    #[tokio::test]
+    async fn a_handed_back_v6_datagram_is_delivered_once_and_never_read_again() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own_v6.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+
+        client.send_to(b"query", to).await.expect("send");
+        let mut sbuf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut sbuf)).await;
+        let read = reads_to(&mut reads, own);
+        assert_eq!(
+            handed_back(&tun) - before,
+            1,
+            "one datagram, one hand-back (read_packet returned {read} packet(s) to {own_v6}; \
+             delivered: {})",
+            got.is_ok()
+        );
+        assert_eq!(read, 0, "a packet to {own_v6} came out of read_packet");
+        let (_, from) = got
+            .unwrap_or_else(|_| panic!("the handed-back datagram to {to} is not delivered"))
+            .unwrap();
+
+        server.send_to(b"answer", from).await.unwrap();
+        let mut cbuf = [0u8; 64];
+        tokio::time::timeout(WAIT, client.recv_from(&mut cbuf))
+            .await
+            .expect("the reply comes back")
+            .unwrap();
+        assert_eq!(handed_back(&tun) - before, 2, "and one more for its reply");
+
+        let (s, c) = tokio::join!(
+            tokio::time::timeout(QUIET, server.recv_from(&mut sbuf)),
+            tokio::time::timeout(QUIET, client.recv_from(&mut cbuf)),
+        );
+        assert!(
+            s.is_err() && c.is_err(),
+            "a datagram arrived twice: {s:?} {c:?}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            2,
+            "nothing came back into the utun for {QUIET:?}"
+        );
+        assert_eq!(
+            reads_to(&mut reads, own),
+            0,
+            "and nothing to {own_v6} was read"
         );
     }
 
@@ -10824,5 +11257,146 @@ mod macos_kernel_tests {
             "the answer is the peer's address: {:02x?}",
             &buf[..n]
         );
+    }
+
+    /// A TCP listener on `ip`, on a port the kernel picks. A fresh IPv6
+    /// address cannot be bound until its duplicate address check ends, so an
+    /// unavailable address is tried again for a few seconds.
+    async fn listen_tcp(ip: std::net::IpAddr) -> tokio::net::TcpListener {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpListener::bind((ip, 0)).await {
+                Ok(l) => return l,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                        && std::time::Instant::now() < until =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("listening on {ip}: {e}"),
+            }
+        }
+    }
+
+    /// A TCP connection from the Mac to `listener`, and a few bytes each way,
+    /// each step within [`WAIT`]. `Err` names the step that did not happen.
+    /// Then, measured and not asserted, how many bytes of a 64 KiB write
+    /// arrive within [`WAIT`]: `Ok` carries that count.
+    async fn tcp_exchange(listener: &tokio::net::TcpListener) -> Result<usize, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let to = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(
+            tokio::time::timeout(WAIT, listener.accept()),
+            tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(to)),
+        );
+        let mut client = match connected {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("the connect to {to} failed: {e}")),
+            Err(_) => return Err(format!("the connect to {to} got no answer within {WAIT:?}")),
+        };
+        let (mut server, from) = match accepted {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => return Err(format!("the accept on {to} failed: {e}")),
+            Err(_) => return Err(format!("nothing was accepted on {to} within {WAIT:?}")),
+        };
+        client
+            .write_all(b"query")
+            .await
+            .map_err(|e| format!("the write to {to}: {e}"))?;
+        let mut q = [0u8; 5];
+        match tokio::time::timeout(WAIT, server.read_exact(&mut q)).await {
+            Ok(Ok(_)) if &q == b"query" => {}
+            other => return Err(format!("the bytes to {to} did not arrive: {other:?} {q:?}")),
+        }
+        server
+            .write_all(b"answer")
+            .await
+            .map_err(|e| format!("the write to {from}: {e}"))?;
+        let mut a = [0u8; 6];
+        match tokio::time::timeout(WAIT, client.read_exact(&mut a)).await {
+            Ok(Ok(_)) if &a == b"answer" => {}
+            other => {
+                return Err(format!(
+                    "the bytes back to {from} did not arrive: {other:?} {a:?}"
+                ));
+            }
+        }
+        let bulk = vec![0x5au8; 64 * 1024];
+        let mut rbuf = vec![0u8; 16 * 1024];
+        let mut arrived = 0usize;
+        let _ = tokio::time::timeout(WAIT, async {
+            let send = client.write_all(&bulk);
+            let recv = async {
+                while arrived < bulk.len() {
+                    match server.read(&mut rbuf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => arrived += n,
+                    }
+                }
+            };
+            tokio::join!(send, recv)
+        })
+        .await;
+        Ok(arrived)
+    }
+
+    /// #4125 (f) — a TCP connection the Mac opens to its own derived IPv6
+    /// carries a few bytes each way. Every segment of it goes through the
+    /// hand-back, with its checksum as macOS left it.
+    #[tokio::test]
+    async fn a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let listener = listen_tcp(own_v6.into()).await;
+        let before = handed_back(&tun);
+        let result = tcp_exchange(&listener).await;
+        let handed = handed_back(&tun) - before;
+        eprintln!(
+            "measure (#4125 v6 TCP): {result:?} (Ok: the bytes of a 64 KiB write that arrived \
+             within {WAIT:?}), segments handed back {handed}"
+        );
+        if let Err(e) = result {
+            panic!("TCP to [{own_v6}]: {e} (segments handed back {handed})");
+        }
+        assert!(handed > 0, "its segments go through the hand-back");
+    }
+
+    /// #4125 (f), the control — the same over the node's own IPv4 address,
+    /// whose checksums macOS finishes itself.
+    #[tokio::test]
+    async fn a_tcp_connection_to_its_own_address_carries_bytes_both_ways() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let listener = listen_tcp(own.into()).await;
+        let before = handed_back(&tun);
+        let result = tcp_exchange(&listener).await;
+        let handed = handed_back(&tun) - before;
+        eprintln!(
+            "measure (#4125 v4 TCP): {result:?} (Ok: the bytes of a 64 KiB write that arrived \
+             within {WAIT:?}), segments handed back {handed}"
+        );
+        if let Err(e) = result {
+            panic!("TCP to {own}: {e} (segments handed back {handed})");
+        }
+        assert!(handed > 0, "its segments go through the hand-back");
     }
 }
