@@ -153,6 +153,10 @@ Consequences, each a property rather than a feature:
 - **Two halves, one approval.** `halves: 2` is accepted only for `os: macos, role: daemon`
   (`validate_start`, `:327-334`): delivery then mints two daemon tokens, each on the ledger,
   for the per-user half and the root half of a macOS install (operator decision 7, B2).
+  A new Mac that the wizard makes one row (FR-141 P2, while the server's
+  `wizard_macos_one_row` is on) pairs with `halves: 1`, and the wizard spends its one token
+  on root's config, the Mac's one row. To the server it is a plain one-token daemon pairing,
+  and the plan counts one device.
 
 > ⚠️ The tunnel enroll route never checked for an archived organization — a pre-existing gap
 > the spec files separately. `approve` refuses an archived organization for **both** kinds,

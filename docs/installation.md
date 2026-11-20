@@ -2350,6 +2350,47 @@ is never one row. The tunnel client can still be installed. The server's
 `wizard_reinstall_guard` turns the guard off; it is on by default, and the wizard
 reads anything but a JSON `false` as on (`agents/roomler-setup/src/features.rs`).
 
+**One device from the wizard (FR-141 P2, behind a switch).** With the server's
+`wizard_macos_one_row` on (`ROOMLER__SETUP__WIZARD_MACOS_ONE_ROW`, default off; the
+wizard reads only a JSON `true` as on), the daemon card with "Join the overlay network"
+ticked makes a Mac that is not enrolled yet ONE device row, as `install.sh --one-row`
+does from a terminal: root's daemon, which owns the overlay and supervises the person's
+screen worker. The wizard runs as the person, so it decides from four facts it can read
+as the person (`agents/roomler-setup/src/one_row_form.rs:139`), on the Welcome page, at
+pairing start and again in the install's preflight, before any token is spent:
+
+| Fact | Open when |
+|---|---|
+| The server's switch | `wizard_macos_one_row` is a JSON `true` |
+| Root's config | there is no `/etc/roomler/config.toml`, unless this run's own earlier attempt placed it (a Retry) |
+| The person's config | neither config tree names a device, and none is unreadable |
+| The release | the macOS `.pkg` the install takes is `agent-v0.4.201` or later, the first that knows `enroll --one-row` (an older one would stop after the token is spent) |
+
+Open, the card says one device. The pairing asks for one token (`halves: 1`), and the
+paste box has one field. The approval card and the Done page name one device. The token
+enrolls root's config in the wizard's process, under the device's own name, with the
+overlay on and both FR-43 switches. Before that, the wizard makes the person's app
+folders as the person and stops, with nothing enrolled, if one is not theirs to write
+(FR-147: nothing as root makes a folder in a home). The one administrator dialog then
+runs `install.sh --privileged-steps --one-row --config-from FILE`. That places root's
+config before the one package run, whose guard removes the LaunchAgent and starts root's
+service (`install_macos_one_row_half`). No person's enrollment and no user half run, so
+nothing starts a LaunchAgent beside the worker (#4092). A cancel or a failure after the
+enroll keeps the config for Retry, which never posts the token twice. Unticked, the card
+installs the per-user half alone, as before.
+
+Closed, the ticked box makes B2's two rows, as before. While the switch is on, the page
+says why under the card:
+
+| Closed because | What the page says to do |
+|---|---|
+| Root's service is enrolled already (two rows, or a supervised worker) | Keep its two devices; to make it one, `sudo roomlerd one-row` five minutes after this install |
+| The person's screen sharing is enrolled already | The private network joins as a second device; for one device, the install script's `--one-row` with a new token, then delete the old row |
+| The release is older than 0.4.201, or unknown | The box makes two devices |
+
+The wizard never converts an enrolled Mac: a layout changes by its person's own command
+(the operator's ruling on #971, 2026-11-02).
+
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
@@ -2600,10 +2641,11 @@ The guard decides it here as it does at every update after.
 | Its person enrolled in an earlier install | Goes ahead, and says that row now stays offline, to be deleted in the device list |
 
 It is refused, with a message that names the flag, off macOS, with `--role tunnel`,
-beside `--daemon-token`, with `--privileged-steps` or `--user-steps`, and with
-`--no-enroll`. It is the script's alone for now: the wizard has no one-row control, and
-FR-129's next phase decides whether it gets one. The script a server hands out changes
-with that server's roll.
+beside `--daemon-token`, with `--user-steps`, with `--privileged-steps` unless
+`--config-from` names the root config to place (the setup wizard's half, above), and with
+`--no-enroll`. The wizard's own one-row form is behind the server's
+`wizard_macos_one_row`, off by default (FR-141 P2, the macOS wizard above). The script a
+server hands out changes with that server's roll.
 
 Read on released 0.4.201, a fresh Mac and the script roomler.ai serves: one row at the
 first start, then, once both permissions were on and the root half had restarted as the
