@@ -2015,8 +2015,8 @@ async fn overlay_removes_reach_peers_homed_on_another_pod() {
 
 /// How long these tests wait for the pod serving a call to end a seat whose
 /// admission is gone once no withdrawal reached it: two passes of its seat
-/// check, ten seconds apart, each read bounded at five seconds, and slack for
-/// a loaded runner.
+/// check, ten seconds apart, each a read and the room guard's reads, each
+/// bounded at five seconds (40 s), and slack for a loaded runner.
 const SEAT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The pod serving `room_id`'s call (app1) can no longer be reached by the

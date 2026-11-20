@@ -49,9 +49,12 @@
 //!   (`media_cluster::end_calls_of_rooms_gone`).
 //!
 //! **The bound.** On a pod whose reads succeed, a seat whose admission is gone
-//! ends within two passes after the membership's end, each a sleep, a read
-//! and the room guard's reads: `2 × (SEAT_CHECK_SECS + 2 × READ_TIMEOUT)`,
-//! 40 s. A guard that does not answer keeps the seat for two more passes.
+//! ends within `2 × (SEAT_CHECK_SECS + 2 × READ_TIMEOUT)`, 40 s, of the
+//! membership's end: the read under way then, two sleeps, the two reads that
+//! miss and one ask of the room guard, each at its limit. Asks about other
+//! seats in the same passes add up to [`READ_TIMEOUT`] to each of the two
+//! passes before the deciding one. A guard that does not answer keeps the
+//! seat for two more passes.
 //!
 //! **The switch.** [`SWITCH`] (`ROOMLER__CONFERENCE__SEAT_CHECK`) is read
 //! from the environment only, once, as the pod starts ([`spawn`]). `false`,
@@ -59,9 +62,23 @@
 //! empty, `true`, `1`, `on` or `yes` leaves it on; any other value leaves it
 //! on and warns ([`SWITCH_UNKNOWN`]), so a typo never turns it off unseen.
 //!
-//! **The log.** Every seat the check ends is one warning in one wording,
-//! [`ENDED`], with the org, the room, the person, how many connections closed
-//! and what each of the two reads found (`alert = seat_check_ended`).
+//! **The log.** Each line has one wording and an `alert` field, a handle for
+//! a person reading the pod's log (nothing files or pages on them):
+//!
+//! - [`ENDED`] (`alert = seat_check_ended`): every seat the check ends, with
+//!   the org, the room, the person, how many connections closed, what each of
+//!   the two reads found and the room guard's refusal (`guard`);
+//! - [`GUARD_ADMITS`] (`alert = seat_check_guard_admits`): a verdict the room
+//!   guard overruled, with what each of the two reads found;
+//! - [`ODD_DOCUMENT`] (`alert = seat_check_odd_document`): a document a read
+//!   could not decode, with its collection, its `_id` and its fields;
+//! - [`SWITCH_UNKNOWN`] (`alert = seat_check_switch_unknown`): a value of
+//!   [`SWITCH`] the check does not know, once, as the pod starts.
+//!
+//! A healthy pod logs none of the last three. A read that keeps failing warns
+//! from its [`FAILED_READS_TO_WARN`]th in a row, and so does a room guard that
+//! keeps not answering; the pod's start logs `seat check: on this pod`, or
+//! `seat check: off on this pod`, at info.
 //!
 //! **Who holds a seat.** Every participant entry is made by
 //! `RoomManager::create_transports`, whose one caller is
