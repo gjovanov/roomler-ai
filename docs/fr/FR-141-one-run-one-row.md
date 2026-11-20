@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:876-946`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8830-8836`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:877-947`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8830-8836`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1045-1050`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1074-1078`, `postinstall:355-388`); on a Mac that is one row already, the package only (`install.sh:1015-1033`) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -127,8 +127,8 @@ one row does not hold, the switch stays off and the wizard installs today's two 
 ### 3. A re-install lands on the same row(s) (P3)
 
 P0 decides its shape. What the code already gives: the root half's hardware id and `adopt-enrollment`'s fold
-(`orchestrator_unix.rs:876-884`), and the warning a Linux re-install gets from `root_identity`
-(`orchestrator_unix.rs:841-871`). What it lacks on a Mac: any look at the root daemon before the enroll
+(`orchestrator_unix.rs:877-885`), and the warning a Linux re-install gets from `root_identity`
+(`orchestrator_unix.rs:842-872`). What it lacks on a Mac: any look at the root daemon before the enroll
 (`root_identity.rs:67-79`). The privileged half runs as root and can read the root's config as
 `root_config_says` does (`install.sh:987-991`), and the root daemon's `Status` already reports `gui_worker.one_row`
 (`crates/localapi/src/lib.rs:490`, `:530-542`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
@@ -149,7 +149,8 @@ person's half on it and says why.
     Roomler with `curl -fsSL <the server the person chose>/api/setup/install.sh | sh -s -- --uninstall`
     ([`installation.md`, Uninstall](../installation.md#uninstall-every-platform)), then start Setup again. That is the
     road to a new enrollment after the row was deleted (launchd starts the daemon again after its exit 7, #2293, so the
-    stop can still show), and to two rows on a Mac the terminal installed as one row. A Mac that `sudo roomlerd
+    stop can still show). It promises no layout: with P2's switch on, Setup gives a new Mac one device and no two-row
+    choice, so "two devices" would be true only while the switch is off. A Mac that `sudo roomlerd
     one-row` made one row is also offered `sudo roomlerd one-row --revert`, but only while root's copy from before,
     `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:64-82`): only that command
     writes it, a finished revert removes it (`:2695-2700`), and with no copy the revert says only "nothing to revert"

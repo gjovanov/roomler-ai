@@ -189,10 +189,11 @@ pub async fn stop_for(role: Role, server: &str) -> Option<String> {
 /// script's `--uninstall` (`docs/installation.md`, Uninstall), from `server`,
 /// the one the person chose, then start Setup again. That is the road to a new
 /// enrollment after the row was deleted (launchd starts the daemon again after
-/// its exit 7, #2293, so the stop can still show), and to two rows on a Mac the
-/// terminal installed as one row. A Mac a migration made one row is also
-/// offered the revert, while its copy is there: anywhere else the revert says
-/// only "nothing to revert".
+/// its exit 7, #2293, so the stop can still show). It promises no layout: what
+/// Setup installs then is its own form's choice, and FR-141 P2's switch gives a
+/// new Mac one device with no two-row choice. A Mac a migration made one row is
+/// also offered the revert, while its copy is there: anywhere else the revert
+/// says only "nothing to revert".
 pub fn stop_text(mac: &OneRowMac, server: &str) -> String {
     let name = mac.name.trim();
     let named = if name.is_empty() {
@@ -214,8 +215,8 @@ pub fn stop_text(mac: &OneRowMac, server: &str) -> String {
         "This Mac is one device already{named}: its screen sharing, remote control and \
          private network run there, and it updates itself. Roomler Setup installs nothing \
          over it, because another install would add devices beside it. The tunnel client \
-         can still be installed.{revert} To start again from nothing, after its device was \
-         deleted or to set it up as two devices, remove Roomler in Terminal with \
+         can still be installed.{revert} To start again from nothing, for example after \
+         its device was deleted, remove Roomler in Terminal with \
          `curl -fsSL {server}/api/setup/install.sh | sh -s -- --uninstall`, then start \
          Roomler Setup again."
     )
@@ -282,10 +283,12 @@ mod tests {
 
     /// #4133's first note: the stop names a way forward that works as typed
     /// on every Mac it shows on. Removing Roomler and starting Setup again is
-    /// the road to a fresh enrollment (the row was deleted) and to two rows
-    /// (a Mac the terminal installed as one row, with no copy to put back),
-    /// so every stop names it, with the server the person chose. The revert
-    /// would only say "nothing to revert" there, so it is not offered.
+    /// the road to a fresh enrollment (the row was deleted) on every one-row
+    /// Mac, so every stop names it, with the server the person chose. It
+    /// promises no layout: FR-141 P2's switch gives a new Mac one device with
+    /// no two-row choice, so "two devices" would be true only while it is off.
+    /// A Mac the terminal installed as one row has no copy to put back, and
+    /// the revert would only say "nothing to revert" there: it is not offered.
     #[test]
     fn the_stop_names_a_way_forward() {
         for name in ["Studio Mac", " "] {
@@ -296,8 +299,10 @@ mod tests {
             let said = stop_text(&one_row, SERVER);
             assert!(said.starts_with("This Mac is one device already"), "{said}");
             assert!(said.contains("installs nothing"), "{said}");
+            assert!(said.contains("after its device was deleted"), "{said}");
             assert!(said.contains(UNINSTALL), "{said}");
             assert!(said.contains("start Roomler Setup again"), "{said}");
+            assert!(!said.contains("two devices"), "no layout promised: {said}");
             assert!(!said.contains("--revert"), "nothing to revert: {said}");
         }
         assert!(
@@ -330,6 +335,7 @@ mod tests {
         assert!(said.contains(REVERT), "{said}");
         assert!(said.contains("deleted since"), "{said}");
         assert!(said.contains(UNINSTALL), "the fresh start stays: {said}");
+        assert!(!said.contains("two devices"), "no layout promised: {said}");
     }
 
     /// #4133's second note: the wizard started as root asks the system
