@@ -365,6 +365,11 @@ mod role_reconcile_tests;
 mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
+/// #3950 — the seat check's follow-ups: a document that does not decode costs
+/// only the seats it bears on their verdict, the room guard decides each end,
+/// a pass ends only the seats it read, and an ended seat settles its call once.
+#[cfg(test)]
+mod seat_check_tests;
 /// FR-102 P9c — the carrier a session rides: the agent records it on
 /// `rc:session.stats` once Active, and the server stores it on
 /// `remote_sessions.carrier` — a code only, absent read as unknown, never
