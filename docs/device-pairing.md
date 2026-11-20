@@ -254,7 +254,7 @@ or a `+json` type is refused 415 before it is read (`declares_json`, `parse_body
 
 `PairingSettings` and its defaults: `crates/config/src/settings.rs:133-198`; `SetupSettings`:
 `:78-127`. Both load whole or absent (a file with no `[pairing]` table is the defaults), and a
-test pins every default (`settings.rs:1798-1815`, `:1848-1865`).
+test pins every default (`settings.rs:1829-1846`, `:1879-1896`).
 
 ## 7 · The audit — `pairing_audit`
 
