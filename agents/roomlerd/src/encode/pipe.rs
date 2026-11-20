@@ -167,7 +167,27 @@ pub struct Pipe {
     /// FR-148 P1 — the pair memory's side of this session: the same laws from
     /// the entry's floor, and the push-back record (`pair_memory`).
     memory: super::pair_memory::SessionMemory,
+    /// FR-148 D46 B2 — windows left that are no reading for the shadow model
+    /// or the pair memory: the in-flight budget saw the clock stand still for
+    /// the least and S, or read a release ([`Self::note_stall`]). Whether the
+    /// last window was one of them, for its push-backs.
+    stall_windows: u8,
+    window_gated: bool,
+    /// The tcp_shape harness's count of such windows; `None` is
+    /// [`STALL_WINDOWS`].
+    stall_gate: Option<u8>,
 }
+
+/// FR-148 D46 B2 — the windows a stall the in-flight budget saw keeps out of
+/// the shadow model and the pair memory, counted from the last step that saw
+/// it. The steps inside the stall mark the window that ends in it, and the
+/// step that reads the release marks the window its burst comes back in:
+/// D24's rule ("that window and the one after it") from the sender's side,
+/// where the budget keeps the transit short and so the validity gate sees no
+/// stall. A second window kept 15 of a 20 s run's windows out on a `tcp_shape`
+/// stall shape (a stall every 3.3 s), and the floor could not come back from
+/// a sample that read under the path.
+pub const STALL_WINDOWS: u8 = 1;
 
 impl Pipe {
     /// Every window, unconditionally: bytes that ARRIVED. Needs no congestion
@@ -195,6 +215,9 @@ impl Pipe {
     /// the shadow model and the pair memory take a delivery only from a `valid`
     /// one, because the opener's burst and the drain after a stall deliver more
     /// in one window than the path carries.
+    ///
+    /// FR-148 D46 B2 — nor from one of the [`STALL_WINDOWS`] after a stall the
+    /// in-flight budget saw ([`Self::note_stall`]).
     pub fn observe_delivered_in(
         &mut self,
         bps: u32,
@@ -202,10 +225,14 @@ impl Pipe {
         valid: bool,
         now: Instant,
     ) -> bool {
+        // A window that delivered nothing is gated while a stall's count
+        // stands, and uses none of it.
+        self.window_gated = self.stall_windows > 0;
         if bps == 0 {
             return false;
         }
-        if valid {
+        self.stall_windows = self.stall_windows.saturating_sub(1);
+        if valid && !self.window_gated {
             self.model.delivered(bps, basis, now);
             self.memory.delivered(bps, basis, now);
         }
@@ -263,9 +290,12 @@ impl Pipe {
             return;
         }
         // Every caller is a valid window: the goodput fold and the link loop
-        // both act only on one (`governor`).
-        self.model.pushed_back(bps, basis, now);
-        self.memory.pushed_back_in(bps, basis, take, now);
+        // both act only on one (`governor`). FR-148 D46 B2: a window after a
+        // stall the budget saw is no reading for the model or the memory.
+        if !self.window_gated {
+            self.model.pushed_back(bps, basis, now);
+            self.memory.pushed_back_in(bps, basis, take, now);
+        }
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
         self.capacity_basis = Some(basis);
@@ -291,6 +321,40 @@ impl Pipe {
                 self.floor_basis = Some(basis);
             }
         }
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back (D46 item 10): P1, a
+    /// sample that read a standing queue, or P3, one the in-flight budget read
+    /// as backlogged with no still span in it. The shadow model and the pair
+    /// memory take it, under the last valid window's `take`; this type's own
+    /// law never does, so nothing a session sends or opens moves. Neither
+    /// ever raises a floor ([`PathModel::sample_pushed_back`]).
+    pub fn observe_sample_capacity(
+        &mut self,
+        bps: u32,
+        by: PushedBy,
+        take: super::pair_memory::Take,
+        now: Instant,
+    ) {
+        if bps == 0 {
+            return;
+        }
+        self.model.sample_pushed_back(bps, by, now);
+        self.memory.sample_pushed_back_in(bps, by, take, now);
+    }
+
+    /// FR-148 D46 B2 — the in-flight budget saw the clock stand still for the
+    /// least and S with bytes out, or read a release: the next
+    /// [`STALL_WINDOWS`] windows are no reading for the shadow model or the
+    /// pair memory. This type's own law takes them as before.
+    pub fn note_stall(&mut self) {
+        self.stall_windows = self.stall_gate.unwrap_or(STALL_WINDOWS);
+    }
+
+    /// The tcp_shape harness's rule-D sweep: `n` windows after a stall.
+    #[cfg(test)]
+    pub(crate) fn set_stall_gate(&mut self, n: u8) {
+        self.stall_gate = Some(n);
     }
 
     /// The demonstrated lower bound: the most this path has EVER been shown to
@@ -517,11 +581,45 @@ impl std::fmt::Display for PathNumber {
 /// one, and the capacity moves only on a backlogged one. An assumed value never
 /// stands below the floor ([`Self::stand_in`]) and is never offered for storing
 /// ([`Self::offer`]).
+///
+/// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3
+/// ([`Self::sample_pushed_back`]), sets the capacity and lowers the floor
+/// damped, as a backlogged push-back does, and never raises it: its bytes are
+/// SCTP's acknowledgements, which a stall's release brings back at once.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PathModel {
     floor: Option<Held>,
     /// Backlogged by construction: nothing else sets it.
     capacity: Option<(u32, Instant)>,
+    /// FR-148 D46 B2 — the delivery sample that set the capacity; `None` when
+    /// a window's push-back did.
+    capacity_by: Option<PushedBy>,
+}
+
+/// FR-148 D46 B2 — the delivery sample whose push-back wrote a model number
+/// (D46 item 10). The `path model` line and the close line say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushedBy {
+    /// P1: the sample read a standing queue (`QueueReading::queued`).
+    P1,
+    /// P3: with the in-flight budget computing, the sample counted, was
+    /// backlogged, and no still span met it.
+    P3,
+}
+
+impl PushedBy {
+    /// The word the lines write.
+    pub fn word(self) -> &'static str {
+        match self {
+            PushedBy::P1 => "p1",
+            PushedBy::P3 => "p3",
+        }
+    }
+
+    /// `p1`, `p3`, or `-` for a number no delivery sample wrote.
+    pub fn word_of(by: Option<Self>) -> &'static str {
+        by.map_or("-", Self::word)
+    }
 }
 
 /// The reading that set the model's floor.
@@ -531,6 +629,8 @@ struct Held {
     basis: Basis,
     remembered: bool,
     at: Instant,
+    /// FR-148 D46 B2 — the delivery sample whose push-back lowered it.
+    by: Option<PushedBy>,
 }
 
 impl PathModel {
@@ -539,6 +639,40 @@ impl PathModel {
         if bps > 0 && basis != Basis::Assumed {
             self.raise(bps, basis, false, now);
         }
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3: the capacity
+    /// at its rate, and the floor lowered damped toward it when it stands
+    /// above. Never a raise, and never a floor where there was none.
+    pub fn sample_pushed_back(&mut self, bps: u32, by: PushedBy, now: Instant) {
+        if bps == 0 {
+            return;
+        }
+        self.capacity = Some((bps, now));
+        self.capacity_by = Some(by);
+        if let Some(f) = self.floor
+            && bps < f.bps
+        {
+            self.floor = Some(Held {
+                bps: super::rate_memory::damp(f.bps, bps),
+                basis: Basis::Backlogged,
+                remembered: false,
+                at: now,
+                by: Some(by),
+            });
+        }
+    }
+
+    /// FR-148 D46 B2 — the delivery sample that lowered the floor last, while
+    /// that floor stands; `None` when another reading set it.
+    pub fn floor_by(&self) -> Option<PushedBy> {
+        self.floor.and_then(|f| f.by)
+    }
+
+    /// FR-148 D46 B2 — the delivery sample that set the capacity, while it is
+    /// fresh ([`Self::capacity`]).
+    pub fn capacity_by(&self, now: Instant) -> Option<PushedBy> {
+        self.capacity(now).and(self.capacity_by)
     }
 
     /// A rate an earlier session measured (the pair memory's seed), taken at the
@@ -562,11 +696,13 @@ impl PathModel {
             Basis::AppLimited => self.raise(bps, basis, false, now),
             Basis::Backlogged => {
                 self.capacity = Some((bps, now));
+                self.capacity_by = None;
                 let set = |bps| Held {
                     bps,
                     basis,
                     remembered: false,
                     at: now,
+                    by: None,
                 };
                 match self.floor {
                     Some(f) if bps < f.bps => {
@@ -586,6 +722,7 @@ impl PathModel {
                 basis,
                 remembered,
                 at: now,
+                by: None,
             });
         }
     }
@@ -658,6 +795,11 @@ pub struct PathView {
     pub model_capacity: Option<PathNumber>,
     /// The stand-in as the model lets it stand ([`PathModel::stand_in`]).
     pub model_stand_in: Option<PathNumber>,
+    /// FR-148 D46 B2 — the delivery sample, P1 or P3, whose push-back lowered
+    /// the model's floor last and set its capacity ([`PathModel::floor_by`],
+    /// [`PathModel::capacity_by`]); `None` where a window's reading did.
+    pub model_floor_by: Option<PushedBy>,
+    pub model_capacity_by: Option<PushedBy>,
 }
 
 #[cfg(test)]
@@ -1257,5 +1399,86 @@ mod tests {
         p.observe_capacity(0, now);
         assert_eq!(p.ceiling_anchor_bps(now), None);
         assert_eq!(p.counts(), (0, 0));
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back moves the shadow model
+    /// and the pair memory, and nothing of this type's own: the capacity at
+    /// its rate, the floor lowered damped toward it (sustained evidence
+    /// converges on it), never raised, and never set where there was none.
+    /// Counted in the memory under the window's take, in the split as well.
+    #[test]
+    fn a_sample_push_back_moves_only_the_model_and_never_raises_its_floor() {
+        use super::super::pair_memory::{Read, Take};
+        let now = t0();
+        let (clear, over) = (Take::Sample(Read::Clear), Take::Sample(Read::Overproduced));
+        let mut p = Pipe::default();
+        p.observe_delivered_in(2_400_000, Basis::AppLimited, true, now);
+        p.observe_sample_capacity(1_500_000, PushedBy::P1, over, now);
+        let m = p.model();
+        assert_eq!(m.capacity(now).map(|c| c.bps), Some(1_500_000));
+        assert_eq!(m.capacity_by(now), Some(PushedBy::P1));
+        let damped = super::super::rate_memory::damp(2_400_000, 1_500_000);
+        assert_eq!(
+            m.floor(now).map(|f| (f.bps, f.basis)),
+            Some((damped, Basis::Backlogged))
+        );
+        assert_eq!(m.floor_by(), Some(PushedBy::P1));
+        // This type's own numbers: the delivery's, and no capacity.
+        assert_eq!(p.floor_bps(now), Some(2_400_000));
+        assert_eq!(p.capacity_bps(now), None);
+        assert_eq!(p.counts(), (1, 0));
+        for _ in 0..20 {
+            p.observe_sample_capacity(1_500_000, PushedBy::P3, clear, now);
+        }
+        let floor = p.model().floor(now).unwrap().bps;
+        assert!(floor.abs_diff(1_500_000) <= 15_000, "{floor}");
+        assert_eq!(p.model().floor_by(), Some(PushedBy::P3));
+        // A burst no rule saw is still no raise.
+        p.observe_sample_capacity(3_000_000, PushedBy::P1, clear, now);
+        assert_eq!(p.model().floor(now).unwrap().bps, floor);
+        assert_eq!(p.model().capacity(now).map(|c| c.bps), Some(3_000_000));
+        let c = p.memory().closing(now, 1_795_000_000);
+        assert_eq!((c.counted, c.counted_overproduced), (22, 1));
+        assert_eq!((c.counted_p1, c.counted_p3), ((2, 1), (20, 20)));
+        // A window's push-back after them is today's again.
+        p.observe_capacity(1_400_000, Basis::Backlogged, now);
+        assert_eq!(p.model().capacity_by(now), None);
+        let mut fresh = Pipe::default();
+        fresh.observe_sample_capacity(1_000_000, PushedBy::P3, clear, now);
+        assert_eq!(fresh.model().floor(now), None);
+        assert_eq!(fresh.model().capacity(now).map(|c| c.bps), Some(1_000_000));
+        assert_eq!(fresh.floor_bps(now), None);
+    }
+
+    /// FR-148 D46 B2 — a stall the in-flight budget saw keeps the next
+    /// [`STALL_WINDOWS`] window out of the shadow model and the pair memory,
+    /// its delivery and its push-backs alike, counted from the last mark; a
+    /// window that delivered nothing counts for none. This type's own law
+    /// takes every one, as before.
+    #[test]
+    fn a_stall_the_budget_saw_keeps_the_next_window_out_of_the_model() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.observe_delivered_in(1_000_000, Basis::AppLimited, true, now);
+        p.note_stall();
+        p.note_stall();
+        assert!(!p.observe_delivered_in(0, Basis::AppLimited, true, now));
+        p.observe_delivered_in(3_000_000, Basis::Backlogged, true, now);
+        p.observe_capacity(3_000_000, Basis::Backlogged, now);
+        assert_eq!(p.model().floor(now).map(|f| f.bps), Some(1_000_000));
+        assert_eq!(p.model().capacity(now), None);
+        assert_eq!(p.memory().closing(now, 1_795_000_000).counted, 0);
+        assert_eq!(p.capacity_bps(now), Some(3_000_000), "its own law took it");
+        assert_eq!(p.counts(), (2, 1));
+        p.observe_delivered_in(1_200_000, Basis::Backlogged, true, now);
+        assert_eq!(p.model().floor(now).map(|f| f.bps), Some(1_200_000));
+        p.observe_capacity(1_100_000, Basis::Backlogged, now);
+        assert_eq!(p.model().capacity(now).map(|c| c.bps), Some(1_100_000));
+        // A rejected window is no reading either way, and it is the one the
+        // stall keeps out.
+        p.note_stall();
+        p.observe_delivered_in(1_300_000, Basis::Backlogged, false, now);
+        p.observe_delivered_in(1_400_000, Basis::Backlogged, true, now);
+        assert_eq!(p.model().floor(now).map(|f| f.bps), Some(1_400_000));
     }
 }

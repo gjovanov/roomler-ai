@@ -101,9 +101,9 @@ paced       = Some(quantized)  if quantized + 5 ≤ target_fps   // engage ≥5 
 
 floored at `FPS_PACE_MIN = 15` (`encode_pressure.rs:139` — below that the cure is
 a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
-masked at 1.0 (`governor.rs:1946`): the pixels-bound HW encode time never
+masked at 1.0 (`governor.rs:1953`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
-reads `governor.paced_fps()` each loop (`governor.rs:1958`; consumed at
+reads `governor.paced_fps()` each loop (`governor.rs:1965`; consumed at
 `peer.rs:8215`, logged at `:10075`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 

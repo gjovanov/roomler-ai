@@ -2,7 +2,7 @@
 
 **Issue:** [#4054](https://github.com/gjovanov/roomler-ai/issues/4054) · **Status:** claimed 2026-11-19. Spec only, nothing built. P0 (a read on the first release with #4063) comes first, then P1 (one-row Mac); D1–D4 await the operator
 **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (the prompt-surface chain), [FR-43](FR-43-macos-single-enrollment.md) (the one-row Mac, its screen worker and the delegation channel), #3864 and #3967 (the app's road over the person socket), #4053 and its fix #4063 (the gate on the panel)
-**Related:** #3999 (the screen a panel opens on), #3845 (the seat asked again at an answer), #3962 (telling the viewer at once), #4000 (a window runs from the request)
+**Related:** #3999 (the screen a panel opens on, fixed by #4094), #3845 (the seat asked again at an answer), #3962 (telling the viewer at once), #4000 (a window runs from the request)
 
 **Anchors:** master `8136cf4c2` (2026-11-19), read in the tree, with #4063 merged in it as `eb74c8902`.
 
@@ -323,11 +323,25 @@ no more. Binding a panel's question to the panel alone is D3.
 
 ### Screens
 
-The panel opens on `NSScreen::mainScreen` (`mac.rs:505`), and the app's prompt on the primary monitor
-(`agents/roomler-desktop/src/panels.rs:402`, `:474`), so with several screens they can open on different ones (#3999).
-FR-149 moves `Panel::new` into the session process unchanged, and whichever rule #3999 chooses applies to the session
-panel. A process in the session reads the person's screens and the active app directly, which may make that rule
-easier to keep. It is not solved here.
+At this spec's pin (master `8136cf4c2`) the daemon's panel opened on `NSScreen::mainScreen` (`mac.rs:505`), and the
+app's prompt on the primary monitor (`agents/roomler-desktop/src/panels.rs:402`; its banner too, `:474`), so with
+several screens they could open on different ones (#3999). #4094 fixed that before this FR.
+
+Since #4094 (this paragraph's anchors at master `a912e3251`), one rule places both: a question opens on the screen
+that holds the pointer when it is shown, else on the primary screen, the menu bar's. One pure function decides:
+`consent_screen::choose` (`crates/agent-core/src/consent_screen.rs:57`; a screen's edges, `Frame::holds`, `:47`).
+Each process reads the pointer and the screens on its own main thread (`NSEvent::mouseLocation`, `NSScreen::screens`)
+and passes them in. The daemon's panel asks it from `Panel::new` (`agents/roomlerd/src/indicator/mac.rs:500`) through
+`question_screen` (`:876`). The app's prompt asks it from `place_consent` (`agents/roomler-desktop/src/panels.rs:773`)
+through `place_on_pointer_screen` (`:797`), and `appkit_origin` (`:837`) puts the prompt on the chosen screen, clear
+of the panel. Where no screen can be read, the prompt keeps the primary monitor (`position_consent`, `panels.rs:401`).
+`docs/desktop-companion.md` §10.9.3 has the rule's edges, its tests and its field cells.
+
+For this FR the rule needs nothing new. The design moves `Panel::new` into the session process unchanged (One-row Mac,
+Two-row Mac), so the session panel keeps the rule: the session process reads the pointer and the screens on its own
+main thread, as `question_screen` does in the root daemon today. A question then opens on the screen the person's
+pointer is on, whichever process draws it, and the app's prompt, where a question goes when no panel shows it, follows
+the same rule. Nothing about the screen is left to solve here.
 
 ### The switch
 
@@ -489,7 +503,7 @@ D3, and with D4's first case.
 
 - #4053's app-only fallback, and #4063's gate with its lab cells, which #4063 covers.
 - Consent panels on Windows and Linux.
-- The screen a panel opens on (#3999).
+- The screen a panel opens on (#3999), which #4094 solved before this FR; the session panel keeps its rule (Screens).
 - The panel in the captured stream (`mac.rs:49-55`), which does not change with the process that draws it.
 - The "Being viewed by …" banner, which stays with the app (`mac.rs:5-6`).
 - Telling the viewer at once that a question has no surface (#3962).
@@ -503,3 +517,4 @@ D3, and with D4's first case.
 | 2026-11-19 | the lab, a two-row Mac, 0.4.227: who is at the console, read with `stat /dev/console`, utmpx and notify(3) | the owner of `/dev/console` follows the console's person through a lock, a log-out, the login window and a fast user switch; utmpx keeps records of people not at the console; notify(3) posts nothing at a lock (Evidence) |
 | 2026-11-19 | the macOS lab's review of this spec: the worker's log, the console read, drawing, the two-row long-poll | folded in: where the lines are (Lab cells), the read and why not utmpx, `shown` is not seen, C4b, the long-poll's four rules, D4's two cases |
 | 2026-11-19 | the anchors re-pinned on master `8136cf4c2`, which holds #4063 (`eb74c8902`) | each read again by content there: the ones marked (#4063), and those into `mac.rs` and the docs, moved to the lines that hold what they name now; the `delegate_worker.rs` table, one line off at the old pin too, takes in its stdin row; the lifeline anchor in the Evidence table names `macos_supervisor.rs`; #4063's gate is anchored where Evidence and Design describe it. No text or decision changed |
+| 2026-11-20 | #3999's rule merged as #4094 (`a912e3251`) | Screens and Out of scope now say the session panel keeps it, and Related names the fix. No decision, phase or criterion changed |
