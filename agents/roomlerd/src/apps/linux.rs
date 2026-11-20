@@ -18,8 +18,10 @@
 //! (`roomler:tmux:<session>` / `roomler:app:<key>`) so [`super::classify_title`]
 //! can map a window back to its session/app without pid/xprop games.
 //!
-//! A tmux session with **no live xterm** (after an agent restart, or the
-//! operator detached) still appears in the list with a synthetic
+//! A tmux session with **no live xterm** (its xterm ended with the virtual
+//! desktop when its X server died, #4100; a daemon no service manager owns
+//! restarted; or the operator detached) still appears in the list with a
+//! synthetic
 //! `tmux:<session>` window id; [`LinuxWm::focus`] special-cases that to
 //! spawn a fresh attached xterm — so "attach to an existing bash
 //! session" works within the 3-message protocol (no separate verb).
@@ -195,10 +197,16 @@ impl LinuxWm {
     /// keeps running after the handle drops (std, unlike tokio).
     ///
     /// #4100 — on the daemon's own display, the virtual desktop is asked
-    /// first who starts it.
+    /// first who starts it: where its keeper runs, the keeper does, and a
+    /// start it cannot take fails here, never falling back to this spawn.
     fn spawn_detached(&self, program: &str, args: &[&str], apt: &str) -> Result<()> {
         if let Target::Daemon { display } = &self.target {
-            let XStart::Direct = (self.start)(display, program, args);
+            match (self.start)(display, program, args) {
+                XStart::Direct => {}
+                XStart::Started => return Ok(()),
+                XStart::Failed(e) => return Err(spawn_error(program, apt, e)),
+                XStart::Refused(why) => bail!("`{program}` was not started: {why}"),
+            }
         }
         self.cmd(program)?
             .args(args)
@@ -206,15 +214,7 @@ impl LinuxWm {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::anyhow!(
-                        "`{program}` not installed on the agent host (apt install {apt})"
-                    )
-                } else {
-                    anyhow::Error::new(e).context(format!("spawning {program}"))
-                }
-            })?;
+            .map_err(|e| spawn_error(program, apt, e))?;
         Ok(())
     }
 
@@ -306,7 +306,7 @@ fn on_path_in(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
 const HELPERS: &[MissingTool] = &[
     MissingTool {
         tool: "tmux",
-        blocks: "persistent shell sessions (the ones that survive an agent restart)",
+        blocks: "persistent shell sessions (the ones that outlive their terminal and a disconnect)",
         install: "apt install tmux",
     },
     MissingTool {
@@ -525,6 +525,17 @@ impl WindowManager for LinuxWm {
         let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
         self.spawn_detached(program, &rest, program)?;
         Ok(LaunchOutcome::default())
+    }
+}
+
+/// What a start of `program` that failed with `e` says, whoever started it
+/// (#4100: Remote Apps, or the virtual desktop's keeper): an actionable
+/// "install X" for a program that is not there, else the error.
+fn spawn_error(program: &str, apt: &str, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("`{program}` not installed on the agent host (apt install {apt})")
+    } else {
+        anyhow::Error::new(e).context(format!("spawning {program}"))
     }
 }
 

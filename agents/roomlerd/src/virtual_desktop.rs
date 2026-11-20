@@ -305,13 +305,65 @@ pub fn down() -> Option<String> {
 }
 
 /// #4100 — who starts an X client that Remote Apps (FR-56) asked for on a
-/// display of this daemon's ([`start_x_client`]).
+/// display of this daemon's ([`start_x_client`]), and how that went.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) enum XStart {
-    /// Remote Apps starts it itself, as before #4100.
+    /// Remote Apps starts it itself, as before #4100: no keeper of this
+    /// daemon's runs on that display.
     Direct,
+    /// The desktop's keeper started it, as its child.
+    Started,
+    /// The desktop's keeper could not start it: the error its start
+    /// returned, as Remote Apps' own start would have got it.
+    Failed(std::io::Error),
+    /// Not started, and why: the desktop is stopping or down, or its keeper
+    /// refused the start or did not answer in time.
+    Refused(String),
 }
+
+/// #4100 — now on `CLOCK_MONOTONIC`, in milliseconds: one clock for the daemon
+/// and its keeper, who reads the deadline the daemon gave a start.
+#[cfg(target_os = "linux")]
+fn monotonic_ms() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime(2)` with a live out-pointer; Linux always has
+    // `CLOCK_MONOTONIC`.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+    }
+    (now.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(now.tv_nsec as u64 / 1_000_000)
+}
+
+/// #4100 — the starts that wait for their keeper's answer, by id: the daemon
+/// puts each one here before it writes it, and the thread that follows the
+/// keeper's output ([`follow_keeper`]) hands each answer to its start. That
+/// thread's end closes it: every start still waiting hears so at once, and a
+/// later one is refused before it is written.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Waiting {
+    starts: std::collections::HashMap<u64, std::sync::mpsc::SyncSender<keeper::Answer>>,
+    closed: bool,
+}
+
+/// [`Waiting`], shared by the daemon and the thread that follows the keeper.
+/// Taken AFTER [`Desktop`]'s state, never before; that thread takes nothing
+/// else.
+#[cfg(target_os = "linux")]
+type Answers = std::sync::Arc<std::sync::Mutex<Waiting>>;
+
+/// #4100 — the slack past a start's deadline that the daemon waits for its
+/// answer: the keeper starts nothing read after the deadline, so a start the
+/// daemon gave up on never starts later, and one it answered just in time
+/// still has its answer heard.
+#[cfg(target_os = "linux")]
+const X_CLIENT_SLACK: Duration = Duration::from_secs(1);
 
 /// #4100 — what Remote Apps asks before it starts an X client on the daemon's
 /// own display: [`start_x_client`] in the daemon, a test's desktop in a test.
@@ -1251,8 +1303,13 @@ struct State {
     /// The write end of the keeper's input (#3665). Its end is the keeper's
     /// signal to take the whole desktop down: dropped by every kill of the
     /// tree, and closed by the kernel when the daemon dies however it dies.
-    /// Created close-on-exec, so no other program holds it.
+    /// Created close-on-exec, so no other program holds it. Non-blocking
+    /// once the job is out (#4100): each later write is one start of at most
+    /// [`KEEPER_JOB_MAX`] bytes, whole or not at all, never a wait.
     lifeline: Option<std::process::ChildStdin>,
+    /// #4100 — the starts written on `lifeline` that wait for the keeper's
+    /// answer; kept and dropped with it.
+    answers: Option<Answers>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1303,6 +1360,9 @@ struct Desktop {
     /// #3671 — how many times the desktop came back on a new X server
     /// ([`generation`]).
     generation: std::sync::atomic::AtomicU64,
+    /// #4100 — the number of the last start of an X client Remote Apps sent
+    /// a keeper ([`Desktop::start_x_client`]).
+    x_starts: std::sync::atomic::AtomicU64,
 }
 
 /// #3671 — what [`supervise`] calls, on its own thread, once an exit's
@@ -1347,6 +1407,7 @@ impl Desktop {
             tell_down: std::sync::OnceLock::new(),
             retire: std::sync::OnceLock::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
+            x_starts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1496,6 +1557,10 @@ impl Desktop {
         let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
         let (handle, lifeline, mut waiting) = {
             let mut st = self.state();
+            // #4100 — no start is written once the lifeline is gone; one
+            // waiting for its answer hears the keeper's end from the thread
+            // that follows it.
+            st.answers = None;
             (
                 st.tree.take(),
                 st.lifeline.take(),
@@ -1832,7 +1897,13 @@ impl Desktop {
         };
         let pid = child.id() as i32;
         let input = child.stdin.take();
-        let ready = follow_keeper(child.stderr.take(), pid, self.plan.keeper_lines.clone());
+        let answers = Answers::default();
+        let ready = follow_keeper(
+            child.stderr.take(),
+            pid,
+            self.plan.keeper_lines.clone(),
+            answers.clone(),
+        );
         // The job goes out only after `ready`, so a keeper given up on here
         // never had one and started nothing; and it is stopped before its
         // input ends, never after.
@@ -1880,6 +1951,10 @@ impl Desktop {
             drop(input);
             return Err(format!("its job could not be sent: {e}"));
         }
+        // #4100 — every later write is a start of Remote Apps' (one line of at
+        // most `KEEPER_JOB_MAX`, whole or not at all): a keeper that does not
+        // read refuses it, and never holds the daemon.
+        keeper::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&input));
         // From here the keeper's exit is the desktop's failure (K1), never a
         // direct start on top of what it started. The lifeline is kept only
         // for the tree it belongs to: a stop that took the tree meanwhile
@@ -1888,6 +1963,7 @@ impl Desktop {
         let mut st = self.state();
         if !st.stopping && st.tree.as_ref().is_some_and(|t| t.keeper == Some(pid)) {
             st.lifeline = Some(input);
+            st.answers = Some(answers);
             Ok(Some(pid))
         } else {
             Ok(None)
@@ -1924,24 +2000,152 @@ impl Desktop {
     }
 
     /// #4100 — who starts the X client `program` with `args` that Remote Apps
-    /// asked for on `display` ([`start_x_client`]). For now Remote Apps
-    /// starts every one itself, as before #4100.
+    /// asked for on `display` ([`start_x_client`]), and how it went.
+    ///
+    /// Where this desktop's keeper runs, the keeper starts it, as its child
+    /// in the desktop's group, so that its exit is collected and the
+    /// desktop's teardown reaches it and whatever it leaves behind. Nothing
+    /// falls back to a direct start there: a start the keeper cannot take is
+    /// refused. Remote Apps starts the client itself, as before, on another
+    /// display, under the kill switch, after a keeper this daemon turned off,
+    /// and while the tree has no keeper (it refused, or was not ready in
+    /// time: the window manager was started directly too).
+    ///
+    /// Decided under the state lock, and the start written under it, never a
+    /// wait (the lifeline is non-blocking, and a start of at most
+    /// [`KEEPER_JOB_MAX`] bytes goes whole or not at all); the answer is
+    /// awaited outside it, for the start's wait and [`X_CLIENT_SLACK`].
     fn start_x_client(&self, display: &str, program: &str, args: &[&str]) -> XStart {
-        let _ = (display, program, args, self.plan.x_client_wait);
-        XStart::Direct
+        if display != self.display
+            || !matches!(self.plan.clients, Clients::Keeper(_))
+            || self.keeper_off.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return XStart::Direct;
+        }
+        let wait = self.plan.x_client_wait;
+        let id = self
+            .x_starts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let line = keeper::Start {
+            id,
+            argv: std::iter::once(program)
+                .chain(args.iter().copied())
+                .map(String::from)
+                .collect(),
+            deadline_ms: monotonic_ms().saturating_add(wait.as_millis() as u64),
+        }
+        .line();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let answers = {
+            let st = self.state();
+            if st.stopping {
+                return XStart::Refused("the daemon is stopping".into());
+            }
+            // D1 — no X server to start it onto: a client started now would
+            // die at once, or land on the next server, outside any tree.
+            if st.up.is_none() {
+                return XStart::Refused(format!(
+                    "this device's virtual desktop is down: {}. The agent starts it again by \
+                     itself; launch it again in a moment",
+                    st.why_down
+                ));
+            }
+            if st.tree.as_ref().and_then(|t| t.keeper).is_none() {
+                return XStart::Direct;
+            }
+            if line.len() > KEEPER_JOB_MAX {
+                return XStart::Refused(format!(
+                    "its start is {} bytes, more than {KEEPER_JOB_MAX} bytes (one write to the desktop's keeper)",
+                    line.len()
+                ));
+            }
+            let (Some(lifeline), Some(answers)) = (st.lifeline.as_ref(), st.answers.as_ref())
+            else {
+                return XStart::Refused("the desktop's keeper has no input".into());
+            };
+            {
+                let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+                if waiting.closed {
+                    return XStart::Refused("the desktop's keeper is gone".into());
+                }
+                waiting.starts.insert(id, tx);
+            }
+            let fd = std::os::fd::AsRawFd::as_raw_fd(lifeline);
+            // SAFETY: `write(2)` from a live buffer of `line.len()` bytes to
+            // the daemon's end of the keeper's input. It is non-blocking, and
+            // a write of at most `PIPE_BUF` bytes is whole or fails (EAGAIN
+            // on a full pipe, EPIPE once the keeper is gone; SIGPIPE is
+            // ignored in the daemon).
+            let n = unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+            if n != line.len() as isize {
+                let e = std::io::Error::last_os_error();
+                answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .starts
+                    .remove(&id);
+                return XStart::Refused(format!("the desktop's keeper could not take it: {e}"));
+            }
+            answers.clone()
+        };
+        let answer = match rx.recv_timeout(wait + X_CLIENT_SLACK) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Given up under the lock its answer is handed over under: an
+                // answer that came in between is in the channel already.
+                let gave_up = answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .starts
+                    .remove(&id)
+                    .is_some();
+                match rx.try_recv() {
+                    Ok(answer) if !gave_up => answer,
+                    _ => {
+                        return XStart::Refused(format!(
+                            "the desktop's keeper did not answer within {:?}",
+                            wait + X_CLIENT_SLACK
+                        ));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return XStart::Refused("the desktop's keeper is gone".into());
+            }
+        };
+        match answer {
+            keeper::Answer::Started { .. } => XStart::Started,
+            keeper::Answer::Failed {
+                os_error,
+                kind,
+                text,
+            } => XStart::Failed(match os_error {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None if kind == "NotFound" => {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, text)
+                }
+                None => std::io::Error::other(text),
+            }),
+            keeper::Answer::Refused { why } => {
+                XStart::Refused(format!("the desktop's keeper refused it: {why}"))
+            }
+        }
     }
 }
 
 /// Follow a keeper's stderr on a thread of its own: its first `ready` or
-/// `refused: <why>` line goes to the receiver this returns, and every other
+/// `refused: <why>` line goes to the receiver this returns, its answer to a
+/// start of Remote Apps' to that start in `answers` (#4100), and every other
 /// line to the log, as a warning where [`keeper_line`] says so (a `warn: `
 /// line, or a `refused: ` line after `ready`). The thread ends with the
-/// keeper's stderr.
+/// keeper's stderr, and closes `answers` as it ends.
 #[cfg(target_os = "linux")]
 fn follow_keeper(
     stderr: Option<std::process::ChildStderr>,
     pid: i32,
     copy: Option<KeeperLines>,
+    answers: Answers,
 ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String> {
     use std::io::BufRead as _;
     let stderr = stderr.ok_or("it has no stderr")?;
@@ -1971,14 +2175,58 @@ fn follow_keeper(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(line.clone());
                 }
+                if let Some((id, answer)) = keeper::Answer::parse(&line) {
+                    answered(&answers, pid, id, answer);
+                    continue;
+                }
                 match keeper_line(&line) {
                     (true, said) => warn!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
                     (false, said) => info!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
                 }
             }
+            // The keeper's output ended, and with it every answer still to
+            // come: each start that waits hears so now (its sender dropped),
+            // and none is written from here on.
+            let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.closed = true;
+            waiting.starts.clear();
         })
         .map_err(|e| format!("its output could not be followed: {e}"))?;
     Ok(rx)
+}
+
+/// #4100 — hand the keeper's answer to start `id` to the start that waits
+/// for it, under the lock the daemon gives the start up under (never a
+/// wait: one answer a start, into a channel of one). An answer that comes
+/// after its start gave up is logged: one that started a client warns, since
+/// that client runs although its launch failed.
+#[cfg(target_os = "linux")]
+fn answered(
+    answers: &Answers,
+    keeper_pid: i32,
+    id: u64,
+    answer: std::result::Result<keeper::Answer, String>,
+) {
+    let answer = answer.unwrap_or_else(|why| keeper::Answer::Refused { why });
+    let mut waiting = answers.lock().unwrap_or_else(|e| e.into_inner());
+    match waiting.starts.remove(&id) {
+        Some(start) => {
+            let _ = start.try_send(answer);
+        }
+        None => {
+            drop(waiting);
+            match answer {
+                keeper::Answer::Started { pid } => warn!(
+                    vd_keeper = keeper_pid,
+                    "virtual-desktop vd-keeper: Remote Apps' start {id} began client {pid} after the daemon stopped waiting for it, so its launch was reported failed (#4100)"
+                ),
+                other => info!(
+                    vd_keeper = keeper_pid,
+                    "virtual-desktop vd-keeper: an answer to Remote Apps' start {id} after the daemon stopped waiting for it: {other:?}"
+                ),
+            }
+        }
+    }
 }
 
 /// How the daemon logs a keeper's line after its first answer: whether it

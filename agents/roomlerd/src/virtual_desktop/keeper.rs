@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! The desktop's keeper (#3665): a process of the virtual desktop's own that
-//! starts the window manager and the startup apps, adopts whatever they leave
-//! behind, collects every one of them that exits, and takes all of them down
-//! when it is told to or when the daemon is gone.
+//! starts the window manager, the startup apps and the apps and terminals
+//! Remote Apps asks for (#4100), adopts whatever they leave behind, collects
+//! every one of them that exits, and takes all of them down when it is told
+//! to or when the daemon is gone.
 //!
 //! ## Why a process of its own
 //!
@@ -18,7 +19,8 @@
 //! next `systemctl stop` for `TimeoutStopSec`.
 //!
 //! The keeper is a child subreaper (`PR_SET_CHILD_SUBREAPER`) and the parent of
-//! the window manager and the apps. What they leave behind is adopted by the
+//! the window manager, the apps and Remote Apps' clients. What they leave
+//! behind is adopted by the
 //! keeper instead of init, so it stays a descendant of a process the daemon
 //! recorded, and the teardown's parent-link closure reaches it for its whole
 //! life. The keeper also waits for every child it has, so nothing that exits
@@ -46,7 +48,7 @@
 //!    input that ends first, a parent that changed, or no job within
 //!    [`JOB_WAIT`] means that the daemon is gone, or was stopped for that
 //!    long (SIGSTOP, a debugger, a freezer), and the keeper goes on as in
-//!    step 5, with nothing of its own to take down. A daemon that was only
+//!    step 6, with nothing of its own to take down. A daemon that was only
 //!    stopped loses the desktop it was starting, and its supervisor starts
 //!    it again;
 //! 3. starts the window manager and the apps with `/dev/null` on stdin, stdout
@@ -56,14 +58,23 @@
 //!    second at first, doubling to five minutes, and a second again after one
 //!    that ran a minute. An exit in a teardown starts nothing, and a start
 //!    that comes due in one, or while the X server is not running, is dropped;
-//! 4. on SIGTERM alone (a service manager's stop signals every process of the
+//! 4. starts the apps and terminals Remote Apps (FR-56) asks for on the
+//!    desktop (#4100): each is a [`Start`] line on its input after the job,
+//!    an argv and a deadline, read whole by [`Lines`]. It is started through
+//!    the same [`spawn_client`] at the loop's tail, in the wake that read it,
+//!    and answered on stderr, `start <id>: ` and an [`Answer`]. One read in a
+//!    teardown, while the X server is not running, or past its deadline (the
+//!    daemon has stopped waiting, and told the person it failed) is refused,
+//!    and starts nothing. Their exits are collected and said nowhere;
+//! 5. on SIGTERM alone (a service manager's stop signals every process of the
 //!    unit at once), takes down what it started and stays, for [`LINGER`] at
 //!    most, until its input ends;
-//! 5. when the daemon is gone or tearing down, takes down what it started AND
-//!    every other member of the desktop's group, the X server included, then
-//!    exits. It hears that from the end of its input, which only the daemon
-//!    can cause (by its teardown, or by dying), and, should anything else
-//!    hold the write end, from its parent no longer being the daemon.
+//! 6. when the daemon is gone or tearing down, refuses the starts it read and
+//!    has not answered, takes down what it started AND every other member of
+//!    the desktop's group, the X server included, then exits. It hears that
+//!    from the end of its input, which only the daemon can cause (by its
+//!    teardown, or by dying), and, should anything else hold the write end,
+//!    from its parent no longer being the daemon.
 //!
 //! A client's exit is reported only once the desktop has outlived it by
 //! [`NOTICE_DELAY`]. The X server's death and a stop make every client exit
@@ -228,7 +239,6 @@ impl Job {
 
 /// #4100 — an X client Remote Apps asks the keeper to start: one JSON line on
 /// the keeper's input, after the job. Unknown fields are ignored.
-#[allow(dead_code)] // #4100: written and read from the fix on
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Start {
     /// The daemon's number for this start, which the keeper's answer names.
@@ -241,7 +251,6 @@ pub(super) struct Start {
     pub(super) deadline_ms: u64,
 }
 
-#[allow(dead_code)] // #4100: written and read from the fix on
 impl Start {
     /// The start as the line the daemon writes.
     pub(super) fn line(&self) -> String {
@@ -252,6 +261,140 @@ impl Start {
 
     fn parse(line: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(line).map_err(|e| format!("a start it cannot read: {e}"))
+    }
+}
+
+/// #4100 — what begins the keeper's answer to a [`Start`] on its stderr:
+/// `start <id>: ` and the [`Answer`] as JSON, one line. No other line of the
+/// keeper's begins so (`ready`, `refused: `, `info: `, `warn: `).
+const ANSWER_PREFIX: &str = "start ";
+
+/// #4100 — the keeper's answer to a [`Start`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Answer {
+    /// It runs: the keeper's child, in the desktop's group.
+    Started { pid: i32 },
+    /// Its start failed, with the error the start returned: the OS error's
+    /// number when it has one, its kind and its text, so that the daemon
+    /// says what its own start of it would have said.
+    Failed {
+        os_error: Option<i32>,
+        kind: String,
+        text: String,
+    },
+    /// Not started, and why.
+    Refused { why: String },
+}
+
+impl Answer {
+    /// The answer to start `id`, as the line the keeper says.
+    pub(super) fn line(&self, id: u64) -> String {
+        format!(
+            "{ANSWER_PREFIX}{id}: {}",
+            serde_json::to_string(self).unwrap_or_default()
+        )
+    }
+
+    /// The start an answer line answers, and the answer, or why it cannot be
+    /// read; `None` for every other line.
+    pub(super) fn parse(line: &str) -> Option<(u64, Result<Self, String>)> {
+        let (id, answer) = line.strip_prefix(ANSWER_PREFIX)?.split_once(": ")?;
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let id = id.parse().ok()?;
+        Some((
+            id,
+            serde_json::from_str(answer).map_err(|e| format!("an answer it cannot read: {e}")),
+        ))
+    }
+}
+
+/// #4100 — the longest line the keeper reads as a start, its newline left
+/// out: one write the daemon makes whole or not at all
+/// ([`super::KEEPER_JOB_MAX`], `PIPE_BUF`, with the newline).
+const START_MAX: usize = super::KEEPER_JOB_MAX - 1;
+
+/// #4100 — the keeper's input after the job, cut into whole lines: what came
+/// behind the job's line in its read, then each read. A line longer than
+/// [`START_MAX`] is no start the daemon wrote: it is dropped whole, up to its
+/// newline, and counted. The carry never holds more than one line's bound
+/// and one read.
+#[derive(Debug, Default)]
+struct Lines {
+    /// The beginning of a line whose newline has not come yet.
+    carry: Vec<u8>,
+    /// The rest of a line that passed the bound is being dropped.
+    dropping: bool,
+}
+
+/// What [`Lines::feed`] found: the whole lines, in order, and how many lines
+/// it dropped for their length.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Fed {
+    lines: Vec<Vec<u8>>,
+    too_long: usize,
+}
+
+impl Lines {
+    fn feed(&mut self, mut bytes: &[u8]) -> Fed {
+        let mut fed = Fed::default();
+        while !bytes.is_empty() {
+            let (part, newline) = match bytes.iter().position(|b| *b == b'\n') {
+                Some(nl) => (&bytes[..nl], true),
+                None => (bytes, false),
+            };
+            bytes = if newline {
+                &bytes[part.len() + 1..]
+            } else {
+                &[]
+            };
+            if !self.dropping {
+                self.carry.extend_from_slice(part);
+                if self.carry.len() > START_MAX {
+                    self.carry.clear();
+                    self.dropping = true;
+                    fed.too_long += 1;
+                }
+            }
+            if newline {
+                if self.dropping {
+                    self.dropping = false;
+                } else {
+                    fed.lines.push(std::mem::take(&mut self.carry));
+                }
+            }
+        }
+        fed
+    }
+}
+
+/// The starts in what [`Lines::feed`] found, each line that is none said in
+/// a warning of its own.
+fn starts_in(fed: Fed) -> Vec<Start> {
+    for _ in 0..fed.too_long {
+        say(&format!(
+            "warn: a line of more than {START_MAX} bytes on its input was dropped: it is no start"
+        ));
+    }
+    fed.lines
+        .into_iter()
+        .filter_map(|line| match Start::parse(&line) {
+            Ok(start) => Some(start),
+            Err(why) => {
+                say(&format!("warn: {why}"));
+                None
+            }
+        })
+        .collect()
+}
+
+/// Answer each of `starts` with a refusal: the keeper is leaving, and starts
+/// nothing more.
+fn refuse_all(starts: &mut Vec<Start>, why: &str) {
+    for start in starts.drain(..) {
+        say(&Answer::Refused { why: why.into() }.line(start.id));
     }
 }
 
@@ -304,8 +447,9 @@ fn say(line: &str) {
 }
 
 /// Set `O_NONBLOCK` on `fd`, keeping its other status flags. The keeper's
-/// stderr is a pipe of its own: its children get `/dev/null`.
-fn set_nonblocking(fd: RawFd) {
+/// stderr is a pipe of its own: its children get `/dev/null`. The daemon's
+/// end of the keeper's input too, once the job is out (#4100).
+pub(super) fn set_nonblocking(fd: RawFd) {
     // SAFETY: `fcntl(2)` on a descriptor number; on a closed one both calls
     // fail with EBADF, which leaves nothing to do.
     unsafe {
@@ -422,16 +566,29 @@ fn daemon_gone(daemon: i32) -> bool {
     unsafe { libc::getppid() != daemon }
 }
 
-/// Read the job's line from `fd`. `Ok(None)` when the input ends before a
-/// whole line, the daemon is gone, or no whole line came within `wait`: the
-/// daemon left before it said what to start.
+/// [`read_job_and_rest`] without the rest: the job alone.
+#[cfg(test)]
 fn read_job(fd: RawFd, daemon: i32, wait: Duration) -> Result<Option<Job>, String> {
+    read_job_and_rest(fd, daemon, wait).map(|read| read.map(|(job, _)| job))
+}
+
+/// Read the job's line from `fd`, and what came behind it in the same read:
+/// #4100 — the starts the daemon wrote after the job, which the keeper's loop
+/// reads first. `Ok(None)` when the input ends before a whole line, the
+/// daemon is gone, or no whole line came within `wait`: the daemon left
+/// before it said what to start.
+fn read_job_and_rest(
+    fd: RawFd,
+    daemon: i32,
+    wait: Duration,
+) -> Result<Option<(Job, Vec<u8>)>, String> {
     let deadline = Instant::now() + wait;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
-            return Job::parse(&buf[..nl]).map(Some);
+            let rest = buf.split_off(nl + 1);
+            return Job::parse(&buf[..nl]).map(|job| Some((job, rest)));
         }
         if buf.len() > JOB_MAX {
             return Err(format!("a job longer than {JOB_MAX} bytes"));
@@ -484,6 +641,8 @@ struct Book {
     /// #4099 — the window manager's restart delays.
     wm_delays: WmDelays,
     apps: Vec<(i32, String)>,
+    /// #4100 — the X clients Remote Apps asked for and the keeper started.
+    clients: Vec<i32>,
     /// Adopted processes collected (orphans of the desktop's processes).
     adopted: u64,
     /// Exits are expected now: the keeper is taking the desktop down.
@@ -616,6 +775,42 @@ impl Book {
         self.start_wm(job);
     }
 
+    /// #4100 — start an X client Remote Apps asked for, on the desktop's
+    /// display: never in a teardown, never onto an X server that is not
+    /// running (`server_runs`, read now), and never past the start's deadline,
+    /// when the daemon has stopped waiting for it and its launch has failed.
+    fn start_x_client(
+        &mut self,
+        start: &Start,
+        display: &str,
+        server_runs: impl FnOnce() -> bool,
+    ) -> Answer {
+        let refused = |why: &str| Answer::Refused { why: why.into() };
+        if self.tearing_down {
+            return refused("the desktop is being taken down");
+        }
+        if !server_runs() {
+            return refused("its X server is not running");
+        }
+        if super::monotonic_ms() > start.deadline_ms {
+            return refused("it came after the daemon stopped waiting for it");
+        }
+        let Some((program, args)) = start.argv.split_first() else {
+            return refused("it names no program");
+        };
+        match spawn_client(program, args, display) {
+            Ok(pid) => {
+                self.clients.push(pid);
+                Answer::Started { pid }
+            }
+            Err(e) => Answer::Failed {
+                os_error: e.raw_os_error(),
+                kind: format!("{:?}", e.kind()),
+                text: e.to_string(),
+            },
+        }
+    }
+
     /// How long the loop's `poll` may wait, in its milliseconds: [`POLL_MAX`],
     /// or until the window manager's start is due, rounded up so that it
     /// never wakes before.
@@ -667,6 +862,11 @@ impl Book {
         } else if let Some(i) = self.apps.iter().position(|(p, _)| *p == pid) {
             let (_, app) = self.apps.swap_remove(i);
             format!("info: startup app {app} ({pid}) exited: {how}")
+        } else if let Some(i) = self.clients.iter().position(|p| *p == pid) {
+            // #4100 — a client Remote Apps started: people close these all
+            // day, so its exit is collected and said nowhere.
+            self.clients.swap_remove(i);
+            return;
         } else {
             self.adopted += 1;
             return;
@@ -886,8 +1086,8 @@ pub(super) fn run() -> i32 {
     // daemon left between `ready` and the job, or was stopped for that long
     // (review R3-3). The desktop goes with it, as it does once the keeper
     // has its job (review R2-3).
-    let job = match read_job(0, daemon, JOB_WAIT) {
-        Ok(Some(job)) => job,
+    let (job, rest) = match read_job_and_rest(0, daemon, JOB_WAIT) {
+        Ok(Some(read)) => read,
         Ok(None) => {
             // Review R3-4 — a daemon that left reads nothing of this, so the
             // line says what the keeper saw, which is true for whoever reads
@@ -914,16 +1114,29 @@ pub(super) fn run() -> i32 {
     if !TERM.load(Ordering::SeqCst) {
         book.start(&job);
     }
-    serve(me, daemon, group, wake, &job, &mut book)
+    serve(me, daemon, group, wake, &job, &rest, &mut book)
 }
 
 /// The keeper's loop: collect children, report the exits the desktop
-/// outlived, and end when the daemon is gone or tearing down (the whole
-/// desktop) or on SIGTERM (what the keeper started, then the linger).
-fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Book) -> i32 {
+/// outlived, start the X clients Remote Apps asks for (#4100), and end when
+/// the daemon is gone or tearing down (the whole desktop) or on SIGTERM (what
+/// the keeper started, then the linger). `rest` is what came behind the job.
+fn serve(
+    me: i32,
+    daemon: i32,
+    group: i32,
+    wake: RawFd,
+    job: &Job,
+    rest: &[u8],
+    book: &mut Book,
+) -> i32 {
     let grace = Duration::from_millis(job.grace_ms).min(GRACE_MAX);
     let mut termed: Option<Instant> = None;
     let mut input = [0u8; 4096];
+    // #4100 — the starts read and not answered yet: what came behind the job
+    // first, answered in the loop's first wake.
+    let mut lines = Lines::default();
+    let mut starts = starts_in(lines.feed(rest));
     loop {
         let mut fds = [
             libc::pollfd {
@@ -937,15 +1150,17 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
                 revents: 0,
             },
         ];
+        // A start already read is answered in this wake, without a wait.
+        let wait = if starts.is_empty() { book.wait_ms() } else { 0 };
         // SAFETY: `poll(2)` over a live array of two descriptors. A signal
         // makes it return early (EINTR), which the loop treats as a wake.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, book.wait_ms()) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
         drain(wake);
         book.reap();
         let mut ended = false;
         if ready > 0 && fds[0].revents != 0 {
-            // SAFETY: `read(2)` into a live buffer. Lines after the job are
-            // reserved for later; their bytes are read and dropped.
+            // SAFETY: `read(2)` into a live buffer. #4100: after the job, the
+            // input holds starts of X clients for Remote Apps, a line each.
             let n = unsafe { libc::read(0, input.as_mut_ptr().cast(), input.len()) };
             ended = n == 0
                 || (n < 0
@@ -953,9 +1168,13 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
                         std::io::Error::last_os_error().raw_os_error(),
                         Some(libc::EINTR) | Some(libc::EAGAIN)
                     ));
+            if n > 0 {
+                starts.extend(starts_in(lines.feed(&input[..n as usize])));
+            }
         }
         if ended {
             say("info: the daemon closed the desktop's input — taking the whole desktop down");
+            refuse_all(&mut starts, "the desktop is being taken down");
             teardown(me, daemon, Some(group), grace, book);
             say_goodbye(book);
             return 0;
@@ -965,6 +1184,7 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
         // parent now.
         if daemon_gone(daemon) {
             say("info: the daemon is gone — taking the whole desktop down");
+            refuse_all(&mut starts, "the desktop is being taken down");
             teardown(me, daemon, Some(group), grace, book);
             say_goodbye(book);
             return 0;
@@ -978,6 +1198,7 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
         }
         if termed.is_some_and(|t| t.elapsed() >= LINGER) {
             say("info: the daemon did not close the desktop's input after the stop — leaving");
+            refuse_all(&mut starts, "the desktop is being taken down");
             say_goodbye(book);
             return 0;
         }
@@ -988,6 +1209,12 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
         // #4099 — a window manager that exited is started again here, once
         // its delay has passed, and only while the X server runs.
         book.start_wm_when_due(job, || is_running(group));
+        // #4100 — each start read, answered in the wake that read it, the
+        // teardown, the X server and its deadline each looked at now.
+        for start in starts.drain(..) {
+            let answer = book.start_x_client(&start, &job.display, || is_running(group));
+            say(&answer.line(start.id));
+        }
     }
 }
 
@@ -1094,7 +1321,8 @@ pub(super) mod tests {
         let parent = unsafe { libc::getppid() };
         let (r, w) = pipe();
         write_all(w, line.as_bytes());
-        // A later line is reserved: the job's reader stops at the first.
+        // A later line is the keeper loop's (#4100: a start): the job's
+        // reader stops at the first.
         write_all(w, b"{\"later\":true}\n");
         close(w);
         let read = read_job(r, parent, JOB_WAIT);
@@ -1160,6 +1388,186 @@ pub(super) mod tests {
         close(r);
         assert_eq!(read, Ok(Ok(None)), "after {took:?}");
         assert!(took >= Duration::from_millis(1500), "it took {took:?}");
+    }
+
+    /// #4100 — what came behind the job's line in its read is handed on
+    /// whole, a start and the beginning of the next one alike.
+    #[test]
+    fn what_came_behind_the_job_is_handed_on() {
+        // SAFETY: `getppid(2)` cannot fail.
+        let parent = unsafe { libc::getppid() };
+        let job = Job {
+            display: ":100".into(),
+            group: 4242,
+            wm: "openbox".into(),
+            apps: vec![],
+            grace_ms: 1500,
+            wm_delay_floor_ms: 250,
+            wm_delay_ceil_ms: 4000,
+            wm_stable_after_ms: 30_000,
+        };
+        let start = Start {
+            id: 3,
+            argv: vec!["xterm".into(), "-T".into(), "a \"title\"\n".into()],
+            deadline_ms: 99,
+        };
+        let (r, w) = pipe();
+        write_all(
+            w,
+            format!("{}{}{{\"id\":4", job.line(), start.line()).as_bytes(),
+        );
+        close(w);
+        let read = read_job_and_rest(r, parent, JOB_WAIT);
+        close(r);
+        let (got, rest) = read.unwrap().unwrap();
+        assert_eq!(got, job);
+        let mut lines = Lines::default();
+        let fed = lines.feed(&rest);
+        assert_eq!(fed.too_long, 0);
+        assert_eq!(fed.lines.len(), 1, "{fed:?}");
+        assert_eq!(Start::parse(&fed.lines[0]), Ok(start));
+        assert_eq!(lines.carry, b"{\"id\":4");
+    }
+
+    /// #4100 — the keeper's input after the job, cut into lines: a line split
+    /// across reads is read whole; one of exactly one write's bytes is read;
+    /// a longer one is dropped whole, counted, and the line after it is read.
+    #[test]
+    fn the_input_is_cut_into_starts_and_an_overlong_line_is_dropped_whole() {
+        let mut lines = Lines::default();
+        assert_eq!(lines.feed(b"{\"id\":1,"), Fed::default());
+        let fed = lines.feed(b"\"argv\":[\"a\"],\"deadline_ms\":5}\n{\"id\"");
+        assert_eq!(
+            fed.lines,
+            vec![b"{\"id\":1,\"argv\":[\"a\"],\"deadline_ms\":5}".to_vec()]
+        );
+        assert_eq!(lines.carry, b"{\"id\"");
+
+        // Exactly one write's bytes with its newline: read.
+        let mut lines = Lines::default();
+        let full = vec![b'x'; START_MAX];
+        let mut bytes = full.clone();
+        bytes.push(b'\n');
+        let fed = lines.feed(&bytes);
+        assert_eq!((fed.lines, fed.too_long), (vec![full], 0));
+
+        // One byte more, over two reads: dropped whole up to its newline,
+        // and the line after it is read.
+        let mut lines = Lines::default();
+        let fed = lines.feed(&[b'y'; START_MAX - 10]);
+        assert_eq!(fed, Fed::default());
+        let mut bytes = vec![b'y'; 11];
+        bytes.extend_from_slice(b"still the long line\nnext\n");
+        let fed = lines.feed(&bytes);
+        assert_eq!(fed.too_long, 1);
+        assert_eq!(fed.lines, vec![b"next".to_vec()]);
+        assert!(lines.carry.is_empty() && !lines.dropping);
+
+        // A long line's rest that never ends holds nothing: the carry stays
+        // empty while it is dropped.
+        let mut lines = Lines::default();
+        let fed = lines.feed(&[b'z'; START_MAX + 1]);
+        assert_eq!(fed.too_long, 1);
+        for _ in 0..4 {
+            assert_eq!(lines.feed(&[b'z'; 4096]), Fed::default());
+        }
+        assert!(lines.carry.is_empty() && lines.dropping);
+
+        // Empty lines are lines: the start's reader says what it cannot read.
+        let fed = Lines::default().feed(b"\n\n");
+        assert_eq!(fed.lines, vec![Vec::<u8>::new(), Vec::new()]);
+    }
+
+    /// #4100 — an answer reads back as it was said, for the start it names;
+    /// no other line of the keeper's reads as one.
+    #[test]
+    fn an_answer_reads_back_for_its_start_and_no_other_line_does() {
+        for (id, answer) in [
+            (7, Answer::Started { pid: 4242 }),
+            (
+                u64::MAX,
+                Answer::Failed {
+                    os_error: Some(13),
+                    kind: "PermissionDenied".into(),
+                    text: "Permission denied (os error 13)".into(),
+                },
+            ),
+            (
+                1,
+                Answer::Failed {
+                    os_error: None,
+                    kind: "Other".into(),
+                    text: "a: \"b\"\nc".into(),
+                },
+            ),
+            (
+                0,
+                Answer::Refused {
+                    why: "its X server is not running".into(),
+                },
+            ),
+        ] {
+            let line = answer.line(id);
+            assert!(!line.contains('\n'), "one line: {line:?}");
+            assert_eq!(Answer::parse(&line), Some((id, Ok(answer))));
+        }
+        for not_an_answer in [
+            "ready",
+            "refused: start 1: no",
+            "info: start 1: {}",
+            "warn: the window manager (12) exited",
+            "start x: {}",
+            "start : {}",
+            "start -1: {}",
+            "start 1 {}",
+            "start 99999999999999999999999: {}",
+        ] {
+            assert_eq!(Answer::parse(not_an_answer), None, "{not_an_answer:?}");
+        }
+        // An answer line it cannot read is still the answer to its start.
+        assert!(matches!(
+            Answer::parse("start 5: {\"new\":1}"),
+            Some((5, Err(_)))
+        ));
+    }
+
+    /// #4100 — a start the keeper must not take is refused before anything
+    /// is started: in a teardown, onto an X server that is not running, past
+    /// its deadline, and with no program. One that cannot start says the
+    /// error its start returned.
+    #[test]
+    fn a_start_the_keeper_must_not_take_is_refused_and_one_that_fails_says_why() {
+        let start = |argv: &[&str], deadline_ms: u64| Start {
+            id: 1,
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            deadline_ms,
+        };
+        let refused = |answer: Answer| match answer {
+            Answer::Refused { why } => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        let never = "/nonexistent/roomler-4100/never-started";
+        let mut book = Book::default();
+        book.tear_down();
+        let why = refused(book.start_x_client(&start(&[never], u64::MAX), ":9", || true));
+        assert!(why.contains("taken down"), "{why}");
+
+        let mut book = Book::default();
+        let why = refused(book.start_x_client(&start(&[never], u64::MAX), ":9", || false));
+        assert!(why.contains("X server is not running"), "{why}");
+        let why = refused(book.start_x_client(&start(&[never], 0), ":9", || true));
+        assert!(why.contains("stopped waiting"), "{why}");
+        let why = refused(book.start_x_client(&start(&[], u64::MAX), ":9", || true));
+        assert!(why.contains("no program"), "{why}");
+
+        match book.start_x_client(&start(&[never], u64::MAX), ":9", || true) {
+            Answer::Failed { os_error, kind, .. } => {
+                assert_eq!(os_error, Some(libc::ENOENT));
+                assert_eq!(kind, "NotFound");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(book.clients.is_empty(), "{:?}", book.clients);
     }
 
     #[test]

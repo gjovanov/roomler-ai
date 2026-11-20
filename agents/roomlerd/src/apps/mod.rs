@@ -36,7 +36,9 @@
 //! ## Platform backends
 //! * `linux` — `wmctrl` (list/focus) + `tmux` (bash sessions) + `xterm`.
 //!   The flagship: a bash "session" is a tmux session, surfaced as an
-//!   xterm attached to it — survives agent restart/disconnect and is
+//!   xterm attached to it — outlives its xterm, a disconnect and the virtual
+//!   desktop's X server (a daemon restart only where no service manager owns
+//!   the daemon), and is
 //!   ssh-attachable. Windows are matched back to their session/app via a
 //!   `roomler:tmux:<s>` / `roomler:app:<key>` xterm-title convention.
 //! * `windows` — `EnumWindows` / `SetForegroundWindow` / a plain spawn on
