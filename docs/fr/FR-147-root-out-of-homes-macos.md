@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2698`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:2713`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:960`) and `folder_words` (`:1093`), with `r5_words` (`:1139`); `refusals` (`:1481`) says them.
 
 ### Root's records
@@ -530,12 +530,12 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2443`, its sequence at `:2471`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2458`, its sequence at `:2486`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2698`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2713`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:2755-2846`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:2770-2861`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:3-51` (the step table) and `one_row_home.rs:3-60`.
 - `docs/README.md`: the `installation.md` row names the rule.

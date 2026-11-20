@@ -368,9 +368,12 @@ compile.
 - **No config file is a normal state for the companion (#3996).** The companion never runs on
   a config; the device service does. So every read it makes of one goes through
   `load_if_there` (`agents/roomler-desktop/src/commands.rs:3849`): no file is no config, with
-  nothing logged. A file that is there goes through `config::load`, so a broken one still logs
-  `config unreadable and no usable previous copy — the host must be re-enrolled` at ERROR and
-  is recovered from its `.prev` (`config::read_if_present` would hide it, FR-66). A one-row
+  nothing logged. A file that is there goes through `config::load`, so a broken one is always
+  logged at ERROR (`config::read_if_present` would hide it, FR-66). If its `.prev` loads, the
+  read returns that copy and puts it back as the live file:
+  `config unreadable — RECOVERED from the previous good copy; …`. If no usable `.prev` exists,
+  the read fails:
+  `config unreadable and no usable previous copy — the host must be re-enrolled`. A one-row
   Mac's person has none until the screen worker writes one with no enrollment in it at its
   first start (FR-43 P3a), a host not enrolled yet has none, and the person at a Windows
   background-service install cannot see the machine-wide one.
