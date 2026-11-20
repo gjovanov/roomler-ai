@@ -938,9 +938,9 @@ kill switch. That is what makes E2E-3 executable before P2.
 ### 10b. Integration (`crates/tests`, real MongoDB + Redis)
 
 New module `crates/tests/src/peer_relay_tests.rs`. Model on
-`crates/tests/src/relay_region_tests.rs:46` (40 lines; `TestApp::spawn_with_settings`,
-`fixtures/test_app.rs:181`, with both a REST and an in-process `app.state` assertion). For a
-two-pod topology copy `cluster_tests.rs:798` via `spawn_pair` (`test_app.rs:152`).
+`crates/tests/src/relay_region_tests.rs:49` (40 lines; `TestApp::spawn_with_settings`,
+`fixtures/test_app.rs:207`, with both a REST and an in-process `app.state` assertion). For a
+two-pod topology copy `cluster_tests.rs:1485` via `spawn_pair` (`test_app.rs:179`).
 
 Server-decision tests — all implementable as described: `mint_refused_when_mode_off`,
 `mint_refused_without_relay_grant`, `mint_refused_cross_tenant` (404-shaped: leaks neither
@@ -952,15 +952,15 @@ content nor existence), `mint_refused_for_secondary_org`, `mint_requires_relay_s
 
 ⚠️ **The data-plane round trip does NOT go here.** The first draft proposed
 `three_node_relay_roundtrip` in this crate with "A and B forced off direct". That is not
-implementable: `crates/tests/Cargo.toml:17` depends on `roomlerd` with **default
+implementable: `crates/tests/Cargo.toml:44` depends on `roomlerd` with **default
 features**, and `overlay-l3`/`overlay-netstack` are opt-in — **the overlay data plane,
 WireGuard, carriers and `CarrierPlane` are not compiled into the test binary at all**
 (`grep -l 'tunnel_core|overlay::' crates/tests/src/` returns nothing). `connect_agent`
-(`agent_presence_tests.rs:57`) is control-plane only, and no "force off direct" primitive
+(`agent_presence_tests.rs:61`) is control-plane only, and no "force off direct" primitive
 exists anywhere. Put the round trip in a **`tunnel-core` in-crate test over three loopback
 UDP sockets** — no TUN, no `CAP_NET_ADMIN`, which `ubuntu-latest` does not grant.
 
-⚠️ CI: the lane's floor is `MIN=200` against ~294 (`integration-tests.yml:272`), so +11 tests
+⚠️ CI: the lane's floor is `MIN=200` against ~294 (`integration-tests.yml:430`), so +11 tests
 changes nothing detectable. **The real gap is the `pull_request: paths:` filter**, which
 lists `crates/tests`, `crates/db`, `crates/services/src/dao`, `crates/api/src/routes`,
 `crates/api/src/ws` and **not** `crates/tunnel-core/**` or `crates/remote_control/**` — so
@@ -968,7 +968,7 @@ every P2/P4 PR would skip this lane entirely. The workflow's own comment says to
 this: *"If a new crate becomes part of what these tests drive, add it here."* Add both paths
 in the same PR as `peer_relay_tests.rs`.
 ⚠️ Set `RUST_LOG` — the harness installs a subscriber only when it is set
-(`fixtures/test_app.rs:62`) — and use `--nocapture`.
+(`fixtures/test_app.rs:67`) — and use `--nocapture`.
 
 ### 10c. E2E on the real fleet — mars, zeus, jupiter
 

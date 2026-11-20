@@ -52,10 +52,10 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:940-949`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2016-2053`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2487-2495`). `install.sh --one-row` is
   the one-token path (`install.sh:993-1089`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
-  (`docs/installation.md:2146-2150`).
+  (`docs/installation.md:2667-2668`).
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
   (`agents/roomler-setup/src/root_identity.rs:67-79`), so on a Mac that is already one row or supervised the
   wizard would enroll a new person's half and start a LaunchAgent that the package's guard removes
@@ -73,7 +73,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   (`docs/platform-support.md:79-83`).
 - **The script never turns the overlay on.** `enroll_daemon` passes no `--overlay` (`scripts/install.sh:1132-1188`),
   and the daemon's own system hint keeps it off on purpose: "a Linux system node is not forced onto the mesh"
-  (`agents/roomlerd/src/service.rs:2324-2329`).
+  (`agents/roomlerd/src/service.rs:2714-2719`).
 - The web app's add-device dialog says, for a Linux machine-wide install, "Screen capture needs a logged-in
   session — pick 'This user only' for desktops" (`ui/src/utils/enrollCommands.ts:239-241`). That predates FR-95
   and FR-113 and contradicts the wizard's recommended system card. Its macOS block gives a one-token one-liner,
@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:867-937`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8830-8836`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:867-937`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8922-8928`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1045-1050`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1074-1078`, `postinstall:355-388`); on a Mac that is one row already, the package only (`install.sh:1015-1033`) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -134,10 +134,21 @@ P0 decides its shape. What the code already gives: the root half's hardware id a
 (`crates/localapi/src/lib.rs:490`, `:530-542`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
 person's half on it and says why.
 
+- **2026-11-20, narrowed and built first (decision D2-A, the operator's 2A on #971's part 2):** a Mac whose root daemon
+  says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
+  The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
+  socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
+  (`crates/localapi/src/lib.rs:3674-3676`) and passes it through whole (`:3795-3817`). The read is bounded to 3 s and
+  believed only from a socket root serves; unknown is never one row. The stop is one decision
+  (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
+  install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes
+  one-row Macs whatever P2's switch says (#971's flip). A supervised Mac (the supervisor on, one row off) is out of
+  this step: it keeps today's road.
+
 ### 4. The terminal and the web dialog (P4)
 
 - `install.sh --overlay` on Linux, opt-in: with `--system` the TUN, per-user the netstack, as the wizard does. The
-  default stays off, as the daemon's hint says (`service.rs:518-529`, and its test at `:2481-2486`).
+  default stays off, as the daemon's hint says (`service.rs:556-567`, and its test at `:2871-2876`).
 - The dialog's Linux note says what a system install shows today (`enrollCommands.ts:239-241`). Its macOS block
   puts the wizard first where the server offers it (`enrollCommands.ts:198-203`) and says what the one-liner
   installs.
@@ -149,7 +160,7 @@ person's half on it and says why.
 | P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | done 2026-11-11: Linux and macOS (cells M1 to M5), in the [field log](#field-log) |
 | P1 | The question on the first page (design 1), with `front_tests` | server key `wizard_mesh_choice` in `/api/setup/features`, default on: off restores today's layout | not started |
 | P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | not started |
-| P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | not started |
+| P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | in progress 2026-11-20: the one-row guard (design 3's 2026-11-20 line) built, field read owed (AC4's one-row cell, on the first `setup-v*` that carries it); the same-row re-install not started |
 | P4 | `install.sh --overlay` on Linux; the dialog's Linux note and macOS block | the flag is opt-in; the dialog rolls back with the image | not started |
 | P5 | Docs: `docs/installation.md` (the wizard's macOS and Linux sections, the dialog, `--overlay`), `docs/platform-support.md` §2 and §4, `docs/device-pairing.md` | none | not started |
 | P6 | Field verification on released builds (the criteria below) | none | not started |
@@ -164,7 +175,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:2452-2453`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:2675-2676`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

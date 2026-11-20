@@ -10,7 +10,7 @@
 //!
 //! CLI:
 //!   roomlerd enroll --server <url> --token <enrollment-jwt> \
-//!                        --name "Goran's Laptop" [--config <path>]
+//!                        --name "Casey's Laptop" [--config <path>]
 //!   roomlerd run    [--config <path>]
 
 use anyhow::{Context, Result, bail};
@@ -5941,7 +5941,12 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
             for_upgrade,
         } => {
             let how = stop_for_upgrade_or_not(for_upgrade, updater::record_update_attempt, || {
-                service::stop(config_path).context("stopping the daemon")
+                if for_upgrade {
+                    service::stop_for_upgrade(config_path)
+                } else {
+                    service::stop(config_path)
+                }
+                .context("stopping the daemon")
             })?;
             println!("{how}");
             Ok(())

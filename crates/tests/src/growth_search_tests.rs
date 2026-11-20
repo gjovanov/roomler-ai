@@ -556,7 +556,7 @@ fn feed_xml(posts: &[(&str, &str, &str)]) -> String {
     );
     for (slug, title, published) in posts {
         s.push_str(&format!(
-            "  <entry>\n    <id>https://roomler.ai/blog/{slug}/</id>\n    <title>{title}</title>\n    <link rel=\"alternate\" type=\"text/html\" href=\"https://roomler.ai/blog/{slug}/\"/>\n    <published>{published}</published>\n    <updated>{published}</updated>\n    <author><name>Goran</name></author>\n  </entry>\n"
+            "  <entry>\n    <id>https://roomler.ai/blog/{slug}/</id>\n    <title>{title}</title>\n    <link rel=\"alternate\" type=\"text/html\" href=\"https://roomler.ai/blog/{slug}/\"/>\n    <published>{published}</published>\n    <updated>{published}</updated>\n    <author><name>Casey</name></author>\n  </entry>\n"
         ));
     }
     s.push_str("</feed>\n");

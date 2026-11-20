@@ -1726,7 +1726,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10246-10279`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10247-10280`):
 
 | Field | Meaning |
 |---|---|
@@ -1738,7 +1738,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:856`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6611`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6616`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1752,11 +1752,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6844`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6849`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6873`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6878`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
@@ -1802,7 +1802,7 @@ constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every fr
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
 measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
-is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9752`), so
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9753`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that

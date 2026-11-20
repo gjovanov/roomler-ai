@@ -620,6 +620,14 @@ function renderWelcome() {
   const limitText = ROLE_LIMIT_NOTE[a.roleLimit] ?? null;
   limitNote.hidden = limitText === null;
   limitNote.textContent = limitText ?? "";
+  // FR-141 P3 — a Mac that is one row already: its root daemon said so, and
+  // Rust worded it (AgentDetect.oneRowStop). No device install goes on from
+  // here; the tunnel client still can. Pairing start and the install refuse
+  // with the same words, so this note is a courtesy, never the gate itself.
+  const oneRowStop = oneRowStopOf(a);
+  const oneRowNote = document.getElementById("one-row-note");
+  oneRowNote.hidden = oneRowStop === null;
+  oneRowNote.textContent = oneRowStop ?? "";
   const copy = ROLE_COPY[state.os] ?? ROLE_COPY.windows;
   document.querySelectorAll("label.role-daemon").forEach((card) => {
     const role = card.dataset.role;
@@ -678,9 +686,11 @@ function renderWelcome() {
   relaunchStatus.hidden = !state.relaunchNote;
   relaunchStatus.textContent = state.relaunchNote ?? "";
 
-  // Continue button gate.
+  // Continue button gate. FR-141 P3: on a Mac that is one row already, only
+  // the tunnel client goes on.
+  const oneRowHolds = oneRowStop !== null && state.role !== null && state.role !== "tunnel-client";
   const canContinue =
-    state.role !== null && (warning === null || state.roleAck) && !needsElevation;
+    state.role !== null && (warning === null || state.roleAck) && !needsElevation && !oneRowHolds;
   document.getElementById("welcome-continue").disabled = !canContinue;
 
   // FR-102 P3b: the box shows the in-memory state (unticked on every
@@ -706,6 +716,13 @@ function elevationNoteLead(kind) {
   return kind === "permachine" || kind === "ambiguous"
     ? "This device already has the background service, and its settings are in a folder only administrators may open."
     : "An earlier background service left its settings on this device, in a folder only administrators may open.";
+}
+
+// FR-141 P3 — the one-row stop Rust sent, or null: anything but a non-empty
+// string (an older backend sends nothing) is no stop.
+function oneRowStopOf(agent) {
+  const said = agent?.oneRowStop;
+  return typeof said === "string" && said !== "" ? said : null;
 }
 
 // FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
@@ -1424,7 +1441,7 @@ function pairDisplayUri(uri) {
   return (uri ?? "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
 }
 
-// «Goran Jovanov» (@gjovanov) — or «Goran Jovanov» from an older server.
+// «Display Name» (@username) — or «Display Name» from an older server.
 function pairApproverLabel(p) {
   const name = `«${p.approverName || "an administrator"}»`;
   return p.approverUsername ? `${name} (@${p.approverUsername})` : name;

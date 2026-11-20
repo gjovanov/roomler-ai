@@ -44,7 +44,13 @@ are required**, both under *System Settings → Privacy & Security*, both for
 | Grant | Without it |
 |---|---|
 | **Screen & System Audio Recording** | The stream shows the desktop wallpaper and nothing else — no windows, no menu bar |
-| **Accessibility** | Keys and clicks are silently dropped |
+| **Accessibility** (**Device Control and Data Access** on macOS 27) | Keys and clicks are silently dropped |
+
+A **Roomler** entry, if a list shows one, is the menu-bar app, and its toggle
+changes nothing: turn on **roomlerd**. On macOS 27, Privacy & Security has no
+Accessibility row: the input grant is listed under **Device Control and Data
+Access**. The **Accessibility** page in the sidebar is a different one, for
+assistive settings.
 
 :::danger macOS never reports these as errors
 There is no dialog, no log entry from the OS, and no failure — just a desktop
@@ -129,7 +135,7 @@ nothing to capture: enable virtual-display mode there.
 | Symptom | Almost always |
 |---|---|
 | Wallpaper only, no windows | macOS Screen Recording grant |
-| Screen fine, clicks and keys do nothing | macOS Accessibility grant, or a Linux layout problem |
+| Screen fine, clicks and keys do nothing | macOS Accessibility grant (Device Control and Data Access on macOS 27), or a Linux layout problem |
 | Freezes at the lock screen or a UAC prompt | Windows not in system service mode |
 | Completely black, fixed by reconnecting | A capture handle that came up empty; the agent rebuilds it |
 | Nothing to capture on a Linux box | No logged-in session, or the portal is not running |
