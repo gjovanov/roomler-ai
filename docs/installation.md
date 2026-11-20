@@ -579,6 +579,15 @@ file is a *normal* answer for that caller.
 | `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3613`, `:3621`), and the load fails. Each line is worded for what happened to the live file (below) |
 | `config::read_if_present` (`:3652`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
+A start never restores a missing file, because `run` checks for the file before it loads it. With
+no `config.toml`, an enrolled device's start stops with *"no config found"*
+(`agents/roomlerd/src/app.rs:3914-3919`) before the load (`:3982`); its service manager starts it
+again, and it stops again. An unenrolled one-row Mac's screen worker passes that check and writes
+the person a new file with no enrollment instead (`:3969-3981`). Only a process that loads the
+configuration once the file is gone restores it: a command such as `roomlerd org ls`, or a daemon
+or worker that was already running, the next time it loads the file. Whether a start should
+restore one is the open #4157.
+
 ```mermaid
 flowchart TD
     Q["a caller needs config.toml"] --> A{"is 'no file' a normal answer<br/>for THIS caller?"}
