@@ -1222,7 +1222,7 @@ pub struct AgentConfig {
     /// FR-148 D46 — the in-flight budget's switch: `off` (unset; the
     /// default), `shadow` or `on`. `shadow` computes the budget on the
     /// data-channel pumps and writes its fields on the `path delivery` line;
-    /// it holds nothing, and until D46's step B3 neither does `on`. Env
+    /// it holds nothing. `on` (D46 B3) holds a relayed session's frames. Env
     /// `ROOMLERD_INFLIGHT_BUDGET`, read once per session. Local only.
     #[serde(default)]
     pub inflight_budget: Option<String>,

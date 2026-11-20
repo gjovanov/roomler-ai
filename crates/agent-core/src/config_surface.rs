@@ -1453,7 +1453,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "enum:off|shadow|on",
-        description: "FR-148 D46 - the in-flight budget's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg): `off` (empty; the default: nothing is computed and the path delivery line is as before), `shadow` (once a frame the budget is computed from SCTP's acknowledgements, the frames it would have held are counted, and its fields close the path delivery line; it holds nothing) or `on` (runs as `shadow`, with a warning, until D46's step B3). Needs `path_model` other than `off`: that line carries its fields. Env: ROOMLERD_INFLIGHT_BUDGET (a set variable wins). This device only: never pushable. Restart required.",
+        description: "FR-148 D46 - the in-flight budget's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg): `off` (empty; the default: nothing is computed and the path delivery line is as before), `shadow` (once a frame the budget is computed from SCTP's acknowledgements, the frames it would have held are counted, and its fields close the path delivery line; it holds nothing) or `on` (on a relayed session the budget acts: a frame it holds is skipped before capture, a hold while the acknowledgements stand still calls no rate decrease, and the relay byte gate and the VP9 4:4:4 watermark hold nothing; a direct session computes it as `shadow` does). Needs `path_model` other than `off`: that line carries its fields. Env: ROOMLERD_INFLIGHT_BUDGET (a set variable wins). This device only: never pushable. Restart required.",
     },
     KeyMeta {
         key: "relay_max_kbps",
