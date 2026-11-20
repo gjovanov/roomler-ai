@@ -7,7 +7,7 @@
 #   bash .github/actions/ci-linux-system-deps/ci-apt.test.sh
 #
 # The helper is SOURCED, and each case then points its globals at a scratch
-# directory (ETC_APT, BIN_DIR, BOUNDS_FILE, FAILOVER_FAILED, ARCH, SUDO). That
+# directory (ETC_APT, BIN_DIR, BOUNDS_FILE, FAILOVER_FAILED, DOCKER_DNS, ARCH, SUDO). That
 # is a test's view of the code that ships, not a knob: the shipped helper reads
 # no environment variable to change its behaviour. The failure paths themselves
 # are proven for real by the self-test's fault cells (ci-apt-selftest.yml).
@@ -24,7 +24,7 @@ export CI_APT_TEST_ACTIVE=1
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 HELPER="$HERE/ci-apt.sh"
-EXPECTED_CASES=30
+EXPECTED_CASES=32
 
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
@@ -230,6 +230,7 @@ run_case() {
     BIN_DIR="$S/bin"
     BOUNDS_FILE="$S/ci-apt.bounds"
     FAILOVER_FAILED="$S/failover-failed"
+    DOCKER_DNS="$S/docker-dns"
     SUDO=()
     HOME="$S/home-runner"
     SUDO_USER=""
@@ -324,12 +325,25 @@ run_case reach-healthy "$FX_2604" x86_64 -- cmd_reach
 expect_eq "$RC" 0 rc
 expect_has "$OUT" "resolvers in use"
 expect_not "$OUT" "::warning"
+[ -e "$S/docker-dns" ] && bad "container DNS arguments on a healthy runner" || ok
+expect_not "$OUT" "containers get"
 
 SETUP='echo ALL >"$S/dead-system"; : >"$S/heal-on-switch"; echo 168.63.129.16 >"$S/dead-dig"'
 run_case reach-failover "$FX_2604" x86_64 -- cmd_reach
 expect_eq "$RC" 0 "rc after a failover that helped"
 expect_has "$OUT" "::warning title=apt mirror DNS::"
 expect_has "$CALLS" "resolvectl dns eth0 1.1.1.1 8.8.8.8"
+expect_eq "$(tr '
+' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments"
+expect_has "$OUT" "containers get: --dns 1.1.1.1 --dns 8.8.8.8"
+
+# A public resolver answers, but the switch does not heal the system resolver:
+# the link is put back, and containers are told nothing.
+SETUP='echo ALL >"$S/dead-system"; echo 168.63.129.16 >"$S/dead-dig"'
+run_case reach-switch-no-help "$FX_2604" x86_64 -- cmd_reach
+expect_eq "$RC" 1 rc
+expect_has "$CALLS" "resolvectl revert eth0"
+[ -e "$S/docker-dns" ] && bad "container DNS arguments after a switch that was reverted" || ok
 
 SETUP='echo ALL >"$S/dead-system"; echo ALL >"$S/dead-dig"'
 run_case reach-all-dead "$FX_2604" x86_64 -- cmd_reach
@@ -355,6 +369,15 @@ expect_has "$APT" "update -qq"
 expect_not "$OUT" "::warning"
 [ -e "$S/bin/apt-fast" ] && ok || bad "no stand-in under BIN_DIR"
 [ -e "$S/ci-apt.bounds" ] && bad "a bounds file without bound options" || ok
+[ -e "$S/docker-dns" ] && bad "container DNS arguments on a healthy runner" || ok
+
+SETUP='echo ALL >"$S/dead-system"; : >"$S/heal-on-switch"; echo 168.63.129.16 >"$S/dead-dig"'
+run_case prepare-failover "$FX_2204" x86_64 -- cmd_prepare
+expect_eq "$RC" 0 rc
+expect_has "$OUT" "::warning title=apt mirror DNS::"
+expect_eq "$(tr '
+' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments a later step reads"
+expect_has "$APT" "update -qq" "the refresh after the failover"
 
 SETUP='echo ALL >"$S/dead-system"; echo ALL >"$S/dead-dig"'
 run_case prepare-all-dead "$FX_2604" x86_64 -- cmd_prepare

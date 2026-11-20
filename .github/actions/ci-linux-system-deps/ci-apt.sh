@@ -88,10 +88,10 @@
 #      Acquire::AllowInsecureRepositories): every index is checked against
 #      Ubuntu's signing keys and every package against the index, so package
 #      integrity does not rest on DNS. A poisoned answer can only make a
-#      download fail, never make a wrong package install. A container started
-#      afterwards takes the new resolvers too: on a systemd-resolved host
-#      Docker copies /run/systemd/resolve/resolv.conf, which the switch
-#      rewrites (measured by the self-test's runner-dead cells).
+#      download fail, never make a wrong package install. A container does not
+#      always see the switch (an image with a static /etc/resolv.conf hands
+#      Docker only the upstream it went around), so a switch that helped also
+#      writes its resolvers to $DOCKER_DNS for the container steps to pass.
 #   3. STAND IN for apt-fast. The action runs only `apt-fast --version` and
 #      `apt-fast --yes install <name=ver ...>` (its stdout is parsed for
 #      `^Unpacking name:arch (ver)` lines), and downloads apt-fast from
@@ -160,6 +160,15 @@ BOUNDS_FILE=/usr/local/etc/ci-apt.bounds
 # Left behind by a failover that did not help, so the later phases of the same
 # job do not try it (and print it) again.
 FAILOVER_FAILED=/tmp/ci-apt.failover-failed
+# Written by a failover that helped: the resolvers it switched to, as
+# `docker run` arguments, one per line (`--dns`, then an address). Docker gives
+# a container the host's /etc/resolv.conf minus its loopback entries, and where
+# that file is static (ubuntu-22.04-arm since image 20261116.196.1: an egress
+# proxy, the stub, then the upstream) the copy holds only the upstream the
+# switch went around, so a container started after it still cannot resolve
+# (#3710). No failover, no file: a healthy job passes containers nothing new.
+# It is not removed later in the job, because the switch is not either.
+DOCKER_DNS=/tmp/ci-apt.docker-dns
 # This file, by its own path (when sourced, $0 is the caller).
 SELF=${BASH_SOURCE[0]}
 
@@ -374,7 +383,12 @@ switch_resolver() {
       return 1
     fi
   fi
-  warn "apt mirror DNS" "this runner's resolver (${orig_dns:-none} on $link) did not resolve the mirrors apt uses ($REQUIRED) while ${good[*]} did, so $link now uses ${good[*]} for the rest of this job, containers started from now on included (#3698, #3710). apt still verifies every index and package against the archive's signing keys, so package integrity does not depend on DNS."
+  if printf -- '--dns\n%s\n' "${good[@]}" 2>/dev/null >"$DOCKER_DNS"; then
+    log "the container steps pass these resolvers to docker from $DOCKER_DNS"
+  else
+    log "could not write $DOCKER_DNS: containers keep the host's resolv.conf"
+  fi
+  warn "apt mirror DNS" "this runner's resolver (${orig_dns:-none} on $link) did not resolve the mirrors apt uses ($REQUIRED) while ${good[*]} did, so $link now uses ${good[*]} for the rest of this job, and the container steps pass them to docker (#3698, #3710). apt still verifies every index and package against the archive's signing keys, so package integrity does not depend on DNS."
   return 0
 }
 
@@ -681,6 +695,7 @@ cmd_reach() {
     return 1
   fi
   log "the mirror names resolve; resolvers in use: $(resolvers_in_use)"
+  if [ -s "$DOCKER_DNS" ]; then log "containers get: $(tr '\n' ' ' <"$DOCKER_DNS")(from $DOCKER_DNS)"; fi
   return 0
 }
 

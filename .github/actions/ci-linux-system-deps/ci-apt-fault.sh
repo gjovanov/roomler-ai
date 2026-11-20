@@ -64,7 +64,7 @@ cmd_facts() {
   done
   echo "----- resolvectl status"
   resolvectl status 2>&1 | head -40
-  echo "----- /etc/resolv.conf"
+  echo "----- /etc/resolv.conf ($(readlink /etc/resolv.conf || echo 'a file, not a link'))"
   cat /etc/resolv.conf
   echo "----- /run/systemd/resolve/resolv.conf"
   cat /run/systemd/resolve/resolv.conf 2>&1
