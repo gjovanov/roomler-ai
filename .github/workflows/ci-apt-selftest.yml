@@ -1,0 +1,240 @@
+# The apt helper's self-test (#3710): `.github/actions/ci-linux-system-deps/
+# ci-apt.sh` on every runner image a lane that calls it runs on (ubuntu-latest,
+# ubuntu-22.04, ubuntu-22.04-arm), healthy and under a resolver fault.
+#
+# The fault cells are a FUNCTIONAL RESOLVER-FAULT CONTROL on each job's own
+# throwaway runner: ci-apt-fault.sh drops DNS answers for the Ubuntu mirror names
+# (the 2026-11-11 outage, #3698) and nothing else, proves the fault took effect
+# before a cell's result counts, and proves at the end that it was hit. Each
+# cell is a fresh job, so no cell inherits another's fault or failover.
+#
+# Its own workflow, path-filtered: ci.yml has no path filter, so a job there
+# would run on every PR. The filter names every file a job here grades:
+# the helper's directory, apt-seed-install, deb-bare-check.sh, this file, and
+# the three release workflows the parse step reads (no PR runs those).
+name: ci-apt self-test
+
+on:
+  pull_request:
+    paths:
+      - '.github/actions/ci-linux-system-deps/**'
+      - '.github/actions/apt-seed-install/**'
+      - 'scripts/deb-bare-check.sh'
+      - '.github/workflows/ci-apt-selftest.yml'
+      - '.github/workflows/release-agent.yml'
+      - '.github/workflows/release-setup.yml'
+      - '.github/workflows/release-tunnel.yml'
+  push:
+    branches: [master]
+    paths:
+      - '.github/actions/ci-linux-system-deps/**'
+      - '.github/actions/apt-seed-install/**'
+      - 'scripts/deb-bare-check.sh'
+      - '.github/workflows/ci-apt-selftest.yml'
+      - '.github/workflows/release-agent.yml'
+      - '.github/workflows/release-setup.yml'
+      - '.github/workflows/release-tunnel.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-apt-selftest-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  offline:
+    name: ci-apt offline tests and workflow parse
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The helper's offline tests (stub binaries, no network)
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.test.sh
+
+      - name: shellcheck the helper and its tests
+        run: |
+          shellcheck --version | head -2
+          shellcheck -S warning .github/actions/ci-linux-system-deps/ci-apt.sh \
+            .github/actions/ci-linux-system-deps/ci-apt.test.sh \
+            .github/actions/ci-linux-system-deps/ci-apt-fault.sh
+
+      - name: Every workflow that calls the helper parses (actionlint, pinned)
+        # A workflow file that does not parse is ABSENT from a PR's checks, not
+        # red, and no PR runs the release workflows at all. Pinned by version and
+        # sha256; shellcheck's pass over every run block is off (pre-existing
+        # findings in files this lane does not own), the YAML and expressions
+        # are what is read.
+        env:
+          AL_VERSION: 1.7.12
+          AL_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          curl -fsSL -o "$d/al.tgz" "https://github.com/rhysd/actionlint/releases/download/v${AL_VERSION}/actionlint_${AL_VERSION}_linux_amd64.tar.gz"
+          echo "${AL_SHA256}  $d/al.tgz" | sha256sum -c -
+          tar -xzf "$d/al.tgz" -C "$d" actionlint
+          "$d/actionlint" -version
+          "$d/actionlint" -shellcheck= -pyflakes= \
+            .github/workflows/ci-apt-selftest.yml \
+            .github/workflows/release-agent.yml \
+            .github/workflows/release-setup.yml \
+            .github/workflows/release-tunnel.yml \
+            .github/workflows/ci.yml \
+            .github/workflows/ui-phone-smoke.yml \
+            .github/workflows/deb-bare-image.yml
+          # Composite actions are not workflows; a YAML parse is what they get.
+          for f in .github/actions/ci-linux-system-deps/action.yml .github/actions/apt-seed-install/action.yml; do
+            python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1])); print("parses:", sys.argv[1])' "$f"
+          done
+
+  fault:
+    name: ci-apt fault cell (${{ matrix.cell }}, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      # 10 cells; at most 4 at a time, so the self-test never holds the
+      # account's runner slots.
+      max-parallel: 4
+      matrix:
+        runner: [ubuntu-latest, ubuntu-22.04, ubuntu-22.04-arm]
+        cell: [healthy, runner-dead, all-dead]
+        include:
+          - runner: ubuntu-22.04-arm
+            cell: arm64-names
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      H: .github/actions/ci-linux-system-deps
+      CELL: ${{ matrix.cell }}
+      # Not preinstalled on any image, tiny, in main.
+      PKG: hello
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image facts
+        run: |
+          bash "$H/ci-apt-fault.sh" facts
+          echo "apt's sources name: $(bash "$H/ci-apt-fault.sh" source-hosts | tr '\n' ' ')"
+          if dpkg -s "$PKG" >/dev/null 2>&1; then echo "::error title=ci-apt self-test::$PKG is preinstalled here, so installing it proves nothing"; exit 1; fi
+
+      - name: Pull the container image before any fault
+        if: matrix.cell == 'runner-dead'
+        run: docker pull -q ubuntu:24.04
+
+      - name: Inject the fault and prove it took effect
+        if: matrix.cell != 'healthy'
+        run: |
+          case "$CELL" in runner-dead) m=runner ;; all-dead) m=all ;; arm64-names) m=ports ;; esac
+          bash "$H/ci-apt-fault.sh" inject "$m"
+          bash "$H/ci-apt-fault.sh" prove "$m"
+
+      - name: "Negative control: today's bare apt-get fails under the fault"
+        if: matrix.cell == 'runner-dead'
+        run: |
+          set +e
+          SECONDS=0
+          timeout 150 sudo apt-get update -qq >/tmp/nc-update.log 2>&1
+          urc=$?
+          timeout 120 sudo apt-get install -y --no-install-recommends "$PKG" >/tmp/nc-install.log 2>&1
+          irc=$?
+          tail -5 /tmp/nc-update.log /tmp/nc-install.log
+          echo "bare update rc=$urc, bare install rc=$irc, in ${SECONDS} s"
+          grep -q 'Temporary failure resolving\|Could not resolve' /tmp/nc-update.log /tmp/nc-install.log \
+            || { echo "::error title=ci-apt self-test::the bare apt-get met no resolver failure: the fault did not reach apt"; exit 1; }
+          [ "$irc" -ne 0 ] || { echo "::error title=ci-apt self-test::the bare install succeeded under the fault, so this cell proves nothing"; exit 1; }
+
+      - name: "D2: does a container started under the fault reach the mirror?"
+        if: matrix.cell == 'runner-dead'
+        run: |
+          docker run --rm ubuntu:24.04 sh -c 'echo "--- resolv.conf"; cat /etc/resolv.conf; timeout 90 apt-get update -qq 2>&1 | tail -3' | tee /tmp/ctr-before.log
+          if grep -q 'Temporary failure resolving\|Could not resolve' /tmp/ctr-before.log; then echo "D2 before failover: the container did NOT reach the mirror"; else echo "D2 before failover: the container reached the mirror"; fi
+
+      - name: ci-apt.sh prepare
+        run: |
+          set +e
+          SECONDS=0
+          bash "$H/ci-apt.sh" prepare 2>&1 | tee /tmp/prepare.log
+          rc=${PIPESTATUS[0]}
+          echo "prepare: rc=$rc in ${SECONDS} s"
+          echo "$SECONDS" >/tmp/prepare.secs
+          [ "$rc" -eq 0 ] || { echo "::error title=ci-apt self-test::prepare returned $rc; it must never fail the step"; exit 1; }
+
+      - name: Judge prepare
+        run: |
+          s=$(cat /tmp/prepare.secs)
+          case "$CELL" in
+            healthy)
+              ! grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::a failover on a healthy runner"; exit 1; } ;;
+            runner-dead)
+              grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not fail over to a public resolver"; exit 1; } ;;
+            all-dead)
+              grep -q '::warning title=apt mirrors unreachable' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not report the mirrors unreachable"; exit 1; }
+              [ "$s" -le 120 ] || { echo "::error title=ci-apt self-test::prepare took $s s with every resolver dead (bound: about 90)"; exit 1; } ;;
+          esac
+          echo "prepare judged ok for $CELL ($s s)"
+
+      - name: Install one package through the helper
+        id: install
+        continue-on-error: true
+        run: |
+          set +e
+          SECONDS=0
+          bash "$H/ci-apt.sh" fallback "$PKG" 2>&1 | tee /tmp/install.log
+          rc=${PIPESTATUS[0]}
+          echo "install: rc=$rc in ${SECONDS} s"
+          echo "$rc $SECONDS" >/tmp/install.res
+          exit "$rc"
+
+      - name: Judge the install
+        run: |
+          read -r rc s </tmp/install.res
+          errors=$(grep -c '^::error' /tmp/install.log || true)
+          case "$CELL" in
+            all-dead)
+              [ "$rc" -ne 0 ] || { echo "::error title=ci-apt self-test::an install succeeded with every resolver dead"; exit 1; }
+              [ "$errors" -eq 1 ] || { echo "::error title=ci-apt self-test::$errors ::error lines (want exactly 1)"; exit 1; }
+              [ "$s" -le 120 ] || { echo "::error title=ci-apt self-test::the failing install took $s s"; exit 1; } ;;
+            *)
+              [ "$rc" -eq 0 ] && dpkg -s "$PKG" >/dev/null 2>&1 || { echo "::error title=ci-apt self-test::the install failed (rc=$rc after $s s)"; exit 1; } ;;
+          esac
+          echo "install judged ok for $CELL (rc=$rc, $s s, $errors ::error)"
+
+      - name: "The probe asks the names apt uses (#3710)"
+        if: always() && matrix.cell == 'arm64-names'
+        run: |
+          want=$(bash "$H/ci-apt-fault.sh" source-hosts | tr '\n' ' ')
+          probed=$(grep -m1 'ci-apt: system resolver:' /tmp/prepare.log | sed 's/.*system resolver://; s/=[^ ]*//g')
+          echo "apt's sources name:   $want"
+          echo "the helper probed:   $probed"
+          for h in $want; do
+            case " $probed " in
+              *" $h "*) ;;
+              *) echo "::error title=ci-apt self-test::the helper probed [$probed ] but apt's sources name [$want]: its probe passed while apt could not resolve $h, so no failover ran and the install waited on the resolver (#3710)"; exit 1 ;;
+            esac
+          done
+
+      - name: "The stand-in fails and leaves the action nothing to save"
+        if: matrix.cell == 'all-dead'
+        run: |
+          mkdir -p ~/cache-apt-pkgs
+          SECONDS=0
+          if apt-fast --yes install "$PKG"; then echo "::error title=ci-apt self-test::the stand-in succeeded with every resolver dead"; exit 1; fi
+          echo "stand-in failed as it must, in ${SECONDS} s"
+          [ ! -e ~/cache-apt-pkgs ] || { echo "::error title=ci-apt self-test::~/cache-apt-pkgs survived: the action would save a failed install"; exit 1; }
+
+      - name: "D2: does a container started after the failover reach the mirror?"
+        if: matrix.cell == 'runner-dead'
+        run: |
+          docker run --rm ubuntu:24.04 sh -c 'echo "--- resolv.conf"; cat /etc/resolv.conf; timeout 90 apt-get update -qq 2>&1 | tail -3' | tee /tmp/ctr-after.log
+          if grep -q 'Temporary failure resolving\|Could not resolve' /tmp/ctr-after.log; then
+            echo "D2 after failover: the container did NOT reach the mirror; with --dns:"
+            docker run --rm --dns 1.1.1.1 --dns 8.8.8.8 ubuntu:24.04 sh -c 'timeout 90 apt-get update -qq 2>&1 | tail -3'
+          else
+            echo "D2 after failover: the container reached the mirror"
+          fi
+
+      - name: The fault was hit while the cell ran
+        if: always() && matrix.cell != 'healthy'
+        run: bash "$H/ci-apt-fault.sh" hits
