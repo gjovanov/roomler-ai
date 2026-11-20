@@ -23,7 +23,12 @@
 //!   a person's other tab, or a call whose sessions a sweep closed, would lose
 //!   a seat they are entitled to.
 //! - A seat whose admission reads as gone in [`MISSES_TO_END`] complete reads
-//!   in a row, a pass apart, ends the way a withdrawal that reached it ends
+//!   in a row, a pass apart, is a verdict, and the room guard `media:join`
+//!   runs decides it: asked about the person, on the primary, within
+//!   [`READ_TIMEOUT`], only its refusal ends the seat, and an admission
+//!   ([`GUARD_ADMITS`]), a failure or no answer keeps it. The reads pick the
+//!   seats to ask about; the guard's own answer decides. A seat ends the way
+//!   a withdrawal that reached it ends
 //!   (`revoke::withdraw_these_seats_here`): its connections hear
 //!   `room:call_ended` with `reason: "not_a_member"`, everyone left hears
 //!   `media:peer_left`. Then the call's books, as a hang-up's: the person's
@@ -41,8 +46,9 @@
 //!   (`media_cluster::end_calls_of_rooms_gone`).
 //!
 //! **The bound.** On a pod whose reads succeed, a seat whose admission is gone
-//! ends within two passes and their reads of the membership's end:
-//! `2 × (SEAT_CHECK_SECS + READ_TIMEOUT)`, 30 s.
+//! ends within two passes after the membership's end, each a sleep, a read
+//! and the room guard's reads: `2 × (SEAT_CHECK_SECS + 2 × READ_TIMEOUT)`,
+//! 40 s. A guard that does not answer keeps the seat for two more passes.
 //!
 //! **The switch.** [`SWITCH`] (`ROOMLER__CONFERENCE__SEAT_CHECK`) set to
 //! `false`, `0`, `off` or `no` turns the check off on a pod; it is read once,
@@ -68,6 +74,8 @@ use std::time::{Duration, Instant};
 use bson::{Bson, Document, doc, oid::ObjectId};
 use mongodb::options::{ReadPreference, SelectionCriteria};
 use roomler_ai_db::models::RoomVisibility;
+use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
+use roomler_core::ApiError;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -102,6 +110,15 @@ pub const ODD_DOCUMENT: &str =
 /// How long the check keeps quiet about a document that stays odd, once it
 /// warned about it: the document's next warning comes no sooner.
 pub const ODD_DOCUMENT_WARN_EVERY: Duration = Duration::from_secs(3600);
+
+/// The one wording of the warning for a verdict the room guard overrules:
+/// the check's reads found the seat's admission gone, and the guard admits
+/// the person.
+pub const GUARD_ADMITS: &str =
+    "seat check: the room guard admits a seat its reads found gone; the seat stays";
+
+/// How many of one pass's room-guard reads run at once.
+const GUARD_READS_AT_ONCE: usize = 8;
 
 /// A person seated in a room's media on this pod: `(room, user)`. The check
 /// counts by the person in the room, because the admission is the person's:
@@ -152,6 +169,8 @@ pub struct SeatCheckMemory {
     /// The documents that did not decode, by collection and `_id`, with when
     /// the check last warned about each.
     odd_warned: HashMap<(&'static str, String), Instant>,
+    /// How many room-guard reads in a row did not answer.
+    guard_failures: u32,
 }
 
 /// A seat key the verdict ends, with what its first and its last read found.
@@ -319,18 +338,60 @@ pub async fn read_seats(state: &ConferenceState, memory: &mut SeatCheckMemory) -
     }
 }
 
-/// The end half of a pass: end the seats of each verdict in `read`, as
-/// `revoke::withdraw_these_seats_here` ends them, then keep the call's books.
-/// `memory` is the loop's, the one the read half keeps. Returns the seat keys
-/// it ended.
+/// The end half of a pass. The room guard `media:join` runs is asked about
+/// the person of each verdict in `read` ([`ask_the_room_guard`]), and only
+/// its refusal ends the seat, as `revoke::withdraw_these_seats_here` ends it;
+/// then the call's books are kept. A guard that admits the person, fails or
+/// does not answer keeps the seat. `memory` is the loop's, the one the read
+/// half keeps. Returns the seat keys it ended.
 pub async fn end_seats(
     state: &ConferenceState,
-    _memory: &mut SeatCheckMemory,
+    memory: &mut SeatCheckMemory,
     read: &SeatRead,
 ) -> Vec<SeatKey> {
+    if read.verdicts.is_empty() {
+        return Vec::new();
+    }
+    let words = ask_the_room_guard(state, read).await;
     let mut ended = Vec::new();
-    for verdict in &read.verdicts {
+    for (verdict, word) in read.verdicts.iter().zip(words) {
         let (room_id, user_id) = verdict.key;
+        let tenant = read
+            .tenants
+            .get(&room_id)
+            .map(|tenant| tenant.to_hex())
+            .unwrap_or_default();
+        let refusal = match word {
+            GuardWord::Refuses(refusal) => {
+                memory.guard_failures = 0;
+                refusal
+            }
+            GuardWord::Admits => {
+                memory.guard_failures = 0;
+                warn!(
+                    tenant = %tenant, room = %room_id, user = %user_id,
+                    first_read = verdict.first.as_str(), second_read = verdict.last.as_str(),
+                    alert = "seat_check_guard_admits", "{GUARD_ADMITS}"
+                );
+                continue;
+            }
+            GuardWord::NoAnswer(e) => {
+                memory.guard_failures = memory.guard_failures.saturating_add(1);
+                if memory.guard_failures >= FAILED_READS_TO_WARN {
+                    warn!(
+                        tenant = %tenant, room = %room_id, user = %user_id,
+                        guard_failures = memory.guard_failures, %e,
+                        "seat check: the room guard keeps failing to answer; the seat stays"
+                    );
+                } else {
+                    debug!(
+                        tenant = %tenant, room = %room_id, user = %user_id, %e,
+                        "seat check: the room guard did not answer; the seat stays"
+                    );
+                }
+                continue;
+            }
+        };
         let conns = read.seats.get(&verdict.key).cloned().unwrap_or_default();
         let closed =
             crate::revoke::withdraw_these_seats_here(state, room_id, user_id, &conns).await;
@@ -338,15 +399,10 @@ pub async fn end_seats(
             // Closed meanwhile: a hang-up, or a withdrawal that came late.
             continue;
         }
-        let tenant = read
-            .tenants
-            .get(&room_id)
-            .map(|tenant| tenant.to_hex())
-            .unwrap_or_default();
         warn!(
             tenant = %tenant, room = %room_id, user = %user_id, seats = closed.len(),
             first_read = verdict.first.as_str(), second_read = verdict.last.as_str(),
-            alert = "seat_check_ended", "{ENDED}"
+            guard = refusal, alert = "seat_check_ended", "{ENDED}"
         );
         // The call's books, as a hang-up keeps them: the person's open call
         // sessions close and the count drops (none left after a removal whose
@@ -361,6 +417,93 @@ pub async fn end_seats(
         ended.push(verdict.key);
     }
     ended
+}
+
+/// What the room guard said about a verdict's seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuardWord {
+    /// It refuses the person, by the refusal named: the verdict stands.
+    Refuses(&'static str),
+    /// It admits the person: the seat stays.
+    Admits,
+    /// It failed, or did not answer within the pass's deadline: the seat
+    /// stays.
+    NoAnswer(String),
+}
+
+/// The room guard's answer as a word. Only a refusal, matched by its
+/// variant, ends a seat: `NotAMember` (not in the room's org), `Forbidden`
+/// (a private room the person is not in) or `NotFound` (no live room in the
+/// org, or a secret room the person is not in). Any other error, a failed
+/// read or a document that does not decode among them, is no answer.
+fn guard_word<T>(answer: Result<T, ApiError>) -> GuardWord {
+    match answer {
+        Ok(_) => GuardWord::Admits,
+        Err(ApiError::NotAMember) => GuardWord::Refuses("not_a_member"),
+        Err(ApiError::Forbidden(_)) => GuardWord::Refuses("forbidden"),
+        Err(ApiError::NotFound(_)) => GuardWord::Refuses("not_found"),
+        Err(e) => GuardWord::NoAnswer(e.to_string()),
+    }
+}
+
+/// Ask the room guard about the person of each verdict in `read`, in the
+/// org the read found for the room: the function `media:join`'s gate runs
+/// (`roomler_ai_mod_chat::guards::require_room_in_tenant_with`), over DAOs on
+/// a handle that reads the primary, as the check's own reads do, so a lagging
+/// secondary cannot answer for it. At most [`GUARD_READS_AT_ONCE`] run at a
+/// time, all within one [`READ_TIMEOUT`]: a read still out at the deadline is
+/// no answer. The words come back in the verdicts' order.
+async fn ask_the_room_guard(state: &ConferenceState, read: &SeatRead) -> Vec<GuardWord> {
+    use futures::StreamExt;
+    let db = on_the_primary(&state.db);
+    let (tenants, rooms) = (TenantDao::new(&db), RoomDao::new(&db));
+    let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+    // The asks are made first, from a named function, so no closure that
+    // makes futures sits in the stream the pass awaits.
+    let asks: Vec<_> = read
+        .verdicts
+        .iter()
+        .map(|verdict| {
+            let (room_id, user_id) = verdict.key;
+            let tenant_id = read.tenants.get(&room_id).copied();
+            ask_once(&tenants, &rooms, tenant_id, room_id, user_id, deadline)
+        })
+        .collect();
+    futures::stream::iter(asks)
+        .buffered(GUARD_READS_AT_ONCE)
+        .collect()
+        .await
+}
+
+/// One ask of [`ask_the_room_guard`], answered by `deadline`.
+async fn ask_once(
+    tenants: &TenantDao,
+    rooms: &RoomDao,
+    tenant_id: Option<ObjectId>,
+    room_id: ObjectId,
+    user_id: ObjectId,
+    deadline: tokio::time::Instant,
+) -> GuardWord {
+    let Some(tenant_id) = tenant_id else {
+        return GuardWord::NoAnswer("the read found no org for the room".to_string());
+    };
+    let asked = roomler_ai_mod_chat::guards::require_room_in_tenant_with(
+        tenants, rooms, tenant_id, room_id, user_id,
+    );
+    match tokio::time::timeout_at(deadline, asked).await {
+        Ok(answer) => guard_word(answer),
+        Err(_) => GuardWord::NoAnswer(format!("no answer within {READ_TIMEOUT:?}")),
+    }
+}
+
+/// `db`, reading the primary whatever the connection string prefers.
+fn on_the_primary(db: &mongodb::Database) -> mongodb::Database {
+    db.client().database_with_options(
+        db.name(),
+        mongodb::options::DatabaseOptions::builder()
+            .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            .build(),
+    )
 }
 
 /// Warn about each document of `odd` the check has not warned about within
@@ -1220,6 +1363,36 @@ mod tests {
         // Seats in public rooms only: no room rows are read.
         let public = [(w.p1, w.a)];
         assert!(room_rows_filter(&public, &rooms).is_none());
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_room_guard_ends_a_seat() {
+        assert_eq!(guard_word(Ok(())), GuardWord::Admits);
+        for (refusal, word) in [
+            (ApiError::NotAMember, "not_a_member"),
+            (
+                ApiError::Forbidden("Not a member of this room".into()),
+                "forbidden",
+            ),
+            (ApiError::NotFound("Resource not found".into()), "not_found"),
+        ] {
+            assert_eq!(guard_word::<()>(Err(refusal)), GuardWord::Refuses(word));
+        }
+        // A failed read, a document that does not decode, and every other
+        // error: no answer, so the seat stays.
+        for failure in [
+            ApiError::Internal("Kind: Server selection timeout".into()),
+            ApiError::ServiceUnavailable("unavailable".into()),
+            ApiError::BadRequest("bad".into()),
+            ApiError::Unauthorized("no".into()),
+            ApiError::Conflict("conflict".into()),
+            ApiError::Validation("invalid".into()),
+        ] {
+            assert!(
+                matches!(guard_word::<()>(Err(failure)), GuardWord::NoAnswer(_)),
+                "a failure is no answer"
+            );
+        }
     }
 
     #[test]
