@@ -1124,3 +1124,142 @@ pub async fn delete_tunnel_policy(
     }
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    //! #3636 — what a tunnel-policy answer carries on the wire. Every id is
+    //! the 24-hex string `docs/api.md` promises: the web app reads it as a
+    //! string, names the subject by it, and sends it back when it saves.
+
+    use super::*;
+    use bson::DateTime;
+    use roomler_ai_remote_control::models::{HostPattern, PortRange, ProtocolKind, TunnelPolicy};
+    use serde_json::Value;
+
+    /// A stored policy that names every subject and target kind there is:
+    /// a user, a role, a tunnel client and a device as subjects, the two
+    /// catch-alls, and the device as a target. The four ids, in that order.
+    fn every_kind() -> (TunnelPolicy, [ObjectId; 4]) {
+        let ids = [
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        ];
+        let [user, role, client, device] = ids;
+        let now = DateTime::now();
+        let policy = TunnelPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: "every kind".into(),
+            subjects: vec![
+                PolicySubject::UserId { user_id: user },
+                PolicySubject::RoleId { role_id: role },
+                PolicySubject::TunnelClientId {
+                    tunnel_client_id: client,
+                },
+                PolicySubject::AgentId { agent_id: device },
+                PolicySubject::AllUsers,
+            ],
+            targets: vec![
+                PolicyTarget::AgentId { agent_id: device },
+                PolicyTarget::AllAgents,
+            ],
+            allowlist: vec![DestinationRule {
+                host_pattern: HostPattern::Cidr("192.0.2.1/32".into()),
+                port_range: PortRange { low: 9, high: 9 },
+                proto: ProtocolKind::Tcp,
+            }],
+            max_concurrent_flows: None,
+            max_bytes_per_session: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        (policy, ids)
+    }
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// What is wrong with `entries` as the browser reads them, against
+    /// `want`: `(kind, the id)`, `None` for a catch-all. An id must be the
+    /// 24-hex string of the stored one; a catch-all is the single key `kind`;
+    /// nothing is lost, added or reordered.
+    fn wire_problems(
+        what: &str,
+        entries: &Value,
+        want: &[(&str, Option<ObjectId>)],
+    ) -> Vec<String> {
+        let Some(got) = entries.as_array() else {
+            return vec![format!("{what}: not an array: {entries}")];
+        };
+        let mut wrong = Vec::new();
+        if got.len() != want.len() {
+            wrong.push(format!(
+                "{what}: {} entries, want {}: {entries}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (i, (entry, (kind, id))) in got.iter().zip(want).enumerate() {
+            let at = format!("{what}[{i}] ({kind})");
+            if entry["kind"] != *kind {
+                wrong.push(format!("{at}: the kind is {}", entry["kind"]));
+            }
+            let keys = entry.as_object().map_or(0, |o| o.len());
+            match id {
+                None if keys != 1 => wrong.push(format!(
+                    "{at}: a catch-all is the single key `kind`: {entry}"
+                )),
+                None => {}
+                Some(id) => match entry["id"].as_str() {
+                    None => wrong.push(format!("{at}: the id is not a string: {entry}")),
+                    Some(s) if !is_hex24(s) => {
+                        wrong.push(format!("{at}: the id is not 24 lowercase hex: {s}"))
+                    }
+                    Some(s) if s != id.to_hex() => {
+                        wrong.push(format!("{at}: the id {s} is not the stored {id}"))
+                    }
+                    Some(_) if keys != 2 => {
+                        wrong.push(format!("{at}: `kind` and `id` only: {entry}"))
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        wrong
+    }
+
+    /// The answer of every tunnel-policy route (create, list, get, update)
+    /// is a `TunnelPolicyResponse`: its subject and target ids are hex
+    /// strings, never bson's extended JSON `{"$oid": …}`, which the web app
+    /// printed as `[object Object]` and could not edit.
+    #[test]
+    fn a_policy_answer_names_every_subject_and_target_id_as_a_hex_string() {
+        let (policy, [user, role, client, device]) = every_kind();
+        let answer = serde_json::to_value(TunnelPolicyResponse::from(policy)).expect("serialises");
+        let mut wrong = wire_problems(
+            "subjects",
+            &answer["subjects"],
+            &[
+                ("user_id", Some(user)),
+                ("role_id", Some(role)),
+                ("tunnel_client_id", Some(client)),
+                ("agent_id", Some(device)),
+                ("all_users", None),
+            ],
+        );
+        wrong.extend(wire_problems(
+            "targets",
+            &answer["targets"],
+            &[("agent_id", Some(device)), ("all_agents", None)],
+        ));
+        let text = answer.to_string();
+        if text.contains("$oid") {
+            wrong.push(format!("the answer carries `$oid`: {text}"));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}

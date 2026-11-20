@@ -261,10 +261,10 @@ async fn a_member_without_manage_agents_writes_no_tunnel_policy() {
     );
 }
 
-/// An id as a policy answers it: the `ObjectId` crosses the wire as
-/// `{"$oid": "<hex>"}`, though a request may name it as the bare hex.
+/// An id as a policy answers it: the 24-hex string `docs/api.md` promises
+/// (#3636). An answer that carries bson's `{"$oid": …}` reads as `None`.
 fn oid(v: &Value) -> Option<&str> {
-    v.as_str().or_else(|| v["$oid"].as_str())
+    v.as_str()
 }
 
 /// The org's tunnel ACL names who may reach which device and which internal
