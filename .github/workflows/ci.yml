@@ -1297,8 +1297,8 @@ jobs:
         # whose marker printed first passed the step.
         run: |
           set -o pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xauth
+          # Probe, failover, refresh and install, each bounded (#3710).
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xvfb xauth
           xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 virtual_desktop::wm_nudge_tests virtual_desktop::supervise_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
@@ -1333,8 +1333,8 @@ jobs:
       - name: The real clipboard on X11 — untouched without the opt-in, its tests run with it (#3813)
         run: |
           set -euo pipefail
-          # The step above refreshed the index and installed xvfb.
-          sudo apt-get install -y --no-install-recommends xvfb xauth xclip
+          # The step above installed xvfb; the helper asks the mirror names again.
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xvfb xauth xclip
           export SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env -u ROOMLERD_TEST_REAL_CLIPBOARD ROOMLERD_TEST_X11=1 bash -euo pipefail -c '
             holds() { [ "$(xclip -selection clipboard -o 2>/dev/null)" = "$SENTINEL" ]; }
@@ -1442,7 +1442,7 @@ jobs:
         run: |
           set -o pipefail
           command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
-          command -v xclip >/dev/null || sudo apt-get install -y --no-install-recommends xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
+          command -v xclip >/dev/null || bash .github/actions/ci-linux-system-deps/ci-apt.sh install -y --no-install-recommends -- xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
           rc=0
           results=()
           # One invocation: its output to a log, its `x11-real:` line grepped, its
@@ -2334,10 +2334,10 @@ jobs:
       # (its apt-retries step sits ~400 lines further down, long after this),
       # so `ci-ffmpeg-*` was one superseded libvpx version away from the same
       # outage the GTK set just caused.
-      - name: Configure apt retries and refresh the index
+      - name: Configure apt retries, reach the mirror, refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh prepare || echo "::warning::ci-apt.sh prepare failed (rc=$?): the cached-apt step below runs unbounded, as before #3710"
 
       - name: Install build deps (cached apt)
         # libclang is bindgen's runtime requirement (ffmpeg-sys-next and
@@ -2361,8 +2361,8 @@ jobs:
           sudo ldconfig
           if ! ldconfig -p | grep -q 'libvpx\.so'; then
             echo "::warning::cached apt set did not deliver libvpx — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libvpx-dev
+            bash .github/actions/ci-linux-system-deps/ci-apt.sh fallback \
+              pkg-config libclang-dev libvpx-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
       # 2026-10-24: this lane's cache was evicted, bindgen ran fresh under the

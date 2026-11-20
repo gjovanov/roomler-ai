@@ -226,7 +226,7 @@
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3024`).
+      (`coarsen_bitrate`, `encode/aimd.rs:523`, applied in `set_bitrate`, `encoder.rs:3024`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung

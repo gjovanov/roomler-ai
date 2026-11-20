@@ -71,7 +71,7 @@ Sealing closes the write side only. Every reader below keeps working.
 | Folder | Read by | Anchor |
 |---|---|---|
 | `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1931-1936` |
-| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder. It may not delete one there, so since #3799 the service removes what that worker's ledger says it sent | `agents/roomlerd/src/app.rs:2308-2318`, `crash_recorder.rs:345-361`, `crash_uploader.rs:18-23` |
+| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder. It may not delete one there, so since #3799 the service removes what that worker's ledger says it sent | `agents/roomlerd/src/app.rs:2310-2320`, `crash_recorder.rs:345-361`, `crash_uploader.rs:18-23` |
 | the SystemContext attempt record | Setup, as the person who started it (Users read, `record_aces`) | `machine_tree.rs:537-551` |
 
 ## Design
