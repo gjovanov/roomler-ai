@@ -400,7 +400,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 The docs:
 
-- `docs/installation.md`, the clean-up's row (`docs/installation.md:1662`) and wherever it describes
+- `docs/installation.md`, the clean-up's row (`docs/installation.md:1671`) and wherever it describes
   `cleanup-legacy-install`: every removal acts through the folder it checked and leaves a path with a link on it,
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
