@@ -138,7 +138,7 @@ person's half on it and says why.
   says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
   The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
   socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
-  (`crates/localapi/src/lib.rs:3674-3676`) and passes it through whole (`:3795-3817`). The read is bounded to 3 s and
+  (`crates/localapi/src/lib.rs:3683-3685`) and passes it through whole (`:3804-3826`). The read is bounded to 3 s and
   believed only from a socket root serves; unknown is never one row. The stop is one decision
   (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
   install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes

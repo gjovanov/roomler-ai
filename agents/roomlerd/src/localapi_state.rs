@@ -1208,6 +1208,15 @@ impl LocalApiState for DaemonState {
             .unwrap_or_default()
     }
 
+    /// #2531 — and noted as `uid`'s read: what shows the being-viewed notice
+    /// (`indicator::notify::viewing`) that their companion is listening.
+    fn rc_sessions_for_person(&self, uid: u32) -> Vec<tunnel_core::localapi::RcSessionInfo> {
+        self.rc_sessions
+            .as_ref()
+            .map(|r| r.list_for_person(uid))
+            .unwrap_or_default()
+    }
+
     fn rc_disconnect(&self, session_id: &str) -> bool {
         // Same guard as `consent_decide`, and for the same reason: the id
         // reaches a lookup keyed by `ObjectId`, and refusing a malformed one up
