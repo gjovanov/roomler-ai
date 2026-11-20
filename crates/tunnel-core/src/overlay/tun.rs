@@ -11003,6 +11003,16 @@ mod macos_kernel_tests {
         let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .unwrap();
+        // #4175 — first one stray, from a second socket to port 9 (discard),
+        // where nothing listens. The utun reads it as well, and only the
+        // test's own datagram may be counted.
+        let stray = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        stray
+            .send_to(b"stray", (own, 9))
+            .await
+            .expect("send the stray");
         client.send_to(b"query", to).await.expect("send");
         let mut buf = [0u8; 64];
         let got = tokio::time::timeout(QUIET, server.recv_from(&mut buf)).await;
