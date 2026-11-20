@@ -7,7 +7,7 @@ import { api } from '@/api/client'
 // Matches `crates/remote_control/src/models.rs` (OverlaySelector / OverlayTarget
 // / OverlayRule / OverlayAclMode) and the answers of
 // `crates/modules/network/src/routes/overlay_policy.rs`: snake_case `kind`-tagged
-// unions as `{kind, id}`, though an answer still writes an id as `{"$oid"}` (#3636).
+// unions as `{kind, id}`, every id its 24-hex string (#3636), sent back as it is.
 
 /** Who the rule applies to — the node ORIGINATING traffic. */
 export type OverlaySelector =
