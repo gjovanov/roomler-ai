@@ -3572,7 +3572,7 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // the host now runs on an older config.
     let prev = prev_path(path);
     match load_prev(path, &prev) {
-        Ok(cfg) => {
+        Ok(mut cfg) => {
             if not_found(&err) {
                 tracing::error!(
                     path = %path.display(),
@@ -3590,6 +3590,10 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
                      the live file was likely truncated by an unclean shutdown"
                 );
             }
+            // #4157 — the copy's run marks are those of a run that went on after it was
+            // kept, so they say nothing of how that run ended: the next start must not
+            // count them as a crash ([`previous_run`]). A run on the restored copy marks itself.
+            clear_run_marks(&mut cfg);
             // Reinstate it as the live file so the next save has a base. The
             // keys this build does not know are the copy's to keep (#2078):
             // the live file, which a save reads them from, parses as nothing.
@@ -4874,6 +4878,43 @@ fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
         anyhow::bail!("{why}");
     }
     try_load(prev)
+}
+
+/// #4157 — what [`load`] restores the copy without: the marks a run leaves on
+/// the config ([`mark_run_starting`], `last_run_boot`), which [`previous_run`]
+/// reads. The crash count and the rest of the copy stay as they are.
+fn clear_run_marks(cfg: &mut AgentConfig) {
+    cfg.last_run_unhealthy = false;
+    cfg.last_run_boot = None;
+}
+
+/// #4157 — the last good copy of a config that is not there, as [`load`] would
+/// read it to restore it ([`previous_copy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousCopy {
+    /// It loads, and holds a primary enrollment.
+    Enrolled,
+    /// It loads, and holds no primary enrollment
+    /// ([`AgentConfig::has_primary_enrollment`]).
+    NoEnrollment,
+    /// There is none.
+    Missing,
+    /// It is there, and does not load or may not be read. At the
+    /// machine-global location on Windows, also one that fails the machine
+    /// tree's check.
+    Broken,
+}
+
+/// #4157 — what a start whose config at `path` is missing can run on: its last
+/// good copy ([`prev_path`]), read through the same check as [`load`]'s
+/// restore. It reads the copy and writes nothing.
+pub fn previous_copy(path: &std::path::Path) -> PreviousCopy {
+    match load_prev(path, &prev_path(path)) {
+        Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
+        Ok(_) => PreviousCopy::NoEnrollment,
+        Err(e) if not_found(&e) => PreviousCopy::Missing,
+        Err(_) => PreviousCopy::Broken,
+    }
 }
 
 fn derive_ws_url(http_url: &str) -> String {
@@ -7734,6 +7775,119 @@ tenant_id = "tid2"
         let line = the_error_line(&log);
         assert!(line.contains(UNREADABLE_NO_COPY_LINE), "{log}");
         assert!(!line.contains("config missing"), "{log}");
+    }
+
+    /// A device on 0.4.2 that has crashed twice: its last good copy (`.prev`) is
+    /// the config its last start saved, marked as that start marks it (boot
+    /// `7`), and the live file is a save made later in that run. `now` is a
+    /// minute after the second crash.
+    fn with_a_copy_a_run_marked() -> (tempfile::TempDir, PathBuf, u64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut cfg = test_fixture();
+        cfg.last_known_good_version = Some("0.4.1".into());
+        cfg.crash_count = 2;
+        cfg.last_crash_unix = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, 1_000_000);
+        save(&path, &cfg).expect("the start's save");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).expect("a later save: rotates the marked config to .prev");
+        (dir, path, 1_000_060)
+    }
+
+    /// #4157 — a restore clears the run marks the copy carries, missing and
+    /// unreadable live file alike, so the next start on the same boot counts no
+    /// crash and, at two crashes already, does not roll the device back. The
+    /// crash count is the copy's, and a crash of the run started on the
+    /// restored config counts, as any crash does.
+    #[test]
+    fn a_restored_config_brings_no_crash_to_the_next_start() {
+        for unreadable in [false, true] {
+            let (_dir, path, now) = with_a_copy_a_run_marked();
+            let copy = try_load(&prev_path(&path)).expect("the copy");
+            assert!(copy.last_run_unhealthy, "the premise: the copy is marked");
+            assert_eq!(previous_run(&copy, Some("7"), false), PreviousRun::Crashed);
+            if unreadable {
+                std::fs::write(&path, vec![0u8; 64]).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+
+            let mut restored = load(&path).expect("restored from .prev");
+            for cfg in [&restored, &try_load(&path).expect("reinstated")] {
+                assert!(!cfg.last_run_unhealthy, "unreadable={unreadable}");
+                assert_eq!(cfg.last_run_boot, None, "unreadable={unreadable}");
+                assert_eq!(cfg.crash_count, 2, "the copy's count stays");
+                assert_eq!(cfg.machine_name, "host", "the copy, not the live file");
+            }
+            assert_eq!(
+                previous_run(&restored, Some("7"), false),
+                PreviousRun::Clean
+            );
+            start_a_run(&mut restored, Some("7"), false, now);
+            assert_eq!(restored.crash_count, 2, "unreadable={unreadable}");
+            assert!(!should_rollback(&restored, "0.4.2", now));
+
+            // The run on the restored config crashes: the start after it counts it.
+            save(&path, &restored).expect("the restored start's save");
+            let mut next = load(&path).expect("the live file");
+            start_a_run(&mut next, Some("7"), false, now + 60);
+            assert_eq!(next.crash_count, 3, "unreadable={unreadable}");
+            assert!(should_rollback(&next, "0.4.2", now + 60));
+        }
+    }
+
+    /// #4157 — a missing config beside a copy that does not load is not
+    /// restored, and nothing is written: neither the live file nor the copy.
+    #[test]
+    fn a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let prev = prev_path(&path);
+        std::fs::write(&prev, "agent_token = \"broken\n").unwrap();
+
+        let (_cap, _guard) = captured();
+        assert!(not_found(&load(&path).expect_err("the copy does not load")));
+        assert!(!path.exists(), "no live file was written");
+        assert_eq!(
+            std::fs::read_to_string(&prev).unwrap(),
+            "agent_token = \"broken\n"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml.prev")]);
+    }
+
+    /// #4157 — what a start finds in the last good copy of a missing config,
+    /// read as [`load`] would restore it. Asking writes nothing.
+    #[test]
+    fn previous_copy_reads_the_copy_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let prev = prev_path(&path);
+        let ask = |want: PreviousCopy| {
+            assert_eq!(previous_copy(&path), want);
+            assert!(!path.exists(), "{want:?}: no live file was written");
+        };
+        ask(PreviousCopy::Missing);
+        std::fs::write(&prev, "agent_token = \"broken\n").unwrap();
+        ask(PreviousCopy::Broken);
+        std::fs::write(&prev, vec![0u8; 64]).unwrap();
+        ask(PreviousCopy::Broken);
+        let blank = AgentConfig::for_person_with_no_enrollment("host").unwrap();
+        std::fs::write(&prev, toml::to_string(&blank).unwrap()).unwrap();
+        ask(PreviousCopy::NoEnrollment);
+        std::fs::write(&prev, toml::to_string(&test_fixture()).unwrap()).unwrap();
+        ask(PreviousCopy::Enrolled);
+        let copy = std::fs::read(&prev).unwrap();
+        let _ = previous_copy(&path);
+        assert_eq!(
+            std::fs::read(&prev).unwrap(),
+            copy,
+            "the copy is not changed"
+        );
     }
 
     /// #3116 — the same on a real file system: a config in a directory this

@@ -3911,10 +3911,10 @@ async fn run_cmd(
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault, told apart by type and never by
-        // its words: a Windows worker records no crash for it, and (#4028) the
-        // service host's worker exits with its own code, so the host records none.
+    if config_at_start::of(config_path, unenrolled) == config_at_start::AtStart::NoConfig {
+        // #4023 — the device's state, not a fault, told apart by type and never by its words:
+        // a Windows worker records no crash for it, and (#4028) the service host's worker exits
+        // with its own code. #4157 — a missing file with an enrolled copy is restored instead.
         return Err(roomlerd::daemon_error::NoConfig::of_run(config_path, supervisor_flag).into());
     }
     // Take the single-instance lock before doing anything else. If
@@ -9112,3 +9112,6 @@ mod no_enrollment_exit_tests {
 
 /// #3589 — what the last line of `adopt-enrollment` says was at the target.
 mod adopt_line;
+
+/// #4157 — what a `run` does with its config before it takes the lock.
+mod config_at_start;
