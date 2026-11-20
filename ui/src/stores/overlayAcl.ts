@@ -5,9 +5,9 @@ import { ref } from 'vue'
 import { api } from '@/api/client'
 
 // Matches `crates/remote_control/src/models.rs` (OverlaySelector / OverlayTarget
-// / OverlayRule / OverlayAclMode) and the responses in
-// `crates/api/src/routes/overlay_policy.rs`. snake_case mirrors the Rust wire
-// shape, adjacently-tagged unions as `{kind, id}` like the tunnel-policy store.
+// / OverlayRule / OverlayAclMode) and the answers of
+// `crates/modules/network/src/routes/overlay_policy.rs`: snake_case `kind`-tagged
+// unions as `{kind, id}`, though an answer still writes an id as `{"$oid"}` (#3636).
 
 /** Who the rule applies to — the node ORIGINATING traffic. */
 export type OverlaySelector =
