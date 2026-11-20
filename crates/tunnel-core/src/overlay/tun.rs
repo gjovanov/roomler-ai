@@ -7220,6 +7220,234 @@ mod macos_kernel_tests {
         );
     }
 
+    /// #4117 — the utun's first IPv4 address is its own peer, with the
+    /// overlay block's mask, and the block is routed on the utun. The lab Mac
+    /// on 0.4.228 read `inet <self> --> 28.30.0.0 netmask 0xff000000`, no IPv4
+    /// route on its utun, and `route -n get <self>` answering the default route.
+    #[tokio::test]
+    async fn the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let state = || {
+            format!(
+                "ifconfig {iface}:\n{}\nnetstat -rn -f inet:\n{}",
+                sh("ifconfig", &[&iface]),
+                sh("netstat", &["-rn", "-f", "inet"])
+            )
+        };
+
+        let cfg = sh("ifconfig", &[&iface]);
+        let shaped = [
+            "inet",
+            "100.65.0.5",
+            "-->",
+            "100.65.0.5",
+            "netmask",
+            "0xfffffc00",
+        ];
+        assert!(
+            cfg.lines().any(|l| l
+                .split_whitespace()
+                .take(shaped.len())
+                .eq(shaped.iter().copied())),
+            "the first address must be its own peer, with the block's mask:\n{}",
+            state()
+        );
+        let block = super::parse_bsd_route_get(&sh(
+            "route",
+            &[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+            ],
+        ));
+        assert!(
+            super::bsd_route_is_ours(block.as_ref(), "100.65.0.0".parse().unwrap(), 22, &iface),
+            "the overlay block must be routed on {iface}: {block:?}\n{}",
+            state()
+        );
+        // The node's own address, and one of the block's that no peer holds.
+        for dest in ["100.65.0.5", "100.65.1.77"] {
+            let got = route_get("-inet", dest);
+            assert_eq!(
+                got.as_ref().and_then(|g| g.interface.as_deref()),
+                Some(iface.as_str()),
+                "`route -n get {dest}` must answer {iface}, not the default route: {got:?}\n{}",
+                state()
+            );
+        }
+    }
+
+    /// #4117 — TEMPORARY, removed with the fix: what this kernel does with a
+    /// utun's first address in each shape, printed for the record. Asserts
+    /// nothing about the kernel.
+    #[tokio::test]
+    async fn measure_4117_first_address_shapes() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        fn run(prog: &str, args: &[&str]) -> String {
+            match std::process::Command::new(prog).args(args).output() {
+                Ok(o) => format!(
+                    "{prog} {args:?}: {} stdout={:?} stderr={:?}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => format!("{prog} {args:?}: could not run: {e}"),
+            }
+        }
+        fn describe(p: &[u8]) -> String {
+            match p.first().map(|b| b >> 4) {
+                Some(4) if p.len() >= 20 => format!(
+                    "v4 proto={} {}.{}.{}.{} -> {}.{}.{}.{} len={}",
+                    p[9],
+                    p[12],
+                    p[13],
+                    p[14],
+                    p[15],
+                    p[16],
+                    p[17],
+                    p[18],
+                    p[19],
+                    p.len()
+                ),
+                Some(6) if p.len() >= 40 => format!("v6 next={} len={}", p[6], p.len()),
+                _ => format!("{} bytes {:02x?}", p.len(), &p[..p.len().min(24)]),
+            }
+        }
+        async fn probe(tun: &SystemTun, stage: &str) {
+            use std::time::Duration;
+            while let Ok(Ok(p)) =
+                tokio::time::timeout(Duration::from_millis(150), tun.read_packet()).await
+            {
+                eprintln!(
+                    "{stage}: queued on the utun before the probe: {}",
+                    describe(&p)
+                );
+            }
+            let ip = Ipv4Addr::new(100, 65, 0, 5);
+            match std::net::UdpSocket::bind((ip, 0)) {
+                Err(e) => eprintln!("{stage}: bind {ip}:0: {e}"),
+                Ok(rx) => {
+                    let _ = rx.set_read_timeout(Some(Duration::from_millis(700)));
+                    let to = rx.local_addr().expect("local addr");
+                    for (label, from) in [
+                        ("unbound sender", Ipv4Addr::UNSPECIFIED),
+                        ("sender bound to the overlay address", ip),
+                    ] {
+                        let sent = std::net::UdpSocket::bind((from, 0))
+                            .and_then(|tx| tx.send_to(b"roomler-4117", to));
+                        let mut buf = [0u8; 64];
+                        let got = rx
+                            .recv_from(&mut buf)
+                            .map(|(n, src)| format!("{n} bytes from {src}"));
+                        eprintln!(
+                            "{stage}: local UDP, {label} -> {to}: sent={sent:?} delivered={got:?}"
+                        );
+                        match tokio::time::timeout(Duration::from_millis(400), tun.read_packet())
+                            .await
+                        {
+                            Ok(Ok(p)) => eprintln!("{stage}:   the utun read {}", describe(&p)),
+                            _ => eprintln!("{stage}:   the utun read nothing"),
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "{stage}: {}",
+                run("ping", &["-c", "1", "-t", "2", "100.65.0.5"])
+            );
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let dump = |stage: &str| {
+            let routes = sh("netstat", &["-rn", "-f", "inet"]);
+            let mine: Vec<&str> = routes
+                .lines()
+                .filter(|l| {
+                    l.contains(iface.as_str())
+                        || l.trim_start().starts_with("100.")
+                        || l.trim_start().starts_with("default")
+                })
+                .collect();
+            eprintln!(
+                "==== #4117 {stage}\n-- ifconfig {iface}:\n{}\n-- netstat -rn -f inet \
+                 (utun, 100.x, default):\n{}\n-- {}\n-- {}\n-- {}",
+                sh("ifconfig", &[&iface]),
+                mine.join("\n"),
+                run("route", &["-n", "get", "100.65.0.5"]),
+                run("route", &["-n", "get", "100.65.1.77"]),
+                run(
+                    "route",
+                    &[
+                        "-n",
+                        "get",
+                        "-inet",
+                        "-net",
+                        "100.65.0.0",
+                        "-prefixlen",
+                        "22"
+                    ]
+                ),
+            );
+        };
+
+        dump("A: as the bring-up leaves it");
+        probe(&tun, "A").await;
+        let alias = [
+            iface.as_str(),
+            "inet",
+            "100.65.0.5",
+            "100.65.0.5",
+            "netmask",
+            "255.255.252.0",
+            "alias",
+        ];
+        eprintln!("B: {}", run("ifconfig", &alias));
+        dump("B: the address as its own peer, with the block's mask");
+        probe(&tun, "B").await;
+        let add = [
+            "-n",
+            "add",
+            "-inet",
+            "-net",
+            "100.65.0.0",
+            "-prefixlen",
+            "22",
+            "-interface",
+            iface.as_str(),
+        ];
+        eprintln!("C: {}", run("route", &add));
+        dump("C: and the block routed on the utun");
+        probe(&tun, "C").await;
+        eprintln!("D: the same add again: {}", run("route", &add));
+        eprintln!("D: the same alias again: {}", run("ifconfig", &alias));
+        dump("D: after both again");
+        drop(tun);
+    }
+
     /// #1856 — the route guard re-asserts every installed route on every
     /// wave. Re-asserting a route that is already ours must not WRITE: the
     /// old delete-then-add left the `/32` absent for ~3 ms per wave (an
