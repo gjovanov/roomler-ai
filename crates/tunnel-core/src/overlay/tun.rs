@@ -3572,6 +3572,10 @@ mod system {
         /// Windows. Seeded with the bring-up's decision, which logged its own.
         #[cfg(target_os = "macos")]
         utun_block_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), bool)>>,
+        /// #4125 — the read path's hand-back of a packet for this utun's own
+        /// address, and its count ([`Self::self_delivered`]).
+        #[cfg(target_os = "macos")]
+        self_delivery: SelfDelivery,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -5464,6 +5468,11 @@ mod system {
 
             own_adapters::register(&if_name, tun_luid, connected_v4_block);
 
+            // #4125 — the address is fixed for the device's life, so it is
+            // read once, here, with the kill switch.
+            #[cfg(target_os = "macos")]
+            let self_delivery = SelfDelivery::at_bring_up(opts.ip, &if_name);
+
             Ok(Self {
                 dev,
                 if_name,
@@ -5480,6 +5489,8 @@ mod system {
                 utun_block: utun_block.map(|(block, _)| block),
                 #[cfg(target_os = "macos")]
                 utun_block_state: std::sync::Mutex::new(utun_block.into_iter().collect()),
+                #[cfg(target_os = "macos")]
+                self_delivery,
                 #[cfg(windows)]
                 _wfp,
                 #[cfg(windows)]
@@ -5545,6 +5556,10 @@ mod system {
                 .recv(&mut buf)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // #4125 — a packet for the utun's own address goes back to the
+            // kernel, and the read goes on to the next packet.
+            #[cfg(target_os = "macos")]
+            let n = self.past_own_packets(&mut buf, n).await?;
             buf.truncate(n);
             Ok(buf)
         }
@@ -7379,6 +7394,151 @@ mod system {
         crate::env::flag("OVERLAY_UTUN_BLOCK_ROUTE", true)
     }
 
+    /// #4125 — `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0` stops the read path's
+    /// hand-back ([`SystemTun::past_own_packets`]): a packet the Mac sends to
+    /// its own overlay address is then read like any other, as with #4117
+    /// alone. Read once, at the bring-up. Default ON. With
+    /// `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` the hand-back never fires
+    /// either way: in that shape such a packet never enters the utun.
+    #[cfg(target_os = "macos")]
+    fn utun_self_delivery_enabled() -> bool {
+        crate::env::flag("OVERLAY_UTUN_SELF_DELIVERY", true)
+    }
+
+    /// #4125 — the shortest gap between two DEBUG lines for a failed
+    /// hand-back.
+    #[cfg(target_os = "macos")]
+    const SELF_DELIVERY_FAILED_LOG_MS: u64 = 60_000;
+
+    /// #4125 — a utun is point-to-point, and macOS adds no local route for a
+    /// utun's own address: with #4117's shape the address's host route is on
+    /// the utun, so a packet the Mac sends to its own overlay address goes
+    /// into the utun, and no peer holds that address. Linux and Windows
+    /// deliver such a packet through their kernel's local route, and the
+    /// daemon never sees it. Here the read path hands it back to the kernel
+    /// ([`SystemTun::past_own_packets`]), which delivers it as inbound.
+    #[cfg(target_os = "macos")]
+    struct SelfDelivery {
+        /// The utun's address, fixed for its life (a runtime whose netmap
+        /// names another one exits for a rebuild, and a device is reused
+        /// only for the same address). `None` with the kill switch off.
+        own: Option<Ipv4Addr>,
+        /// Packets handed back.
+        handed_back: std::sync::atomic::AtomicU64,
+        /// Packets whose write back failed, each dropped.
+        failed: std::sync::atomic::AtomicU64,
+        /// When a failed write last logged: ms after `since`, plus 1, so 0
+        /// is "never" and the first failure always logs.
+        failed_logged_at: std::sync::atomic::AtomicU64,
+        since: std::time::Instant,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SelfDelivery {
+        /// The hand-back for a utun brought up with `ip`, unless the kill
+        /// switch is off, which one INFO says.
+        fn at_bring_up(ip: Ipv4Addr, if_name: &str) -> Self {
+            let on = utun_self_delivery_enabled();
+            if !on {
+                tracing::info!(
+                    utun = %if_name, addr = %ip,
+                    "overlay: packets to this node's own overlay address are not handed back to \
+                     the OS (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)"
+                );
+            }
+            Self {
+                own: on.then_some(ip),
+                handed_back: std::sync::atomic::AtomicU64::new(0),
+                failed: std::sync::atomic::AtomicU64::new(0),
+                failed_logged_at: std::sync::atomic::AtomicU64::new(0),
+                since: std::time::Instant::now(),
+            }
+        }
+
+        /// One more packet handed back. The first logs ONE INFO; the rest
+        /// are only counted.
+        fn note_handed_back(&self, if_name: &str) {
+            if self
+                .handed_back
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+                && let Some(own) = self.own
+            {
+                tracing::info!(
+                    utun = %if_name, addr = %own,
+                    "overlay: a packet to this node's own overlay address was handed back to \
+                     the OS; the next ones are counted, not logged"
+                );
+            }
+        }
+
+        /// A write back failed and its packet is dropped: counted, and a
+        /// DEBUG line at most once a [`SELF_DELIVERY_FAILED_LOG_MS`], with a
+        /// compare-and-swap so two readers never both log (as `wg.rs` throttles
+        /// its reverse-path line).
+        fn note_failed(&self, if_name: &str, e: &std::io::Error) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let failed = self.failed.fetch_add(1, Relaxed) + 1;
+            let now = self.since.elapsed().as_millis() as u64 + 1;
+            let last = self.failed_logged_at.load(Relaxed);
+            if (last == 0 || now.saturating_sub(last) >= SELF_DELIVERY_FAILED_LOG_MS)
+                && self
+                    .failed_logged_at
+                    .compare_exchange(last, now, Relaxed, Relaxed)
+                    .is_ok()
+            {
+                tracing::debug!(
+                    utun = %if_name, error = %e, failed,
+                    "overlay: a packet to this node's own overlay address could not be handed \
+                     back to the OS; dropped"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl SystemTun {
+        /// #4125 — while the packet in `buf[..n]` is for this utun's own
+        /// address ([`super::utun_hands_back`]), write it back into the utun
+        /// as it came (no TTL or hop-limit change, no new checksum), and read
+        /// the next packet into `buf`. Returns the length of the first packet
+        /// that is not, which [`TunIo::read_packet`] returns as before: a
+        /// handed-back packet never reaches the outbound path.
+        ///
+        /// The write is the device's own, the one under
+        /// [`TunIo::write_packet`], without the wait for writability that
+        /// `AsyncDevice::send` adds: the descriptor is non-blocking, so a
+        /// write the kernel does not take at once fails here. A failed write
+        /// drops its packet ([`SelfDelivery::note_failed`]), and nothing is
+        /// written twice: a hand-back never holds up the read.
+        async fn past_own_packets(&self, buf: &mut [u8], mut n: usize) -> std::io::Result<usize> {
+            let sd = &self.self_delivery;
+            while super::utun_hands_back(&buf[..n], sd.own) {
+                let device: &tun::Device = &self.dev;
+                match device.send(&buf[..n]) {
+                    Ok(_) => sd.note_handed_back(&self.if_name),
+                    Err(e) => sd.note_failed(&self.if_name, &e),
+                }
+                n = self
+                    .dev
+                    .recv(buf)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            Ok(n)
+        }
+
+        /// #4125 — how many packets this utun's read path has handed back to
+        /// the OS, each a packet for the utun's own address. A count, as
+        /// `SplitTun::intercepted` is, that a test or a diagnostic reads; only
+        /// the first hand-back logs a line.
+        pub fn self_delivered(&self) -> u64 {
+            self.self_delivery
+                .handed_back
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
     /// #4117 — the gate's address input ([`super::bsd_non_overlay_v4`]) as
     /// the interfaces show it right now. Ours are `overlay_if` and the names
     /// in `own_adapters`, where `up_with` registers each utun by the name the
@@ -8365,6 +8525,135 @@ mod system {
         }
     }
 }
+
+/// #4125 — whether a utun's read path hands `packet` back to the OS: its
+/// destination, as
+/// [`Router::dst_of_ip_packet`](crate::overlay::router::Router::dst_of_ip_packet)
+/// reads it (an IPv4 destination, or the IPv4 a derived overlay IPv6
+/// carries), is the utun's own address `own`. `None` is the kill switch off:
+/// then nothing is. One comparison, no allocation, no lock.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_hands_back(packet: &[u8], own: Option<std::net::Ipv4Addr>) -> bool {
+    own.is_some_and(|own| crate::overlay::router::Router::dst_of_ip_packet(packet) == Some(own))
+}
+
+#[cfg(test)]
+mod utun_self_delivery_tests {
+    use super::utun_hands_back;
+    use crate::overlay::router::derive_overlay_v6;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const OWN: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 5);
+    const PEER: Ipv4Addr = Ipv4Addr::new(100, 65, 0, 9);
+
+    /// A UDP packet from `src` to `dst`, with a full IPv4 header.
+    fn v4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p
+    }
+
+    /// A UDP packet from `src` to `dst`, with a full IPv6 header.
+    fn v6(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&8u16.to_be_bytes());
+        p[6] = 17;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p
+    }
+
+    #[test]
+    fn a_packet_to_its_own_v4_is_handed_back_whatever_its_source() {
+        for src in [OWN, PEER, Ipv4Addr::new(192, 168, 1, 10)] {
+            assert!(utun_hands_back(&v4(src, OWN), Some(OWN)), "from {src}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_a_peer_the_block_or_the_internet_is_not() {
+        for dst in [
+            PEER,
+            Ipv4Addr::new(100, 65, 0, 4),
+            Ipv4Addr::new(100, 65, 0, 6),
+            Ipv4Addr::new(100, 65, 0, 0),
+            Ipv4Addr::new(100, 65, 3, 255),
+            Ipv4Addr::new(100, 64, 0, 5),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            assert!(!utun_hands_back(&v4(OWN, dst), Some(OWN)), "to {dst}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_its_own_derived_v6_is_handed_back() {
+        let own6 = derive_overlay_v6(OWN);
+        for src in [own6, derive_overlay_v6(PEER)] {
+            assert!(utun_hands_back(&v6(src, own6), Some(OWN)), "from {src}");
+        }
+    }
+
+    #[test]
+    fn a_packet_to_any_other_v6_is_not() {
+        let own6 = derive_overlay_v6(OWN);
+        // The same low 32 bits under another prefix.
+        let mut s = own6.segments();
+        s[2] ^= 1;
+        let beside = Ipv6Addr::from(s);
+        for dst in [
+            derive_overlay_v6(PEER),
+            beside,
+            "fd00::6441:5".parse().unwrap(),
+            "fe80::6441:5".parse().unwrap(),
+            "ff02::1".parse().unwrap(),
+            "ff02::fb".parse().unwrap(),
+            "2001:db8::6441:5".parse().unwrap(),
+            Ipv6Addr::LOCALHOST,
+            OWN.to_ipv6_mapped(),
+        ] {
+            assert!(!utun_hands_back(&v6(own6, dst), Some(OWN)), "to {dst}");
+        }
+    }
+
+    #[test]
+    fn a_packet_shorter_than_its_header_is_not() {
+        let p4 = v4(OWN, OWN);
+        for len in 0..20 {
+            assert!(!utun_hands_back(&p4[..len], Some(OWN)), "IPv4, {len} bytes");
+        }
+        let own6 = derive_overlay_v6(OWN);
+        let p6 = v6(own6, own6);
+        for len in 0..40 {
+            assert!(!utun_hands_back(&p6[..len], Some(OWN)), "IPv6, {len} bytes");
+        }
+    }
+
+    #[test]
+    fn a_packet_of_another_version_is_not() {
+        let mut p = v4(OWN, OWN);
+        for version in [0u8, 5, 7, 15] {
+            p[0] = (version << 4) | 5;
+            assert!(!utun_hands_back(&p, Some(OWN)), "version {version}");
+        }
+    }
+
+    #[test]
+    fn with_the_kill_switch_off_nothing_is() {
+        let own6 = derive_overlay_v6(OWN);
+        assert!(!utun_hands_back(&v4(OWN, OWN), None));
+        assert!(!utun_hands_back(&v6(own6, own6), None));
+    }
+}
+
 /// macOS overlay networking against a REAL utun.
 ///
 /// Everything in the macOS arms — address aliasing, peer `/32`s, subnet
@@ -9863,9 +10152,18 @@ mod macos_kernel_tests {
     const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
     /// The words of the one INFO line a utun logs at its first hand-back.
     const HANDED_BACK: &str = "was handed back to the OS";
+    /// The words of the INFO a bring-up logs with the kill switch off.
+    const SELF_DELIVERY_OFF: &str =
+        "are not handed back to the OS (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)";
 
-    /// How many packets `tun` has handed back to the kernel. Nothing hands
-    /// back yet: the fix reads the utun's own count here.
+    /// How many packets `tun` has handed back to the kernel.
+    #[cfg(target_os = "macos")]
+    fn handed_back(tun: &SystemTun) -> u64 {
+        tun.self_delivered()
+    }
+
+    /// Off macOS every test here skips before it reads a count.
+    #[cfg(not(target_os = "macos"))]
     fn handed_back(_tun: &SystemTun) -> u64 {
         0
     }
@@ -10116,6 +10414,7 @@ mod macos_kernel_tests {
         // SAFETY: the kernel tests run on one thread; nothing else reads it.
         unsafe { crate::env::test_env::set("OVERLAY_UTUN_SELF_DELIVERY", "0") };
 
+        let (logs, _guard) = Logs::start();
         let own = Ipv4Addr::new(100, 65, 0, 5);
         let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
         let mut reads = read_utun(tun.clone());
@@ -10137,11 +10436,24 @@ mod macos_kernel_tests {
             "switched off, the datagram is read from the utun"
         );
         assert_eq!(handed_back(&tun), 0, "switched off, nothing is handed back");
+        let text = logs.text();
+        assert_eq!(
+            logs.lines_with(SELF_DELIVERY_OFF).len(),
+            1,
+            "one INFO at the bring-up says so:\n{text}"
+        );
+        assert!(
+            logs.lines_with(HANDED_BACK).is_empty(),
+            "and none for a hand-back:\n{text}"
+        );
     }
 
-    /// #4125 (e) — the same exchange with the node's derived IPv6. It also
-    /// prints what macOS does with a packet to that address: the route its
-    /// lookup answers, and whether the packet came out of the utun.
+    /// #4125 (e) — the same exchange with the node's derived IPv6. macOS routes
+    /// that address as a local one, and still, on #4117's code, a datagram to
+    /// it was read from the utun and never delivered (measured on the CI
+    /// runner). So it is handed back too: one hand-back for the datagram, one
+    /// for its reply, and neither comes out of the read. It also prints the
+    /// route macOS answers for the address.
     #[tokio::test]
     async fn a_datagram_to_its_own_derived_v6_is_delivered_and_answered() {
         if !cfg!(target_os = "macos") {
@@ -10178,28 +10490,32 @@ mod macos_kernel_tests {
         let mut buf = [0u8; 64];
         let got = tokio::time::timeout(WAIT, server.recv_from(&mut buf)).await;
         let read = reads_to(&mut reads, own);
+        let first = handed_back(&tun) - before;
         eprintln!(
             "measure (#4125 v6): the datagram to {to}: delivered={}, read from the utun={read}, \
-             handed back={}",
-            got.is_ok(),
-            handed_back(&tun) - before
+             handed back={first}",
+            got.is_ok()
         );
         let (_, from) = got
             .unwrap_or_else(|_| {
                 panic!("a datagram to {to} is not delivered (read from the utun: {read})")
             })
             .unwrap();
+        assert_eq!(read, 0, "a packet to {own_v6} came out of read_packet");
+        assert_eq!(first, 1, "one datagram, one hand-back");
         server.send_to(b"answer", from).await.unwrap();
         let back = tokio::time::timeout(WAIT, client.recv_from(&mut buf)).await;
+        let read = reads_to(&mut reads, own);
+        let total = handed_back(&tun) - before;
         eprintln!(
-            "measure (#4125 v6): the reply to {from}: delivered={}, read from the utun={}, \
-             handed back={}",
-            back.is_ok(),
-            reads_to(&mut reads, own),
-            handed_back(&tun) - before
+            "measure (#4125 v6): the reply to {from}: delivered={}, read from the utun={read}, \
+             handed back={total}",
+            back.is_ok()
         );
         back.unwrap_or_else(|_| panic!("the reply to {from} never comes back"))
             .unwrap();
+        assert_eq!(read, 0, "the reply to {from} came out of read_packet");
+        assert_eq!(total, 2, "and one more hand-back for the reply");
     }
 
     /// #4125 — the overlay's own resolver, bound to the utun's address as the

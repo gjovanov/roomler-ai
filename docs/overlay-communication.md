@@ -1146,7 +1146,7 @@ an installer the old daemon started is still running.
 
 | Platform | How | Window in which a fork on another thread gets a copy |
 |---|---|---|
-| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:3638`) | none |
+| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:3642`) | none |
 | macOS | a utun is a socket, and macOS takes no close-on-exec flag at `socket()`, so the descriptor is marked on the line after the create | create → mark. The long-lived children and every child that runs a caller's code sweep everything above stderr ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)) |
 | Windows | Wintun has no descriptor to inherit | — |
 
@@ -1173,10 +1173,10 @@ guard, above), which is why a mesh with peers kept working.
 
 The bring-up now gives the first address the shape wg-quick gives a utun on
 macOS, routes the block on it while the gate below allows it, and reads both
-back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:7531`, called
-from `up_with` at `tun.rs:5243`). Every route-guard wave then decides the
+back (`shape_utun_v4`, `crates/tunnel-core/src/overlay/tun.rs:7691`, called
+from `up_with` at `tun.rs:5247`). Every route-guard wave then decides the
 block's route again, with the function the bring-up used
-(`decide_utun_block`, `tun.rs:7442`):
+(`decide_utun_block`, `tun.rs:7602`):
 
 ```mermaid
 flowchart TD
@@ -1212,15 +1212,15 @@ fails withholds (`utun_block_gate`, `tun.rs:804`).
 
 | Input | Read from | Withholds when |
 |---|---|---|
-| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:7388`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:950`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
-| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:7406`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:837`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
+| Every IPv4 address of every other interface | `getifaddrs`, through the `if-addrs` crate (`bsd_non_overlay_v4_now`, `tun.rs:7548`). Left out: loopback's, this utun's, and those of every utun this daemon created, by the name the kernel gave each one (`own_adapters`; `bsd_non_overlay_v4`, `tun.rs:950`) | one of them sits inside the block; or the list cannot be read, or does not show this utun |
+| The default gateway | `route -n get -inet default`, read again for every decision (`bsd_default_gateway_v4_now`, `tun.rs:7566`). When the default route has no next hop, as a full-tunnel VPN's interface route has none, the IPv4 uplink the overlay holds for its exit pins (`utun_gate_gateway`, `tun.rs:837`). The bring-up holds none yet | it sits inside the block; or `route` cannot run |
 
 "Ours" is never a name prefix: another product's utun is named the same way.
 A sibling org's utun carries an address inside this one's block whenever the
 two blocks nest or are the same (the legacy `/10`), and counting it would
 withhold the block, which is the trap #1237 was on Windows. So `up_with`
 registers each utun as soon as the kernel has named it, before its own
-decision runs (`tun.rs:5241`); the registration at the end of `up_with` stays.
+decision runs (`tun.rs:5245`); the registration at the end of `up_with` stays.
 
 **The decision** (`utun_block_step`, `tun.rs:928`) takes the gate and the
 block's own lookup (`utun_block_held`, `tun.rs:883`), and writes at most once:
@@ -1251,7 +1251,7 @@ add would start the next wave every time.
   `defend_block_floor` on every platform
   (`crates/tunnel-core/src/overlay/runtime/route_guard.rs:129`). Windows keeps
   its block floors there; a Mac has none, and its arm is this decision for
-  the utun's block, on the blocking pool (`tun.rs:5891`, `tun.rs:5999`). A
+  the utun's block, on the blocking pool (`tun.rs:5906`, `tun.rs:6014`). A
   Mac that joins a network with an address or a gateway inside the block
   loses the block's route on the next wave, and gets it back on the first wave
   after it leaves. A route something else deleted, such as a VPN that reaps
@@ -1287,7 +1287,7 @@ add would start the next wave every time.
   is its own peer and the block routes on it`. macOS `route` exits 0 when the
   kernel refuses a write (`route: writing to routing socket: File exists`,
   measured), so the read-back decides, never an exit status (`run_bringup`,
-  `tun.rs:7490`).
+  `tun.rs:7650`).
 * **Another product may route the CGNAT range.** Another mesh on the same Mac
   can hold `100.64.0.0/10`. A per-org block is usually narrower than that, so
   its route is added beside the other one and wins by longest prefix. A route
@@ -1305,7 +1305,7 @@ add would start the next wave every time.
 * **Kill switch:** `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` leaves the utun as the
   `tun` crate made it, as through 0.4.228, logs `overlay: utun left as
   created`, and no wave decides anything for the block
-  (`utun_block_route_enabled`, `tun.rs:7378`). It is read from the daemon's
+  (`utun_block_route_enabled`, `tun.rs:7393`). It is read from the daemon's
   environment; there is no `config.toml` key.
 
 The `macos_kernel_tests` run as root against a real utun in the CI step `macOS
@@ -1313,20 +1313,101 @@ overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:8699`) | the shape |
-| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:8772`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
-| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:8858`) | 0.4.228's shape, and no wave routes the block |
-| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:8910`) | a peer's `/32` beside the block |
-| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:8971`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
-| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:9022`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
-| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:9086`) | a deleted block route is back after one wave |
-| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:9133`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
-| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:9252`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
-| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:9295`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
+| `the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun` (`tun.rs:8988`) | the shape |
+| `a_block_another_product_holds_is_left_alone_and_the_bring_up_stands` (`tun.rs:9061`) | a route for exactly the block on `lo0` stays there, and the address still gets its shape and its host route |
+| `the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it` (`tun.rs:9147`) | 0.4.228's shape, and no wave routes the block |
+| `a_peer_route_comes_and_goes_beside_the_block_route` (`tun.rs:9199`) | a peer's `/32` beside the block |
+| `an_address_inside_the_block_withholds_the_block_route_at_bring_up` (`tun.rs:9260`) | an `lo0` alias inside the block withholds at the bring-up, with one WARN naming it; the address keeps its shape and its host route |
+| `a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it` (`tun.rs:9311`) | the alias added after the bring-up: the next wave deletes our route, one WARN for two waves; the alias gone: the next wave routes the block again, one INFO |
+| `a_reaped_block_route_is_restored_by_the_next_wave` (`tun.rs:9375`) | a deleted block route is back after one wave |
+| `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:9422`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
+| `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:9541`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
+| `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:9584`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
 
 The parsers, the argv builders, the gate and the decision are pure and tested
 on every platform (`utun_shape_tests`, `tun.rs:971`; `utun_block_gate_tests`,
 `tun.rs:1181`), with the line the lab Mac printed on 0.4.228 as a fixture.
+
+### A Mac answers its own overlay address (#4125)
+
+A utun is point-to-point, and macOS adds no local route for a utun's own
+address. With #4117's shape the address's host route is on the utun, so a
+packet the Mac sends to its own overlay address goes into the utun, and the
+daemon reads it. No peer holds that address, so on #4117's code `ping <self>`
+on the Mac got no answer, and neither did the Mac's own lookups of overlay
+names: MagicDNS listens on `<self>:53`
+(`crates/tunnel-core/src/overlay/runtime.rs:2438`), and macOS sends the overlay
+zone there (`runtime.rs:2478`, then
+`crates/tunnel-core/src/overlay/dns.rs:537`). Linux and Windows deliver such a
+packet through their kernel's local route for the address, and the daemon
+never sees it.
+
+The utun's read path now hands such a packet back to the OS. It writes the
+packet back into the same utun as it came, and the kernel takes it as inbound
+and delivers it, as it delivers a peer's packet (`past_own_packets`,
+`crates/tunnel-core/src/overlay/tun.rs:7514`, called from `read_packet` at
+`tun.rs:5562`). A reply to it is a packet to the same address, so it takes the
+same way back:
+
+```mermaid
+flowchart TD
+    app["a program on the Mac sends to the node's own overlay address, such as ping or a lookup at the resolver"] --> utun["the kernel sends it into the utun, by the address's host route"]
+    utun --> read["the utun's read path reads it"]
+    read --> own{"is the destination this utun's own address?"}
+    own -- yes --> back["written back into the utun, as it came"]
+    back --> deliver["the kernel takes it as inbound and delivers it"]
+    back --> next["the read goes on to the next packet"]
+    next --> read
+    own -- no --> pump["returned to the outbound path, which sends it to the peer that holds the address"]
+```
+
+| Rule | What the read path does |
+|---|---|
+| Which packets | those whose destination is the utun's own address (`utun_hands_back`, `tun.rs:8536`), read as `Router::dst_of_ip_packet` reads it (`crates/tunnel-core/src/overlay/router.rs:475`): an IPv4 destination, or the IPv4 a derived overlay IPv6 carries. So the node's derived IPv6 is handed back too, and no other IPv6 is |
+| As it came | no TTL or hop-limit change and no new checksum: the node is not routing it |
+| Never forwarded | a handed-back packet never reaches the outbound path |
+| A failed write | drops the packet, and it is never written again. The write is the device's own non-blocking one, without the wait for writability that the write of a peer's packet has, so a write the kernel does not take at once fails as well, and a hand-back never holds up the read. A DEBUG line, at most once a minute, reads `overlay: a packet to this node's own overlay address could not be handed back to the OS; dropped`, with the count of failed writes |
+| Cost | one comparison per packet read, with no allocation and no lock |
+| Platforms | macOS only. Linux and Windows read as before |
+
+* **The utun's own address** is the one it was brought up with, read once, at
+  the bring-up (`SelfDelivery`, `tun.rs:7421`, from `up_with` at
+  `tun.rs:5474`). It does not change while the utun lives: a runtime whose
+  netmap names another address exits for a rebuild (`runtime.rs:3941`), and
+  the daemon reuses a utun only for the same address. Each utun hands back only
+  its own address; a sibling org's utun hands back its own.
+* **IPv6.** macOS routes the derived IPv6 as a local address, and still, on
+  #4117's code, a datagram the Mac sent to it was read from the utun and never
+  delivered (measured on a macOS 26 CI runner). The same comparison covers it,
+  so it is handed back like the IPv4 address.
+* **The count.** `SystemTun::self_delivered` (`tun.rs:7535`) counts the packets
+  a utun has handed back. The first one logs ONE INFO, `overlay: a packet to
+  this node's own overlay address was handed back to the OS; the next ones are
+  counted, not logged`. There is no line per packet.
+* **Kill switch:** `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0` stops the hand-back:
+  such a packet is then read like any other and gets no answer, as with #4117
+  alone (`utun_self_delivery_enabled`, `tun.rs:7404`). It is read
+  once, at the bring-up, which then logs `overlay: packets to this node's own
+  overlay address are not handed back to the OS
+  (ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0)`. It is independent of
+  `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0`: in that shape a self-addressed packet
+  never enters the utun, so the hand-back never fires. It is read from the
+  daemon's environment; there is no `config.toml` key.
+
+The `macos_kernel_tests` drive the read path the daemon runs, as root on a real
+utun in #4117's shape, in the CI step `macOS overlay against a real utun`:
+
+| Test | Asserts |
+|---|---|
+| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10252`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
+| `a_ping_to_its_own_address_is_answered` (`tun.rs:10291`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
+| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10332`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
+| `the_kill_switch_hands_nothing_back` (`tun.rs:10404`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
+| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:10458`) | the same exchange with the derived IPv6: delivered, answered, one hand-back each way |
+| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:10524`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+
+The rule is pure and tested on every platform (`utun_self_delivery_tests`,
+`tun.rs:8541`).
 
 ---
 
@@ -1354,6 +1435,7 @@ prefix is still honoured.
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 | `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
 | `…_UTUN_BLOCK_ROUTE` | **on** (#4117) | macOS: the utun's first address is its own peer, and the overlay block is routed on the utun while no other interface's address and no default gateway sits inside the block, decided again on every route-guard wave (§8); off = the utun as the `tun` crate made it, as through 0.4.228, and no wave decides anything for the block. Environment only |
+| `…_UTUN_SELF_DELIVERY` | **on** (#4125) | macOS: the utun's read path hands a packet the Mac sends to its own overlay address, IPv4 or derived IPv6, back to the OS, so it is answered (§8); off = it is read like any other packet and gets no answer, as with #4117 alone. Environment only |
 
 One DERP knob sits outside that prefix: the queue's age bound,
 `ROOMLERD_DERP_QUEUE_MAX_AGE_MS`, default 100, where `0` turns the check off
