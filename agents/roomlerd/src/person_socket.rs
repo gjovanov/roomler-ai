@@ -723,6 +723,11 @@ async fn follow_the_seat(
             failed = Some((l.uid, Instant::now()));
         }
         let look = look_at_the_seat(following.wait).await;
+        // #4119 — the Mac's consent panel follows the look too: a seat that
+        // empties or changes hands ends a root process's panel, which then
+        // makes no window (`indicator::mac::seat_looked`).
+        #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+        crate::indicator::mac::seat_looked(&look);
         match (&look, not_known_since) {
             (Look::NotKnown(why), None) => {
                 tracing::warn!(

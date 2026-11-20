@@ -31,6 +31,14 @@ pub use devices::{
     MeshEdgeEndLite, MeshEdgeLite, MeshNodeLite, MeshView,
 };
 
+// #1363 — MagicDNS's measured outcome and the words every client prints for
+// it, in one place so the CLI and the companion cannot disagree.
+mod dns_health;
+pub use dns_health::{
+    DNS_PROBE_EVERY_MAX_MS, DNS_PROBE_EVERY_MS, DNS_PROBE_LATE_MS, DnsHealth, DnsProbeOutcome,
+    DnsProbeStatus, DnsUnreachedReason, LegacyDns,
+};
+
 /// How this node currently reaches a peer — the Tailscale-style connection
 /// type shown per device in the UI. `Tunnel` is the userspace SOCKS/forward
 /// path (used when a corp full-tunnel VPN captures the overlay's routes);
@@ -728,14 +736,21 @@ fn is_zero_u32(v: &u32) -> bool {
 /// desktop's DNS section and `roomler status` render. Tenant-level
 /// domain administration stays server-side (web admin); these are the
 /// per-node facts.
+///
+/// #1363 — read it through [`DnsStatus::health`], never field by field:
+/// `resolver_bound` and `os_steer_active` record attempts, and only `probe`
+/// records whether the OS actually reaches the resolver.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DnsStatus {
     /// The magic domain in effect (e.g. `tenant.roomler.net`).
     pub magic_domain: String,
-    /// The local resolver bound `<overlay-ip>:53` (the split-DNS target).
+    /// The local resolver holds `<overlay-ip>:53` (the split-DNS target)
+    /// right now. #1363: it follows the resolver for the whole session, so a
+    /// resolver that lost its socket and is rebinding reads `false`.
     pub resolver_bound: bool,
-    /// The OS was successfully pointed at our resolver for the magic
-    /// domain (split-DNS steer active; reverted on daemon exit).
+    /// The OS steer for the magic domain was WRITTEN (Windows: the NRPT rule
+    /// was added; reverted on daemon exit). Not evidence that it is in
+    /// effect: a policy-managed NRPT discards a written rule (#1363).
     pub os_steer_active: bool,
     /// Upstream resolver non-overlay queries forward to.
     pub upstream: String,
@@ -749,6 +764,16 @@ pub struct DnsStatus {
     /// nothing is claimed that was never measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_steer_bypassed: Option<String>,
+    /// #1363 — the measured outcome: what the OS made of
+    /// `_roomler-probe.<magic domain>` and when. `None` from a daemon that
+    /// predates the measurement; its clients then print today's words and
+    /// never claim the resolver answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<DnsProbeStatus>,
+    /// #1363 — FR-72 P6's hosts-file rung is serving the names (the OS DNS
+    /// path was measured not to reach the resolver).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosts_fallback: bool,
 }
 
 /// NAT-traversal: the outcome of this node's server-reflexive (STUN) gather.

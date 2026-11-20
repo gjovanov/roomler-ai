@@ -1273,8 +1273,8 @@ fn netd_enabled() -> bool {
     }
     // FR-66: `read_if_present`, NOT `load`. This path is legitimately absent on
     // every user-context install (the worker runs in session 1 and keeps its
-    // config under `%APPDATA%`), and `load` announces a missing config as
-    // `the host must be re-enrolled` at ERROR — so probing an optional flag
+    // config under `%APPDATA%`), and `load` announces a missing config at
+    // ERROR, with advice to enroll (again) — so probing an optional flag
     // through it told every healthy host to re-enroll on every service start.
     // Behaviour here is unchanged: absent still means the flag is off.
     let p = crate::config::machine_global_config_path();

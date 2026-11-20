@@ -2829,8 +2829,8 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // key recognises the box across orgs (and across the %PROGRAMDATA% vs
     // %APPDATA% path drift that re-enroll's rc.52 BLOCKER-6 guards against).
     // FR-66: `read_if_present`, NOT `load(..).ok()`. A FIRST enrollment has no
-    // config by definition, and `load` announces a missing one as `the host
-    // must be re-enrolled` at ERROR — so enrolling a clean machine told the
+    // config by definition, and `load` announces a missing one at ERROR, with
+    // advice to enroll (again) — so enrolling a clean machine told the
     // operator to re-enroll it, mid-enrollment. Behaviour is unchanged: absent
     // still means "no machine_id to reuse".
     //

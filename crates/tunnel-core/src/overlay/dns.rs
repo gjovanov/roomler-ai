@@ -93,8 +93,25 @@ pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
 /// Both orgs, five hours dead — while a probe minutes later bound the same
 /// address on the first try. Nothing was holding it any more; nothing asked.
 pub async fn run(cfg: DnsConfig, bound: tokio::sync::watch::Sender<bool>) {
+    let addr = cfg.bind;
+    run_with(cfg, bound, move || UdpSocket::bind(addr), serve).await;
+}
+
+/// [`run`] with the bind and the serve loop injected, so a test can take the
+/// socket away the way a failed receive does.
+pub(crate) async fn run_with<B, BF, S, SF>(
+    cfg: DnsConfig,
+    bound: tokio::sync::watch::Sender<bool>,
+    bind: B,
+    serve: S,
+) where
+    B: Fn() -> BF,
+    BF: std::future::Future<Output = std::io::Result<UdpSocket>>,
+    S: Fn(DnsConfig, Arc<UdpSocket>) -> SF,
+    SF: std::future::Future<Output = ()>,
+{
     loop {
-        let sock = bind_until_up(&cfg, &bound).await;
+        let sock = bind_until_up(&cfg, &bound, &bind).await;
         // P5 S4b — tell the runtime the resolver is actually listening, so it
         // only steers the "." catch-all at this address when there IS a live
         // resolver. Steering "." at a dead :53 would blackhole ALL DNS (worse
@@ -103,10 +120,17 @@ pub async fn run(cfg: DnsConfig, bound: tokio::sync::watch::Sender<bool>) {
         // ⚠️ This can now fire LATE — after the runtime's initial wait gave up.
         // The runtime therefore keeps watching it and installs the steer when it
         // flips, instead of reading it once. A `watch` (not a `oneshot`) is what
-        // makes the late arrival observable at all.
-        let _ = bound.send(true);
+        // makes the late arrival observable at all. `send_replace` stores the
+        // value even while no receiver is alive.
+        bound.send_replace(true);
         info!(bind = %cfg.bind, domain = %cfg.magic_domain, "magicdns: resolver up");
-        serve(&cfg, sock).await;
+        serve(cfg.clone(), sock).await;
+        // #1363 — the socket is gone: say so NOW, not at the next failed bind.
+        // The status reads this for the whole session, and a resolver that
+        // sat in its rebind loop used to read as bound because only the first
+        // bind was ever reported. The OS steer does not follow it (one-way,
+        // see the runtime's tick): this is a report, not a revoke.
+        bound.send_replace(false);
         // #2213 — never just exit. The runtime keeps the OS steer for the
         // whole session (it only ever reacts to a LATE bind), so a resolver
         // that returned left the steer pointing at nothing: the magic domain
@@ -116,13 +140,18 @@ pub async fn run(cfg: DnsConfig, bound: tokio::sync::watch::Sender<bool>) {
 }
 
 /// Bind `cfg.bind`, retrying until it works.
-async fn bind_until_up(
+async fn bind_until_up<B, BF>(
     cfg: &DnsConfig,
     bound: &tokio::sync::watch::Sender<bool>,
-) -> Arc<UdpSocket> {
+    bind: &B,
+) -> Arc<UdpSocket>
+where
+    B: Fn() -> BF,
+    BF: std::future::Future<Output = std::io::Result<UdpSocket>>,
+{
     let mut attempt: u32 = 0;
     loop {
-        match UdpSocket::bind(cfg.bind).await {
+        match bind().await {
             Ok(s) => return Arc::new(s),
             Err(e) => {
                 // WARN once, then DEBUG: a permanently-held port (a real DNS
@@ -132,7 +161,7 @@ async fn bind_until_up(
                     // Report not-bound so the runtime withholds the OS steer.
                     // Steering at a resolver that never bound blackholes the
                     // magic domain host-wide (NRPT is registry-global).
-                    let _ = bound.send(false);
+                    bound.send_replace(false);
                     warn!(bind = %cfg.bind, %e, "magicdns: bind failed; retrying");
                 } else {
                     debug!(bind = %cfg.bind, %e, attempt, "magicdns: bind still failing");
@@ -156,7 +185,7 @@ async fn bind_until_up(
 /// which Windows reports on the NEXT receive ([`recv_error_is_transient`]).
 /// Field, 2026-10-14: both Windows exit clients' resolvers exited on it within
 /// ten seconds of the exit's "." steer pointing every query at them.
-async fn serve(cfg: &DnsConfig, sock: Arc<UdpSocket>) {
+async fn serve(cfg: DnsConfig, sock: Arc<UdpSocket>) {
     let mut buf = [0u8; 1500];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {

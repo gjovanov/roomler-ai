@@ -70,7 +70,7 @@ pub const AGENT_PLIST: &str = "com.roomler.agent.plist";
 pub const VERIFY_WITHIN: Duration = Duration::from_secs(60);
 /// How long the daemon that leaves may take to make way for the next one.
 pub const RESTART_WITHIN: Duration = Duration::from_secs(30);
-/// Between two reads of the daemon's status while waiting.
+/// Between two reads while waiting: of the daemon's status, or of `ps` (#4092).
 const POLL: Duration = Duration::from_millis(500);
 
 /// `path` with `.pre-one-row` after it: `config.toml` → `config.toml.pre-one-row`.
@@ -1591,6 +1591,15 @@ pub trait Host: Send {
     fn bootout_agent(&mut self, uid: u32) -> Result<()>;
     /// `launchctl` with [`bootstrap_argv`]'s arguments.
     fn bootstrap(&mut self, argv: &[String]) -> Result<()>;
+    /// #4092 — does a screen worker still run as `uid`: a process running
+    /// exactly `<roomlerd> run --supervised`, in either form
+    /// ([`crate::macos_supervisor::worker_commands`]), read from `ps` as the
+    /// supervisor reads it ([`crate::macos_supervisor::stale_workers`]).
+    /// `Err`: `ps` gave no answer in time.
+    async fn gui_worker_runs(&mut self, uid: u32) -> Result<bool>;
+    /// `launchctl kickstart gui/<uid>/com.roomler.agent`, without `-k`: it
+    /// starts the job if it is not running, and does nothing if it is.
+    fn kickstart_agent(&mut self, uid: u32) -> Result<()>;
     /// `roomlerd one-row-home <verb>` as `account` ([`spawn_plan`]), fed
     /// `stdin`, within [`CHILD_DEADLINE`].
     async fn person(&mut self, account: &Account, verb: Verb, stdin: &[u8]) -> Result<ChildOutput>;
@@ -1915,10 +1924,12 @@ fn kept_of(seen: &crate::one_row_home::ReadAnswer) -> crate::one_row_home::Kept 
 }
 
 /// Puts back what [`steps`] did: root's file first, then every person whose
-/// `convert` was started, answered or not, then the LaunchAgents, then a
-/// restart onto them. Each failure is said and the rest still run. Root's
-/// records go only once that restart answered (or none was needed): until
-/// then they are how `--revert` finishes the job.
+/// `convert` was started, answered or not, then a restart onto them where the
+/// conversion had restarted, then the LaunchAgents (#4092: only once that
+/// restart answered, through [`start_agent`]; at once where none was needed).
+/// Each failure is said and the rest still run. Root's records go only once
+/// that restart answered (or none was needed): until then they are how
+/// `--revert` finishes the job.
 async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
     let mut problems = Vec::new();
     let mut root_back = true;
@@ -1963,15 +1974,13 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
             }
         }
     }
-    for &index in &done.booted_out {
-        let a = &read.people[index].account;
-        match host.bootstrap(&bootstrap_argv(a.uid, &a.home)) {
-            Ok(()) => host.say(&format!("bootstrapped: gui/{}/com.roomler.agent", a.uid)),
-            Err(e) => problems.push(format!("gui/{}/com.roomler.agent: {e:#}", a.uid)),
-        }
-    }
     let mut answered = true;
-    if done.restarted {
+    // #4092 — the LaunchAgents go last. After the conversion's restart the
+    // one-row daemon's screen worker held the person's lock until that daemon
+    // left, so they wait for this restart's answer and for that worker. With
+    // supervision on in root's file put back, the restarted daemon's own
+    // supervisor hands each agent back, so they do not wait. `None`: none load.
+    let start = if done.restarted {
         host.say("restarting the daemon onto the files put back");
         let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
         let back = match host.kickstart() {
@@ -1979,20 +1988,38 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
             Err(e) => Err(e),
         };
         match back {
-            Ok(status) => host.say(&format!(
-                "the daemon is back{}",
-                if status.connected {
-                    ", connected"
-                } else {
-                    ", not connected yet"
-                }
-            )),
+            Ok(status) => {
+                host.say(&format!(
+                    "the daemon is back{}",
+                    if status.connected {
+                        ", connected"
+                    } else {
+                        ", not connected yet"
+                    }
+                ));
+                Some(!read.root.macos_supervise_gui_worker)
+            }
             Err(e) => {
                 answered = false;
                 problems.push(format!(
                     "the restart onto the files put back: {e:#}. `sudo launchctl kickstart -k \
                      system/com.roomler.daemon` retries it"
                 ));
+                for &index in &done.booted_out {
+                    problems.push(not_bootstrapped(read.people[index].account.uid));
+                }
+                None
+            }
+        }
+    } else {
+        // No restart, so no one-row worker ran: they load at once.
+        Some(false)
+    };
+    if let Some(wait) = start {
+        for &index in &done.booted_out {
+            let a = &read.people[index].account;
+            if let Err(e) = start_agent(host, a.uid, &a.home, wait).await {
+                problems.push(format!("gui/{}/com.roomler.agent: {e:#}", a.uid));
             }
         }
     }
@@ -2045,6 +2072,87 @@ async fn wait_for_new_daemon<H: Host>(
         }
         host.sleep(POLL).await;
     }
+}
+
+/// #4092 — how long `--revert` and the undo wait, once the restart has
+/// answered, for the screen worker of the daemon that left to stop, before
+/// they load the person's LaunchAgent. That worker runs as the person and
+/// holds their single-instance lock. A worker of this release stops by itself
+/// once its daemon is gone, at the latest
+/// [`LIFELINE_BACKSTOP`](crate::macos_supervisor::LIFELINE_BACKSTOP) later (its
+/// forced exit), and the new daemon answers only after the old one has gone.
+/// The 5 s past that are the margin the reap gives the same stop
+/// ([`REAP_GRACE`](crate::macos_supervisor::REAP_GRACE)). A worker still there
+/// by then does not hear its lifeline, and a longer wait would not change that.
+pub const WORKER_GONE_WITHIN: Duration =
+    Duration::from_secs(crate::macos_supervisor::LIFELINE_BACKSTOP.as_secs() + 5);
+
+/// #4092 — waits within [`WORKER_GONE_WITHIN`], reading every [`POLL`], until no
+/// screen worker runs as `uid`. `None` once none does, else what the last read
+/// said. A `ps` that gives no answer is waited out like a worker that still
+/// runs: by the bound, a worker that hears its lifeline has stopped. Nothing
+/// here stops a process.
+async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
+    let start = host.now();
+    loop {
+        let no_answer = match host.gui_worker_runs(uid).await {
+            Ok(false) => return None,
+            Ok(true) => None,
+            Err(e) => Some(e),
+        };
+        if host.now().saturating_sub(start) >= WORKER_GONE_WITHIN {
+            let secs = WORKER_GONE_WITHIN.as_secs();
+            return Some(match no_answer {
+                None => format!(
+                    "the one-row daemon's screen worker still runs as uid {uid} after {secs} s, \
+                     holding the lock this agent takes"
+                ),
+                Some(e) => format!(
+                    "`ps` gave no answer for {secs} s ({e:#}), so whether the one-row daemon's \
+                     screen worker, which holds the lock this agent takes, has stopped is not known"
+                ),
+            });
+        }
+        host.sleep(POLL).await;
+    }
+}
+
+/// #4092 — a person's LaunchAgent loaded again once the daemon has restarted
+/// onto the files put back. Until the daemon that left is gone, its screen
+/// worker runs as the person and holds their single-instance lock, and an agent
+/// that finds the lock held exits 0, which `KeepAlive{SuccessfulExit=false}`
+/// never starts again. With `wait` (the restarted daemon supervises nobody, so
+/// nobody else hands the agent back) that worker is waited for first
+/// ([`worker_gone`]). Then the bootstrap, then `kickstart` without `-k`, which
+/// starts a job that lost the race anyway and does nothing to one that runs:
+/// the supervisor's own hand-back (`kickstart_launch_agent` in
+/// `macos_supervisor.rs`). `Err`: the bootstrap's, which the caller says.
+async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) -> Result<()> {
+    let job = format!("gui/{uid}/com.roomler.agent");
+    if wait && let Some(why) = worker_gone(host, uid).await {
+        host.say(&format!(
+            "{job}: {why}. Nothing here stops a process: if the agent is not running once that \
+             worker has stopped, `sudo launchctl kickstart {job}` starts it"
+        ));
+    }
+    host.bootstrap(&bootstrap_argv(uid, home))?;
+    host.say(&format!("bootstrapped: {job}"));
+    match host.kickstart_agent(uid) {
+        Ok(()) => host.say(&format!("kickstarted: {job}")),
+        Err(e) => host.say(&format!(
+            "{job}: `launchctl kickstart` failed ({e:#}); launchd starts it at the next login"
+        )),
+    }
+    Ok(())
+}
+
+/// #4092 — what `--revert` and the undo say of an agent they load only once
+/// the restart has answered, when it did not.
+fn not_bootstrapped(uid: u32) -> String {
+    format!(
+        "gui/{uid}/com.roomler.agent: not bootstrapped, as the daemon did not restart onto the \
+         files put back; launchd loads it at the next login"
+    )
 }
 
 /// The Verify step: the restarted daemon has every part of one row within
@@ -2340,7 +2448,8 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             p.name,
             p.uid,
             if bootstrap_for == Some(p.uid) {
-                ", and their LaunchAgent is bootstrapped"
+                ", and their LaunchAgent is bootstrapped after the restart, once the one-row \
+                 screen worker that runs as them has stopped"
             } else {
                 ""
             }
@@ -2360,13 +2469,10 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
     out
 }
 
-/// One person's files back, by their own process. `Err`: why not, said
-/// with that person's name; the record stays.
-async fn give_back<H: Host>(
-    host: &mut H,
-    p: &RevertPerson,
-    bootstrap_for: Option<u32>,
-) -> std::result::Result<(), String> {
+/// One person's files back, by their own process. `Ok`: whether their plist
+/// went back, which [`revert`] loads only after the restart (#4092). `Err`:
+/// why not, said with that person's name; the record stays.
+async fn give_back<H: Host>(host: &mut H, p: &RevertPerson) -> std::result::Result<bool, String> {
     let Some(account) = &p.account else {
         return Err(format!(
             "no account has uid {} now; root keeps their files in {RECORDS}/{}",
@@ -2476,24 +2582,16 @@ async fn give_back<H: Host>(
         "put back by {}'s own process: their files",
         p.name
     ));
-    if plist_back && bootstrap_for == Some(p.uid) {
-        match host.bootstrap(&bootstrap_argv(p.uid, &account.home)) {
-            Ok(()) => host.say(&format!("bootstrapped: gui/{}/com.roomler.agent", p.uid)),
-            Err(e) => host.say(&format!(
-                "gui/{}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
-                 login",
-                p.uid
-            )),
-        }
-    }
-    Ok(())
+    Ok(plist_back)
 }
 
 /// `--revert` (the spec's six steps): unfinished uid folders removed; root's
 /// file back first, as a copy of its kept bytes checked against `root.json`;
 /// each person in uid order, one who fails named and the others going on;
-/// the restart; then, only once it answered, the records of those given
-/// back, and `root.json` and the kept copy if nobody failed.
+/// the restart; then, only once it answered, the console person's LaunchAgent
+/// where root's file leaves it to launchd (#4092, [`start_agent`]), the
+/// records of those given back, and `root.json` and the kept copy if nobody
+/// failed.
 pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     for &uid in &r.unfinished {
         host.remove_records_of(uid)
@@ -2532,11 +2630,20 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         failed.push((*uid, name.clone()));
     }
     let mut given_back = Vec::new();
+    // #4092 — `(uid, home)` of the person whose LaunchAgent loads after the
+    // restart: given back, their plist back, and `bootstrap_for`.
+    let mut agent = None;
     for p in &r.people {
-        match give_back(host, p, bootstrap_for).await {
-            Ok(()) => {
+        match give_back(host, p).await {
+            Ok(plist_back) => {
                 if matches!(p.back, Back::Record { .. }) {
                     given_back.push(p.uid);
+                }
+                if plist_back
+                    && bootstrap_for == Some(p.uid)
+                    && let Some(account) = &p.account
+                {
+                    agent = Some((p.uid, account.home.clone()));
                 }
             }
             Err(why) => {
@@ -2560,6 +2667,9 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     let status = match back {
         Ok(status) => status,
         Err(e) => {
+            if let Some((uid, _)) = &agent {
+                host.say(&not_bootstrapped(*uid));
+            }
             host.say(&format!(
                 "root's records stay in {RECORDS}: `sudo roomlerd one-row --revert` finishes the \
                  job"
@@ -2567,6 +2677,17 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
             return Err(e.context("the restart onto the files put back"));
         }
     };
+    // #4092 — only now. Until the restart answered, the daemon might still run
+    // the one-row file, whose moved enrollments the person's file holds again:
+    // two processes on one enrollment, which root's file going first prevents.
+    // Now it runs root's file put back, which leaves this person to launchd.
+    if let Some((uid, home)) = &agent
+        && let Err(e) = start_agent(host, *uid, home, true).await
+    {
+        host.say(&format!(
+            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next login"
+        ));
+    }
     for uid in given_back {
         host.remove_records_of(uid)
             .with_context(|| format!("removing {RECORDS}/{uid}"))?;
@@ -2688,6 +2809,9 @@ mod mac {
 
     const DAEMON: &str = "system/com.roomler.daemon";
     const AGENT_LABEL: &str = "com.roomler.agent";
+    /// #4092 — how long one `ps` may take. It answers in well under a second;
+    /// past this the read counts as no answer, which the wait waits out.
+    const PS_DEADLINE: Duration = Duration::from_secs(5);
 
     pub(super) async fn run(dry_run: bool, revert_asked: bool, yes: bool) -> Result<()> {
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -3174,6 +3298,44 @@ mod mac {
             bail!("launchctl {}: {last}", argv.join(" "))
         }
 
+        async fn gui_worker_runs(&mut self, uid: u32) -> Result<bool> {
+            // A worker's command line carries its daemon's own path, which the
+            // daemon's plist gives as the package's binary. This command may
+            // have been typed through `/usr/local/bin/roomlerd`, a link into
+            // it that `current_exe` does not resolve: so both.
+            let mut commands = crate::macos_supervisor::worker_commands(PERSON_PROGRAM).to_vec();
+            if let Some(own) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok())
+                .filter(|own| own != PERSON_PROGRAM)
+            {
+                commands.extend(crate::macos_supervisor::worker_commands(&own));
+            }
+            // #3080 — read until `ps` exits, within its deadline, on the
+            // blocking pool; one `-o` per column, as the supervisor reads it.
+            let out = tokio::task::spawn_blocking(|| {
+                let mut ps = std::process::Command::new("/bin/ps");
+                ps.args(["-axww", "-o", "pid=", "-o", "uid=", "-o", "command="]);
+                tunnel_core::child::output_bounded(&mut ps, PS_DEADLINE)
+            })
+            .await
+            .context("the thread that ran `ps`")?
+            .context("`ps`")?;
+            if !out.status.success() {
+                bail!("`ps` exited with {:?}", out.status.code());
+            }
+            let ps = String::from_utf8_lossy(&out.stdout);
+            let workers =
+                crate::macos_supervisor::stale_workers(&ps, &commands, std::process::id());
+            Ok(workers.iter().any(|&(_, worker_uid)| worker_uid == uid))
+        }
+
+        fn kickstart_agent(&mut self, uid: u32) -> Result<()> {
+            // Without `-k` (`macos_supervisor::kickstart_launch_agent`).
+            launchctl(&["kickstart", &format!("gui/{uid}/{AGENT_LABEL}")])
+                .map_err(anyhow::Error::msg)
+        }
+
         async fn person(
             &mut self,
             account: &Account,
@@ -3640,6 +3802,12 @@ mod tests {
         daemon: fn(u32) -> NodeStatus,
         /// The virtual clock: only a sleep moves it.
         clock: Duration,
+        /// #4092 — the screen worker the leaving daemon ran as each uid:
+        /// `Some(n)` still runs for the next `n` reads, `None` never stops.
+        /// No call of the `Host` stops one.
+        workers: HashMap<u32, Option<u32>>,
+        /// `ps` gives no answer.
+        ps_fails: bool,
     }
 
     fn one_row_daemon(kicks: u32) -> NodeStatus {
@@ -3696,6 +3864,8 @@ mod tests {
                 stuck: false,
                 daemon,
                 clock: Duration::ZERO,
+                workers: HashMap::new(),
+                ps_fails: false,
             }
         }
 
@@ -3732,9 +3902,10 @@ mod tests {
         }
 
         fn wrote(&self) -> bool {
+            let reads = ["read ", "status: ", "worker "];
             self.calls
                 .iter()
-                .any(|c| !c.starts_with("read ") && c != "dseditgroup")
+                .any(|c| !reads.iter().any(|r| c.starts_with(r)) && c != "dseditgroup")
         }
 
         /// The person's files as every release before root's side left a
@@ -3960,6 +4131,32 @@ mod tests {
             self.calls.push(format!("bootstrap {uid}"));
             Ok(())
         }
+        async fn gui_worker_runs(&mut self, uid: u32) -> Result<bool> {
+            if self.ps_fails {
+                self.calls.push(format!("worker {uid}: no answer"));
+                bail!("`ps` did not exit within 5 s (the test said so)");
+            }
+            let runs = match self.workers.get(&uid).copied() {
+                None => false,
+                Some(None) => true,
+                Some(Some(0)) => {
+                    self.workers.remove(&uid);
+                    false
+                }
+                Some(Some(n)) => {
+                    self.workers.insert(uid, Some(n - 1));
+                    true
+                }
+            };
+            let word = if runs { "runs" } else { "gone" };
+            self.calls.push(format!("worker {uid}: {word}"));
+            Ok(runs)
+        }
+        fn kickstart_agent(&mut self, uid: u32) -> Result<()> {
+            self.hit("kickstart_agent")?;
+            self.calls.push(format!("agent kickstart {uid}"));
+            Ok(())
+        }
         async fn person(
             &mut self,
             account: &Account,
@@ -4016,6 +4213,8 @@ mod tests {
             let mut s = (self.daemon)(kicks);
             s.pid = Some(1000 + kicks);
             s.started_at_ms = Some(u64::from(kicks));
+            // Which daemon answered: restarted `kicks` times.
+            self.calls.push(format!("status: daemon {kicks}"));
             Ok(s)
         }
         fn kickstart(&mut self) -> Result<()> {
@@ -4170,9 +4369,10 @@ mod tests {
         // Root's file and the person's byte for byte, root's records gone.
         assert_eq!(mac.files(), before);
         assert!(mac.loaded.contains(&501), "the LaunchAgent is loaded again");
+        // #4092: the bootstrap comes after the undo's own restart.
         assert_eq!(
             calls_of(&mac, &["kickstart", "bootstrap", "put-back"]),
-            ["kickstart", "put-back 501", "bootstrap 501", "kickstart"]
+            ["kickstart", "put-back 501", "kickstart", "bootstrap 501"]
         );
     }
 
@@ -4336,6 +4536,279 @@ mod tests {
         assert_eq!(bootstrap_after_revert(false, Some(501)), Some(501));
         assert_eq!(bootstrap_after_revert(true, Some(501)), None);
         assert_eq!(bootstrap_after_revert(false, None), None);
+    }
+
+    /// #4092: until the restart, the one-row daemon's screen worker runs as
+    /// the person and holds their single-instance lock, and an agent that
+    /// finds it held exits 0 for good. So the person's agent is bootstrapped
+    /// only after the restarted daemon has answered and that worker is gone,
+    /// then kickstarted without `-k`.
+    #[tokio::test]
+    async fn revert_starts_the_agent_once_the_restart_has_answered() {
+        let mut mac = Fake::new(one_row_daemon);
+        convert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "put-back",
+                    "kickstart",
+                    "status: daemon 2",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "put-back 501",
+                "kickstart",
+                "status: daemon 2",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4092: a worker that still runs for three reads after the restart:
+    /// the bootstrap waits until it has gone.
+    #[tokio::test]
+    async fn revert_waits_for_the_old_screen_worker_to_stop() {
+        let mut mac = Fake::new(one_row_daemon);
+        convert_now(&mut mac).await.unwrap();
+        mac.workers.insert(501, Some(3));
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]),
+            [
+                "worker 501: runs",
+                "worker 501: runs",
+                "worker 501: runs",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+        assert!(
+            !mac.said().contains("sudo launchctl kickstart"),
+            "{}",
+            mac.said()
+        );
+    }
+
+    /// #4092: a worker still there when the bound has passed, and a `ps`
+    /// that never answers. The bootstrap and the kickstart run anyway, the
+    /// line names what starts the agent once the worker has stopped, and
+    /// nothing stops the worker: no call of the `Host` can.
+    #[tokio::test]
+    async fn revert_bootstraps_after_the_bound_and_leaves_the_worker_alone() {
+        for ps_fails in [false, true] {
+            let mut mac = Fake::new(one_row_daemon);
+            convert_now(&mut mac).await.unwrap();
+            mac.workers.insert(501, None);
+            mac.ps_fails = ps_fails;
+            let start = mac.now();
+            revert_now(&mut mac).await.unwrap();
+            assert!(
+                mac.now() - start >= WORKER_GONE_WITHIN,
+                "ps_fails {ps_fails}"
+            );
+            assert_eq!(
+                calls_of(&mac, &["bootstrap", "agent"]),
+                ["bootstrap 501", "agent kickstart 501"],
+                "ps_fails {ps_fails}"
+            );
+            let said = mac.said();
+            assert!(
+                said.contains("`sudo launchctl kickstart gui/501/com.roomler.agent`"),
+                "ps_fails {ps_fails}: {said}"
+            );
+            assert_eq!(
+                said.contains("`ps` gave no answer"),
+                ps_fails,
+                "ps_fails {ps_fails}: {said}"
+            );
+            assert_eq!(mac.workers.get(&501), Some(&None), "nothing stopped it");
+        }
+    }
+
+    /// Supervision on before the conversion: the installer had removed the
+    /// plist, so `--revert` loads no LaunchAgent, kickstarts none and waits
+    /// for no worker, as before #4092.
+    #[tokio::test]
+    async fn revert_with_supervision_on_starts_no_agent() {
+        let mut mac = Fake::new(one_row_daemon);
+        let mut on = mac.root_cfg();
+        on.macos_supervise_gui_worker = true;
+        mac.root.insert(RootFile::Config, toml_of(&on));
+        convert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+    }
+
+    /// D5 with #4092: the console person's give-back fails, so their agent is
+    /// neither bootstrapped nor kickstarted, and ana is still given back.
+    #[tokio::test]
+    async fn a_person_whose_give_back_fails_gets_no_agent_start() {
+        let mut mac = Fake::new(one_row_daemon).with_ana();
+        convert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        mac.scripts.insert((501, "put-back"), Script::Exit(4));
+        let e = revert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(e.contains("casey"), "{e}");
+        assert_eq!(
+            calls_of(&mac, &["put-back", "worker", "bootstrap", "agent"]),
+            ["put-back 501", "put-back 502"]
+        );
+    }
+
+    /// Two people given back: only the console person's agent starts, after
+    /// the restart, and only their worker is waited for.
+    #[tokio::test]
+    async fn revert_starts_only_the_console_persons_agent() {
+        let mut mac = Fake::new(one_row_daemon).with_ana();
+        convert_now(&mut mac).await.unwrap();
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            calls_of(
+                &mac,
+                &["put-back", "kickstart", "worker", "bootstrap", "agent"]
+            ),
+            [
+                "put-back 501",
+                "put-back 502",
+                "kickstart",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+    }
+
+    /// #4092 in the undo (lab cell C4): the verify fails after the restart,
+    /// so the one-row daemon's worker holds the person's lock. The undo
+    /// restarts first, waits for that worker, then bootstraps and kickstarts.
+    #[tokio::test]
+    async fn an_undo_after_the_restart_starts_the_agent_once_the_worker_is_gone() {
+        let mut mac = Fake::new(no_grant_daemon);
+        mac.workers.insert(501, Some(2));
+        assert!(convert_now(&mut mac).await.is_err());
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "kickstart",
+                    "put-back",
+                    "status: daemon 2",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "kickstart",
+                "put-back 501",
+                "kickstart",
+                "status: daemon 2",
+                "worker 501: runs",
+                "worker 501: runs",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// The undo of a conversion that stopped before its restart: no one-row
+    /// worker ran, so the agent is bootstrapped at once, with no restart and
+    /// no wait, then kickstarted without `-k`.
+    #[tokio::test]
+    async fn an_undo_before_the_restart_starts_the_agent_at_once() {
+        let mut mac = Fake::new(one_row_daemon);
+        mac.fail = Some(("save_root", 1));
+        assert!(convert_now(&mut mac).await.is_err());
+        assert_eq!(
+            calls_of(
+                &mac,
+                &["kickstart", "status", "worker", "bootstrap", "agent"]
+            ),
+            ["bootstrap 501", "agent kickstart 501"]
+        );
+    }
+
+    /// Supervision on in the root file the undo put back: the restarted
+    /// daemon's own supervisor hands the agent back (its `HandBack`), so the
+    /// undo waits for no worker, and still loads the agent after the restart.
+    #[tokio::test]
+    async fn an_undo_onto_supervision_on_waits_for_no_worker() {
+        let mut mac = Fake::new(no_grant_daemon);
+        let mut on = mac.root_cfg();
+        on.macos_supervise_gui_worker = true;
+        mac.root.insert(RootFile::Config, toml_of(&on));
+        mac.workers.insert(501, None);
+        assert!(convert_now(&mut mac).await.is_err());
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "kickstart",
+                    "status: daemon 2",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "kickstart",
+                "kickstart",
+                "status: daemon 2",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+    }
+
+    /// #4092: a restart that never answers. Neither the undo nor `--revert`
+    /// loads the person's agent beside a daemon that may still run the
+    /// one-row file, whose moved enrollments the person's file holds again.
+    /// Each says so, and the `--revert` whose restart answers starts it.
+    #[tokio::test]
+    async fn a_restart_that_never_answers_starts_no_agent() {
+        let mut mac = Fake::new(one_row_daemon);
+        mac.stuck = true;
+        assert!(convert_now(&mut mac).await.is_err());
+        assert!(
+            calls_of(&mac, &["bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        let line = "gui/501/com.roomler.agent: not bootstrapped";
+        assert!(mac.said().contains(line), "{}", mac.said());
+        mac.said.clear();
+        assert!(revert_now(&mut mac).await.is_err());
+        assert!(
+            calls_of(&mac, &["bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        assert!(mac.said().contains(line), "{}", mac.said());
+        mac.stuck = false;
+        mac.calls.clear();
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(
+            calls_of(&mac, &["bootstrap", "agent"]),
+            ["bootstrap 501", "agent kickstart 501"]
+        );
     }
 
     /// AC1: a Mac converted by a release before root's side, whose revert has
