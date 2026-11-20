@@ -10977,6 +10977,35 @@ mod macos_kernel_tests {
         );
     }
 
+    /// #4175 — of the packets read so far, how many are the test's own
+    /// datagram (IPv4 UDP to `to`, from the port `from`, the payload exactly
+    /// `query`), and how many others are addressed to `own`, by its IPv4 or
+    /// by its derived IPv6. Drains the receiver.
+    fn its_own_and_others(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        own: Ipv4Addr,
+        from: u16,
+        to: std::net::SocketAddr,
+    ) -> (usize, usize) {
+        let (mut its_own, mut others) = (0, 0);
+        while let Ok(p) = rx.try_recv() {
+            let dst = crate::overlay::router::Router::dst_of_ip_packet(&p);
+            let is_its_own = p.first().map(|b| b >> 4) == Some(4)
+                && dst.map(std::net::IpAddr::V4) == Some(to.ip())
+                && udp_pseudo(&p).is_some_and(|(_, at, end)| {
+                    p[at..at + 2] == from.to_be_bytes()
+                        && p[at + 2..at + 4] == to.port().to_be_bytes()
+                        && &p[at + 8..end] == b"query"
+                });
+            if is_its_own {
+                its_own += 1;
+            } else if dst == Some(own) {
+                others += 1;
+            }
+        }
+        (its_own, others)
+    }
+
     /// #4125 (d) — `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0`: nothing is handed
     /// back. The datagram is read from the utun, as before the hand-back, and
     /// never delivered. Safe to set here, as the other kill-switch tests say.
@@ -11020,9 +11049,14 @@ mod macos_kernel_tests {
             got.is_err(),
             "switched off, a datagram to {to} is not delivered: {got:?}"
         );
+        let from = client.local_addr().unwrap().port();
+        let (its_own, others) = its_own_and_others(&mut reads, own, from, to);
+        eprintln!(
+            "measure (#4175): the test's one stray included, {others} other packet(s) to {own} \
+             were read"
+        );
         assert_eq!(
-            reads_to(&mut reads, own),
-            1,
+            its_own, 1,
             "switched off, the datagram is read from the utun"
         );
         assert_eq!(handed_back(&tun), 0, "switched off, nothing is handed back");
@@ -11383,6 +11417,12 @@ mod macos_kernel_tests {
             Ok(Err(e)) => return Err(format!("the accept on {to} failed: {e}")),
             Err(_) => return Err(format!("nothing was accepted on {to} within {WAIT:?}")),
         };
+        // #4175 — SO_LINGER 0: each end's drop sends one RST and frees it at
+        // once, so no FIN is left to be retransmitted once this utun is gone.
+        client
+            .set_zero_linger()
+            .and_then(|()| server.set_zero_linger())
+            .map_err(|e| format!("SO_LINGER 0 on {to}: {e}"))?;
         client
             .write_all(b"query")
             .await
