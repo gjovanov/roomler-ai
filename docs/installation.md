@@ -2014,7 +2014,7 @@ the loader check is all a bare image can ask of it.
 | Lane | What goes through it |
 |---|---|
 | `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
-| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190, for that reason. A container that cannot refresh its index from the mirror is not a package failure: it prints `MIRROR UNREACHABLE` and the script exits 3, while a package that does not start prints `DOES NOT START: <package>` and exits 1. In CI, `ci-apt.sh reach --containers` runs first, so a dead runner resolver fails over before any container starts ([build-caches.md](build-caches.md#5-how-apt-reaches-the-mirrors), #3710) |
 
 ⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
 not the package. Its package list is written by hand, so it named the real ALSA
