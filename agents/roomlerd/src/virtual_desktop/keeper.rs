@@ -50,7 +50,12 @@
 //!    stopped loses the desktop it was starting, and its supervisor starts
 //!    it again;
 //! 3. starts the window manager and the apps with `/dev/null` on stdin, stdout
-//!    and stderr, and waits for every child it has, its own or adopted;
+//!    and stderr, and waits for every child it has, its own or adopted. A
+//!    window manager that exits, or fails to start, is started again the same
+//!    way after the X server's own backoff (#4099, [`Book::start_wm`]): a
+//!    second at first, doubling to five minutes, and a second again after one
+//!    that ran a minute. An exit in a teardown starts nothing, and a start
+//!    that comes due in one, or while the X server is not running, is dropped;
 //! 4. on SIGTERM alone (a service manager's stop signals every process of the
 //!    unit at once), takes down what it started and stays, for [`LINGER`] at
 //!    most, until its input ends;
@@ -63,7 +68,9 @@
 //! A client's exit is reported only once the desktop has outlived it by
 //! [`NOTICE_DELAY`]. The X server's death and a stop make every client exit
 //! within milliseconds, before the keeper hears why, and such an exit is no
-//! news.
+//! news. A window manager's start does not wait for that notice: its delay
+//! runs from the exit, and the start looks at the teardown and the X server
+//! when it comes due (#4099).
 //!
 //! Every write to stderr is non-blocking and ignores its error: once the daemon
 //! is gone, stderr is a broken pipe, and nothing in the teardown may block or
@@ -71,8 +78,8 @@
 #![cfg(target_os = "linux")]
 
 use super::{
-    ProcInfo, Procs, RealProcs, describe_exit, is_running, kill_tree_with, read_proc_snapshot,
-    with_wslg_pulse,
+    Backoff, ProcInfo, Procs, RealProcs, describe_exit, is_running, kill_tree_with,
+    read_proc_snapshot, with_wslg_pulse,
 };
 use std::ffi::OsString;
 use std::os::fd::RawFd;
@@ -121,6 +128,15 @@ const GRACE_MAX: Duration = Duration::from_secs(10);
 /// because the desktop did not run on without that client.
 const NOTICE_DELAY: Duration = Duration::from_secs(2);
 
+/// #4099 — the shortest delay before the window manager is started again,
+/// whatever its job says: a job's 0 would start one that exits at once in a
+/// loop, a core spun as root.
+const WM_DELAY_MIN: Duration = Duration::from_millis(100);
+
+/// The longest the loop's `poll` waits, so that a parent that changed and a
+/// held exit that came due are each seen within a second.
+const POLL_MAX: Duration = Duration::from_secs(1);
+
 /// How long the keeper waits for its job after `ready` (review R2-3). The
 /// daemon sends it as soon as it reads `ready`, with no lock and no blocking
 /// call in between. A keeper it gives up on was not ready within its wait
@@ -166,6 +182,35 @@ pub(super) struct Job {
     pub(super) apps: Vec<String>,
     /// How long the keeper's teardown waits after SIGTERM before SIGKILL.
     pub(super) grace_ms: u64,
+    /// #4099 — the window manager's restart delay after its first exit, in
+    /// milliseconds. A job without it (a daemon from before the field) gets
+    /// the X server's own, [`super::RESTART_DELAY_FLOOR`].
+    #[serde(default = "server_delay_floor_ms")]
+    pub(super) wm_delay_floor_ms: u64,
+    /// #4099 — the longest restart delay, in milliseconds: the X server's
+    /// [`super::RESTART_DELAY_CEIL`] when the job does not say.
+    #[serde(default = "server_delay_ceil_ms")]
+    pub(super) wm_delay_ceil_ms: u64,
+    /// #4099 — how long, in milliseconds, a window manager must have run for
+    /// its exit to start the delays over: the X server's
+    /// [`super::STABLE_AFTER`] when the job does not say.
+    #[serde(default = "server_stable_after_ms")]
+    pub(super) wm_stable_after_ms: u64,
+}
+
+/// The X server's [`super::RESTART_DELAY_FLOOR`], in a job's milliseconds.
+fn server_delay_floor_ms() -> u64 {
+    super::RESTART_DELAY_FLOOR.as_millis() as u64
+}
+
+/// The X server's [`super::RESTART_DELAY_CEIL`], in a job's milliseconds.
+fn server_delay_ceil_ms() -> u64 {
+    super::RESTART_DELAY_CEIL.as_millis() as u64
+}
+
+/// The X server's [`super::STABLE_AFTER`], in a job's milliseconds.
+fn server_stable_after_ms() -> u64 {
+    super::STABLE_AFTER.as_millis() as u64
 }
 
 impl Job {
@@ -402,6 +447,13 @@ fn read_job(fd: RawFd, daemon: i32, wait: Duration) -> Result<Option<Job>, Strin
 #[derive(Debug, Default)]
 struct Book {
     wm: Option<i32>,
+    /// #4099 — when the running window manager was started.
+    wm_since: Option<Instant>,
+    /// #4099 — when the window manager is to be started again, after an
+    /// exit or a start that failed.
+    wm_due: Option<Instant>,
+    /// #4099 — the window manager's restart delays.
+    wm_delays: WmDelays,
     apps: Vec<(i32, String)>,
     /// Adopted processes collected (orphans of the desktop's processes).
     adopted: u64,
@@ -410,6 +462,57 @@ struct Book {
     /// Exits of the keeper's own clients, each with the line that reports it,
     /// held for [`NOTICE_DELAY`] ([`Book::say_notices`]).
     notices: Vec<(Instant, String)>,
+}
+
+/// #4099 — the window manager's restart delays: the X server's backoff
+/// (`supervise`'s), on the job's numbers.
+struct WmDelays {
+    delays: Backoff,
+    /// A window manager that ran this long starts the delays over.
+    stable_after: Duration,
+}
+
+impl WmDelays {
+    /// The job's numbers, its floor at least [`WM_DELAY_MIN`] and its
+    /// ceiling at least its floor.
+    fn of(job: &Job) -> Self {
+        let floor = Duration::from_millis(job.wm_delay_floor_ms).max(WM_DELAY_MIN);
+        let ceil = Duration::from_millis(job.wm_delay_ceil_ms).max(floor);
+        Self {
+            delays: Backoff::new(floor, ceil),
+            stable_after: Duration::from_millis(job.wm_stable_after_ms),
+        }
+    }
+
+    /// The delay before the next start: after a window manager that ran
+    /// `up_for`, or after a start that failed (`None`). A run of
+    /// `stable_after` or longer starts the delays over, as the X server's
+    /// does; a failed start never does.
+    fn after(&mut self, up_for: Option<Duration>) -> Duration {
+        if up_for.is_some_and(|up| up >= self.stable_after) {
+            self.delays.reset();
+        }
+        self.delays.next()
+    }
+}
+
+impl Default for WmDelays {
+    /// The X server's numbers, as a job without its own gets them.
+    fn default() -> Self {
+        Self {
+            delays: Backoff::new(super::RESTART_DELAY_FLOOR, super::RESTART_DELAY_CEIL),
+            stable_after: super::STABLE_AFTER,
+        }
+    }
+}
+
+impl std::fmt::Debug for WmDelays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WmDelays")
+            .field("next", &self.delays.peek())
+            .field("stable_after", &self.stable_after)
+            .finish()
+    }
 }
 
 /// What a sweep of `waitpid` found.
@@ -427,19 +530,71 @@ impl Book {
     /// PulseAudio where it exists, and nothing of the keeper's but its
     /// environment, its working directory and its umask.
     fn start(&mut self, job: &Job) {
-        match spawn_client(&job.wm, &job.display) {
-            Ok(pid) => self.wm = Some(pid),
-            Err(e) => say(&format!(
-                "warn: window manager {} failed to start (continuing bare): {e}",
-                job.wm
-            )),
-        }
+        self.wm_delays = WmDelays::of(job);
+        self.start_wm(job);
         for app in &job.apps {
             match spawn_client(app, &job.display) {
                 Ok(pid) => self.apps.push((pid, app.clone())),
                 Err(e) => say(&format!("warn: startup app {app} failed to launch: {e}")),
             }
         }
+    }
+
+    /// Start the window manager: its first start and every one after it
+    /// (#4099), all through [`spawn_client`], so that each gets what the
+    /// first got. One that fails to start is tried again after the next
+    /// delay, and said in one line.
+    fn start_wm(&mut self, job: &Job) {
+        match spawn_client(&job.wm, &job.display) {
+            Ok(pid) => {
+                self.wm = Some(pid);
+                self.wm_since = Some(Instant::now());
+            }
+            Err(e) => {
+                let delay = self.wm_again_after(None);
+                say(&format!(
+                    "warn: the window manager {} failed to start: {e} — it is tried again in {delay:?}",
+                    job.wm
+                ));
+            }
+        }
+    }
+
+    /// Schedule the window manager's next start, after one that ran
+    /// `up_for`, or after a start that failed (`None`); the delay it waits.
+    fn wm_again_after(&mut self, up_for: Option<Duration>) -> Duration {
+        let delay = self.wm_delays.after(up_for);
+        self.wm_due = Some(Instant::now() + delay);
+        delay
+    }
+
+    /// Start the window manager again once its delay has passed: never in a
+    /// teardown, and never onto an X server that is not running
+    /// (`server_runs`), each read now, at the start, not at the exit. A start
+    /// refused is dropped, never left due: a due time in the past would make
+    /// every `poll` a 0 ms one.
+    fn start_wm_when_due(&mut self, job: &Job, server_runs: impl FnOnce() -> bool) {
+        if self.wm_due.is_none_or(|due| Instant::now() < due) {
+            return;
+        }
+        self.wm_due = None;
+        if self.tearing_down {
+            return;
+        }
+        if !server_runs() {
+            return;
+        }
+        self.start_wm(job);
+    }
+
+    /// How long the loop's `poll` may wait, in its milliseconds: [`POLL_MAX`],
+    /// or until the window manager's start is due, rounded up so that it
+    /// never wakes before.
+    fn wait_ms(&self) -> libc::c_int {
+        let wait = self.wm_due.map_or(POLL_MAX, |due| {
+            due.saturating_duration_since(Instant::now()).min(POLL_MAX)
+        });
+        wait.as_nanos().div_ceil(1_000_000) as libc::c_int
     }
 
     /// Collect every child that has exited, the keeper's own and adopted
@@ -469,8 +624,16 @@ impl Book {
         let how = describe_status(status);
         let line = if self.wm == Some(pid) {
             self.wm = None;
+            let up_for = self.wm_since.take().map_or(Duration::ZERO, |t| t.elapsed());
+            // An exit in a teardown is expected: nothing to start or say.
+            if self.tearing_down {
+                return;
+            }
+            // #4099 — only scheduled here: the start, and its look at the
+            // teardown and the X server, come at the loop's tail.
+            let delay = self.wm_again_after(Some(up_for));
             format!(
-                "warn: the window manager ({pid}) exited: {how} — the desktop runs on without one"
+                "warn: the window manager ({pid}) exited: {how} — it is started again {delay:?} after its exit"
             )
         } else if let Some(i) = self.apps.iter().position(|(p, _)| *p == pid) {
             let (_, app) = self.apps.swap_remove(i);
@@ -746,7 +909,7 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
         ];
         // SAFETY: `poll(2)` over a live array of two descriptors. A signal
         // makes it return early (EINTR), which the loop treats as a wake.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, book.wait_ms()) };
         drain(wake);
         book.reap();
         let mut ended = false;
@@ -789,8 +952,12 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
             return 0;
         }
         // The X server is the desktop's group leader, and the daemon's child:
-        // dead, it stays a zombie until the daemon's teardown reaps it.
+        // dead, it stays a zombie until the daemon's teardown reaps it, and
+        // a member of its group keeps its number from reuse.
         book.say_notices(|| is_running(group));
+        // #4099 — a window manager that exited is started again here, once
+        // its delay has passed, and only while the X server runs.
+        book.start_wm_when_due(job, || is_running(group));
     }
 }
 
@@ -886,6 +1053,9 @@ pub(super) mod tests {
             wm: "/opt/my wm/openbox".into(),
             apps: vec!["xterm".into(), "/tmp/it's \"quoted\"\\ and\nnewline".into()],
             grace_ms: 1500,
+            wm_delay_floor_ms: 250,
+            wm_delay_ceil_ms: 4000,
+            wm_stable_after_ms: 30_000,
         };
         let line = job.line();
         assert_eq!(line.matches('\n').count(), 1, "one line: {line:?}");

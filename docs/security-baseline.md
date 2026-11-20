@@ -509,12 +509,12 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   gone, and the pod serving the call ends it for everyone in it. That pod also ends it on its own when it
   finds the room's document gone in two reconcile reads in a row, so a lost word cannot
   keep the call alive. The same holds for one seat: the pod serving a call checks its own
-  seats every 10 s (`crates/modules/conference/src/seat_check.rs`), and a seat whose
-  admission (the org membership, and the room membership where the room's visibility wants
-  one) reads as gone in two complete reads in a row ends there, within 30 s, so a withdrawal
-  that did not reach that pod cannot keep it. ⚠️ The check re-reads the room guard's own
-  rule, never a second copy: wherever the guard admits, it keeps the seat, and a failed or
-  late read keeps every seat. `docs/real-time.md` has the flow.
+  seats every 10 s (`crates/modules/conference/src/seat_check.rs`, flow in `docs/real-time.md`).
+  A seat whose admission (the org membership, and the room membership where the room's
+  visibility wants one) reads as gone in two complete reads in a row is put to the room guard
+  `media:join` runs; only its refusal ends it there, within 40 s, so a withdrawal that did not
+  reach that pod cannot keep it. ⚠️ The guard's own answer decides each end, never a copy of
+  its rule; doubt (a failed or late read, a document that does not decode, no answer) keeps it.
 - **A room membership ends with the org membership.** Every room fan-out (messages,
   edits, reactions, pins, typing, mentions) reaches the people holding a row in
   `room_members`, so the same hook, run after the org membership row is gone, drops the

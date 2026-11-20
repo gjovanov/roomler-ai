@@ -117,8 +117,8 @@ carries no digest.
 - VERSIONINFO comes from `build.rs` + `embed_resource::compile_for`. **Never**
   winres/winresource — its link-lib leaks a second `RT_VERSION` into the Tauri
   EXEs.
-- Rehearse with `signing_mode=local` dispatches, **never** with throwaway
-  `agent-v*` tags.
+- Rehearse with `signing_mode=off` dispatches (`local` fails: no local cert is
+  set, run 43676947954, #3901), **never** with throwaway `agent-v*` tags.
 - macOS is all-or-nothing on six `APPLE_*` secrets.
 - ⚠️ **Signing a `.app` re-signs its main executable** — with `--force` that
   replaces the binary's own signature, entitlements and all. The bundle

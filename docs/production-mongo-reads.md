@@ -362,7 +362,10 @@ pump doubles the heartbeats.
 What the lines cannot tell:
 
 - **Why a target moved.** The governor sets the applied target in `record_applied`
-  (`agents/roomlerd/src/encode/governor.rs:2060`) and no line says why, so a move prints
+  (`agents/roomlerd/src/encode/governor.rs:2213`). An agent with FR-148 P0's move causes writes
+  why on the pump's own target lines (`why`) and counts the moves in its heartbeat
+  (`target_moves`, [Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)),
+  but this read takes neither field yet and an older agent writes neither, so a move prints
   "reason: not logged".
 - **Which session owns a line that names none.** The encoder lines and the rate-memory line carry
   no session id. Such a line goes to the session whose lines span its time, from 10 s before the

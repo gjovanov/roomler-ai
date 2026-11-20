@@ -5,7 +5,7 @@
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
 
-**Anchors:** master `73f341a94` (2026-11-20), read in the tree. The Evidence keeps them: it is the code before P1a. From Design on, the anchors into the code P1a moves follow it, since master was merged into #4135 (2026-11-20).
+**Anchors:** master `73f341a94` (2026-11-20), read in the tree. The Evidence keeps them: it is the code before P1a. From Design on, the anchors into the code P1a and P1b move follow it, since master was merged into #4135 (2026-11-20).
 
 ## Goal
 
@@ -216,7 +216,7 @@ runs the same verb by hand gets the same two lines.
 
 ### P1b: the watcher owns the per-user relaunch
 
-`ensure_service_running` (`post_install.rs:668-697`) settles the per-Machine service after every verdict. For per-user
+`ensure_service_running` (`post_install.rs:679-713`) settles the per-Machine service after every verdict. For per-user
 it asks the task for a start only after a failed install (`:707-735`), because "exit 0 means the new task is
 registered … and its one-shots do this". #3507 is a successful install that registered nothing. P1b gives the per-user
 arm the service's contract: after every verdict, the daemon runs, or the record says why not.
@@ -242,10 +242,10 @@ flowchart TD
   daemon creates it at start, in the person's session, where the watcher runs too.
 - **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1439`), with room for
   a slow guest.
-- **The first update onto P1b runs the old release's watcher.** `post_install.rs:703-705` says the same of #3292. So
+- **The first update onto P1b runs the old release's watcher.** `post_install.rs:719-721` says the same of #3292. So
   P1b protects the hops after it, and P1a protects the first one: through the task's own one-shots where the account
   can replace it, and through `Roomler start-<SID>` where it cannot (D1).
-- **The record.** `last-install.json` (`post_install.rs:125-137`) gets a field `daemon`: running or not running, how it
+- **The record.** `last-install.json` (`post_install.rs:125-142`) gets a field `daemon`: running or not running, how it
   came back, and each rung's answer. It is additive in the file and on the wire (`NodeStatus.last_install`, FR-67 P3),
   and the verdict words stay what they are.
 
@@ -295,7 +295,7 @@ launcher then waits once and leaves with the daemon's code, as on master.
 | P1a | `the_start_task_runs_the_launchers_start_and_goes_by_itself` | its XML: the one-shots with their end boundaries, `DeleteExpiredTaskAfter`, the launcher with `service start`, no logon or boot trigger |
 | P1a | `every_per_user_msi_step_writes_its_record` | every per-user custom action of `main.wxs` is a step that writes the record, as `the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones |
 | P1a | `a_task_the_account_cannot_replace_is_named_at_start` | the access check's answer, with a medium copy of the test's own token, over C2's descriptor (no), C1's and P1a's (yes) |
-| P1b | the relaunch ladder over a seam (look, start, register, launch, clock), as `settle_service` is over `ServiceHandle` (`post_install.rs:902-904`) | each rung; a daemon that comes up at each rung; none; the failed-install entry |
+| P1b | the relaunch ladder over a seam (look, start, register, launch, clock), as `settle_service` is over `ServiceHandle` (`post_install.rs:1203-1205`) | each rung; a daemon that comes up at each rung; none; the failed-install entry |
 | P1b | the record's `daemon` field | round-trips, and a record without it still parses |
 | P2 | `the_launchers_ends_agree_with_the_install_table` | every code in the table above, against `Install`'s doc table and `worker_end_is_no_crash` (`supervisor.rs:1078-1090`) |
 | P2 | the loop over a seam (spawn, wait, session ending, sleep) | the backoff and its reset, a failed spawn retried, an ending session leaves |
