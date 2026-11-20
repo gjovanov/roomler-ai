@@ -641,3 +641,165 @@ async fn test_stream_an_empty_write_spends_no_sequence_number() -> Result<()> {
     );
     Ok(())
 }
+
+/// Polls `fut` once, in place, and says where it stands.
+async fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(move |cx| Poll::Ready(fut.as_mut().poll(cx))).await
+}
+
+/// A whole unordered message of stream 1 (the stream `stream_on` makes).
+fn message(tsn: u32, data: &'static [u8]) -> ChunkPayloadData {
+    ChunkPayloadData {
+        stream_identifier: 1,
+        tsn,
+        unordered: true,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(data),
+        payload_type: PayloadProtocolIdentifier::Binary,
+        ..Default::default()
+    }
+}
+
+/// Roomler patch (#4116): a read sees its stream's shutdown, whenever it
+/// lands. Upstream's `read_sctp` checked `read_shutdown`, then took the
+/// queue's lock and read, and made its `notified()` only once it had found
+/// nothing. A shutdown sets the flag, then wakes the waiters of that instant
+/// with `notify_waiters()`, which stores no permit, so one that landed
+/// between the check and the wait was lost: the read waited for good for
+/// data that never came. Here the test holds the queue's lock, so the read
+/// stops at that await, past its check; a data channel's close
+/// (`Shutdown::Both`) runs to its end; then the test lets the lock go. One
+/// thread, so the order is the code's, not a race's, and the timeout makes a
+/// lost shutdown a failure, not a hang.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_a_read_sees_a_shutdown_between_its_check_and_its_wait() -> Result<()> {
+    let state = Arc::new(AtomicU8::new(AssociationState::Established as u8));
+    let s = stream_on(
+        "shutdown_between_check_and_wait",
+        &state,
+        &Arc::new(PendingQueue::new()),
+    );
+    let mut buf = [0u8; 64];
+
+    let held = s.reassembly_queue.lock().await;
+    let mut read = std::pin::pin!(s.read_sctp(&mut buf));
+    assert!(
+        poll_once(read.as_mut()).await.is_pending(),
+        "the read must wait for the queue's lock, past its check of the flag"
+    );
+    s.shutdown(Shutdown::Both).await?;
+    drop(held);
+
+    match tokio::time::timeout(Duration::from_secs(5), read).await {
+        Ok(read) => assert_eq!(
+            read,
+            Ok((0, PayloadProtocolIdentifier::Unknown)),
+            "a read whose stream shut down returns (0, Unknown)"
+        ),
+        Err(_) => panic!(
+            "#4116: the stream shut down between the read's check and its wait, and the read \
+             missed it: it waits for good for data that never comes"
+        ),
+    }
+    Ok(())
+}
+
+/// Roomler patch (#4116): no chunk's wake-up is lost to a read that
+/// registers its wait before its checks. A chunk's `notify_one()` stores a
+/// permit when nobody waits, so upstream lost none; this holds that the fix
+/// keeps it so. A chunk and a read race for the queue's lock, both ways
+/// round:
+/// 1. the read takes the lock first and finds nothing; the chunk's wake-up,
+///    which comes after, ends its wait;
+/// 2. the chunk takes it first, so its wake-up reaches the read's registered
+///    wait before the read's check, which then finds the chunk. The wake-up
+///    the read did not need is kept for the next waiter: tokio passes a
+///    `notify_one()` that an enabled `Notified` drops unreceived to the next
+///    waiter, or stores it as the permit;
+/// 3. a read after that still waits, and the next chunk wakes it.
+///
+/// The test holds the lock while it lines them up. Tokio's lock serves its
+/// waiters in turn, so the order is the code's, not a race's.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_a_chunk_that_races_a_read_still_wakes_it() -> Result<()> {
+    let state = Arc::new(AtomicU8::new(AssociationState::Established as u8));
+    let s = stream_on(
+        "a_chunk_that_races_a_read",
+        &state,
+        &Arc::new(PendingQueue::new()),
+    );
+    let mut buf = [0u8; 64];
+    let in_time = Duration::from_secs(5);
+
+    // 1. The read takes the lock first.
+    {
+        let held = s.reassembly_queue.lock().await;
+        let mut read = std::pin::pin!(s.read_sctp(&mut buf));
+        assert!(poll_once(read.as_mut()).await.is_pending());
+        let mut data = std::pin::pin!(s.handle_data(message(1, b"first")));
+        assert!(
+            poll_once(data.as_mut()).await.is_pending(),
+            "the chunk must wait for the queue's lock, behind the read"
+        );
+        drop(held);
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "the read found nothing and must wait"
+        );
+        assert!(
+            poll_once(data.as_mut()).await.is_ready(),
+            "the chunk is queued once the read lets the lock go"
+        );
+        let got = tokio::time::timeout(in_time, read).await;
+        assert_eq!(
+            got,
+            Ok(Ok((5, PayloadProtocolIdentifier::Binary))),
+            "the chunk that came as the read began to wait never woke it"
+        );
+    }
+    assert_eq!(&buf[..5], b"first");
+
+    // 2. The chunk takes the lock first; the read is registered behind it.
+    {
+        let held = s.reassembly_queue.lock().await;
+        let mut data = std::pin::pin!(s.handle_data(message(2, b"second")));
+        assert!(poll_once(data.as_mut()).await.is_pending());
+        let mut read = std::pin::pin!(s.read_sctp(&mut buf));
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "the read must wait for the queue's lock, behind the chunk"
+        );
+        drop(held);
+        assert!(poll_once(data.as_mut()).await.is_ready());
+        let got = tokio::time::timeout(in_time, read).await;
+        assert_eq!(got, Ok(Ok((6, PayloadProtocolIdentifier::Binary))));
+    }
+    assert_eq!(&buf[..6], b"second");
+    {
+        let mut next = std::pin::pin!(s.read_notifier.notified());
+        assert!(
+            next.as_mut().enable(),
+            "the chunk's wake-up, which the read took but did not need, was lost: \
+             the next waiter must find it"
+        );
+    }
+
+    // 3. A read after that waits, and the next chunk wakes it.
+    {
+        let mut read = std::pin::pin!(s.read_sctp(&mut buf));
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "the read found nothing and must wait"
+        );
+        s.handle_data(message(3, b"third")).await;
+        let got = tokio::time::timeout(in_time, read).await;
+        assert_eq!(
+            got,
+            Ok(Ok((5, PayloadProtocolIdentifier::Binary))),
+            "a chunk that came while the read waited never woke it"
+        );
+    }
+    assert_eq!(&buf[..5], b"third");
+    Ok(())
+}

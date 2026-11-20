@@ -5910,7 +5910,7 @@ async fn handle_server_msg(
                 };
                 if native {
                     info!(%request_id, native, "consent prompt surface (exec)");
-                    let _ = surface_tx.send(true);
+                    let _ = surface_tx.send(Shown::Yes);
                 } else {
                     // FR-93 P6f — and where the companion cannot show it, a
                     // desktop notification. In the background, as the
@@ -5959,10 +5959,11 @@ async fn handle_server_msg(
                 ind.hide_prompt(&request_id);
                 let outcome = if !decision.granted() {
                     // #3982 — what the surfaces came to, never waited for.
-                    let have_surface = shown_by_now(surface);
+                    let shown = shown_by_now(surface);
+                    let have_surface = shown == Shown::Yes;
                     warn!(%request_id, ?caller, ?decision, have_surface, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
-                        error: Some(exec_refusal(decision, have_surface)),
+                        error: Some(exec_refusal(decision, shown)),
                         ..Default::default()
                     }
                 } else if via_service {
@@ -7880,19 +7881,21 @@ pub(crate) async fn rc_consent_task(
 
 /// #3982 — the surfaces of an exec question that no native panel showed, in
 /// SSH's order: the desktop companion, started if it is not running
-/// ([`crate::companion::ensure_running`]), which shows the question when it
-/// is up and the marker landed; else FR-93 P6f's desktop notification.
-/// Whether either showed it, which the command's answer reads at the
-/// window's end ([`shown_by_now`], [`exec_refusal`]). Run on a task of its
-/// own: the command waits on the broker alone, never on this. Logs the
-/// question's surfaces, as an SSH or a remote-control question's are.
+/// ([`crate::companion::ensure_running_verdict`]), which shows the question
+/// when it is up and the marker landed; else FR-93 P6f's desktop
+/// notification. Whether either showed it, and #4140 if neither did, why,
+/// which the command's answer reads at the window's end ([`shown_by_now`],
+/// [`exec_refusal`]). Run on a task of its own: the command waits on the
+/// broker alone, never on this. Logs the question's surfaces, as an SSH or a
+/// remote-control question's are.
 pub(crate) async fn exec_surfaces_up(
     marker: bool,
     indicator: &ViewerIndicator,
     view: crate::indicator::PromptView,
-) -> bool {
+) -> Shown {
     let request_id = view.session_hex.clone();
-    let companion = crate::companion::ensure_running().await;
+    let tray = crate::companion::ensure_running_verdict().await;
+    let companion = tray.up();
     // A companion that is up with the marker to read IS a surface. One with
     // no marker has nothing to show, so the notification is asked for then
     // too, as for SSH.
@@ -7902,17 +7905,34 @@ pub(crate) async fn exec_surfaces_up(
         %request_id, native = false, companion, marker, notified, have_surface,
         "consent prompt surface (exec)"
     );
-    have_surface
+    if have_surface {
+        Shown::Yes
+    } else {
+        Shown::No(tray.why_not_shown(marker))
+    }
+}
+
+/// #4140 — what an exec question's surfaces came to ([`exec_surfaces_up`]),
+/// as its answer reads it at the window's end ([`shown_by_now`],
+/// [`exec_refusal`]): a surface showed it, or none did, and why. Until #4140
+/// it was a `bool`, and the answer could not tell a Mac's closed road to the
+/// app from an app that is not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// A surface showed it.
+    Yes,
+    /// None showed it, for this cause.
+    No(crate::consent::NoSurface),
 }
 
 /// #3982 — whether a surface showed an exec question, read when its window
 /// ends and never waited for: [`exec_surfaces_up`]'s verdict, which comes
-/// within seconds of a 30 s window's start. `true` while it is not known yet,
-/// or when nothing will send one (an auto-granted command asks nobody; a task
-/// that ended without one): only a known "nothing showed it" changes the
-/// command's words.
-pub(crate) fn shown_by_now(mut verdict: tokio::sync::oneshot::Receiver<bool>) -> bool {
-    verdict.try_recv().unwrap_or(true)
+/// within seconds of a 30 s window's start. [`Shown::Yes`] while it is not
+/// known yet, or when nothing will send one (an auto-granted command asks
+/// nobody; a task that ended without one): only a known "nothing showed it"
+/// changes the command's words.
+pub(crate) fn shown_by_now(mut verdict: tokio::sync::oneshot::Receiver<Shown>) -> Shown {
+    verdict.try_recv().unwrap_or(Shown::Yes)
 }
 
 /// #4000 — [`shown_by_now`] for an RC question, read when it ends: what its
@@ -7949,12 +7969,12 @@ fn rc_shown_by_now(
 /// the question says so, in SSH's words naming the execution policy
 /// ([`crate::consent::nobody_could_be_asked`]): the caller then answers it
 /// with `roomlerd consent` there, or changes the device's policy, instead of
-/// reading it as a person who said nothing. Every other refusal reads as
-/// before.
-pub(crate) fn exec_refusal(decision: crate::consent::Decision, have_surface: bool) -> String {
-    match decision {
-        crate::consent::Decision::Timeout if !have_surface => {
-            crate::consent::nobody_could_be_asked("execution")
+/// reading it as a person who said nothing. #4140 — and with the cause the
+/// device found. Every other refusal reads as before.
+pub(crate) fn exec_refusal(decision: crate::consent::Decision, shown: Shown) -> String {
+    match (decision, shown) {
+        (crate::consent::Decision::Timeout, Shown::No(why)) => {
+            crate::consent::nobody_could_be_asked("execution", why)
         }
         _ => format!("the operator at this device did not approve the command ({decision:?})"),
     }
@@ -10186,54 +10206,68 @@ mod notification_off_the_loop_tests {
 /// question's surfaces came to ([`shown_by_now`]).
 #[cfg(test)]
 mod exec_answer_tests {
-    use super::{exec_refusal, shown_by_now};
-    use crate::consent::Decision;
+    use super::{Shown, exec_refusal, shown_by_now};
+    use crate::consent::{Decision, NoSurface};
 
     /// The verdict is read when the window ends, never waited for. One that
-    /// came says what it says. One not known yet, or one nothing will send
-    /// (an auto-granted command; a task that ended without one), reads as a
-    /// surface, so the words stay "did not approve the command".
+    /// came says what it says, #4140 the cause with it. One not known yet, or
+    /// one nothing will send (an auto-granted command; a task that ended
+    /// without one), reads as a surface, so the words stay "did not approve
+    /// the command".
     #[test]
     fn a_verdict_not_known_by_the_windows_end_keeps_todays_words() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tx.send(false).unwrap();
-        assert!(!shown_by_now(rx), "nothing showed it");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tx.send(true).unwrap();
-        assert!(shown_by_now(rx), "a surface showed it");
-        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        assert!(shown_by_now(rx), "not known yet");
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        for sent in [
+            Shown::No(NoSurface::NothingUp),
+            Shown::No(NoSurface::RoadClosed),
+            Shown::Yes,
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(sent).unwrap();
+            assert_eq!(shown_by_now(rx), sent, "a verdict that came");
+        }
+        let (_tx, rx) = tokio::sync::oneshot::channel::<Shown>();
+        assert_eq!(shown_by_now(rx), Shown::Yes, "not known yet");
+        let (tx, rx) = tokio::sync::oneshot::channel::<Shown>();
         drop(tx);
-        assert!(shown_by_now(rx), "nothing will say");
+        assert_eq!(shown_by_now(rx), Shown::Yes, "nothing will say");
     }
 
     /// A window that ran out with no surface to show the question says that
-    /// nobody could be asked, in SSH's words naming the execution policy. One
-    /// a surface showed is the person's timeout, as before. An answer, and a
-    /// question withdrawn, read as they always did, surface or not.
+    /// nobody could be asked, in SSH's words naming the execution policy, and
+    /// #4140 for the cause the device found: nothing up keeps #3982's words,
+    /// and a Mac's closed road to the app says so. One a surface showed is
+    /// the person's timeout, as before. An answer, and a question withdrawn,
+    /// read as they always did, surface or not.
     ///
     /// Red before #3982: every refusal read "did not approve the command".
     #[test]
     fn only_a_window_no_surface_showed_says_nobody_could_be_asked() {
         assert_eq!(
-            exec_refusal(Decision::Timeout, false),
-            crate::consent::nobody_could_be_asked("execution")
+            exec_refusal(Decision::Timeout, Shown::No(NoSurface::NothingUp)),
+            "nobody could be asked at this device — it has no prompt surface (no one at its screen and the Roomler desktop app is not running); answer with `roomlerd consent` there, start the desktop app, or set this device's execution policy to auto"
         );
         assert_eq!(
-            exec_refusal(Decision::Timeout, true),
+            exec_refusal(Decision::Timeout, Shown::No(NoSurface::RoadClosed)),
+            "nobody could be asked at this device — the question could not reach the Roomler desktop app there (the app gets this device's questions through a part of Roomler in the person's session, and that part is not running or did not answer); answer with `roomlerd consent` there, or set this device's execution policy to auto"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Timeout, Shown::Yes),
             "the operator at this device did not approve the command (Timeout)"
         );
-        for have_surface in [true, false] {
+        for shown in [
+            Shown::Yes,
+            Shown::No(NoSurface::NothingUp),
+            Shown::No(NoSurface::RoadClosed),
+        ] {
             assert_eq!(
-                exec_refusal(Decision::Denied, have_surface),
+                exec_refusal(Decision::Denied, shown),
                 "the operator at this device did not approve the command (Denied)",
-                "denied (surface={have_surface})"
+                "denied ({shown:?})"
             );
             assert_eq!(
-                exec_refusal(Decision::Cancelled, have_surface),
+                exec_refusal(Decision::Cancelled, shown),
                 "the operator at this device did not approve the command (Cancelled)",
-                "withdrawn (surface={have_surface})"
+                "withdrawn ({shown:?})"
             );
         }
     }

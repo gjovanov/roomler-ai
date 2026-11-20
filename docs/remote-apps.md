@@ -136,7 +136,7 @@ Four rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:314`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:4570`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:4908`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock`, the process's `ProbeState::first`
 (`agents/roomlerd/src/encode/caps.rs:49`, filled at `:165`); both the hello
-and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1940`, `:2687`, through one builder, `:7087`)
+and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1940`, `:2687`, through one builder, `:7088`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
