@@ -1145,7 +1145,9 @@ impl ConsentBroker {
     /// rewritten as it stands, its deadline (`expires_at_ms`) kept, only while
     /// the question is on the books and under their lock, as
     /// [`Self::write_prompt_while_asking`] does. `Ok(false)` = the question
-    /// had ended, or had no marker to rewrite.
+    /// had ended, had no marker to rewrite, or was the app's already (two
+    /// moves of one question, the channel's end and its caller's write, move
+    /// it, and start the app, once).
     pub fn to_the_companion_while_asking(&self, session_hex: &str) -> Result<bool> {
         let mut books = self
             .inner
@@ -1166,6 +1168,9 @@ impl ConsentBroker {
         else {
             return Ok(false);
         };
+        if marker.surface == PromptSurface::Companion.wire() {
+            return Ok(false);
+        }
         marker.surface = PromptSurface::Companion.wire().to_string();
         let body = serde_json::to_string(&marker)?;
         if self.inner.sentinel_dir.is_none() {

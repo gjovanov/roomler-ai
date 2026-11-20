@@ -2491,7 +2491,10 @@ mod sshd {
                 crate::consent::PromptSurface::Companion
             },
         };
-        let marker = match broker.write_prompt(sentinel, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            broker, sentinel, &prompt, &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(?caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");

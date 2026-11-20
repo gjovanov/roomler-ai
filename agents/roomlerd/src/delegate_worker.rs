@@ -411,7 +411,6 @@ async fn attach_once(
     // announcement, so a change in between is never missed.
     let mut gates = watch_gates();
     let hosts_panel = crate::indicator::session_panel::hosts_the_panel(person.is_some());
-    let panel_says = crate::indicator::session_panel::WorkerSays::default();
     {
         let caps = own_caps();
         tracing::info!(
@@ -433,9 +432,16 @@ async fn attach_once(
         )
         .await?;
     }
-    // FR-149 P1 — the root daemon's questions on this panel come down with
-    // the channel, however it ends.
-    let _panel = TakeDownAtTheEnd(hosts_panel);
+    // FR-149 P1 — the root daemon's panel frames, served off this loop: a
+    // show waits for the panel's main thread on a task of its own, and its
+    // answer comes back for this loop to write. The desk carries a click's
+    // word too, and the root daemon's questions on this panel come down with
+    // it when the channel ends, however it ends.
+    let mut panel = crate::indicator::session_panel::Desk::new(
+        std::sync::Arc::new(crate::indicator::session_panel::ThePanel),
+        hosts_panel,
+        true,
+    );
     // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
     // their row and its broker are gone, so the daemon's `Request` arm is the
     // only consent there is. Subscribed BEFORE the first frame, so a change in
@@ -546,24 +552,15 @@ async fn attach_once(
                             .await?;
                         }
                         // FR-149 P1 — the root daemon asks this panel to show
-                        // its question. Answered inline: the panel's one
-                        // main-thread job is a pump tick or two, inside the
-                        // root daemon's `PANEL_WITHIN`. A worker that does not
-                        // host the panel was never asked, and says `not_up`.
+                        // its question. Never waited for here: the show waits
+                        // for the panel's main thread on a task of its own,
+                        // and its word comes back on the desk's arm below. A
+                        // worker that does not host the panel was never
+                        // asked, and says `not_up`.
                         Ok(WorkerLane::Here(DelegateFrame::PanelAsk { id, question })) => {
-                            let state = if hosts_panel {
-                                crate::indicator::session_panel::answer(id.clone(), question).await
-                            } else {
-                                crate::indicator::session_panel::PanelState::NotUp {
-                                    why: "not_hosting".into(),
-                                }
-                            };
-                            panel_says.told(&state);
-                            write_frame(&mut wr, &DelegateFrame::PanelTold { id, state }).await?;
+                            panel.ask(id, question);
                         }
-                        Ok(WorkerLane::Here(DelegateFrame::PanelHide { id })) => {
-                            crate::indicator::session_panel::take_down(Some(&id));
-                        }
+                        Ok(WorkerLane::Here(DelegateFrame::PanelHide { id })) => panel.hide(&id),
                         Ok(WorkerLane::Here(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
@@ -604,6 +601,12 @@ async fn attach_once(
                     // The signalling loop is gone; so is any session it held.
                     None => return Ok(()),
                 }
+            }
+            // FR-149 P1 — the panel's word for the root daemon: a question's
+            // answer, or a click's that the root half did not take. Written
+            // from THIS loop, as a delegated session's replies are.
+            (id, state) = panel.next_word() => {
+                write_frame(&mut wr, &DelegateFrame::PanelTold { id, state }).await?;
             }
             // FR-43 P3a — this worker's own log lines, for the daemon to upload
             // on its row. What is queued goes in one frame, so a burst is one
@@ -653,18 +656,6 @@ async fn attach_once(
                     return Ok(());
                 }
             }
-        }
-    }
-}
-
-/// FR-149 P1 — the root daemon's question on this worker's panel comes down
-/// when the attach ends, however it ends (a closed channel, an error, a stop).
-struct TakeDownAtTheEnd(bool);
-
-impl Drop for TakeDownAtTheEnd {
-    fn drop(&mut self) {
-        if self.0 {
-            crate::indicator::session_panel::take_down(None);
         }
     }
 }

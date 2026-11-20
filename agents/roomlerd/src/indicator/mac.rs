@@ -61,10 +61,14 @@
 //! the one slot every question shares, so there is never a second panel, and
 //! a click on it goes out on the same `ConsentSender`: the signalling loop
 //! sends it on the person's app's road to the root half
-//! (`consent_relay::panel_clicked`), never to this process's own broker,
-//! which is not asking it. The root daemon takes it down (`PanelHide`,
+//! (`consent_relay::panel_answered`), never to this process's own broker,
+//! which is not asking it. The slot is cleared at the click, so a click the
+//! root half refused is said to the root daemon, which moves the question to
+//! the person's app. The root daemon takes it down (`PanelHide`,
 //! [`dismiss_root_question`]); so does the pump at its time's end, and the
-//! worker when its channel ends.
+//! worker when its channel ends. The panel is built with no lock held
+//! (`put_up`), so a window server that stalls the build never stalls the
+//! worker's frame loop.
 //!
 //! ## The main loop's promise (FR-149 P1, C2)
 //!
@@ -315,10 +319,14 @@ pub(crate) fn show_root_question(id: &str, question: &PanelQuestion) -> PanelSta
 }
 
 /// FR-149 P1 — on the main thread: the root daemon's question into the one
-/// slot, and its panel up, when the slot is still free.
+/// slot, and its panel up, when the slot is still free. The slot is read, and
+/// then filled, under the shared lock, and the window is built between the
+/// two with no lock held: a window server that stalls the build stalls the
+/// main thread alone, never a thread that takes the lock (the worker's frame
+/// loop, whose `PanelHide` takes the question down, and the next question's
+/// gate).
 fn put_up(mtm: MainThreadMarker, view: PromptView) -> PanelState {
-    let mut s = shared().lock().unwrap();
-    if s.prompt.is_some() {
+    if shared().lock().unwrap().prompt.is_some() {
         return PanelState::Busy;
     }
     let _inside = exit_net::inside("the panel's window");
@@ -338,10 +346,24 @@ fn put_up(mtm: MainThreadMarker, view: PromptView) -> PanelState {
             why: format!("no_window_device: window number {number}"),
         };
     }
+    let filled = {
+        let mut s = shared().lock().unwrap();
+        // This process's own question took the slot while the window was
+        // built (`Inner::prompt`): it is that question's.
+        let free = s.prompt.is_none();
+        if free {
+            s.prompt = Some(view);
+            s.root = true;
+            s.dirty = false;
+        }
+        free
+    };
+    if !filled {
+        // Dropped with no lock held: it closes the window.
+        drop(panel);
+        return PanelState::Busy;
+    }
     PANEL.with_borrow_mut(|p| *p = Some(panel));
-    s.prompt = Some(view);
-    s.root = true;
-    s.dirty = false;
     PanelState::Shown
 }
 

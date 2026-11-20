@@ -1568,7 +1568,13 @@ impl Handler {
         // The marker is written either way (`roomlerd consent --list` shows a
         // natively-prompted question too); without it the companion has
         // nothing to render, so it is part of "could anyone be asked".
-        let marker = match self.ctx.consent.write_prompt(&prompt_id, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            &self.ctx.consent,
+            &prompt_id,
+            &prompt,
+            &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(%e, native, "record: could not write the .pending consent marker");

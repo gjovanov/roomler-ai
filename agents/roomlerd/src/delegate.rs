@@ -222,7 +222,9 @@ pub enum DelegateFrame {
     /// the question carries the panel's text and the time left in
     /// milliseconds. Sent only to a worker that said
     /// [`crate::indicator::session_panel::CONSENT_PANEL`]. The answer is
-    /// [`DelegateFrame::PanelTold`] with the same `id`. Additive both ways: an
+    /// [`DelegateFrame::PanelTold`] with the same `id`, from a show the worker
+    /// runs off its frame loop (`session_panel::Desk`): a panel whose main
+    /// thread stalls never stops the channel's other frames. Additive both ways: an
     /// older worker never says the word, so it is never asked, and an older
     /// daemon drops the word and never asks; a reader on either side skips a
     /// frame it does not know (a debug line), as it always has.
@@ -234,8 +236,12 @@ pub enum DelegateFrame {
     /// `shown`, `busy`, or `not_up` with its reason. Read only on this
     /// channel, whose attach proved the secret, and only while `id` is asked
     /// ([`DelegateHost::ask_panel`]); a late `shown` gets a
-    /// [`DelegateFrame::PanelHide`]. It routes a question and never decides
-    /// one: the panel's answer takes the app's road (`consent_relay`).
+    /// [`DelegateFrame::PanelHide`]. Unasked, `not_up` says the panel no
+    /// longer shows a question it showed (a click the root half refused):
+    /// the daemon moves it to the person's app while its broker asks it and
+    /// it is on the panel's books, and drops the word otherwise. It routes a
+    /// question and never decides one: the panel's answer takes the app's
+    /// road (`consent_relay`).
     PanelTold {
         id: String,
         state: crate::indicator::session_panel::PanelState,
@@ -1168,6 +1174,9 @@ struct Inner {
     /// FR-149 P1 — the broker whose markers the channel's end rewrites for the
     /// app (D4). Set on a one-row Mac's root daemon.
     consent: Mutex<Option<crate::consent::ConsentBroker>>,
+    /// FR-149 P1 — how many times a question moved to the person's app
+    /// started the app ([`DelegateHost::start_the_app`]).
+    app_starts: std::sync::atomic::AtomicUsize,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -1456,7 +1465,9 @@ impl DelegateHost {
     }
 
     /// FR-149 P1 — the worker's word on question `id`. Counted only while the
-    /// question is asked; a late or unasked `shown` gets a `PanelHide`.
+    /// question is asked; a late or unasked `shown` gets a `PanelHide`. An
+    /// unasked `not_up` is the worker saying that its panel no longer shows
+    /// the question ([`Self::panel_let_go`]).
     fn panel_told(&self, id: String, state: crate::indicator::session_panel::PanelState) {
         use crate::indicator::session_panel::PanelState;
         let waiting = self
@@ -1466,6 +1477,10 @@ impl DelegateHost {
             .expect("panel_asks mutex")
             .remove(&id);
         let shown = state == PanelState::Shown;
+        let not_up = match &state {
+            PanelState::NotUp { why } => Some(why.clone()),
+            _ => None,
+        };
         if shown {
             self.inner
                 .on_panel
@@ -1475,7 +1490,6 @@ impl DelegateHost {
         }
         let counted = waiting.is_some_and(|tx| tx.send(state).is_ok());
         if !counted {
-            tracing::debug!(%id, "delegation: a panel answer nobody is waiting for");
             if shown && self.off_the_panel(&id) {
                 tracing::info!(
                     %id,
@@ -1483,8 +1497,87 @@ impl DelegateHost {
                      down (FR-149)"
                 );
                 self.send_panel_hide(&id);
+            } else if let Some(why) = not_up {
+                self.panel_let_go(&id, &why);
+            } else {
+                tracing::debug!(%id, "delegation: a panel answer nobody is waiting for");
             }
         }
+    }
+
+    /// FR-149 P1 — the worker says, unasked, that its panel no longer shows
+    /// question `id` (a click the root half refused: the panel took it down
+    /// before the answer was relayed). While this daemon's broker asks `id`
+    /// and `id` is on the panel's books, the question moves to the person's
+    /// app as D4 moves one whose channel ended ([`Self::to_the_app`]), and
+    /// leaves the books. Anything else is dropped. The word routes the
+    /// question and never decides, ends or extends it, and it is never put
+    /// back on the panel: the refusal may mean the question ended, was
+    /// answered elsewhere or the seat moved, which the broker knows.
+    fn panel_let_go(&self, id: &str, why: &str) {
+        let broker = self.inner.consent.lock().expect("consent mutex").clone();
+        if !broker.is_some_and(|b| b.is_asking(id)) {
+            tracing::debug!(%id, %why, "delegation: the panel let go of a question nobody asks");
+            return;
+        }
+        if !self.off_the_panel(id) {
+            tracing::debug!(%id, %why, "delegation: the panel let go of a question it did not show");
+            return;
+        }
+        let moved = self.to_the_app(id);
+        tracing::info!(
+            %id,
+            %why,
+            moved,
+            "consent panel: the screen worker's panel no longer shows the question; it goes to \
+             the person's app for the rest of its window (FR-149)"
+        );
+    }
+
+    /// FR-149 P1 — question `id` moves to the person's app for the rest of
+    /// its window: its marker says `companion`, its deadline kept, by the
+    /// broker's rewrite while it is asked (#4000's rewrite for a
+    /// notification), and the app is started ([`Self::start_the_app`]).
+    /// Whether the marker moved: `false` for a question that ended, or that
+    /// has no marker yet (its caller writes it, and reads the panel's books
+    /// after: `session_panel::write_marker`).
+    pub fn to_the_app(&self, id: &str) -> bool {
+        let broker = self.inner.consent.lock().expect("consent mutex").clone();
+        let moved = match broker.map(|b| b.to_the_companion_while_asking(id)) {
+            Some(Ok(moved)) => moved,
+            Some(Err(e)) => {
+                tracing::warn!(%id, %e, "consent panel: could not mark the question for the app");
+                false
+            }
+            None => false,
+        };
+        if moved {
+            self.start_the_app();
+        }
+        moved
+    }
+
+    /// FR-149 P1 — the person's app, started for a question moved to it, by
+    /// the start a question whose surface is the app makes from the outset
+    /// (`companion::start_for_prompt`, the remote-control prompt's): on a
+    /// task of its own, best-effort, with no lock held. A test counts it and
+    /// starts nothing: a test never starts the real app.
+    fn start_the_app(&self) {
+        self.inner.app_starts.fetch_add(1, Ordering::AcqRel);
+        // The start is detached: nobody reads its verdict, as the question's
+        // own window ends it either way.
+        #[cfg(not(test))]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async {
+                drop(crate::companion::start_for_prompt().await);
+            });
+        }
+    }
+
+    /// FR-149 P1 — how many times a moved question started the app.
+    #[cfg(test)]
+    pub(crate) fn app_starts(&self) -> usize {
+        self.inner.app_starts.load(Ordering::Acquire)
     }
 
     /// Whether `id` was on the session panel, which it leaves now.
@@ -1538,10 +1631,11 @@ impl DelegateHost {
     }
 
     /// FR-149 P1, D4 — the channel ended: each question that was on the
-    /// session panel is marked for the app for the rest of its window, by the
-    /// broker's rewrite of its marker while it is asked (#4000's rewrite for a
-    /// notification). An answer stays bound to its id, and once the prompt's
-    /// look has decided a question, a later one is refused.
+    /// session panel moves to the person's app for the rest of its window
+    /// ([`Self::to_the_app`]: the broker's rewrite of its marker while it is
+    /// asked, #4000's rewrite for a notification, and the app started). An
+    /// answer stays bound to its id, and once the prompt's look has decided a
+    /// question, a later one is refused.
     fn panel_channel_ended(&self) {
         let shown: Vec<String> = self
             .inner
@@ -1550,14 +1644,11 @@ impl DelegateHost {
             .expect("on_panel mutex")
             .drain()
             .collect();
-        let broker = self.inner.consent.lock().expect("consent mutex").clone();
         for id in shown {
-            let to_the_app = broker
-                .as_ref()
-                .map(|b| b.to_the_companion_while_asking(&id));
+            let moved = self.to_the_app(&id);
             tracing::info!(
                 %id,
-                to_the_app = ?to_the_app.as_ref().map(|r| r.as_ref().map_err(|e| e.to_string())),
+                moved,
                 "consent panel: the channel to the screen worker ended while its panel showed a \
                  question; the question goes to the person's app for the rest of its window \
                  (FR-149 D4)"

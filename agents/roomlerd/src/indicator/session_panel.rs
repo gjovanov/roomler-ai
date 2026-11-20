@@ -32,8 +32,28 @@
 //! (`consent_relay::panel_clicked`). At most one panel is on the screen: once
 //! the session panel was asked, the root daemon's own panel is not tried.
 //!
-//! The readers are macOS's (`TheRoad`, the worker's `answer`); here they are
-//! a trait, so these cells run on every lane.
+//! ## When the session panel no longer shows a question
+//!
+//! A question the session panel showed moves to the person's app for the rest
+//! of its window, its marker rewritten `companion` with its deadline kept, and
+//! the app started as for a question whose surface is the app from the outset
+//! (`delegate::DelegateHost::to_the_app`), only while the root daemon's broker
+//! asks it:
+//!
+//! | The panel's end | Where it is moved |
+//! |---|---|
+//! | the channel to the worker ends (D4) | `delegate::DelegateHost::panel_channel_ended`, for each question on the panel's books |
+//! | a click the root half did not take: the panel cleared its slot at the click | the worker says so, unasked (`PanelTold` `not_up`, [`CLICK_NOT_TAKEN`], [`tell_the_root`]), for a question on the books (`delegate::DelegateHost::panel_let_go`) |
+//! | either one before the caller wrote the question's marker, which found nothing to move | the caller's write reads the books after it ([`write_marker`]) |
+//!
+//! The question is never put back on the panel: the root daemon's broker
+//! knows whether a refused click meant an ended question, another answer or a
+//! moved seat. The worker's frame loop never waits for the panel's main
+//! thread: its [`Desk`] shows a question on a task of its own, and a show that
+//! ends after its attach takes itself down.
+//!
+//! The readers are macOS's (`TheRoad`, the worker's [`ThePanel`]); here they
+//! are traits, so these cells run on every lane.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -203,6 +223,12 @@ pub trait Road: Send + Sync {
     fn session_panel_up(&self) -> bool;
     /// Ask the worker to show `question` under `id`, waiting `within`.
     async fn ask(&self, id: &str, question: PanelQuestion, within: Duration) -> Asked;
+    /// Whether question `id` is on the session panel's books now: the
+    /// worker said `shown`, and nothing has taken it down since.
+    fn on_the_panel(&self, id: &str) -> bool;
+    /// Move question `id` to the person's app for the rest of its window
+    /// (`delegate::DelegateHost::to_the_app`). Whether its marker moved.
+    fn to_the_app(&self, id: &str) -> bool;
 }
 
 /// The daemon's [`Road`]: its one-row host (`consent_relay::one_row_host`,
@@ -249,6 +275,52 @@ impl Road for TheRoad {
             None => Asked::NoAnswer,
         }
     }
+    fn on_the_panel(&self, id: &str) -> bool {
+        crate::consent_relay::one_row_host().is_some_and(|host| host.on_the_panel(id))
+    }
+    fn to_the_app(&self, id: &str) -> bool {
+        crate::consent_relay::one_row_host().is_some_and(|host| host.to_the_app(id))
+    }
+}
+
+/// FR-149 P1 — question `id`'s marker, written by its caller once its
+/// surfaces are known (`prompt`, and `shown`, what [`chain`] came to): every
+/// caller that asks a panel writes it here. A question the session panel
+/// showed is read on the panel's books after the write: a channel that ended
+/// between the worker's `shown` and this write found no marker to move (D4,
+/// `delegate::DelegateHost::panel_channel_ended`), and a click the root half
+/// refused in that gap left the panel's books too, so the question moves to
+/// the person's app here. Whichever comes first, the panel's end or this
+/// write, a question the session panel no longer shows ends with its marker
+/// saying `companion` while it is asked, and the app started once.
+pub fn write_marker(
+    broker: &crate::consent::ConsentBroker,
+    id: &str,
+    prompt: &crate::consent::PendingPrompt<'_>,
+    shown: &Prompted,
+) -> anyhow::Result<()> {
+    marked(&TheRoad, broker, id, prompt, shown)
+}
+
+/// [`write_marker`] on `road`.
+fn marked(
+    road: &dyn Road,
+    broker: &crate::consent::ConsentBroker,
+    id: &str,
+    prompt: &crate::consent::PendingPrompt<'_>,
+    shown: &Prompted,
+) -> anyhow::Result<()> {
+    broker.write_prompt(id, prompt)?;
+    if shown.on_the_session_panel() && !road.on_the_panel(id) {
+        let moved = road.to_the_app(id);
+        tracing::info!(
+            %id,
+            moved,
+            "consent panel: the screen worker's panel no longer showed the question when its \
+             marker was written; it goes to the person's app for the rest of its window (FR-149)"
+        );
+    }
+    Ok(())
 }
 
 /// `/dev/console`'s owner now, when that is a person: uid 0 is the login
@@ -460,14 +532,15 @@ pub fn worker_gate(
 
 /// The worker's last-said state of its panel for the root daemon: each change
 /// is logged once (up, not up and why), never a line per question. The worker
-/// (`delegate_worker`) is unix-only, and so is the worker's half here.
-#[cfg(unix)]
+/// (`delegate_worker`) is unix-only, and so is the worker's half here (a test
+/// builds it on every lane).
+#[cfg(any(unix, test))]
 #[derive(Default)]
 pub struct WorkerSays {
     last: std::sync::Mutex<Option<String>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 impl WorkerSays {
     /// `state` was told for a question; a change from the last one is said.
     pub fn told(&self, state: &PanelState) {
@@ -493,41 +566,204 @@ impl WorkerSays {
     }
 }
 
-/// The worker's answer to a root daemon's question. On a Mac whose build has
-/// the panel, [`worker_gate`] and then the panel's own window
-/// (`indicator::mac::show_root_question`); elsewhere `not_up`, though such a
-/// worker never says [`CONSENT_PANEL`] and is never asked.
+/// A word for the root daemon, `PanelTold { id, state }`, which the worker's
+/// frame loop writes ([`Desk::next_word`]).
+pub type Word = (String, PanelState);
+
+/// The words the worker's frame loop has not written yet, at most. Each is a
+/// question's answer or a click's: a handful at a time.
+#[cfg(any(unix, test))]
+const WORDS_QUEUED: usize = 16;
+
+/// FR-149 P1 — why the worker says, unasked, that its panel no longer shows a
+/// question: a click on it the root half did not take.
+pub const CLICK_NOT_TAKEN: &str = "the_answer_was_not_taken";
+
+/// FR-149 P1 — the worker's panel as its frame loop reaches it: macOS's
+/// ([`ThePanel`]), or a test's stand-in.
+#[cfg(any(unix, test))]
+pub trait WorkerPanel: Send + Sync + 'static {
+    /// Put the root daemon's question `id` up, and say what came of it.
+    /// Blocking: the [`Desk`] runs it on the blocking pool, never on the
+    /// frame loop.
+    fn show(&self, id: &str, question: &PanelQuestion) -> PanelState;
+    /// Take the root daemon's question `id` down, or whichever is up
+    /// (`None`). Its own questions stay. Never waits for the panel's main
+    /// thread: the frame loop calls it.
+    fn take_down(&self, id: Option<&str>);
+}
+
+/// The worker's panel. On a Mac whose build has it, [`worker_gate`] and then
+/// the panel's own window (`indicator::mac::show_root_question`), and a
+/// take-down the pump also makes by itself at the question's time's end, so
+/// a lost `PanelHide` leaves nothing past the window. Elsewhere `not_up`,
+/// though such a worker never says [`CONSENT_PANEL`] and is never asked.
 #[cfg(unix)]
-pub async fn answer(id: String, question: PanelQuestion) -> PanelState {
-    #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
-    {
-        // `show_root_question` waits for the main thread, so off the runtime.
-        tokio::task::spawn_blocking(move || super::mac::show_root_question(&id, &question))
-            .await
-            .unwrap_or_else(|e| PanelState::NotUp {
-                why: format!("its show ended with no answer: {e}"),
-            })
+pub struct ThePanel;
+
+#[cfg(unix)]
+impl WorkerPanel for ThePanel {
+    fn show(&self, id: &str, question: &PanelQuestion) -> PanelState {
+        #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+        {
+            super::mac::show_root_question(id, question)
+        }
+        #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
+        {
+            let _ = (id, question);
+            PanelState::NotUp {
+                why: "no_panel_in_this_build".into(),
+            }
+        }
     }
-    #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
-    {
-        let _ = (id, question);
-        PanelState::NotUp {
-            why: "no_panel_in_this_build".into(),
+
+    fn take_down(&self, id: Option<&str>) {
+        #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+        super::mac::dismiss_root_question(id);
+        #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
+        let _ = id;
+    }
+}
+
+/// FR-149 P1 — where a click's word goes ([`tell_the_root`]): the [`Desk`]
+/// of the attach that is up, by its number, so an attach that ends never
+/// takes a newer one's away.
+static CLICK_WORDS: std::sync::Mutex<Option<(u64, tokio::sync::mpsc::Sender<Word>)>> =
+    std::sync::Mutex::new(None);
+
+/// FR-149 P1 — the worker's word to the root daemon, unasked: `state` for
+/// question `id`. The panel takes a question down when it is clicked, so a
+/// click the root half refused leaves the question on no surface: the root
+/// daemon is told `not_up` ([`CLICK_NOT_TAKEN`]) and moves it to the person's
+/// app while it asks it (`delegate::DelegateHost::panel_let_go`). The frame
+/// loop of the attach that is up writes it; with none up nothing is said, and
+/// the channel's end has sent every question the panel showed to the app
+/// (D4). Whether it was queued.
+pub fn tell_the_root(id: &str, state: PanelState) -> bool {
+    let words = CLICK_WORDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|(_, tx)| tx.clone());
+    words.is_some_and(|tx| tx.try_send((id.to_string(), state)).is_ok())
+}
+
+/// FR-149 P1 — the root daemon's panel frames, served for one attach, so that
+/// the worker's frame loop never waits for the panel's main thread: a
+/// `PanelAsk` is shown on a task of its own and its answer comes back here
+/// for the loop to write ([`Self::next_word`]), as a delegated session's
+/// replies do; a `PanelHide` is one take-down that waits for nothing. While
+/// a show waits for a main thread that has stalled, the loop goes on reading
+/// and writing its frames: the delegated sessions', the liveness ping, the
+/// next `PanelHide`.
+///
+/// A show never stays up after its answer could not be heard: the root
+/// daemon takes down a `shown` it no longer waits for (`PanelHide`), and a
+/// show that ends after its attach did takes itself down. When the attach
+/// ends, the desk takes down whichever root question is up.
+#[cfg(any(unix, test))]
+pub struct Desk {
+    panel: std::sync::Arc<dyn WorkerPanel>,
+    hosts: bool,
+    words: tokio::sync::mpsc::Sender<Word>,
+    heard: tokio::sync::mpsc::Receiver<Word>,
+    says: std::sync::Arc<WorkerSays>,
+    /// This desk's number in [`CLICK_WORDS`], when it takes the clicks'.
+    clicks: Option<u64>,
+}
+
+#[cfg(any(unix, test))]
+impl Desk {
+    /// The desk of one attach. `hosts`: this worker said [`CONSENT_PANEL`];
+    /// one that did not was never asked, and answers `not_up`. `clicks`: the
+    /// desk carries the clicks' words too ([`tell_the_root`]), as the
+    /// daemon's attach does (a test's desk carries none).
+    pub fn new(panel: std::sync::Arc<dyn WorkerPanel>, hosts: bool, clicks: bool) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let (words, heard) = tokio::sync::mpsc::channel(WORDS_QUEUED);
+        let clicks = (clicks && hosts).then(|| {
+            let number = NEXT.fetch_add(1, Ordering::Relaxed);
+            *CLICK_WORDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((number, words.clone()));
+            number
+        });
+        Self {
+            panel,
+            hosts,
+            words,
+            heard,
+            says: Default::default(),
+            clicks,
+        }
+    }
+
+    /// `PanelAsk { id, question }`: shown on a task of its own, and never
+    /// waited for here. Its answer comes back as a word.
+    pub fn ask(&self, id: String, question: PanelQuestion) {
+        if !self.hosts {
+            let _ = self.words.try_send((
+                id,
+                PanelState::NotUp {
+                    why: "not_hosting".into(),
+                },
+            ));
+            return;
+        }
+        let (panel, words, says) = (self.panel.clone(), self.words.clone(), self.says.clone());
+        tokio::spawn(async move {
+            let (shows, asked) = (panel.clone(), id.clone());
+            let state = tokio::task::spawn_blocking(move || shows.show(&asked, &question))
+                .await
+                .unwrap_or_else(|e| PanelState::NotUp {
+                    why: format!("its show ended with no answer: {e}"),
+                });
+            says.told(&state);
+            let shown = state == PanelState::Shown;
+            if words.send((id.clone(), state)).await.is_err() && shown {
+                // The attach ended while the panel went up: its end took
+                // down what was up then, and nobody else will take this one.
+                panel.take_down(Some(&id));
+            }
+        });
+    }
+
+    /// `PanelHide { id }`: down now, waiting for nothing.
+    pub fn hide(&self, id: &str) {
+        self.panel.take_down(Some(id));
+    }
+
+    /// The next word for the root daemon, for the frame loop to write.
+    pub async fn next_word(&mut self) -> Word {
+        match self.heard.recv().await {
+            Some(word) => word,
+            // The desk holds a sender, so this never ends; pending beats
+            // spinning.
+            None => std::future::pending().await,
         }
     }
 }
 
-/// The worker takes a root daemon's question down: `PanelHide { id }`, or
-/// `None` for whichever root question is up, when the channel ends. Its own
-/// questions stay. The panel also takes a root question down by itself when
-/// its time is up (`indicator::mac`), so a lost `PanelHide` leaves nothing
-/// past the window.
-#[cfg(unix)]
-pub fn take_down(id: Option<&str>) {
-    #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
-    super::mac::dismiss_root_question(id);
-    #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
-    let _ = id;
+#[cfg(any(unix, test))]
+impl Drop for Desk {
+    fn drop(&mut self) {
+        // A show that ends from now on finds nobody to hear it, and takes
+        // itself down.
+        self.heard.close();
+        if let Some(number) = self.clicks {
+            let mut words = CLICK_WORDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if words.as_ref().is_some_and(|(n, _)| *n == number) {
+                *words = None;
+            }
+        }
+        // FR-149 P1 — the root daemon's question on this panel comes down
+        // with the attach, however it ends.
+        if self.hosts {
+            self.panel.take_down(None);
+        }
+    }
 }
 
 /// Whether this worker hosts the panel for its root daemon, and so says
@@ -618,6 +854,12 @@ mod tests {
             assert_eq!(within, PANEL_WITHIN);
             self.asked.lock().unwrap().push(id.to_string());
             self.told.clone()
+        }
+        fn on_the_panel(&self, _id: &str) -> bool {
+            self.session_up
+        }
+        fn to_the_app(&self, _id: &str) -> bool {
+            false
         }
     }
 
@@ -841,6 +1083,12 @@ mod tests {
         }
         async fn ask(&self, id: &str, question: PanelQuestion, within: Duration) -> Asked {
             self.0.ask_panel(id, question, within).await
+        }
+        fn on_the_panel(&self, id: &str) -> bool {
+            self.0.on_the_panel(id)
+        }
+        fn to_the_app(&self, id: &str) -> bool {
+            self.0.to_the_app(id)
         }
     }
 
@@ -1140,5 +1388,418 @@ mod tests {
             Response::ConsentDecided { ok: true },
             "the app's answer after the panel's click"
         );
+    }
+
+    // ---- The review's cells (F1-F5) -------------------------------------
+
+    /// The root daemon's question `ID`, asked by `broker` with its marker
+    /// written `native`, and on the session panel's books: its stood-in
+    /// worker said `shown` for it.
+    async fn on_the_books(
+        broker: &ConsentBroker,
+        host: &DelegateHost,
+        lines: &mut Lines,
+        cwr: &mut Writer,
+        id: &str,
+        window: Duration,
+    ) {
+        broker
+            .write_prompt(id, &marker(window, PromptSurface::Native))
+            .unwrap();
+        let (h, asked_id) = (host.clone(), id.to_string());
+        let q = PanelQuestion::of(&view(id, window), Instant::now());
+        let asked =
+            tokio::spawn(async move { h.ask_panel(&asked_id, q, Duration::from_secs(5)).await });
+        assert!(matches!(
+            next_frame(lines).await,
+            DelegateFrame::PanelAsk { .. }
+        ));
+        told(cwr, id, PanelState::Shown).await;
+        assert_eq!(asked.await.unwrap(), Asked::Told(PanelState::Shown));
+        assert!(host.on_the_panel(id));
+    }
+
+    /// The worker's word on a click the root half did not take.
+    fn not_taken() -> PanelState {
+        PanelState::NotUp {
+            why: CLICK_NOT_TAKEN.into(),
+        }
+    }
+
+    async fn decided(asking: tokio::task::JoinHandle<Decision>) -> Decision {
+        tokio::time::timeout(Duration::from_secs(3), asking)
+            .await
+            .expect("an answered question ends promptly")
+            .unwrap()
+    }
+
+    /// FR-149 P1 (review F1) — a click the root half refused leaves its
+    /// question on no panel: the worker's panel cleared its slot at the
+    /// click. The worker says so, unasked, and the root daemon moves the
+    /// question to the person's app while it asks it: its marker says
+    /// `companion` with its deadline kept, it leaves the panel's books, and
+    /// the app is started. The word never decides the question, and said
+    /// again it moves nothing more.
+    #[tokio::test]
+    async fn a_refused_click_moves_the_question_to_the_app_while_it_is_asked() {
+        let window = Duration::from_secs(30);
+        let broker = books_broker(window);
+        let asking = tokio::spawn(broker.request_with_mode(ID, Mode::Prompt { timeout: window }));
+        let host = DelegateHost::new();
+        host.set_consent_broker(broker.clone());
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        on_the_books(&broker, &host, &mut lines, &mut cwr, ID, window).await;
+        let before = marker_of(&broker, ID).expect("the question is marked");
+        assert_eq!(before.surface, "native");
+
+        told(&mut cwr, ID, not_taken()).await;
+        read_so_far(&mut lines, &mut cwr).await;
+        let after = marker_of(&broker, ID).expect("still marked");
+        assert_eq!(
+            after.surface, "companion",
+            "a question no panel shows is not the app's"
+        );
+        assert_eq!(after.expires_at_ms, before.expires_at_ms, "a new window");
+        assert!(!host.on_the_panel(ID), "still on the panel's books");
+        assert_eq!(host.app_starts(), 1, "the app was not started for it");
+        assert!(broker.is_asking(ID), "the word decided the question");
+
+        told(&mut cwr, ID, not_taken()).await;
+        read_so_far(&mut lines, &mut cwr).await;
+        assert_eq!(host.app_starts(), 1, "a second move");
+        assert!(broker.record_decision(ID, true));
+        assert_eq!(decided(asking).await, Decision::Granted);
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-149 P1 (review F1) — a refused click for a question that has ended
+    /// changes nothing: no marker comes back, and nothing starts.
+    #[tokio::test]
+    async fn a_refused_click_for_an_ended_question_changes_nothing() {
+        let window = Duration::from_secs(30);
+        let broker = books_broker(window);
+        let asking = tokio::spawn(broker.request_with_mode(ID, Mode::Prompt { timeout: window }));
+        let host = DelegateHost::new();
+        host.set_consent_broker(broker.clone());
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        on_the_books(&broker, &host, &mut lines, &mut cwr, ID, window).await;
+        assert!(broker.record_decision(ID, false));
+        assert_eq!(decided(asking).await, Decision::Denied);
+        assert!(marker_of(&broker, ID).is_none());
+
+        told(&mut cwr, ID, not_taken()).await;
+        read_so_far(&mut lines, &mut cwr).await;
+        assert!(marker_of(&broker, ID).is_none(), "a marker came back");
+        assert_eq!(host.app_starts(), 0, "the app was started");
+        assert!(!broker.is_asking(ID));
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-149 P1 (review F1) — a `not_up` the root daemon did not ask for,
+    /// for a question that is not on the panel's books, changes nothing: the
+    /// marker keeps its surface, and nothing starts.
+    #[tokio::test]
+    async fn a_not_up_for_a_question_off_the_panels_books_changes_nothing() {
+        let window = Duration::from_secs(30);
+        let broker = books_broker(window);
+        let asking = tokio::spawn(broker.request_with_mode(ID, Mode::Prompt { timeout: window }));
+        broker
+            .write_prompt(ID, &marker(window, PromptSurface::Native))
+            .unwrap();
+        let host = DelegateHost::new();
+        host.set_consent_broker(broker.clone());
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        assert!(!host.on_the_panel(ID));
+
+        told(&mut cwr, ID, not_taken()).await;
+        read_so_far(&mut lines, &mut cwr).await;
+        assert_eq!(
+            marker_of(&broker, ID).expect("still marked").surface,
+            "native",
+            "a word for a question the panel did not show moved it"
+        );
+        assert_eq!(host.app_starts(), 0, "the app was started");
+        assert!(broker.is_asking(ID));
+        assert!(broker.record_decision(ID, true));
+        assert_eq!(decided(asking).await, Decision::Granted);
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-149 P1 (review F2) — D4's move starts the app, as a question whose
+    /// surface is the app from the outset does: once for each question that
+    /// moves, and never for one that had ended.
+    #[tokio::test]
+    async fn a_question_moved_to_the_app_at_the_channels_end_starts_the_app() {
+        let window = Duration::from_secs(30);
+        let broker = books_broker(window);
+        let (asked, ended) = (ID, "414900000000000000000a02");
+        let asking =
+            tokio::spawn(broker.request_with_mode(asked, Mode::Prompt { timeout: window }));
+        let over = tokio::spawn(broker.request_with_mode(ended, Mode::Prompt { timeout: window }));
+        let host = DelegateHost::new();
+        host.set_consent_broker(broker.clone());
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        on_the_books(&broker, &host, &mut lines, &mut cwr, asked, window).await;
+        on_the_books(&broker, &host, &mut lines, &mut cwr, ended, window).await;
+        assert!(broker.record_decision(ended, true));
+        assert_eq!(decided(over).await, Decision::Granted);
+        assert_eq!(host.app_starts(), 0);
+
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert_eq!(
+            marker_of(&broker, asked).expect("still marked").surface,
+            "companion"
+        );
+        assert_eq!(host.app_starts(), 1, "the moved question started nothing");
+        assert!(marker_of(&broker, ended).is_none());
+        assert!(broker.record_decision(asked, false));
+        assert_eq!(decided(asking).await, Decision::Denied);
+    }
+
+    /// FR-149 P1 (review F3) — a channel that ends between the worker's
+    /// `shown` and the caller's marker write finds no marker to move (D4); the
+    /// write, reading the panel's books after it, moves the question then.
+    /// Whichever comes first, the question ends with its marker saying
+    /// `companion` while it is asked, and the app started once. (The other
+    /// order, the write first, is D4's own cell above.)
+    #[tokio::test]
+    async fn a_channel_that_ends_before_the_marker_is_written_leaves_the_question_with_the_app() {
+        let window = Duration::from_secs(30);
+        let broker = books_broker(window);
+        let asking = tokio::spawn(broker.request_with_mode(ID, Mode::Prompt { timeout: window }));
+        let host = DelegateHost::new();
+        host.set_consent_broker(broker.clone());
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        let v = view(ID, window);
+        let (road, at) = (HostRoad(host.clone()), v.clone());
+        let chained =
+            tokio::spawn(async move { chain(&road, &at, || panic!("a second panel")).await });
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::PanelAsk { .. }
+        ));
+        told(&mut cwr, ID, PanelState::Shown).await;
+        let shown = chained.await.unwrap();
+        assert!(shown.native && shown.on_the_session_panel(), "{shown:?}");
+
+        // The channel ends here, before the caller writes the marker.
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.on_the_panel(ID));
+        assert_eq!(host.app_starts(), 0, "nothing to move yet");
+
+        let road = HostRoad(host.clone());
+        marked(
+            &road,
+            &broker,
+            ID,
+            &marker(window, PromptSurface::Native),
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            marker_of(&broker, ID).expect("marked").surface,
+            "companion",
+            "the marker says `native` for a panel that is gone"
+        );
+        assert_eq!(host.app_starts(), 1);
+        assert!(broker.is_asking(ID));
+        assert!(broker.record_decision(ID, true));
+        assert_eq!(decided(asking).await, Decision::Granted);
+    }
+
+    /// FR-149 P1 (review F4) — the way back: after a worker gave no answer
+    /// in time, the next question is asked again, and a worker that answers
+    /// again shows it. Nothing remembers the silence past its question.
+    #[tokio::test]
+    async fn after_no_answer_the_next_question_is_asked_again() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        says_the_word(&mut lines, &mut cwr).await;
+        let (first, second) = (ID, "414900000000000000000a03");
+        let road = HostRoad(host.clone());
+        let p = chain(&road, &view(first, Duration::from_secs(30)), || {
+            panic!("a second panel")
+        })
+        .await;
+        assert_eq!(p.session_panel, Some("no_answer"), "{p:?}");
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelAsk { id, .. } => assert_eq!(id, first),
+            other => panic!("expected the first question, got {other:?}"),
+        }
+
+        let at = view(second, Duration::from_secs(30));
+        let chained =
+            tokio::spawn(async move { chain(&road, &at, || panic!("a second panel")).await });
+        match next_frame(&mut lines).await {
+            DelegateFrame::PanelAsk { id, .. } => assert_eq!(id, second, "not asked again"),
+            other => panic!("expected the next question, got {other:?}"),
+        }
+        told(&mut cwr, second, PanelState::Shown).await;
+        let p = chained.await.unwrap();
+        assert!(p.native && p.on_the_session_panel(), "{p:?}");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// A worker's panel whose show waits until the test lets it go, as one
+    /// whose main thread has stalled. It holds the root daemon's question it
+    /// shows, and takes it down as the panel does.
+    #[derive(Default)]
+    struct Stalled {
+        go: Mutex<bool>,
+        cv: std::sync::Condvar,
+        up: Mutex<Option<String>>,
+        shows: std::sync::atomic::AtomicUsize,
+        downs: Mutex<Vec<Option<String>>>,
+    }
+
+    impl Stalled {
+        fn let_go(&self) {
+            *self.go.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+        fn up(&self) -> Option<String> {
+            self.up.lock().unwrap().clone()
+        }
+        fn shows(&self) -> usize {
+            self.shows.load(Ordering::SeqCst)
+        }
+        fn downs(&self) -> Vec<Option<String>> {
+            self.downs.lock().unwrap().clone()
+        }
+    }
+
+    impl WorkerPanel for Stalled {
+        fn show(&self, id: &str, _question: &PanelQuestion) -> PanelState {
+            let mut go = self.go.lock().unwrap();
+            while !*go {
+                go = self.cv.wait(go).unwrap();
+            }
+            *self.up.lock().unwrap() = Some(id.to_string());
+            self.shows.fetch_add(1, Ordering::SeqCst);
+            PanelState::Shown
+        }
+        fn take_down(&self, id: Option<&str>) {
+            self.downs.lock().unwrap().push(id.map(str::to_string));
+            let mut up = self.up.lock().unwrap();
+            if id.is_none() || up.as_deref() == id {
+                *up = None;
+            }
+        }
+    }
+
+    /// The worker's frame loop (`delegate_worker`), for the frames a panel
+    /// is in: a `PanelAsk` and a `PanelHide` go to the desk, a ping is
+    /// answered, and the desk's words are written, each on its arm.
+    async fn worker_loop(
+        mut desk: Desk,
+        mut from_root: tokio::sync::mpsc::Receiver<DelegateFrame>,
+        to_root: tokio::sync::mpsc::Sender<DelegateFrame>,
+    ) {
+        loop {
+            tokio::select! {
+                frame = from_root.recv() => match frame {
+                    Some(DelegateFrame::PanelAsk { id, question }) => desk.ask(id, question),
+                    Some(DelegateFrame::PanelHide { id }) => desk.hide(&id),
+                    Some(DelegateFrame::Ping) => {
+                        let _ = to_root.send(DelegateFrame::Pong).await;
+                    }
+                    Some(_) => {}
+                    None => return,
+                },
+                (id, state) = desk.next_word() => {
+                    let _ = to_root.send(DelegateFrame::PanelTold { id, state }).await;
+                }
+            }
+        }
+    }
+
+    /// FR-149 P1 (review F5) — a panel whose main thread stalls never stops
+    /// the worker's frame loop: while a show waits, a `PanelHide` is served
+    /// and a ping answered, and the show's word comes once it ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_panel_does_not_stop_the_frame_loop() {
+        let other = "414900000000000000000a04";
+        let panel = std::sync::Arc::new(Stalled::default());
+        let (to_worker, from_root) = tokio::sync::mpsc::channel(8);
+        let (to_root, mut heard) = tokio::sync::mpsc::channel(8);
+        let worker = tokio::spawn(worker_loop(
+            Desk::new(panel.clone(), true, false),
+            from_root,
+            to_root,
+        ));
+        let question = PanelQuestion::of(&view(ID, Duration::from_secs(30)), Instant::now());
+        for frame in [
+            DelegateFrame::PanelAsk {
+                id: ID.into(),
+                question,
+            },
+            DelegateFrame::PanelHide { id: other.into() },
+            DelegateFrame::Ping,
+        ] {
+            to_worker.send(frame).await.unwrap();
+        }
+        let ponged = tokio::time::timeout(Duration::from_secs(2), heard.recv()).await;
+        let downs = panel.downs();
+        // Let the show end whatever came, so no thread waits past the test.
+        panel.let_go();
+        assert!(
+            matches!(ponged, Ok(Some(DelegateFrame::Pong))),
+            "the frame loop waited for the panel: {ponged:?}"
+        );
+        assert_eq!(downs, vec![Some(other.to_string())], "the PanelHide waited");
+        match tokio::time::timeout(Duration::from_secs(2), heard.recv()).await {
+            Ok(Some(DelegateFrame::PanelTold { id, state })) => {
+                assert_eq!((id.as_str(), state), (ID, PanelState::Shown));
+            }
+            other => panic!("expected the show's word, got {other:?}"),
+        }
+        drop(to_worker);
+        worker.await.unwrap();
+        assert_eq!(panel.up(), None, "the attach's end left the question up");
+    }
+
+    /// FR-149 P1 (review F5) — a late show never stays on the panel: a show
+    /// that ends after its attach did finds nobody to hear its word, and
+    /// takes itself down. (The root daemon, for its part, takes down a
+    /// `shown` it no longer waits for: `a_late_shown_is_taken_down`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_show_that_ends_after_its_attach_leaves_nothing_on_the_panel() {
+        let panel = std::sync::Arc::new(Stalled::default());
+        let desk = Desk::new(panel.clone(), true, false);
+        let late = panel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            late.let_go();
+        });
+        desk.ask(
+            ID.into(),
+            PanelQuestion::of(&view(ID, Duration::from_secs(30)), Instant::now()),
+        );
+        // The attach ends while the show waits.
+        drop(desk);
+        let t0 = Instant::now();
+        while (panel.shows() == 0 || panel.up().is_some()) && t0.elapsed() < Duration::from_secs(3)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(panel.shows(), 1, "the show never ended");
+        assert_eq!(panel.up(), None, "a late show stayed on the panel");
     }
 }

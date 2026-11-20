@@ -2836,15 +2836,18 @@ async fn connect_once(
                 // own broker is not asking takes the person's app's road to
                 // the root half, whose person socket asks the seat again
                 // before its broker takes it: on a task, since that answer can
-                // take `DECIDE_WITHIN`, and this loop reads on.
+                // take `DECIDE_WITHIN`, and this loop reads on. A click the
+                // root half did not take is said to the root daemon, whose
+                // question then goes to the app (`panel_answered`).
                 if let Some(road) = crate::consent_relay::panel_road(&consent_broker, &session_hex) {
                     let (broker, ind) = (consent_broker.clone(), indicator.clone());
                     tokio::spawn(async move {
-                        let recorded = crate::consent_relay::panel_clicked(
+                        let recorded = crate::consent_relay::panel_answered(
                             &broker,
                             Some(&*road),
                             &session_hex,
                             allow,
+                            |state| crate::indicator::session_panel::tell_the_root(&session_hex, state),
                         )
                         .await;
                         info!(
@@ -4417,7 +4420,14 @@ async fn handle_server_msg(
                 };
 
                 let mut marker = true;
-                if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
+                // FR-149 P1 — and read on the session panel's books after it
+                // (`session_panel::write_marker`).
+                if let Err(e) = crate::indicator::session_panel::write_marker(
+                    consent_broker,
+                    &session_hex,
+                    &prompt,
+                    &shown,
+                ) {
                     // Only fatal to the SURFACE when the companion was the
                     // plan: with a native panel already up, a human can still
                     // answer — the marker's loss costs the CLI listing, not
@@ -5936,7 +5946,12 @@ async fn handle_server_msg(
                         crate::consent::PromptSurface::Companion
                     },
                 };
-                let marker = match consent_broker.write_prompt(&request_id, &prompt) {
+                let marker = match crate::indicator::session_panel::write_marker(
+                    consent_broker,
+                    &request_id,
+                    &prompt,
+                    &on_screen,
+                ) {
                     Ok(_) => true,
                     Err(e) => {
                         tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
