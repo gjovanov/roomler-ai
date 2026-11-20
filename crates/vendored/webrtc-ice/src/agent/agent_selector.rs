@@ -765,6 +765,24 @@ impl ControlledSelector for AgentInternal {
             self.add_pair(local.clone(), remote.clone()).await;
         }
 
+        // Roomler patch (FR-148 P4 step 2): a held mesh-route pair is neither
+        // answered nor checked, as if a firewall dropped the check, so the
+        // browser cannot validate it, and so cannot select it, while the hold
+        // lasts ([`AgentInternal::holds_mesh_route`]).
+        if (*self.carrier_rank)
+            .as_ref()
+            .is_some_and(|rank| rank.mesh_route(&**local, &**remote))
+            && self.holds_mesh_route().await
+        {
+            log::trace!(
+                "[{}]: held, unanswered: {} <- {}",
+                self.get_name(),
+                local,
+                remote
+            );
+            return;
+        }
+
         if let Some(p) = self.find_pair(local, remote).await {
             let use_candidate = m.contains(ATTR_USE_CANDIDATE);
             if use_candidate {

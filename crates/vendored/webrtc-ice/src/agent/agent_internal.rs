@@ -93,6 +93,12 @@ pub struct AgentInternal {
     // Roomler patch (FR-148 P4): the carrier rank, read where a candidate is
     // made and by the controlled agent's checks after its first selection.
     pub(crate) carrier_rank: Arc<Option<CarrierRank>>,
+    // Roomler patch (FR-148 P4 step 2): the route rank's hold
+    // (`holds_mesh_route`). Whether a TURN server off the mesh is configured,
+    // whether the relay gather has ended, and when the checks started.
+    pub(crate) real_turn: bool,
+    pub(crate) relays_settled: AtomicBool,
+    pub(crate) checks_started: SyncMutex<Option<Instant>>,
 }
 
 impl AgentInternal {
@@ -172,6 +178,17 @@ impl AgentInternal {
             agent_conn: Arc::new(AgentConn::new()),
 
             carrier_rank: Arc::clone(&config.carrier_rank),
+            real_turn: (*config.carrier_rank).as_ref().is_some_and(|rank| {
+                rank.route.is_some()
+                    && (config.candidate_types.is_empty()
+                        || config.candidate_types.contains(&CandidateType::Relay))
+                    && config.urls.iter().any(|url| {
+                        matches!(url.scheme, SchemeType::Turn | SchemeType::Turns)
+                            && rank.turn_off_the_mesh(&url.host)
+                    })
+            }),
+            relays_settled: AtomicBool::new(false),
+            checks_started: SyncMutex::new(None),
         };
 
         let chan_receivers = ChanReceivers {
@@ -212,6 +229,8 @@ impl AgentInternal {
         self.update_connection_state(ConnectionState::Checking)
             .await;
 
+        // Roomler patch (FR-148 P4 step 2): the route rank's hold counts from here.
+        *self.checks_started.lock() = Some(Instant::now());
         self.request_connectivity_check();
 
         self.connectivity_checks().await;
@@ -398,6 +417,11 @@ impl AgentInternal {
     pub(crate) async fn ping_all_candidates(&self) {
         log::trace!("[{}]: pinging all candidates", self.get_name(),);
 
+        // Roomler patch (FR-148 P4 step 2): read before the checklist's lock,
+        // which the hold's own read takes.
+        let held = self.holds_mesh_route().await;
+        let rank = (*self.carrier_rank).as_ref();
+
         let mut pairs: Vec<(
             Arc<dyn Candidate + Send + Sync>,
             Arc<dyn Candidate + Send + Sync>,
@@ -412,6 +436,10 @@ impl AgentInternal {
                 );
             }
             for p in &mut *checklist {
+                // Roomler patch (FR-148 P4 step 2): a held pair is not checked.
+                if held && rank.is_some_and(|rank| rank.mesh_route(&*p.local, &*p.remote)) {
+                    continue;
+                }
                 let p_state = p.state.load(Ordering::SeqCst);
                 if p_state == CandidatePairState::Waiting as u8 {
                     p.state
@@ -447,6 +475,20 @@ impl AgentInternal {
         local: Arc<dyn Candidate + Send + Sync>,
         remote: Arc<dyn Candidate + Send + Sync>,
     ) {
+        // Roomler patch (FR-148 P4 step 2): the route rank never pairs a local
+        // candidate off the mesh with a remote on it ([`CarrierRank::route`]).
+        if (*self.carrier_rank)
+            .as_ref()
+            .is_some_and(|rank| rank.crosses_into_the_mesh(&*local, &*remote))
+        {
+            log::debug!(
+                "[{}]: no pair {} -> {}: it crosses into the mesh",
+                self.get_name(),
+                local,
+                remote
+            );
+            return;
+        }
         let p = Arc::new(CandidatePair::new(
             local,
             remote,
@@ -468,6 +510,46 @@ impl AgentInternal {
             }
         }
         None
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): does the controlled agent hold its
+    /// mesh-route pairs now, neither checking nor answering them? Only under
+    /// the route rank, and only while all of these hold:
+    ///
+    /// - the bound has not passed since the checks started ([`RouteRank::hold`]);
+    /// - no pair off the mesh carries the session;
+    /// - a relay off the mesh can still come: its gather has not ended, or a
+    ///   pair off the mesh has not failed.
+    ///
+    /// Read again at every check and every inbound check, so the hold ends on
+    /// the evidence that nothing off the mesh can come, or on the bound.
+    pub(crate) async fn holds_mesh_route(&self) -> bool {
+        let Some(rank) = (*self.carrier_rank).as_ref() else {
+            return false;
+        };
+        let Some(route) = rank.route else {
+            return false;
+        };
+        if rank.mesh_last.is_none() || self.is_controlling.load(Ordering::SeqCst) {
+            return false;
+        }
+        let started = *self.checks_started.lock();
+        if started.is_some_and(|started| started.elapsed() >= route.hold) {
+            return false;
+        }
+        if let Some(selected) = self.agent_conn.get_selected_pair() {
+            if !rank.mesh_route(&*selected.local, &*selected.remote) {
+                return false;
+            }
+        }
+        if self.real_turn && !self.relays_settled.load(Ordering::SeqCst) {
+            return true;
+        }
+        let checklist = self.agent_conn.checklist.lock().await;
+        checklist.iter().any(|p| {
+            p.state.load(Ordering::SeqCst) != CandidatePairState::Failed as u8
+                && !rank.mesh_route(&*p.local, &*p.remote)
+        })
     }
 
     /// Checks if the selected pair is (still) valid.

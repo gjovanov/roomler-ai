@@ -20,6 +20,16 @@ use crate::util::*;
 
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Roomler patch (FR-148 P4 step 2): marks the relay gather ended when dropped
+/// (`AgentInternal::holds_mesh_route`).
+struct RelaysSettled(Arc<AgentInternal>);
+
+impl Drop for RelaysSettled {
+    fn drop(&mut self) {
+        self.0.relays_settled.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Roomler patch (media dodges the overlay): type-preference slot for host
 /// candidates whose interface IP sits inside the Roomler overlay ranges.
 /// Chosen BELOW server-reflexive (100) and ABOVE relay (0), so ICE prefers a
@@ -876,6 +886,9 @@ impl Agent {
         net: Arc<Net>,
         agent_internal: Arc<AgentInternal>,
     ) {
+        // Roomler patch (FR-148 P4 step 2): however this gather ends, the
+        // route rank's hold learns that no relay is still coming from it.
+        let _settled = RelaysSettled(Arc::clone(&agent_internal));
         let wg = WaitGroup::new();
 
         for url in urls {

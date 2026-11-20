@@ -44,6 +44,7 @@ fn mesh_last() -> CarrierRank {
             IpAddr::V4(v4) => u32::from(v4) & 0xffff_fc00 == u32::from(Ipv4Addr::new(100, 65, 4, 0)),
             IpAddr::V6(v6) => v6.segments()[..6] == [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0],
         })),
+        route: None,
     }
 }
 
@@ -707,4 +708,297 @@ async fn a_gather_through_a_mesh_addressed_server_makes_every_candidate_at_255()
     server.close().await?;
     lan.lock().await.stop().await?;
     Ok(())
+}
+
+// FR-148 P4 step 2: the pair's route at the opening. The browser is the
+// controlling side and selects as Chrome does: the first pair its own check
+// validates, at once (`basic_ice_controller.cc`: `HandleInitialSelectDampening`
+// selects at once unless a field trial is set), then nominates it
+// (SEMI_AGGRESSIVE nominates while nothing is selected). The agent selects the
+// first nomination of a pair it has validated itself.
+
+/// The agent's own address off the mesh: the field's LAN host (shape A's local).
+const AGENT_LAN_IP: &str = "192.168.1.10";
+
+/// What the far TURN does in a cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FarTurn {
+    /// Allocates for both ends.
+    Up,
+    /// Refuses both ends' credentials: both relay gathers end at once, empty.
+    Refuses,
+    /// Every packet to it is dropped: no relay gather ends within a cell.
+    Blackholed,
+}
+
+/// The rank the agent runs in the opening cells: the mesh's own block ranked
+/// last, and the route rank with a hold of `hold` at most. (Before step 2:
+/// `mesh_last()` alone, today's `prio`.)
+fn route_rank(hold: Duration) -> CarrierRank {
+    CarrierRank {
+        route: Some(RouteRank { hold }),
+        ..mesh_last()
+    }
+}
+
+/// The agent's first selection, and how long after the checks started.
+struct Opening {
+    local: String,
+    remote: String,
+    after: Duration,
+}
+
+impl std::fmt::Display for Opening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "local {} remote {} after {:?}", self.local, self.remote, self.after)
+    }
+}
+
+/// One session's opening on a flat network, where every address reaches every
+/// other: as in the field, where a check from the agent's LAN socket to a mesh
+/// address reaches it (the destination picks the route, not the socket's
+/// source). The browser sits at the viewer's mesh address, and its host
+/// candidate there stands for the viewer's relay on the mesh (a pair is classed
+/// by its remote's address, not its type). The far TURN is at
+/// `VNET_STUN_SERVER_IP`, and both ends allocate on it, as in the field's TURN
+/// sessions. Every hop costs 10 ms, so a TURN pair needs more time to validate
+/// than a direct one. Candidates trickle both ways, as `rc:ice` does, and the
+/// checks start before either gather ends.
+async fn opening_on_a_flat_net(
+    agent_ips: &[&str],
+    rank: CarrierRank,
+    far_turn: FarTurn,
+) -> Result<Opening> {
+    let router = Arc::new(Mutex::new(router::Router::new(router::RouterConfig {
+        cidr: "0.0.0.0/0".to_owned(),
+        min_delay: Duration::from_millis(10),
+        ..Default::default()
+    })?));
+    if far_turn == FarTurn::Blackholed {
+        let turn_ip = ip(VNET_STUN_SERVER_IP);
+        router
+            .lock()
+            .await
+            .add_chunk_filter(Box::new(move |c: &(dyn chunk::Chunk + Send + Sync)| {
+                c.get_destination_ip() != turn_ip
+            }))
+            .await;
+    }
+    let turn_net = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ip: VNET_STUN_SERVER_IP.to_owned(),
+        ..Default::default()
+    })));
+    let viewer = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec![VIEWER_TUN_IP.to_owned()],
+        ..Default::default()
+    })));
+    let agent_net = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: agent_ips.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    })));
+    connect_net2router(&turn_net, &router).await?;
+    connect_net2router(&viewer, &router).await?;
+    connect_net2router(&agent_net, &router).await?;
+    start_router(&router).await?;
+    let server = add_vnet_stun(turn_net).await?;
+
+    let turn = Url {
+        scheme: SchemeType::Turn,
+        host: VNET_STUN_SERVER_IP.to_owned(),
+        port: VNET_STUN_SERVER_PORT,
+        username: "user".to_owned(),
+        password: if far_turn == FarTurn::Refuses { "wrong" } else { "pass" }.to_owned(),
+        proto: ProtoType::Udp,
+    };
+    let never = Some(Duration::from_secs(3600));
+    let browser = Arc::new(
+        Agent::new(AgentConfig {
+            urls: vec![turn.clone()],
+            network_types: vec![NetworkType::Udp4],
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            net: Some(Arc::clone(&viewer)),
+            // The Chrome stand-in below decides; this agent never nominates by
+            // itself, and keeps checking an unanswered pair as Chrome does.
+            host_acceptance_min_wait: never,
+            srflx_acceptance_min_wait: never,
+            prflx_acceptance_min_wait: never,
+            relay_acceptance_min_wait: never,
+            max_binding_requests: Some(100),
+            ..Default::default()
+        })
+        .await?,
+    );
+    let agent = Arc::new(
+        Agent::new(AgentConfig {
+            urls: vec![turn],
+            network_types: vec![NetworkType::Udp4],
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            net: Some(Arc::clone(&agent_net)),
+            carrier_rank: Arc::new(Some(rank)),
+            ..Default::default()
+        })
+        .await?,
+    );
+    for (from, to) in [(&agent, &browser), (&browser, &agent)] {
+        let to = Arc::clone(to);
+        from.on_candidate(Box::new(move |c: Option<Cand>| {
+            let to = Arc::clone(&to);
+            Box::pin(async move {
+                if let Some(c) = c {
+                    if let Ok(c) = unmarshal_candidate(&c.marshal()) {
+                        let _ = to.add_remote_candidate(&(Arc::new(c) as Cand));
+                    }
+                }
+            })
+        }));
+    }
+
+    let (agent_ufrag, agent_pwd) = agent.get_local_user_credentials().await;
+    let (browser_ufrag, browser_pwd) = browser.get_local_user_credentials().await;
+    agent.gather_candidates()?;
+    browser.gather_candidates()?;
+    let started = Instant::now();
+    let (_agent_cancel, agent_cancel_rx) = mpsc::channel(1);
+    let (_browser_cancel, browser_cancel_rx) = mpsc::channel(1);
+    let accepting = {
+        let agent = Arc::clone(&agent);
+        tokio::spawn(async move {
+            let _ = agent.accept(agent_cancel_rx, browser_ufrag, browser_pwd).await;
+        })
+    };
+    let dialing = {
+        let browser = Arc::clone(&browser);
+        tokio::spawn(async move {
+            let _ = browser.dial(browser_cancel_rx, agent_ufrag, agent_pwd).await;
+        })
+    };
+    // Chrome: the first pair its own check validates, nominated at once and
+    // again every 100 ms, as long as the session lives.
+    let chrome = {
+        let browser = Arc::clone(&browser);
+        tokio::spawn(async move {
+            let mut chosen: Option<(Cand, Cand)> = None;
+            loop {
+                if chosen.is_none() {
+                    let checklist = browser.internal.agent_conn.checklist.lock().await;
+                    chosen = checklist
+                        .iter()
+                        .find(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8)
+                        .map(|p| (Arc::clone(&p.local), Arc::clone(&p.remote)));
+                }
+                if let Some((local, remote)) = &chosen {
+                    nominate(&browser, local, remote).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+    };
+
+    let mut opening = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        if let Some(p) = agent.internal.agent_conn.get_selected_pair() {
+            opening = Some(Opening {
+                local: format!("{}:{}", p.local.address(), p.local.port()),
+                remote: format!("{}:{}", p.remote.address(), p.remote.port()),
+                after: started.elapsed(),
+            });
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    chrome.abort();
+    accepting.abort();
+    dialing.abort();
+    agent.close().await?;
+    browser.close().await?;
+    server.close().await?;
+    router.lock().await.stop().await?;
+    opening.ok_or_else(|| Error::Other("no selection within 8 s".to_owned()))
+}
+
+/// Shape A: the agent's LAN host paired with the viewer's relay on the mesh
+/// validates first, the browser selects it, and the session rides the mesh
+/// although the far TURN allocated. Its local is not ranked last, so the
+/// rank never sees it.
+#[tokio::test]
+async fn shape_a_the_opening_rides_turn_not_the_lan_host_paired_into_the_mesh() -> Result<()> {
+    let o = opening_on_a_flat_net(&[AGENT_LAN_IP], route_rank(Duration::from_secs(3)), FarTurn::Up).await?;
+    println!("shape A: {o}");
+    assert!(
+        o.remote.starts_with(&format!("{VNET_STUN_SERVER_IP}:")),
+        "the opening rides the far TURN: {o}"
+    );
+    Ok(())
+}
+
+/// Shape B: the agent's mesh host, ranked last, paired with the viewer's relay
+/// on the mesh validates first, and the browser selects the first pair it
+/// validates whatever its priority.
+#[tokio::test]
+async fn shape_b_the_opening_rides_turn_not_the_ranked_last_mesh_pair() -> Result<()> {
+    let o = opening_on_a_flat_net(&[AGENT_MESH_IP], route_rank(Duration::from_secs(3)), FarTurn::Up).await?;
+    println!("shape B: {o}");
+    assert!(
+        o.remote.starts_with(&format!("{VNET_STUN_SERVER_IP}:")),
+        "the opening rides the far TURN: {o}"
+    );
+    Ok(())
+}
+
+/// AC23, the far TURN refuses: no relay off the mesh can come, so the session
+/// opens on the mesh at once, far inside the hold's bound.
+#[tokio::test]
+async fn ac23_a_refusing_turn_opens_on_the_mesh_at_once() -> Result<()> {
+    let o = opening_on_a_flat_net(&[AGENT_MESH_IP], route_rank(Duration::from_secs(10)), FarTurn::Refuses).await?;
+    println!("AC23 refused: {o}");
+    assert!(o.remote.starts_with(&format!("{VIEWER_TUN_IP}:")), "on the mesh: {o}");
+    assert!(o.after < Duration::from_secs(2), "inside the 10 s bound: {o}");
+    Ok(())
+}
+
+/// AC23, the far TURN blackholed: neither relay gather ends, so only the
+/// hold's bound lets the mesh open, and it opens within AC23's 5 s.
+#[tokio::test]
+async fn ac23_a_blackholed_turn_opens_on_the_mesh_within_5_s() -> Result<()> {
+    let o = opening_on_a_flat_net(
+        &[AGENT_MESH_IP],
+        route_rank(Duration::from_millis(1500)),
+        FarTurn::Blackholed,
+    )
+    .await?;
+    println!("AC23 blackholed: {o}");
+    assert!(o.remote.starts_with(&format!("{VIEWER_TUN_IP}:")), "on the mesh: {o}");
+    assert!(o.after < Duration::from_secs(5), "AC23: {o}");
+    Ok(())
+}
+
+/// The route rank's one predicate, on the field's candidates: a pair rides the
+/// mesh when either end is on it, and the only pair it never forms is a local
+/// off the mesh with a remote on it.
+#[test]
+fn a_pair_rides_the_mesh_when_either_end_is_on_it() {
+    let route = route_rank(Duration::from_secs(3));
+    let rank = mesh_last();
+    let r = Some(&route);
+    let lan_host = host(AGENT_LAN_IP, 1, host_priority(r, &ip(AGENT_LAN_IP), 1));
+    let mesh_host = host(AGENT_MESH_IP, 2, host_priority(r, &ip(AGENT_MESH_IP), 1));
+    let far_relay = relay("203.0.113.7", 3, relay_priority(r, &ip("203.0.113.7"), "turn.example.org", true, 1));
+    // A relay the agent allocated on the viewer's own relay: served from the mesh.
+    let served = relay(VIEWER_TUN_IP, 4, relay_priority(r, &ip(VIEWER_TUN_IP), VIEWER_TUN_IP, false, 1));
+    let viewer_relay = relay(VIEWER_TUN_IP, 5, chrome(2, 32542));
+    let viewer_far = relay("198.51.100.9", 6, chrome(2, 32542));
+    for (name, local, remote, rides_mesh, crosses) in [
+        ("shape A", &lan_host, &viewer_relay, true, true),
+        ("shape B", &mesh_host, &viewer_relay, true, false),
+        ("far TURN", &far_relay, &viewer_far, false, false),
+        ("far relay to the mesh", &far_relay, &viewer_relay, true, true),
+        ("served from the mesh", &served, &viewer_relay, true, false),
+        ("LAN host to the far relay", &lan_host, &viewer_far, false, false),
+    ] {
+        assert_eq!(route.mesh_route(&**local, &**remote), rides_mesh, "{name}");
+        assert_eq!(route.crosses_into_the_mesh(&**local, &**remote), crosses, "{name}");
+        assert!(!rank.crosses_into_the_mesh(&**local, &**remote), "{name}: prio forms every pair");
+    }
 }

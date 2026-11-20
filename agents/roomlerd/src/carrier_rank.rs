@@ -73,7 +73,7 @@ pub fn gathered(
             return None;
         }
     };
-    if ranked_last && rank == RankMode::Cost {
+    if ranked_last && rank.signals_cost() {
         json.candidate.push_str(NETWORK_COST);
     }
     serde_json::to_value(&json).ok()

@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tunnel_core::localapi::{ConnectionType, PeerInfo};
 use tunnel_core::overlay_footprint as footprint;
 use webrtc::api::setting_engine::SettingEngine;
-use webrtc::ice::agent::agent_config::{CarrierRank, MeshAddrFn};
+use webrtc::ice::agent::agent_config::{CarrierRank, MeshAddrFn, ROUTE_HOLD, RouteRank};
 
 /// The overlay decision for ONE session, resolved when it is requested.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -110,6 +110,12 @@ pub enum RankMode {
     /// ` network-cost 999`, Chrome's own lever.
     #[serde(rename = "1")]
     Cost,
+    /// `route` (FR-148 P4 step 2): `1`, and the pair's route is the rank's
+    /// unit (`CarrierRank::route`): no pair from a local candidate off the mesh
+    /// to a remote on it, and the agent holds its mesh-route pairs while a
+    /// relay off the mesh can still come, [`ROUTE_HOLD`] at most.
+    #[serde(rename = "route")]
+    Route,
 }
 
 impl RankMode {
@@ -119,13 +125,19 @@ impl RankMode {
         Self::parse(tunnel_core::env::node_env("RC_CARRIER_RANK").as_deref())
     }
 
-    /// `0`, `prio` or `1`; anything else, unset included, reads `0`.
+    /// `0`, `prio`, `1` or `route`; anything else, unset included, reads `0`.
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some(v) if v.eq_ignore_ascii_case("prio") => Self::Prio,
             Some("1") => Self::Cost,
+            Some(v) if v.eq_ignore_ascii_case("route") => Self::Route,
             _ => Self::Off,
         }
+    }
+
+    /// Does a ranked-last candidate's line carry ` network-cost 999`?
+    pub fn signals_cost(self) -> bool {
+        matches!(self, Self::Cost | Self::Route)
     }
 
     pub fn is_off(&self) -> bool {
@@ -138,6 +150,7 @@ impl RankMode {
             Self::Off => "0",
             Self::Prio => "prio",
             Self::Cost => "1",
+            Self::Route => "route",
         }
     }
 }
@@ -304,7 +317,10 @@ impl RcOverlay {
             let nets = self.v4_nets.clone();
             Box::new(move |ip: IpAddr| footprint::is_overlay_addr(&nets, ip)) as MeshAddrFn
         });
-        Some(CarrierRank { mesh_last })
+        // FR-148 P4 step 2: the route rank, under `route` alone.
+        let route =
+            (self.carrier_rank == RankMode::Route).then_some(RouteRank { hold: ROUTE_HOLD });
+        Some(CarrierRank { mesh_last, route })
     }
 
     /// [`Self::ice_rank`], set on the session's `SettingEngine`.
@@ -1252,9 +1268,35 @@ mod tests {
         assert_eq!(RankMode::parse(Some("prio")), RankMode::Prio);
         assert_eq!(RankMode::parse(Some(" PRIO ")), RankMode::Prio);
         assert_eq!(RankMode::parse(Some("1")), RankMode::Cost);
-        for m in [RankMode::Off, RankMode::Prio, RankMode::Cost] {
+        assert_eq!(RankMode::parse(Some(" Route ")), RankMode::Route);
+        for m in [
+            RankMode::Off,
+            RankMode::Prio,
+            RankMode::Cost,
+            RankMode::Route,
+        ] {
             assert_eq!(RankMode::parse(Some(m.as_str())), m);
         }
+    }
+
+    /// FR-148 P4 step 2: the route rank reaches ICE under `route` alone, with
+    /// the mesh's blocks ranked last as under `1`, and with its cost lever.
+    #[test]
+    fn only_route_hands_ice_the_route_rank() {
+        for mode in [RankMode::Prio, RankMode::Cost, RankMode::Route] {
+            let mut d = RcOverlay::resolve_ranked(true, None, mode, blocks());
+            d.mesh_last = true;
+            let rank = d.ice_rank().expect("rank mode");
+            assert!(rank.mesh_last.is_some(), "{mode}");
+            let want = (mode == RankMode::Route).then_some(RouteRank { hold: ROUTE_HOLD });
+            assert_eq!(rank.route, want, "{mode}");
+            assert_eq!(mode.signals_cost(), mode != RankMode::Prio, "{mode}");
+        }
+        assert!(
+            RcOverlay::resolve_ranked(true, None, RankMode::Off, blocks())
+                .ice_rank()
+                .is_none()
+        );
     }
 
     /// `RcOverlay` before FR-148 P4, as an older daemon or GUI worker has it:

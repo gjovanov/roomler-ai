@@ -76,12 +76,70 @@ pub type MeshAddrFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 #[derive(Default)]
 pub struct CarrierRank {
     pub mesh_last: Option<MeshAddrFn>,
+    /// Roomler patch (FR-148 P4 step 2): the route rank. `None` keeps the rank
+    /// above exactly as it was. Set, with `mesh_last`, a pair's route is the
+    /// rank's unit, not a candidate's address ([`CarrierRank::mesh_route`]):
+    ///
+    /// - a local candidate off the mesh is never paired with a remote on it
+    ///   (the field's shape A: a LAN socket whose checks reach a mesh address
+    ///   only because the destination picks the route), since every such route
+    ///   is also a pair of the agent's own mesh candidates, which carry the rank;
+    /// - the controlled agent holds its mesh-route pairs, neither checking nor
+    ///   answering them, while a relay off the mesh can still come and none
+    ///   carries the session yet, for [`RouteRank::hold`] at most (the field's
+    ///   shape B: the mesh pair validates first, and the browser selects the
+    ///   first pair it validates).
+    pub route: Option<RouteRank>,
 }
+
+/// Roomler patch (FR-148 P4 step 2): see [`CarrierRank::route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRank {
+    /// How long after the checks start the hold ends, whatever is pending.
+    pub hold: Duration,
+}
+
+/// Roomler patch (FR-148 P4 step 2): the hold's bound in the product. AC23's
+/// 5 s, less a mesh pair's check and nomination once the hold ends (a relayed
+/// mesh round trip or two, under a second) and a margin.
+pub const ROUTE_HOLD: Duration = Duration::from_millis(2500);
 
 impl CarrierRank {
     /// Does this rank put a candidate on `ip` last?
     pub(crate) fn ranks_last(&self, ip: IpAddr) -> bool {
         self.mesh_last.as_ref().is_some_and(|mesh| mesh(ip))
+    }
+
+    /// Is `address` an IP the rank names as the mesh's own?
+    fn names(&self, address: &str) -> bool {
+        address.parse::<IpAddr>().is_ok_and(|ip| self.ranks_last(ip))
+    }
+
+    /// Is `c` a local candidate the mesh carries: one the rank put last (a
+    /// host on the mesh, a srflx mapped to it, a relay relayed on it or served
+    /// from it), or on a mesh address itself?
+    fn local_on_mesh(&self, c: &dyn Candidate) -> bool {
+        c.priority() == ranked_last_priority(c.component()) || self.names(&c.address())
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): does the pair of `local` and `remote`
+    /// ride the mesh? Either end on it does: a check to a remote on the mesh
+    /// goes into the mesh whatever socket sends it. The one predicate the route
+    /// rank's pairing and hold read.
+    pub(crate) fn mesh_route(&self, local: &dyn Candidate, remote: &dyn Candidate) -> bool {
+        self.local_on_mesh(local) || self.names(&remote.address())
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): a pair the route rank never forms:
+    /// its local candidate off the mesh, its remote on it.
+    pub(crate) fn crosses_into_the_mesh(&self, local: &dyn Candidate, remote: &dyn Candidate) -> bool {
+        self.route.is_some() && self.names(&remote.address()) && !self.local_on_mesh(local)
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): is a TURN server at `host` off the
+    /// mesh? A name is: only an address can be the mesh's.
+    pub(crate) fn turn_off_the_mesh(&self, host: &str) -> bool {
+        !self.names(host.trim_start_matches('[').trim_end_matches(']'))
     }
 }
 
