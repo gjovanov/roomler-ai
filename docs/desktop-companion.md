@@ -2405,10 +2405,10 @@ flowchart TD
     SEAT -.-> E
 ```
 
-- **Why that order.** The probe is a window, and on a killed port the window is what ends the process. In both lab
-  runs both console-session names posted at that log-out (`GUISessionUserChanged` at the login too), and the person
-  socket saw nobody at the seat a second before the port died, so either read alone would have answered first. The
-  seat is the second guard, for a Mac where the names do not post. The net is the third.
+- **Why that order.** The probe is a window, and on a killed port the window is what ends the process. In the lab run
+  that watched them, both console-session names posted at that log-out (`GUISessionUserChanged` at the login too), and
+  the person socket saw nobody at the seat a second before the port died, so either read alone would have answered
+  first. The seat is the second guard, for a Mac where the names do not post. The net is the third.
 - **Only a root process.** The seat latch, the console session and the net are a root process's: a one-row Mac's
   daemon and a two-row Mac's root half (`reads_console_session`, `arms_in`, [`exit_net.rs:76`](../agents/roomlerd/src/indicator/exit_net.rs#L76)).
   A two-row Mac's per-user half belongs to a GUI session of its own, which a fast user switch away and back leaves

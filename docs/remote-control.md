@@ -2690,10 +2690,10 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    after the login, AppKit ended the process with exit 0 while it made the
    probe window (`_CGSCreateWindow returned 268435459`), with no line of ours.
    launchd relaunches the daemon only after a non-zero exit, so the root half
-   stayed down until the next boot. Both console-session names posted at
-   that log-out in both runs, so the session's read alone would have answered
-   first. The seat is the second guard, for a Mac where the names do not
-   post.
+   stayed down until the next boot. In the lab run that watched them, both
+   console-session names posted at that log-out, so the session's read alone
+   would have answered first. The seat is the second guard, for a Mac where
+   the names do not post.
 
    Only a root process follows the seat and reads the console session
    (`reads_console_session`, `indicator/panel_gate.rs:129`): a one-row Mac's

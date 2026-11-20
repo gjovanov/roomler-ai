@@ -45,10 +45,10 @@
 //!    then on. No answer in time: `false` for that question.
 //!
 //! Why that order (#4119): the connection's read is a window, and on a dead
-//! port the window itself ends the process (the table's third row). The lab
-//! read both console-session names posted at that log-out
-//! (`GUISessionUserChanged` at the login too), so the session read alone
-//! would have made no window in both runs; the seat is the second guard, for
+//! port the window itself ends the process (the table's third row). In the
+//! lab run that watched them, both console-session names posted at that
+//! log-out (`GUISessionUserChanged` at the login too), so the session read
+//! alone would have made no window; the seat is the second guard, for
 //! a Mac where the names do not post. Under both, an exit that AppKit begins
 //! inside one of our window calls anyway, and that our code did not choose,
 //! leaves with the restart code, which launchd relaunches
