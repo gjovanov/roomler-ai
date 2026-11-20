@@ -227,12 +227,38 @@ fn seats_here(state: &ConferenceState) -> HashMap<SeatKey, Vec<String>> {
     seats
 }
 
-/// One pass of the check, with the memory its loop keeps. Public so tests
-/// drive it directly. Returns the seat keys it ended.
+/// One pass of the check, with the memory its loop keeps: the read half
+/// ([`read_seats`]), then the end half ([`end_seats`]). Public so tests drive
+/// it directly. Returns the seat keys it ended.
 pub async fn check_seats_once(
     state: &ConferenceState,
     memory: &mut SeatCheckMemory,
 ) -> Vec<SeatKey> {
+    let read = read_seats(state, memory).await;
+    end_seats(state, memory, &read).await
+}
+
+/// What the read half of a pass found, for its end half: the seats this pod
+/// served when the pass looked, the verdicts the read gave them, and the org
+/// of each room the read found.
+#[derive(Debug, Default)]
+pub struct SeatRead {
+    /// The seat keys whose admission the read found gone for the
+    /// [`MISSES_TO_END`]th time in a row: what the end half ends.
+    pub verdicts: Vec<Verdict>,
+    /// Why the read failed, when it did: then there is no verdict at all.
+    pub failed: Option<String>,
+    /// Each person in each room, with the connections the pass saw them on.
+    seats: HashMap<SeatKey, Vec<String>>,
+    /// The org of each room the read found a document for.
+    tenants: HashMap<ObjectId, ObjectId>,
+}
+
+/// The read half of a pass: the seats this pod serves, one bounded read of
+/// what admits them, and the verdicts that read gives with what `memory`
+/// holds from the passes before. Public so a test can act between the read
+/// and the end of a pass.
+pub async fn read_seats(state: &ConferenceState, memory: &mut SeatCheckMemory) -> SeatRead {
     let seats = seats_here(state);
     let seated: Vec<SeatKey> = seats.keys().copied().collect();
     let read = if seated.is_empty() {
@@ -259,10 +285,31 @@ pub async fn check_seats_once(
         &seated,
         read.as_ref().ok().map(|a| &a.readings),
     );
+    let (tenants, failed) = match read {
+        Ok(admissions) => (admissions.tenants, None),
+        Err(e) => (HashMap::new(), Some(e)),
+    };
+    SeatRead {
+        verdicts,
+        failed,
+        seats,
+        tenants,
+    }
+}
+
+/// The end half of a pass: end the seats of each verdict in `read`, as
+/// `revoke::withdraw_these_seats_here` ends them, then keep the call's books.
+/// `memory` is the loop's, the one the read half keeps. Returns the seat keys
+/// it ended.
+pub async fn end_seats(
+    state: &ConferenceState,
+    _memory: &mut SeatCheckMemory,
+    read: &SeatRead,
+) -> Vec<SeatKey> {
     let mut ended = Vec::new();
-    for verdict in verdicts {
+    for verdict in &read.verdicts {
         let (room_id, user_id) = verdict.key;
-        let conns = seats.get(&verdict.key).cloned().unwrap_or_default();
+        let conns = read.seats.get(&verdict.key).cloned().unwrap_or_default();
         let closed =
             crate::revoke::withdraw_these_seats_here(state, room_id, user_id, &conns).await;
         if closed.is_empty() {
@@ -270,9 +317,8 @@ pub async fn check_seats_once(
             continue;
         }
         let tenant = read
-            .as_ref()
-            .ok()
-            .and_then(|a| a.tenants.get(&room_id))
+            .tenants
+            .get(&room_id)
             .map(|tenant| tenant.to_hex())
             .unwrap_or_default();
         warn!(
