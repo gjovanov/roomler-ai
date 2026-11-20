@@ -1448,7 +1448,7 @@ of the vendored webrtc-sctp keeps where the events happen:
 The agent reads both without the association's lock (`Association::delivery_clock`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:638`), through the peer
 connection's SCTP transport (`RTCSctpTransport::delivery_clock`,
-`crates/vendored/webrtc/src/sctp_transport/mod.rs:437`, a patch of the vendored
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:474`, a patch of the vendored
 webrtc). That accessor never waits: `stop()` holds the transport's slot across the
 association's close, so a held slot answers `None` and the sampler keeps the clock it
 already has.
@@ -1573,7 +1573,7 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 |---|---|
 | the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:516` (`DeliverySampler`), `:603` (`heartbeat`), `:704` (`on_reading_with`), `:774` (`take_line`) |
 | the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:95` (`QUEUED_OVER_MS`), `:117` (`counts`), `:677-686` (`DeliverySampler::observe`, the one take), `:745` (`judge`), `:441` (`Fold::add_queue`) |
-| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:134` (`Gauges`), `:179` (`take`), `:187` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:445` (`RTCSctpTransport::gauges`) |
+| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:134` (`Gauges`), `:179` (`take`), `:187` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:3978` (made), `:5394` (drained, after the heartbeat line) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6544` (made), `:10360` (drained, after the heartbeat line) |
 | the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:93` (`DeliveryClock`), `:101` (`read`) |
@@ -1992,7 +1992,7 @@ The call sits where the pump hands each media message to its send task
 (`agents/roomlerd/src/peer.rs:5241` in the VP9 4:4:4 pump, `:9914` in the FFmpeg one),
 and only its first call reads anything (`DeliverySampler::on_first_write`,
 `agents/roomlerd/src/media_delivery.rs:834`). It reads the gauges through
-`RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:445`),
+`RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:482`),
 which never waits for the transport's slot, with `GaugeReader::peek`
 (`crates/vendored/webrtc-sctp/src/association/gauges.rs:187`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,

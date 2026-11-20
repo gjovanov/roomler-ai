@@ -9411,7 +9411,7 @@ mod tests {
             allowed_user_ids: vec![user],
             allowed_role_ids: vec![role],
             account_mode: SshAccountMode::ConsoleUser,
-            account: Some("goran".into()),
+            account: Some("casey".into()),
             consent_mode: Some(ConsentMode::Prompt),
         };
         let (gates, spec) = policy.split();
@@ -9420,7 +9420,7 @@ mod tests {
         assert_eq!(gates.allowed_user_ids, vec![user]);
         assert_eq!(gates.allowed_role_ids, vec![role]);
         assert_eq!(spec.account_mode, SshAccountMode::ConsoleUser);
-        assert_eq!(spec.account.as_deref(), Some("goran"));
+        assert_eq!(spec.account.as_deref(), Some("casey"));
         assert_eq!(spec.consent_mode, Some(ConsentMode::Prompt));
     }
 
