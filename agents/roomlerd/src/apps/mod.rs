@@ -482,7 +482,6 @@ pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
 /// asking `start` first, for the virtual desktop's tests (`mod linux` is
 /// private).
 #[cfg(all(test, target_os = "linux"))]
-#[allow(dead_code)] // #4100: the desktop's tests use it from the next commit on
 pub(crate) fn linux_backend_for_tests(
     display: &str,
     tools: [String; 4],

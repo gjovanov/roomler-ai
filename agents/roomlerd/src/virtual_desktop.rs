@@ -6573,6 +6573,887 @@ mod supervise_tests {
     }
 
     // -----------------------------------------------------------------------
+    // #4100: the X clients Remote Apps (FR-56) starts on a desktop whose
+    // keeper runs are the keeper's: collected when they exit, and ended with
+    // the desktop, their orphans with them. A bash session's tmux server
+    // stays outside, and without a keeper Remote Apps starts its clients as
+    // before. Stand-ins only, never the real tmux, xterm, wmctrl or xprop (a
+    // person's tmux is on the default socket); no X server, displays
+    // `:440`-`:456`, `:480`, `:482`, `:489` and `:499`, never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// Remote Apps' helper programs as stand-ins in `dir`, in the order
+    /// [`crate::apps::linux_backend_for_tests`] takes them: tmux, xterm,
+    /// wmctrl and xprop.
+    ///
+    /// tmux's `new-session -d -s <name>` starts a server stand-in in a
+    /// session of its own (`setsid`, as a tmux server leaves its client's),
+    /// which writes its pid to `<dir>/server.pid`, and adds `<name>` to
+    /// `<dir>/sessions`; its `list-sessions` prints that file, and exits 1
+    /// without one, as tmux does with no server. xterm appends
+    /// `$$ <title>` to `<dir>/xterms` and sleeps. wmctrl and xprop print
+    /// nothing.
+    fn app_tools(dir: &Path) -> [String; 4] {
+        let d = dir.display();
+        [
+            script(
+                dir,
+                "tmux",
+                &format!(
+                    "case \"$1\" in\n\
+                     new-session)\n\
+                     setsid sh -c 'echo $$ > \"{d}/server.pid\"; exec sleep 300' \
+                     </dev/null >/dev/null 2>&1 &\n\
+                     echo \"$4\" >> \"{d}/sessions\" ;;\n\
+                     list-sessions)\n\
+                     [ -s \"{d}/sessions\" ] || exit 1\n\
+                     cat \"{d}/sessions\" ;;\n\
+                     *) exit 1 ;;\n\
+                     esac"
+                ),
+            ),
+            script(
+                dir,
+                "xterm",
+                &format!("echo \"$$ $2\" >> \"{d}/xterms\"\nexec sleep 300"),
+            ),
+            script(dir, "wmctrl", "exit 0"),
+            script(dir, "xprop", "exit 0"),
+        ]
+    }
+
+    /// Remote Apps' Linux backend on `display`, with the stand-ins of
+    /// [`app_tools`] for its helper programs, asking `desk` who starts each X
+    /// client, as the daemon asks its own desktop ([`start_x_client`]).
+    fn apps_on(
+        desk: &Arc<Desktop>,
+        display: &str,
+        dir: &Path,
+    ) -> Box<dyn crate::apps::WindowManager> {
+        let desk = desk.clone();
+        crate::apps::linux_backend_for_tests(
+            display,
+            app_tools(dir),
+            Arc::new(move |display: &str, program: &str, args: &[&str]| {
+                desk.start_x_client(display, program, args)
+            }),
+        )
+    }
+
+    /// A Remote Apps entry, as `resolve_app` hands it to a backend.
+    fn entry(key: &str, command: &[&str], terminal: bool, tmux: bool) -> crate::apps::ResolvedApp {
+        crate::apps::ResolvedApp {
+            key: key.into(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            terminal,
+            tmux,
+        }
+    }
+
+    /// A GUI app's stand-in `<dir>/<name>`: it writes its pid to
+    /// `<dir>/<name>.pid`, then sleeps.
+    fn gui_app(dir: &Path, name: &str) -> String {
+        script(
+            dir,
+            name,
+            &format!("echo $$ > \"{}/{name}.pid\"\nexec sleep 300", dir.display()),
+        )
+    }
+
+    /// A GUI app's stand-in that starts [`deaf_setsid_child`], writes its pid
+    /// to `<dir>/app.pid`, and exits once `<dir>/app.exit` is there.
+    fn orphaning_app(dir: &Path) -> String {
+        let d = dir.display();
+        script(
+            dir,
+            "app",
+            &format!(
+                "{}\n\
+                 echo $$ > \"{d}/app.pid\"\n\
+                 while [ ! -e \"{d}/app.exit\" ]; do sleep 0.05; done\n\
+                 exit 0",
+                deaf_setsid_child(dir)
+            ),
+        )
+    }
+
+    /// `desk`, around the server `x_pid`, with its keeper running and marked
+    /// up, as `bring_up` leaves it: a stop for when the test leaves, and the
+    /// keeper's pid.
+    fn kept_up(desk: &Arc<Desktop>, x_pid: i32) -> (StopAtTheEnd, i32) {
+        let stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let _ = running(desk, x_pid, Some(keeper));
+        (stop, keeper)
+    }
+
+    /// The process whose pid a stand-in wrote to `<dir>/<name>`, as `/proc`
+    /// describes it, within `within`: `None` when none ran.
+    fn ran(dir: &Path, name: &str, within: Duration) -> Option<ProcInfo> {
+        poll_for(within, || {
+            let pid = std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse::<i32>()
+                .ok()?;
+            read_proc_stat(pid)
+        })
+    }
+
+    /// The `n`th xterm stand-in (from 0) that ran with `title`, within
+    /// `within`.
+    fn xterm_ran(dir: &Path, title: &str, n: usize, within: Duration) -> Option<ProcInfo> {
+        poll_for(within, || {
+            let pid = whole_lines(dir, "xterms")
+                .into_iter()
+                .filter(|f| f.get(1).is_some_and(|t| t == title))
+                .nth(n)?
+                .first()?
+                .parse::<i32>()
+                .ok()?;
+            read_proc_stat(pid)
+        })
+    }
+
+    /// [`orphaning_app`]'s run: the app and its child as `/proc` describes
+    /// them, once the app was told to exit and its child has another parent
+    /// (`None` for what never ran).
+    fn orphaned(dir: &Path) -> (Option<ProcInfo>, Option<ProcInfo>) {
+        let app = ran(dir, "app.pid", Duration::from_secs(5));
+        let gc = ran(dir, "gc.pid", Duration::from_secs(5));
+        std::fs::write(dir.join("app.exit"), "").unwrap();
+        if let (Some(app), Some(gc)) = (app, gc) {
+            let _ = poll_for(Duration::from_secs(5), || {
+                read_proc_stat(gc.pid).filter(|p| p.ppid != app.pid)
+            });
+        }
+        (app, gc)
+    }
+
+    /// Who `info`'s parent is, in a failure's words.
+    fn parent_named(info: &ProcInfo, keeper: i32) -> String {
+        if info.ppid == keeper {
+            "the desktop's keeper".into()
+        } else if info.ppid == std::process::id() as i32 {
+            "the daemon".into()
+        } else {
+            format!("process {}", info.ppid)
+        }
+    }
+
+    /// How a client that must not have run was started, in a failure's words.
+    fn how_started(info: &ProcInfo, keeper: i32) -> String {
+        if info.ppid == std::process::id() as i32 {
+            "started directly, by the daemon".into()
+        } else {
+            format!("started, under {}", parent_named(info, keeper))
+        }
+    }
+
+    /// The processes a test started that no tree may reach (a client Remote
+    /// Apps started directly, as before #4100, and the orphan of one):
+    /// SIGKILLed when the test leaves, as [`KillAtTheEnd`] does, and each one
+    /// that is this process's own child reaped too, so that a RED leaves no
+    /// zombie behind it.
+    struct EndAtTheEnd(Vec<ProcInfo>);
+    impl Drop for EndAtTheEnd {
+        fn drop(&mut self) {
+            let me = std::process::id() as i32;
+            for info in &self.0 {
+                if !RealProcs.same_process_now(info) {
+                    continue;
+                }
+                RealProcs.signal(info.pid, libc::SIGKILL);
+                if read_proc_stat(info.pid).is_some_and(|now| now.ppid == me) {
+                    let _ = poll_for(Duration::from_secs(1), || {
+                        let mut status = 0;
+                        // SAFETY: `waitpid(2)` on one child of this process,
+                        // with a live out-pointer; WNOHANG never blocks.
+                        let got = unsafe { libc::waitpid(info.pid, &mut status, libc::WNOHANG) };
+                        (got != 0).then_some(())
+                    });
+                }
+            }
+        }
+    }
+
+    /// SIGCONT for a process a test stopped, when the test leaves, whatever
+    /// an assertion did.
+    struct ContAtTheEnd(ProcInfo);
+    impl Drop for ContAtTheEnd {
+        fn drop(&mut self) {
+            signal_recorded(&self.0, libc::SIGCONT);
+        }
+    }
+
+    /// #4100, box 1 — a GUI entry and a terminal entry of Remote Apps,
+    /// started on a desktop whose keeper runs, are the keeper's children in
+    /// the desktop's group, and each one's exit is collected.
+    #[test]
+    fn an_app_remote_apps_starts_runs_under_the_keeper_and_its_exit_is_collected() {
+        let dir = scratch("apps-kept");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":450", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":450", &dir);
+        let gui = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let gui_ran = ran(&dir, "probe.pid", Duration::from_secs(5));
+        let term = apps.launch(&entry("top", &["top"], true, false));
+        let term_ran = xterm_ran(&dir, "roomler:app:top", 0, Duration::from_secs(5));
+        let _ours = EndAtTheEnd(gui_ran.into_iter().chain(term_ran).collect());
+        // Each one ends, as a person closes its window: its exit is for its
+        // parent to collect.
+        let collected_within = |info: &Option<ProcInfo>| {
+            info.as_ref().is_some_and(|info| {
+                signal_recorded(info, libc::SIGTERM);
+                poll_for(Duration::from_secs(2), || reaped(info).then_some(())).is_some()
+            })
+        };
+        let gui_collected = collected_within(&gui_ran);
+        let term_collected = collected_within(&term_ran);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &gui {
+            panic!("the GUI app did not launch: {e:#}");
+        }
+        if let Err(e) = &term {
+            panic!("the terminal app did not launch: {e:#}");
+        }
+        let gui_ran = gui_ran.expect("the GUI app never ran");
+        let term_ran = term_ran.expect("the terminal app's xterm never ran");
+        for (what, info) in [("GUI app", gui_ran), ("terminal app's xterm", term_ran)] {
+            assert_eq!(
+                info.ppid,
+                keeper,
+                "the {what}'s parent is {}, not the desktop's keeper {keeper} (#4100)",
+                parent_named(&info, keeper)
+            );
+            assert_eq!(
+                info.pgid, x_pid,
+                "the {what} is not in the desktop's group (#4100)"
+            );
+        }
+        assert!(
+            gui_collected,
+            "the GUI app's exit was not collected within 2 s (#4100)"
+        );
+        assert!(
+            term_collected,
+            "the terminal app's xterm's exit was not collected within 2 s (#4100)"
+        );
+    }
+
+    /// #4100, box 1 — a bash session's xterm, and the xterm its re-attach
+    /// starts once that one ended, are the keeper's children in the
+    /// desktop's group.
+    #[test]
+    fn a_bash_sessions_xterm_and_its_reattach_run_under_the_keeper() {
+        if !have_setsid("a_bash_sessions_xterm_and_its_reattach_run_under_the_keeper") {
+            return;
+        }
+        let dir = scratch("apps-bash");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":451", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":451", &dir);
+        let launched = apps.launch(&entry("bash", &["bash"], true, true));
+        let server = ran(&dir, "server.pid", Duration::from_secs(5));
+        let first = xterm_ran(&dir, "roomler:tmux:s1", 0, Duration::from_secs(5));
+        let mut ours = EndAtTheEnd(server.into_iter().chain(first).collect());
+        // The xterm ends, as a person closes its window: the session is
+        // detached, and a focus attaches it again in a new xterm.
+        if let Some(first) = &first {
+            signal_recorded(first, libc::SIGTERM);
+            let _ = poll_for(Duration::from_secs(2), || {
+                (!still_running(first)).then_some(())
+            });
+        }
+        let focused = apps.focus("tmux:s1");
+        let again = xterm_ran(&dir, "roomler:tmux:s1", 1, Duration::from_secs(5));
+        ours.0.extend(again);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the bash entry did not launch: {e:#}");
+        }
+        if let Err(e) = &focused {
+            panic!("the re-attach did not start: {e:#}");
+        }
+        let first = first.expect("the bash session's xterm never ran");
+        let again = again.expect("the re-attach's xterm never ran");
+        for (what, info) in [
+            ("bash session's xterm", first),
+            ("re-attach's xterm", again),
+        ] {
+            assert_eq!(
+                info.ppid,
+                keeper,
+                "the {what}'s parent is {}, not the desktop's keeper {keeper} (#4100)",
+                parent_named(&info, keeper)
+            );
+            assert_eq!(
+                info.pgid, x_pid,
+                "the {what} is not in the desktop's group (#4100)"
+            );
+        }
+    }
+
+    /// #4100, box 2 — a Remote Apps client that leaves a child in a session
+    /// of its own (`setsid`, deaf to SIGTERM) and exits: the desktop's stop
+    /// ends that child, as it ends a startup app's
+    /// (`an_orphan_of_an_app_that_exited_by_itself_is_reached_by_the_next_stop`).
+    #[test]
+    fn the_desktops_stop_reaches_the_setsid_orphan_of_a_remote_app() {
+        if !have_setsid("the_desktops_stop_reaches_the_setsid_orphan_of_a_remote_app") {
+            return;
+        }
+        let dir = scratch("apps-orphan");
+        let app = orphaning_app(&dir);
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":452", "exec sleep 300");
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":452", &dir);
+        let launched = apps.launch(&entry("app", &[app.as_str()], false, false));
+        let (app_ran, gc) = orphaned(&dir);
+        let _ours = EndAtTheEnd(app_ran.into_iter().chain(gc).collect());
+        let asked = Instant::now();
+        desk.stop();
+        let gone =
+            gc.map(|gc| poll_for(Duration::from_secs(5), || reaped(&gc).then_some(())).is_some());
+        let took = asked.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the app did not launch: {e:#}");
+        }
+        let gc = gc.expect("the app's setsid child never ran");
+        assert_eq!(
+            gone,
+            Some(true),
+            "the setsid orphan {} of a Remote Apps client outlived the desktop's stop ({took:?}) (#4100)",
+            gc.pid
+        );
+    }
+
+    /// #4100, box 2 — the same orphan when its X server dies: the
+    /// supervisor's teardown ends it, as it ends a startup app's
+    /// (`an_orphan_of_an_app_that_died_with_its_server_does_not_outlive_the_teardown`).
+    #[test]
+    fn an_x_server_death_takes_the_setsid_orphan_of_a_remote_app() {
+        if !have_setsid("an_x_server_death_takes_the_setsid_orphan_of_a_remote_app") {
+            return;
+        }
+        let dir = scratch("apps-orphan-x");
+        let app = orphaning_app(&dir);
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":453", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let apps = apps_on(&desk, ":453", &dir);
+        let launched = apps.launch(&entry("app", &[app.as_str()], false, false));
+        let (app_ran, gc) = orphaned(&dir);
+        let _ours = EndAtTheEnd(app_ran.into_iter().chain(gc).collect());
+        let killed = Instant::now();
+        // The server's stand-in, our child, unreaped while the tree lists it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        let gone =
+            gc.map(|gc| poll_for(Duration::from_secs(10), || reaped(&gc).then_some(())).is_some());
+        let took = killed.elapsed();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the app did not launch: {e:#}");
+        }
+        let gc = gc.expect("the app's setsid child never ran");
+        assert_eq!(
+            gone,
+            Some(true),
+            "the setsid orphan {} of a Remote Apps client outlived its X server's death ({took:?}) (#4100)",
+            gc.pid
+        );
+    }
+
+    /// #4100, guard — a start that reaches the keeper in its own stop (its
+    /// SIGTERM: what the desktop started is taken down, the server runs on)
+    /// is refused, and nothing runs.
+    #[test]
+    fn no_remote_app_starts_in_the_keepers_stop() {
+        let dir = scratch("apps-keeper-stop");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_keeping_lines(&dir, ":454", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":454", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        signal_recorded(&keeper_info, libc::SIGTERM);
+        let stopping = poll_for(Duration::from_secs(10), || {
+            lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|l| l.contains("asked to stop"))
+                .then_some(())
+        });
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let server_ran = is_running(x_pid);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(stopping.is_some(), "the keeper did not take its SIGTERM");
+        if let Some(info) = probe_ran {
+            panic!(
+                "a Remote Apps client was {} in the keeper's stop (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(server_ran, "the server did not run on: this proves nothing");
+        assert!(launched.is_err(), "the launch said it started");
+    }
+
+    /// #4100, guard — a start onto an X server that is gone (SIGKILLed: a
+    /// zombie no supervisor has collected) is refused, nothing runs, and the
+    /// keeper runs on.
+    #[test]
+    fn no_remote_app_starts_onto_a_server_that_is_gone() {
+        let dir = scratch("apps-server-gone");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":455", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":455", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        // The server's stand-in, our child: a zombie until the stop reaps it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        let dead = poll_for(Duration::from_secs(5), || {
+            (!is_running(x_pid)).then_some(())
+        });
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let keeper_ran_on = still_running(&keeper_info);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(dead.is_some(), "the server's stand-in did not die");
+        if let Some(info) = probe_ran {
+            panic!(
+                "a Remote Apps client was {} onto a server that is gone (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(launched.is_err(), "the launch said it started");
+        assert!(keeper_ran_on, "the keeper did not run on");
+    }
+
+    /// #4100, guard — a start the daemon writes right behind the job, in the
+    /// same write, is answered: the keeper hands on what it read past the
+    /// job's line instead of dropping it.
+    #[test]
+    #[allow(clippy::zombie_processes)] // the keeper is reaped by `try_wait`, or killed and waited for
+    fn a_start_written_right_behind_the_job_is_answered() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+        let dir = scratch("apps-behind-the-job");
+        let probe = gui_app(&dir, "probe");
+        let wm = script(&dir, "wm", "exec sleep 300");
+        // The desktop's group, led by a `sleep` in the server's place.
+        let mut leader = Command::new("sleep");
+        leader
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id() as i32;
+        let mut ours = EndAtTheEnd(vec![read_proc_stat(group).expect("the group's leader")]);
+        let mut cmd = KeeperCmd::test().command();
+        cmd.process_group(group)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut keeper = cmd.spawn().unwrap();
+        let keeper_pid = keeper.id() as i32;
+        let job = keeper::Job {
+            display: ":445".into(),
+            group,
+            wm,
+            apps: vec![],
+            grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: 3_600_000,
+            wm_delay_ceil_ms: 3_600_000,
+            wm_stable_after_ms: 3_600_000,
+        };
+        let start = keeper::Start {
+            id: 7,
+            argv: vec![probe],
+            deadline_ms: u64::MAX,
+        };
+        let mut input = keeper.stdin.take().unwrap();
+        input
+            .write_all(format!("{}{}", job.line(), start.line()).as_bytes())
+            .unwrap();
+        // Its lines on a thread of their own, read to the end: a keeper that
+        // never speaks fails this test instead of hanging it.
+        let (said, heard) = std::sync::mpsc::channel();
+        let stderr = keeper.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if said.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let first = heard.recv_timeout(Duration::from_secs(20)).ok();
+        let answer = first.as_ref().and_then(|_| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(line) if line.starts_with("start 7: ") => break Some(line),
+                    Ok(_) => continue,
+                    Err(_) => break None,
+                }
+            }
+        });
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        ours.0.extend(probe_ran);
+        drop(input);
+        let asked = Instant::now();
+        let mut left = false;
+        while asked.elapsed() < Duration::from_secs(10) {
+            if let Ok(Some(_)) = keeper.try_wait() {
+                left = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !left {
+            let _ = keeper.kill();
+            let _ = keeper.wait();
+        }
+        let _ = leader.kill();
+        let _ = leader.wait();
+        drop(ours);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first.as_deref(), Some("ready"));
+        let answer = answer.unwrap_or_else(|| {
+            panic!(
+                "the keeper did not answer a start written right behind its job within 2 s (#4100)"
+            )
+        });
+        let probe_ran =
+            probe_ran.unwrap_or_else(|| panic!("the keeper answered {answer:?}, and nothing ran"));
+        assert_eq!(
+            probe_ran.ppid, keeper_pid,
+            "the start ran, but not under the keeper"
+        );
+    }
+
+    /// #4100, guard — a start longer than one atomic write to the keeper's
+    /// input (`KEEPER_JOB_MAX`, `PIPE_BUF`) is refused before anything is
+    /// written: the refusal names the bound, the keeper says nothing of it,
+    /// and nothing runs.
+    #[test]
+    fn a_start_longer_than_one_atomic_write_is_refused_before_it_is_sent() {
+        let dir = scratch("apps-long");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_keeping_lines(&dir, ":456", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":456", &dir);
+        let long = "x".repeat(KEEPER_JOB_MAX);
+        let launched = apps.launch(&entry(
+            "probe",
+            &[probe.as_str(), long.as_str()],
+            false,
+            false,
+        ));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let (warned, _) = keeper_warnings(&lines, "");
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Some(info) = probe_ran {
+            panic!(
+                "a start of more than {KEEPER_JOB_MAX} bytes was {} (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        let refusal = match &launched {
+            Ok(_) => panic!("the launch said it started"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            refusal.contains(&format!("more than {KEEPER_JOB_MAX} bytes")),
+            "the refusal does not name the bound: {refusal}"
+        );
+        assert!(
+            warned.is_empty(),
+            "something of it reached the keeper: {warned:?}"
+        );
+    }
+
+    /// #4100, guard — a start the daemon gave up on (its keeper stopped by
+    /// SIGSTOP past the wait) fails its launch within the wait, and never
+    /// starts later: the keeper, running again, reads it past its deadline.
+    #[test]
+    fn a_start_the_daemon_gave_up_on_never_starts() {
+        let dir = scratch("apps-gave-up");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":480", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":480", &dir);
+        let keeper_info = read_proc_stat(keeper).expect("the keeper runs");
+        signal_recorded(&keeper_info, libc::SIGSTOP);
+        let cont = ContAtTheEnd(keeper_info);
+        let asked = Instant::now();
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let took = asked.elapsed();
+        // The keeper runs again, and reads the start now.
+        drop(cont);
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(1));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        let wait = desk.plan.x_client_wait;
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Some(info) = probe_ran {
+            panic!(
+                "a start the daemon gave up on was {} (#4100)",
+                how_started(&info, keeper)
+            );
+        }
+        assert!(launched.is_err(), "the launch said it started");
+        assert!(
+            took < wait + Duration::from_secs(2),
+            "the launch took {took:?}, past its wait of {wait:?}"
+        );
+    }
+
+    /// #4100, box 3 (control) — a bash session's tmux server is started as
+    /// before, never through the keeper: it is neither the keeper's child nor
+    /// in the desktop's group, and it outlives the desktop's stop.
+    #[test]
+    fn a_bash_sessions_tmux_server_stays_outside_the_keeper() {
+        if !have_setsid("a_bash_sessions_tmux_server_stays_outside_the_keeper") {
+            return;
+        }
+        let dir = scratch("apps-tmux");
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":482", "exec sleep 300");
+        let (_stop, keeper) = kept_up(&desk, x_pid);
+        let apps = apps_on(&desk, ":482", &dir);
+        let launched = apps.launch(&entry("bash", &["bash"], true, true));
+        let server = ran(&dir, "server.pid", Duration::from_secs(5));
+        let xterm = xterm_ran(&dir, "roomler:tmux:s1", 0, Duration::from_secs(5));
+        let _ours = EndAtTheEnd(server.into_iter().chain(xterm).collect());
+        desk.stop();
+        let outlived = server.is_some_and(|s| still_running(&s));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the bash entry did not launch: {e:#}");
+        }
+        let server = server.expect("the tmux server's stand-in never ran");
+        assert_ne!(server.ppid, keeper, "the tmux server is the keeper's child");
+        assert_ne!(
+            server.pgid, x_pid,
+            "the tmux server is in the desktop's group"
+        );
+        assert!(outlived, "the desktop's stop ended the tmux server");
+    }
+
+    /// #4100, box 4 (control) — where the keeper does not run, Remote Apps
+    /// starts its clients as before: under the kill switch, after a keeper
+    /// that refused, and on another display than the desktop's, a client is
+    /// the daemon's own child, outside the desktop's group.
+    #[test]
+    fn where_the_keeper_does_not_run_remote_apps_starts_its_clients_as_before() {
+        let dir = scratch("apps-direct");
+        let sub = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sub
+        };
+        let (off_dir, refused_dir, kept_dir) = (sub("off"), sub("refused"), sub("kept"));
+        // The kill switch.
+        let (off, off_x) = desktop_with(
+            &off_dir,
+            ":489",
+            "exec sleep 300",
+            Clients::Direct,
+            Duration::from_secs(20),
+        );
+        let _off = StopAtTheEnd(off.clone());
+        assert_eq!(off.start_clients(), None, "the kill switch runs no keeper");
+        let _ = running(&off, off_x, None);
+        // A keeper that refuses: the clients are started directly.
+        let refuses = script(
+            &refused_dir,
+            "keeper",
+            "echo 'refused: no subreaper on this host' >&2\nexit 2",
+        );
+        let (refused, refused_x) = desktop_with(
+            &refused_dir,
+            ":499",
+            "exec sleep 300",
+            Clients::Keeper(KeeperCmd::script(&refuses)),
+            Duration::from_secs(20),
+        );
+        let _refused = StopAtTheEnd(refused.clone());
+        assert_eq!(refused.start_clients(), None, "the keeper refused");
+        let _ = running(&refused, refused_x, None);
+        // A keeper that runs, and Remote Apps on another display.
+        let (kept, kept_x, _lines) = desktop_keeping_lines(&kept_dir, ":440", "exec sleep 300");
+        let (_kept, _keeper) = kept_up(&kept, kept_x);
+
+        let cases = [
+            (
+                "the kill switch",
+                apps_on(&off, ":489", &off_dir),
+                off_x,
+                &off_dir,
+            ),
+            (
+                "a keeper that refused",
+                apps_on(&refused, ":499", &refused_dir),
+                refused_x,
+                &refused_dir,
+            ),
+            (
+                "another display",
+                apps_on(&kept, ":441", &kept_dir),
+                kept_x,
+                &kept_dir,
+            ),
+        ];
+        let mut started = Vec::new();
+        for (case, apps, x_pid, dir) in &cases {
+            let probe = gui_app(dir, "probe");
+            let launched = apps
+                .launch(&entry("probe", &[probe.as_str()], false, false))
+                .map_err(|e| format!("{e:#}"));
+            let client = ran(dir, "probe.pid", Duration::from_secs(5));
+            started.push((*case, launched, client, *x_pid));
+        }
+        let _ours = EndAtTheEnd(started.iter().filter_map(|s| s.2).collect());
+        off.stop();
+        refused.stop();
+        kept.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let me = std::process::id() as i32;
+        for (case, launched, client, x_pid) in started {
+            if let Err(e) = launched {
+                panic!("{case}: the launch failed: {e}");
+            }
+            let info = client.unwrap_or_else(|| panic!("{case}: the client never ran"));
+            assert_eq!(
+                info.ppid, me,
+                "{case}: the client's parent is {}, not the daemon",
+                info.ppid
+            );
+            assert_ne!(
+                info.pgid, x_pid,
+                "{case}: the client is in the desktop's group"
+            );
+        }
+    }
+
+    /// #4100, box 4 (control) — a start that fails says what it said before
+    /// #4100, on the keeper's path as on the direct one: a program that is
+    /// not there, and a file that is not executable.
+    #[test]
+    fn a_start_that_fails_says_what_it_said_before() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("apps-fails");
+        let not_executable = script(&dir, "not-executable", "exit 0");
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let missing = dir.join("not-there").display().to_string();
+        let (desk, x_pid, _lines) = desktop_keeping_lines(&dir, ":442", "exec sleep 300");
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let kept = apps_on(&desk, ":442", &dir);
+        // Another display than the desktop's: started directly.
+        let direct = apps_on(&desk, ":443", &dir);
+        let said = |apps: &dyn crate::apps::WindowManager, program: &str| {
+            apps.launch(&entry("broken", &[program], false, false))
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
+        };
+        let results: Vec<_> = [&missing, &not_executable]
+            .into_iter()
+            .map(|program| {
+                (
+                    program.clone(),
+                    said(&*kept, program),
+                    said(&*direct, program),
+                )
+            })
+            .collect();
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (program, on_the_keepers_path, before) in results {
+            assert!(before.is_err(), "{program}: the direct start did not fail");
+            assert_eq!(
+                on_the_keepers_path, before,
+                "{program}: the keeper's path says otherwise"
+            );
+        }
+    }
+
+    /// #4100 (control) — a Remote Apps client's exit is not the window
+    /// manager's: with the window manager's restart numbers short, a client
+    /// that exits starts no window manager and says nothing of one.
+    #[test]
+    fn a_remote_apps_client_exit_is_not_the_window_managers() {
+        let dir = scratch("apps-not-the-wm");
+        let probe = gui_app(&dir, "probe");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":444",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let (_stop, _keeper) = kept_up(&desk, x_pid);
+        let _first = first_start(&dir);
+        let apps = apps_on(&desk, ":444", &dir);
+        let launched = apps.launch(&entry("probe", &[probe.as_str()], false, false));
+        let probe_ran = ran(&dir, "probe.pid", Duration::from_secs(5));
+        let _ours = EndAtTheEnd(probe_ran.into_iter().collect());
+        if let Some(probe) = &probe_ran {
+            signal_recorded(probe, libc::SIGTERM);
+        }
+        // Past the restart's ceiling, and the delay of a notice (2 s).
+        std::thread::sleep(Duration::from_millis(2500));
+        let starts = wm_starts(&dir);
+        let said = wm_warnings(&lines);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(e) = &launched {
+            panic!("the client did not launch: {e:#}");
+        }
+        assert!(probe_ran.is_some(), "the client never ran");
+        assert_eq!(
+            starts.len(),
+            1,
+            "a client's exit started the window manager again: {starts:?}"
+        );
+        assert!(
+            said.is_empty(),
+            "a client's exit was said as the window manager's: {said:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // #3671: what an X server's exit tells the open sessions, and the exit a
     // stop of the daemon asked for. Stand-ins only: no X server, never `:99`.
     // -----------------------------------------------------------------------

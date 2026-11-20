@@ -128,7 +128,6 @@ impl LinuxWm {
     /// xterm, wmctrl and xprop, in that order) and which asks `start` first,
     /// for the virtual desktop's tests.
     #[cfg(test)]
-    #[allow(dead_code)] // #4100: the desktop's tests use it from the next commit on
     pub(super) fn with(target: Target, tools: [String; 4], start: XStarter) -> Self {
         let [tmux, xterm, wmctrl, xprop] = tools;
         Self {
