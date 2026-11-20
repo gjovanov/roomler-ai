@@ -52,13 +52,18 @@
 //! frame), and it keeps the counters of the `path delivery` line's window.
 //! [`Shadow`] is the pump's side: once per frame, before capture, it reads the
 //! association's clock and gauges (by `peek`, so the delivery sampler's takes
-//! stay its own, FR-148 O10) and steps the core. In B1 the verdict reaches
+//! stay its own, FR-148 O10) and steps the core. In shadow the verdict reaches
 //! those counters and nothing else: no gate, no AIMD call, no keyframe request.
 //!
 //! The switch is `ROOMLERD_INFLIGHT_BUDGET` (config key `inflight_budget`):
 //! `off`, the default, computes nothing; `shadow` computes and writes the
-//! fields; `on` runs as `shadow` until B3, with one warning a pump. See
-//! `docs/rate-control.md` (§ The in-flight budget).
+//! fields; `on` (B3) acts on a constrained (relay) session's capacity gate
+//! ([`Shadow::gate`], [`Pass`]): the step runs before the gate decides, a hold
+//! skips the pass before capture as a full send channel does, a hold in a
+//! still span calls no AIMD decrease, and the FFmpeg relay byte gate and the
+//! VP9-444 watermark arm act on nothing. A direct session under `on` computes
+//! the budget as `shadow` does. See `docs/rate-control.md` (§ The in-flight
+//! budget).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,8 +119,8 @@ const CLOCK_SLOTS: usize = 32;
 /// `RATE_HOLD / GRAIN` figures and one, with room.
 const FIGURE_SLOTS: usize = 48;
 
-/// The switch, `ROOMLERD_INFLIGHT_BUDGET` (D46 item 7). In B1 `on` runs as
-/// `shadow`.
+/// The switch, `ROOMLERD_INFLIGHT_BUDGET` (D46 item 7). From B3 `on` acts on
+/// relay sessions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Off,
@@ -132,7 +137,8 @@ impl Mode {
         }
     }
 
-    /// Anything but `off` computes the budget. In B1 none acts on it.
+    /// Anything but `off` computes the budget; only `on` acts on it, on a
+    /// relay session ([`Shadow::gate`]).
     pub fn computes(self) -> bool {
         self != Mode::Off
     }
@@ -276,6 +282,14 @@ pub struct WindowReport {
     /// FR-148 D46 — frames admitted while a still span stood, whatever let
     /// them go: under the budget, on SCTP's window, or written through.
     pub still_admitted: u64,
+    /// FR-148 D46 B3 — under `on`, on a relay session: the holds that shut a
+    /// pass by themselves (the send channel and the followers let it
+    /// through), and the passes the budget acted on. `(0, 0)` in shadow and
+    /// on a direct session.
+    pub acted: (u64, u64),
+    /// FR-148 D46 B3 — of those holds, the ones in a still span: a stall of
+    /// the carrier, which calls no AIMD decrease.
+    pub acted_stalled: u64,
 }
 
 /// A fixed ring: a push to a full ring drops its oldest.
@@ -463,6 +477,8 @@ struct Window {
     bounds: (u64, u64, u64),
     released: (u64, u64),
     still_admitted: u64,
+    acted: (u64, u64),
+    acted_stalled: u64,
 }
 
 impl Window {
@@ -479,6 +495,8 @@ impl Window {
             bounds: (0, 0, 0),
             released: (0, 0),
             still_admitted: 0,
+            acted: (0, 0),
+            acted_stalled: 0,
         }
     }
 }
@@ -541,6 +559,9 @@ pub struct Budget {
     /// FR-148 D46 B2 — the last step found a still span standing for the
     /// least and S, or read a release; taken by [`Self::take_mark`].
     mark: bool,
+    /// FR-148 D46 B3 — the last step found a still span standing for the
+    /// least and S ([`Self::stalled`]).
+    still_now: bool,
     /// FR-148 D46 B2 — the opening: whether this association's figures gave
     /// the last step's rate, or the opening rate stood in (before the first
     /// full second, and after it while the application-limited rule keeps
@@ -620,6 +641,7 @@ impl Budget {
             last_still: None,
             stood: None,
             mark: false,
+            still_now: false,
             measured: false,
             first_measured: None,
             last: (0, 0, None),
@@ -649,6 +671,7 @@ impl Budget {
         let budget = self.size(rate, &r.gauges);
         let still = self.still_age(t);
         self.mark = read || still.is_some();
+        self.still_now = still.is_some();
         let through = still.and_then(|age| self.through(rate, age));
         let out = r.out();
         let verdict = if out == 0 {
@@ -713,6 +736,26 @@ impl Budget {
     /// the shadow model's gate (`Pipe::note_stall`), and nothing else reads it.
     pub fn take_mark(&mut self) -> bool {
         std::mem::take(&mut self.mark)
+    }
+
+    /// FR-148 D46 B3 — the last step found a still span standing for the least
+    /// and S: a hold then is a stall of the carrier, and calls no AIMD decrease.
+    pub fn stalled(&self) -> bool {
+        self.still_now
+    }
+
+    /// FR-148 D46 B3 — the budget was asked about a pass it acts on.
+    fn note_asked(&mut self) {
+        let n = &mut self.window.acted.1;
+        *n = n.saturating_add(1);
+    }
+
+    /// FR-148 D46 B3 — its hold shut the pass by itself; `stalled`, in a still
+    /// span.
+    fn note_acted_hold(&mut self, stalled: bool) {
+        let w = &mut self.window;
+        w.acted.0 = w.acted.0.saturating_add(1);
+        w.acted_stalled = w.acted_stalled.saturating_add(u64::from(stalled));
     }
 
     /// FR-148 D46 B2 — what the budget saw over a delivery sample's span,
@@ -803,6 +846,7 @@ impl Budget {
         self.last_still = None;
         self.stood = None;
         self.mark = false;
+        self.still_now = false;
         self.measured = false;
         self.first_measured = None;
         self.forget_releases();
@@ -904,6 +948,8 @@ impl Budget {
             bounds: w.bounds,
             released: w.released,
             still_admitted: w.still_admitted,
+            acted: w.acted,
+            acted_stalled: w.acted_stalled,
         }
     }
 
@@ -1195,12 +1241,95 @@ impl<K: PartialEq> PairWatch<K> {
     }
 }
 
-/// The pump's side of the budget in B1: the association's handles, the pair
-/// it last read, its own unsent bytes, and the core. Every call returns
+/// FR-148 D46 B3 — one pass of a pump's capacity gate as the budget answers
+/// it ([`Shadow::gate`]). Under `on`, on a constrained (relay) session, the
+/// budget acts: its hold for the coming frame shuts the pass before capture,
+/// the FFmpeg relay byte gate and the VP9-444 watermark arm act on nothing,
+/// and a hold in a still span (the clock unmoved for the least and S with
+/// bytes out: a stall of the carrier) calls no AIMD decrease. Any other pass
+/// is today's: the byte gate shuts it, the watermark sheds, and each skip
+/// outside FR-35's opener grace decreases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pass {
+    acts: bool,
+    holds: bool,
+    stalled: bool,
+    byte_gate: bool,
+    /// The hold shut the pass by itself: the send channel and the followers
+    /// let it through ([`Self::shuts`]).
+    alone: bool,
+}
+
+impl Pass {
+    /// Today's pass: the budget acts on nothing, and `byte_gate` (the FFmpeg
+    /// pump's relay or direct byte gate; `false` on VP9-444) shuts it.
+    pub fn today(byte_gate: bool) -> Self {
+        Self {
+            byte_gate,
+            ..Self::default()
+        }
+    }
+
+    /// The budget acts on this pass.
+    pub fn acts(&self) -> bool {
+        self.acts
+    }
+
+    /// The capacity gate's last term, asked after the send channel's and the
+    /// followers': while the budget acts, its hold, which has then shut the
+    /// pass by itself; otherwise today's byte gate.
+    pub fn shuts(&mut self) -> bool {
+        if !self.acts {
+            return self.byte_gate;
+        }
+        self.alone = self.holds;
+        self.holds
+    }
+
+    /// The budget's hold shut this pass by itself.
+    pub fn held(&self) -> bool {
+        self.alone
+    }
+
+    /// That hold was in a still span: a stall of the carrier.
+    pub fn stalled(&self) -> bool {
+        self.alone && self.stalled
+    }
+
+    /// Whether the gate's skip calls the AIMD's decrease: never inside FR-35's
+    /// opener grace (`grace`), as today, and never for the budget's hold in a
+    /// still span (D46's no-decrease rule). A pass the send channel or a
+    /// follower shut decreases as today.
+    pub fn decreases(&self, grace: bool) -> bool {
+        !grace && !self.stalled()
+    }
+
+    /// Whether the VP9-444 watermark arm sheds a frame `over` its mark: as
+    /// today, and never while the budget acts.
+    pub fn sheds(&self, over: bool) -> bool {
+        over && !self.acts
+    }
+}
+
+/// The opening rate a pump's step reads: the governor's applied rate, or
+/// before one is applied the rate the pump opened at; 0 when neither is known.
+fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
+    let open = if applied_bps > 0 {
+        applied_bps
+    } else {
+        open_at_bps.unwrap_or(0)
+    };
+    u64::from(open)
+}
+
+/// The pump's side of the budget: the association's handles, the pair it last
+/// read, its own unsent bytes, and the core. In shadow every call returns
 /// nothing to the pump: the verdict reaches the window's counters only.
 /// FR-148 D46 B2 adds one reader, the delivery sampler: the stall mark
 /// ([`Self::take_mark`]) and the facts over a sample ([`Budget::over`]) go to
-/// the shadow model and the pair memory, never to a gate or a rate.
+/// the shadow model and the pair memory, never to a gate or a rate. FR-148
+/// D46 B3: under `on`, on a constrained session, [`Self::gate`] steps the core
+/// before the pump's capacity gate decides, and its [`Pass`] acts there.
 #[derive(Debug)]
 pub struct Shadow {
     budget: Budget,
@@ -1208,6 +1337,9 @@ pub struct Shadow {
     gauges: Option<GaugeReader>,
     pair: PairWatch<RTCIceCandidatePair>,
     pump: Arc<PumpBytes>,
+    /// FR-148 D46 B3 — the switch is `on`: the budget acts on a constrained
+    /// session's gate.
+    on: bool,
 }
 
 impl Default for Shadow {
@@ -1224,20 +1356,16 @@ impl Shadow {
             gauges: None,
             pair: PairWatch::default(),
             pump: Arc::default(),
+            on: false,
         }
     }
 
     /// The pump's budget, from the switch it read: none when `off`, and none
     /// when the delivery sampler is off, since its line carries the fields.
-    /// `on` runs as `shadow` in B1, with one warning.
+    /// `on` acts on constrained sessions ([`Self::gate`]).
     pub fn for_pump(mode: Mode, sampler_on: bool) -> Option<Self> {
-        match mode {
-            Mode::Off => return None,
-            Mode::On => tracing::warn!(
-                "ROOMLERD_INFLIGHT_BUDGET=on runs as shadow until FR-148 D46 B3: \
-                 the in-flight budget is computed and holds nothing"
-            ),
-            Mode::Shadow => {}
+        if mode == Mode::Off {
+            return None;
         }
         if !sampler_on {
             tracing::info!(
@@ -1247,7 +1375,15 @@ impl Shadow {
             );
             return None;
         }
-        Some(Self::new())
+        Some(Self {
+            on: mode == Mode::On,
+            ..Self::new()
+        })
+    }
+
+    /// FR-148 D46 B3 — the switch this budget was made from is `on`.
+    pub fn is_on(&self) -> bool {
+        self.on
     }
 
     /// The send task's handle on the pump's unsent bytes.
@@ -1265,14 +1401,9 @@ impl Shadow {
     /// clock and gauges and step the budget. Never waits: while the
     /// transport's slot is held the handles it has answer, or nothing does.
     pub fn on_frame(&mut self, pc: &RTCPeerConnection, applied_bps: u32, open_at_bps: Option<u32>) {
-        let open = if applied_bps > 0 {
-            applied_bps
-        } else {
-            open_at_bps.unwrap_or(0)
-        };
         self.on_frame_with(
             Instant::now(),
-            u64::from(open),
+            opening(applied_bps, open_at_bps),
             || pc.sctp().delivery_clock(),
             || pc.sctp().gauges(),
         );
@@ -1289,6 +1420,18 @@ impl Shadow {
         clock: impl FnOnce() -> Option<DeliveryClock>,
         gauges: impl FnOnce() -> Option<GaugeReader>,
     ) {
+        let _ = self.read(now, open_bps, clock, gauges);
+    }
+
+    /// [`Self::on_frame_with`]'s read and step, with the step's verdict:
+    /// `None` when there was no clock or no gauges to read.
+    fn read(
+        &mut self,
+        now: Instant,
+        open_bps: u64,
+        clock: impl FnOnce() -> Option<DeliveryClock>,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
+    ) -> Option<Verdict> {
         if let Some(fresh) = clock() {
             if !self.clock.as_ref().is_some_and(|c| c.same(&fresh)) {
                 self.budget.on_new_association();
@@ -1300,22 +1443,136 @@ impl Shadow {
             }
         }
         let (Some(clock), Some(gauges)) = (self.clock.as_ref(), self.gauges.as_ref()) else {
-            return;
+            return None;
         };
         let (acked, peeked) = (clock.read().acked_bytes, gauges.peek());
-        self.on_reading(now, acked, peeked, open_bps);
+        Some(self.step(now, acked, peeked, open_bps))
     }
 
     /// One frame's reading, read. The verdict is counted, and goes nowhere
     /// else.
     pub fn on_reading(&mut self, now: Instant, acked_bytes: u64, gauges: Gauges, open_bps: u64) {
+        let _ = self.step(now, acked_bytes, gauges, open_bps);
+    }
+
+    fn step(&mut self, now: Instant, acked_bytes: u64, gauges: Gauges, open_bps: u64) -> Verdict {
         let reading = Reading {
             acked_bytes,
             gauges,
             pump_bytes: self.pump.now(),
             open_bps,
         };
-        let _ = self.budget.step(now, &reading);
+        self.budget.step(now, &reading)
+    }
+
+    /// FR-148 D46 B3 — the pump's call before its capacity gate decides, with
+    /// today's byte gate for the pass (`false` on VP9-444). Under `on`, on a
+    /// constrained session, it reads the association and steps the core here,
+    /// before the gate, and the [`Pass`] it answers acts on the gate.
+    /// Otherwise it reads nothing, the pass is today's, and the step stays
+    /// [`Self::on_frame`]'s, after the gate, as in shadow.
+    pub fn gate(
+        &mut self,
+        pc: &RTCPeerConnection,
+        applied_bps: u32,
+        open_at_bps: Option<u32>,
+        constrained: bool,
+        byte_gate: bool,
+    ) -> Pass {
+        if !self.acts_on(constrained) {
+            return Pass::today(byte_gate);
+        }
+        self.gate_with(
+            Instant::now(),
+            opening(applied_bps, open_at_bps),
+            || pc.sctp().delivery_clock(),
+            || pc.sctp().gauges(),
+            constrained,
+            byte_gate,
+        )
+    }
+
+    /// [`Self::gate`] at `now`, with the clock and the gauges asked for as
+    /// [`Self::on_frame_with`] asks for them.
+    pub fn gate_with(
+        &mut self,
+        now: Instant,
+        open_bps: u64,
+        clock: impl FnOnce() -> Option<DeliveryClock>,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
+        constrained: bool,
+        byte_gate: bool,
+    ) -> Pass {
+        if !self.acts_on(constrained) {
+            return Pass::today(byte_gate);
+        }
+        let verdict = self.read(now, open_bps, clock, gauges);
+        self.acting(verdict, byte_gate)
+    }
+
+    /// [`Self::gate`] on one frame's reading, as [`Self::on_reading`] reads
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn gate_reading(
+        &mut self,
+        now: Instant,
+        acked_bytes: u64,
+        gauges: Gauges,
+        open_bps: u64,
+        constrained: bool,
+        byte_gate: bool,
+    ) -> Pass {
+        if !self.acts_on(constrained) {
+            return Pass::today(byte_gate);
+        }
+        let verdict = self.step(now, acked_bytes, gauges, open_bps);
+        self.acting(Some(verdict), byte_gate)
+    }
+
+    /// The budget acts on the gate: `on`, on a constrained session.
+    fn acts_on(&self, constrained: bool) -> bool {
+        self.on && constrained
+    }
+
+    /// The pass the budget acts on, from its step's verdict (`None`: nothing
+    /// was read, so nothing holds). The byte gate is counted as today's
+    /// ledger bound's firing, though it shuts nothing now.
+    fn acting(&mut self, verdict: Option<Verdict>, byte_gate: bool) -> Pass {
+        if byte_gate {
+            self.budget.note_bound(Bound::Ledger);
+        }
+        if verdict.is_some() {
+            self.budget.note_asked();
+        }
+        let holds = verdict.is_some_and(Verdict::holds);
+        Pass {
+            acts: true,
+            holds,
+            stalled: holds && self.budget.stalled(),
+            byte_gate,
+            alone: false,
+        }
+    }
+
+    /// FR-148 D46 B3 — the capacity gate's last term for `pass`
+    /// ([`Pass::shuts`]): a hold that shut the pass by itself is counted on
+    /// the line, apart from the send channel's skips.
+    pub fn shut(&mut self, pass: &mut Pass) -> bool {
+        let shut = pass.shuts();
+        if pass.held() {
+            self.budget.note_acted_hold(pass.stalled());
+        }
+        shut
+    }
+
+    /// FR-148 D46 B3 — the VP9-444 watermark arm for `pass`
+    /// ([`Pass::sheds`]): while the budget acts, a frame over the mark is
+    /// counted as the watermark's firing, and nothing is shed.
+    pub fn shed(&mut self, pass: &Pass, over: bool) -> bool {
+        if pass.acts() && over {
+            self.budget.note_bound(Bound::Watermark);
+        }
+        pass.sheds(over)
     }
 
     /// The pumps' 5 s re-read of the selected candidate pair: a new pair
@@ -1813,10 +2070,10 @@ mod tests {
         }
         assert!(Mode::On.computes() && Mode::Shadow.computes() && !Mode::Off.computes());
         assert!(Shadow::for_pump(Mode::Off, true).is_none());
-        assert!(Shadow::for_pump(Mode::Shadow, true).is_some());
+        assert!(Shadow::for_pump(Mode::Shadow, true).is_some_and(|s| !s.is_on()));
         assert!(
-            Shadow::for_pump(Mode::On, true).is_some(),
-            "on runs as shadow in B1"
+            Shadow::for_pump(Mode::On, true).is_some_and(|s| s.is_on()),
+            "on acts on relay sessions from B3"
         );
         assert!(
             Shadow::for_pump(Mode::Shadow, false).is_none(),
@@ -2285,5 +2542,215 @@ mod tests {
         assert_eq!(kept.rate_bps(), Some(1_000_000));
         assert!(kept.over(at(t0, 2_000), at(t0, 4_950), 0).opening);
         assert!(!kept.over(at(t0, 4_000), at(t0, 4_950), 0).opening);
+    }
+
+    /// FR-148 D46 B3 — the budget `on`, as a pump reads the switch, on the
+    /// core `b`.
+    fn on_with(b: Budget) -> Shadow {
+        let mut s = Shadow::for_pump(Mode::On, true).expect("on computes");
+        s.budget = b;
+        s
+    }
+
+    /// The pass the budget `on` answers on a relay session for `r` at `t` ms,
+    /// beside the verdict its core gives for it.
+    fn relay_pass(
+        s: &mut Shadow,
+        t0: Instant,
+        t: u64,
+        r: &Reading,
+        byte_gate: bool,
+    ) -> (Verdict, Pass) {
+        let verdict = s.budget.clone().step(at(t0, t), r);
+        let pass = s.gate_reading(
+            at(t0, t),
+            r.acked_bytes,
+            r.gauges,
+            r.open_bps,
+            true,
+            byte_gate,
+        );
+        (verdict, pass)
+    }
+
+    /// FR-148 D46 B3 — under `on`, on a relay session, only a hold shuts the
+    /// pass: nothing out, under the budget, SCTP's window binding, and a still
+    /// span written through each admit it, whatever the byte gate says. None
+    /// of them is a stall's, and the watermark sheds nothing.
+    #[test]
+    fn under_on_every_verdict_but_hold_admits_a_relay_pass() {
+        // 2 Mbit/s with a least of 50 ms: a budget of 50 000 bytes.
+        let (b, t0) = at_2_mbps_50_ms();
+        let at_50 = |g: Gauges| read(0, delayed(g, 50, 50), 2_000_000);
+        let cases = [
+            ("nothing out", Verdict::NothingOut, at_50(wide(0, 0))),
+            (
+                "under the budget",
+                Verdict::Admit,
+                at_50(wide(40_000, 9_999)),
+            ),
+            (
+                "SCTP's window binds",
+                Verdict::WindowBinds,
+                at_50(g(48_000, 64 << 20, 60_000, 0)),
+            ),
+            ("at the budget", Verdict::Hold, at_50(wide(40_000, 10_000))),
+        ];
+        for (what, want, r) in cases {
+            for byte_gate in [false, true] {
+                let mut s = on_with(b.clone());
+                let (verdict, mut pass) = relay_pass(&mut s, t0, 10, &r, byte_gate);
+                assert_eq!(verdict, want, "{what}");
+                assert!(pass.acts(), "{what}");
+                assert_eq!(
+                    pass.shuts(),
+                    verdict.holds(),
+                    "{what}, byte gate {byte_gate}"
+                );
+                assert!(pass.decreases(false), "{what}: no still span");
+                assert!(!pass.sheds(true), "{what}");
+            }
+        }
+        // Written through a still span after a head-of-line release.
+        let (mut b, t0, acked) = released(true);
+        stand(&mut b, t0, 6_000, 6_250, acked, 1);
+        let mut look = b.clone();
+        look.step(at(t0, 6_300), &read(acked, wide(1, 0), 1_500_000));
+        let over = read(acked, wide(look.last_budget() + 1, 0), 1_500_000);
+        let mut s = on_with(b);
+        let (verdict, mut pass) = relay_pass(&mut s, t0, 6_300, &over, true);
+        assert_eq!(verdict, Verdict::WritesThrough);
+        assert!(s.budget().stalled(), "in a still span");
+        assert!(!pass.shuts(), "written through");
+        assert!(!pass.stalled() && pass.decreases(false));
+    }
+
+    /// FR-148 D46 B3 — the no-decrease rule. A hold while the clock has stood
+    /// still for the least and S with bytes out is a stall of the carrier: it
+    /// shuts the pass and calls no AIMD decrease. A hold before that
+    /// decreases, and so does a pass the send channel or a follower shut while
+    /// the budget held, since the hold did not shut it. Inside FR-35's opener
+    /// grace nothing decreases, as today. The line counts the holds that
+    /// acted, and the stalled ones among them.
+    #[test]
+    fn under_on_a_hold_in_a_still_span_calls_no_decrease() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        let _ = b.take_window();
+        let mut s = on_with(b);
+        // The first still span holds: 2 Mbit/s × (S + S) = 75 000 bytes, and
+        // 100 000 out from 2 s. With no SACK's delay the least and S are 300 ms.
+        let r = read(acked, wide(100_000, 0), 1_500_000);
+        for t in (2_000..=2_800).step_by(50) {
+            let mut pass =
+                s.gate_reading(at(t0, t), r.acked_bytes, r.gauges, r.open_bps, true, false);
+            let still = t >= 2_300;
+            assert!(s.shut(&mut pass), "at {t} ms");
+            assert_eq!(pass.stalled(), still, "at {t} ms");
+            assert_eq!(pass.decreases(false), !still, "at {t} ms");
+            assert!(
+                !pass.decreases(true),
+                "inside the opener's grace, at {t} ms"
+            );
+        }
+        // A pass shut before the budget's term was asked: its skip decreases.
+        let pass = s.gate_reading(
+            at(t0, 2_850),
+            r.acked_bytes,
+            r.gauges,
+            r.open_bps,
+            true,
+            false,
+        );
+        assert!(s.budget().stalled());
+        assert!(!pass.held() && !pass.stalled() && pass.decreases(false));
+        let w = s.take_window();
+        assert_eq!(w.held, (18, 18));
+        assert_eq!((w.acted, w.acted_stalled), ((17, 18), 11));
+    }
+
+    /// FR-148 D46 B3 — the budget acts only under `on`, on a constrained
+    /// session. A direct session under `on`, and any session in shadow, gets
+    /// today's pass: the gate reads and steps nothing (the step stays after
+    /// the gate, as in shadow), the byte gate shuts it, the watermark sheds,
+    /// and its skips decrease outside the grace.
+    #[test]
+    fn the_budget_acts_only_under_on_on_a_constrained_session() {
+        let t0 = Instant::now();
+        // A megabyte out: the budget holds.
+        let deep = read(0, delayed(wide(1 << 20, 1), 50, 50), 2_000_000);
+        for mode in [Mode::Shadow, Mode::On] {
+            for (constrained, byte_gate) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let mut s = Shadow::for_pump(mode, true).unwrap();
+                let mut pass = s.gate_reading(
+                    t0,
+                    deep.acked_bytes,
+                    deep.gauges,
+                    deep.open_bps,
+                    constrained,
+                    byte_gate,
+                );
+                let acts = mode == Mode::On && constrained;
+                let what = format!("{mode:?}, constrained {constrained}, byte gate {byte_gate}");
+                assert_eq!(pass.acts(), acts, "{what}");
+                assert_eq!(pass.shuts(), acts || byte_gate, "{what}");
+                assert_eq!(pass.sheds(true), !acts, "{what}");
+                assert!(pass.decreases(false) && !pass.decreases(true), "{what}");
+                let w = s.take_window();
+                assert_eq!(w.held, (u64::from(acts), u64::from(acts)), "{what}");
+                assert_eq!(w.acted, (0, u64::from(acts)), "{what}");
+                assert_eq!(w.bounds.1, u64::from(acts && byte_gate), "{what}");
+            }
+        }
+    }
+
+    /// FR-148 D46 B3 — under `on`, on a relay session, today's two bounds act
+    /// on nothing and are still counted where they fire: the byte gate at the
+    /// gate, the watermark at its arm. The line counts the holds that shut a
+    /// pass by themselves, apart from a pass the send channel shut first. In
+    /// shadow the bounds are the pump's own calls to count
+    /// (`DeliverySampler::note_gate`, `note_watermark`), and these count
+    /// nothing.
+    #[test]
+    fn under_on_the_byte_gate_and_the_watermark_fire_and_act_on_nothing() {
+        let t0 = Instant::now();
+        let nothing = read(0, delayed(wide(0, 0), 50, 50), 2_000_000);
+        let deep = read(0, delayed(wide(1 << 20, 1), 50, 50), 2_000_000);
+        let mut s = Shadow::for_pump(Mode::On, true).unwrap();
+        // Nothing out and the byte gate shut: the pass goes, and a frame over
+        // the watermark is not shed.
+        let mut pass = s.gate_reading(t0, 0, nothing.gauges, 2_000_000, true, true);
+        assert!(!s.shut(&mut pass));
+        assert!(!s.shed(&pass, true));
+        assert!(!s.shed(&pass, false));
+        // A megabyte out and the byte gate open: the hold shuts the pass.
+        let mut pass = s.gate_reading(at(t0, 10), 0, deep.gauges, 2_000_000, true, false);
+        assert!(s.shut(&mut pass) && pass.held());
+        // Again, but the send channel was full: the budget's term is not
+        // asked, and its hold acted on nothing.
+        let _ = s.gate_reading(at(t0, 20), 0, deep.gauges, 2_000_000, true, true);
+        let w = s.take_window();
+        assert_eq!(w.held, (2, 3), "the core's verdicts");
+        assert_eq!((w.acted, w.acted_stalled), ((1, 3), 0));
+        assert_eq!(
+            w.bounds,
+            (1, 2, 0),
+            "one watermark firing, two of the byte gate"
+        );
+        // In shadow: today's pass, and nothing counted here.
+        let mut s = Shadow::for_pump(Mode::Shadow, true).unwrap();
+        let mut pass = s.gate_reading(t0, 0, deep.gauges, 2_000_000, true, true);
+        assert!(s.shut(&mut pass) && !pass.held());
+        assert!(s.shed(&pass, true));
+        assert_eq!(
+            s.take_window(),
+            WindowReport {
+                slack_ms: 150,
+                ..WindowReport::default()
+            }
+        );
     }
 }
