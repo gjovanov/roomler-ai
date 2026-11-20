@@ -352,7 +352,7 @@ Three links had to break, one in each place that owned it:
 | Where | Change | Anchor |
 |---|---|---|
 | `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
-| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:551`, `:291`, `queue/pending_queue.rs:237` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:568`, `:308`, `queue/pending_queue.rs:237` |
 | `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:270`, `queue/pending_queue.rs:230` |
 
 #1856's comment expected a transport that is really gone to fail the association's `recv`.
@@ -394,10 +394,10 @@ runtime of its own, what the receiver gets):
 
 | Test | Holds | Before the fix |
 |---|---|---|
-| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:353`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
-| `a_healthy_close_still_takes_milliseconds` (`:421`) | the same close with the path alive | passes, 1 ms here |
-| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:462`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
-| `many_writers_share_one_ordered_channel` (`:578`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:358`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:426`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:522`) | the caller polls `peer_close::close` once and drops it while the close is held at its first step, then lets the close go on; nothing is left | an inline close cut the same way leaves 14 tasks alive, in 10 runs of 10 |
+| `many_writers_share_one_ordered_channel` (`:652`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
 
 The stand-in viewer runs on a runtime of its own (`on_viewer`, `:95`), so the agent's runtime
 counts the agent's tasks alone. The viewer's peer, the one that offers, now and then keeps two
@@ -405,6 +405,80 @@ tasks alive after its close: in 6 runs of 60 with the agent closing first, and 3
 viewer first. On a runtime both peers shared, the healthy-close test read them as the agent's
 and failed (`3 tasks alive after both closes, 1 before the peers`). The agent's runtime never
 kept a task past its baseline in those 90 runs.
+
+**A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
+channel the browser opens on a task of its own (`accept_data_channels`,
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:246`), and the loop's body awaits the agent's
+`on_data_channel` handler (`:335`), which awaits in turn (`agents/roomlerd/src/peer.rs:1260`).
+Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
+instant and stores nothing, and the loop made its next wait after the body. So a stop that came
+while the task was in its body was lost: the task waited for good, holding the association, the
+DTLS conn under it and that conn's outgoing loop, two tasks over the baseline. Under load that
+was 2 runs in 2,958 and 2 in 5,652 of a test that closes as its channel opens. By reading, the
+conn also holds the ICE conn, and with it the session's UDP sockets, as a peer that was never
+closed does. The stop is now a `watch` value that `stop` sets first and keeps
+(`sctp_transport/mod.rs:231`). The loop and `start` read it before they wait (`stopped`,
+`:107`), so a stop from any moment before is seen. `start` reads it again under the
+association's slot lock (`:189`), so an association whose handshake ended as the stop came is
+closed instead of stored. With the fix, none of 12,000 runs of that test, six at once on two
+CPUs, left a task.
+
+| Test | Holds | Before the fix |
+|---|---|---|
+| `a_close_while_a_channel_is_being_accepted_leaves_nothing` (`peer_close_tests.rs:777`) | the viewer opens a second channel, and the agent's handler for it waits at a gate (`AcceptGate`, `:733`) while the agent's close (`peer_close::close`) runs to its end; then the gate opens, and nothing is left | `3 tasks alive after both closes, 1 before the peers`, in 12 runs of 12 |
+
+**The same loss one layer down (#4116).** Every data-channel read ends in the SCTP stream's
+`read_sctp` (`crates/vendored/webrtc-sctp/src/stream/mod.rs:186`). A stream is shut down two
+ways: by its own `shutdown`, which a channel's close runs (`:428`), and by the association's
+`unregister_stream`, which its close runs for every stream
+(`src/association/association_internal.rs:364`). Each sets `read_shutdown` and then wakes
+the reads of that instant with one `notify_waiters()`, and only the first one wakes anything.
+Upstream's read checked the flag and the queue, and made its wait only once it had found
+nothing to read. So a shutdown that landed between the check and the wait was lost. The read
+waited for good, and the channel's read loop with it, holding the channel, its stream and the
+handlers the agent set on it (`crates/vendored/webrtc/src/data_channel/mod.rs:310-317`).
+This is the second site of the class, after the accept loop above. The read now makes its
+wait and registers it (`Notified::enable`, `stream/mod.rs:202-203`) before it checks
+anything: a shutdown after that wakes it, and the check sees one from before. A chunk still wakes a read with
+`notify_one()`, which stores a permit when no read waits. One that reaches a read that then
+finds data anyway is not lost either: as the read's unused wait drops, tokio hands the wake-up
+to the next waiter, or stores it as the permit (tokio 1.52.3, `src/sync/notify.rs:1365-1375`).
+
+The channel's read loop has the accept loop's shape too: `close()` wakes it with one
+`notify_waiters()` (`data_channel/mod.rs:451`), and the loop makes its next wait only after
+the agent's message handler has run (`:366-373`), so a close during the handler is lost to
+it. It is left as it is, because that wake is no longer its only stop. The same `close()`
+then shuts the channel's stream (`:455`), which sets `read_shutdown` before its first await
+(`stream/mod.rs:438`). The loop ends through its end-of-stream arm
+(`data_channel/mod.rs:326`), since the flag stays set and the read now sees it whenever it
+was set. That arm also runs the channel's `on_close` handler, as it did whenever the read
+ended the loop. A close that comes before the channel is stored shuts nothing: the accept
+loop lists the channel and calls the agent's handler before `handle_open`
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:333-343`). The association's close,
+which the peer's close always reaches, then sets the flag on every stream, and ends that
+loop the same way.
+
+| Test (`crates/vendored/webrtc-sctp/src/`) | Holds | Before the fix |
+|---|---|---|
+| `test_stream_a_read_sees_a_shutdown_between_its_check_and_its_wait` (`stream/stream_test.rs:676`) | on one thread, the test holds the stream's reassembly-queue lock, so a read stops there, past its check of the flag; the channel's close (`shutdown(Both)`) runs, the lock goes, and the read returns `(0, Unknown)` within 5 s | the read waited for good, in 10 runs of 10 |
+| `test_assoc_close_ends_a_read_between_its_check_and_its_wait` (`association/association_internal/association_internal_test.rs:1353`) | the same, with the association's close in place of the channel's | the read waited for good, in 10 runs of 10 |
+| `test_stream_a_chunk_that_races_a_read_still_wakes_it` (`stream/stream_test.rs:725`) | a chunk that races a read for the queue's lock is read, whichever takes the lock first, and a wake-up the read took but did not need is kept for the next wait | passes: it guards the data path the fix moved |
+
+With the fix each of the three passed 200 runs of 200, one at a time, and the fork's whole
+suite passed (155 tests). CI runs them with the rest in the `vendored-sctp` job.
+
+**Not covered:** two more wakes of this shape were read for #4116 and left as they are. The
+RTP sender's `stop()` sets its flag and wakes with one `notify_waiters()`
+(`crates/vendored/webrtc/src/rtp_transceiver/rtp_sender/mod.rs:565-566`). Its RTCP `read`
+never reads the flag, and it makes its second wait after an await (`:593-611`), so a stop
+before the call, or between its two waits, is lost to that read. The agent's RTCP reader
+calls `read_rtcp`, which wraps it, in a loop (`agents/roomlerd/src/peer.rs:792`), but the
+agent's close aborts that task before it closes the peer (`stop_serving`, `:1952-1954`). Once
+the sender has sent, the read also ends when `stop()` closes the sender's SRTCP stream
+(`crates/vendored/webrtc/src/rtp_transceiver/srtp_writer_future.rs:164-179`). That close ends in webrtc-util's `Buffer::close`, which has
+the same shape: its read checks the flag, lets its lock go, and only then makes its wait
+(webrtc-util 0.10.0, `src/buffer/mod.rs:250-261`). A read that misses both ends at the
+agent's abort.
 
 **How the dead-path test reads the wire.** The vnet router counts a packet on a task of its own,
 after the send that queued it has returned. On a loaded CI runner that task started late, and
@@ -421,6 +495,19 @@ a probe:
 
 The task count is asserted before the wire. When packets went out, it says whether the close
 left something running (a leak) or a last send landed late.
+
+**How the caller-stopped test holds its close.** A close that has already ended when its caller
+stops waiting proves nothing, and the test's own guard says so. Before #4086 the test took that
+precondition from one poll: `peer_close::close` spawns `pc.close()`, and the runtime's other
+worker could run the whole close before the poll, about one CI run in 100. Now the agent's peer
+has one test interceptor ahead of the session's (`CloseGate`, `:466`), whose close waits until
+the test opens the gate. `RTCPeerConnection::close` closes its interceptors before it stops
+anything else (`crates/vendored/webrtc/src/peer_connection/mod.rs:1950`). So a close held at the
+gate has stopped nothing yet, its first poll is Pending on any scheduler, and the test opens the
+gate only after it has dropped the close. Exactly two tasks over the baseline at the end was
+another failure, #4103's: a closed peer could keep two of its tasks for good, with the gate or
+without it, about one run in 1,500 under load. The fix for #4103 above ended it, so two over is
+now a regression of that fix. The test does not tolerate it, and its message names it.
 
 The reset's order has a unit test of its own, on one thread:
 `test_stream_reset_waits_for_a_write_turn`
@@ -450,7 +537,7 @@ by reading the code. A lab guest then showed it on 0.4.221 and not on 0.4.222
 the crate.
 
 Every data-channel send ends in `Stream::write_sctp`
-(`crates/vendored/webrtc-sctp/src/stream/mod.rs:291`), which can wait twice before its
+(`crates/vendored/webrtc-sctp/src/stream/mod.rs:308`), which can wait twice before its
 chunks are queued: for the pending queue's lock, and for room in the queue (128 KiB, shared
 by every stream of the association). Upstream spent the write's stream sequence number (SSN)
 and added its bytes to `buffered_amount` in `packetize`, **before** those waits. A caller that
@@ -486,7 +573,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6185`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6187`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -501,12 +588,12 @@ the fix is there and no caller changed:
 
 | Where | Change | Anchor |
 |---|---|---|
-| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:362`, `:384`, `:523` |
+| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:379`, `:401`, `:540` |
 | `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:304`, `:327` |
 | `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:595`, `:603`, `:536` |
 | `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:339` |
 
-**What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:276`):
+**What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:293`):
 
 - dropped at any await before its first chunk is queued, a write leaves no trace: the SSN and
   `buffered_amount` are as if it had never been called, nothing of it is sent, and the next
@@ -517,10 +604,10 @@ the fix is there and no caller changed:
 
 ⚠️ **The product reaches only the first two.** The agent's associations keep the default
 maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
-(`crates/vendored/webrtc/src/sctp_transport/mod.rs:162`), which means the default
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:177`), which means the default
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
 `association/mod.rs:65`), and `prepare_write` refuses a larger write before it waits
-(`stream/mod.rs:317`). So every agent and tunnel send is below the large threshold and is all
+(`stream/mod.rs:334`). So every agent and tunnel send is below the large threshold and is all
 or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
 once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
 same. The begun-message path and its overdraft are reached only by the tests. The drop records
@@ -586,7 +673,7 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10700`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10701`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5819`), and no such word could arrive. So it asked
@@ -598,9 +685,9 @@ never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4246`, `:5197`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2466` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11329`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
-| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1507`, `:6185`, `agents/roomlerd/src/lock_state.rs:333` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first (on a relayed session under `ROOMLERD_INFLIGHT_BUDGET=on`, at the in-flight budget instead, and the mark sheds nothing: [rate-control.md](rate-control.md#the-budget-acts-under-on-d46-b3)) and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4246`, `:5199`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2466` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11330`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1507`, `:6187`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
 0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every

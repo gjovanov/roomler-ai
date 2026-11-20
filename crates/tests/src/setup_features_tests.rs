@@ -26,7 +26,8 @@ async fn get_anon(app: &TestApp) -> reqwest::Response {
 
 /// The shipped defaults: pairing ON (A1, the server's fact), every claim
 /// about the released wizard OFF (the wizard that installs the daemon off
-/// Windows, or pairs, has not shipped). Exactly these five keys, all
+/// Windows, or pairs, has not shipped), and the one-row guard ON (FR-141
+/// P3), the one switch that is not a claim. Exactly these six keys, all
 /// booleans — a consumer never has to default a missing one.
 #[tokio::test]
 async fn the_default_shape_is_pairing_on_and_the_wizard_claims_off() {
@@ -52,6 +53,7 @@ async fn the_default_shape_is_pairing_on_and_the_wizard_claims_off() {
             "wizard_macos_daemon": false,
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
         })
     );
 }
@@ -76,6 +78,7 @@ async fn each_flag_follows_its_setting() {
             "wizard_macos_daemon": true,
             "wizard_unix_daemon": true,
             "wizard_pairing": true,
+            "wizard_reinstall_guard": true,
         })
     );
 
@@ -109,6 +112,7 @@ async fn each_flag_follows_its_setting() {
             "wizard_macos_daemon": false,
             "wizard_unix_daemon": false,
             "wizard_pairing": true,
+            "wizard_reinstall_guard": true,
         })
     );
 }
@@ -130,6 +134,7 @@ async fn linux_alone_hides_the_cards_from_wizards_released_before_the_split() {
             "wizard_macos_daemon": false,
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
         })
     );
 
@@ -144,6 +149,7 @@ async fn linux_alone_hides_the_cards_from_wizards_released_before_the_split() {
             "wizard_macos_daemon": true,
             "wizard_unix_daemon": false,
             "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
         })
     );
 }
@@ -166,6 +172,7 @@ async fn both_oses_on_turn_every_daemon_key_on() {
             "wizard_macos_daemon": true,
             "wizard_unix_daemon": true,
             "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
         })
     );
 }
@@ -186,12 +193,32 @@ async fn the_legacy_key_turns_both_oses_on() {
             "wizard_macos_daemon": true,
             "wizard_unix_daemon": true,
             "wizard_pairing": false,
+            "wizard_reinstall_guard": true,
         })
     );
 }
 
 /// A signed-in person gets the same answer as nobody: the switches are
 /// server-wide, not a capability of the caller.
+/// FR-141 P3 — the one-row guard's kill switch follows its setting, and
+/// turning it off turns nothing else on or off.
+#[tokio::test]
+async fn the_reinstall_guard_follows_its_setting() {
+    let app = TestApp::spawn_with_settings(|s| s.setup.wizard_reinstall_guard = false).await;
+    let body: Value = get_anon(&app).await.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "pairing": true,
+            "wizard_linux_daemon": false,
+            "wizard_macos_daemon": false,
+            "wizard_unix_daemon": false,
+            "wizard_pairing": false,
+            "wizard_reinstall_guard": false,
+        })
+    );
+}
+
 #[tokio::test]
 async fn a_member_reads_the_same_switches_as_a_guest() {
     let app = TestApp::spawn_with_settings(|s| s.setup.wizard_unix_daemon = true).await;

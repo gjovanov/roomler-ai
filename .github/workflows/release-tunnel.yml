@@ -162,8 +162,8 @@ jobs:
         # The CLI links libssl.so.3. Named here so the build does not depend on
         # what this runner image happens to carry.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libssl-dev pkg-config
+          # Probe, failover, bounded refresh and install, this step's options (#3710).
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh install --refresh-bound 300 --download-bound 600 -y -qq --no-install-recommends -- libssl-dev pkg-config
       - name: Build roomler-tunnel (release)
         run: cargo build -p roomler-cli --release
       - name: Strip binary
@@ -331,7 +331,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: debs
       - name: Install it on bare images and start it
-        run: bash scripts/deb-bare-check.sh debs/*.deb
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns debs/*.deb
 
   # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball

@@ -376,7 +376,7 @@ async fn tunnel_client_update_renames_and_labels() {
         )
         .json(&json!({
             "name": "roadwarrior",
-            "display_name": "Goran's laptop",
+            "display_name": "Casey's laptop",
             "tags": ["laptop"],
         }))
         .send()
@@ -389,7 +389,7 @@ async fn tunnel_client_update_renames_and_labels() {
     assert_eq!(resp["client"]["name"].as_str(), Some("roadwarrior"));
     assert_eq!(
         resp["client"]["display_name"].as_str(),
-        Some("Goran's laptop")
+        Some("Casey's laptop")
     );
     assert_eq!(resp["client"]["tags"][0].as_str(), Some("laptop"));
 

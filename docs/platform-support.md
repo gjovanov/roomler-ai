@@ -128,7 +128,7 @@ flow, and the consent chain's fallbacks.
 | Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support |
 | Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:211`, `:228`, `:257`) |
 | Exit node, serving IPv6 | ⛔ v6 fail-closed | ✅ ip6tables | ✅ pf NAT66 to a stable address, where an unscoped v6 default exists | `crates/tunnel-core/src/overlay/nat.rs:451-453`; §8 |
-| MagicDNS: names resolve on the host | ✅ NRPT | 🟡 through systemd-resolved; a resolver that nothing asks is reported `steered but BYPASSED` | ✅ an SCDynamicStore resolver per utun | `crates/tunnel-core/src/overlay/dns.rs:485-486`, `:510-511`, `:536-537`; the bypass at `:439`; `docs/magicdns.md` |
+| MagicDNS: names resolve on the host | ✅ NRPT | 🟡 through systemd-resolved; a resolver that nothing asks is reported `steered but BYPASSED` | ✅ an SCDynamicStore resolver per utun | `crates/tunnel-core/src/overlay/dns.rs:514-515`, `:539-540`, `:565-566`; the bypass at `:468`; `docs/magicdns.md` |
 | Exit node: DNS goes through the exit | ✅ | 🟡 systemd-resolved only, else `DNS NOT steered` | ✅ | the same steer, with a catch-all domain |
 | The host firewall admits the mesh | ✅ the daemon's Defender rule, and WFP | 🟡 firewalld and ufw left to the owner, and reported | ❌ the Application Firewall is left alone | carriers pass a host firewall by conntrack; only services on the overlay address need an allow (D13, `crates/tunnel-core/src/overlay/hostfw.rs:3-8`) |
 | LAN-direct egress pin; repair of the LAN's own route | ✅ | ❌ | ❌ | out of scope until a field case asks for it (FR-97 §7); `crates/tunnel-core/src/overlay/lan_repair.rs:3-7` |
@@ -147,7 +147,7 @@ and never outliving the daemon (FR-97 P0e).
 | `exec` and SSH `daemon` mode | 🟡 SYSTEM on a SystemContext install, or once anchored (FR-94); the signed-in person on an attended one | ✅ root | ✅ root on the root half's row | `docs/fleet-rpc.md`, Who runs the command |
 | `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:900-912`); Windows: `docs/roomler-ssh.md` |
 | `named:<account>` | ⛔ | ✅ | ✅ | §8 |
-| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1229-1233` |
+| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1231-1235` |
 | A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:893` |
 
 ## 6. The desktop: companion, power, files

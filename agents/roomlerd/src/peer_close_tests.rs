@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, watch};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -213,10 +213,15 @@ async fn wan(wire: &Arc<Wire>, lag: Duration) -> (Arc<Net>, Arc<Net>, Arc<Net>) 
 /// A peer with the interceptors a session has (NACK, reports, TWCC), so their
 /// close is part of what is timed.
 async fn peer(net: Arc<Net>) -> Arc<RTCPeerConnection> {
+    peer_with(net, Registry::new()).await
+}
+
+/// [`peer`], with the test's own interceptors (`registry`) ahead of the
+/// session's: the peer's close closes them first.
+async fn peer_with(net: Arc<Net>, registry: Registry) -> Arc<RTCPeerConnection> {
     let mut engine = MediaEngine::default();
     engine.register_default_codecs().expect("codecs");
-    let registry =
-        register_default_interceptors(Registry::new(), &mut engine).expect("interceptors");
+    let registry = register_default_interceptors(registry, &mut engine).expect("interceptors");
     let mut setting = SettingEngine::default();
     setting.set_vnet(Some(net));
     let api = APIBuilder::new()
@@ -453,11 +458,66 @@ fn a_healthy_close_still_takes_milliseconds() {
     });
 }
 
+/// Holds a peer's close at its first step until the test opens it. The gate
+/// is the first of the peer's interceptors ([`CloseGate::registry`]), and
+/// `RTCPeerConnection::close` closes them before it stops anything else. So
+/// a close held here has stopped nothing yet, and it cannot end before
+/// [`CloseGate::open`], whichever worker runs it and whenever (#4086).
+struct CloseGate {
+    /// Told when the close reaches the gate.
+    reached: Notify,
+    /// `true` once the test lets the close go on.
+    opened: watch::Sender<bool>,
+}
+
+impl CloseGate {
+    fn new() -> Arc<Self> {
+        Arc::new(CloseGate {
+            reached: Notify::new(),
+            opened: watch::Sender::new(false),
+        })
+    }
+
+    /// The test's interceptors for [`peer_with`]: one, which passes every
+    /// stream and report through, and waits at this gate in its close.
+    fn registry(self: &Arc<Self>) -> Registry {
+        use webrtc::interceptor::mock::mock_builder::MockBuilder;
+        use webrtc::interceptor::mock::mock_interceptor::MockInterceptor;
+
+        let gate = Arc::clone(self);
+        let mut registry = Registry::new();
+        registry.add(Box::new(MockBuilder::new(move |_| {
+            let gate = Arc::clone(&gate);
+            Ok(Arc::new(MockInterceptor {
+                close_fn: Some(Box::new(move || {
+                    let gate = Arc::clone(&gate);
+                    Box::pin(async move {
+                        gate.reached.notify_one();
+                        let mut opened = gate.opened.subscribe();
+                        let _ = opened.wait_for(|open| *open).await;
+                        Ok(())
+                    })
+                })),
+                ..Default::default()
+            }))
+        })));
+        registry
+    }
+
+    /// Lets the held close go on.
+    fn open(&self) {
+        self.opened.send_replace(true);
+    }
+}
+
 /// The safety net under every stall a root-cause fix has not met yet: a close
 /// whose caller stops waiting (the agent's budget) goes on to the end on a
-/// task of its own. Here the caller polls the close once and drops it, which
-/// cuts an inline `RTCPeerConnection::close` at its first wait (the
-/// interceptors' loops ending): checked against that, this test fails.
+/// task of its own. Here the caller polls the close once and drops it while
+/// a [`CloseGate`] holds the close at its first step, and the gate then lets
+/// it go. An inline `RTCPeerConnection::close` is cut there, before it has
+/// stopped anything: checked against that, this test fails. Without the gate
+/// the runtime's other worker could run the whole close before that one poll
+/// (#4086).
 #[test]
 fn a_close_its_caller_stopped_waiting_for_still_finishes() {
     let viewer_rt = runtime();
@@ -466,7 +526,8 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
         let (agent_net, viewer_net, _) = wan(&wire, Duration::ZERO).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
-        let agent = peer(agent_net).await;
+        let gate = CloseGate::new();
+        let agent = peer_with(agent_net, gate.registry()).await;
         let (dc, _) = connect(viewer_rt.handle(), &viewer, &agent).await;
 
         let session = bson::oid::ObjectId::new();
@@ -478,15 +539,28 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
             !finished,
             "the close must still be running when its caller stops waiting, or this proves nothing"
         );
+        assert!(
+            tokio::time::timeout(SETTLE, gate.reached.notified())
+                .await
+                .is_ok(),
+            "the close never reached the gate that holds it, or this proves nothing"
+        );
+        // The caller stops waiting while the close is held, then the close
+        // goes on, or nothing does.
         drop(close);
+        gate.open();
 
         close_viewer(viewer_rt.handle(), viewer).await;
         drop((dc, agent));
         let left = settle_to(baseline).await;
+        // Strict on purpose: two over would be #4103 come back, an SCTP accept
+        // task that missed its stop and holds a closed session's sockets.
         assert!(
             left <= baseline,
             "{left} tasks alive after both closes, {baseline} before the peers: \
-             a close its caller stopped waiting for was cut short"
+             a close its caller stopped waiting for was cut short (an inline close \
+             cut this way leaves 14). Exactly 2 more than before the peers is \
+             #4103 come back, not a close cut short"
         );
     });
 }
@@ -649,4 +723,107 @@ fn many_writers_share_one_ordered_channel() {
                 &problems[..problems.len().min(6)]
             );
         });
+}
+
+/// Holds the agent's `on_data_channel` handler until the test opens it. The
+/// SCTP transport awaits that handler inside its accept loop's body
+/// (`accept_data_channels` in the vendored webrtc), as it awaits the agent's
+/// own (`peer.rs`), so a channel held here keeps the accept task in that body
+/// and away from the wait that ends it (#4103).
+struct AcceptGate {
+    /// Told when a channel's handler reaches the gate.
+    reached: tokio::sync::Notify,
+    /// `true` once the test lets the handler return.
+    opened: tokio::sync::watch::Sender<bool>,
+}
+
+impl AcceptGate {
+    fn new() -> Arc<Self> {
+        Arc::new(AcceptGate {
+            reached: tokio::sync::Notify::new(),
+            opened: tokio::sync::watch::Sender::new(false),
+        })
+    }
+
+    /// The agent's handler: every channel it is given waits at the gate.
+    fn handler(self: &Arc<Self>) -> webrtc::peer_connection::OnDataChannelHdlrFn {
+        let gate = Arc::clone(self);
+        Box::new(move |_: Arc<RTCDataChannel>| {
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                gate.reached.notify_one();
+                let mut opened = gate.opened.subscribe();
+                let _ = opened.wait_for(|open| *open).await;
+            })
+        })
+    }
+
+    /// Lets the held handler return.
+    fn open(&self) {
+        self.opened.send_replace(true);
+    }
+}
+
+/// #4103: the peer's close comes while its SCTP transport is still taking up
+/// a channel the viewer has just opened. The accept task is then in its loop
+/// body for that channel, awaiting the agent's `on_data_channel` handler, and
+/// upstream's stop woke it with one `notify_waiters()`, which wakes only the
+/// waiters of that instant and stores nothing. The loop's next wait was made
+/// after it, so the task waited for good, holding the association, the DTLS
+/// conn under it, and that conn's outgoing loop. Here an [`AcceptGate`] holds
+/// the handler, so the whole close, the SCTP stop included, runs while the
+/// task is in its body, on every run.
+#[test]
+fn a_close_while_a_channel_is_being_accepted_leaves_nothing() {
+    let viewer_rt = runtime();
+    runtime().block_on(async {
+        let wire = Arc::new(Wire::default());
+        let (agent_net, viewer_net, _) = wan(&wire, Duration::ZERO).await;
+        let baseline = alive();
+        let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
+        let agent = peer(agent_net).await;
+        let (dc, _) = connect(viewer_rt.handle(), &viewer, &agent).await;
+
+        // The viewer opens a second channel, as a browser opens its control
+        // and input channels after the video one, and the agent's handler
+        // for it waits at the gate.
+        let gate = AcceptGate::new();
+        agent.on_data_channel(gate.handler());
+        let viewer_opens = Arc::clone(&viewer);
+        let _ = on_viewer(viewer_rt.handle(), async move {
+            viewer_opens
+                .create_data_channel("control", None)
+                .await
+                .expect("the second data channel")
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(SETTLE, gate.reached.notified())
+                .await
+                .is_ok(),
+            "the agent never took up the second channel, or this proves nothing"
+        );
+
+        // The session ends while that channel is still being set up: the
+        // agent's close runs to its end while the accept task is held.
+        let session = bson::oid::ObjectId::new();
+        let closed =
+            tokio::time::timeout(SETTLE, close_peer_connection(Arc::clone(&agent), session)).await;
+        assert!(
+            closed.is_ok(),
+            "the agent's close never ended while one of its channels was being accepted"
+        );
+        gate.open();
+
+        close_viewer(viewer_rt.handle(), viewer).await;
+        drop((dc, agent));
+        let left = settle_to(baseline).await;
+        assert!(
+            left <= baseline,
+            "{left} tasks alive after both closes, {baseline} before the peers: the close \
+             came while the agent's SCTP transport was taking up a channel, and its accept \
+             task missed the stop. Two over is that task and the DTLS conn's outgoing loop, \
+             which the association the task holds keeps alive (#4103)"
+        );
+    });
 }

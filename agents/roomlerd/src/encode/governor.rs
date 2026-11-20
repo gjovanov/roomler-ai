@@ -38,7 +38,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::aimd::AimdController;
+use super::aimd::{AimdController, Cause, Causes, CeilingSource, Congestion, FloorSource};
 use super::encode_pressure::{DownscaleTier, EncodePressure};
 use super::goodput::{GoodputEstimator, GoodputSink};
 use super::pipe::{Basis, PathNumber, PathView};
@@ -46,7 +46,7 @@ use super::viewer_rate::{self, ViewerRateController};
 
 /// A bitrate target the pump must apply to the live encoder
 /// (`enc.set_bitrate(bps)`). Emitted at most once per underlying
-/// AIMD move (`take_pending` is change-gated).
+/// AIMD move (`take_move` is change-gated).
 ///
 /// ⚠ Surfaced side effect, not a surprise: on QSV/AMF encoders
 /// `set_bitrate` lands as a debounced encoder REBUILD whose first
@@ -58,6 +58,89 @@ pub struct AppliedBitrate {
     /// Whether this target differs from the previously-applied one —
     /// the change-gated log condition the pumps use.
     pub changed: bool,
+    /// FR-148 P0 — why the target moved since the last one handed out. A held
+    /// target (the FFmpeg pump's `deferred_bps`) keeps it until it lands.
+    pub why: Why,
+}
+
+/// FR-148 P0 — why the live target moved: the controller's causes since the
+/// last target it handed out, in the order they happened, and for an additive
+/// increase whether the sender was application-limited. Written as the causes
+/// joined by `+`: `decrease(full)`, `decrease(stall)+ceiling(plan)`,
+/// `increase(app-limited)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Why {
+    pub causes: Causes,
+    /// For an `increase` only: did the last viewer window write under half the
+    /// target it ran with (R3, [`pair_memory::pushing_against_plan`])? `None`
+    /// without an increase, or before the first window.
+    ///
+    /// [`pair_memory::pushing_against_plan`]: super::pair_memory::pushing_against_plan
+    pub app_limited: Option<bool>,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        for cause in self.causes.iter() {
+            f.write_str(sep)?;
+            sep = "+";
+            match (cause, self.app_limited) {
+                (Cause::Increase, Some(true)) => f.write_str("increase(app-limited)")?,
+                (Cause::Increase, Some(false)) => f.write_str("increase(loaded)")?,
+                (Cause::Increase, None) => f.write_str("increase(no-window)")?,
+                (other, _) => write!(f, "{other}")?,
+            }
+        }
+        match (sep, self.causes.more()) {
+            ("", _) => f.write_str("none"),
+            (_, true) => f.write_str("+more"),
+            (_, false) => Ok(()),
+        }
+    }
+}
+
+/// How many distinct [`Why`]s the tally keeps between two heartbeats. Past it,
+/// a move counts under `more`, so the tally stays bounded even where nothing
+/// drains it (the heartbeat line filtered out).
+const MOVES_KEPT: usize = 16;
+
+/// FR-148 P0 — the applied moves since the last heartbeat, counted by their
+/// [`Why`], in the order each first happened. Written `why:count` joined by
+/// `,` (`increase(app-limited):3,ceiling(plan):1`), or `none`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Moves {
+    kept: Vec<(Why, u32)>,
+    more: u32,
+}
+
+impl Moves {
+    fn note(&mut self, why: Why) {
+        if let Some((_, n)) = self.kept.iter_mut().find(|(w, _)| *w == why) {
+            *n = n.saturating_add(1);
+        } else if self.kept.len() < MOVES_KEPT {
+            self.kept.push((why, 1));
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+    }
+}
+
+impl std::fmt::Display for Moves {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kept.is_empty() && self.more == 0 {
+            return f.write_str("none");
+        }
+        let mut sep = "";
+        for (why, n) in &self.kept {
+            write!(f, "{sep}{why}:{n}")?;
+            sep = ",";
+        }
+        if self.more > 0 {
+            write!(f, "{sep}more:{}", self.more)?;
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of a viewer-rate window fold (once per second).
@@ -338,6 +421,11 @@ pub struct RateGovernor {
     /// it against `pipe_bps` before anything acts. The one exception is V5b,
     /// which reads a rise of the floor as a veto on a reading ([`Self::refute_readings`]).
     belief: super::pipe::Pipe,
+    /// FR-148 D46 B2 — the last window's [`Take`](super::pair_memory::Take)
+    /// when the gate found it valid, `None` when it did not (or before the
+    /// first): what a delivery sample's push-back is filed under
+    /// ([`Self::on_sample_push_back`]).
+    sample_take: Option<super::pair_memory::Take>,
     /// FR-79 V5b — how many times a delivery took out what stood below it, for
     /// the heartbeat.
     readings_refuted: u32,
@@ -377,6 +465,12 @@ pub struct RateGovernor {
     shadow: Option<super::ratectl::Controller>,
     /// FR-148 P0 — how each path number was obtained (shadow; see [`PathTags`]).
     path: PathTags,
+    /// FR-148 P0 — the last viewer window's R3 verdict: did it write under half
+    /// the target it ran with? Read only to word an additive increase
+    /// ([`Why::app_limited`]). `None` before the first window.
+    window_app_limited: Option<bool>,
+    /// FR-148 P0 — the applied moves since the last heartbeat, by [`Why`].
+    moves: Moves,
 }
 
 /// FR-71 T1a — what the pump measured about its own send side over one
@@ -454,6 +548,14 @@ const LINK_CEILING_TTL: Duration = Duration::from_secs(15);
 /// waits for perfection never fires. One `QUEUE_GROWTH_MS` worth of residue
 /// is the same quantum the loop already treats as "not growing".
 const LINK_RELEASE_DEPTH_MS: i32 = viewer_rate::QUEUE_GROWTH_MS as i32;
+
+/// FR-148 P0 — a stage that changed a bound becomes its source: the last stage
+/// to change it is the one whose number is in force.
+fn retag<S>(source: &mut S, before: u32, after: u32, stage: S) {
+    if after != before {
+        *source = stage;
+    }
+}
 
 impl RateGovernor {
     /// `flags` carries every kill switch (see [`GovernorFlags`]); the
@@ -538,6 +640,7 @@ impl RateGovernor {
             window_sender: None,
             evidence: super::evidence::Rejections::default(),
             belief: super::pipe::Pipe::default(),
+            sample_take: None,
             readings_refuted: 0,
             last_reading_bps: None,
             window_hard_stall: false,
@@ -555,6 +658,8 @@ impl RateGovernor {
                 }
             },
             path: PathTags::open(now, ceiling_seed_bps),
+            window_app_limited: None,
+            moves: Moves::default(),
         };
         // FR-148 P0 — the learned ceiling as the session opens, at the seed or at
         // its nominal start; and the seed, a rate an earlier session measured,
@@ -919,8 +1024,8 @@ impl RateGovernor {
         }
         let ctrl = self.aimd.as_mut()?;
         ctrl.observe(self.send_depth as u32, true, now);
-        let bps = ctrl.take_pending()?;
-        Some(self.record_applied(bps))
+        let moved = ctrl.take_move()?;
+        Some(self.record_applied(moved))
     }
 
     /// Pre-encode tick, every frame that reaches the encoder: lazily
@@ -957,6 +1062,11 @@ impl RateGovernor {
         // physics bound there; the estimate stays OBSERVED on relay
         // (heartbeat `goodput_bps`) as the dataset for a future
         // lumpiness-robust design.
+        //
+        // FR-148 P0 — each stage below that changes the ceiling becomes its
+        // source, and so does each floor stage: the line that reports a move
+        // the bound made names the stage whose number was in force.
+        let (plan_bps, mut ceiling_src) = (ceiling_bps, CeilingSource::Plan);
         let ceiling_bps = if self.measured_ceiling
             && !constrained
             && let Some(g) = self.goodput.estimate_bps(now)
@@ -965,6 +1075,7 @@ impl RateGovernor {
         } else {
             ceiling_bps
         };
+        retag(&mut ceiling_src, plan_bps, ceiling_bps, CeilingSource::Pipe);
         // FR-59 P3 — the viewer's arrival rate, while it is still live.
         // Expired here rather than at the window fold because a viewer that
         // goes SILENT is silent, not congested, and the fold only runs when
@@ -1017,17 +1128,29 @@ impl RateGovernor {
         } else {
             ceiling_bps
         };
+        // FR-148 P0 — `learned` whenever the learner's lift is the number in
+        // force, so the FFmpeg pump's own lift of its plan reads `learned` too.
+        if constrained && ceiling_bps > 0 && ceiling_bps == self.learner.ceiling_for(0) {
+            ceiling_src = CeilingSource::Learned;
+        }
         // FR-59 P3 — and then bound it by what the VIEWER says is actually
         // arriving, while its transit queue is growing. Applied AFTER the
         // learner deliberately: the learner's evidence is what the pipe
         // carried in the past, and a live report that the receiver is
         // falling behind outranks it.
+        let lifted_bps = ceiling_bps;
         let ceiling_bps = match link_rx_bps {
             Some(rx) if constrained => ceiling_bps
                 .min(((rx as u64) * viewer_rate::LINK_CEILING_PCT / 100) as u32)
                 .max(1),
             _ => ceiling_bps,
         };
+        retag(
+            &mut ceiling_src,
+            lifted_bps,
+            ceiling_bps,
+            CeilingSource::Arrival,
+        );
         // FR-63 — the opener has no evidence yet, so it must not commit to
         // whatever constant the chain above produced. Build the ramp from THIS
         // tick's RESOLVED ceiling (the AIMD below is built the same way) and
@@ -1070,10 +1193,17 @@ impl RateGovernor {
                 );
             }
         }
+        let clamped_bps = ceiling_bps;
         let ceiling_bps = match self.slow_start.as_ref() {
             Some(ss) if !ss.done() => ceiling_bps.min(ss.target_bps()).max(1),
             _ => ceiling_bps,
         };
+        retag(
+            &mut ceiling_src,
+            clamped_bps,
+            ceiling_bps,
+            CeilingSource::Opener,
+        );
         // FR-59 P1 — the legibility floor descends toward a measured pipe.
         // `MIN_BITRATE_BPS` is calibrated for the 2–9 Mbps band every
         // measured relay sat in; below it the floor is not a floor but a
@@ -1085,6 +1215,7 @@ impl RateGovernor {
         // rate clamp above would be silently undone on exactly the links it
         // exists for. Evidence-gated, so a session with no measurement at
         // all is byte-for-byte unchanged.
+        let mut floor_src = FloorSource::Area;
         let floor_bps = match measured_bps {
             Some(g) if self.slow_link.floor_relief => {
                 let relieved = super::goodput::measured_floor_bps(
@@ -1093,6 +1224,7 @@ impl RateGovernor {
                     super::slow_link_min_bitrate_bps(),
                 );
                 self.relieved_floor_bps = (relieved < floor_bps).then_some(relieved);
+                retag(&mut floor_src, floor_bps, relieved, FloorSource::Relief);
                 // FR-148 P0 — tagged as the reading or stand-in it came from.
                 if let Some((_, tag)) = self.pipe_tagged(now, constrained) {
                     self.path.relieved = tag;
@@ -1127,6 +1259,7 @@ impl RateGovernor {
                     // FR-148 P0 — the opener's ramp is computed: assumed, as old
                     // as the session.
                     self.path.relieved = Tag::assumed(Origin::At(self.path.opened_at));
+                    floor_src = FloorSource::Ramp;
                 }
                 ramped
             }
@@ -1158,8 +1291,8 @@ impl RateGovernor {
             let initial = open_at_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
             AimdController::new(initial, floor_bps, ceiling_bps, depth as u32, now)
         });
-        ctrl.set_floor(floor_bps);
-        ctrl.set_ceiling(ceiling_bps);
+        ctrl.set_floor_from(floor_bps, floor_src);
+        ctrl.set_ceiling_from(ceiling_bps, ceiling_src);
         ctrl.observe(
             depth.saturating_sub(send_capacity) as u32,
             send_capacity == 0,
@@ -1175,8 +1308,8 @@ impl RateGovernor {
                 self.path.learned_moved(self.learner.learned_bps(), now);
             }
         }
-        let bps = ctrl.take_pending()?;
-        Some(self.record_applied(bps))
+        let moved = ctrl.take_move()?;
+        Some(self.record_applied(moved))
     }
 
     /// try_send-Full arm: an encoded frame overflowed the send channel
@@ -1192,8 +1325,8 @@ impl RateGovernor {
         }
         let ctrl = self.aimd.as_mut()?;
         ctrl.note_buffer_overflow(now);
-        let bps = ctrl.take_pending()?;
-        Some(self.record_applied(bps))
+        let moved = ctrl.take_move()?;
+        Some(self.record_applied(moved))
     }
 
     /// Feed the AIMD a congestion sample from a BLOCKED SEND, without
@@ -1206,7 +1339,7 @@ impl RateGovernor {
     /// direct-only (the FR-1 P2 relay regression), so the one signal that
     /// always works was the one nothing acted on.
     ///
-    /// Deliberately NOT `on_send_overflow`: that one calls `take_pending`,
+    /// Deliberately NOT `on_send_overflow`: that one calls `take_move`,
     /// which marks the move applied while the encoder is never told. The
     /// pump's own `pre_encode_tick` picks this up one frame later and
     /// routes it through the normal apply arms — the same discipline the
@@ -1230,7 +1363,7 @@ impl RateGovernor {
         if hard {
             self.window_hard_stall = true;
         } else if let Some(ctrl) = self.aimd.as_mut() {
-            ctrl.note_buffer_overflow(now);
+            ctrl.note_congestion(Congestion::Stall, now);
         }
     }
 
@@ -1435,6 +1568,15 @@ impl RateGovernor {
             sent_bps,
             self.applied_bps,
         );
+        self.sample_take = valid.then_some(take);
+        // FR-148 P0 — the same R3 test, kept whatever the gate said, for the line
+        // that words an additive increase: the sender's own byte count against
+        // the target the window ran with, so a still screen reads app-limited.
+        self.window_app_limited = Some(!super::pair_memory::pushing_against_plan(
+            state,
+            sent_bps,
+            self.applied_bps,
+        ));
         // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
         // reads only the window's facts: `Pipe` takes it whatever the verdict, the
         // shadow model and the pair memory only from a valid window.
@@ -1703,7 +1845,7 @@ impl RateGovernor {
         let changed = new_div != self.skip_divisor;
         self.skip_divisor = new_div;
         // Feed the AIMD a congestion sample and STOP — deliberately no
-        // `take_pending` here: consuming the move would mark it applied
+        // `take_move` here: consuming the move would mark it applied
         // while the encoder never heard about it. The pump's own
         // `pre_encode_tick` picks it up one frame later (≤33 ms) and
         // routes it through the existing apply arms.
@@ -1715,13 +1857,21 @@ impl RateGovernor {
         // never full (`bytes_inflight=0`, `send_wait_max_ms=0.3`), the viewer's
         // age report landed in a rejected window, so NOTHING in the loop could
         // produce a decrease while the transport stalled eleven times.
-        // `note_buffer_overflow` is the rate-limited ×0.85 with its 500 ms
+        // `note_congestion` is the rate-limited ×0.85 with its 500 ms
         // spacing — deliberately not `apply_hard_md`, which has no spacing at
         // all and would halve once per stalled window.
+        // FR-148 P0 — the cause names the first of the three that holds.
         if (age_over || link_over || stall_is_ours)
             && let Some(ctrl) = self.aimd.as_mut()
         {
-            ctrl.note_buffer_overflow(now);
+            let signal = if age_over {
+                Congestion::Age
+            } else if link_over {
+                Congestion::Link
+            } else {
+                Congestion::TransitStall
+            };
+            ctrl.note_congestion(signal, now);
         }
         // FR-70 P1 — advance the prior. A LIVE measurement (blocked-send
         // goodput, or the viewer's arrival rate while its queue grows)
@@ -1994,6 +2144,13 @@ impl RateGovernor {
         self.applied_bps
     }
 
+    /// FR-148 P0 — the moves handed out since the last call, counted by their
+    /// [`Why`]. Each pump's heartbeat line takes them (`target_moves`), so a
+    /// count covers the time since the previous heartbeat line.
+    pub fn take_moves(&mut self) -> Moves {
+        std::mem::take(&mut self.moves)
+    }
+
     pub fn frames_skipped_decode(&self) -> u64 {
         self.frames_skipped_decode
     }
@@ -2050,10 +2207,20 @@ impl RateGovernor {
         Some(((i64::from(shadow) - i64::from(live)) * 100 / i64::from(live)) as i32)
     }
 
-    fn record_applied(&mut self, bps: u32) -> AppliedBitrate {
+    /// The target handed out, with why it moved (FR-148 P0): the controller's
+    /// causes, and for an increase the last window's R3 verdict. Each move is
+    /// counted by its `why` for the heartbeat ([`Self::take_moves`]).
+    fn record_applied(&mut self, (bps, causes): (u32, Causes)) -> AppliedBitrate {
         let changed = bps != self.applied_bps;
         self.applied_bps = bps;
-        AppliedBitrate { bps, changed }
+        let why = Why {
+            causes,
+            app_limited: self
+                .window_app_limited
+                .filter(|_| causes.contains(Cause::Increase)),
+        };
+        self.moves.note(why);
+        AppliedBitrate { bps, changed, why }
     }
 }
 
@@ -2097,7 +2264,30 @@ impl RateGovernor {
             model_floor: model.floor(now).map(aged),
             model_capacity: model.capacity(now),
             model_stand_in: model.stand_in(prior, now).map(aged),
+            model_floor_by: model.floor_by(),
+            model_capacity_by: model.capacity_by(now),
         }
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3, at the pump's
+    /// heartbeat: to the shadow model and the pair memory only
+    /// ([`super::pipe::Pipe::observe_sample_capacity`]), filed under the last
+    /// window's take. After a window the gate rejected, nothing: the sample
+    /// ran beside a stall the viewer saw. No rate or gate reads it, and the
+    /// path memory it reaches opens a session only under `path_model = on`.
+    pub fn on_sample_push_back(&mut self, bps: u32, by: super::pipe::PushedBy, now: Instant) {
+        if let Some(take) = self.sample_take {
+            self.belief.observe_sample_capacity(bps, by, take, now);
+        }
+    }
+
+    /// FR-148 D46 B2 — the in-flight budget, computing on or in shadow, saw
+    /// the clock stand still for the least and S with bytes out, or read a
+    /// release: the next [`super::pipe::STALL_WINDOWS`] windows are no reading
+    /// for the shadow model or the pair memory
+    /// ([`super::pipe::Pipe::note_stall`]). Nothing else moves.
+    pub fn note_path_stall(&mut self) {
+        self.belief.note_stall();
     }
 
     /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged
@@ -5922,6 +6112,71 @@ mod tests {
         assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
     }
 
+    /// FR-148 D46 B2 — a delivery sample's push-back reaches the shadow model
+    /// and the pair memory only, filed under the last window the gate
+    /// accepted: the applied rate and `Pipe`'s own law do not move. Before any
+    /// window, and after one the gate rejected, it reaches nothing. A stall
+    /// the in-flight budget saw keeps the next window out of the model, while
+    /// `Pipe`'s own floor still takes it.
+    #[test]
+    fn a_sample_push_back_moves_only_the_shadow_model() {
+        use crate::encode::pipe::PushedBy;
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let model = |s: &V5bSession| {
+            let m = s.g.belief.model();
+            (
+                m.floor(s.t).map(|f| f.bps),
+                m.capacity(s.t).map(|c| c.bps),
+                m.floor_by(),
+            )
+        };
+        s.g.on_sample_push_back(500_000, PushedBy::P1, s.t);
+        assert_eq!(model(&s), (None, None, None), "no window yet");
+        let link = viewer_rate::pack_link(1_200_000, 0);
+        for _ in 0..5 {
+            s.window(150_000, Some(28), link, false);
+        }
+        assert_eq!(model(&s), (Some(1_200_000), None, None));
+        let (applied, own) = (s.g.applied_bps(), s.g.belief_bps(s.t));
+        s.g.on_sample_push_back(900_000, PushedBy::P1, s.t);
+        let (floor, capacity, by) = model(&s);
+        assert!(
+            floor.is_some_and(|f| (900_000..1_200_000).contains(&f)),
+            "{floor:?}"
+        );
+        assert_eq!((capacity, by), (Some(900_000), Some(PushedBy::P1)));
+        let m = s.g.belief.model();
+        assert_eq!(m.capacity_by(s.t), Some(PushedBy::P1));
+        assert_eq!((s.g.applied_bps(), s.g.belief_bps(s.t)), (applied, own));
+        // The memory filed it once, under the window's take: counted, or set
+        // aside as D29 says.
+        let filed = |s: &V5bSession| {
+            let c = s.g.memory().closing(s.t, P1_NOW_UNIX);
+            c.counted + c.not_counted + c.unread + c.viewer_late + c.under_plan
+        };
+        assert_eq!(filed(&s), 1);
+        // A stall the viewer saw: the sample beside it reaches nothing.
+        s.stall();
+        let before = model(&s);
+        s.g.on_sample_push_back(400_000, PushedBy::P3, s.t);
+        assert_eq!(model(&s), before);
+        assert_eq!(filed(&s), 1);
+        // The stall's shadow, then a valid window back at the floor.
+        for _ in 0..2 {
+            s.window(150_000, Some(28), link, false);
+        }
+        assert_eq!(model(&s).0, Some(1_200_000));
+        // The budget saw a stall: its release reaches `Pipe`'s own floor only.
+        s.g.note_path_stall();
+        let more = viewer_rate::pack_link(1_500_000, 0);
+        s.window(187_500, Some(28), more, false);
+        assert_eq!(model(&s).0, Some(1_200_000), "kept out of the model");
+        assert_eq!(s.g.belief_bps(s.t).1, Some(1_500_000), "Pipe's own floor");
+        s.window(187_500, Some(28), more, false);
+        assert_eq!(model(&s).0, Some(1_500_000));
+    }
+
     /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:
     /// arrivals near 0.6 Mbit/s, the viewer's queue growing in runs of three
     /// windows while the pump offers 1 Mbit/s, so the link loop refuses the
@@ -6829,5 +7084,669 @@ mod tests {
             .pre_encode_tick(relay_cap, floor, true, DEPTH, now)
             .expect("the fresh encoder is told its target on the next tick");
         assert_eq!(applied.bps, relay_cap);
+    }
+
+    /// FR-148 P0 — the scripted session of the no-behaviour-change test: every
+    /// input that moves the live target, at fixed times, on one transport. A
+    /// measured pipe (direct), a plan ceiling that drops and returns, an area
+    /// floor that rises, fullness at the gate and at the tick, overflows,
+    /// rebuilds, a viewer window every 1023 ms (an age that rises, a transit
+    /// queue that grows and then drains), and on a constrained session slow
+    /// start, the learner, and a soft and a hard send stall; then long runs with
+    /// nothing full, loaded, then still, then loaded, for the additive increase.
+    /// Every applied move is written as `call:bps:changed`, `call` counting each
+    /// call into the governor, and beside it as `call:why`.
+    fn replay(constrained: bool) -> (String, String) {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                slow_start: constrained,
+                ..GovernorFlags::default()
+            },
+            if constrained { 8_000_000 } else { 0 },
+            None,
+            start,
+        );
+        let (hi, lo) = if constrained {
+            (6_000_000, 4_000_000)
+        } else {
+            (CEILING, 3_000_000)
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut whys: Vec<String> = Vec::new();
+        let mut note = |call: u32, a: Option<AppliedBitrate>| {
+            if let Some(a) = a {
+                out.push(format!("{call}:{}:{}", a.bps, u8::from(a.changed)));
+                whys.push(format!("{call}:{}", a.why));
+            }
+        };
+        let mut call = 0u32;
+        let mut sent: u64 = 0;
+        let mut t = start;
+        for i in 0..2400u32 {
+            t += Duration::from_millis(33);
+            // The send task's bytes: the target's worth while the screen moves,
+            // a trickle while it is still.
+            sent += if (1200..1800).contains(&i) {
+                2_000
+            } else {
+                u64::from(g.applied_bps()) / 240
+            };
+            match i {
+                // A 10 Mbit/s pipe, measured on blocked sends: the direct clamp.
+                10..=14 if !constrained => {
+                    for _ in 0..8 {
+                        g.goodput_sink().record(30_000, Duration::from_millis(24));
+                    }
+                }
+                45 | 46 | 350 => {
+                    call += 1;
+                    note(call, g.on_send_overflow(t));
+                }
+                130 | 700 => {
+                    call += 1;
+                    g.on_encoder_rebuilt();
+                }
+                400 if constrained => {
+                    call += 1;
+                    g.note_send_stall(Duration::from_millis(300), t);
+                }
+                450 if constrained => {
+                    g.goodput_sink().record(25_000, Duration::from_millis(1500));
+                    call += 1;
+                    g.note_send_stall(Duration::from_millis(1500), t);
+                }
+                _ => {}
+            }
+            if i % 31 == 30 {
+                let age: (u16, u16) = if (360..480).contains(&i) {
+                    (300, 60)
+                } else {
+                    (62, 60)
+                };
+                let link = match i {
+                    540..620 => viewer_rate::pack_link(300_000, 250),
+                    620..700 => viewer_rate::pack_link(300_000, -200),
+                    _ => 0,
+                };
+                call += 1;
+                let _ = g.tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || viewer_rate::pack_age(age.0, age.1, 80),
+                    || link,
+                    constrained,
+                    |d| d,
+                    sent,
+                );
+            }
+            call += 1;
+            if (300..330).contains(&i) && i % 2 == 0 {
+                // The gate skips the frame on a full channel: no tick.
+                note(call, g.on_backpressure_skip(t));
+                continue;
+            }
+            let ceiling = if (200..260).contains(&i) { lo } else { hi };
+            let floor = if (120..150).contains(&i) {
+                hi / 8 * 7
+            } else {
+                crate::encode::MIN_BITRATE_BPS
+            };
+            let capacity = if matches!(i, 20..=22 | 80 | 1000 | 2000) {
+                0
+            } else {
+                DEPTH
+            };
+            note(
+                call,
+                g.pre_encode_tick(ceiling, floor, constrained, capacity, t),
+            );
+        }
+        (out.join(" "), whys.join(" "))
+    }
+
+    /// FR-148 P0 — what [`replay`] applied on a direct transport before any
+    /// cause was named: recorded on `211ac93b6`, before this change was written.
+    const REPLAY_DIRECT: &str = "1:12000000:1 21:10200000:1 32:8500000:1 47:7225000:1 85:6141250:1 126:8500000:1 \
+         138:8500000:0 210:3000000:1 313:2550000:1 330:2167500:1 365:1842375:1 523:2373625:1 \
+         680:2904875:1 728:2904875:0 838:3436125:1 994:3967375:1 1038:3372205:1 1195:3903455:1 \
+         1352:4434705:1 1509:4965955:1 1665:5497205:1 1822:6028455:1 1979:6778455:1 \
+         2070:5761640:1 2227:6511640:1 2384:7261640:1";
+
+    /// FR-148 P0 — the same on a constrained transport.
+    const REPLAY_CONSTRAINED: &str = "1:300000:1 33:600000:1 67:1500000:1 126:5250000:1 138:5250000:0 210:4000000:1 \
+         243:4250000:1 313:3612500:1 330:3070625:1 365:2610010:1 418:2218500:1 453:1885725:1 \
+         486:1500000:1 614:270000:1 730:270000:0 771:303750:1 928:341718:1 1040:290445:1 \
+         1197:326750:1 1354:367593:1 1511:413542:1 1667:465234:1 1824:523388:1 1981:588811:1 \
+         2072:500480:1 2229:563040:1 2386:633420:1";
+
+    /// FR-148 P0 — naming the causes moves nothing: the scripted session above
+    /// applies exactly the targets it applied before any cause was named, at the
+    /// same calls, on both transports. A difference here is a behaviour change.
+    #[test]
+    fn naming_the_causes_moves_no_target() {
+        assert_eq!(replay(false).0, REPLAY_DIRECT, "direct");
+        assert_eq!(replay(true).0, REPLAY_CONSTRAINED, "constrained");
+    }
+
+    /// FR-148 P0 — the word a move's line prints, or `-` when nothing moved.
+    fn why_of(a: Option<AppliedBitrate>) -> String {
+        a.map_or_else(|| "-".to_string(), |a| a.why.to_string())
+    }
+
+    /// FR-148 P0 — why each move of [`replay`] happened, on a direct transport:
+    /// the measured 10 Mbit/s pipe clamps the plan (`ceiling(pipe)`), and in the
+    /// still span (2 KB a frame, about 0.48 Mbit/s under a 4-6 M target) the
+    /// increases read `app-limited`.
+    const REPLAY_DIRECT_WHY: &str = "1:open 21:decrease(full) 32:ceiling(pipe) 47:decrease(overflow) 85:decrease(full) \
+         126:floor(area) 138:reapply 210:ceiling(plan) 313:decrease(full) 330:decrease(full) \
+         365:decrease(overflow) 523:increase(loaded) 680:increase(loaded) 728:reapply \
+         838:increase(loaded) 994:increase(loaded) 1038:decrease(full) 1195:increase(loaded) \
+         1352:increase(app-limited) 1509:increase(app-limited) 1665:increase(app-limited) \
+         1822:increase(app-limited) 1979:increase(loaded) 2070:decrease(full) \
+         2227:increase(loaded) 2384:increase(loaded)";
+
+    /// FR-148 P0 — the same, constrained: slow start opens at 300 k and its ramp
+    /// lifts the floor (`floor(ramp)`) until it ends and the area floor stands;
+    /// the soft stall, the age loop, the hard stall and the growing transit
+    /// queue each name their decrease, and the queue's arrival-rate ceiling
+    /// folds into the same move. The still span's 0.48 Mbit/s is over half a
+    /// 0.33-0.52 M target, so its increases read `loaded`.
+    const REPLAY_CONSTRAINED_WHY: &str = "1:open 33:floor(ramp) 67:floor(area) 126:floor(area) 138:reapply 210:ceiling(plan) \
+         243:increase(loaded) 313:decrease(full) 330:decrease(full) 365:decrease(overflow) \
+         418:decrease(stall) 453:decrease(age) 486:hard-decrease \
+         614:decrease(link)+ceiling(arrival) 730:reapply 771:increase(loaded) \
+         928:increase(loaded) 1040:decrease(full) 1197:increase(loaded) 1354:increase(loaded) \
+         1511:increase(loaded) 1667:increase(loaded) 1824:increase(loaded) \
+         1981:increase(loaded) 2072:decrease(full) 2229:increase(loaded) 2386:increase(loaded)";
+
+    /// FR-148 P0 — and every move of that session says why, at the call that
+    /// made it.
+    #[test]
+    fn every_move_of_the_replay_says_why() {
+        assert_eq!(replay(false).1, REPLAY_DIRECT_WHY, "direct");
+        assert_eq!(replay(true).1, REPLAY_CONSTRAINED_WHY, "constrained");
+    }
+
+    /// FR-148 P0 — the pump's own inputs, one at a time, each named on the move
+    /// it makes: the first target, a full channel at the gate and at the tick,
+    /// an overflow, a higher area floor, a lower plan, and a rebuild.
+    #[test]
+    fn each_pump_input_names_its_move() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let mut t = Instant::now();
+        let mut g = gov(t);
+        assert_eq!(
+            why_of(g.pre_encode_tick(3_000_000, floor, true, DEPTH, t)),
+            "open"
+        );
+        t += Duration::from_millis(600);
+        assert_eq!(why_of(g.on_backpressure_skip(t)), "decrease(full)");
+        t += Duration::from_millis(600);
+        assert_eq!(
+            why_of(g.pre_encode_tick(3_000_000, floor, true, 0, t)),
+            "decrease(full)"
+        );
+        t += Duration::from_millis(600);
+        assert_eq!(why_of(g.on_send_overflow(t)), "decrease(overflow)");
+        let up = g.pre_encode_tick(3_000_000, 2_000_000, true, DEPTH, t);
+        assert_eq!(
+            (up.map(|a| a.bps), why_of(up)),
+            (Some(2_000_000), "floor(area)".to_string())
+        );
+        let down = g.pre_encode_tick(1_800_000, floor, true, DEPTH, t);
+        assert_eq!(
+            (down.map(|a| a.bps), why_of(down)),
+            (Some(1_800_000), "ceiling(plan)".to_string())
+        );
+        g.on_encoder_rebuilt();
+        let again = g
+            .pre_encode_tick(1_800_000, floor, true, DEPTH, t)
+            .expect("the rebuilt encoder is told its target");
+        assert_eq!(
+            (again.bps, again.changed, again.why.to_string()),
+            (1_800_000, false, "reapply".to_string())
+        );
+    }
+
+    /// FR-148 P0 — a folded move names every cause in the order it happened: a
+    /// soft send stall's ×0.85 lands between two ticks and the next tick lowers
+    /// the plan too, so one target carries both. The heartbeat counts it once,
+    /// under its whole why, and taking the count empties it.
+    #[test]
+    fn a_folded_move_names_every_cause_in_order() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let mut t = Instant::now();
+        let mut g = gov(t);
+        g.pre_encode_tick(3_000_000, floor, true, DEPTH, t);
+        t += Duration::from_millis(600);
+        g.note_send_stall(Duration::from_millis(300), t);
+        let a = g
+            .pre_encode_tick(2_000_000, floor, true, DEPTH, t)
+            .expect("one move");
+        assert_eq!(
+            (a.bps, a.why.to_string()),
+            (2_000_000, "decrease(stall)+ceiling(plan)".to_string())
+        );
+        assert_eq!(
+            g.take_moves().to_string(),
+            "open:1,decrease(stall)+ceiling(plan):1"
+        );
+        assert_eq!(
+            g.take_moves().to_string(),
+            "none",
+            "the next heartbeat starts empty"
+        );
+    }
+
+    /// FR-148 P0 — an additive increase says whether the sender was
+    /// application-limited in the last viewer window: R3, the send task's own
+    /// byte count against the target the window ran with.
+    #[test]
+    fn an_increase_says_whether_the_sender_was_application_limited() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let increase = |window_bytes: Option<u64>| -> String {
+            let t0 = Instant::now();
+            let mut g = gov(t0);
+            g.pre_encode_tick(3_000_000, floor, false, DEPTH, t0);
+            // Room to climb: an overflow takes the target to 2.55 M.
+            g.on_send_overflow(t0 + Duration::from_millis(600));
+            let mut t = t0 + Duration::from_millis(1100);
+            if let Some(bytes) = window_bytes {
+                g.tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0,
+                    || 0,
+                    false,
+                    |d| d,
+                    bytes,
+                )
+                .expect("window due");
+            }
+            while t < t0 + Duration::from_secs(20) {
+                t += Duration::from_millis(200);
+                if let Some(a) = g.pre_encode_tick(3_000_000, floor, false, DEPTH, t) {
+                    return a.why.to_string();
+                }
+            }
+            "-".to_string()
+        };
+        assert_eq!(increase(None), "increase(no-window)");
+        // 50 KB in the 1.1 s window is 0.36 Mbit/s under a 2.55 M target: what
+        // a still screen writes.
+        assert_eq!(increase(Some(50_000)), "increase(app-limited)");
+        // 400 KB is 2.9 Mbit/s: the sender pushed against its target.
+        assert_eq!(increase(Some(400_000)), "increase(loaded)");
+    }
+
+    /// FR-148 P0 — FR-15's age loop names its decrease: two windows learn a
+    /// 60 ms floor, then the age sits at 200 ms and the loop cuts twice.
+    #[test]
+    fn an_age_excess_names_its_decrease() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let start = Instant::now();
+        let mut g = gov(start);
+        let mut whys = vec![why_of(
+            g.pre_encode_tick(3_000_000, floor, true, DEPTH, start),
+        )];
+        for (i, (avg, min)) in [(62u16, 60u16), (64, 61), (200, 62), (205, 63), (210, 63)]
+            .into_iter()
+            .enumerate()
+        {
+            let t = start + Duration::from_millis(1100 * (i as u64 + 1));
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age(avg, min, 100),
+                || 0,
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+            whys.push(why_of(g.pre_encode_tick(3_000_000, floor, true, DEPTH, t)));
+        }
+        assert_eq!(
+            whys,
+            ["open", "-", "-", "-", "decrease(age)", "decrease(age)"]
+        );
+        assert_eq!(g.take_moves().to_string(), "open:1,decrease(age):2");
+    }
+
+    /// FR-148 P0 — FR-59 P3's growing transit queue names its decrease, and the
+    /// arrival-rate ceiling it sets folds into the same move at the next tick.
+    /// Then the viewer reports a faster arrival: the relieved floor rises with
+    /// it and pulls the target up (`floor(relief)`), first to the ceiling still
+    /// in force, then to itself.
+    #[test]
+    fn a_growing_transit_queue_names_its_decrease_and_its_bounds() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let start = Instant::now();
+        let mut g = gov(start);
+        let mut t = start;
+        let mut moves = Vec::new();
+        for i in 0..8 {
+            t += Duration::from_millis(1100);
+            let rx = if i < 4 { 400_000 } else { 1_200_000 };
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0,
+                || viewer_rate::pack_link(rx, 250),
+                true,
+                |o| o,
+                // 4 Mbit/s offered, over 1.1 × either arrival rate: the queue
+                // the viewer reports is the sender's.
+                offering(start, t) * 4,
+            )
+            .expect("window due");
+            for _ in 0..4 {
+                t += Duration::from_millis(200);
+                if let Some(a) = g.pre_encode_tick(3_000_000, floor, true, DEPTH, t) {
+                    moves.push(format!("w{i}:{}:{}", a.bps, a.why));
+                }
+            }
+        }
+        assert_eq!(
+            moves,
+            [
+                "w0:3000000:open",
+                "w1:360000:decrease(link)+ceiling(arrival)",
+                "w2:340000:decrease(link)",
+                "w4:360000:floor(relief)",
+                "w4:1020000:floor(relief)",
+            ]
+        );
+    }
+
+    /// FR-148 P0 — FR-79 V5's transit stall over the measured pipe names its
+    /// decrease: the cell of `a_transit_stall_above_the_measured_pipe_cuts_the_rate`,
+    /// where both silent windows cut and the one move names the cause once.
+    #[test]
+    fn a_transit_stall_names_its_decrease() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            None,
+            start,
+        );
+        let sender = WindowSenderStats {
+            inflight_bytes: 1_500,
+            budget_bytes: 128_000,
+            gate_skips: 0,
+            send_wait_max_ms: 1.0,
+            send_wait_avg_ms: Some(0.5),
+            frames_sent: 30,
+            stalled_passes: 0,
+            opening: false,
+        };
+        let mut t = start;
+        for i in 0..4 {
+            if i == 3 {
+                for _ in 0..12 {
+                    g.goodput_sink().record(1_500, Duration::from_millis(12));
+                }
+            }
+            t += Duration::from_millis(1100);
+            g.note_window_sender(sender);
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(42, 40, 80, 41),
+                || 0,
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+        }
+        assert_eq!(
+            why_of(g.pre_encode_tick(3_000_000, floor, true, DEPTH, t)),
+            "open"
+        );
+        for _ in 0..2 {
+            t += Duration::from_millis(1100);
+            g.note_window_sender(sender);
+            g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+                .expect("window due");
+        }
+        let a = g.pre_encode_tick(3_000_000, floor, true, DEPTH, t);
+        assert_eq!(
+            (a.map(|a| a.bps), why_of(a)),
+            (Some(2_167_500), "decrease(transit-stall)".to_string())
+        );
+    }
+
+    /// FR-148 P0 — FR-35's ×0.5 names itself: the free-loop hard stall of
+    /// `a_hard_stall_on_a_free_loop_still_halves_at_its_own_window`.
+    #[test]
+    fn a_hard_stall_names_its_halving() {
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(1100);
+            t2_clean_window(&mut g, t);
+        }
+        g.goodput_sink().record(25_000, Duration::from_millis(2900));
+        t += Duration::from_millis(2900);
+        g.note_send_stall(Duration::from_millis(2900), t);
+        g.note_window_sender(t2_sender(12));
+        g.tick_viewer_window(
+            t,
+            30,
+            || viewer_rate::pack_report(12, false),
+            || viewer_rate::pack_age_with_arrival(300, 50, 80, 299),
+            || 0,
+            true,
+            |o| o,
+            0,
+        )
+        .expect("window due");
+        let a = g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert_eq!(
+            (a.map(|a| a.bps), why_of(a)),
+            (Some(2_805_000), "hard-decrease".to_string())
+        );
+    }
+
+    /// FR-148 P0 — the constrained ceiling's own stages name their moves: FR-35's
+    /// learned ceiling holds a plan that drops under it (`ceiling(learned)`), and
+    /// FR-63's opener caps a session that flips from direct to a relay
+    /// (`ceiling(opener)`), whose ramp then lifts the floor one doubling at a
+    /// time (`floor(ramp)`) until it ends and the area floor stands.
+    #[test]
+    fn the_learned_ceiling_and_the_opener_name_their_moves() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        assert_eq!(
+            why_of(g.pre_encode_tick(7_000_000, floor, true, DEPTH, start)),
+            "open"
+        );
+        let a = g.pre_encode_tick(3_000_000, floor, true, DEPTH, start);
+        assert_eq!(
+            (a.map(|a| a.bps), why_of(a)),
+            (Some(5_610_000), "ceiling(learned)".to_string())
+        );
+
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                slow_start: true,
+                ..GovernorFlags::default()
+            },
+            0,
+            None,
+            start,
+        );
+        assert_eq!(
+            why_of(g.pre_encode_tick(3_000_000, floor, false, DEPTH, start)),
+            "open"
+        );
+        let a = g.pre_encode_tick(3_000_000, floor, true, DEPTH, start);
+        assert_eq!(
+            (a.map(|a| a.bps), why_of(a)),
+            (Some(300_000), "ceiling(opener)".to_string())
+        );
+        let mut t = start;
+        let mut moves = Vec::new();
+        for _ in 0..3 {
+            t += Duration::from_millis(1100);
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0,
+                || 0,
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+            for _ in 0..2 {
+                t += Duration::from_millis(33);
+                if let Some(a) = g.pre_encode_tick(3_000_000, floor, true, DEPTH, t) {
+                    moves.push(format!("{}:{}", a.bps, a.why));
+                }
+            }
+        }
+        // Each doubling lands one tick after its window: the controller caps a
+        // new floor at the ceiling already in force, and the ramp raised both.
+        assert_eq!(
+            moves,
+            [
+                "600000:floor(ramp)",
+                "1200000:floor(ramp)",
+                "1500000:floor(area)"
+            ]
+        );
+    }
+
+    /// FR-148 P0 — the FFmpeg pump holds a target for a rebuild-bound encoder
+    /// (`deferred_bps`) and applies it at the next quiet. The hold is the
+    /// [`AppliedBitrate`] itself, so the line that lands it prints the why it was
+    /// handed out with, whatever the governor did since, and the heartbeat
+    /// counted the move when it was handed out. A newer target replaces a hold,
+    /// and its why explains its own step.
+    #[test]
+    fn a_held_target_keeps_its_why_until_it_lands() {
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let mut t = Instant::now();
+        let mut g = gov(t);
+        g.pre_encode_tick(3_000_000, floor, true, DEPTH, t);
+        t += Duration::from_millis(600);
+        let mut held = g.on_send_overflow(t);
+        for _ in 0..10 {
+            t += Duration::from_millis(33);
+            assert_eq!(
+                why_of(g.pre_encode_tick(3_000_000, floor, true, DEPTH, t)),
+                "-"
+            );
+        }
+        assert_eq!(g.take_moves().to_string(), "open:1,decrease(overflow):1");
+        let landed = held.take().expect("a held target");
+        assert_eq!(
+            (landed.bps, landed.why.to_string()),
+            (2_550_000, "decrease(overflow)".to_string())
+        );
+
+        t += Duration::from_millis(600);
+        held = g.on_send_overflow(t);
+        if let Some(newer) = g.pre_encode_tick(1_800_000, floor, true, DEPTH, t) {
+            held = Some(newer);
+        }
+        let landed = held.expect("a held target");
+        assert_eq!(
+            (landed.bps, landed.why.to_string()),
+            (1_800_000, "ceiling(plan)".to_string())
+        );
+    }
+
+    /// FR-148 P0 — what a line writes for a why and for the heartbeat's tally.
+    /// A move with more distinct causes than are kept ends `+more`, and past 16
+    /// distinct whys the tally counts a move under `more`, so it stays bounded
+    /// where nothing takes it (the heartbeat line filtered out).
+    #[test]
+    fn a_why_and_the_tally_read_as_written() {
+        assert_eq!(Why::default().to_string(), "none");
+        assert_eq!(Moves::default().to_string(), "none");
+
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = AimdController::new(12_000_000, 1_500_000, 12_000_000, 8, t0);
+        for (n, signal) in [
+            (600, Congestion::Full),
+            (1_200, Congestion::Overflow),
+            (1_800, Congestion::Stall),
+            (2_400, Congestion::Age),
+            (3_000, Congestion::Link),
+            (3_600, Congestion::TransitStall),
+        ] {
+            c.note_congestion(signal, ms(n));
+        }
+        c.apply_hard_md(ms(3_610));
+        c.set_ceiling_from(1_800_000, CeilingSource::Opener);
+        let (_, causes) = c.take_move().expect("a move");
+        assert_eq!(
+            Why {
+                causes,
+                app_limited: None
+            }
+            .to_string(),
+            "open+decrease(full)+decrease(overflow)+decrease(stall)+decrease(age)+\
+             decrease(link)+decrease(transit-stall)+hard-decrease+more"
+        );
+
+        let every = [
+            Cause::Open,
+            Cause::Increase,
+            Cause::Decrease(Congestion::Full),
+            Cause::Decrease(Congestion::Overflow),
+            Cause::Decrease(Congestion::Stall),
+            Cause::Decrease(Congestion::Age),
+            Cause::Decrease(Congestion::Link),
+            Cause::Decrease(Congestion::TransitStall),
+            Cause::HardDecrease,
+            Cause::Ceiling(CeilingSource::Plan),
+            Cause::Ceiling(CeilingSource::Pipe),
+            Cause::Ceiling(CeilingSource::Learned),
+            Cause::Ceiling(CeilingSource::Arrival),
+            Cause::Ceiling(CeilingSource::Opener),
+            Cause::Floor(FloorSource::Area),
+            Cause::Floor(FloorSource::Relief),
+            Cause::Floor(FloorSource::Ramp),
+            Cause::Reapply,
+        ];
+        let mut tally = Moves::default();
+        for cause in every.into_iter().chain([Cause::Open]) {
+            tally.note(Why {
+                causes: Causes::of(cause),
+                app_limited: None,
+            });
+        }
+        assert_eq!(
+            tally.to_string(),
+            "open:2,increase(no-window):1,decrease(full):1,decrease(overflow):1,\
+             decrease(stall):1,decrease(age):1,decrease(link):1,decrease(transit-stall):1,\
+             hard-decrease:1,ceiling(plan):1,ceiling(pipe):1,ceiling(learned):1,\
+             ceiling(arrival):1,ceiling(opener):1,floor(area):1,floor(relief):1,more:2"
+        );
     }
 }

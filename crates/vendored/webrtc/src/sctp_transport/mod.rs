@@ -16,7 +16,7 @@ use data::message::message_channel_open::ChannelType;
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU8};
 use sctp::association::Association;
 use sctp_transport_state::RTCSctpTransportState;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex};
 use util::Conn;
 
 use crate::api::setting_engine::SettingEngine;
@@ -46,7 +46,8 @@ pub type OnDataChannelOpenedHdlrFn = Box<
 >;
 
 struct AcceptDataChannelParams {
-    notify_rx: Arc<Notify>,
+    // Roomler patch (#4103): the transport's stop, as a value (`stopped`).
+    stopped_rx: watch::Receiver<bool>,
     sctp_association: Arc<Association>,
     data_channels: Arc<Mutex<Vec<Arc<RTCDataChannel>>>>,
     on_error_handler: Arc<ArcSwapOption<Mutex<OnErrorHdlrFn>>>,
@@ -89,9 +90,22 @@ pub struct RTCSctpTransport {
     pub(crate) data_channels_requested: Arc<AtomicU32>,
     data_channels_accepted: Arc<AtomicU32>,
 
-    notify_tx: Arc<Notify>,
+    // Roomler patch (#4103): `true` from the start of `stop`, for good.
+    // Upstream kept a `Notify` here, and its `notify_waiters()` wakes only the
+    // waiters of that instant and stores nothing: a stop that came while the
+    // accept task was in its loop body, or before `start` was waiting, was
+    // lost (`stopped`).
+    stopped_tx: watch::Sender<bool>,
 
     setting_engine: Arc<SettingEngine>,
+}
+
+/// Roomler patch (#4103): resolves once the transport is stopped, and at once
+/// if it already is, whenever the stop came: `wait_for` reads the value before
+/// it waits. The transport gone (the sender dropped) counts as stopped, since
+/// nothing can stop it any more.
+async fn stopped(stopped_rx: &mut watch::Receiver<bool>) {
+    let _ = stopped_rx.wait_for(|stopped| *stopped).await;
 }
 
 impl RTCSctpTransport {
@@ -115,7 +129,7 @@ impl RTCSctpTransport {
             data_channels_requested: Arc::new(AtomicU32::new(0)),
             data_channels_accepted: Arc::new(AtomicU32::new(0)),
 
-            notify_tx: Arc::new(Notify::new()),
+            stopped_tx: watch::Sender::new(false),
 
             setting_engine,
         }
@@ -142,40 +156,49 @@ impl RTCSctpTransport {
         }
         self.is_started.store(true, Ordering::SeqCst);
 
+        // Roomler patch (#4103): this wait sees a stop from before it began,
+        // the `conn().await` below included. Upstream made its `notified()` at
+        // the `select!`, so such a stop was lost, and `start` then built an
+        // association, stored Connected over Closed and spawned an accept
+        // task, none of which anything closed. The stop is polled first
+        // (`biased;`), so a stop already set never starts a handshake, whose
+        // loops would live until the DTLS conn closes.
+        let mut stopped_rx = self.stopped_tx.subscribe();
         let dtls_transport = self.transport();
         if let Some(net_conn) = &dtls_transport.conn().await {
-            let sctp_association = loop {
-                tokio::select! {
-                    _ = self.notify_tx.notified() => {
-                        // It seems like notify_tx is only notified on Stop so perhaps this check
-                        // is redundant.
-                        // TODO: Consider renaming notify_tx to shutdown_tx.
-                        if self.state.load(Ordering::SeqCst) == RTCSctpTransportState::Closed as u8 {
-                            return Err(Error::ErrSCTPTransportDTLS);
-                        }
-                    },
-                    association = sctp::association::Association::client(sctp::association::Config {
-                        net_conn: Arc::clone(net_conn) as Arc<dyn Conn + Send + Sync>,
-                        // Roomler patch: pull rwnd from SettingEngine
-                        // (was hardcoded 0 = 1 MiB upstream default).
-                        max_receive_buffer_size: self.setting_engine.get_sctp_max_receive_buffer_size(),
-                        max_message_size: 0,
-                        name: String::new(),
-                    }) => {
-                        break Arc::new(association?);
-                    }
-                };
+            let sctp_association = tokio::select! {
+                biased;
+                _ = stopped(&mut stopped_rx) => return Err(Error::ErrSCTPTransportDTLS),
+                association = sctp::association::Association::client(sctp::association::Config {
+                    net_conn: Arc::clone(net_conn) as Arc<dyn Conn + Send + Sync>,
+                    // Roomler patch: pull rwnd from SettingEngine
+                    // (was hardcoded 0 = 1 MiB upstream default).
+                    max_receive_buffer_size: self.setting_engine.get_sctp_max_receive_buffer_size(),
+                    max_message_size: 0,
+                    name: String::new(),
+                }) => Arc::new(association?),
             };
 
             {
                 let mut sa = self.sctp_association.lock().await;
+                // Roomler patch (#4103): `stop` sets its value before it takes
+                // this slot, so a stop that came as the handshake ended either
+                // finds the association here or is read here, under the slot's
+                // lock. Then the association is closed here, and neither it
+                // nor Connected is stored over the stop.
+                let stopped_now = *stopped_rx.borrow();
+                if stopped_now {
+                    drop(sa);
+                    let _ = sctp_association.close().await;
+                    return Err(Error::ErrSCTPTransportDTLS);
+                }
                 *sa = Some(Arc::clone(&sctp_association));
+                self.state
+                    .store(RTCSctpTransportState::Connected as u8, Ordering::SeqCst);
             }
-            self.state
-                .store(RTCSctpTransportState::Connected as u8, Ordering::SeqCst);
 
             let param = AcceptDataChannelParams {
-                notify_rx: self.notify_tx.clone(),
+                stopped_rx,
                 sctp_association,
                 data_channels: Arc::clone(&self.data_channels),
                 on_error_handler: Arc::clone(&self.on_error_handler),
@@ -197,6 +220,16 @@ impl RTCSctpTransport {
 
     /// Stop stops the SCTPTransport
     pub async fn stop(&self) -> Result<()> {
+        // Roomler patch (#4103): the stop is a value, set first and kept.
+        // Upstream woke the accept task with one `notify_waiters()` here at
+        // the end, which wakes only the waiters of that instant: a stop that
+        // came while the task was in its loop body (awaiting the app's
+        // `on_data_channel` handler, say) was lost, and the task then waited
+        // for good, holding the association and through it the DTLS conn.
+        // Set before the slot is taken, for `start`'s read under that slot's
+        // lock. `send_replace` stores it even with no receiver left.
+        self.stopped_tx.send_replace(true);
+
         {
             let mut sctp_association = self.sctp_association.lock().await;
             if let Some(sa) = sctp_association.take() {
@@ -207,12 +240,10 @@ impl RTCSctpTransport {
         self.state
             .store(RTCSctpTransportState::Closed as u8, Ordering::SeqCst);
 
-        self.notify_tx.notify_waiters();
-
         Ok(())
     }
 
-    async fn accept_data_channels(param: AcceptDataChannelParams) {
+    async fn accept_data_channels(mut param: AcceptDataChannelParams) {
         let dcs = param.data_channels.lock().await;
         let mut existing_data_channels = Vec::new();
         for dc in dcs.iter() {
@@ -224,7 +255,13 @@ impl RTCSctpTransport {
 
         loop {
             let dc = tokio::select! {
-                _ = param.notify_rx.notified() => break,
+                biased;
+                // Roomler patch (#4103): seen whenever the stop came, this
+                // loop's body included (`stopped`). Polled first (`biased;`),
+                // so after a stop the loop takes up no further stream and
+                // never calls the app's `on_data_channel` handler for a
+                // stopped transport.
+                _ = stopped(&mut param.stopped_rx) => break,
                 result = DataChannel::accept(
                     &param.sctp_association,
                     data::data_channel::Config::default(),

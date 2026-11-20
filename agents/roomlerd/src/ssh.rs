@@ -519,7 +519,9 @@ pub fn stored_host_key_is_usable(_cfg: &crate::config::AgentConfig) -> bool {
 }
 
 /// FR-105 — how a worker answers the question its SYSTEM service relays.
-#[cfg(all(windows, feature = "ssh-server"))]
+/// #4140 — and, on every OS, how a test asks a question under the tray's
+/// stand-in (`companion::tray_start_tests`).
+#[cfg(all(any(windows, test), feature = "ssh-server"))]
 pub(crate) use sshd::ask_here;
 
 #[cfg(feature = "ssh-server")]
@@ -2494,12 +2496,16 @@ mod sshd {
         };
         let mut have_surface = native;
         let mut notified = false;
+        // #4140 — why nothing showed it, if nothing does: the refusal's words.
+        let mut why_not = crate::consent::NoSurface::NothingUp;
         if !native {
             // Awaited, not spawned, and bounded: its verdict is what lets the
             // refusal below say "nobody could be asked" instead of "nobody
             // answered" — different fixes, and the caller cannot tell them
-            // apart afterwards.
-            let companion_up = companion.up().await;
+            // apart afterwards. #4140 — and it keeps a Mac's closed road to
+            // the tray apart from a tray that is not up.
+            let tray = companion.verdict().await;
+            let companion_up = tray.up();
             // FR-93 P6f — the last on-screen surface, as for a screen-control
             // request: a desktop notification where the companion cannot show
             // the question.
@@ -2516,6 +2522,7 @@ mod sshd {
             // this read `native` alone, so a question the companion showed
             // and nobody answered was reported as one nobody could be asked.
             have_surface = (companion_up && marker) || notified;
+            why_not = tray.why_not_shown(marker);
         }
         info!(?caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
 
@@ -2534,9 +2541,9 @@ mod sshd {
         Err(match decision {
             // #3982 — one text with an exec command that no surface showed
             // (`consent::nobody_could_be_asked`); a test there pins this
-            // sentence.
+            // sentence. #4140 — for the cause found above.
             crate::consent::Decision::Timeout if !have_surface => {
-                crate::consent::nobody_could_be_asked("SSH")
+                crate::consent::nobody_could_be_asked("SSH", why_not)
             }
             crate::consent::Decision::Timeout => format!(
                 "nobody approved this session at the device within {}s",
@@ -3487,13 +3494,13 @@ mod tests {
             RunAs::ConsoleUser
         );
         assert_eq!(
-            super::sshd::parse_account_mode("named:goran").unwrap(),
-            RunAs::Named("goran".into())
+            super::sshd::parse_account_mode("named:casey").unwrap(),
+            RunAs::Named("casey".into())
         );
         // Whitespace is tolerated; an empty account and an unknown word are not.
         assert_eq!(
-            super::sshd::parse_account_mode(" named: goran ").unwrap(),
-            RunAs::Named("goran".into())
+            super::sshd::parse_account_mode(" named: casey ").unwrap(),
+            RunAs::Named("casey".into())
         );
         assert!(super::sshd::parse_account_mode("named:").is_err());
         assert!(super::sshd::parse_account_mode("root").is_err());

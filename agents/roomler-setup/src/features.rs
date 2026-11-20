@@ -63,6 +63,13 @@ pub struct SetupFeatures {
     /// alone; a split server sends `wizard_linux_daemon &&
     /// wizard_macos_daemon` for the wizards released before it.
     pub wizard_unix_daemon: bool,
+    /// FR-141 P3 — the server said `"wizard_reinstall_guard": false` in so
+    /// many words: the operator turned the one-row guard off
+    /// ([`crate::reinstall_guard`]). The guard is ON by default, the other
+    /// way round from every switch above, so this and only this turns it
+    /// off: an older server, a timeout, an error page or a string `"false"`
+    /// leave it on, because a Mac it fails to guard ends up with three rows.
+    pub reinstall_guard_off: bool,
 }
 
 impl SetupFeatures {
@@ -80,6 +87,12 @@ impl SetupFeatures {
             HostOs::Macos => self.wizard_macos_daemon || self.wizard_unix_daemon,
             HostOs::Windows | HostOs::Other => false,
         }
+    }
+
+    /// FR-141 P3 — is the one-row guard on? Yes unless the server turned it
+    /// off ([`Self::reinstall_guard_off`]).
+    pub fn reinstall_guard_on(self) -> bool {
+        !self.reinstall_guard_off
     }
 
     /// The answer as the page binds it, for `os`: the per-OS rule applied
@@ -165,6 +178,10 @@ pub fn parse(status: u16, body: &[u8]) -> SetupFeatures {
         wizard_linux_daemon: flag("wizard_linux_daemon"),
         wizard_macos_daemon: flag("wizard_macos_daemon"),
         wizard_unix_daemon: flag("wizard_unix_daemon"),
+        reinstall_guard_off: object
+            .get("wizard_reinstall_guard")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
     }
 }
 
@@ -320,7 +337,30 @@ mod tests {
         wizard_linux_daemon: true,
         wizard_macos_daemon: true,
         wizard_unix_daemon: true,
+        reinstall_guard_off: false,
     };
+
+    /// FR-141 P3 — the one-row guard is on unless the server says a JSON
+    /// `false`: absent (every server before the key), a string, an error
+    /// page or no answer at all keep it on.
+    #[test]
+    fn only_a_json_false_turns_the_one_row_guard_off() {
+        assert!(parse(200, ALL_ON).reinstall_guard_on(), "absent is on");
+        assert!(
+            !parse(
+                200,
+                br#"{"pairing": true, "wizard_reinstall_guard": false}"#
+            )
+            .reinstall_guard_on(),
+            "the operator's false"
+        );
+        assert!(parse(200, br#"{"wizard_reinstall_guard": true}"#).reinstall_guard_on());
+        assert!(parse(200, br#"{"wizard_reinstall_guard": "false"}"#).reinstall_guard_on());
+        assert!(parse(200, br#"{"wizard_reinstall_guard": 0}"#).reinstall_guard_on());
+        assert!(parse(404, br#"{"wizard_reinstall_guard": false}"#).reinstall_guard_on());
+        assert!(parse(200, b"<html>blocked</html>").reinstall_guard_on());
+        assert!(SetupFeatures::default().reinstall_guard_on());
+    }
     const ALL_ON: &[u8] = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": true, "wizard_unix_daemon": true, "wizard_pairing": true}"#;
 
     /// Only a JSON `true` switches a key on.

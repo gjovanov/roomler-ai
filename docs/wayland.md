@@ -43,6 +43,15 @@ flowchart TD
   only while that session is on screen and unlocked
   ([`linux-capture.md`](linux-capture.md) §1.2.1). Otherwise, or with the keys
   set to off, the viewer is told `wayland_not_enabled` and what is missing.
+- **The banner counts only once it is shown to be there** (#2531). A session
+  counts as told by the companion's banner only after that person's companion
+  has read the live sessions from the daemon, within 6 s of the capture
+  opening. A companion that cannot reach the daemon, or that stops reading for
+  longer than that, gets the notification instead, and the daemon's log names
+  which one said it. The companion reaches a root daemon through a socket in the
+  person's own runtime directory, and that socket now follows them through a
+  log-out and log-in by itself
+  ([`desktop-companion.md`](desktop-companion.md) §12.5).
 - **Every refusal names itself.** A Wayland desktop that no arm may capture
   says so, never a black stream and never "headless"
   ([`linux-capture.md`](linux-capture.md) §1.1).
@@ -213,4 +222,4 @@ ones that decide this page:
 | — | `ROOMLERD_SESSION_WATCH` | on | the user-switch notice (`session_away`); off = the last frame stays, with no reason |
 | — | `ROOMLERD_SLEEP_NOTICE` | on | the sleep notice (`host_sleep`) and the logind delay inhibitor that gives it time; off = a sleeping computer says nothing, as before P5h |
 | — | `ROOMLERD_NOTIFY_CONSENT` | on | a consent question no panel or companion can show goes to the desktop's notification (P6f); off = `no_prompt_surface` there, as before |
-| — | `ROOMLERD_VIEWING_NOTICE` | on | a session on the DRM arm, which no compositor indicator shows, starts the companion, else posts a being-viewed notification with Disconnect (P6g); off = nothing at the screen, as before |
+| — | `ROOMLERD_VIEWING_NOTICE` | on | a session on the DRM arm, which no compositor indicator shows, starts the companion, else posts a being-viewed notification with Disconnect (P6g). Since #2531 the banner counts only once the companion has read the session within 6 s, and the notification goes up when it has not, or when it stops reading; off = nothing at the screen, as before |

@@ -743,3 +743,129 @@ async fn an_over_allowance_orgs_pairs_leave_turn_for_the_derp_floor() {
         "back inside the allowance, TURN is granted again"
     );
 }
+
+/// A relay request that says whether the requester's `/derp` failed, as an
+/// agent's does (`derp_mux_failed`, absent when false).
+async fn relay_request_reporting(ws: &mut Ws, peer: ObjectId, derp_mux_failed: bool) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let req = serde_json::json!({
+        "t": "rc:overlay.relay_request",
+        "peer_node_id": peer.to_hex(),
+        "derp_mux_failed": derp_mux_failed,
+    });
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send relay_request");
+}
+
+/// #2992 — the P4c-1 pin respects a node's report that it cannot hold
+/// `/derp`. Over the allowance the pair is stamped DERP and granted no TURN.
+/// Once one end's relay request reports `derp_mux_failed`, that end is
+/// granted TURN and the pair is re-stamped on BOTH ends at once, with its
+/// capability verdict. The server remembers the report per node, so the
+/// other end, whose own `/derp` works, is granted TURN too. A later request
+/// from the reporting end with `/derp` up takes the report back, and the pair
+/// is stamped DERP again.
+#[tokio::test]
+async fn the_allowance_pin_lets_go_of_a_pair_whose_end_cannot_hold_derp() {
+    use std::time::Duration;
+    let app = TestApp::spawn_with_settings(|s| {
+        enable(s);
+        s.relay_allowance.turn = true;
+    })
+    .await;
+    let Some(redis) = app.state.redis_pubsub.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let seeded = app.seed_tenant("i2992").await;
+    let tid = oid(&seeded.tenant_id);
+    let mut ws: Vec<Ws> = Vec::new();
+    for m in ["i2992-a", "i2992-b"] {
+        let (_, token) = enroll(&app, &seeded, m).await;
+        ws.push(connect_agent(&app, &token).await);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let [a, b] = &mut ws[..] else { unreachable!() };
+    join_derp(a, 4, true).await;
+    join_derp(b, 5, true).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a_node = live_node(&app, tid, "i2992-a").await;
+    let (a_id, b_id) = (
+        a_node.id.unwrap(),
+        live_node(&app, tid, "i2992-b").await.id.unwrap(),
+    );
+    let network = a_node.network_id;
+    let drain = Duration::from_millis(500);
+    let single_relay =
+        |v: &Option<String>| v.as_deref().is_some_and(|v| v.starts_with("single-relay"));
+
+    // Over the allowance: stamped DERP, and no TURN grant.
+    recv_t(a, "drain", drain).await;
+    let key = relay_allowance::set_key(app.db.name());
+    let set = serde_json::json!({ network.to_hex(): 125_000 }).to_string();
+    redis.kv_set_ex(&key, &set, 900).await.unwrap();
+    relay_allowance::refresh(net(&app)).await;
+    assert_eq!(
+        verdict_for(a, b_id, Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some("derp"),
+        "over the allowance, the pair's verdict is DERP"
+    );
+    relay_request_reporting(a, b_id, false).await;
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(2))
+            .await
+            .is_none(),
+        "with /derp up, no TURN grant"
+    );
+
+    // A reports that it cannot hold /derp.
+    recv_t(a, "drain", drain).await;
+    recv_t(b, "drain", drain).await;
+    relay_request_reporting(a, b_id, true).await;
+    let to_a = verdict_for(a, b_id, Duration::from_secs(5)).await;
+    assert!(
+        single_relay(&to_a),
+        "the reporting end's row for its peer is re-stamped with its capability: {to_a:?}"
+    );
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(5))
+            .await
+            .is_some(),
+        "and it is granted TURN"
+    );
+    let to_b = verdict_for(b, a_id, Duration::from_secs(5)).await;
+    assert!(
+        single_relay(&to_b),
+        "the other end is re-stamped in the same breath: {to_b:?}"
+    );
+    // The report is A's, remembered: B's own request, /derp up, gets TURN too.
+    relay_request_reporting(b, a_id, false).await;
+    assert!(
+        recv_t(b, "rc:overlay.relay_grant", Duration::from_secs(5))
+            .await
+            .is_some(),
+        "the pair keeps TURN from either end while the report stands"
+    );
+
+    // A's /derp is up again: the report is taken back, and the pin returns.
+    recv_t(a, "drain", drain).await;
+    recv_t(b, "drain", drain).await;
+    relay_request_reporting(a, b_id, false).await;
+    assert_eq!(
+        verdict_for(a, b_id, Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some("derp"),
+        "the pair is stamped DERP again"
+    );
+    assert!(
+        recv_t(a, "rc:overlay.relay_grant", Duration::from_secs(2))
+            .await
+            .is_none(),
+        "and granted no TURN"
+    );
+}

@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11074`](../agents/roomlerd/src/peer.rs#L11074)).
+control-channel arm sends the answer ([`peer.rs:11075`](../agents/roomlerd/src/peer.rs#L11075)).
 
 ### The answers
 
@@ -102,7 +102,7 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3527`](../crates/localapi/src/lib.rs#L3527), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
+  ([`lib.rs:3561`](../crates/localapi/src/lib.rs#L3561), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
   push it ([`models.rs:9768`](../crates/remote_control/src/models.rs#L9768)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
@@ -292,7 +292,7 @@ sequenceDiagram
   ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1602`](../agents/roomlerd/src/virtual_desktop.rs#L1602) `start_server`). An
+  the same display ([`virtual_desktop.rs:1613`](../agents/roomlerd/src/virtual_desktop.rs#L1613) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`

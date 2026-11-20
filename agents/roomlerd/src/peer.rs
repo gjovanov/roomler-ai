@@ -4501,7 +4501,8 @@ async fn media_pump_vp9_444_dc(
             warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
             return;
         }
-        if send_tx.capacity() == 0 || pipeline.followers_congested() {
+        delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
@@ -4513,7 +4514,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -4521,7 +4522,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
         // software encoder cannot hold the target, take frames on an even grid
@@ -5019,7 +5020,7 @@ async fn media_pump_vp9_444_dc(
                         quality = quality::label(q_now),
                         base_bps = base,
                         ceiling_bps = ceiling,
-                        target_bps = applied.bps,
+                        target_bps = applied.bps, why = %applied.why,
                         "VP9-444 set_bitrate (AIMD)"
                     );
                 }
@@ -5193,14 +5194,15 @@ async fn media_pump_vp9_444_dc(
         // queue. On webrtc-rs this rarely fires (dc.send().await blocks first,
         // keeping buffered_amount low), but it's a cheap belt-and-suspenders
         // check that also preserves the shed-on-overflow behaviour.
+        // FR-148 D46 B3 — under `on`, on a relay, the budget's hold replaces it.
         let buffered = dc.buffered_amount().await as u64;
-        if buffered > dc_buffered_high {
+        if delivery.sheds(buffered > dc_buffered_high) {
             if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                 enc.set_bitrate(applied.bps).await;
                 info!(
                     %session_id,
                     buffered,
-                    new_target = applied.bps,
+                    new_target = applied.bps, why = %applied.why,
                     "VP9-444 AIMD decrease (DC buffer over high watermark)"
                 );
             }
@@ -5334,7 +5336,7 @@ async fn media_pump_vp9_444_dc(
                 avg_scale_ms,
                 avg_encode_ms,
                 paced_fps = ?governor.paced_software_fps(),
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
                 // FR-15 — the viewer's own paint age + the learned path
@@ -5391,7 +5393,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, None); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -7246,7 +7248,7 @@ async fn media_pump_ffmpeg_dc(
     // STATIC image — invisible). The governor's mirror advances at emit
     // time, so heartbeat `target_bps` shows the target while the encoder
     // briefly runs the old maxrate — an accepted, bounded skew.
-    let mut deferred_bps: Option<u32> = None;
+    let mut deferred_bps: Option<crate::encode::governor::AppliedBitrate> = None;
     // Seeded "a minute ago" so the first apply lands at once — through the
     // boot-safe helper: `Instant::now() - 60 s` panics on a host up for less
     // than a minute, and a session that starts that early is exactly what a
@@ -8105,7 +8107,8 @@ async fn media_pump_ffmpeg_dc(
         // produced on 2026-09-04 (662 ms and 782 ms passes with both at zero),
         // and it is why this whole block is timed rather than just its sleep.
         let gate_start = watch.start();
-        if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
+        delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
                 info!(
@@ -8162,12 +8165,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            let bp_applied = if constrained && !opener_grace_done {
-                grace_bp_skips += 1;
-                None
-            } else {
-                governor.on_backpressure_skip(std::time::Instant::now())
-            };
+            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            let in_grace = constrained && !opener_grace_done;
+            grace_bp_skips += u32::from(in_grace);
+            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
@@ -8186,7 +8187,7 @@ async fn media_pump_ffmpeg_dc(
                     deferred_bps = None;
                     swap_wanted = Some(applied.bps);
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -8196,7 +8197,7 @@ async fn media_pump_ffmpeg_dc(
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
         PassWatch::stop(gate_start, &mut gate_us);
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -9508,7 +9509,7 @@ async fn media_pump_ffmpeg_dc(
                 && enc.reconfig_forces_idr()
                 && applied.bps > enc.current_maxrate_bps();
             if held_increase {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             } else if enc.supports_dynamic_bitrate() {
                 deferred_bps = None;
                 if constrained && relay_idr_thrift {
@@ -9562,22 +9563,22 @@ async fn media_pump_ffmpeg_dc(
                         timed_apply!(enc.set_bitrate(applied.bps).await);
                     }
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             } else {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             }
             if applied.changed {
                 info!(
                     %session_id,
                     codec_label,
                     ceiling_bps = ceiling,
-                    target_bps = applied.bps,
+                    target_bps = applied.bps, why = %applied.why,
                     deferred = deferred_bps.is_some(),
                     "FFmpeg DC pump set_bitrate (AIMD)"
                 );
             }
-        } else if let Some(bps) = deferred_bps
+        } else if let Some(held) = deferred_bps
             && last_motion_at.elapsed() >= DEFER_QUIET
         {
             // FR-10 — relay IDR thrift: each flush is a re-open whose first
@@ -9591,7 +9592,7 @@ async fn media_pump_ffmpeg_dc(
                 relay_idr_thrift,
                 last_deferred_apply_at.map(|t| t.elapsed()),
                 enc.current_maxrate_bps(),
-                bps,
+                held.bps,
             );
             if allow {
                 // Quiet flush: the held QSV/AMF target applies now, while the
@@ -9609,11 +9610,11 @@ async fn media_pump_ffmpeg_dc(
                     // inside the window is dead air. The quiet-gated adoption
                     // still bumps `send_epoch` and still ships the IDR on a
                     // static scene; only the freeze goes away.
-                    swap_wanted = Some(bps);
+                    swap_wanted = Some(held.bps);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate scheduled (background rebuild)"
                     );
                 } else {
@@ -9622,11 +9623,11 @@ async fn media_pump_ffmpeg_dc(
                     if !enc.supports_dynamic_bitrate() {
                         send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    timed_apply!(enc.set_bitrate(bps).await);
+                    timed_apply!(enc.set_bitrate(held.bps).await);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate applied at quiet"
                     );
                 }
@@ -9967,7 +9968,7 @@ async fn media_pump_ffmpeg_dc(
                             deferred_bps = None;
                             swap_wanted = Some(applied.bps);
                         } else {
-                            deferred_bps = Some(applied.bps);
+                            deferred_bps = Some(applied);
                         }
                     }
                 }
@@ -10165,7 +10166,7 @@ async fn media_pump_ffmpeg_dc(
                 codec_label,
                 target_fps,
                 constrained,
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 width = w,
                 height = h,
                 encoder = enc.name(),
@@ -10357,7 +10358,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, seed_age); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block

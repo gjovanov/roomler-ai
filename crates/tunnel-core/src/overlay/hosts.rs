@@ -161,29 +161,59 @@ fn write_atomic(path: &std::path::Path, content: &str) -> io::Result<()> {
     }
 }
 
-/// How often the ladder re-tests the DNS rung. Cheap (one `getaddrinfo`), and
-/// the interval is the worst-case lag before a host whose DNS came back climbs
-/// off the hosts file.
-const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
-/// A `getaddrinfo` that has not answered in this long is a failure. Generous:
-/// on an enforced-DNS host the query is refused fast, but a corporate resolver
-/// under load can be slow, and a false "DNS is broken" would write the fallback
-/// on a host that does not need it.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// What one tick does to the hosts file, decided apart from the file.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Leave the file alone.
+    Hold,
+    /// Write the block, or bring it in step with the netmap.
+    Write,
+    /// Remove the block, if there is one.
+    Clear(&'static str),
+}
+
+/// #1363 — the ladder's decision for one tick. Each NEW reading (by its
+/// `seq`) moves the rung once; between readings an active block is only kept
+/// in step with the netmap, so a peer that joined or changed address is never
+/// missing from it. Any answer is the DNS rung, this node's resolver or not:
+/// names resolve, which is all the rung is for (the status is stricter).
+fn step(enabled: bool, active: bool, seen: &mut u64, reading: &super::dns_probe::Reading) -> Step {
+    if !enabled {
+        return Step::Clear("switch off");
+    }
+    if reading.seq == 0 || reading.seq == *seen {
+        return if active { Step::Write } else { Step::Hold };
+    }
+    *seen = reading.seq;
+    if reading.outcome.dns_resolves() {
+        // Never ratchet: DNS works, so give the file back.
+        Step::Clear("the OS DNS path reaches the resolver again")
+    } else {
+        Step::Write
+    }
+}
 
 /// The MagicDNS resolution ladder: prefer the OS DNS steer, fall back to the
 /// hosts file, and **climb back** as soon as DNS works again.
 ///
 /// The rung is chosen by measurement, never assumed — the same rule the carrier
-/// cascade follows. The measurement is [`dns::PROBE_LABEL`], a name only our own
-/// resolver answers, resolved through the OS: it succeeds exactly when the OS
-/// steer reaches us.
+/// cascade follows. The measurement is [`dns::PROBE_LABEL`], a name only an
+/// overlay resolver answers, resolved through the OS: it succeeds exactly when
+/// the OS DNS path reaches one.
+///
+/// #1363 — the lookup is no longer the ladder's own: one probe task
+/// ([`super::dns_probe::OsProbe`]) makes it once a minute, off the runtime
+/// loop, and the status reads the same reading. The ladder acts on each new
+/// reading once ([`step`]).
+///
+/// [`dns::PROBE_LABEL`]: super::dns::PROBE_LABEL
 pub struct Ladder {
     enabled: bool,
     magic_domain: String,
     /// Is our block currently in the file?
     active: bool,
-    next_probe: std::time::Instant,
+    /// The last probe reading acted on ([`super::dns_probe::Reading::seq`]).
+    seen: u64,
 }
 
 impl Ladder {
@@ -203,48 +233,44 @@ impl Ladder {
             enabled,
             magic_domain,
             active: false,
-            next_probe: std::time::Instant::now(),
+            seen: 0,
         }
     }
 
-    /// Does the OS resolve a name only our resolver can answer?
-    async fn dns_reaches_us(&self) -> bool {
-        let host = format!("{}.{}:0", super::dns::PROBE_LABEL, self.magic_domain);
-        match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::lookup_host(host)).await {
-            Ok(Ok(mut addrs)) => addrs.next().is_some(),
-            _ => false,
-        }
+    /// The kill switch, as constructed: the runtime runs the probe for the
+    /// ladder while it is on, whatever else the host's state.
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
-    /// Called from the runtime's periodic tick.
-    pub async fn tick(&mut self, names: &super::dns::NameMap, answer_aaaa: bool) {
-        if !self.enabled {
-            self.deactivate("switch off");
-            return;
-        }
-        if std::time::Instant::now() < self.next_probe {
-            // Between probes, keep an ACTIVE block in step with the netmap —
-            // a peer that joined or changed address must not be missing from it.
-            if self.active {
+    /// Is the hosts-file block serving the names right now? (#1363: the
+    /// status's `names served from the hosts file`.)
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Called from the runtime's periodic tick with the probe's latest
+    /// reading. Never waits on the network: the lookup is the probe task's.
+    pub fn tick(
+        &mut self,
+        reading: &super::dns_probe::Reading,
+        names: &super::dns::NameMap,
+        answer_aaaa: bool,
+    ) {
+        match step(self.enabled, self.active, &mut self.seen, reading) {
+            Step::Hold => {}
+            Step::Clear(why) => self.deactivate(why),
+            Step::Write => {
+                if !self.active {
+                    tracing::warn!(
+                        domain = %self.magic_domain,
+                        "magicdns: the OS DNS path does not reach our resolver — \
+                         falling back to hosts-file entries"
+                    );
+                }
+                self.active = true;
                 self.write(names, answer_aaaa);
             }
-            return;
-        }
-        self.next_probe = std::time::Instant::now() + PROBE_EVERY;
-
-        if self.dns_reaches_us().await {
-            // Never ratchet: DNS works, so give the file back.
-            self.deactivate("the OS DNS path reaches the resolver again");
-        } else {
-            if !self.active {
-                tracing::warn!(
-                    domain = %self.magic_domain,
-                    "magicdns: the OS DNS path does not reach our resolver — \
-                     falling back to hosts-file entries"
-                );
-            }
-            self.active = true;
-            self.write(names, answer_aaaa);
         }
     }
 
@@ -299,6 +325,66 @@ mod tests {
 
     fn e(name: &str, v4: [u8; 4]) -> Entry {
         (name.into(), Ipv4Addr::from(v4), None)
+    }
+
+    /// #1363 — the ladder reads the shared probe's readings and decides as it
+    /// did when the lookup was its own: each new reading moves the rung once,
+    /// any answer is the DNS rung (this node's resolver or another), and an
+    /// active block follows the netmap between readings.
+    #[test]
+    fn the_ladder_moves_once_a_reading_and_takes_any_answer_as_dns() {
+        use super::super::dns_probe::{Outcome, Reading};
+        let r = |seq, outcome| Reading {
+            seq,
+            outcome,
+            at: None,
+            reason: None,
+            next_at: None,
+        };
+        let other = std::net::IpAddr::V4(Ipv4Addr::new(100, 65, 4, 2));
+        let mut seen = 0;
+
+        // Nothing measured yet: nothing to do.
+        assert_eq!(
+            step(true, false, &mut seen, &Reading::default()),
+            Step::Hold
+        );
+        // Unanswered: the hosts rung.
+        assert_eq!(
+            step(true, false, &mut seen, &r(1, Outcome::Unanswered)),
+            Step::Write
+        );
+        assert_eq!(seen, 1);
+        // The same reading again moves nothing; the active block only follows
+        // the netmap.
+        assert_eq!(
+            step(true, true, &mut seen, &r(1, Outcome::Unanswered)),
+            Step::Write
+        );
+        assert_eq!(
+            step(true, false, &mut seen, &r(1, Outcome::Unanswered)),
+            Step::Hold
+        );
+        // Another node's resolver answering is DNS working: climb back.
+        assert_eq!(
+            step(
+                true,
+                true,
+                &mut seen,
+                &r(2, Outcome::AnsweredElsewhere(other))
+            ),
+            Step::Clear("the OS DNS path reaches the resolver again")
+        );
+        assert_eq!(
+            step(true, true, &mut seen, &r(3, Outcome::Answered)),
+            Step::Clear("the OS DNS path reaches the resolver again")
+        );
+        // The switch off clears, whatever the reading.
+        assert_eq!(
+            step(false, true, &mut seen, &r(4, Outcome::Unanswered)),
+            Step::Clear("switch off")
+        );
+        assert_eq!(seen, 3, "a switched-off ladder takes no reading");
     }
 
     #[test]

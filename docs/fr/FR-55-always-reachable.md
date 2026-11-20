@@ -6,7 +6,7 @@ evidence and then built under FR-97 P3b (2026-10-17, the last section), **P4 bui
 [#3148](https://github.com/gjovanov/roomler-ai/pull/3148) (2026-10-30)**: a device going
 to sleep says so first and reads *asleep* instead of *offline* (§P4 design),
 **field-verified on Linux on the released `0.4.190`** (2026-10-31, field log), with the
-same read owed on Windows and on a Mac;
+same read made on Windows (2026-11-01, the chip by eye 2026-11-20) and still owed on a Mac;
 P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
 falls asleep on battery and is then plugged in stays asleep all night with our
 assertion held (2026-09-24, field log). This line read "proposed" until then, with the
@@ -190,11 +190,11 @@ The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
       `roomler devices` and on the API, and the same device read plain `offline` when it
       lost its network instead (field log). 2026-11-01: Windows' hook has run for real.
       Three laptops logged 11 goodbyes on `0.4.190`–`0.4.194`, and one of them was asleep at
-      the read, with `sleep` on its row on `0.4.195` (field log). Owed: a Mac, whose hook has
-      not run in a field test, and the chip read by eye on a Windows row. The box stays
-      partial until then. 2026-10-30, #3148: built and proven through the real
-      server (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`,
-      shown failing first with the kill switch).*
+      the read, with `sleep` on its row on `0.4.195` (field log). 2026-11-20: the chip read `asleep` by eye on a Windows
+      row, and a Mac's hook has run in the field, 4 sleeps on `0.4.218`–`0.4.224` with each goodbye written (field log).
+      Owed: a Mac row read while that Mac sleeps, `sleep` on its row or its chip reading `asleep`, which shows the server
+      got the frame. The box stays partial until then. 2026-10-30, #3148: built and proven through the real server
+      (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`, shown failing first with the kill switch).*
 - [~] ⚠️ The macOS **clamshell** limitation is documented in the UI where the policy is
       set — not discovered by a user whose lid-closed Mac still vanishes. *2026-10-30,
       #3148: the policy is set in two places, and both carry the key's ⚠️ clamshell
@@ -478,3 +478,62 @@ macOS), and the same chip was read on Linux on 10-31. So AC5's Windows half rest
 and that code, not on a person's eyes.
 
 Still owed: a Mac asleep on `0.4.190` or newer. AC5 stays partial.
+
+### 2026-11-20 — a Mac's goodbye runs in the field, and the chip is read by eye on Windows
+
+Nobody staged this one either. Two bounded reads of production at 08:26Z and 08:30Z took 7
+days of `agent_logs` and every `agents` row, with the client outside the database pod
+(`scripts/prod-mongo-read.sh`), sliced by day, each slice counted before it was read.
+`mongodb-0`'s restart count was 1 before and after both reads, with no memory event. The
+goodbye lines were found through one rare word of the text index, `goodbye`, and then by
+their fixed prefix, never a phrase search or a regex: 65 of 391,542 batches carry the word,
+and they hold 66 goodbye lines and 55 hook summaries.
+
+| device | goodbye lines | hook runs that told the server (`said ≥ 1`) | releases logged | last goodbye | the row at the read |
+|---|---|---|---|---|---|
+| Mac, root daemon row | 4 | 4 of 4 | `0.4.218`–`0.4.224` | 11-17 | `online` on `0.4.227`, no `sleep` |
+| Mac, per-user row | 4 | 4 of 4 | `0.4.218`–`0.4.224` | 11-17 | `online` on `0.4.227`, no `sleep` |
+| Windows laptop 1 | 21 | 21 of 21 | `0.4.218`–`0.4.227` | 11-19 | `offline` on `0.4.227`, no `sleep` |
+| Windows laptop 2 | 8 | 8 of 9 | `0.4.220`–`0.4.228` | 11-20 | `offline` on `0.4.228`, `sleep: { at: 07:04:05Z, power: { policy: never, on_ac: true, held: false } }` |
+| Windows laptop 3 | 14 | 7 of 7 | `0.4.224`–`0.4.227` | 11-19 | `online` on `0.4.228` |
+| Windows laptop 4 | 10 | 5 of 5 | `0.4.224`–`0.4.227` | 11-19 | `online` on `0.4.228` |
+| Windows laptop 5 | 5 | 5 of 5 | `0.4.224`, `0.4.227` | 11-19 | `online` on `0.4.228` |
+
+- **The Mac's IOKit hook has run in the field.** Each of the Mac's 4 sleeps logged, on both
+  of its rows, the goodbye (`agents/roomlerd/src/signaling.rs:2314-2319`), the hook's summary
+  with `connections=1 said=1` (`agents/roomlerd/src/sleep_notice.rs:429-435`), the reconnect
+  hold and `awake again: reconnecting` (`:341-346`). Every one was asleep by policy with
+  nothing held: the per-user half at `never`, the root daemon at `on-ac` with `on_ac` false
+  or unknown.
+- **No Mac logged a hook failure.** 53 Mac rows logged the hook's start (`:878`) 347 times on
+  `0.4.216`–`0.4.228`, and none logged that `IORegisterForSystemPower` failed or that the
+  run loop ended (`:862-866`, `:882`). Most of them are short-lived test machines that never
+  slept.
+- **What this read can't show for the Mac is `sleep` on its row.** The server writes it at
+  the goodbye (`crates/modules/fleet/src/socket.rs:709-734`) and the next hello clears it.
+  Nothing else keeps it: the socket's end is only a server log line (`:1085-1095`). The Mac
+  logged no sleep after 11-17, so whether the server got those frames was not read. As on
+  10-31, `said=1` says only that the frame was written.
+- **Laptop 2 was asleep at the read,** by policy: `never`, on mains, nothing held.
+- **Laptop 1's `offline` carries no reason.** It went offline at 00:57Z with no `sleep` on its
+  row, so no goodbye reached the server then. Like C's on 11-01, the row says plain `offline`,
+  which is all it knows.
+- **Laptop 5 slept 5 times with its policy at `always` and the hold taken** (`held: true`). A
+  Windows power request doesn't stop a sleep that a closed lid or a person asks for. Such a
+  row reads `asleep` with the "past its hold" sentence instead of "as its power policy allows"
+  (`ui/src/utils/devicePresence.ts:109-116`).
+- Four of the five Windows laptops reported running on battery at a goodbye. A laptop with
+  two goodbye lines per hook run has two control connections.
+
+**The chip, by eye.** At 08:29Z the devices page of laptop 2's org was opened in a new tab of
+the operator's browser, signed in to an account of that org. The row showed the sleep icon and
+a blue-grey `asleep` status chip, next to two Windows rows of the same org that read plain
+`offline`. The chip's explanation gave the moment of the sleep, the row's `sleep.at`
+(07:04:05Z) in the browser's time zone, and said the device slept as its power policy allows,
+with nothing holding it awake (`never`, on mains). It also said the device reconnects by
+itself when it wakes, and that `on-ac` or `always` keeps it reachable. That is the sentence the
+Linux guest's chip showed on 10-31, read this time on a Windows row. Nothing on the page was
+clicked except the table's search field and its clear button.
+
+Still owed: a Mac row read while the Mac sleeps, either `sleep` on its row or its chip reading
+`asleep`. That read is what shows the server got a Mac's frame. AC5 stays partial.
