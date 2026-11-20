@@ -519,14 +519,17 @@ Join «Acme» (acme) as approved by «Dana» (@dana)? [y/N]
 > reason for the byte-for-byte match, and an early draft that case-folded let exactly such a
 > lookalike through on the dev stack.
 
-**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:306-345`) is refused
+**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:340-380`) is refused
 beside `--token` or `--no-enroll`, for the tunnel role (the `roomler` CLI has no `--pair` yet),
 beside `--daemon-token`, and on a B0 half. The slug is checked against a spelled-out character
 class, because a range like `a-z` follows the locale's collation in some shells. The enroll
 then runs where `--token` ran: as the console user for a per-user install, as root into
-`/etc/roomler/config.toml` for `--system`, with stdin from `/dev/null` (`:1156-1177`). On macOS
-the root half is a second enrollment, so a paired per-user install prints the two commands
-that pair it afterwards, as root (`:909-917`); one approval for both halves is B2.
+`/etc/roomler/config.toml` for `--system`, with stdin from `/dev/null` (`:1313-1334`). On macOS,
+since FR-43's flip on 2026-11-19, a Mac that is not enrolled yet pairs as one row: one approval,
+and the root half enrolls with it as the Mac's only row (`:1213-1229`). A paired per-user install
+(`--per-user`, or a Mac whose person's half was enrolled already) prints the two commands that
+pair the root half afterwards, as root, as a row of its own (`:974-982`). The wizard's one
+approval for both halves is B2, two rows until its one-row form in FR-43's next phase.
 `install.ps1 -Pair [-PairOrg SLUG]` has the same refusals (`scripts/install.ps1:216-230`, a
 case-sensitive `-cnotmatch`) and enrolls with the role's own elevation and `--machine-global`
 logic (`:313`).

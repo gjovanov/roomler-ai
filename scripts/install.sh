@@ -13,7 +13,7 @@
 #   Roles:
 #     daemon  — the roomlerd daemon ("be accessed"): Linux .deb / macOS .pkg,
 #               enrolls with an AGENT enrollment token (Devices → Enroll → Device),
-#               enables the packaged autostart (systemd user unit / LaunchAgent).
+#               enables the packaged autostart (systemd user unit; on a Mac, see --one-row).
 #     tunnel  — the roomler CLI only ("reach others"): enrolls with a TUNNEL
 #               enrollment token (Devices → Enroll → Tunnel client).
 #
@@ -134,8 +134,17 @@ MACOS_DAEMON_MARKER="/etc/roomler/enable-daemon"
 MACOS_DAEMON_BIN="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 DAEMON_TOKEN=""
 # FR-43 P3d — `--one-row`: the Mac's root half alone holds the enrollment (see
-# install_macos_one_row). Off by default, so a Mac installs as two rows.
+# install_macos_one_row). Since the operator's flip (2026-11-19) it is also the
+# DEFAULT for a Mac that is not enrolled yet (macos_default_layout); a Mac that
+# is enrolled keeps its layout. --per-user is the per-user half alone, the
+# layout a Mac got from this script before the flip.
 ONE_ROW=0
+ONE_ROW_BY_DEFAULT=0
+PER_USER=0
+# What macos_root_layout read (none / one-row / own-row), and why the default
+# kept a Mac off one row (own-row / per-user / no-credential), for the NOTE.
+ROOT_LAYOUT=""
+MACOS_KEPT=""
 NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
 # graphical session; --desktop / --no-desktop force it either way.
@@ -159,7 +168,7 @@ DIGEST_REQUIRED=0
 usage() {
     sed -n '2,51p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT | --pair [--pair-org SLUG]]"
-    echo "                  [--name NAME] [--daemon-token JWT | --one-row] [--system] [--download-only] [--no-enroll]"
+    echo "                  [--name NAME] [--daemon-token JWT | --one-row | --per-user] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
     echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
     echo "                  [--config-take KEYS] [--server URL] [--name NAME] [--desktop|--no-desktop]"
@@ -195,23 +204,30 @@ usage() {
     echo "                  the device's on-screen consent prompt, so a host set to"
     echo "                  'Prompt on host' without it cannot ask anybody."
     echo
-    echo "  --daemon-token  macOS only. Installs the privileged half as well (overlay/mesh)."
-    echo "                  macOS needs TWO processes: a per-user LaunchAgent for screen"
-    echo "                  capture and input (they only work inside a GUI login session)"
-    echo "                  and a root LaunchDaemon for the overlay (creating a utun needs"
-    echo "                  root). They cannot share one enrollment — the hub keys on the"
-    echo "                  device id, and the second connection displaces the first — so"
-    echo "                  this takes a SECOND single-use enrollment token and the Mac"
-    echo "                  appears as two devices."
+    echo "  --one-row       macOS. The DEFAULT for a Mac that is not enrolled yet: ONE token"
+    echo "                  (or one --pair approval), ONE device: the root LaunchDaemon holds"
+    echo "                  the enrollment, runs the overlay, and serves the screen through a"
+    echo "                  worker it starts in the login session, which holds none. The"
+    echo "                  package, the root half's enrollment, then the package again: its"
+    echo "                  guard removes the per-user LaunchAgent. On a Mac that is one row"
+    echo "                  already it only updates the package (no token needed). Without the"
+    echo "                  flag, a Mac that is enrolled already keeps its layout; with it, a"
+    echo "                  Mac whose per-user half is enrolled becomes one row (delete its old"
+    echo "                  row afterwards). An enrolled two-row Mac becomes one row with:"
+    echo "                  sudo roomlerd one-row"
     echo
-    echo "  --one-row       macOS only, off by default. ONE token (or one --pair approval),"
-    echo "                  ONE device: the root LaunchDaemon holds the enrollment, runs the"
-    echo "                  overlay, and serves the screen through a worker it starts in the"
-    echo "                  login session, which holds none. The package, the root half's"
-    echo "                  enrollment, then the package again: its guard removes the per-user"
-    echo "                  LaunchAgent. Not with --daemon-token. On a Mac that is one row"
-    echo "                  already it only updates the package (no token needed). An enrolled"
-    echo "                  two-row Mac becomes one row with: sudo roomlerd one-row"
+    echo "  --daemon-token  macOS only. TWO rows: the per-user half and the root half, each"
+    echo "                  its own device. A per-user LaunchAgent does screen capture and"
+    echo "                  input (they only work inside a GUI login session) and a root"
+    echo "                  LaunchDaemon the overlay (creating a utun needs root). They cannot"
+    echo "                  share one enrollment — the hub keys on the device id, and the"
+    echo "                  second connection displaces the first — so this takes a SECOND"
+    echo "                  single-use enrollment token. Not with --one-row."
+    echo
+    echo "  --per-user      macOS only. The per-user half alone: screen sharing, no overlay"
+    echo "                  mesh and no root service. The layout this script gave a Mac before"
+    echo "                  one row became the default, for a person who wants no root daemon"
+    echo "                  on their Mac. The package still needs sudo."
     exit 1
 }
 
@@ -225,6 +241,7 @@ while [ $# -gt 0 ]; do
         --name) NAME="$2"; shift 2 ;;
         --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
         --one-row) ONE_ROW=1; shift ;;
+        --per-user) PER_USER=1; shift ;;
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
@@ -271,7 +288,7 @@ case "$OS" in
 esac
 
 if [ "$SYSTEM" = 1 ] && { [ "$ROLE" != daemon ] || [ "$OS" != Linux ]; }; then
-    echo "error: --system applies to '--role daemon' on Linux only (on macOS use --daemon-token for the privileged half; the tunnel role installs a CLI, not a service)" >&2
+    echo "error: --system applies to '--role daemon' on Linux only (on macOS the root half comes with the default, one row, or with --daemon-token, two rows; the tunnel role installs a CLI, not a service)" >&2
     exit 1
 fi
 
@@ -303,6 +320,23 @@ if [ "$ONE_ROW" = 1 ]; then
     fi
 fi
 
+# FR-43 — `--per-user`: the per-user half alone, the layout this script gave a
+# Mac before one row became the default. Refused wherever it cannot mean that.
+if [ "$PER_USER" = 1 ]; then
+    if [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; then
+        echo "error: --per-user applies to '--role daemon' on macOS only (on Linux the per-user install is the default, and --system the root one)" >&2
+        exit 1
+    fi
+    if [ "$ONE_ROW" = 1 ] || [ -n "$DAEMON_TOKEN" ]; then
+        echo "error: --per-user installs the per-user half alone, and --one-row and --daemon-token each install the root half: pass one of them" >&2
+        exit 1
+    fi
+    if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
+        echo "error: --per-user is this script's terminal install: the halves a GUI runs (--privileged-steps, --user-steps) take their layout from the GUI" >&2
+        exit 1
+    fi
+fi
+
 # ─── FR-129 A4: --pair ──────────────────────────────────────────────────────
 #
 # One enrollment, two ways to its token: a pasted --token, or a pairing the
@@ -323,10 +357,11 @@ if [ "$PAIR" = 1 ] && [ "$UNINSTALL" != 1 ]; then
         exit 1
     fi
     if [ -n "$DAEMON_TOKEN" ]; then
-        # The root half is its own enrollment (FR-43). One approval for both
-        # halves is FR-129 B2; until then a paired Mac gets its root half from
-        # a second pairing run as root, which the per-user install prints.
-        echo "error: --pair pairs the per-user half; the macOS root half is a second enrollment, paired afterwards as root (the install prints the command) or taken from --token <jwt> --daemon-token <second-jwt>. One approval for both halves is FR-129 B2." >&2
+        # The root half is its own enrollment on two rows (FR-43). One
+        # approval for the whole Mac is the default one row; a paired per-user
+        # half gets its root half from a second pairing run as root, which the
+        # per-user install prints.
+        echo "error: --pair with --daemon-token would pair the per-user half and leave the root half a second enrollment: for one row from one approval, leave --daemon-token out (a Mac not enrolled yet pairs as one row by default); for two rows, pass --token <jwt> --daemon-token <second-jwt>." >&2
         exit 1
     fi
 elif [ -n "$PAIR_ORG" ] && [ "$UNINSTALL" != 1 ]; then
@@ -428,7 +463,7 @@ if [ "$OS" = Darwin ] && [ "$UNINSTALL" != 1 ]; then
     fi
     CONSOLE_UID="$(id -u "$CONSOLE_USER")"
     if [ "$(id -u)" = 0 ]; then
-        printf '==> %s\n' "running as root — the per-user half will be installed for '$CONSOLE_USER' (uid $CONSOLE_UID)"
+        printf '==> %s\n' "running as root — the console user is '$CONSOLE_USER' (uid $CONSOLE_UID): the screen is served from their session"
     fi
 fi
 
@@ -859,15 +894,26 @@ install_daemon_macos() {
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
-        if [ "$ONE_ROW" = 1 ]; then
+        # The dry run reads nothing on the Mac, so the default's plan is the
+        # one-row plan, and what an enrolled Mac does instead is said.
+        if [ "$ONE_ROW" = 1 ] || { macos_layout_unnamed && { [ -n "$TOKEN" ] || [ "$PAIR" = 1 ]; }; }; then
             say "download-only: would run: sudo touch $MACOS_DAEMON_MARKER"
             say "download-only: would run: sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --server $SERVER $(enroll_cred_hint) --name $NAME --overlay --one-row"
             say "download-only: would run the package again: its guard removes the per-user LaunchAgent and starts the root half"
+            [ "$ONE_ROW" = 1 ] || say "download-only: one row is the default for a Mac that is not enrolled yet; a Mac enrolled already keeps its layout (two rows, or the per-user half alone)"
             return 0
         fi
         say "download-only: would run: $daemon_bin enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
         [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
         return 0
+    fi
+
+    # FR-43 — one row is the default (the operator, 2026-11-19) for a Mac that
+    # is not enrolled yet, and a Mac that is enrolled keeps its layout (#971,
+    # 2026-11-02: a Mac changes layout only by its person's own command). A
+    # flag that names a layout skips the read.
+    if macos_layout_unnamed; then
+        macos_default_layout
     fi
 
     # FR-43 P3d — one token, one row: a sequence of its own.
@@ -897,6 +943,14 @@ install_daemon_macos() {
         exit 1
     }
 
+    macos_after_package "$daemon_bin"
+}
+
+# What follows the package on every layout but one row: the per-user half,
+# then the root half when one was asked for, then the notes. A one-row install
+# whose release has no one-row form falls back to this (install_macos_one_row).
+macos_after_package() {
+    daemon_bin="$1"
     # ── the per-user half: capture + input, inside the GUI session ──
     # The terminal path enrolls and kickstarts here; a privileged half leaves
     # both to the caller — its own enroll, then `--user-steps` as the person.
@@ -908,6 +962,15 @@ install_daemon_macos() {
     # ── the privileged half: overlay/mesh, as root, its own enrollment ──
     if [ -n "$DAEMON_TOKEN" ] || [ -n "$CONFIG_FROM" ]; then
         install_macos_privileged_half "$daemon_bin"
+    elif [ "$MACOS_KEPT" = own-row ]; then
+        # The default found a root half that is a row of its own (two rows,
+        # or P2's supervised worker on the person's enrollment): left alone.
+        # #4097: a migration begun within five minutes of the person's agent
+        # starting (this install restarted it) stops and puts the Mac back.
+        say "NOTE: this Mac's root half is enrolled already, as a row of its own, so the Mac"
+        say "      keeps its layout. To make it one row, wait five minutes after this install,"
+        say "      then run: sudo roomlerd one-row (sooner, it stops and leaves the Mac as it"
+        say "      was). It says its plan and asks first, and --revert puts the Mac back."
     elif [ "$PAIR" = 1 ]; then
         # FR-129 A4 — the root half is its own enrollment, so until B2 pairs
         # both halves from one approval it is paired afterwards, as root, in
@@ -922,8 +985,98 @@ install_daemon_macos() {
         say "      mesh does not (creating a utun needs root). Pass --daemon-token <a second"
         say "      enrollment token> to add the privileged half."
     fi
+    case "$MACOS_KEPT" in
+        per-user)
+            say "      Its per-user half was enrolled already, so it keeps that layout. For one"
+            say "      row (one device, the overlay on), run this again with --one-row and a new"
+            say "      token, then delete the old row in the dashboard (Devices)."
+            ;;
+        no-credential)
+            say "      Given --token <enrollment-jwt> or --pair, this script installs a Mac that"
+            say "      is not enrolled yet as one row: one device, the overlay on."
+            ;;
+    esac
 
     [ "$PRIV_STEPS" = 1 ] || macos_permissions_notice
+}
+
+# FR-43 — no flag names this Mac's layout: the default decides it
+# (macos_default_layout). --one-row, --per-user and --daemon-token name one;
+# --no-enroll enrolls nothing; a half (--privileged-steps) takes the GUI's.
+macos_layout_unnamed() {
+    [ "$ONE_ROW" != 1 ] && [ "$PER_USER" != 1 ] && [ -z "$DAEMON_TOKEN" ] \
+        && [ "$NO_ENROLL" != 1 ] && [ "$PRIV_STEPS" != 1 ] && [ -z "$CONFIG_FROM" ]
+}
+
+# FR-43 — the root half's layout, read the way the package's postinstall guard
+# reads it: none (no root config), one-row (both switches), or own-row (a row
+# of its own: two rows, or P2's supervised worker on the person's enrollment).
+macos_root_layout() {
+    if ! as_root test -f "$MACOS_DAEMON_CONFIG"; then
+        echo none
+    elif root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
+        echo one-row
+    else
+        echo own-row
+    fi
+}
+
+# FR-43 — the default (the operator's flip, 2026-11-19): one row on a Mac that
+# is not enrolled yet, and a Mac that is enrolled keeps its layout, call for
+# call. Enrolled is the root half's config, or a per-user config with an
+# enrollment: the console user's, and the caller's when that is another
+# person (where enroll_daemon would enroll). A Mac that is one row already
+# takes the one-row path, which then only updates the package. Nothing to
+# enroll with (no --token, no --pair) installs the per-user half, as before.
+macos_default_layout() {
+    ROOT_LAYOUT="$(macos_root_layout)"
+    case "$ROOT_LAYOUT" in
+        one-row) ONE_ROW=1; ONE_ROW_BY_DEFAULT=1; return 0 ;;
+        own-row) MACOS_KEPT=own-row; return 0 ;;
+    esac
+    if person_enrolled "$CONSOLE_USER"; then
+        MACOS_KEPT=per-user
+    elif [ "$(id -u)" != 0 ] && [ "$(id -u)" != "$CONSOLE_UID" ] && person_enrolled "$(id -un)"; then
+        MACOS_KEPT=per-user
+    elif [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; then
+        MACOS_KEPT=no-credential
+    else
+        ONE_ROW=1
+        ONE_ROW_BY_DEFAULT=1
+    fi
+}
+
+# Run a command as ACCOUNT: directly when this is that account, else through
+# sudo (root needs no password for it). FR-147: the layout's reads in a
+# person's home run as that person, never with root's rights.
+as_account() {
+    acct="$1"; shift
+    if [ "$(id -un)" = "$acct" ]; then "$@"; else sudo -H -u "$acct" "$@"; fi
+}
+
+# FR-43 — whether ACCOUNT's per-user config holds an enrollment, read as that
+# account. The safe side is enrolled: a home that cannot be found, a sudo that
+# cannot run as that account (a mistyped password, a cancel, no right to), or a
+# config there that its own account cannot read keeps the Mac's layout. sudo is
+# asked once, before the reads, and remembers a yes for them.
+person_enrolled() {
+    home="$(home_of "$1")"
+    [ -n "$home" ] || return 0
+    as_account "$1" true || {
+        warn "sudo could not run as $1, so this script cannot tell whether their per-user half is enrolled already: this Mac installs its per-user half, as before one row became the default"
+        return 0
+    }
+    # RETIRED-NAME-ANCHOR: the trees the daemon resolves, new first (appdirs.rs
+    # OLD_APP): live.roomler.roomler, then live.roomler.roomler-agent, pre-rename.
+    for tree in live.roomler.roomler live.roomler.roomler-agent; do
+        f="$home/Library/Application Support/$tree/config.toml"
+        as_account "$1" test -e "$f" || continue
+        if as_account "$1" grep -qE '^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"[^"]' "$f" 2>/dev/null; then
+            return 0
+        fi
+        as_account "$1" test -r "$f" || return 0
+    done
+    return 1
 }
 
 # postinstall bootstrapped com.roomler.agent into the CONSOLE user's gui
@@ -990,7 +1143,9 @@ root_config_says() {
     as_root grep -qE "^[[:space:]]*$1[[:space:]]*=[[:space:]]*true" "$MACOS_DAEMON_CONFIG"
 }
 
-# FR-43 P3d — `--one-row`: one token, one device row. The root half alone holds
+# FR-43 P3d — `--one-row`: one token, one device row, and since the operator's
+# flip (2026-11-19) the default for a Mac that is not enrolled yet
+# (macos_default_layout). The root half alone holds
 # the enrollment and runs the overlay, and it serves the person's screen through
 # a worker it starts in their login session, which holds no enrollment
 # (`macos_one_row`). The order is what makes it one command:
@@ -1012,13 +1167,13 @@ install_macos_one_row() {
     # which says its plan, keeps a copy of each file it changes and can put the
     # Mac back. Enrolling over it here would leave both rows.
     one_row_already=0
-    if as_root test -f "$MACOS_DAEMON_CONFIG"; then
-        if root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
-            one_row_already=1
-        else
-            echo "error: this Mac's root half is enrolled already ($MACOS_DAEMON_CONFIG), as a row of its own. --one-row installs a Mac that is not enrolled yet; to make this one one row, run: sudo roomlerd one-row (it says its plan and asks first, and --revert puts the Mac back). Nothing was changed, and the token is not spent." >&2
-            exit 1
-        fi
+    # The default read the root half already (macos_default_layout).
+    [ -n "$ROOT_LAYOUT" ] || ROOT_LAYOUT="$(macos_root_layout)"
+    if [ "$ROOT_LAYOUT" = one-row ]; then
+        one_row_already=1
+    elif [ "$ROOT_LAYOUT" = own-row ]; then
+        echo "error: this Mac's root half is enrolled already ($MACOS_DAEMON_CONFIG), as a row of its own. --one-row installs a Mac that is not enrolled yet; to make this one one row, run: sudo roomlerd one-row (it says its plan and asks first, and --revert puts the Mac back). Nothing was changed, and the token is not spent." >&2
+        exit 1
     elif [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; then
         echo "error: --one-row enrolls this Mac's root half as its one row: pass --token <enrollment-jwt> or --pair" >&2
         exit 1
@@ -1043,8 +1198,16 @@ install_macos_one_row() {
     fi
 
     # A release from before P3d refuses the flag. Asked before the marker and
-    # before the token is spent, so the Mac keeps only the package.
+    # before the token is spent, so the Mac keeps only the package. Taken by
+    # default, the install goes on as the per-user half, which needs nothing
+    # the package did not just give it; asked for, it stops.
     if ! "$daemon_bin" enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'; then
+        if [ "$ONE_ROW_BY_DEFAULT" = 1 ]; then
+            warn "this release's roomlerd has no 'enroll --one-row' yet, so this Mac installs its per-user half, as before one row became the default"
+            ONE_ROW=0
+            macos_after_package "$daemon_bin"
+            return 0
+        fi
         echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
         exit 1
     fi

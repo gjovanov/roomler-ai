@@ -120,9 +120,12 @@ describe('enrollCommands', () => {
     for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'user')) {
       // macOS carries a caveat at EVERY scope: its per-user/root split is a
       // property of the platform (capture needs a GUI session, a utun needs
-      // root), not of the scope the operator picked.
+      // root), not of the scope the operator picked. FR-43: one device by
+      // default, and the flags of the two other layouts.
       if (os.os === 'macos') {
-        expect(os.note).toMatch(/daemon-token/)
+        expect(os.note).toMatch(/one device/)
+        expect(os.note).toMatch(/--per-user/)
+        expect(os.note).toMatch(/--daemon-token/)
       } else {
         expect(os.note).toBeUndefined()
       }

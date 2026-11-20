@@ -82,11 +82,16 @@ flowchart LR
   that way, but Roomler SSH answers, because it terminates inside the daemon
   (`agents/roomlerd/src/overlay.rs:334-340`).
 - A Mac needs both halves for both planes: a root process has no WindowServer, and the person
-  cannot create a `utun`. Each half is its own enrollment, so such a Mac is two device rows by
-  default. FR-43 P3's switch, or `sudo roomlerd one-row` on a Mac already enrolled, makes it one
-  (`docs/installation.md`, macOS). With `macos_supervise_gui_worker` on (default
-  off), the root half starts a worker in the person's session itself, and stands down while the
-  LaunchAgent runs one (`agents/roomlerd/src/macos_supervisor.rs:3-36`).
+  cannot create a `utun`. Since FR-43's flip (the operator, 2026-11-19), the install script, and
+  so the dashboard's one-liner, makes a Mac that is not enrolled yet ONE device row: the root half
+  holds the enrollment and runs the overlay, and serves the screen through a worker it starts in
+  the person's session. A Mac enrolled already keeps its layout, and `sudo roomlerd one-row`
+  makes an enrolled two-row Mac one. Two rows, each half its own enrollment, are
+  `--daemon-token`'s (and the wizard's, until FR-43's next phase); `--per-user` is the per-user
+  half alone, with no mesh (`docs/installation.md`, macOS). With `macos_supervise_gui_worker`
+  on (one row turns it on; the key's own default is off), the root half starts a worker in the
+  person's session itself, and stands down while the LaunchAgent runs one
+  (`agents/roomlerd/src/macos_supervisor.rs:3-36`).
 - On Windows, an attended install's commands and SSH sessions run as the signed-in person until
   an administrator anchors the device to its service (FR-94, `docs/fleet-rpc.md`).
 
@@ -123,7 +128,7 @@ flow, and the consent chain's fallbacks.
 
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
-| In the mesh on an OS adapter | ✅ perMachine | ✅ system unit | ✅ root half, a second device row by default (one with FR-43 P3) | §2 |
+| In the mesh on an OS adapter | ✅ perMachine | ✅ system unit | ✅ root half: the Mac's one row by default (FR-43), a second row with `--daemon-token` | §2 |
 | One adapter per organization (multi-org) | ✅ | ✅ | ✅ | `agents/roomlerd/src/overlay.rs:318-324`; `docs/multi-org.md` |
 | Exit node, as a client | ✅ | ✅ | ✅ when the uplink has v6, else v6 fail-closed | `docs/overlay-exit-nodes.md`, Platform support |
 | Exit node and subnet router, serving IPv4 | 🟡 WinNAT, which needs the Hyper-V feature: without it (always on Home) the offer is withheld, with the reason | ✅ iptables | ✅ pf, in our own anchor; root half only | each OS's probe (`crates/tunnel-core/src/overlay/nat.rs:211`, `:228`, `:257`) |

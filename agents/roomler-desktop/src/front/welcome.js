@@ -198,22 +198,24 @@
   function paintNetwork() {
     const btn = el('wl-btn-net-enable');
     const userBox = el('wl-net-user');
-    // A Mac is two enrollments: this app talks to the per-user (capture)
-    // half, and the mesh belongs to the privileged half. Offering to put THIS
-    // half on the mesh as well would make the Mac two nodes.
+    // On a Mac the mesh belongs to the privileged (root) half: on one row
+    // (FR-43, install.sh's default since 2026-11-19) it holds the Mac's only
+    // enrollment, on two rows its own. Offering to put the per-user half on
+    // the mesh as well would make the Mac two nodes.
     if (platform.name === 'macos') {
       setText('wl-net-state', networkState());
       setText('wl-net-user-title', 'On a Mac');
       setText(
         'wl-net-user-text',
         platform.macosPrivilegedHalf
-          ? "The private network runs in Roomler's system service, which has its own " +
-              'enrollment (it appears among your devices with "-daemon" after its name). ' +
-              'There is nothing to turn on here.'
-          : "On a Mac the private network runs in Roomler's system service, which the " +
-              'setup wizard adds when "Join the overlay network" is ticked, and install.sh ' +
-              'when given a second enrollment token (--daemon-token). Screen sharing works ' +
-              'without it.',
+          ? "The private network runs in Roomler's system service on this Mac, so there is " +
+              'nothing to turn on here. (A Mac set up as two devices lists that service on ' +
+              'its own, with "-daemon" after its name.)'
+          : "On a Mac the private network runs in Roomler's system service, which this Mac " +
+              'does not have yet. The setup wizard adds it when "Join the overlay network" ' +
+              'is ticked. install.sh adds it with --one-row and a new enrollment token, which ' +
+              "makes this Mac one device (then remove the Mac's old device row), or with " +
+              '--daemon-token, a second device row. Screen sharing works without it.',
       );
       userBox.hidden = false;
       btn.hidden = true;

@@ -244,16 +244,16 @@ export function enrollCommands(
     {
       os: 'macos',
       title: 'macOS',
-      // macOS needs TWO processes for full functionality and cannot merge
-      // them: capture and input only work inside a GUI login session, while
-      // creating a utun for the overlay needs root. They also cannot share one
-      // enrollment — the hub keys on agent_id, so the second control-WS
-      // connection displaces the first — hence a second token and a second
-      // device row. Say so here rather than letting someone discover that
-      // their Mac never appears in the mesh.
+      // macOS needs TWO processes for full functionality: capture and input
+      // only work inside a GUI login session, while creating a utun for the
+      // overlay needs root. FR-43: since the operator's flip (2026-11-19) the
+      // one-liner makes a Mac that is not enrolled yet ONE device row (the
+      // root half holds the enrollment and serves the screen through a worker
+      // it starts in the login session), and a Mac enrolled already keeps its
+      // layout. The two other layouts stay one flag away; say which is which.
       note:
         kind === 'agent'
-          ? 'Installs the per-user half (screen sharing + input). To also join the overlay mesh, mint a second enrollment token and append --daemon-token <token> — that adds a root LaunchDaemon and a second device row for this Mac.'
+          ? 'Installs this Mac as one device: screen sharing, input and the overlay mesh, from one token (sudo prompts for the package and its root service). A Mac that is enrolled already keeps its layout. For screen sharing alone, with no root service and no mesh, append --per-user. For two device rows (a per-user half and a root half), mint a second enrollment token and append --daemon-token <token>.'
           : undefined,
       blocks: [shOneLiner('macos'), ...wizardWhereItInstalls('macos', 'macos'), manual('macos')],
     },

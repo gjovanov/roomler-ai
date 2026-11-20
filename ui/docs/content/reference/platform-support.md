@@ -37,10 +37,12 @@ into your session.
 | Windows | **Per user** | you, from sign-in | your desktop |
 | Linux | **System** (`--system`) | root, from boot | the private network; your GNOME or KDE desktop while you are at it and it is unlocked |
 | Linux | **Per user** (the default) | you | your desktop |
-| macOS | the **per-user half** (the default) | you, in your login session | your desktop |
-| macOS | the **root half** (`--daemon-token`) | root, from boot | the private network |
+| macOS | **one device** (the default) | root, from boot, with a screen worker it starts in your login session | your desktop, the private network |
+| macOS | the **per-user half** alone (`--per-user`) | you, in your login session | your desktop |
+| macOS | **two devices** (`--daemon-token`; the graphical installer, for now) | the per-user half as you, the root half as root from boot | your desktop, the private network |
 
-A Mac needs both halves for both, and shows up as two devices.
+A Mac needs both halves for both. By default they are one device; a Mac enrolled
+before keeps its layout.
 
 :::tip No admin rights? You can still join the network
 An install that runs as you cannot create a network adapter, but it can join
