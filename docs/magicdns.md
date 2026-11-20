@@ -334,9 +334,9 @@ measured 2 s after it (kicks that come together cost one lookup):
 
 | Kick | Where |
 |---|---|
-| the steer is written late, once the resolver binds | `runtime.rs:3101` |
-| the resolver gets its socket back | `runtime.rs:3120` |
-| the network materially moves (a VPN connects, the default route changes). netstate publishes at most one such change per 120 s, so a VPN's route war never drives it | `runtime.rs:3497` |
+| the steer is written late, once the resolver binds | `runtime.rs:3103` |
+| the resolver gets its socket back | `runtime.rs:3122` |
+| the network materially moves (a VPN connects, the default route changes). netstate publishes at most one such change per 120 s, so a VPN's route war never drives it | `runtime.rs:3499` |
 | the host slept: the wall clock ran more than 30 s past the monotonic one, which stops in a suspend on Linux and macOS | `dns_probe.rs:104` |
 
 Each reading says when the next one comes (`next_at_ms`), so a client reads a

@@ -368,9 +368,12 @@ compile.
 - **No config file is a normal state for the companion (#3996).** The companion never runs on
   a config; the device service does. So every read it makes of one goes through
   `load_if_there` (`agents/roomler-desktop/src/commands.rs:3849`): no file is no config, with
-  nothing logged. A file that is there goes through `config::load`, so a broken one still logs
-  `config unreadable and no usable previous copy — the host must be re-enrolled` at ERROR and
-  is recovered from its `.prev` (`config::read_if_present` would hide it, FR-66). A one-row
+  nothing logged. A file that is there goes through `config::load`, so a broken one is always
+  logged at ERROR (`config::read_if_present` would hide it, FR-66). If its `.prev` loads, the
+  read returns that copy and puts it back as the live file:
+  `config unreadable — RECOVERED from the previous good copy; …`. If no usable `.prev` exists,
+  the read fails:
+  `config unreadable and no usable previous copy — the host must be re-enrolled`. A one-row
   Mac's person has none until the screen worker writes one with no enrollment in it at its
   first start (FR-43 P3a), a host not enrolled yet has none, and the person at a Windows
   background-service install cannot see the machine-wide one.
@@ -417,7 +420,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2810`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:2907`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
@@ -2362,6 +2365,120 @@ sequenceDiagram
 
   A one-row Mac is the control.
 
+#### 10.8.2 After a log-out, the root daemon's panel makes no window (#4053, #4119)
+
+The root daemon's own panel, the native panel of §10.8 and §10.8.1, can show a question only while the window
+server serves its process. A question it cannot show takes the road of one asked while it is busy: it is marked
+`companion` and goes to the menu-bar app, over the relay on a one-row Mac (§10.8) and through the announcement on a
+two-row Mac (§10.8.1). It is never a refusal. The release labs measured three shapes in which the window server stops
+serving it, each for the rest of the process's life:
+
+| Shape | Measured | What the panel does |
+|---|---|---|
+| launchd starts the root daemon at boot, before anyone signs in | refused at the start (0.4.226) | the gate's first read says so, and every question goes to the app (#4053) |
+| a log-out detaches the window server, and the daemon runs on | a one-row Mac still on connection 0 after the next login (0.4.226, 0.4.228) | a probe window gets no window device, or another console session has started: every question from then on goes to the app (#4053) |
+| a log-out kills the window-server port, and the daemon runs on | a two-row Mac's root half, two runs of two (0.4.228): "WindowServer event port death" at the log-out. At the first question after the login, AppKit ended the process with exit 0 while it made #4053's probe window, with no line of ours. launchd relaunches only a non-zero exit, so the `-daemon` row stayed offline until the next boot | since #4119 the seat and the console session answer before any window is made. An exit that AppKit begins inside a panel window call anyway leaves with 32, a code of its own, and launchd starts the daemon again |
+
+Which log-outs kill the port is not known: a one-row Mac's left it detached, a two-row Mac's root half's killed it.
+
+| Part | What it does | Where |
+|---|---|---|
+| the gate | asked by `prompt` at each question, with no lock held: nothing once the panel has ended, then the console session, then, unless that says another session, the probe window. A seat change, another console session and a lost connection each hold for the process's life. A read with no answer in time gives `false` for that question alone | `PanelGate::verdict`, [`panel_gate.rs:330`](../agents/roomlerd/src/indicator/panel_gate.rs#L330); `prompt`, [`mac.rs:190`](../agents/roomlerd/src/indicator/mac.rs#L190) |
+| the seat latch | in a root process only. The person socket's look at `/dev/console`'s owner, every 5 s, is told to the gate. A seat that the last look found a person at, and that this look finds empty or someone else's, ends the panel, with one WARN. A seat that goes from nobody to a person (a boot, then a login) ends nothing, and a look that could not tell changes nothing. The latch is held, never read at a question: after the login someone is at the seat again | `PanelGate::seat_looked`, [`panel_gate.rs:275`](../agents/roomlerd/src/indicator/panel_gate.rs#L275); `seat_looked`, [`mac.rs:892`](../agents/roomlerd/src/indicator/mac.rs#L892); called by `follow_the_seat`, [`person_socket.rs:730`](../agents/roomlerd/src/person_socket.rs#L730) |
+| the console session | in a root process only: notify(3) on CoreGraphics' `GUIConsoleSessionChanged` and `GUISessionUserChanged`, from the pump's start. Another session answers before the probe window is made, so that question makes no window. A session read with no answer leaves the probe to decide, as before | `reads_console_session`, [`panel_gate.rs:129`](../agents/roomlerd/src/indicator/panel_gate.rs#L129); the two names, [`console_watch.rs:40`](../agents/roomlerd/src/indicator/console_watch.rs#L40); `ConsoleWatch`, [`:47`](../agents/roomlerd/src/indicator/console_watch.rs#L47) |
+| the probe window | a 1×1 window, never shown, made with its window device on the main thread, 500 ms at most. A number above 0 means the window server serves the process. Just before it makes the window, the main thread asks the gate again whether the panel has ended | `probe`, [`mac.rs:879`](../agents/roomlerd/src/indicator/mac.rs#L879); `window_device`, [`mac.rs:911`](../agents/roomlerd/src/indicator/mac.rs#L911) |
+| the exit net | in a root process only: an `atexit` hook, registered once when the pump starts. The main thread marks itself while it is inside the probe window, the panel's window, or the event fetch and dispatch. An exit that begins on that thread inside one of them, and that our code did not choose, writes one line to stderr and leaves with 32, `APPKIT_ENDED_EXIT_CODE`: the net's own code, never the requested restart's 9 | `arm`, [`exit_net.rs:89`](../agents/roomlerd/src/indicator/exit_net.rs#L89); `inside`, [`:115`](../agents/roomlerd/src/indicator/exit_net.rs#L115); `the_net`, [`:138`](../agents/roomlerd/src/indicator/exit_net.rs#L138); the code, [`watchdog.rs:259`](../agents/roomlerd/src/watchdog.rs#L259); armed in `run_main_loop`, after `finishLaunching`, [`mac.rs:431`](../agents/roomlerd/src/indicator/mac.rs#L431); the marks, [`mac.rs:446`](../agents/roomlerd/src/indicator/mac.rs#L446), [`:474`](../agents/roomlerd/src/indicator/mac.rs#L474), [`:912`](../agents/roomlerd/src/indicator/mac.rs#L912) |
+| a chosen exit | the delegate's `NSTerminateNow` (a log-out's quit from loginwindow, or a quit with no supervisor) marks its exit as chosen before AppKit exits 0, so the net leaves that 0 alone (#3164) | `exit_chosen`, [`exit_net.rs:131`](../agents/roomlerd/src/indicator/exit_net.rs#L131), called at [`mac.rs:319`](../agents/roomlerd/src/indicator/mac.rs#L319) |
+
+```mermaid
+flowchart TD
+    Q(["a question, at the root daemon's panel"]) --> E{"has the panel ended?"}
+    E -- "yes" --> APP["false: the question goes to the menu-bar app"]
+    E -- "no" --> S{"the console session,<br/>against the pump's start"}
+    S -- "another one" --> AS["ended for the process's life<br/>no window made, WARN window_number=none"]
+    S -- "the same, or no answer" --> P["the probe window, on the main thread,<br/>after the gate is asked again"]
+    P -- "a number above 0, the session the same" --> SHOW["the panel shows the question"]
+    P -- "0 or less" --> LOST["ended for the process's life (Lost)"]
+    P -- "no answer in 500 ms, or the session read had none" --> ONE["false for this question only"]
+    P -. "AppKit exits inside the window call" .-> NET["the exit net: exit 32, its own code,<br/>launchd starts roomlerd again"]
+    LOOK(["the person socket's look, every 5 s"]) -- "a person left the seat, or another took it" --> SEAT["ended for the process's life<br/>one WARN with seat_was and seat_now"]
+    AS --> APP
+    LOST --> APP
+    ONE --> APP
+    SEAT -.-> E
+```
+
+- **Why that order.** The probe is a window, and on a killed port the window is what ends the process. In the lab run
+  that watched them, both console-session names posted at that log-out (`GUISessionUserChanged` at the login too), and
+  the person socket saw nobody at the seat a second before the port died, so either read alone would have answered
+  first. The seat is the second guard, for a Mac where the names do not post. The net is the third.
+- **Only a root process.** The seat latch, the console session and the net are a root process's: a one-row Mac's
+  daemon and a two-row Mac's root half (`reads_console_session`, `arms_in`, [`exit_net.rs:83`](../agents/roomlerd/src/indicator/exit_net.rs#L83)).
+  A two-row Mac's per-user half belongs to a GUI session of its own, which a fast user switch away and back leaves
+  alive, so its connection alone decides. Its exit 0 at a log-out is what the end of its session should bring:
+  launchd starts it at the next login (#3164), and a relaunch would put it back into a session that is ending.
+- **What the net leaves alone.** An exit keeps its code unless it begins on the main thread inside one of the marked
+  calls. That covers the clean stop after a SIGTERM, which exits 0 on the `roomlerd-main` thread while the main thread
+  sits in the event fetch (#3195), a requested restart, an error, the quit backstop and the watchdog. A chosen exit
+  keeps its 0 wherever it begins.
+- **What the net cannot see.** An `_exit` (atexit hooks do not run), a signal, and an exit on another thread. Where
+  AppKit ends a process that way, the seat and the console session, read before any window, are what hold.
+- **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
+  (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
+  healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
+  counts it (`app.rs:4315`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+- **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
+  the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
+  leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'
+  `RestartPreventExitStatus=7 8`, and which is neither a Darwin signal's number nor a `sysexits.h` code. No supervisor
+  but launchd sees it: the net exists in the macOS panel build only and arms in a root process only, while the FR-43
+  supervisor's worker runs as the person at the console. The code's doc,
+  [`watchdog.rs:259`](../agents/roomlerd/src/watchdog.rs#L259), gives what each supervisor would do with it.
+- **Logs.**
+  - `macOS consent panel available`, with `window_number` and `console_session`, at the start, or in its place the
+    WARN that the process could not put a window on the screen (#4053).
+  - the console session's WARN, `macOS consent panel: another console session has started since the panel came up …`,
+    with `console_session` and `console_session_at_start`. Since #4119 it says `window_number=none`: no probe window
+    was made.
+  - the seat's WARN, `macOS consent panel: the person at the seat has left it, or someone else has taken it, since the
+    panel came up …`, with `seat_was` (a uid) and `seat_now` (a uid, or `nobody`), once, when the poll sees the change.
+  - the net's line, on stderr, which the daemon's plist sends to `daemon.log`: `roomlerd: an exit began inside the probe
+    window on the AppKit thread, and roomlerd did not choose it …`, naming the call it caught and the code it leaves
+    with (`leaving with 32 (APPKIT_ENDED_EXIT_CODE)`). `launchctl print system/com.roomler.daemon` then shows
+    `last exit code = 32`, where 0.4.228 showed 0.
+- **Tested**, red first in #4119's pull request:
+  - the gate, in `indicator::panel_gate::tests`:
+    - `another_console_session_answers_without_a_probe_window`;
+    - `another_console_session_takes_no_question_from_then_on_with_one_warn`, whose second half is a lost connection
+      and another session at once: `AnotherSession`, with no probe window and `window_number=none`, where it probed and
+      answered `Lost` until #4119;
+    - `a_seat_that_empties_or_changes_hands_ends_a_root_panel_with_no_read`;
+    - `a_login_after_nobody_and_a_look_that_cannot_tell_latch_nothing`;
+    - `a_per_user_panel_is_not_ended_by_the_seat`;
+    - `a_question_the_panel_does_not_take_reaches_the_app_as_a_taken_panels_does`, which follows the seat's `false` to
+      the app beside the other verdicts.
+
+    These run in rust-agent's "Test agent under vp9-444", in windows-agent-sessions' "Agent unit tests on Windows (the
+    whole --lib suite)" and in the macOS job's "cargo check + test the agent's Mac-only units".
+  - the net, in `indicator::exit_net::tests`, each exit played by a copy of the test binary:
+    `an_exit_inside_our_call_that_we_did_not_choose_leaves_with_its_own_code` (32, where the net's first code was the
+    requested restart's 9); `an_exit_the_net_leaves_alone_keeps_its_code` (outside a call, after one, a chosen exit,
+    and an exit 0, a requested restart's 9 and an exit 3 on another thread while the main one is marked);
+    `only_a_root_process_arms_the_net`. They run on Unix only: in "Test agent under vp9-444", and in the macOS job's
+    Mac-only units, on the libc whose `exit` the net hooks.
+  - the net's code, in `watchdog::tests`: `exit_code_sentinels_are_distinct_and_documented`,
+    `the_appkit_ended_code_is_no_other_code_in_the_tree` (no code the tree exits with, a code above Darwin's signal
+    numbers and below `sysexits.h`), and `shipped_linux_units_restart_the_restart_requested_sentinel`, which asserts it
+    outside both units' `RestartPreventExitStatus`. They run in "Test agent under vp9-444" and in windows-agent-sessions'
+    "Agent unit tests on Windows (the whole --lib suite)".
+  - `indicator/mac.rs` itself compiles only in the macOS job's "cargo check agent (viewer-indicator-macos — the AppKit
+    panel + the main-thread swap)".
+- **Field cell**, on a two-row Mac: restart the root half with the person signed in (`available window_number>0
+  console_session=0`); one exec question on its panel, left to its timeout; log out (Apple menu) and back in; then ONE
+  exec to the `-daemon` row. The root half stays up (`pgrep`, and `launchctl print system/com.roomler.daemon` `runs`
+  unchanged), the question goes to the person's app, and one WARN names the session or the seat. On 0.4.228 the same
+  steps end the root half with exit 0.
+
 ### 10.9 A click on the prompt is acted on, or logged (#3873)
 
 Read in the 0.4.221 release lab on a Linux system install: the daemon started the tray for a
@@ -2462,7 +2579,7 @@ most 480 × 240 logical. On a Mac, since #3999, that screen is the one the point
 
 | Daemon panel | Size | Where |
 |---|---|---|
-| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:86`, `:511` |
+| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:98`, `:541` |
 | X11 | 480 × 236 at the desktop's scale | `agents/roomlerd/src/indicator/x11.rs:67`, `:299` |
 | Windows | 460 × 232 physical px, no larger in logical units | `agents/roomlerd/src/indicator/win.rs:135`, `:611` |
 
@@ -2665,7 +2782,7 @@ could not keep the prompt clear of a panel on another screen.
 
 | Surface | Until #3999 | Since |
 |---|---|---|
-| the daemon's panel (`Panel::new`, `agents/roomlerd/src/indicator/mac.rs:500`) | the top centre of `NSScreen::mainScreen`, the screen of the window with the keyboard focus | the top centre of the chosen screen, 48 down as before (`question_screen`, `mac.rs:876`). With no screen at all, the same 1440 × 900 stand-in as before |
+| the daemon's panel (`Panel::new`, `agents/roomlerd/src/indicator/mac.rs:530`) | the top centre of `NSScreen::mainScreen`, the screen of the window with the keyboard focus | the top centre of the chosen screen, 48 down as before (`question_screen`, `mac.rs:940`). With no screen at all, the same 1440 × 900 stand-in as before |
 | the app's prompt (`place_consent`, `agents/roomler-desktop/src/panels.rs:773`) | #3987's place on the primary monitor, the menu bar's (Tauri's `primary_monitor`) | #3987's place on the chosen screen (`appkit_origin`, `panels.rs:837`), set through AppKit on the main thread (`place_on_pointer_screen`, `panels.rs:797`). Where no screen can be read, the primary monitor as before (`position_consent`, `panels.rs:401`) |
 
 **The rule.** A surface opens on the screen that holds the pointer when it is shown. If no screen

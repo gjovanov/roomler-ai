@@ -220,7 +220,7 @@ prevent, and the guard re-asserts it on every tick.
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
 - The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2422-2431`) and independent of NAT setup
-  (`runtime.rs:2158-2181`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
+  (`runtime.rs:2161-2184`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
@@ -228,7 +228,7 @@ prevent, and the guard re-asserts it on every tick.
   although every agent row has one (`models.rs:1917`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
-  (`crates/modules/network/src/overlay.rs:2970`). A client accepts any peer whose fanned routes hold `/0`
+  (`crates/modules/network/src/overlay.rs:3067`). A client accepts any peer whose fanned routes hold `/0`
   (`route_guard.rs:303-304`). So an exit that stops offering, on any OS, stays an exit in its clients' netmaps until
   an admin un-approves it. ⚠️ A device-side fix alone cannot close the black hole.
 
@@ -290,7 +290,7 @@ and the consent chain's fallbacks.
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:282-334`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
 | D5 | The setup wizard installs the daemon | ✅ | ✅ since 0.4.184 (FR-129 B1) | ✅ since 0.4.184 (FR-129 B1); the root half since 0.4.187 (B2) | Was: the tunnel client only on Linux and macOS (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offered it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`). *Since FR-129 B1:* the wizard has daemon roles on every OS (`agents/roomler-setup/src/role.rs:101-108`): on Linux the system daemon and the per-user one, on macOS the person's daemon, with the root half beside it when the private-network box is ticked (`role.rs:130`). Windows asks no server (`commands.rs:158`). On Linux and macOS a card shows only when the chosen server's switch for that OS is on (`commands.rs:239`, `features.rs:77`), and an install refuses without it (`orchestrator_unix.rs:331-343`). The server answers per OS on `GET /api/setup/features` from `[setup] wizard_linux_daemon` and `wizard_macos_daemon`, each default off (`crates/modules/fleet/src/setup_release.rs:200-211`, `crates/config/src/settings.rs:89`, `:93`). The enroll dialog and the homepages offer the wizard for an agent on that answer (`ui/src/utils/enrollCommands.ts:198-203`, `:290`). Field-verified on Ubuntu, Fedora KDE and macOS in [FR-129](FR-129-guided-cross-platform-installer.md) AC11, on 0.4.189 to 0.4.191 | P0c, D5, FR-129 B1, B2 |
-| D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4359`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
+| D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4373`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
 
 ### 2.5 SSH and Fleet RPC
 
@@ -426,7 +426,7 @@ flowchart TB
   0.4.134 too):* our adapter comes up not forwarding, because after a crash it is recreated with its old setting
   where the boot purge could not reach it; and the ledger records our WinNAT instances so the purge removes the
   one a crash leaves. The WinNAT reason now names Hyper-V.
-- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2708`). The approval stays stored, because a
+- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2805`). The approval stays stored, because a
   flapping join must not cost an admin's decision, but it takes effect only while the device still offers the route.
   An agent older than P0b keeps advertising what it always did, so the intersection changes nothing for it.
 - **Admin UI.** An OS chip on the routes row (`OverlayNodeResponse` gains `os`, read from `Agent.os`), and the
@@ -639,7 +639,7 @@ Prefer the SCDynamicStore to files: a supplemental resolver (`SupplementalMatchD
 `SCDynamicStoreAddTemporaryValue` should disappear when the daemon's store session ends, which would make the steer
 crash-safe by construction (unverified; P1c's first task). The fallback for the split zone is `/etc/resolver/<domain>`
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
-(`runtime.rs:2449-2469`): never steer at a `:54` that did not bind.
+(`runtime.rs:2452-2472`): never steer at a `:53` that did not bind.
 
 *Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
 SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2247-2262`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2288-2303`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -745,7 +745,7 @@ test of the SIGKILL property itself.
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
   on the main thread, which `viewer-indicator-macos` gives to AppKit for the daemon's life (P2b's release set has it),
-  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:137`), run by the
+  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:149`), run by the
   pump on its next pass. The list is the selectable keyboard sources (the input menu's); the token is the source ID's
   hash; the tag is BCP-47 for a layout the table knows, else the source's own name. Offered wherever the switch is
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says
@@ -1032,7 +1032,7 @@ test of the SIGKILL property itself.
   off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
   carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
   `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
-  retired config keys (`crates/agent-core/src/config.rs:4359`), and the hidden `roomler hive hook`
+  retired config keys (`crates/agent-core/src/config.rs:4373`), and the hidden `roomler hive hook`
   (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
   It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
   that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,

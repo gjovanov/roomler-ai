@@ -848,6 +848,11 @@ async fn follow_the_seat(
             }
         }
         let look = look_at_the_seat(following.wait).await;
+        // #4119 — the Mac's consent panel follows the look too: a seat that
+        // empties or changes hands ends a root process's panel, which then
+        // makes no window (`indicator::mac::seat_looked`).
+        #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+        crate::indicator::mac::seat_looked(&look);
         // #2531 — nobody at the seat ends a run of tries for a missing
         // runtime directory, so the next log-in's is said again.
         if matches!(look, Look::Nobody) {
