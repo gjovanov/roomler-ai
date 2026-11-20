@@ -45,9 +45,11 @@ pub fn write_to(mut out: impl Write, error: &anyhow::Error) {
 #[derive(Debug)]
 pub struct NoConfig {
     path: PathBuf,
-    /// #4028 — the `run` that found no config is the worker the Windows service
-    /// host started ([`NoConfig::of_run`]), so it ends with its own exit code.
-    service_worker: bool,
+    /// #4028 — the `run` that found no config was started by a Windows
+    /// supervisor that reads its exit code ([`NoConfig::of_run`]): the service
+    /// host's worker, or (FR-150 P2) the per-user task's daemon, whose launcher
+    /// leaves on it. So it ends with its own exit code.
+    supervisor_reads_code: bool,
 }
 
 impl NoConfig {
@@ -55,19 +57,23 @@ impl NoConfig {
     pub fn at(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
-            service_worker: false,
+            supervisor_reads_code: false,
         }
     }
 
     /// #4028 — no config at `path`, found by the `run` whose spawner `supervisor`
-    /// names (`run --supervisor`, a hidden flag). Only the Windows service host's
-    /// word, `scm`, makes it the service's worker, and only on Windows: the one
-    /// rule `supervision::detect_here` keeps for every `run`. FR-43's macOS flag
-    /// can never make that answer, so it is not asked for.
+    /// names (`run --supervisor`, a hidden flag). The Windows service host's
+    /// word, `scm`, and (FR-150 P2) the per-user task's, `task`, name a
+    /// supervisor that reads the code, and only on Windows: the one rule
+    /// `supervision::detect_here` keeps for every `run`. FR-43's macOS flag can
+    /// never make that answer, so it is not asked for.
     pub fn of_run(path: &Path, supervisor: Option<&str>) -> Self {
         use crate::supervision::{Supervision, detect_here};
         Self {
-            service_worker: detect_here(supervisor, false) == Supervision::WindowsScm,
+            supervisor_reads_code: matches!(
+                detect_here(supervisor, false),
+                Supervision::WindowsScm | Supervision::WindowsTask
+            ),
             ..Self::at(path)
         }
     }
@@ -109,10 +115,12 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
 /// record for it (`win_service::supervisor::should_record_supervisor_crash`), and
 /// it backs off exactly as for an exit 1 (`decide_exit_reaction`'s generic arm).
 ///
-/// **The Windows service host's worker only** ([`NoConfig::of_run`]). Every other
-/// `run` that finds no config exits 1, as it always has: systemd's units, launchd,
-/// FR-43's macOS supervisor, a container's runtime and the per-user Scheduled Task
-/// read the exit code too, and none of them is told of this one.
+/// **The Windows supervisors' runs only** ([`NoConfig::of_run`]): the service
+/// host's worker, and since FR-150 P2 the per-user Scheduled Task's daemon,
+/// whose launcher (`agents/roomlerdw`) leaves on this code where it would start
+/// a crash again. Every other `run` that finds no config exits 1, as it always
+/// has: systemd's units, launchd, FR-43's macOS supervisor and a container's
+/// runtime read the exit code too, and none of them is told of this one.
 ///
 /// Why 78. No other code in the tree is 78: not 0 or 1, the watchdog's sentinels
 /// (2, 7, 8, 9), the stand-in's 10, the probe and portal helpers' 3 to 5, a
@@ -126,13 +134,14 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
 pub const NO_ENROLLMENT_EXIT_CODE: i32 = 78;
 
 /// #4028 — the code a process whose `main` ends with `error` exits with, when it
-/// is not std's 1: [`NO_ENROLLMENT_EXIT_CODE`] for the Windows service host's
-/// worker that found no config ([`NoConfig::of_run`]), bare or under a context.
+/// is not std's 1: [`NO_ENROLLMENT_EXIT_CODE`] for a Windows supervisor's `run`
+/// that found no config ([`NoConfig::of_run`]: the service host's worker or the
+/// per-user task's daemon), bare or under a context.
 /// `None` for every other error and every other process: they exit 1.
 pub fn exit_code(error: &anyhow::Error) -> Option<i32> {
     error
         .downcast_ref::<NoConfig>()
-        .filter(|no_config| no_config.service_worker)
+        .filter(|no_config| no_config.supervisor_reads_code)
         .map(|_| NO_ENROLLMENT_EXIT_CODE)
 }
 
@@ -341,20 +350,23 @@ mod exit_code_tests {
     }
 
     /// #4028 — the worker the Windows service host started (`run --supervisor
-    /// scm`) that finds no config has its own exit code, under a context too.
-    /// The per-user Task's worker, a bare `run`, a word no spawner says, and
-    /// every platform but Windows exit 1, as they always have. So does an error
-    /// of any other kind, one that only says the same words included.
+    /// scm`) that finds no config has its own exit code, under a context too,
+    /// and since FR-150 P2 so has the per-user task's daemon (`task`). A bare
+    /// `run`, a word no spawner says, and every platform but Windows exit 1, as
+    /// they always have. So does an error of any other kind, one that only says
+    /// the same words included.
     #[test]
-    fn only_the_service_hosts_worker_with_no_config_has_its_own_code() {
+    fn only_a_windows_supervisors_run_with_no_config_has_its_own_code() {
         let path = Path::new(PATH);
         let service = anyhow::Error::from(NoConfig::of_run(path, Some("scm")));
         assert_eq!(exit_code(&service), service_code());
         let under_a_context =
             anyhow::Error::from(NoConfig::of_run(path, Some("scm"))).context("starting the worker");
         assert_eq!(exit_code(&under_a_context), service_code());
+        let task = anyhow::Error::from(NoConfig::of_run(path, Some("task")));
+        assert_eq!(exit_code(&task), service_code());
 
-        for supervisor in [Some("task"), None, Some("nssm"), Some("")] {
+        for supervisor in [None, Some("nssm"), Some(""), Some("tasks")] {
             let err = anyhow::Error::from(NoConfig::of_run(path, supervisor));
             assert_eq!(exit_code(&err), None, "{supervisor:?}");
         }
@@ -407,7 +419,7 @@ mod exit_code_tests {
 
         let others: [anyhow::Result<()>; 3] = [
             Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock")),
-            Err(NoConfig::of_run(path, Some("task")).into()),
+            Err(NoConfig::of_run(path, None).into()),
             Ok(()),
         ];
         for res in others {
