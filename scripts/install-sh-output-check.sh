@@ -24,8 +24,8 @@
 # (a privileged half as root) in a throwaway debian:12 container with no
 # network. Stand-ins on PATH answer for curl (the feed and the downloads), sudo
 # (which runs nothing but `test`, a question), dpkg, apt-get, systemctl,
-# installer, launchctl, uname, hostname, the daemon and the tunnel CLI, and
-# they record every call; a case can make one of their calls read its stdin
+# installer, launchctl, uname, hostname, dscl, the daemon and the tunnel CLI,
+# and they record every call; a case can make one of their calls read its stdin
 # first, as a binary could, or fail, as dpkg -i does where a dependency is
 # missing. A running daemon's own image, /proc/$pid/exe, cannot be a stand-in
 # (a script's is its interpreter), so where a case has one running, systemctl
@@ -202,7 +202,7 @@ line=$me
 for a in "$@"; do line="$line [$a]"; done
 case "$me" in
     curl | roomlerd | roomler) printf '%s\n' "$line" >>"$C/$me.log" ;;
-    uname | hostname | mktemp | stat | sleep) ;; # answers, not actions
+    uname | hostname | mktemp | stat | sleep | dscl) ;; # answers, not actions
     *) printf '%s\n' "$line" >>"$C/calls.log" ;;
 esac
 # #3925 — a case can make one call read its stdin first, as a binary could: the
@@ -244,12 +244,24 @@ case "$me" in
             cat "$C/version.out"
             exit "$(cat "$C/version.rc")"
         fi
-        # Its enroll's help names --one-row, as a release's since FR-43 P3d.
-        if [ "$*" = "enroll --help" ]; then echo "      --one-row"; fi ;;
+        # Its enroll's help names --one-row, as a release's since FR-43 P3d,
+        # unless the case stands for a release from before it.
+        if [ "$*" = "enroll --help" ] && [ ! -f "$C/no-one-row" ]; then echo "      --one-row"; fi ;;
     sudo)
         # `test` is a question, not an action, so it is answered for real: a
-        # Mac case then finds no root config and enrolls the root half.
+        # Mac case then finds no root config and enrolls the root half. So is
+        # a `test` asked as another account (-H -u ACCOUNT): the script asks
+        # that way whether a person's own config is there.
+        if [ "${1:-}" = -H ] && [ "${2:-}" = -u ] && [ "${4:-}" = test ]; then shift 3; fi
         if [ "${1:-}" = test ]; then shift; test "$@"; exit; fi ;;
+    dscl)
+        # macOS's directory service, asked for an account's home: the
+        # container's passwd answers, and no such account answers nothing.
+        if [ "$#" = 4 ] && [ "$1" = . ] && [ "$2" = -read ] && [ "$4" = NFSHomeDirectory ]; then
+            h=$(awk -F: -v u="${3#/Users/}" '$1 == u { print $6 }' /etc/passwd)
+            [ -n "$h" ] || exit 56
+            echo "NFSHomeDirectory: $h"
+        fi ;;
     roomler)
         if [ "${1:-}" = --version ]; then
             # A case can make its Nth --version (this one is logged above)
@@ -293,7 +305,7 @@ esac
 exit 0
 EOF
 chmod 755 "$S/standin"
-for t in curl sudo systemctl installer launchctl uname hostname stat mktemp sleep roomler; do
+for t in curl sudo systemctl installer launchctl uname hostname stat mktemp sleep dscl roomler; do
     ln -sf "$S/standin" "$BIN/$t"
 done
 for t in dpkg apt-get; do ln -sf "$S/standin" "$DPKG/$t"; done
@@ -381,15 +393,32 @@ SH=""
 # form, makes it exit 1 in that call. HAS_CONFIG=1 puts an
 # earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
 # half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
-# as root, as a privileged half runs. The records land in $RUNS/$SH/CASE.
+# as root, as a privileged half runs. PERSON puts the person's own config
+# from an earlier install in their home (FR-43): new (enrolled, in the tree
+# the daemon resolves), old (enrolled, in the tree from before the rename),
+# locked (enrolled, and not even its account can read it) or bare (no
+# enrollment in it). NO_ONE_ROW=1 makes the daemon a release from before
+# `enroll --one-row`. The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
-    rm -rf "$C" /tmp/roomler-install.* /etc/roomler /Library/LaunchDaemons
+    rm -rf "$C" /tmp/roomler-install.* /etc/roomler /Library/LaunchDaemons /home/tester/Library
     mkdir -p "$C"
     if [ "${HAS_CONFIG:-0}" = 1 ]; then
         mkdir -p /etc/roomler
         printf 'agent_id = "check-earlier"\n' >/etc/roomler/config.toml
+    fi
+    if [ -n "${PERSON:-}" ]; then
+        pdir="/home/tester/Library/Application Support/live.roomler.roomler"
+        [ "$PERSON" != old ] || pdir="$pdir-agent"
+        mkdir -p "$pdir"
+        if [ "$PERSON" = bare ]; then
+            printf 'server = "https://roomler.example"\n' >"$pdir/config.toml"
+        else
+            printf 'agent_id = "check-person"\n' >"$pdir/config.toml"
+        fi
+        chown -R 1000:1000 /home/tester/Library
+        [ "$PERSON" != locked ] || chmod 000 "$pdir/config.toml"
     fi
     if [ "${HAS_PLIST:-0}" = 1 ]; then
         mkdir -p /Library/LaunchDaemons
@@ -411,6 +440,7 @@ run() {
     [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
     [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
     [ -z "${FAILS:-}" ] || printf '%s' "${FAILS#* }" >"$C/fails.${FAILS%% *}"
+    [ "${NO_ONE_ROW:-0}" = 0 ] || : >"$C/no-one-row"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -542,13 +572,20 @@ for SH in $SHELLS; do
     says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
     READS='roomlerd [update-helper]' run deb-user/reads-stdin-caps Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
     says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    # FR-43 — since the operator's flip (2026-11-19) a Mac's default, given a
+    # token, is one row on a Mac that is not enrolled yet: the one-row
+    # sequence (as pkg-one-row runs it). A person's config with no enrollment
+    # in it does not make the Mac enrolled.
+    row="==> enrolling this Mac as 'check-host' against https://roomler.example, as its one row, overlay on (token is single-use, never echoed)"
     run pkg/match Darwin arm64 0 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
-    says agent-v0.4.221 0.4.221 0; done_case
+    says agent-v0.4.221 0.4.221 0; want "$row"; done_case
     run pkg/exit1 Darwin arm64 0 normal '' 1 --role daemon --token check-token
     says agent-v0.4.221 "no answer (/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --version exited 1)" 0
-    done_case
+    want "$row"; done_case
     READS_STDIN=1 run pkg/reads-stdin Darwin arm64 0 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
-    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    PERSON=bare run pkg/person-unenrolled Darwin arm64 0 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
+    says agent-v0.4.221 0.4.221 0; want "$row"; done_case
 
     # #3919 — a per-user re-run finds the daemon already running, and says
     # which version it runs or moves onto: as the binary names it when that
@@ -628,11 +665,74 @@ for SH in $SHELLS; do
     # #3925 — a Mac as one row (--one-row): the daemon's enroll --help, which
     # says whether this release has --one-row, reads its stdin.
     one=(--role daemon --one-row --token check-token)
-    row="==> enrolling this Mac as 'check-host' against https://roomler.example, as its one row, overlay on (token is single-use, never echoed)"
     run pkg-one-row/normal Darwin arm64 0 normal "$new" 0 "${one[@]}"
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
     READS='roomlerd [enroll] [--help]' run pkg-one-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${one[@]}"
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+
+    # FR-43 — --per-user: the per-user half alone, the layout a Mac got by
+    # default before the flip, call for call (the record's pkg before it).
+    pu="==> NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
+    perusr=(--role daemon --per-user --token check-token)
+    run pkg-per-user/match Darwin arm64 0 normal "$new" 0 "${perusr[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$pu"; lines "as its one row" 0; done_case
+    READS_STDIN=1 run pkg-per-user/reads-stdin Darwin arm64 0 normal "$new" 0 "${perusr[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$pu"; lines "as its one row" 0; want "==> done."; done_case
+    # A Mac enrolled already keeps its layout across the update that carries
+    # the flip (#971, 2026-11-02: a Mac changes layout only by its person's
+    # own command), call for call. Its person's own enrollment, in the tree
+    # the daemon resolves or in the one from before the rename, or a config
+    # there its own account cannot read (the safe side): the per-user half.
+    kept="==>       Its per-user half was enrolled already, so it keeps that layout. For one"
+    usr1=(--role daemon --token check-token)
+    for p in new old locked; do
+        PERSON=$p run "pkg-default-per-user/$p" Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+        says agent-v0.4.221 0.4.221 0; want "$pu"; want "$kept"; lines "as its one row" 0; done_case
+    done
+    # Its root half enrolled as a row of its own, the root config there without
+    # both one-row switches: two rows (the first switch off), or P2's
+    # supervised worker on the person's enrollment (only the second off).
+    own="==> NOTE: this Mac's root half is enrolled already, as a row of its own, so the Mac"
+    HAS_CONFIG=1 HAS_PLIST=1 FAILS='sudo [grep]' run pkg-default-own-row/two-row Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$own"; lines "as its one row" 0; lines "$pu" 0; done_case
+    HAS_CONFIG=1 HAS_PLIST=1 FAILS='sudo macos_one_row' run pkg-default-p2/supervised Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$own"; lines "as its one row" 0; lines "$pu" 0; done_case
+    # One row already (both switches): the package updates, with its marker,
+    # and nothing enrolls, given a token or not.
+    already="==> this Mac is one row already: the package updates, and its enrollment stays"
+    HAS_CONFIG=1 HAS_PLIST=1 run pkg-default-one-row/token Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$already (the token is not used)"; lines "as its one row" 0; done_case
+    HAS_CONFIG=1 HAS_PLIST=1 run pkg-default-one-row/no-token Darwin arm64 0 normal "$new" 0 --role daemon
+    says agent-v0.4.221 0.4.221 0; want "$already"; lines "as its one row" 0; done_case
+    # Nothing to enroll with on a Mac not enrolled yet: the per-user half, as
+    # before, and the NOTE says what gives one row.
+    nocred="==>       Given --token <enrollment-jwt> or --pair, this script installs a Mac that"
+    run pkg-default-no-token/normal Darwin arm64 0 normal "$new" 0 --role daemon
+    says agent-v0.4.221 0.4.221 0; want "$pu"; want "$nocred"; done_case
+    # A release from before P3d has no `enroll --one-row`: the default goes on
+    # as the per-user half, its token spent there, and says why (an explicit
+    # --one-row stops instead).
+    oldrel="WARNING: this release's roomlerd has no 'enroll --one-row' yet, so this Mac installs its per-user half, as before one row became the default"
+    NO_ONE_ROW=1 run pkg-default-old-release/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$oldrel"; want "$pu"; lines "as its one row" 0; done_case
+    # Run as root (curl … | sudo sh): the person's config is asked about as
+    # the person (sudo -H -u), and a Mac not enrolled yet is one row.
+    AS_ROOT=1 run pkg-default-root/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    # Download only reads nothing on the Mac: given a token, the default's
+    # plan is the one-row plan, with what a Mac enrolled already does; a flag
+    # that names the layout plans that layout.
+    dlp=(--role daemon --download-only --token check-token)
+    rowplan="--overlay --one-row"
+    keeps="a Mac enrolled already keeps its layout"
+    run pkg-dl-plan/default Darwin arm64 0 normal '' 0 "${dlp[@]}"
+    says agent-v0.4.221 "$none" 0; lines "$rowplan" 1; lines "$keeps" 1; done_case
+    run pkg-dl-plan/one-row Darwin arm64 0 normal '' 0 "${dlp[@]}" --one-row
+    says agent-v0.4.221 "$none" 0; lines "$rowplan" 1; lines "$keeps" 0; done_case
+    run pkg-dl-plan/per-user Darwin arm64 0 normal '' 0 "${dlp[@]}" --per-user
+    says agent-v0.4.221 "$none" 0; lines "$rowplan" 0; lines "$keeps" 0
+    want "==> download-only: would run: /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd enroll --server https://roomler.example --token <token> --name check-host"
+    done_case
 
     # The tunnel role installs the CLI, which names itself as it always has;
     # neither #3881 line belongs to it. What the CLI answers is printed when

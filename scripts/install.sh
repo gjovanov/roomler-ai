@@ -463,7 +463,7 @@ if [ "$OS" = Darwin ] && [ "$UNINSTALL" != 1 ]; then
     fi
     CONSOLE_UID="$(id -u "$CONSOLE_USER")"
     if [ "$(id -u)" = 0 ]; then
-        printf '==> %s\n' "running as root — the per-user half will be installed for '$CONSOLE_USER' (uid $CONSOLE_UID)"
+        printf '==> %s\n' "running as root — the console user is '$CONSOLE_USER' (uid $CONSOLE_UID): the screen is served from their session"
     fi
 fi
 
@@ -965,9 +965,12 @@ macos_after_package() {
     elif [ "$MACOS_KEPT" = own-row ]; then
         # The default found a root half that is a row of its own (two rows,
         # or P2's supervised worker on the person's enrollment): left alone.
+        # #4097: a migration begun within five minutes of the person's agent
+        # starting (this install restarted it) stops and puts the Mac back.
         say "NOTE: this Mac's root half is enrolled already, as a row of its own, so the Mac"
-        say "      keeps its layout. To make it one row: sudo roomlerd one-row (it says its"
-        say "      plan and asks first, and --revert puts the Mac back)."
+        say "      keeps its layout. To make it one row, wait five minutes after this install,"
+        say "      then run: sudo roomlerd one-row (sooner, it stops and leaves the Mac as it"
+        say "      was). It says its plan and asks first, and --revert puts the Mac back."
     elif [ "$PAIR" = 1 ]; then
         # FR-129 A4 — the root half is its own enrollment, so until B2 pairs
         # both halves from one approval it is paired afterwards, as root, in
@@ -1062,7 +1065,7 @@ person_enrolled() {
     for tree in live.roomler.roomler live.roomler.roomler-agent; do
         f="$home/Library/Application Support/$tree/config.toml"
         as_account "$1" test -e "$f" || continue
-        if as_account "$1" grep -qE '^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"[^"]' "$f"; then
+        if as_account "$1" grep -qE '^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"[^"]' "$f" 2>/dev/null; then
             return 0
         fi
         as_account "$1" test -r "$f" || return 0
