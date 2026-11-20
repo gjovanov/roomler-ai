@@ -7616,6 +7616,176 @@ mod macos_kernel_tests {
             .any(|t| t == needle)
     }
 
+    /// Whole-word match for an interface name, so `utun4` never matches
+    /// `utun40`.
+    fn names(haystack: &str, iface: &str) -> bool {
+        haystack
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == iface)
+    }
+
+    /// The block's own lookup, `route -n get -inet -net <net> -prefixlen
+    /// <plen>`, parsed: `None` when it matched nothing (`not in table`).
+    fn block_route(net: &str, plen: u8) -> Option<super::BsdRouteGet> {
+        super::parse_bsd_route_get(&sh(
+            "route",
+            &[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                net,
+                "-prefixlen",
+                &plen.to_string(),
+            ],
+        ))
+    }
+
+    /// Is the route for exactly `net/plen` ours on `iface`?
+    fn block_is_ours(net: &str, plen: u8, iface: &str) -> bool {
+        super::bsd_route_is_ours(
+            block_route(net, plen).as_ref(),
+            net.parse().unwrap(),
+            plen,
+            iface,
+        )
+    }
+
+    /// One block of `route -n monitor` output is a table write.
+    fn is_write(block: &str) -> bool {
+        let kind = block.lines().find(|l| l.starts_with("RTM_")).unwrap_or("");
+        kind.starts_with("RTM_ADD")
+            || kind.starts_with("RTM_DELETE")
+            || kind.starts_with("RTM_CHANGE")
+    }
+
+    /// An address on `lo0` while this lives: another interface whose address
+    /// sits inside the block. The lab cell's own commands: `ifconfig lo0 alias
+    /// <addr> netmask 255.255.255.255`, and `ifconfig lo0 -alias <addr>` on
+    /// drop, whatever happened in between.
+    struct LoAlias(&'static str);
+
+    impl LoAlias {
+        fn add(addr: &'static str) -> Self {
+            let alias = Self(addr);
+            sh(
+                "ifconfig",
+                &["lo0", "alias", addr, "netmask", "255.255.255.255"],
+            );
+            assert!(
+                mentions(&sh("ifconfig", &["lo0"]), addr),
+                "staging the lo0 alias {addr} failed:\n{}",
+                sh("ifconfig", &["lo0"])
+            );
+            alias
+        }
+    }
+
+    impl Drop for LoAlias {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("ifconfig")
+                .args(["lo0", "-alias", self.0])
+                .output();
+        }
+    }
+
+    /// The words of the WARN that says the block's route is withheld, at the
+    /// bring-up and on a wave alike.
+    const WITHHELD: &str = "the utun's block route is withheld";
+    /// The words of the INFO a wave logs when the withhold ends.
+    const NO_LONGER_WITHHELD: &str = "the utun's block route is no longer withheld";
+
+    /// Every event at INFO and above that THIS thread emits while the guard
+    /// lives. The bring-up runs on the test's thread, and so does a wave's
+    /// logging (its commands run on the blocking pool, its lines do not).
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        /// The lines that carry `words`.
+        fn lines_with(&self, words: &str) -> Vec<String> {
+            self.text()
+                .lines()
+                .filter(|l| l.contains(words))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// Three waves under `route -n monitor`, then a control write on `lo0`
+    /// for `control` that the monitor must see. Returns every write that
+    /// names the block (`100.65.0.0`, or `100.65` as route(8) may shorten it)
+    /// or the utun. Our own child, killed by its own handle: the daemon's
+    /// netstate backend is a `route -n monitor` too.
+    async fn block_writes_during_three_waves(
+        tun: &SystemTun,
+        iface: &str,
+        control: &str,
+    ) -> Vec<String> {
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.defend_block_floor().await;
+        }
+        sh(
+            "route",
+            &["-n", "add", "-inet", control, "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", control]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks.iter().any(|b| is_write(b) && mentions(b, control)),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        blocks
+            .iter()
+            .filter(|b| {
+                is_write(b)
+                    && (mentions(b, "100.65.0.0") || mentions(b, "100.65") || names(b, iface))
+            })
+            .map(|b| b.to_string())
+            .collect()
+    }
+
     /// The utun's descriptor is close-on-exec, so a program started after the
     /// bring-up, with no sweep of its own, does not hold it.
     #[cfg(target_os = "macos")]
@@ -7930,6 +8100,13 @@ mod macos_kernel_tests {
             !super::bsd_route_is_ours(block.as_ref(), "100.65.0.0".parse().unwrap(), 22, &iface),
             "switched off, the block is not routed on {iface}: {block:?}"
         );
+        // The switch takes the route guard's arm with it: no wave routes it.
+        tun.defend_block_floor().await;
+        assert!(
+            !block_is_ours("100.65.0.0", 22, &iface),
+            "switched off, no wave routes the block on {iface} either: {:?}",
+            block_route("100.65.0.0", 22)
+        );
     }
 
     /// #4117 — with the block routed on the utun, a peer's `/32` still comes
@@ -7989,6 +8166,331 @@ mod macos_kernel_tests {
         assert!(
             block_is_ours(),
             "deleting a /32 that is not there leaves the block's route"
+        );
+    }
+
+    /// #4117 — an address of another interface inside the block (a LAN that
+    /// numbers from 100.64.0.0/10 more coarsely than the block) withholds the
+    /// block's route at the bring-up. One WARN names the address and its
+    /// interface. The utun keeps its own-peer shape, and its address keeps
+    /// its host route.
+    #[tokio::test]
+    async fn an_address_inside_the_block_withholds_the_block_route_at_bring_up() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _alias = LoAlias::add("100.65.2.77");
+        let ip = Ipv4Addr::new(100, 65, 0, 5);
+        let (logs, guard) = Logs::start();
+        let tun = SystemTun::up(ip, MASK_22, 1280).expect("utun bring-up");
+        drop(guard);
+        let iface = tun.if_name().to_string();
+
+        assert!(
+            !block_is_ours("100.65.0.0", 22, &iface),
+            "an address inside the block withholds its route on {iface}: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+        assert_eq!(
+            super::parse_bsd_inet_line(&sh("ifconfig", &[&iface]), ip),
+            Some(super::BsdInet {
+                peer: Some(ip),
+                mask: Some(MASK_22),
+            }),
+            "withheld or not, the address is its own peer with the block's mask"
+        );
+        assert_eq!(
+            route_get("-inet", "100.65.0.5").and_then(|g| g.interface),
+            Some(iface.clone()),
+            "and the address keeps its own host route on {iface}"
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("WARN")
+                && lines[0].contains("100.65.2.77 on lo0"),
+            "ONE WARN says the route is withheld and names the address and its interface:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — the route guard decides again on every wave. An address that
+    /// comes inside the block after the bring-up (a laptop joining such a
+    /// LAN) makes the next wave delete our block route, and one WARN says so
+    /// however many waves follow. Once the address is gone the next wave
+    /// routes the block again, and one INFO says so.
+    #[tokio::test]
+    async fn a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+
+        let alias = LoAlias::add("100.65.2.77");
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert!(
+            block_route("100.65.0.0", 22).is_none(),
+            "the next wave deletes our block route: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("WARN")
+                && lines[0].contains("100.65.2.77 on lo0"),
+            "ONE WARN for two waves, naming the address and its interface:\n{}",
+            logs.text()
+        );
+
+        drop(alias);
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "with the address gone, the next wave routes the block on {iface} again: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        let lines = logs.lines_with(NO_LONGER_WITHHELD);
+        assert!(
+            lines.len() == 1 && lines[0].contains("INFO"),
+            "ONE INFO for two waves says the withhold ended:\n{}",
+            logs.text()
+        );
+        assert!(
+            logs.lines_with(WITHHELD).is_empty(),
+            "and nothing is withheld any more:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — a block route that something else deleted (a full-tunnel VPN
+    /// that reaps routes it did not add) is put back by the next wave.
+    #[tokio::test]
+    async fn a_reaped_block_route_is_restored_by_the_next_wave() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+        sh(
+            "route",
+            &[
+                "-n",
+                "delete",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+            ],
+        );
+        assert!(
+            block_route("100.65.0.0", 22).is_none(),
+            "staging the reap failed: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        tun.defend_block_floor().await;
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the next wave restores the block's route on {iface}: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+    }
+
+    /// #4117 — a wave deletes only OUR route. While another product holds a
+    /// route for exactly the block, an address inside the block withholds
+    /// (one WARN), and the other product's route stays where it is.
+    #[tokio::test]
+    async fn a_withhold_never_deletes_another_products_route_for_the_block() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        /// Whatever happens, the stand-in's route is removed.
+        struct Foreign;
+        impl Drop for Foreign {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("route")
+                    .args([
+                        "-n",
+                        "delete",
+                        "-inet",
+                        "-net",
+                        "100.65.0.0",
+                        "-prefixlen",
+                        "22",
+                    ])
+                    .output();
+            }
+        }
+        let held_on_lo0 = || {
+            block_route("100.65.0.0", 22).is_some_and(|g| {
+                g.destination == "100.65.0.0" && g.interface.as_deref() == Some("lo0")
+            })
+        };
+        let _foreign = Foreign;
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+                "-interface",
+                "lo0",
+            ],
+        );
+        assert!(
+            held_on_lo0(),
+            "the stand-in for another product must hold the block first: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        assert!(
+            held_on_lo0(),
+            "the bring-up leaves the other product's route"
+        );
+
+        let _alias = LoAlias::add("100.65.2.77");
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert!(
+            held_on_lo0(),
+            "a withhold never deletes a route that is not ours: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1 && lines[0].contains("100.65.2.77 on lo0"),
+            "the wave did decide to withhold, so the route was spared by design:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — every utun of this daemon is ours, whatever number the kernel
+    /// gave it, so no org's utun withholds another org's block. Three utuns:
+    /// A on a `/21`; B on a `/22` nested inside A's block; C on A's very
+    /// block (the legacy case, where two orgs share one), which A already
+    /// routes. Each one's address sits inside a sibling's block.
+    #[tokio::test]
+    async fn no_utun_of_ours_withholds_a_siblings_block() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        const MASK_21: Ipv4Addr = Ipv4Addr::new(255, 255, 248, 0);
+        let (logs, guard) = Logs::start();
+        let a = SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_21, 1280).expect("utun A");
+        let b = SystemTun::up(Ipv4Addr::new(100, 65, 4, 9), MASK_22, 1280).expect("utun B");
+        let c = SystemTun::up(Ipv4Addr::new(100, 65, 0, 6), MASK_21, 1280).expect("utun C");
+        for tun in [&a, &b, &c] {
+            tun.defend_block_floor().await;
+        }
+        drop(guard);
+        let (ia, ib) = (a.if_name().to_string(), b.if_name().to_string());
+        assert!(
+            block_is_ours("100.65.0.0", 21, &ia),
+            "A's block stays on {ia}: {:?}",
+            block_route("100.65.0.0", 21)
+        );
+        assert!(
+            block_is_ours("100.65.4.0", 22, &ib),
+            "B's block, nested inside A's, stays on {ib}: {:?}",
+            block_route("100.65.4.0", 22)
+        );
+        assert!(
+            logs.lines_with(WITHHELD).is_empty(),
+            "no utun of ours withholds another's block:\n{}",
+            logs.text()
+        );
+        drop(c);
+        drop(b);
+        drop(a);
+    }
+
+    /// #4117 — a wave that finds the block's route as it should be writes
+    /// nothing, routed or withheld, so it cannot arm the next wave through
+    /// the route monitor (#1856). Watches the routing socket while waves run.
+    #[tokio::test]
+    async fn a_wave_that_finds_the_block_route_as_decided_writes_nothing() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+        let writes = block_writes_during_three_waves(&tun, &iface, "100.65.0.253").await;
+        assert!(
+            writes.is_empty(),
+            "waves that find the block routed must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        let _alias = LoAlias::add("100.65.2.77");
+        // The withhold itself is one write; the waves after it must be none.
+        tun.defend_block_floor().await;
+        let writes = block_writes_during_three_waves(&tun, &iface, "100.65.0.254").await;
+        assert!(
+            writes.is_empty(),
+            "waves that find the block withheld must not write the table:\n{}",
+            writes.join("\n---\n")
         );
     }
 
