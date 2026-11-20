@@ -815,10 +815,10 @@ async fn tunnel_policy_manager(
     Ok(tid)
 }
 
-/// Wire shape for create + update. `subjects`, `targets`, and
-/// `allowlist` re-use the BSON serde representation of the
-/// `roomler_ai_remote_control::models` types — adjacently-tagged
-/// (`{kind: "...", id: "..."}` / `{kind: "...", value: "..."}`).
+/// Wire shape for create + update: the `roomler_ai_remote_control::models`
+/// types as they deserialize. A subject or target is `{kind, id}`, a
+/// catch-all `{kind}`; an id is the 24-hex string or bson's `{"$oid"}`,
+/// both stored as an ObjectId. Answers carry the hex (`PolicySubjectView`).
 #[derive(Debug, Deserialize)]
 pub struct TunnelPolicyCreateRequest {
     pub name: String,
@@ -872,8 +872,8 @@ pub struct TunnelPolicyResponse {
     pub id: String,
     pub tenant_id: String,
     pub name: String,
-    pub subjects: Vec<PolicySubject>,
-    pub targets: Vec<PolicyTarget>,
+    pub subjects: Vec<PolicySubjectView>,
+    pub targets: Vec<PolicyTargetView>,
     pub allowlist: Vec<DestinationRule>,
     pub max_concurrent_flows: Option<u32>,
     pub max_bytes_per_session: Option<u64>,
@@ -887,8 +887,8 @@ impl From<roomler_ai_remote_control::models::TunnelPolicy> for TunnelPolicyRespo
             id: p.id.map(|i| i.to_hex()).unwrap_or_default(),
             tenant_id: p.tenant_id.to_hex(),
             name: p.name,
-            subjects: p.subjects,
-            targets: p.targets,
+            subjects: p.subjects.into_iter().map(Into::into).collect(),
+            targets: p.targets.into_iter().map(Into::into).collect(),
             allowlist: p.allowlist,
             max_concurrent_flows: p.max_concurrent_flows,
             max_bytes_per_session: p.max_bytes_per_session,
@@ -1125,6 +1125,78 @@ pub async fn delete_tunnel_policy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A policy subject as a tunnel-policy answer carries it (#3636): its id the
+/// 24-hex string `docs/api.md` promises, never bson's `{"$oid": …}`, which
+/// the web app printed as `[object Object]` and could not edit. The kinds and
+/// the `id` key are the model's (`PolicySubject`), so what a page saves back
+/// is what the request types read. Serialize only, built at the route: what
+/// Mongo stores and what the forward gate compiles stay the model's.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicySubjectView {
+    UserId {
+        #[serde(rename = "id")]
+        user_id: String,
+    },
+    RoleId {
+        #[serde(rename = "id")]
+        role_id: String,
+    },
+    TunnelClientId {
+        #[serde(rename = "id")]
+        tunnel_client_id: String,
+    },
+    AgentId {
+        #[serde(rename = "id")]
+        agent_id: String,
+    },
+    AllUsers,
+}
+
+/// No `_` arm and no `..`: a subject kind or field the model gains does not
+/// compile until its answer is written here.
+impl From<PolicySubject> for PolicySubjectView {
+    fn from(subject: PolicySubject) -> Self {
+        match subject {
+            PolicySubject::UserId { user_id } => Self::UserId {
+                user_id: user_id.to_hex(),
+            },
+            PolicySubject::RoleId { role_id } => Self::RoleId {
+                role_id: role_id.to_hex(),
+            },
+            PolicySubject::TunnelClientId { tunnel_client_id } => Self::TunnelClientId {
+                tunnel_client_id: tunnel_client_id.to_hex(),
+            },
+            PolicySubject::AgentId { agent_id } => Self::AgentId {
+                agent_id: agent_id.to_hex(),
+            },
+            PolicySubject::AllUsers => Self::AllUsers,
+        }
+    }
+}
+
+/// A policy target as an answer carries it; see [`PolicySubjectView`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyTargetView {
+    AgentId {
+        #[serde(rename = "id")]
+        agent_id: String,
+    },
+    AllAgents,
+}
+
+impl From<PolicyTarget> for PolicyTargetView {
+    fn from(target: PolicyTarget) -> Self {
+        match target {
+            PolicyTarget::AgentId { agent_id } => Self::AgentId {
+                agent_id: agent_id.to_hex(),
+            },
+            PolicyTarget::AllAgents => Self::AllAgents,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! #3636 — what a tunnel-policy answer carries on the wire. Every id is
@@ -1134,7 +1206,7 @@ mod tests {
     use super::*;
     use bson::DateTime;
     use roomler_ai_remote_control::models::{HostPattern, PortRange, ProtocolKind, TunnelPolicy};
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     /// A stored policy that names every subject and target kind there is:
     /// a user, a role, a tunnel client and a device as subjects, the two
@@ -1261,5 +1333,101 @@ mod tests {
             wrong.push(format!("the answer carries `$oid`: {text}"));
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Every subject kind, with the JSON an answer carries for it, written
+    /// out: the kind strings are a compatibility surface the web app matches.
+    fn every_subject() -> Vec<(PolicySubject, Value)> {
+        let [user, role, client, device] = [(); 4].map(|()| ObjectId::new());
+        vec![
+            (
+                PolicySubject::UserId { user_id: user },
+                json!({ "kind": "user_id", "id": user.to_hex() }),
+            ),
+            (
+                PolicySubject::RoleId { role_id: role },
+                json!({ "kind": "role_id", "id": role.to_hex() }),
+            ),
+            (
+                PolicySubject::TunnelClientId {
+                    tunnel_client_id: client,
+                },
+                json!({ "kind": "tunnel_client_id", "id": client.to_hex() }),
+            ),
+            (
+                PolicySubject::AgentId { agent_id: device },
+                json!({ "kind": "agent_id", "id": device.to_hex() }),
+            ),
+            (PolicySubject::AllUsers, json!({ "kind": "all_users" })),
+        ]
+    }
+
+    /// Every target kind, as [`every_subject`].
+    fn every_target() -> Vec<(PolicyTarget, Value)> {
+        let device = ObjectId::new();
+        vec![
+            (
+                PolicyTarget::AgentId { agent_id: device },
+                json!({ "kind": "agent_id", "id": device.to_hex() }),
+            ),
+            (PolicyTarget::AllAgents, json!({ "kind": "all_agents" })),
+        ]
+    }
+
+    fn subject_answer(subject: &PolicySubject) -> Value {
+        serde_json::to_value(PolicySubjectView::from(subject.clone())).expect("serialises")
+    }
+
+    fn target_answer(target: &PolicyTarget) -> Value {
+        serde_json::to_value(PolicyTargetView::from(target.clone())).expect("serialises")
+    }
+
+    #[test]
+    fn each_subject_and_target_kind_answers_its_kind_and_its_hex_id() {
+        for (subject, want) in every_subject() {
+            assert_eq!(subject_answer(&subject), want, "{subject:?}");
+        }
+        for (target, want) in every_target() {
+            assert_eq!(target_answer(&target), want, "{target:?}");
+        }
+    }
+
+    /// The view writes the model's own kind and keys, so a kind the model
+    /// renamed or a key it moved cannot leave the answers behind.
+    #[test]
+    fn an_answer_names_the_kind_and_the_keys_the_model_writes() {
+        fn keys(v: &Value) -> Vec<&String> {
+            v.as_object().expect("an object").keys().collect()
+        }
+        for (subject, _) in every_subject() {
+            let (answer, model) = (
+                subject_answer(&subject),
+                serde_json::to_value(&subject).unwrap(),
+            );
+            assert_eq!(answer["kind"], model["kind"], "{subject:?}");
+            assert_eq!(keys(&answer), keys(&model), "{subject:?}");
+        }
+        for (target, _) in every_target() {
+            let (answer, model) = (
+                target_answer(&target),
+                serde_json::to_value(&target).unwrap(),
+            );
+            assert_eq!(answer["kind"], model["kind"], "{target:?}");
+            assert_eq!(keys(&answer), keys(&model), "{target:?}");
+        }
+    }
+
+    /// What an answer carries reads back through the request types as the
+    /// stored value it came from: the editor's save is a round trip.
+    #[test]
+    fn an_answer_reads_back_as_the_subject_or_target_it_came_from() {
+        for (subject, _) in every_subject() {
+            let back: PolicySubject = serde_json::from_value(subject_answer(&subject)).unwrap();
+            assert_eq!(back, subject);
+        }
+        for (target, _) in every_target() {
+            let back: PolicyTarget = serde_json::from_value(target_answer(&target)).unwrap();
+            assert_eq!(back, target);
+        }
     }
 }
