@@ -1,6 +1,6 @@
 # FR-150: A per-user daemon is never left down by its own update or by a crash
 
-**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20. Spec only, nothing built. P0 (reads on a lab guest) comes first, then P1a, P1b and P2, each its own pull request
+**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day, nothing built yet. P1a, P1b and P2 follow, each its own pull request
 **Absorbs:** [#3507](https://github.com/gjovanov/roomler-ai/issues/3507) (the update path) and [#3295](https://github.com/gjovanov/roomler-ai/issues/3295) (the crash path), with the 2026-11-08 triage's re-spec of both
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
@@ -14,7 +14,9 @@ registered its task. After this FR:
 
 - **The task stays replaceable by its own account, whoever registered it.** The registration writes the task's
   security descriptor, so a task registered from an elevated token can be replaced, run and deleted by the person's
-  own medium-integrity update, as a task registered at medium can today.
+  own medium-integrity update, as a task registered at medium can today. A task an earlier elevated registration left
+  is registered again by the next elevated `service install`, and until then each self-update over it still brings
+  the daemon back.
 - **One owner checks that the daemon came back after an update.** The post-install watcher waits for the new daemon.
   When none appears, it starts the daemon through the task, then registers the task again, then (D2) starts the
   launcher itself. The install record says whether the daemon runs and how it came back, not only whether the binary
@@ -53,7 +55,7 @@ The mechanism holds on master for the per-account task of #3801 (0.4.221 and lat
 | `RegisterAutostart` (`service install`) replaces `Roomler-<SID>` with `/Create /XML /F` | refused, `Access is denied`, and the XML is kept in `%TEMP%`. `Return="ignore"` | `main.wxs:403-409`, `:542-544`; `agents/roomlerd/src/service.rs:802-831` |
 | The task that stays | the old definition: a logon trigger and the OS-start event, its one-shots long past | `service.rs:1300-1309` |
 | The watcher, which is the OLD release's | `SucceededVerified`; after a success it starts nothing | `agents/roomlerd/src/post_install.rs:699-735` |
-| `service start`, `stop` and `uninstall` | all act on the same task. Whether `/Run` and `/End` are refused too is C2's read | `service.rs:844-864`, `:947-978` |
+| `service start`, `stop` and `uninstall` | all act on the same task. `/Run` and `/End` succeed at medium (C2); `uninstall`'s delete is refused | `service.rs:844-864`, `:947-978` |
 
 `main.wxs:46-50` states the assumption that breaks: "schtasks /Create /XML /F against a non-elevated task succeeds for
 the user who owns it". The account does not own a task registered elevated.
@@ -89,10 +91,11 @@ user only", and hand installs. Three more things bear on the fix:
   manual fix (delete the task elevated, then `service install` from a normal shell), and `main.wxs:31-35` dates it to
   2026-04-29. It was this.
 - `win_token::restricted_medium_copy` (`agents/roomlerd/src/win_token.rs:218-222`) makes a medium copy of an elevated
-  token whose owner and default DACL are the user's. It is P1a's fallback if C3 reads that a descriptor in the XML is
-  not applied: an elevated `service install` would then register the task through that token.
+  token whose owner and default DACL are the user's. It was P1a's fallback in case a descriptor in the XML was not
+  applied. C3 read that it is, so P1a's access check uses the copy instead (Design).
 - The tests' task library treats every task whose principal is the caller as one the caller may change
-  (`service/user_task.rs:442-444`), so it cannot model #3507. P1a gives it a task the caller may only read.
+  (`service/user_task.rs:442-444`), so it cannot model #3507. P1a gives it a task the caller may read and run but not
+  replace, whose descriptor a replace keeps (C2, C5).
 
 ### #3295: a crash stays down until the next sign-in
 
@@ -128,39 +131,72 @@ offline, cannot happen on master for the same reason.
 
 ### P1a: the task names its own security descriptor
 
-`render_task_xml` (`service.rs:1285-1349`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`. Its SDDL is built
-from the SID of the account the process runs as (`own_account`, `service.rs:713-715`), the account the task runs as:
+`render_task_xml` (`service.rs:1285-1349`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
+Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:713-715`), the account
+the task runs as:
 
 ```text
-D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<the account's SID>)
+O:<the account's SID>D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<the account's SID>)
 ```
 
-The DACL is the one a medium registration gets by default. P0 reads that default (C1), and P1a's SDDL is set to what
-C1 reads.
+P0 read what Task Scheduler does with it (the field log has each cell):
+
+- **A descriptor in the XML is applied when the task is created, and only then.** An elevated registration takes the
+  owner and the three entries (C3), and so do a new task registered at medium (C3b) and a standard account's own
+  registration (C3c). The account's access check over its task's file then grants the write and the delete a replace
+  needs (C3c), which is what the start check below reads.
+  A `/Create /F` over a task that is there leaves that task's descriptor as it was, whoever asks and whatever the XML
+  says (C1b, C5).
+- The scheduler keeps its own entries after ours: the ones the Tasks folder passes down, and read for the principal.
+  The account ends with full access and the owner a medium registration gives it (C1), and the entries Administrators
+  and SYSTEM hold are unchanged.
 
 | Who registers | Owner | The account's access | Its own update can replace the task |
 |---|---|---|---|
 | medium, master | the account | full (C1) | yes |
-| elevated, master | Administrators | read | **no** (#3507) |
-| medium, P1a | the account | full | yes |
-| elevated, P1a | Administrators, or the account if C3 reads that the owner is applied | full | yes |
+| elevated, master | Administrators | read (C2) | **no** (#3507) |
+| medium, P1a | the account | full (C3b; a standard account's own, C3c) | yes |
+| elevated, P1a, a new task | the account (C3) | full | yes |
+| elevated, P1a, over a task an elevated master registered | Administrators: the replace keeps it (C5) | read | not until the repair below |
 
-**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1310-1316`), and
-Task Scheduler refuses a `HighestAvailable` registration from a caller that is not elevated (C4 reads it). So full
-access gives the account nothing beyond what every medium registration gives it today.
+**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1310-1316`). At
+medium, Task Scheduler refuses a document at `HighestAvailable` (C4), and one whose principal is SYSTEM or another
+account, as a new task and over a task the account has full access to (C4b). So full access gives the account nothing
+beyond what every medium registration gives it today.
 
-**The repair of a task an earlier elevated registration left.** No medium process can change that task. Any elevated
-run of `service install` from P1a's release can: the wizard started as an administrator, `install.ps1 -AllowElevated`,
-or `roomlerd service install` in an elevated shell. That registration replaces the descriptor (C5), and `register`
-then deletes the account's legacy `Roomler` too (`user_task.rs:159-174`), which no medium process can.
+**The repair of a task an earlier elevated registration left.** An elevated run of `service install` from P1a's release
+(the wizard started as an administrator, `install.ps1 -AllowElevated`, or `roomlerd service install` in an elevated
+shell) replaces the task, and the task keeps its descriptor (C5). So when the access check below says the account still
+cannot replace it, `register` deletes the task and registers it again, and the descriptor applies (C5c).
+`IRegisteredTask::SetSecurityDescriptor` repairs it in place too (C5b), but needs Task Scheduler's COM bindings, which
+the agent does not carry; the delete and the create go through the `Library` seam `register` already uses
+(`user_task.rs:91-113`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
+finds the instance lock held (`instance_lock.rs`) and exits. `register` then deletes the account's legacy `Roomler`
+too (`user_task.rs:159-174`), which no medium process can.
 
-**The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor (the task's file
-under `%SystemRoot%\System32\Tasks`, C6) and checks it with its own token (`AccessCheck`). When its account cannot
+**A self-update over a task its account cannot replace still comes back.** The update's `RegisterAutostart` runs the
+new package's launcher (`main.wxs:403-409`), so the first hop onto P1a already runs P1a's `service install`. At medium
+its replace is refused, but a medium process may still run that task (C2) and register a task of its own. So
+`service install` then registers `Roomler start-<SID>`, a task of the account's own:
+
+- the same three one-shots as the task's own (`service.rs:1266`), each with an end boundary an hour after the
+  registration, so a sleep inside that hour keeps them (`StartWhenAvailable`);
+- one action, the launcher with `service start` (`service.rs:844-864`): a `/Run` of the account's task, so the daemon
+  runs under its own task, and its `IgnoreNew` drops the later starts (C6b);
+- `DeleteExpiredTaskAfter`, so it deletes itself once it has expired (C6b, C6c).
+
+It adds no custom action and no relaunch owner: the one-shots stay `service install`'s, in a task the account may
+write. The step still fails, so the person's log says why (below), and the next elevated `service install` repairs the
+task and deletes this one.
+
+**The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor from the task's file
+under `%SystemRoot%\System32\Tasks` (the scheduler's copy in the registry is not readable at medium, C6) and checks it
+with a medium copy of its own token (`win_token::restricted_medium_copy`, `AccessCheck`). When its account cannot
 replace the task, it logs one WARN at start with the repair, and `service status` says so. Nothing is sent to the
-server (D5).
+server (D5). `register` asks the same check.
 
-**Kill switch:** `ROOMLERD_TASK_SD=0` in the environment of `service install`. The XML then carries no descriptor, as on
-master.
+**Kill switch:** `ROOMLERD_TASK_SD=0` in the environment of `service install`. It registers master's task: no
+descriptor in the XML, no repair and no `Roomler start-<SID>`.
 
 ### P1a: the per-user MSI's steps write their record
 
@@ -203,8 +239,8 @@ flowchart TD
 - **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1266`), with room for
   a slow guest.
 - **The first update onto P1b runs the old release's watcher.** `post_install.rs:703-705` says the same of #3292. So
-  P1b protects the hops after it, and P1a protects the first one wherever the task can be replaced. D1 asks about a
-  task that cannot be.
+  P1b protects the hops after it, and P1a protects the first one: through the task's own one-shots where the account
+  can replace it, and through `Roomler start-<SID>` where it cannot (D1).
 - **The record.** `last-install.json` (`post_install.rs:125-137`) gets a field `daemon`: running or not running, how it
   came back, and each rung's answer. It is additive in the file and on the wire (`NodeStatus.last_install`, FR-67 P3),
   and the verdict words stay what they are.
@@ -248,10 +284,13 @@ launcher then waits once and leaves with the daemon's code, as on master.
 
 | Phase | Test | Pins |
 |---|---|---|
-| P1a | `the_task_names_its_own_descriptor` | the SDDL in the rendered XML, built from the account's SID, equal to C1's read |
-| P1a | `the_switch_leaves_the_descriptor_out` | `ROOMLERD_TASK_SD=0` renders master's XML |
+| P1a | `the_task_names_its_own_descriptor` | the SDDL in the rendered XML, built from the account's SID, in `<RegistrationInfo>` after `<URI>` |
+| P1a | `the_switch_registers_masters_task` | `ROOMLERD_TASK_SD=0`: master's XML, no repair, no `Roomler start-<SID>` |
+| P1a | `an_elevated_install_registers_a_locked_task_again` | over the fake library, where a replace keeps a task's descriptor (C5): elevated, the task deleted and registered again; at medium, the replace refused and the task left |
+| P1a | `a_refused_replace_leaves_a_start_of_the_accounts_own` | `Roomler start-<SID>` registered only when the replace was refused, the account cannot replace the task and a config exists; deleted by a later `register` that succeeds and by `unregister` |
+| P1a | `the_start_task_runs_the_launchers_start_and_goes_by_itself` | its XML: the one-shots with their end boundaries, `DeleteExpiredTaskAfter`, the launcher with `service start`, no logon or boot trigger |
 | P1a | `every_per_user_msi_step_writes_its_record` | every per-user custom action of `main.wxs` is a step that writes the record, as `the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones |
-| P1a | `a_task_the_account_cannot_replace_is_named_at_start` | the access check's answer over a descriptor with Administrators as owner and read for the account |
+| P1a | `a_task_the_account_cannot_replace_is_named_at_start` | the access check's answer, with a medium copy of the test's own token, over C2's descriptor (no), C1's and P1a's (yes) |
 | P1b | the relaunch ladder over a seam (look, start, register, launch, clock), as `settle_service` is over `ServiceHandle` (`post_install.rs:902-904`) | each rung; a daemon that comes up at each rung; none; the failed-install entry |
 | P1b | the record's `daemon` field | round-trips, and a record without it still parses |
 | P2 | `the_launchers_ends_agree_with_the_install_table` | every code in the table above, against `Install`'s doc table and `worker_end_is_no_crash` (`supervisor.rs:1078-1090`) |
@@ -270,17 +309,28 @@ corporate laptops, and this FR makes no per-user install on them.
 
 | Cell | Phase | What | On master or the current release | With the phase |
 |---|---|---|---|---|
-| C1 | P0 | the descriptor of a task registered at medium: owner and DACL | read | |
-| C2 | P0 | the same, registered elevated; then from medium on it: `/Run`, `/End`, `/Delete`, `/Create /F` | read (`/Create /F` refused, #3507) | |
-| C3 | P0 | an elevated registration whose XML carries the descriptor: is it applied, the owner too? | read | |
-| C4 | P0 | a medium `/Create` with `HighestAvailable` over a task the account has full access to | read (refused, expected) | |
-| C5 | P0 | an elevated `/Create /F` with the descriptor, over C2's task: is the descriptor replaced? | read | |
-| C6 | P0 | the task's file descriptor, read and checked by the account at medium | read | |
+| C1 | P0 | the descriptor of a task registered at medium: owner and DACL | **read**: owner the account; full access for it, passed down from the Tasks folder's entry for the creator, and read beside it; Administrators and SYSTEM all but execute and delete-child | |
+| C1b | P0 | a medium `/Create /F` whose XML carries the descriptor, over C1's task | **read**: accepted, and the task's descriptor left as it was | |
+| C2 | P0 | the same, registered elevated; then from medium on it: `/Run`, `/End`, `/Delete`, `/Create /F` | **read**: owner Administrators, read for the account; `/Run` and `/End` succeed, `/Delete` and `/Create /F` are refused (`Access is denied`, #3507) | |
+| C3 | P0 | an elevated registration whose XML carries the descriptor: is it applied, the owner too? | **read**: applied, the owner too, our three entries ahead of the scheduler's | |
+| C3b | P0 | a new task registered at medium (an administrator's filtered token) whose XML carries the descriptor | **read**: applied, the owner too; a medium replace with no descriptor and a medium delete then succeed | |
+| C3c | P0 | the same from a standard account, in `render_task_xml`'s shape; then its replaces with and without the descriptor, its access check over the task's file, its own delete | **read**: master's registration gives C1's descriptor; P1a's is applied, the owner too; the access check grants write and delete; both replaces succeed and leave the descriptor as it was; its own delete succeeds | |
+| C4 | P0 | a medium `/Create` with `HighestAvailable` over a task the account has full access to | **read**: refused, as a new task and over that task | |
+| C4b | P0 | a medium registration whose principal is SYSTEM or another account, as a new task and over a task the account has full access to | **read**: refused each time, and the task's principal left as it was | |
+| C5 | P0 | an elevated `/Create /F` with the descriptor, over C2's task: is the descriptor replaced? | **read**: no. The replace succeeds and the descriptor stays: owner Administrators, read for the account | |
+| C5b | P0 | the repair by `IRegisteredTask::SetSecurityDescriptor`, elevated, over C2's task | **read**: applied in place, the owner too, and a medium replace then succeeds | |
+| C5c | P0 | the repair by a delete and a new registration with the descriptor, elevated | **read**: applied, and a medium replace and a medium delete then succeed | |
+| C5d | P0 | an elevated delete of a task while its instance runs | **read**: the instance's process runs on | |
+| C6 | P0 | the task's file descriptor, read and checked by the account at medium | **read**: at medium the task's descriptor (COM) and its file's are readable, the registry copy is not; the access check with the medium token says what the replace then does | |
+| C6b | P0 | a medium task whose one-shots `/Run` a task the account cannot replace, with end boundaries and `DeleteExpiredTaskAfter` | **read**: the first one-shot started the task; the second was dropped by its `IgnoreNew` (`0x800710E0`); the medium task was gone after its last end boundary | |
+| C6c | P0 | how such a task goes, read by its query, COM, its file and its registry key | **read**: query, COM and file gone within seconds of its end boundary; the registry key stays until a `/Delete` of the name, which succeeds | |
+| C6d | P0 | the same name registered again at medium after it went | **read**: accepted over the key it left; it ran its one-shot and went again | |
 | C7 | P1a | per-user installed from an elevated token, then a self-update | **RED**: 0.4.227 → 0.4.228, no daemon at +10 min, the record says success | candidate A → B: back within the one-shots; the task's descriptor gives the account full access |
-| C8 | P1a | the same from a medium token (control) | back at the first one-shot | the same |
+| C7b | P1a | the first hop: a task 0.4.228 registered elevated, updated to candidate A | the same RED | back within the one-shots, through `Roomler start-<SID>`, which is gone an hour later |
+| C8 | P1a | the same from a medium token (control): an administrator's filtered token, and a standard account signed in at the console | back at the first one-shot | the same |
 | C9 | P1a | a refused registration | **RED**: no line in any log of ours | `step failed` with `Access is denied` in the person's log; the daemon's start WARN |
-| C10 | P1a | the repair: an elevated `service install` from A over a task 0.4.228 registered elevated | | the descriptor replaced, the legacy task gone, and the next update comes back |
-| C11 | P1b | the second hop on a task the account cannot replace: registered elevated by 0.4.228, updated to A, then to B | offline until the next sign-in | back within 5 min; the record says how |
+| C10 | P1a | the repair: an elevated `service install` from A over a task 0.4.228 registered elevated | | the task registered again with the descriptor, the legacy task gone, the running daemon left running, and the next update comes back |
+| C11 | P1b | the second hop on a task the account cannot replace, with `ROOMLERD_TASK_SD=0` so no `Roomler start-<SID>` is left: registered elevated by 0.4.228, updated to A, then to B | offline until the next sign-in | back within 5 min; the record says how |
 | C12 | P1b | the task deleted after a successful install | offline, even at the next sign-in | back; the record says the watcher registered the task again |
 | C13 | P2 | `taskkill /F` of the daemon | **RED**: no daemon at +5 min | the row back online within a minute, with no window and no sign-in |
 | C14 | P2 | `service stop`, a removal (exit 7), an update | stays down | stays down; after the update the new task's one-shot starts it |
@@ -297,15 +347,16 @@ the release owner names.
 
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
-| P0 | C1–C6 on a lab guest, read before P1a is built | read only | not started |
-| P1a | the task's own descriptor; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | not started; after P0 |
+| P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | not started; after P0 |
 | P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | not started; after P1a |
 | P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | not started; after P1a, independent of P1b |
 | Field | each phase's cells on its candidates, then C19 on the release | read only | not started |
 | Docs | each phase's docs in its own pull request | none | not started |
 
-- **P1a leaves working by itself**: no new task is registered that its account cannot replace, a registration that
-  is refused says so in the person's log, and an elevated run repairs a task that was. Acceptance: AC2–AC5.
+- **P1a leaves working by itself**: no new task is registered that its account cannot replace, a self-update over
+  one that was still brings the daemon back, a registration that is refused says so in the person's log, and an
+  elevated run repairs the task. Acceptance: AC2–AC5.
 - **P1b leaves**: a daemon that did not come back after an update brought back, from the hop after P1b, and the record
   says so. Acceptance: AC6.
 - **P2 leaves**: a crash restarted, the deliberate ends kept down. Acceptance: AC7, AC8.
@@ -326,7 +377,8 @@ The docs:
 
 ## Acceptance criteria
 
-- [ ] **AC1** (P0): C1–C6 are read, the field log says what each read, and P1a's descriptor is the one C1 reads.
+- [ ] **AC1** (P0): C1–C6 are read, the field log says what each read, and P1a's descriptor gives the account the
+  owner and the full access C1 reads a medium registration gives it.
 - [ ] **AC2** (#3507 RED): C7 fails on the current release: a self-update of a per-user install registered from an
   elevated token leaves no daemon at +10 min while the record reads success.
 - [ ] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
@@ -345,9 +397,10 @@ The docs:
 - [ ] **AC11** — Docs updated in house style (tables, the watcher's ladder as a mermaid flow, `file:line` anchors):
   the sections above in `docs/installation.md`, the rule and the module docs, linked from `docs/README.md`.
 
-## Open decisions
+## Decisions (operator, 2026-11-20)
 
-Each has a recommendation and waits for the operator.
+The operator answered all five as recommended ("All A", through the hub). The text below is what was asked, and each
+recommendation is now the decision.
 
 - **D1. The first hop onto P1b, for a task its account cannot replace.** That hop runs the old release's watcher,
   which starts nothing after a success, and P1a's medium registration is refused on that task. Recommended: accept one
@@ -355,6 +408,11 @@ Each has a recommendation and waits for the operator.
   hops after it come back through P1b. Fallback: a post-commit action in the new package (after `InstallFinalize`,
   `asyncNoWait`) that waits for the installer to end and then brings the daemon back. It covers the first hop and an
   upgrade by hand, at the price of one more custom action and a second relaunch owner.
+  **Since P0:** the stay-down does not happen where `service install` can register a task of the account's own. A
+  medium process may run a task it cannot replace (C2), so P1a's `service install` leaves `Roomler start-<SID>`, whose
+  one-shots run it (C6b, the Design). That covers the first hop and an upgrade by hand with no new custom action and
+  no second relaunch owner, so the fallback is not built. The stay-down D1 accepted is left for an account that cannot
+  register even that task.
 - **D2. The watcher's last rung.** Recommended: when the task cannot start the daemon, the watcher starts the launcher
   itself, and the record says the daemon runs outside its task, and why. Fallback: stop at the task, and record
   "not running" with each rung's answer.
@@ -383,3 +441,7 @@ Each has a recommendation and waits for the operator.
 |---|---|---|
 | 2026-11-20 | claimed from #3507 and #3295, after the operator's ruling of 2026-11-19 ("planned and implemented") | spec only |
 | 2026-11-20 | which installs register the task elevated, read in the code and in a shipped wizard's manifest | a double-click and every self-update run at medium; the elevated wizard on an administrator's own account, `install.ps1 -AllowElevated` and hand installs in an elevated shell register it elevated (Evidence) |
+| 2026-11-20 | P0, C1–C6, on a throwaway Windows 11 guest (build 26200): an administrator with UAC on, from an elevated shell and from the person's console session at medium. The probe tasks ran a sleeper, never the daemon | each cell as the cells table says. What changes P1a: a descriptor in the XML is applied only when a task is created (C3, C1b, C5), so an elevated replace repairs nothing, and a medium process may run and end a task it cannot replace (C2). The registry copy of a task's descriptor is not readable at medium, its file's is (C6). A first try at C4 with a SYSTEM principal was refused by the schema (`LogonType` `ServiceAccount`), not by the scheduler; C4b redid it |
+| 2026-11-20 | P0's follow-ups, the same guest: C1b, C3b, C4b, C5b–C5d, C6b–C6d | as the cells table says. The repair works by a delete and a create (C5c) and by `SetSecurityDescriptor` (C5b); a medium task of the account's own brings back a daemon whose task the account cannot replace, and goes by itself (C6b–C6d). So P1a gains the repair and `Roomler start-<SID>` (Design), and D1's stay-down is avoided |
+| 2026-11-20 | C3c, a standard account (a throwaway local user in Users only) | **not read**: its process never started. From a task with a stored password it did not run within 120 s (no batch logon right), and `Start-Process -Credential` from the person's session answered `Access is denied`. Owed before P1a ships: the standard account's own registration with the descriptor |
+| 2026-11-20 | C3c, read: the same throwaway standard account, given the batch logon right for this cell only, its process started by a task with its stored password (medium, no Administrators in its token, a batch logon in session 0). The right, the account and the tasks were removed after it | as the cells table says: P1a's descriptor goes into a standard account's own registration and is applied, owner included, and every later replace and delete of its own succeeds. The caller's logon was a batch one, not an interactive one: C3b read an interactive caller (an administrator's filtered token), and C8 reads a standard account signed in at the console |
