@@ -112,6 +112,13 @@ Every API pod pulls them on its `/stats` poll from `GET /stats/turn-usage`, unde
 the prefix nginx already proxies, and books each leg once across pods as the
 paying org's `turn_bytes`.
 
+If that Redis stops answering, derp-relay's subscribe gives up after 3 s, at the
+connect or at a `PSUBSCRIBE`, logs
+`derp-relay: subscribing to coturn's statistics failed` with an error such as
+`no answer within 3000 ms (connect)`, and tries again 1, 2, 4 … 30 s apart. It
+does not probe a subscription that is up: with the Redis on the same host, a
+connection gone deaf is a frozen Redis, which coturn cannot publish to either.
+
 That endpoint is **not** public, unlike `/stats`, because the usernames name
 orgs and principals. The API signs each request with the DERP ticket key for
 this PoP's `REGION`, and derp-relay checks it with the public key it already

@@ -15,6 +15,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::ws::sub_probe::ProbeCounters;
+
 /// rc `SessionRequest` misses answered with `agent_on_other_pod` (C-2).
 pub static RC_REHOME_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Tunnel opens rejected with `agent_on_other_pod` (C-3).
@@ -75,6 +77,13 @@ pub static RC_SLOT_CLAIM_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// FR-115 P3b — session requests refused because every slot of the payer
 /// (an org, or an account in no org) was held.
 pub static RC_SLOT_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// #3952 — each Redis subscriber's probe of its own connection
+/// (`crate::ws::sub_probe`): probes sent, heard, missed and unknown, and the
+/// deaf verdicts, each one a new subscription. On a Redis that answers,
+/// `heard` keeps up with `sent` and `missed` and `deaf` stay 0.
+pub static SUB_PROBE_FANOUT: ProbeCounters = ProbeCounters::new();
+pub static SUB_PROBE_BUS: ProbeCounters = ProbeCounters::new();
+pub static SUB_PROBE_TURN: ProbeCounters = ProbeCounters::new();
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);

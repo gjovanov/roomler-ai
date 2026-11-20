@@ -124,7 +124,7 @@ already polls every 30 s; the poller resolves network → tenant and writes the 
 > baseline **both pods share** in Redis, one per (region, endpoint, network), and one Lua
 > compare-and-advance decides which pod books the growth (`book_network_bytes`,
 > `crates/core/src/relay_load.rs:495`; `RedisPubSub::advance_baseline`,
-> `crates/core/src/ws/redis_pubsub.rs:313`).
+> `crates/core/src/ws/redis_pubsub.rs:314`).
 
 | The sample, against the shared baseline | Books | The baseline |
 |---|---|---|
@@ -193,8 +193,8 @@ flowchart LR
 
 | Path | Where |
 |---|---|
-| The cluster's coturn (P4b-1) | every pod subscribes, `crates/modules/network/src/turn_usage.rs:81` |
-| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:262`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
+| The cluster's coturn (P4b-1) | every pod subscribes, `crates/modules/network/src/turn_usage.rs:124`; the subscription probes its own connection and subscribes again when it goes deaf, and the totals published in between are not booked (#3952, `docs/multi-pod-scale-out.md` "The subscriptions") |
+| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:262`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`); its subscribe to the PoP's Redis gives up after 3 s and tries again (`STATS_REDIS_BOUND`, `crates/derp-relay/src/main.rs:400`) |
 | The booking | `crates/core/src/turn_bytes.rs:86`: the first pod to claim a leg books it, and a username naming no org is counted as unattributed |
 
 > ⚠️ **`turn_bytes` is monitored only behind `relay_allowance.turn_attribution`**, which

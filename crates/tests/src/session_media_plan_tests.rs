@@ -79,6 +79,21 @@ impl Logged {
         )
     }
 
+    /// #3952 — as [`Logged::install`], with the server's own DEBUG lines too
+    /// (core and the network module), where a subscriber's dropped message
+    /// and a probe's miss are logged.
+    pub(crate) fn install_debug(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(
+                    "info,roomler_core=debug,roomler_ai_mod_network=debug",
+                ))
+                .with_ansi(false)
+                .with_writer(self.clone())
+                .finish(),
+        )
+    }
+
     pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
