@@ -283,6 +283,12 @@ mod privacy_activity_tests;
 mod privacy_gate_tests;
 #[cfg(test)]
 mod rate_limit_tests;
+/// #4042 — a viewer's hang-up of a session that runs through the cross-pod
+/// relay reaches the pod that holds it, at the window's default of 0 and with
+/// it on, within a bound measured from a same-pod hang-up; the next Connect
+/// gets a new session; and another member's hang-up is refused as on one pod.
+#[cfg(test)]
+mod rc_cross_pod_hangup_tests;
 #[cfg(test)]
 mod rc_idle_limit_tests;
 #[cfg(test)]

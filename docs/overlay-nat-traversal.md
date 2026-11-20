@@ -497,12 +497,12 @@ cascade's guarantees while replacing its reactive counters:
   Hive replica streams put `RMHIVE01` · a 12-byte tag · a QUIC packet on a DERP payload
   ([`derp.rs:166`](../crates/tunnel-core/src/transport/derp.rs#L166)). Hive is parked and no build sends one, but a 0.4.199
   peer still does, so `deliver` drops such a frame FIRST and counts it in `hive_drops()`
-  ([`derp.rs:527`](../crates/tunnel-core/src/transport/derp.rs#L527), [`derp.rs:464`](../crates/tunnel-core/src/transport/derp.rs#L464)).
+  ([`derp.rs:532`](../crates/tunnel-core/src/transport/derp.rs#L532), [`derp.rs:469`](../crates/tunnel-core/src/transport/derp.rs#L469)).
   Left to the tunnel/WG split below it, the frame would reach a tunnel's QUIC endpoint,
   boringtun or `Unrouted`, and `Unrouted` sends the overlay after a healthy DIRECT pair onto
   the relay, with a hold-down that grows to 15 minutes. The test is
   `a_parked_hive_frame_is_dropped_and_never_unrouted`
-  ([`derp.rs:826`](../crates/tunnel-core/src/transport/derp.rs#L826)). ⚠️ Nothing outside `derp.rs` reads `hive_drops()`, so
+  ([`derp.rs:873`](../crates/tunnel-core/src/transport/derp.rs#L873)). ⚠️ Nothing outside `derp.rs` reads `hive_drops()`, so
   `roomler status` does not print it. ⚠️ The stub goes only once no deployed agent can send
   the magic: past the rollback reach of the last release that compiled Hive
   ([retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137)).
@@ -601,6 +601,10 @@ straight over TURN, released the allocation the peer was dialing, and a peer who
 `/derp` had never opened sat with no carrier for 12 minutes, where 0.4.172 kept
 the pair on TURN. Now a peer that does not answer within 15 s keeps the pair on
 TURN, and is not probed again for 10 minutes (`STAMP_PROBE_BACKOFF`).
+A node that has no `/derp` of its own open (its floor off, its STUN working) opens it
+on the stamp and probes once it registers; one that cannot hold it reports so, and the
+pair keeps TURN (#2992, [overlay-communication.md](overlay-communication.md),
+*Lazy connection*).
 ⚠️ Only an installed **TURN** carrier is probed, and only on the server's stamp,
 never on a local derivation. A direct carrier, an org relay, a pair with another
 probe in flight and a pair still being established are left alone: DERP is a

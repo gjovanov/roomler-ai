@@ -1222,7 +1222,7 @@ pub struct AgentConfig {
     /// FR-148 D46 — the in-flight budget's switch: `off` (unset; the
     /// default), `shadow` or `on`. `shadow` computes the budget on the
     /// data-channel pumps and writes its fields on the `path delivery` line;
-    /// it holds nothing, and until D46's step B3 neither does `on`. Env
+    /// it holds nothing. `on` (D46 B3) holds a relayed session's frames. Env
     /// `ROOMLERD_INFLIGHT_BUDGET`, read once per session. Local only.
     #[serde(default)]
     pub inflight_budget: Option<String>,
@@ -3600,13 +3600,27 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
             Ok(cfg)
         }
         Err(prev_err) => {
-            tracing::error!(
-                path = %path.display(),
-                error = %format!("{err:#}"),
-                prev = %prev_path(path).display(),
-                prev_error = %format!("{prev_err:#}"),
-                "config unreadable and no usable previous copy — the host must be re-enrolled"
-            );
+            // #4102 — and with no copy to run on, the line names the live
+            // file's case the same way. Both stay ERROR with their advice:
+            // this is the config the process runs on (FR-66). A missing
+            // file's words also fit a device that was never enrolled.
+            if not_found(&err) {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %format!("{err:#}"),
+                    prev = %prev_path(path).display(),
+                    prev_error = %format!("{prev_err:#}"),
+                    "config missing and no usable previous copy — the host must be enrolled (again)"
+                );
+            } else {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %format!("{err:#}"),
+                    prev = %prev_path(path).display(),
+                    prev_error = %format!("{prev_err:#}"),
+                    "config unreadable and no usable previous copy — the host must be re-enrolled"
+                );
+            }
             Err(err)
         }
     }
@@ -3614,8 +3628,8 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
 
 /// Read a config that is EXPECTED to be absent — a probe, not a load.
 ///
-/// FR-66. [`load`] is deliberately **not** a neutral reader: on the
-/// both-copies-missing arm it logs `the host must be re-enrolled` at ERROR.
+/// FR-66. [`load`] is deliberately **not** a neutral reader: with no usable
+/// previous copy it logs at ERROR that the host must be (re-)enrolled.
 /// That is correct for the config a process RUNS ON — it is the 2026-08-12
 /// all-NUL self-heal, where the worker really was exit-1'ing every 60 s and
 /// re-enrollment really was the remedy — and wrong for a caller merely asking
@@ -7119,30 +7133,33 @@ tenant_id = "tid2"
             "precondition: the probe target is absent"
         );
 
-        // 1) The probe: absent means absent. No ERROR, no re-enroll advice.
+        // 1) The probe: absent means absent. No ERROR, no advice to enroll,
+        // in either of `load`'s words (`enrolled (again)`, `re-enrolled`).
         assert!(
             read_if_present(&missing).is_none(),
             "an absent optional config must read as None"
         );
         let probe_log = cap.text();
         assert!(
-            !probe_log.contains("re-enrolled"),
-            "probing an optional config must not advise re-enrollment; got: {probe_log}"
+            !probe_log.contains("enrolled"),
+            "probing an optional config must not advise enrolling or re-enrolling; got: {probe_log}"
         );
         assert!(
             !probe_log.contains("ERROR"),
             "probing an optional config must not log at ERROR; got: {probe_log}"
         );
 
-        // 2) The alarm still works. Same path, the loud reader.
+        // 2) The alarm still works. Same path, the loud reader. The file is not
+        // there, so the advice is worded for a host that may never have been
+        // enrolled (#4102); a file that does not load keeps `re-enrolled`.
         assert!(
             load(&missing).is_err(),
             "load of an absent config must still fail"
         );
         let load_log = cap.text();
         assert!(
-            load_log.contains("re-enrolled"),
-            "load must still say the host needs re-enrolling; got: {load_log}"
+            load_log.contains("the host must be enrolled (again)"),
+            "load must still say the host needs enrolling (again); got: {load_log}"
         );
         assert!(
             load_log.contains("ERROR"),
@@ -7538,6 +7555,13 @@ tenant_id = "tid2"
     const UNREADABLE_LINE: &str = "config unreadable — RECOVERED from the previous good copy; \
                                    the live file was likely truncated by an unclean shutdown";
 
+    /// [`load`]'s two lines when no previous copy can be used (#4102): the
+    /// live file is not there, or it is there and does not load.
+    const MISSING_NO_COPY_LINE: &str =
+        "config missing and no usable previous copy — the host must be enrolled (again)";
+    const UNREADABLE_NO_COPY_LINE: &str =
+        "config unreadable and no usable previous copy — the host must be re-enrolled";
+
     /// A config saved twice, so its last good copy (`.prev`) is the first
     /// save, `machine_name = "first"`, and the live file the second.
     fn with_a_last_good_copy() -> (tempfile::TempDir, PathBuf) {
@@ -7642,6 +7666,73 @@ tenant_id = "tid2"
         let log = cap.text();
         let line = the_error_line(&log);
         assert!(line.contains(UNREADABLE_LINE), "{log}");
+        assert!(!line.contains("config missing"), "{log}");
+    }
+
+    /// #4102 — a live config that is not there, with no copy beside it, is
+    /// named missing, never "unreadable": `roomlerd org` on a device with no
+    /// config named a fault that did not happen. The line stays ERROR and
+    /// keeps its advice (FR-66), in words that also fit a device that was
+    /// never enrolled. `load` still fails with the live file's own error.
+    #[test]
+    fn a_missing_config_with_no_previous_copy_is_logged_as_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let (cap, _guard) = captured();
+        let err = load(&path).expect_err("nothing to load and no copy");
+        assert!(not_found(&err), "the live file's read error: {err:#}");
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(MISSING_NO_COPY_LINE), "{log}");
+        assert!(!line.contains("unreadable"), "{log}");
+    }
+
+    /// #4102 — a live config that is not there, beside a copy that does not
+    /// parse, is missing too, and the line names why the copy could not be
+    /// used: its own parse error, in `prev_error`.
+    #[test]
+    fn a_missing_config_with_a_previous_copy_that_does_not_parse_names_its_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let prev = prev_path(&path);
+        std::fs::write(&prev, "agent_token = \"broken\n").unwrap();
+
+        let (cap, _guard) = captured();
+        let err = load(&path).expect_err("the copy does not parse");
+        assert!(not_found(&err), "the live file's read error: {err:#}");
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(MISSING_NO_COPY_LINE), "{log}");
+        assert!(!line.contains("unreadable"), "{log}");
+        let copy_error = line
+            .split_once("prev_error=")
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        assert!(
+            copy_error.starts_with(&format!(
+                "parsing config at {}: TOML parse error",
+                prev.display()
+            )),
+            "{log}"
+        );
+    }
+
+    /// #4102 — a live config that is there and does not parse, with no copy
+    /// beside it, keeps the line it had, word for word: unreadable, and the
+    /// host must be re-enrolled. A parse error is never read as missing.
+    #[test]
+    fn a_config_that_does_not_parse_with_no_previous_copy_keeps_the_re_enrollment_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+
+        let (cap, _guard) = captured();
+        let err = load(&path).expect_err("does not parse, and no copy");
+        assert!(!not_found(&err), "a parse error: {err:#}");
+        let log = cap.text();
+        let line = the_error_line(&log);
+        assert!(line.contains(UNREADABLE_NO_COPY_LINE), "{log}");
         assert!(!line.contains("config missing"), "{log}");
     }
 

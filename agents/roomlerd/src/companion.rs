@@ -1171,7 +1171,65 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
 /// ask, and there never was" need different things done about them.
 pub async fn ensure_running() -> bool {
-    tray_up().await && reaches_the_tray().await
+    ensure_running_verdict().await.up()
+}
+
+/// #4140 — [`ensure_running`]'s verdict with its cause kept, for an exec
+/// question's words ([`crate::signaling::exec_surfaces_up`]): the tray's half
+/// ([`tray_up`]), then, of a tray that is up, the road to it
+/// ([`reaches_the_tray`]).
+pub(crate) async fn ensure_running_verdict() -> TrayVerdict {
+    TrayVerdict::of_a_tray(tray_up().await).await
+}
+
+/// #4140 — the companion's verdict for a question, with the cause kept:
+/// "the tray is not up" and "the tray is up, and the question cannot reach
+/// it" were both `false` ([`ensure_running`], [`up_for_a_question`]), so the
+/// caller of an exec or SSH question no surface showed was told that the app
+/// was not running when it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrayVerdict {
+    /// The tray is up, and this daemon's question reaches it.
+    Up,
+    /// The tray is not up: no companion on this host, nobody at the screen,
+    /// or a start that failed or ran out of its wait. The road is not asked.
+    NotUp,
+    /// #3864, #3967 — the tray is up, and a Mac's road from this daemon's
+    /// question to it is closed ([`reaches_the_tray`] logs why).
+    RoadClosed,
+}
+
+impl TrayVerdict {
+    /// The verdict of a tray whose own half answered `up`: the road is asked
+    /// of a tray that is up, and only of one, as `tray_up() &&
+    /// reaches_the_tray()` asked it.
+    async fn of_a_tray(up: bool) -> Self {
+        if !up {
+            return Self::NotUp;
+        }
+        if reaches_the_tray().await {
+            Self::Up
+        } else {
+            Self::RoadClosed
+        }
+    }
+
+    /// Whether the question gets to a tray that is up: the `bool` that every
+    /// caller with no words to pick reads, as before #4140.
+    pub(crate) fn up(self) -> bool {
+        self == Self::Up
+    }
+
+    /// #4140 — why the companion did not show a question that no other
+    /// surface showed either, given whether its marker was written: the
+    /// closed road, when the road alone kept the question from a tray that is
+    /// up with the marker to read; else nothing up to show it, FR-27's words.
+    pub(crate) fn why_not_shown(self, marker: bool) -> crate::consent::NoSurface {
+        match self {
+            Self::RoadClosed if marker => crate::consent::NoSurface::RoadClosed,
+            _ => crate::consent::NoSurface::NothingUp,
+        }
+    }
 }
 
 /// #3983 — the tray's half of [`ensure_running`]'s verdict: whether the tray
@@ -1284,7 +1342,7 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
 
 /// #3983 — the companion's verdict for a consent question: read beside the
 /// window by an RC prompt's consent task since #4000 ([`start_for_prompt`]), and
-/// waited for first by an SSH session's or a recording's ([`Companion::up`]). The
+/// waited for first by an SSH session's or a recording's (`Companion::verdict`). The
 /// tray's start gets [`crate::signaling::COMPANION_START_BUDGET`]. The road to
 /// the tray ([`reaches_the_tray`]) is asked after it, within its own
 /// [`crate::consent_relay::RELAY_WITHIN`], outside that budget. Until #3983 the
@@ -1293,10 +1351,18 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
 /// could show read as having no surface. Off a Mac's root daemon the road is
 /// direct and answers at once, so the wait is the start's alone, as before.
 async fn up_for_a_question() -> bool {
-    tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, tray_up())
-        .await
-        .unwrap_or(false)
-        && reaches_the_tray().await
+    verdict_for_a_question().await.up()
+}
+
+/// #4140 — [`up_for_a_question`]'s verdict with its cause kept, for an SSH
+/// question's words ([`Companion::verdict`]).
+async fn verdict_for_a_question() -> TrayVerdict {
+    TrayVerdict::of_a_tray(
+        tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, tray_up())
+            .await
+            .unwrap_or(false),
+    )
+    .await
 }
 
 // #3983 — the longest a question waits for `up_for_a_question` before its
@@ -1376,18 +1442,28 @@ impl Companion {
     /// a start at most [`crate::signaling::COMPANION_START_BUDGET`], then for
     /// the road to the tray at most its own 1 s ([`up_for_a_question`]).
     ///
-    /// Compiled where something asks through it: a remote recording, and an
-    /// SSH session. Built without either, it is dead code, and every
-    /// `-D warnings` lane on such a build fails.
-    #[cfg(any(feature = "recording", feature = "ssh-server"))]
+    /// Compiled where something asks through it: a remote recording (an SSH
+    /// session reads [`Self::verdict`] since #4140). Built without it, it is
+    /// dead code, and every `-D warnings` lane on such a build fails.
+    #[cfg(feature = "recording")]
     pub(crate) async fn up(self) -> bool {
+        self.verdict().await.up()
+    }
+
+    /// #4140 — whether the companion is up to show the question, with the
+    /// cause kept for an SSH question's words: [`Self::System`] tells a tray
+    /// that is not up from a Mac's closed road ([`verdict_for_a_question`]).
+    /// A test's fixed answers are a tray that is up, or not.
+    #[cfg(any(feature = "recording", feature = "ssh-server"))]
+    pub(crate) async fn verdict(self) -> TrayVerdict {
         match self {
-            Self::System => up_for_a_question().await,
-            Self::Fixed(up) => up,
-            Self::Timed { .. } => true,
+            Self::System => verdict_for_a_question().await,
+            Self::Fixed(true) => TrayVerdict::Up,
+            Self::Fixed(false) => TrayVerdict::NotUp,
+            Self::Timed { .. } => TrayVerdict::Up,
             Self::Starting(after) => {
                 tokio::time::sleep(after).await;
-                true
+                TrayVerdict::Up
             }
         }
     }
@@ -3363,7 +3439,7 @@ mod tray_start_tests {
                 answers: Answers::After(SLOW_ROAD),
             });
             assert!(
-                rt.block_on(asking(stood, Companion::System.up())),
+                rt.block_on(asking(stood, Companion::System.verdict())).up(),
                 "two rows, a slow start and a slow road: the companion is up"
             );
         }
@@ -4160,32 +4236,39 @@ mod tray_start_tests {
     /// the command (Timeout)". The surfaces go up as the WS loop's task puts
     /// them up ([`crate::signaling::exec_surfaces_up`]), and the answer is
     /// worded as the command's task words it
-    /// ([`crate::signaling::exec_refusal`]).
+    /// ([`crate::signaling::exec_refusal`]). #4140 — a tray that is not up,
+    /// none installed or nobody at the screen, keeps these words.
     ///
     /// Red before #3982: every unanswered exec question ended "did not
     /// approve the command (Timeout)", whether anything showed it or not.
     #[test]
     fn an_exec_question_no_surface_showed_says_nobody_could_be_asked() {
-        use crate::consent::Decision;
+        use crate::consent::{Decision, NoSurface};
         let rt = runtime();
         let none = Host::default();
         none.not_installed.store(true, SeqCst);
+        let nobody_there = Host::default();
+        nobody_there.nobody.store(true, SeqCst);
         let works = Host::default();
         // No native panel and no notification: the companion alone decides.
         let ind = crate::indicator::ViewerIndicator::disabled();
         let words_at_the_windows_end = |host: &Host, marker: bool| {
             let ind = ind.clone();
             rt.block_on(asking(StandIn::new(host_steps(host)), async move {
-                let have_surface =
-                    crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
-                crate::signaling::exec_refusal(Decision::Timeout, have_surface)
+                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                crate::signaling::exec_refusal(Decision::Timeout, shown)
             }))
         };
-        let nobody = crate::consent::nobody_could_be_asked("execution");
+        let nobody = crate::consent::nobody_could_be_asked("execution", NoSurface::NothingUp);
         assert_eq!(
             words_at_the_windows_end(&none, true),
             nobody,
             "no companion: nobody could be asked"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&nobody_there, true),
+            nobody,
+            "nobody at the screen: the start fails, and nobody could be asked"
         );
         assert_eq!(
             words_at_the_windows_end(&works, false),
@@ -4196,6 +4279,261 @@ mod tray_start_tests {
             words_at_the_windows_end(&works, true),
             "the operator at this device did not approve the command (Timeout)",
             "a companion that showed it: nobody answered"
+        );
+    }
+
+    /// #4140 — this daemon as a Mac's root on `host`, once for each road that
+    /// is closed, and what closes it: one row's (#3864) and two rows'
+    /// (#3967).
+    fn closed_roads(host: &Host) -> Vec<(StandIn, &'static str)> {
+        use crate::consent_relay::Worker;
+        use crate::consent_relay::stand_in::{Announced, Answers, Road};
+        let one_row = Road {
+            worker: Worker {
+                relays: true,
+                uid: Some(501),
+            },
+            answers: Answers::Yes,
+        };
+        let two_rows = Announced {
+            uid: Some(501),
+            answers: Answers::Yes,
+        };
+        let on = || StandIn::new(host_steps(host));
+        vec![
+            (
+                on().on_one_row(Road {
+                    worker: Worker {
+                        relays: false,
+                        ..one_row.worker
+                    },
+                    ..one_row
+                }),
+                "one row: no worker that relays (the screen worker is down)",
+            ),
+            (
+                on().on_one_row(Road {
+                    worker: Worker {
+                        uid: None,
+                        ..one_row.worker
+                    },
+                    ..one_row
+                }),
+                "one row: a worker whose account is not known",
+            ),
+            (
+                on().on_one_row(Road {
+                    answers: Answers::No,
+                    ..one_row
+                }),
+                "one row: a person socket that does not answer (gone)",
+            ),
+            (
+                on().on_one_row(Road {
+                    answers: Answers::Never,
+                    ..one_row
+                }),
+                "one row: a person socket that never answers (stalled)",
+            ),
+            (
+                on().on_two_rows(Announced {
+                    uid: None,
+                    ..two_rows
+                }),
+                "two rows: no per-user half announced (it is down: the 0.4.228 lab read)",
+            ),
+            (
+                on().on_two_rows(Announced {
+                    answers: Answers::No,
+                    ..two_rows
+                }),
+                "two rows: a person socket that does not answer (gone)",
+            ),
+            (
+                on().on_two_rows(Announced {
+                    answers: Answers::Never,
+                    ..two_rows
+                }),
+                "two rows: a person socket that never answers (stalled)",
+            ),
+        ]
+    }
+
+    /// #4140 — the controls beside [`closed_roads`]: this daemon on `host`
+    /// with each road open, and as no Mac's root, whose tray asks it
+    /// directly.
+    fn open_roads(host: &Host) -> Vec<(StandIn, &'static str)> {
+        use crate::consent_relay::Worker;
+        use crate::consent_relay::stand_in::{Announced, Answers, Road};
+        let on = || StandIn::new(host_steps(host));
+        vec![
+            (on(), "no Mac's root: the tray asks this daemon directly"),
+            (
+                on().on_one_row(Road {
+                    worker: Worker {
+                        relays: true,
+                        uid: Some(501),
+                    },
+                    answers: Answers::Yes,
+                }),
+                "one row, the road open",
+            ),
+            (
+                on().on_two_rows(Announced {
+                    uid: Some(501),
+                    answers: Answers::Yes,
+                }),
+                "two rows, announced and answering",
+            ),
+        ]
+    }
+
+    /// #4140 — an exec question that no surface showed because a Mac's road
+    /// from this daemon's question to the app, which is up with the marker
+    /// to read, was closed, ends with words that name that cause: the
+    /// question could not reach the Roomler desktop app there. They say
+    /// neither that the app is not running nor anything about the screen.
+    /// One row and two rows read the same, whatever closed the road
+    /// ([`closed_roads`]). The controls: an open road shows the question, and
+    /// its window's end is the person's timeout ([`open_roads`]). A closed
+    /// road that was not what kept the question off the screen keeps FR-27's
+    /// words: with no marker to read, or with a tray that is not up, whose
+    /// road is not asked.
+    ///
+    /// Red before #4140: a closed road read "no one at its screen and the
+    /// Roomler desktop app is not running".
+    #[test]
+    fn an_exec_question_a_closed_road_kept_from_the_app_says_so() {
+        use crate::consent::{Decision, NoSurface};
+        use crate::consent_relay::stand_in::Announced;
+        let rt = runtime();
+        let works = Host::default();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let words_at_the_windows_end = |stood: StandIn, marker: bool| {
+            let ind = ind.clone();
+            rt.block_on(asking(stood, async move {
+                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("q4")).await;
+                crate::signaling::exec_refusal(Decision::Timeout, shown)
+            }))
+        };
+        let closed = crate::consent::nobody_could_be_asked("execution", NoSurface::RoadClosed);
+        let nothing_up = crate::consent::nobody_could_be_asked("execution", NoSurface::NothingUp);
+        for (stood, what) in closed_roads(&works) {
+            assert_eq!(
+                words_at_the_windows_end(stood, true),
+                closed,
+                "{what}: the question could not reach the app"
+            );
+        }
+        for (stood, what) in open_roads(&works) {
+            assert_eq!(
+                words_at_the_windows_end(stood, true),
+                "the operator at this device did not approve the command (Timeout)",
+                "{what}: the app showed it, and nobody answered"
+            );
+        }
+        for (stood, what) in closed_roads(&works) {
+            assert_eq!(
+                words_at_the_windows_end(stood, false),
+                nothing_up,
+                "{what}, and no marker to read: the app had nothing to show"
+            );
+        }
+        let not_up = StandIn::new(host_steps(&none)).on_two_rows(Announced {
+            uid: None,
+            answers: crate::consent_relay::stand_in::Answers::Yes,
+        });
+        assert_eq!(
+            words_at_the_windows_end(not_up, true),
+            nothing_up,
+            "no companion, and the road closed: the tray is not up, and the road is not asked"
+        );
+    }
+
+    /// #4140 — an SSH question reads the causes an exec one does, asked as
+    /// the daemon asks it ([`crate::ssh::ask_here`], through
+    /// [`Companion::System`]) with no native panel and no notification, for a
+    /// 1 s window. A closed road, on one row and on two, ends with the closed
+    /// road's words naming the SSH policy. A tray that is not up keeps FR-27's
+    /// words, whatever its road. An open road shows the question, and its
+    /// window's end is the person's timeout.
+    ///
+    /// Red before #4140: a closed road read "no one at its screen and the
+    /// Roomler desktop app is not running".
+    #[cfg(feature = "ssh-server")]
+    #[test]
+    fn an_ssh_question_a_closed_road_kept_from_the_app_says_so() {
+        use crate::consent::NoSurface;
+        use crate::consent_relay::stand_in::{Announced, Answers};
+        let rt = runtime();
+        let works = Host::default();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let refusal_at_the_windows_end = |stood: StandIn| {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let broker = crate::consent::ConsentBroker::new(
+                crate::consent::Mode::AutoGrant,
+                dir.path().join("consent"),
+            )
+            .expect("a broker on its own folder");
+            let ind = crate::indicator::ViewerIndicator::disabled();
+            let id = bson::oid::ObjectId::new().to_hex();
+            rt.block_on(asking(stood, async move {
+                crate::ssh::ask_here(
+                    &broker,
+                    &ind,
+                    Companion::System,
+                    "Alice",
+                    Some("g4140"),
+                    &id,
+                    "open an interactive shell",
+                    Duration::from_secs(1),
+                )
+                .await
+            }))
+            .expect_err("nobody answered")
+        };
+        let closed = crate::consent::nobody_could_be_asked("SSH", NoSurface::RoadClosed);
+        let nothing_up = crate::consent::nobody_could_be_asked("SSH", NoSurface::NothingUp);
+        // Each row's first closed road: the others close it the same way (the
+        // exec test beside this one reads them all).
+        let roads = closed_roads(&works);
+        for row in ["one row", "two rows"] {
+            let (stood, what) = roads
+                .iter()
+                .find(|(_, what)| what.starts_with(row))
+                .cloned()
+                .expect("a closed road on this row");
+            assert_eq!(
+                refusal_at_the_windows_end(stood),
+                closed,
+                "{what}: the question could not reach the app"
+            );
+        }
+        let not_up = StandIn::new(host_steps(&none)).on_two_rows(Announced {
+            uid: None,
+            answers: Answers::Yes,
+        });
+        assert_eq!(
+            refusal_at_the_windows_end(not_up),
+            nothing_up,
+            "no companion, and the road closed: the tray is not up"
+        );
+        assert_eq!(
+            refusal_at_the_windows_end(StandIn::new(host_steps(&none))),
+            nothing_up,
+            "no companion, and no Mac's root"
+        );
+        let (announced, what) = open_roads(&works)
+            .into_iter()
+            .find(|(_, what)| what.starts_with("two rows"))
+            .expect("two rows' open road");
+        assert_eq!(
+            refusal_at_the_windows_end(announced),
+            "nobody approved this session at the device within 1s",
+            "{what}: the app showed it, and nobody answered"
         );
     }
 }
@@ -8107,9 +8445,9 @@ XMODIFIERS=@im=ibus
     #[test]
     fn session_ids_survive_both_observed_column_layouts() {
         // systemd 255 (Ubuntu 24.04): SESSION UID USER SEAT TTY STATE IDLE SINCE
-        let s255 = "7173 1000 gjovanov - -     active no  -\n\
-                    7631 1000 gjovanov - pts/5 active yes 17h ago\n\
-                    7767 1000 gjovanov - -     active no  -\n";
+        let s255 = "7173 1000 cjackson - -     active no  -\n\
+                    7631 1000 cjackson - pts/5 active yes 17h ago\n\
+                    7767 1000 cjackson - -     active no  -\n";
         assert_eq!(session_ids(s255), ["7173", "7631", "7767"]);
 
         // systemd 257 (Fedora 42): a LEADER and a CLASS column appear, so
