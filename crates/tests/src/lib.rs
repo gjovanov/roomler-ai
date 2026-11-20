@@ -340,6 +340,11 @@ mod rc_session_policy_tests;
 /// response timeout, instead of hanging.
 #[cfg(test)]
 mod redis_bound_tests;
+/// #3952 — a Redis subscriber whose own connection goes deaf finds it within
+/// a stated bound and subscribes again; a subscribe that gets no answer gives
+/// up within #3840's bounds; a healthy subscriber never subscribes again.
+#[cfg(test)]
+mod redis_subscriber_tests;
 #[cfg(test)]
 mod relay_allowance_tests;
 #[cfg(test)]
