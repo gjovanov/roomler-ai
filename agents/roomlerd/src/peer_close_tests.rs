@@ -553,14 +553,14 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
         close_viewer(viewer_rt.handle(), viewer).await;
         drop((dc, agent));
         let left = settle_to(baseline).await;
-        // Strict on purpose: #4103's two tasks may hold a closed session's
-        // sockets, so its failures stay visible here until it is fixed.
+        // Strict on purpose: two over would be #4103 come back, an SCTP accept
+        // task that missed its stop and holds a closed session's sockets.
         assert!(
             left <= baseline,
             "{left} tasks alive after both closes, {baseline} before the peers: \
              a close its caller stopped waiting for was cut short (an inline close \
              cut this way leaves 14). Exactly 2 more than before the peers is \
-             #4103's leftover instead, not a close cut short"
+             #4103 come back, not a close cut short"
         );
     });
 }

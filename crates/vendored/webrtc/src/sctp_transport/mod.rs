@@ -160,11 +160,14 @@ impl RTCSctpTransport {
         // the `conn().await` below included. Upstream made its `notified()` at
         // the `select!`, so such a stop was lost, and `start` then built an
         // association, stored Connected over Closed and spawned an accept
-        // task, none of which anything closed.
+        // task, none of which anything closed. The stop is polled first
+        // (`biased;`), so a stop already set never starts a handshake, whose
+        // loops would live until the DTLS conn closes.
         let mut stopped_rx = self.stopped_tx.subscribe();
         let dtls_transport = self.transport();
         if let Some(net_conn) = &dtls_transport.conn().await {
             let sctp_association = tokio::select! {
+                biased;
                 _ = stopped(&mut stopped_rx) => return Err(Error::ErrSCTPTransportDTLS),
                 association = sctp::association::Association::client(sctp::association::Config {
                     net_conn: Arc::clone(net_conn) as Arc<dyn Conn + Send + Sync>,
@@ -252,8 +255,12 @@ impl RTCSctpTransport {
 
         loop {
             let dc = tokio::select! {
+                biased;
                 // Roomler patch (#4103): seen whenever the stop came, this
-                // loop's body included (`stopped`).
+                // loop's body included (`stopped`). Polled first (`biased;`),
+                // so after a stop the loop takes up no further stream and
+                // never calls the app's `on_data_channel` handler for a
+                // stopped transport.
                 _ = stopped(&mut param.stopped_rx) => break,
                 result = DataChannel::accept(
                     &param.sctp_association,

@@ -10,7 +10,7 @@ use crate::rtp_transceiver::rtp_codec::RTPCodecType;
 // Cargo bump can't silently un-do the patch. The default of 0 must
 // preserve the upstream 1 MiB fallback; a non-zero value must round-
 // trip exactly. Consumed by RTCSctpTransport::start at
-// src/sctp_transport/mod.rs:171.
+// src/sctp_transport/mod.rs:174.
 #[test]
 fn test_sctp_max_receive_buffer_size_roundtrip() -> Result<()> {
     let mut s = SettingEngine::default();
