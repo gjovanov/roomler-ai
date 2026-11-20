@@ -3691,7 +3691,7 @@ slack the queue stood, the budget's samples read `queued`, and 8 P1 a run were c
 none from a `Clear` window (every one from an `Overproduced` window in #4115's first
 runs); at 75 and 150 ms the samples were P3, 8 a run.
 
-**What it leaves.** What the opening rule leaves, and two readings that stay as they
+**What it leaves.** What the opening rule leaves, and three readings that stay as they
 were, each measured here:
 
 - The opening's samples reach nothing. On the loaded cells the session's first sample
@@ -3716,6 +3716,18 @@ were, each measured here:
   seventh, B1's at 1.052, had three marks and kept one window out. B1's budget ended at
   0.94 to 1.78 there and the budget at 0.84 to 1.77, from run to run; neither is a
   loaded cell.
+- On a path that drops, neither edge holds. On the shallow queues SCTP made fast
+  retransmits in each of the 45 runs and T3 timeouts in 37, its window down to one
+  packet. On the four shallow controls the budget writers' bracket was on the bar in 4
+  of their 24 runs.
+  The capacity ended under 0.95 in 17: in 16 a P3 sample set it, at 0.79 to 0.95 times
+  the link, and in one a window's push-back (P0's law, 0.58). The floor ended over 1.05
+  in 9. Keeping out as well a sample with a hold that SCTP's window sized rather than
+  the rate (`cw`) leaves 5 capacities under 0.95 and puts 8 runs on the bar, but 15
+  floors end over 1.05, at up to 1.78: the samples `cw` keeps out are what lowered the
+  floor after windows FR-79's gate passed that read up to 1.79 times the link (`maxrx`).
+  Both edges there belong to the step for a path that drops: P3 when SCTP's window and
+  not the rate held the budget, and the windows that read over the link.
 
 ### Where
 
