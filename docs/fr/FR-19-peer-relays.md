@@ -222,8 +222,8 @@ Four requirements, all in P0:
 3. The variant stays a **unit variant**. The session is pushed **out-of-band** as its own
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
    **`Copy`** (`:1985`); a `session` payload would break that derive and ripple through
-   `netmap.rs:92`, `relay_link.rs:1148-1151` and three by-value returns at
-   `overlay.rs:1934/1952/2030` — and would also change the JSON from a string tag to a map.
+   `netmap.rs:92`, `relay_link.rs:1312-1315` and three by-value returns at
+   `overlay.rs:1959/1977/2055` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
 
 ---
@@ -369,10 +369,10 @@ Verdict machinery to extend, verified against master:
 | what | anchor |
 |---|---|
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
-| …delegating to the pure decision | `overlay.rs:2024` `relay_verdict_core` |
-| Measured caps supersede presence | `overlay.rs:1972-1981` (in `verdict_from_nodes`, `:1951`) |
+| …delegating to the pure decision | `overlay.rs:2049` `relay_verdict_core` |
+| Measured caps supersede presence | `overlay.rs:1997-2006` (in `verdict_from_nodes`, `:1976`) |
 | Wire verdict enum | `crates/remote_control/src/signaling.rs:3457` `RelayStrategyWire` |
-| Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1125` `relay_strategy` |
+| Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1289` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
 
@@ -423,13 +423,13 @@ the first:
 
 ⚠️ **"Fail closed" is not implementable through the API the first draft prescribed.**
 `load_acl` returns `AclCtx` — **not** `Result` — and its error path returns `AclCtx::off()`,
-logging *"failing OPEN"* (`overlay.rs:1848-1851`, `:1864`). That is byte-identical to a
+logging *"failing OPEN"* (`overlay.rs:1873-1876`, `:1889`). That is byte-identical to a
 tenant that genuinely has ACLs disabled, so a caller shaped like the existing precedent
 (`overlay.rs:726-750`) takes the "no ACL configured" branch on a Mongo blip and **grants**,
 while its author believes it fails closed. Required: a `try_load_acl(…) -> Result<AclCtx, _>`
 for the new gate, with the two existing callers keeping their posture via an explicit
 `.unwrap_or_else(|_| AclCtx::off())` — which also turns their fail-open into a visible
-decision. Same for `overlay_source_of` (`overlay.rs:1871`), which swallows both errors
+decision. Same for `overlay_source_of` (`overlay.rs:1896`), which swallows both errors
 (`.ok()` → `owner_user_id: None`; `unwrap_or_default()` → empty roles), silently failing to
 match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_every_silent_drop`.
 
@@ -615,11 +615,11 @@ So the design is:
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:434`) vending one per
+  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:439`) vending one per
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:415`, `UdpRelayConn` `:564`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
-- **`relay_strategy` (`relay_link.rs:1160`) gains a branch**; the server verdict picks Org
+- **`relay_strategy` (`relay_link.rs:1324`) gains a branch**; the server verdict picks Org
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
@@ -688,7 +688,7 @@ evidence that justifies it.
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
 the counter was added without a reader"*. It has one now: the agent's `/derp` loop logs
-`stale_drops()` (`transport/derp.rs:421`) as `dropped_stale` whenever it moves
+`stale_drops()` (`transport/derp.rs:426`) as `dropped_stale` whenever it moves
 (`agents/roomlerd/src/derp.rs:477`).
 
 | surface | addition |
@@ -708,8 +708,8 @@ never have measured, and an unmeasured capability is `None`, never `false` (`Cap
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
 It does: the name is the one this network's netmap gives the relay node
-(`crates/tunnel-core/src/overlay/runtime.rs:3144`, `:4333`), and the netmap takes it from that
-network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:2925-2929`). A
+(`crates/tunnel-core/src/overlay/runtime.rs:3146`, `:4335`), and the netmap takes it from that
+network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:3022-3026`). A
 relay node missing from the map shows as its node id in hex.
 
 ### 9. Where the code goes — implementation map
@@ -719,12 +719,12 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:158` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:434` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
-| Client cascade branch | `relay_link.rs:1125` `relay_strategy` |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:439` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| Client cascade branch | `relay_link.rs:1289` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
-| Netmap shaping | `overlay.rs:2062` `shape_peer` |
+| Netmap shaping | `overlay.rs:2087` `shape_peer` |
 | Wire model | `crates/remote_control/src/signaling.rs:3477` `NetmapPeer`; `:3455` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |

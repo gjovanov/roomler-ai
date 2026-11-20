@@ -220,7 +220,7 @@ prevent, and the guard re-asserts it on every tick.
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
 - The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2422-2431`) and independent of NAT setup
-  (`runtime.rs:2158-2181`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
+  (`runtime.rs:2161-2184`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
@@ -228,7 +228,7 @@ prevent, and the guard re-asserts it on every tick.
   although every agent row has one (`models.rs:1917`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
-  (`crates/modules/network/src/overlay.rs:2970`). A client accepts any peer whose fanned routes hold `/0`
+  (`crates/modules/network/src/overlay.rs:3067`). A client accepts any peer whose fanned routes hold `/0`
   (`route_guard.rs:303-304`). So an exit that stops offering, on any OS, stays an exit in its clients' netmaps until
   an admin un-approves it. ⚠️ A device-side fix alone cannot close the black hole.
 
@@ -426,7 +426,7 @@ flowchart TB
   0.4.134 too):* our adapter comes up not forwarding, because after a crash it is recreated with its old setting
   where the boot purge could not reach it; and the ledger records our WinNAT instances so the purge removes the
   one a crash leaves. The WinNAT reason now names Hyper-V.
-- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2708`). The approval stays stored, because a
+- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2805`). The approval stays stored, because a
   flapping join must not cost an admin's decision, but it takes effect only while the device still offers the route.
   An agent older than P0b keeps advertising what it always did, so the intersection changes nothing for it.
 - **Admin UI.** An OS chip on the routes row (`OverlayNodeResponse` gains `os`, read from `Agent.os`), and the
@@ -639,7 +639,7 @@ Prefer the SCDynamicStore to files: a supplemental resolver (`SupplementalMatchD
 `SCDynamicStoreAddTemporaryValue` should disappear when the daemon's store session ends, which would make the steer
 crash-safe by construction (unverified; P1c's first task). The fallback for the split zone is `/etc/resolver/<domain>`
 (honoured by the system resolver, not by `dig`), purged at boot. Keep the existing bound-resolver gate
-(`runtime.rs:2449-2469`): never steer at a `:54` that did not bind.
+(`runtime.rs:2452-2472`): never steer at a `:53` that did not bind.
 
 *Done first, 2026-10-14, on throwaway tart VMs with `scutil` only, before any code (§8):* a temporary key's holder
 SIGKILLed → the key is gone within 1–4 s (two keys in one session: both); the same key without the flag survives its
