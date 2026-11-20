@@ -246,7 +246,7 @@ into `roomlerd::purge_exit_routes()` and called:
   their replacement: [below](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440),
   and
 - (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
-  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2243`):
+  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2245`):
   see [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
 The stale-route purge drops the peer and subnet routes it finds on the overlay's

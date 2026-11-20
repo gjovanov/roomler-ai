@@ -1599,7 +1599,7 @@ What a step writes, in order. Its own lines have the target `roomler_node_core::
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
-exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2281`).
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2283`).
 
 One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1437`). It gives the role to `service install` and
@@ -2154,6 +2154,25 @@ sequenceDiagram
     (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
     into its last good copy (`config.toml.prev`) when that one loads, and keeps
     the damaged file as `config.toml.unreadable`.
+  - `adopt-enrollment`'s **last line says what was at the target** (#3589). The
+    outcome alone cannot: a target that was not there and one that was there
+    and held no enrollment both end as a fresh primary, so the verb records what
+    its merge-base read found and words only that arm from it. What is written
+    and kept is the same on every row; only the words differ.
+
+    | At the target | The last line says | Where |
+    |---|---|---|
+    | nothing | *"written fresh (no config was here)"* | `agents/roomlerd/src/app/adopt_line.rs:54` |
+    | a config that loads and holds no enrollment | *"written into the config here, which held no enrollment (its settings kept)"* | `:55-57` |
+    | a config that does not load, with no usable `.prev` | *"written fresh: the config here could not be read and had no usable last good copy (kept as …`.unreadable`)"* | `:58-65` |
+    | a config that does not load, whose `.prev` loads and holds no enrollment | *"written into the config's last good copy, which held no enrollment (its settings kept); the config here could not be read (kept as …`.unreadable`)"* | `:66-73` |
+    | Windows, the machine-global config, not private to its administrators (#3609) | *"written fresh: the config here was not private to this computer's administrators, so nothing of it was carried over"* | `:74-76` |
+    | an enrolled config | the words it always had: refreshed, replaced, refreshed org, appended | `agents/roomlerd/src/app.rs:3228-3235` |
+
+    The record is made where the read is matched
+    (`agents/roomlerd/src/app.rs:3156-3181`) and the words are chosen at
+    `:3227`. A copy that could not be kept says why instead of where, and the
+    WARNING above it is unchanged.
   - A system scope's machine id is **derived from the host name** (the person
     cannot read the one in root's config). On a renamed host, or a VM cloned
     together with its config, the server therefore enrolls a **new device**: the
@@ -3497,7 +3516,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2243`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2245`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
