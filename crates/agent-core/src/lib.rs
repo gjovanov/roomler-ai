@@ -29,6 +29,9 @@ pub mod boot_id;
 pub mod companion_autostart;
 pub mod config;
 pub mod config_surface;
+/// #3999 — the screen a consent question opens on, on a Mac with several
+/// screens: the daemon's panel and the app's prompt choose by this one rule.
+pub mod consent_screen;
 pub mod crash_recorder;
 /// FR-84 D6 — the companion's per-user state (Welcome done, login opt-out).
 pub mod desktop_state;

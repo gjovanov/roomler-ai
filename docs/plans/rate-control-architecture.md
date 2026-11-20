@@ -111,8 +111,8 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 
 | PR | delete | anchors | precondition |
 |---|---|---|---|
-| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5105, 5088–5095, 6475–6522, 6533–6569, 6639–6644`; `mod.rs:423–480` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7269–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `mod.rs:509–520` | VT measured or kept on the settle rule |
+| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5105, 5088–5095, 6475–6522, 6533–6569, 6639–6644`; `encode/mod.rs:423–480` | A0 pass on QSV, switch ON one release |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7269–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `encode/mod.rs:509–520` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1253–1257`; `peer.rs:4825` | — (#3472 measured the divergence as a defect) |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
@@ -208,7 +208,7 @@ viewer_rate_clamp, queue_drain, relay_age_feedback`; B3b `constrained_queue_meas
 `reference_bps`), `slow_link_profile` (→ rung), `relay_ceiling_learn` + `relay_max_hi_kbps` (→
 prior bound), `area_min_bitrate` (→ `RateDomain` rule), and delete `aimd.rs`, `ceiling_learn.rs`,
 `LinkLoop`/`AgeLoop`, the P1/P3/P4/P6 governor arms. Retired keys join a `RETIRED_KEYS`
-accept-and-ignore list for one release (mirrors `mod.rs:138–147`). Tests: aimd (15) → ratectl
+accept-and-ignore list for one release (mirrors `encode/mod.rs:138–147`). Tests: aimd (15) → ratectl
 invariants; governor (32) → ~15 retire, the rest re-anchor; viewer_rate (24) → 10 become sensor
 tests; ceiling_learn (12) → 4 prior tests; goodput/rate_profile/encode_pressure/kf_policy stay.
 
