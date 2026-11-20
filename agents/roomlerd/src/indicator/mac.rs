@@ -499,15 +499,15 @@ struct Panel {
 impl Panel {
     fn new(mtm: MainThreadMarker, v: &PromptView) -> Result<Self> {
         unsafe {
-            // Top-centre of the main screen: out of the way of most content,
-            // and where a notification is expected. AppKit's origin is
-            // BOTTOM-left, so "48 px below the top" is `max_y - H - 48`.
-            let frame = NSScreen::mainScreen(mtm)
-                .map(|s| s.frame())
-                .unwrap_or(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(1440.0, 900.0),
-                ));
+            // #3999 — the top centre of the screen that holds the pointer,
+            // else of the primary (`question_screen`), as the app's prompt
+            // chooses: out of the way of most content, and where a
+            // notification is expected. AppKit's origin is BOTTOM-left, so
+            // "48 px below the top" is `max_y - H - 48`.
+            let frame = question_screen(mtm).unwrap_or(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(1440.0, 900.0),
+            ));
             let origin = NSPoint::new(
                 frame.origin.x + (frame.size.width - W) / 2.0,
                 frame.origin.y + frame.size.height - H - 48.0,
@@ -867,4 +867,29 @@ fn window_device(mtm: MainThreadMarker) -> Connection {
     } else {
         Connection::Refused(number)
     }
+}
+
+/// #3999 — the frame of the screen a question opens on: the one that holds
+/// the pointer, else the primary screen, by the rule the app's prompt follows
+/// (`roomler_node_core::consent_screen`). Read on the main thread, as the app
+/// reads them. `None` with no screen at all.
+fn question_screen(mtm: MainThreadMarker) -> Option<NSRect> {
+    use roomler_node_core::consent_screen::{self, Frame, Point};
+    let frames: Vec<NSRect> = NSScreen::screens(mtm)
+        .to_vec()
+        .iter()
+        .map(|s| s.frame())
+        .collect();
+    let screens: Vec<Frame> = frames
+        .iter()
+        .map(|f| Frame {
+            x: f.origin.x,
+            y: f.origin.y,
+            w: f.size.width,
+            h: f.size.height,
+        })
+        .collect();
+    let p = objc2_app_kit::NSEvent::mouseLocation();
+    let chosen = consent_screen::choose(Point { x: p.x, y: p.y }, &screens)?;
+    frames.get(chosen).copied()
 }
