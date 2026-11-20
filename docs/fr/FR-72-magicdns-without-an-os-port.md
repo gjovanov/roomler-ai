@@ -316,13 +316,6 @@ separate times.
       block, restores the file's original 21 lines and leaves every foreign line
       intact; switching back on re-establishes resolution. The removal path is
       the one that matters, so it was tested rather than inferred.
-- [ ] **P3 — reporting** (#1363): `roomler status` says `active` only when the
-      OS resolves `_roomler-probe.<magic domain>` to this node's own address,
-      and names every other state, *retrying* included. Unit: every word, and a
-      resolver that loses its socket after binding. Lab, as #1363's cells are
-      written: a Windows 11 guest with a policy-managed NRPT, and a Linux host
-      whose resolver bypasses systemd-resolved, each RED on the release before
-      the fix and GREEN after.
 
 ### ⚠️ Two criteria struck, because they were wrong
 
