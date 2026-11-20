@@ -331,7 +331,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: debs
       - name: Install it on bare images and start it
-        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh debs/*.deb
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns debs/*.deb
 
   # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball

@@ -662,8 +662,8 @@ jobs:
         # the daemon cannot start on (#3204). verify-linux-debs installs the
         # finished packages.
         run: |
-          set -euo pipefail; bash .github/actions/ci-linux-system-deps/ci-apt.sh reach archive.ubuntu.com security.ubuntu.com
-          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
+          set -euo pipefail; bash .github/actions/ci-linux-system-deps/ci-apt.sh reach archive.ubuntu.com security.ubuntu.com; DNS=(); [ ! -s /tmp/ci-apt.docker-dns ] || mapfile -t DNS </tmp/ci-apt.docker-dns
+          docker run --rm "${DNS[@]}" -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
             LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version
@@ -1237,8 +1237,8 @@ jobs:
 
       - name: Verify the bundled agent loads on stock Ubuntu 24.04 (arm64)
         run: |
-          set -euo pipefail; bash .github/actions/ci-linux-system-deps/ci-apt.sh reach ports.ubuntu.com
-          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
+          set -euo pipefail; bash .github/actions/ci-linux-system-deps/ci-apt.sh reach ports.ubuntu.com; DNS=(); [ ! -s /tmp/ci-apt.docker-dns ] || mapfile -t DNS </tmp/ci-apt.docker-dns
+          docker run --rm "${DNS[@]}" -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
             LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version
@@ -1355,7 +1355,7 @@ jobs:
           path: debs
 
       - name: Install them on bare images and start them
-        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh --install-sh scripts/install.sh debs/*.deb
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns --install-sh scripts/install.sh debs/*.deb
 
   # ---------------------------------------------------------------------------
   # 2. Windows — MSI via cargo-wix. The MSI PAYLOAD (roomlerd.exe + the
