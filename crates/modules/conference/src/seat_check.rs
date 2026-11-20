@@ -405,13 +405,19 @@ pub async fn end_seats(
             guard = refusal, alert = "seat_check_ended", "{ENDED}"
         );
         // The call's books, as a hang-up keeps them: the person's open call
-        // sessions close and the count drops (none left after a removal whose
-        // hook ran), then the call is settled, so one they were the last one
-        // in ends here, where its media is.
-        if let Err(e) = crate::call::finalize_call_leave_db(state, room_id, user_id, None).await {
-            warn!(room = %room_id, user = %user_id, %e, "seat check: closing the call sessions of an ended seat failed");
-        }
-        if let Err(e) = crate::call::settle_call_after_departure(state, room_id).await {
+        // sessions close and the count drops, and the call is settled once,
+        // by finalize when it closed their last session, else here (none was
+        // left open after a removal whose hook ran, or finalize failed), so a
+        // call they were the last one in ends here, where its media is.
+        let settled = match crate::call::finalize_call_leave_db(state, room_id, user_id, None).await
+        {
+            Ok(settled) => settled,
+            Err(e) => {
+                warn!(room = %room_id, user = %user_id, %e, "seat check: closing the call sessions of an ended seat failed");
+                false
+            }
+        };
+        if !settled && let Err(e) = crate::call::settle_call_after_departure(state, room_id).await {
             warn!(room = %room_id, %e, "seat check: settling the call of an ended seat failed");
         }
         ended.push(verdict.key);
