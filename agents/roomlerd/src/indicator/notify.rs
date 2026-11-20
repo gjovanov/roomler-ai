@@ -302,7 +302,7 @@ mod parent {
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// How long posting may take: a session bus round trip or three. A wedged
     /// bus must not hold the prompt's window.
@@ -677,7 +677,9 @@ mod parent {
     enum Viewing {
         /// Being put up: the companion asked first, then the notification.
         Pending,
-        /// The companion runs, and its banner lists every live session.
+        /// The companion of the person at the screen read the live sessions
+        /// after this one was registered, and goes on reading: its banner
+        /// lists it (#2531).
         Companion,
         /// The notification is up; dropping this takes it down.
         Live(std::process::ChildStdin),
@@ -699,12 +701,29 @@ mod parent {
         f(&mut viewings().lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// #2531 — how often the notice looks for the companion's read, and, once
+    /// told, whether the companion still reads.
+    const TOLD_POLL: Duration = Duration::from_millis(100);
+    const QUIET_CHECK: Duration = Duration::from_secs(1);
+
     /// FR-93 P6g — `session` is served by an arm the compositor shows nothing
     /// for: DRM reads the scanout below it, so neither GNOME's pill nor KDE's
     /// tray icon appears, and the person at the screen could be watched with
     /// nothing saying so. Say it: the companion's banner where a companion can
     /// run (it lists every live session), else a notification naming the
     /// controller, with **Disconnect**. Once per session; called on the runtime.
+    ///
+    /// #2531 — **told is shown, not presumed.** A running companion is not
+    /// one that lists the session: one that cannot reach the daemon (its
+    /// person socket gone, `ROOMLERD_PERSON_SOCKET=0`) shows no banner at all,
+    /// and before this the session was recorded as told all the same, with no
+    /// notification (measured on 0.4.228). It counts as told only once the
+    /// companion of the person at the screen has read the live sessions after
+    /// the session was registered, within `rc_sessions::TOLD_WITHIN`
+    /// ([`told_by_the_companion`]). Otherwise, and when a told session's
+    /// companion stops reading for longer than that ([`while_the_companion_reads`]),
+    /// the notification goes up, and the log names it.
+    /// `companion::ensure_running` still starts the companion first.
     pub(crate) fn viewing(session: ObjectId, registry: crate::rc_sessions::RcSessionRegistry) {
         if !viewing_enabled() {
             return;
@@ -724,20 +743,14 @@ mod parent {
             return;
         };
         rt.spawn(async move {
-            if crate::companion::ensure_running().await {
-                tracing::info!(%session, "being viewed: the companion's banner says so (FR-93 P6g)");
-                with_viewings(|v| {
-                    if matches!(v.get(&session), Some(Viewing::Pending)) {
-                        v.insert(session, Viewing::Companion);
-                    }
-                });
-                return;
-            }
+            let opened = Instant::now();
+            let companion = crate::companion::ensure_running().await;
             // The pump opens its capture as the peer is built, a moment before
             // the session is registered (once its answer is ready): wait for
             // that, and never for a session that does not get there. Measured
             // in the lab: the first build looked once, too early, and showed
-            // nothing.
+            // nothing. #2531 — the banner too lists a session only once it is
+            // registered, so both ways of saying it wait for that.
             let hex = session.to_hex();
             let mut found = None;
             for _ in 0..REGISTERED_POLLS {
@@ -752,56 +765,193 @@ mod parent {
                 with_viewings(|v| v.remove(&session));
                 return;
             };
-            let req = viewing_request(&info.controller_name, &info.permissions);
-            let closed = Arc::new(AtomicBool::new(false));
-            let (closed_said, closed_end) = (closed.clone(), closed);
-            let on_said = move |said: &Said| match said {
-                Said::Action(k) if k == DISCONNECT => {
-                    let ended = registry.disconnect(&session, crate::rc_sessions::Via::Notification);
-                    tracing::info!(%session, ended, "the person at the screen pressed Disconnect on the being-viewed notification (FR-93 P6g)");
-                }
-                Said::Closed(2) => closed_said.store(true, Ordering::Relaxed),
-                _ => {}
-            };
-            let on_end = move || {
-                // Ended by the person's close: remembered, so a reopen of the
-                // capture does not put it back. Any other end leaves the entry
-                // to `viewing_ended`.
-                if closed_end.load(Ordering::Relaxed) {
-                    with_viewings(|v| {
-                        if v.contains_key(&session) {
-                            v.insert(session, Viewing::Closed);
+            let why = if companion {
+                match told_by_the_companion(&session, &registry, opened).await {
+                    Heard::Told(uid) => {
+                        let told = with_viewings(|v| {
+                            let pending = matches!(v.get(&session), Some(Viewing::Pending));
+                            if pending {
+                                v.insert(session, Viewing::Companion);
+                            }
+                            pending
+                        });
+                        if !told {
+                            return;
                         }
-                    });
-                }
-            };
-            // Its session's end is read after the show (`Viewing::Pending`
-            // below), so the show itself is always wanted.
-            let posted = tokio::task::spawn_blocking(move || {
-                launch(&req, "viewing", on_said, on_end, || true)
-            })
-            .await;
-            match posted {
-                Ok(Ok(stdin)) => {
-                    tracing::info!(%session, "being viewed: a notification says so, with Disconnect (FR-93 P6g)");
-                    // A session that ended while it was being posted drops it
-                    // here, which takes the notification down at once.
-                    with_viewings(|v| {
-                        if matches!(v.get(&session), Some(Viewing::Pending)) {
-                            v.insert(session, Viewing::Live(stdin));
+                        tracing::info!(
+                            %session, uid,
+                            "being viewed: the companion's banner says so (FR-93 P6g); it read the \
+                             live sessions after this one was registered (#2531)"
+                        );
+                        match while_the_companion_reads(&session, &registry, uid).await {
+                            Some(why) => why,
+                            None => return,
                         }
-                    });
+                    }
+                    Heard::NotTold(why) => why,
+                    Heard::Ended => {
+                        with_viewings(|v| v.remove(&session));
+                        return;
+                    }
                 }
-                Ok(Err(why)) => {
-                    tracing::info!(%session, %why, "no being-viewed notification (FR-93 P6g)");
-                    with_viewings(|v| v.remove(&session));
-                }
-                Err(e) => {
-                    tracing::warn!(%session, %e, "no being-viewed notification (FR-93 P6g)");
-                    with_viewings(|v| v.remove(&session));
-                }
-            }
+            } else {
+                "no companion runs for the person at the screen".to_string()
+            };
+            say_it_with_a_notification(session, registry, info, why).await;
         });
+    }
+
+    /// #2531 — what [`told_by_the_companion`] heard.
+    enum Heard {
+        /// The companion of the person with this uid, at the screen, read the
+        /// live sessions after the session was registered.
+        Told(u32),
+        /// It did not, and why.
+        NotTold(String),
+        /// The session ended while it waited.
+        Ended,
+    }
+
+    /// #2531 — wait, until `rc_sessions::TOLD_WITHIN` after the later of the
+    /// capture's open and the session's registration, for the companion of
+    /// the person at the screen to read the live sessions after the session
+    /// was registered (`rc_sessions::told`). Their reads over the person socket
+    /// are the record (`RcSessionRegistry::person_read_at`), and who is at the
+    /// screen is the person socket's own look (`person_socket::person_at_the_seat_now`).
+    async fn told_by_the_companion(
+        session: &ObjectId,
+        registry: &crate::rc_sessions::RcSessionRegistry,
+        opened: Instant,
+    ) -> Heard {
+        use crate::rc_sessions::{TOLD_WITHIN, Told, told};
+        let Some(registered) = registry.registered_at(session) else {
+            return Heard::Ended;
+        };
+        let Some(uid) = crate::person_socket::person_at_the_seat_now().await else {
+            return Heard::NotTold(
+                "no person socket serves whoever is at the screen (nobody signed in there, root, \
+                 or not known), so no companion's read can show it"
+                    .into(),
+            );
+        };
+        let deadline = opened.max(registered) + TOLD_WITHIN;
+        loop {
+            match told(
+                Instant::now(),
+                registered,
+                deadline,
+                registry.person_read_at(uid),
+            ) {
+                Told::Yes => return Heard::Told(uid),
+                Told::No => {
+                    return Heard::NotTold(format!(
+                        "the companion of the person at the screen did not read the live sessions \
+                         within {TOLD_WITHIN:?}"
+                    ));
+                }
+                Told::NotYet => {}
+            }
+            if !with_viewings(|v| v.contains_key(session)) {
+                return Heard::Ended;
+            }
+            tokio::time::sleep(TOLD_POLL).await;
+        }
+    }
+
+    /// #2531 — while a told session lives, its companion must go on reading:
+    /// one that reads nothing for longer than `rc_sessions::TOLD_WITHIN` (it
+    /// was closed, or lost its socket) no longer shows the banner. `Some(why)`
+    /// once it went quiet, with the session switched back to being put up;
+    /// `None` once the session ended, or the person closed what said it.
+    async fn while_the_companion_reads(
+        session: &ObjectId,
+        registry: &crate::rc_sessions::RcSessionRegistry,
+        uid: u32,
+    ) -> Option<String> {
+        use crate::rc_sessions::{TOLD_WITHIN, gone_quiet};
+        loop {
+            tokio::time::sleep(QUIET_CHECK).await;
+            if !with_viewings(|v| matches!(v.get(session), Some(Viewing::Companion))) {
+                return None;
+            }
+            if gone_quiet(Instant::now(), registry.person_read_at(uid), TOLD_WITHIN) {
+                let switched = with_viewings(|v| {
+                    let told = matches!(v.get(session), Some(Viewing::Companion));
+                    if told {
+                        v.insert(*session, Viewing::Pending);
+                    }
+                    told
+                });
+                return switched.then(|| {
+                    format!(
+                        "the companion of the person at the screen read nothing for longer than \
+                         {TOLD_WITHIN:?}"
+                    )
+                });
+            }
+        }
+    }
+
+    /// FR-93 P6g — the notification for `session`, with **Disconnect**: the
+    /// way it is said when the companion's banner does not say it, logged with
+    /// `because`.
+    async fn say_it_with_a_notification(
+        session: ObjectId,
+        registry: crate::rc_sessions::RcSessionRegistry,
+        info: tunnel_core::localapi::RcSessionInfo,
+        because: String,
+    ) {
+        let req = viewing_request(&info.controller_name, &info.permissions);
+        let closed = Arc::new(AtomicBool::new(false));
+        let (closed_said, closed_end) = (closed.clone(), closed);
+        let on_said = move |said: &Said| match said {
+            Said::Action(k) if k == DISCONNECT => {
+                let ended = registry.disconnect(&session, crate::rc_sessions::Via::Notification);
+                tracing::info!(%session, ended, "the person at the screen pressed Disconnect on the being-viewed notification (FR-93 P6g)");
+            }
+            Said::Closed(2) => closed_said.store(true, Ordering::Relaxed),
+            _ => {}
+        };
+        let on_end = move || {
+            // Ended by the person's close: remembered, so a reopen of the
+            // capture does not put it back. Any other end leaves the entry
+            // to `viewing_ended`.
+            if closed_end.load(Ordering::Relaxed) {
+                with_viewings(|v| {
+                    if v.contains_key(&session) {
+                        v.insert(session, Viewing::Closed);
+                    }
+                });
+            }
+        };
+        // Its session's end is read after the show (`Viewing::Pending`
+        // below), so the show itself is always wanted.
+        let posted =
+            tokio::task::spawn_blocking(move || launch(&req, "viewing", on_said, on_end, || true))
+                .await;
+        match posted {
+            Ok(Ok(stdin)) => {
+                tracing::info!(
+                    %session, because = %because,
+                    "being viewed: a notification says so, with Disconnect (FR-93 P6g)"
+                );
+                // A session that ended while it was being posted drops it
+                // here, which takes the notification down at once.
+                with_viewings(|v| {
+                    if matches!(v.get(&session), Some(Viewing::Pending)) {
+                        v.insert(session, Viewing::Live(stdin));
+                    }
+                });
+            }
+            Ok(Err(why)) => {
+                tracing::info!(%session, %why, because = %because, "no being-viewed notification (FR-93 P6g)");
+                with_viewings(|v| v.remove(&session));
+            }
+            Err(e) => {
+                tracing::warn!(%session, %e, because = %because, "no being-viewed notification (FR-93 P6g)");
+                with_viewings(|v| v.remove(&session));
+            }
+        }
     }
 
     /// FR-93 P6g — `session` ended: its notification, if one is up, comes

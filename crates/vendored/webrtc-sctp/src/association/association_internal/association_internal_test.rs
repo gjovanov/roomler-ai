@@ -1336,3 +1336,51 @@ async fn test_a_late_ack_timeout_loses_no_sack_and_leaves_the_timer_free() -> Re
 
     Ok(())
 }
+
+use std::future::Future;
+use std::task::Poll;
+
+/// Roomler patch (#4116): the association's close ends a read of its
+/// streams, whenever it lands. `unregister_stream` sets a stream's
+/// `read_shutdown`, then wakes the waiters of that instant with
+/// `notify_waiters()`, as the stream's own shutdown does, and upstream's
+/// `read_sctp` made its wait only after its check: a close that landed
+/// between the two was lost, and the read waited for good. The test holds
+/// the stream's queue lock, so the read stops there, past its check, while
+/// the association closes; then it lets the lock go. One thread, so the
+/// order is the code's, not a race's.
+#[tokio::test(flavor = "current_thread")]
+async fn test_assoc_close_ends_a_read_between_its_check_and_its_wait() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    });
+    a.set_state(AssociationState::Established);
+    let s = a.create_stream(1, false).expect("a new stream");
+    let mut buf = [0u8; 64];
+
+    let held = s.reassembly_queue.lock().await;
+    let mut read = std::pin::pin!(s.read_sctp(&mut buf));
+    let polled = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+    assert!(
+        polled.is_pending(),
+        "the read must wait for the queue's lock, past its check of the flag"
+    );
+    a.close().await?;
+    drop(held);
+
+    match tokio::time::timeout(Duration::from_secs(5), read).await {
+        Ok(read) => assert_eq!(
+            read,
+            Ok((0, PayloadProtocolIdentifier::Unknown)),
+            "a read of a stream its association closed returns (0, Unknown)"
+        ),
+        Err(_) => panic!(
+            "#4116: the association closed between the read's check and its wait, and the \
+             read missed it: it waits for good for data that never comes"
+        ),
+    }
+    Ok(())
+}

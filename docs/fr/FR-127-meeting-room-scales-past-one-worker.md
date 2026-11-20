@@ -198,7 +198,7 @@ and its socket reconnects into the new server with the old protocol until the pa
 
 **Kill switches.** `[meetings] visible_tiles = false`: the server ignores `caps` and `media:view` (every consumer resumed,
 as today) and sends `meeting.view = false`. `[meetings] audio_dtx = false`: as above. Both in `MeetingsSettings`
-(`crates/config/src/settings.rs:370`, beside `free_cap` at `:376`), read where `meeting_cap.rs:104` reads `free_cap`.
+(`crates/config/src/settings.rs:273`, beside `free_cap` at `:279`), read where `meeting_cap.rs:104` reads `free_cap`.
 
 ### 3.2 P2 — simulcast
 
@@ -381,7 +381,7 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 
 ### 3.6 Per phase — files, tests, switches, baseline, docs
 
-| Phase | Files | Tests | Switch (`MeetingsSettings`, `settings.rs:370`) | Baseline | Docs owed |
+| Phase | Files | Tests | Switch (`MeetingsSettings`, `settings.rs:273`) | Baseline | Docs owed |
 |---|---|---|---|---|---|
 | P1 | `ws_media.rs` (the `media:view` arm, `caps` in join, `meeting` in `transport_created`), `room_manager.rs` (`ViewState`, `apply_view`, paused creation), `settings.rs`; `conference.ts` (report, DTX, the `meeting` read), `VideoTile.vue` (observer + `visible` emit), the three layouts, `ConferenceView.vue` | unit: `apply_view` on a fake room (`None` vs `Some([])`, audio untouched); integration (`crates/tests/src/conference_tests.rs`, the `ws_join_media` helper at `:1125`): a view client's video consumer is created paused and resumes on `media:view`, a legacy join resumes everything, `visible_tiles = false` via `TestApp::spawn_with_settings` (`crates/tests/src/fixtures/test_app.rs:194`, as `meeting_cap_tests.rs:364` does), an owner pause survives a viewer's view (AC2); Vitest: the store's report from stream keys, the layouts forward `visible` (as `conferenceLayoutTiles.spec.ts` does for `picture-black`); e2e: scroll a strip, assert `getStats` moves and no `picture-black` | `visible_tiles` (default on), `audio_dtx` (default on), `view_max` | none: `media:*` is not in `wire` (§2) and the namespace map is unchanged | `docs/real-time.md` (the two messages, the `meeting` object, the view rule), `docs/api.md` if it lists `media:*` |
 | P2 | `conference.ts` (encodings, `capture`), `ws_media.rs` (`capture`, the layer map on view), `room_manager.rs` (`preferred_layers`, `set_preferred_layers`, priority), `settings.rs` | unit: the size → layer map; integration: a producer with two encodings is a `Simulcast` consumer and `media:view` sizes change `preferred_layers`; a screen share is skipped; `simulcast = false` sends `null`; e2e: `currentLayers` follows the tile size on Chromium | `simulcast` (default on), `simulcast_layers` (2) | none | `docs/real-time.md` (the ladder), `docs/testing.md` (`--layers`, `--tiles`) |

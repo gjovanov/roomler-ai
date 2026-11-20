@@ -573,7 +573,7 @@ without a seam in production code. What they miss, the reconcile reaps within tw
 
 Each socket has a token bucket for its `media:*` frames: `[meetings] media_frame_burst`
 frames at once (400), refilled at `media_frame_rate` a second (20)
-(`crates/config/src/settings.rs:280`, `:285`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
+(`crates/config/src/settings.rs:307`, `:312`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
 `…_RATE`; `0` turns the limit off). A frame is counted on the pod that holds the socket, as it
 arrives and before anything is looked up for it (`ws_media.rs:56`), so a frame forwarded to
 the call's owner pod is counted once, where it came in.

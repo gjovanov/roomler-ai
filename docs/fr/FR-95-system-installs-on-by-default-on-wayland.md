@@ -103,7 +103,10 @@ flowchart TD
 prompt chain. But a default-on capture asks nobody: what the person at the screen needs is to know, and to be
 able to end it. That is FR-93 P6g's notice: the companion's banner where one runs, else a critical notification,
 *This screen is being viewed*, with **Disconnect**. So the check is whether that notice can reach this person,
-and `ROOMLERD_VIEWING_NOTICE=0` makes every host one with no surface.
+and `ROOMLERD_VIEWING_NOTICE=0` makes every host one with no surface. Since #2531 the banner counts for a session
+only once that person's companion has read it from the daemon, within 6 s; else the notification goes up
+([`desktop-companion.md`](../desktop-companion.md) §12.5). The open-time check is unchanged: a running companion
+still counts there as a surface.
 
 ⚠️ **Bound to a session, not a user.** A second login of the same person is a different session, told nothing,
 so the guard compares logind's session id. A user switch to someone else therefore reads `session_away` until
