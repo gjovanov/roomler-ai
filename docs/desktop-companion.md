@@ -2799,7 +2799,10 @@ screen said anyone was watching. Now each pump, once its capture opens on DRM, s
 companion (`companion::ensure_running`), whose banner lists every live session. Where no
 companion can run, the daemon posts a notification instead: *"This screen is being viewed —
 Alice is viewing this screen and can use its keyboard and mouse."*, with **Disconnect**, which
-ends the session as the banner's does. The notification stays on screen (critical urgency),
+ends the session as the banner's does. Since #2531 a companion that runs is not enough: the
+banner counts only once the person's companion has read the session from the daemon, within
+6 s, and the notification goes up when it has not, or when it then stops reading (§12.5).
+The notification stays on screen (critical urgency),
 comes down with the session, and stays down for that session once the person closes it.
 The kill switch is `ROOMLERD_VIEWING_NOTICE=0`.
 A per-user install, and a supervised Mac through its worker (FR-43), never had this problem.
@@ -3123,6 +3126,119 @@ the person at the console of a per-user daemon in an RDP session:
 `the_external_access_passwords_refusal_names_the_person_at_the_screen` and
 `a_console_persons_keys_refusal_names_the_person_at_the_screen` (every `CONSOLE_PERSON_KEYS`
 entry).
+
+### 12.5 A socket no path reaches, and a banner nobody saw (#2531)
+
+On a Linux system install the companion reaches the root daemon only through the person
+socket in the person's own runtime directory (§12.3). Two things went wrong together, and
+both were measured on 0.4.228 in the lab:
+
+- **The socket outlived its path.** The poll compared only *who* is at the seat. A log-out and
+  log-in of the same person removes the runtime directory and makes a new one. When no 5 s look
+  fell between the two (an autologin does it in about 1 s), the poll saw the same uid and kept a
+  listener that no path reached any more. The new companion read
+  `refresh failed … device service not running (no LocalAPI endpoint)` from its first poll,
+  and nothing short of a daemon restart brought the socket back. Removing the socket file did
+  the same.
+- **"Told" was presumed.** For a session on the DRM arm (FR-93 P6g) the daemon asked only
+  whether the companion was running, or could be started. It then logged
+  `being viewed: the companion's banner says so` and posted no notification. In the state above
+  the screen showed no banner and no notification at all.
+
+**The listener lives only while its path names it.** A person socket records the socket file
+it bound as its filesystem's device and its inode (`BoundSocket`,
+`crates/localapi/src/lib.rs:5220`). Both are needed: a runtime directory made again is a new
+filesystem, whose inode numbers start over, and whose device number can be one an earlier
+directory had (measured: 54, 53, 54, 53 across three re-logins, root inode 1 each time). Every
+second it looks at its path (`PATH_CHECK`, `agents/roomlerd/src/person_socket.rs:124`). Once
+the path is gone, or names anything else, it stops, and so does every connection it serves
+(`serve_person_socket`, `crates/localapi/src/lib.rs:5150`). The poll serves the person again
+at once, at the same path, with no pause (`Ended`, `agents/roomlerd/src/person_socket.rs:654`;
+`follow_the_seat`, `agents/roomlerd/src/person_socket.rs:813`).
+
+| How a listener ended | When the person is served again |
+|---|---|
+| its path no longer names its socket (removed, replaced, or a log-out and log-in under it) | at once: the poll wakes for it (`until_lost`, `agents/roomlerd/src/person_socket.rs:726`) |
+| the runtime directory is not there yet (a log-in shows the person a moment before logind makes it) | at the next look, 5 s, said once for each log-in (`person socket: the person's runtime directory is not there yet; trying again at each look`) |
+| a live socket of another process holds the path, a file that is not a socket is there, the directory is not the person's | after `RETRY_AFTER`, 30 s (`agents/roomlerd/src/person_socket.rs:116`), as before: a per-user daemon's live socket is never taken over |
+
+⚠️ **The way out compares device and inode while the listener is still open, and only then
+closes it.** The open socket pins its own filesystem, so no other file can have its pair yet.
+Once it is closed, a new runtime directory can take the device number back, with inode numbers
+that start over, and a socket bound there since could match. It used to compare the inode alone,
+after the close.
+
+⚠️ The first check comes one period after the bind, never at once, so a path emptied as fast as
+it is bound is served again at most once a second, never in a loop.
+
+**Told is shown, not presumed.** The companion learns of a session only by reading the live
+sessions (`RcSessions`), every 750 ms. That read is now the evidence:
+
+- The person socket's own person reading `RcSessions` over it is noted as theirs
+  (`rc_sessions_for_person`, `crates/localapi/src/lib.rs:3115`, dispatched at `:4118`;
+  `RcSessionRegistry::list_for_person`, `agents/roomlerd/src/rc_sessions.rs:246`). The time is
+  taken before the list, so a read counts only for sessions it could list. Root over the same
+  socket, and every client of the daemon's own endpoint, read as before, with nothing noted.
+- A session counts as told by the banner only once the companion of the person at the screen
+  has read the live sessions after the session was registered, within `TOLD_WITHIN`, 6 s
+  (`agents/roomlerd/src/rc_sessions.rs:398`, `told`, `:417`). The time counts from the
+  capture's open, or from the registration where that came later, since a banner can list a
+  session only once it is registered. Who is at the screen is the person socket's own look
+  (`person_at_the_seat_now`, `agents/roomlerd/src/person_socket.rs:515`), the person that
+  socket serves.
+- With no such read the notification goes up, with **Disconnect**, and the log says why
+  (`because=`): no companion runs, the companion did not read the session within 6 s, or no
+  person socket serves whoever is at the screen (nobody signed in there, root, or not known).
+- A told session's companion must go on reading. One that reads nothing for longer than 6 s
+  (closed, or its socket lost) brings the notification up
+  (`gone_quiet`, `agents/roomlerd/src/rc_sessions.rs:434`;
+  `while_the_companion_reads`, `agents/roomlerd/src/indicator/notify.rs:866`). The notification
+  then stays until the session ends or the person closes it, even if the companion comes back.
+
+```mermaid
+flowchart TD
+    O["a session's capture opens on DRM"] --> E["ensure_running: start the companion"]
+    E --> R["wait for the session's registration"]
+    R --> C{"does a companion run?"}
+    C -- "no" --> N["the notification, with Disconnect<br/>because: no companion runs"]
+    C -- "yes" --> T{"a read of the live sessions by the person<br/>at the screen, after the registration,<br/>within 6 s?"}
+    T -- "no" --> N
+    T -- "yes" --> B["told: the companion's banner says so"]
+    B --> Q{"a read every 6 s at least?"}
+    Q -- "yes, while the session lives" --> Q
+    Q -- "no" --> N
+```
+
+| The bound | Where | Why this long |
+|---|---|---|
+| the path check, 1 s | `PATH_CHECK`, `agents/roomlerd/src/person_socket.rs:124` | one `lstat` in a tmpfs; a lost socket is served again within it and one look |
+| the look, 5 s | `POLL`, as before | unchanged |
+| told within, 6 s | `TOLD_WITHIN`, `agents/roomlerd/src/rc_sessions.rs:398` | above the longest gap between two reads of a working companion: it sleeps 750 ms between polls and gives a read 5 s (`WATCH_READ_WITHIN`, `agents/roomler-desktop/src/main.rs:361`). A companion started for the session is waited for 2.5 s at most (`TRAY_START_WAIT`), and polls 750 ms after it is up. One slower than that to its first read gets the notification as well as its banner: the bound errs toward telling |
+| the quiet check, 1 s | `QUIET_CHECK`, `agents/roomlerd/src/indicator/notify.rs:707` | a companion gone quiet is caught within 7 s |
+
+**Unchanged:** whom the socket serves and what it answers (`Scope::Person`), the kill switches
+(`ROOMLERD_PERSON_SOCKET=0` now means no read can show the banner, so a DRM session gets the
+notification; `ROOMLERD_VIEWING_NOTICE=0` says nothing at all, as before), per-user installs
+(their daemon restarts with the session and binds its own socket, and opens no DRM capture),
+and a Mac. A Mac's root half binds its person socket in a directory only root writes, which no
+log-out removes, so its path is not watched there, and a bind that fails still waits the pause
+(both are Linux-only). Out of scope: proving the banner rendered (#3436: a companion whose web
+engine died still reads) and the consent prompt's companion verdict (#3466). Root signed in at
+the seat reaches the daemon's own socket, whose reads are not noted, so its DRM sessions get
+the notification as well as any banner.
+
+The tests:
+
+| Test | Where | What it holds |
+|---|---|---|
+| `a_removed_socket_file_is_served_again_within_a_look` | `agents/roomlerd/src/person_socket.rs:1721` | the real poll and a real socket (Linux, as the runner): a removed file is served again within a look, with no pause |
+| `a_replaced_socket_file_ends_the_listener_and_a_live_one_is_left_alone` | `agents/roomlerd/src/person_socket.rs:1764` | a stale replacement is cleared and served; a live one ends the listener, is kept and waits out the pause |
+| `a_runtime_directory_not_there_yet_is_tried_again_at_the_next_look` | `agents/roomlerd/src/person_socket.rs:1830` | a missing runtime directory is tried again at each look, said once for each log-in |
+| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:11829` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
+| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:11921` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
+| `a_session_is_told_only_by_a_read_after_its_registration` | `agents/roomlerd/src/rc_sessions.rs:448` | the decision, with a stubbed clock and record (every OS) |
+| `a_companion_that_stops_reading_for_longer_than_the_bound_has_gone_quiet` | `agents/roomlerd/src/rc_sessions.rs:481` | a told session's companion gone quiet |
+| `a_persons_read_is_noted_for_them_and_a_reannounce_keeps_the_registration` | `agents/roomlerd/src/rc_sessions.rs:505` | the record: per person, after the registration, kept across a re-announce |
 
 ## 13. One version: the companion follows the daemon (FR-117)
 

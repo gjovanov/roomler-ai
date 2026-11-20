@@ -107,11 +107,21 @@ pub fn any_user_runtime_dir(root: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// After a listener could not be served (no runtime dir yet, or a per-user
-/// daemon owns the path), the same person is retried this long after, rather
-/// than on every tick.
+/// After a listener could not be served (a per-user daemon's live socket
+/// holds the path, a file that is not a socket is there, the directory is not
+/// the person's), the same person is retried this long after, rather than on
+/// every tick. #2531 — not for a runtime directory that is not there yet,
+/// which a log-in makes a moment later: that is tried again at the next look.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// #2531 — how often a listener checks that its path still names its socket
+/// (`localapi::serve_person_socket`): one `lstat` in the person's runtime
+/// directory. A listener whose path no longer names it ends, and is served
+/// again at once ([`Ended::Lost`]), so a removed or replaced socket file comes
+/// back within this and one look.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PATH_CHECK: Duration = Duration::from_secs(1);
 
 /// The kill switch. Anything but an explicit off leaves it on.
 pub fn enabled_by_env(v: Option<&str>) -> bool {
@@ -494,6 +504,21 @@ pub async fn at_the_seat_now(uid: u32) -> tunnel_core::localapi::AtTheSeat {
     seat_for(uid, look_at_the_seat(wait).await)
 }
 
+/// #2531 — the person at the seat now, by the rule this socket follows (a
+/// person, never root), through the same one lookup in flight,
+/// `files::SEAT_LOOKUP_WAIT` at most. `None` for nobody, and for a look that
+/// could not tell. The being-viewed notice (`indicator::notify::viewing`)
+/// asks it whose reads of the live sessions show that the companion of the
+/// person at the screen is listening: this socket serves that person, so
+/// their companion reads over it.
+#[cfg(target_os = "linux")]
+pub async fn person_at_the_seat_now() -> Option<u32> {
+    match look_at_the_seat(crate::files::SEAT_LOOKUP_WAIT).await {
+        Look::Person(uid) if uid != 0 => Some(uid),
+        Look::Person(_) | Look::Nobody | Look::NotKnown(_) => None,
+    }
+}
+
 /// #3796 — the one lookup of who is at seat0 in flight for the person
 /// socket, on a thread named `seat0-person`. #3845 — the checks
 /// ([`at_the_seat_now`]) and the 5 s poll ([`follow_the_seat`]) both ask
@@ -622,26 +647,91 @@ pub(crate) mod stand_in {
     }
 }
 
+/// #2531 — how a listener's task ended on its own, which decides when its
+/// person is served again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// Its path no longer named its socket (removed, or replaced): a log-out
+    /// and log-in, or the file taken away. Served again at once.
+    Lost,
+    /// The person's runtime directory was not there: a log-in makes it a
+    /// moment after the seat shows the person. Tried again at the next look.
+    NoDir,
+    /// Not served for any other reason: tried again after [`RETRY_AFTER`].
+    Failed,
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Listener {
     uid: u32,
     stop: watch::Sender<bool>,
+    /// #2531 — how its task ended, once it has; `None` while it serves.
+    ended: watch::Receiver<Option<Ended>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Listener {
-    fn start(uid: u32, path: std::path::PathBuf, state: Arc<dyn LocalApiState>) -> Self {
+    fn start(
+        uid: u32,
+        path: std::path::PathBuf,
+        state: Arc<dyn LocalApiState>,
+        check: Duration,
+    ) -> Self {
         let (stop, rx) = watch::channel(false);
+        let (said, ended) = watch::channel(None);
         let task = tokio::spawn(async move {
-            if let Err(e) = localapi::serve_person_socket(path.clone(), uid, state, rx).await {
-                tracing::warn!(
-                    path = %path.display(), uid, error = %e,
-                    "person socket: not served (FR-27 P11); retrying later"
-                );
-            }
+            let how = match localapi::serve_person_socket(path.clone(), uid, state, rx, check).await
+            {
+                Ok(()) => Ended::Lost,
+                // Linux only: a Mac's bind makes its own root-owned
+                // directory, and a failure there keeps the pause, as before.
+                Err(e) if cfg!(target_os = "linux") && e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        path = %path.display(), uid, error = %e,
+                        "person socket: the person's runtime directory is not there yet"
+                    );
+                    Ended::NoDir
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(), uid, error = %e,
+                        "person socket: not served (FR-27 P11); retrying later"
+                    );
+                    Ended::Failed
+                }
+            };
+            let _ = said.send(Some(how));
         });
-        Self { uid, stop, task }
+        Self {
+            uid,
+            stop,
+            ended,
+            task,
+        }
+    }
+
+    /// #2531 — whether its task has ended (or is ending) on its own.
+    fn has_ended(&self) -> bool {
+        self.task.is_finished()
+            || self.ended.borrow().is_some()
+            || self.ended.has_changed().is_err()
+    }
+
+    /// #2531 — until its task ends because its path no longer names its
+    /// socket. Any other end waits for the next look, where its retry rule
+    /// applies: a runtime directory that is not there is not tried again in
+    /// a loop.
+    async fn until_lost(&mut self) {
+        if self
+            .ended
+            .wait_for(|how| *how == Some(Ended::Lost))
+            .await
+            .is_err()
+        {
+            std::future::pending::<()>().await;
+        }
     }
 
     async fn stop(self) {
@@ -684,6 +774,11 @@ struct Following {
     wait: Duration,
     /// Where the socket for a uid is made (`localapi::person_socket_path`).
     path: Box<dyn Fn(u32) -> std::path::PathBuf + Send + Sync>,
+    /// #2531 — how often a listener checks its path ([`PATH_CHECK`]).
+    check: Duration,
+    /// #2531 — the pause after a listener that could not be served
+    /// ([`RETRY_AFTER`]).
+    retry_after: Duration,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -693,6 +788,8 @@ impl Following {
             every: POLL,
             wait: LOOK_WAIT,
             path: Box::new(localapi::person_socket_path),
+            check: PATH_CHECK,
+            retry_after: RETRY_AFTER,
         }
     }
 }
@@ -706,6 +803,12 @@ impl Following {
 /// nobody, which closed the person's socket while logind hung. A look that
 /// cannot tell now keeps what is served ([`step`]). A run of them is said
 /// once as it begins and once as it ends, never on every look.
+///
+/// #2531 — a listener lives only while its path names its socket
+/// (`localapi::serve_person_socket`). One that ended because it no longer
+/// did is looked after at once, and served again at that look with no pause:
+/// before, a log-out and log-in that no look fell between left it serving a
+/// socket no path reached, until the daemon restarted.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn follow_the_seat(
     state: Arc<dyn LocalApiState>,
@@ -716,13 +819,40 @@ async fn follow_the_seat(
     let mut failed: Option<(u32, Instant)> = None;
     // #3845 — when the run of looks that could not tell began, while one runs.
     let mut not_known_since: Option<Instant> = None;
+    // #2531 — whose runtime directory was missing at the last try, said once.
+    let mut no_dir: Option<u32> = None;
     loop {
-        // A listener that ended on its own was not served: note it, and let
-        // the step below see "nobody served" so it retries after the pause.
-        if let Some(l) = current.take_if(|l| l.task.is_finished()) {
-            failed = Some((l.uid, Instant::now()));
+        // A listener that ended on its own: the step below sees "nobody
+        // served", and how it ended decides whether it is served again at
+        // this look or after the pause (#2531).
+        if let Some(l) = current.take_if(|l| l.has_ended()) {
+            let how = *l.ended.borrow();
+            let uid = l.uid;
+            let _ = l.task.await;
+            match how.unwrap_or(Ended::Failed) {
+                Ended::Lost => no_dir = None,
+                Ended::NoDir => {
+                    if no_dir != Some(uid) {
+                        tracing::info!(
+                            uid,
+                            "person socket: the person's runtime directory is not there yet; \
+                             trying again at each look (#2531)"
+                        );
+                        no_dir = Some(uid);
+                    }
+                }
+                Ended::Failed => {
+                    no_dir = None;
+                    failed = Some((uid, Instant::now()));
+                }
+            }
         }
         let look = look_at_the_seat(following.wait).await;
+        // #2531 — nobody at the seat ends a run of tries for a missing
+        // runtime directory, so the next log-in's is said again.
+        if matches!(look, Look::Nobody) {
+            no_dir = None;
+        }
         match (&look, not_known_since) {
             (Look::NotKnown(why), None) => {
                 tracing::warn!(
@@ -765,15 +895,29 @@ async fn follow_the_seat(
                     );
                     l.stop().await;
                 }
-                let too_soon = failed.is_some_and(|(u, at)| u == uid && at.elapsed() < RETRY_AFTER);
+                let too_soon =
+                    failed.is_some_and(|(u, at)| u == uid && at.elapsed() < following.retry_after);
                 if !too_soon {
-                    current = Some(Listener::start(uid, (following.path)(uid), state.clone()));
+                    current = Some(Listener::start(
+                        uid,
+                        (following.path)(uid),
+                        state.clone(),
+                        following.check,
+                    ));
                     failed = None;
                 }
             }
         }
         tokio::select! {
             _ = tokio::time::sleep(following.every) => {}
+            // #2531 — a listener whose path no longer names it is looked
+            // after at once.
+            () = async {
+                match current.as_mut() {
+                    Some(l) => l.until_lost().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
@@ -1237,6 +1381,20 @@ mod following_the_seat_tests {
         dir: &Path,
         every: Duration,
     ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        follow_pausing(state, dir, every, RETRY_AFTER)
+    }
+
+    /// #2531 — how often a test's listener checks its path.
+    const CHECK: Duration = Duration::from_millis(20);
+
+    /// [`follow`], pausing `retry_after` after a listener that could not be
+    /// served.
+    fn follow_pausing(
+        state: &Arc<Counted>,
+        dir: &Path,
+        every: Duration,
+        retry_after: Duration,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let (stop, shutdown) = watch::channel(false);
         let state: Arc<dyn LocalApiState> = state.clone();
         let dir = dir.to_path_buf();
@@ -1244,6 +1402,8 @@ mod following_the_seat_tests {
             every,
             wait: WAIT,
             path: Box::new(move |uid| dir.join(uid.to_string()).join("roomler.sock")),
+            check: CHECK,
+            retry_after,
         };
         (
             stop,
@@ -1531,6 +1691,200 @@ mod following_the_seat_tests {
             Ok(Response::ConsentDecided { ok: true })
         );
         assert_eq!(state.answers.load(SeqCst), 1);
+        stop_following(stop, poll).await;
+    }
+
+    /// The socket file at `path` as (device, inode), if one is there.
+    ///
+    /// ⚠️ An identity only while something holds that file open: once the
+    /// last holder of a removed file is gone, the filesystem may give its
+    /// inode number to the next file (ext4 did, here). So the tests below
+    /// count the binds in the log (`UP`) and ask the path, and compare inodes
+    /// only of a file a live socket holds.
+    fn file_at(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    }
+
+    /// The line each bind of a person socket logs.
+    const UP: &str = "person-at-the-device socket up";
+
+    /// #2531 — the person socket's file is removed, as a log-out and log-in
+    /// that no look falls between does to it (logind removes the runtime
+    /// directory and makes a new one), and as the lab's RED did by hand. The
+    /// listener ends within one look, the poll binds a new socket at the same
+    /// path for the same person with no pause (the pause here is `LONG`), and
+    /// the old listener's way out takes nothing from the new one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removed_socket_file_is_served_again_within_a_look() {
+        let Some(me) = me() else { return };
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow_pausing(&state, dir.path(), EVERY, LONG);
+        until_served(&path, true, "the person's socket").await;
+
+        // With no file at the path nothing answers there, so an answer is
+        // the new socket's.
+        std::fs::remove_file(&path).unwrap();
+        let removed = Instant::now();
+        until_served(&path, true, "a new socket at the path").await;
+        assert!(
+            removed.elapsed() < SEVERAL_LOOKS,
+            "served again {:?} after the removal: not within a look",
+            removed.elapsed()
+        );
+        let second = file_at(&path);
+        // Several looks and checks later the new socket is still the one at
+        // the path, and still served: nothing took it away, and nothing was
+        // bound again (its own listener holds its file, so the pair is its).
+        tokio::time::sleep(SEVERAL_LOOKS).await;
+        assert_eq!(file_at(&path), second, "the new socket stays");
+        assert!(served(&path).await, "and is served");
+        let text = log.text();
+        assert_eq!(lines_with(&text, UP), 2, "{text}");
+        assert_eq!(lines_with(&text, "path no longer names it"), 1, "{text}");
+        assert_eq!(lines_with(&text, "retrying later"), 0, "{text}");
+        stop_following(stop, poll).await;
+    }
+
+    /// #2531 — the socket's file is replaced by another socket. One nobody
+    /// serves (left behind) is cleared and the person served again within a
+    /// look. One that another process serves (a per-user daemon of the same
+    /// person would) ends the listener all the same, and is never taken over:
+    /// the old listener's way out leaves it, and the poll keeps the pause for
+    /// it. Once it is gone, the person is served again after the pause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replaced_socket_file_ends_the_listener_and_a_live_one_is_left_alone() {
+        let Some(me) = me() else { return };
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let pause = Duration::from_millis(600);
+        let (stop, poll) = follow_pausing(&state, dir.path(), EVERY, pause);
+        until_served(&path, true, "the person's socket").await;
+
+        // Replaced by a socket nobody serves: cleared, and served again. The
+        // one left behind answers nothing, so an answer is the new socket's.
+        std::fs::remove_file(&path).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let replaced = Instant::now();
+        until_served(&path, true, "a new socket over the one left behind").await;
+        assert!(
+            replaced.elapsed() < SEVERAL_LOOKS,
+            "served again {:?} after the replacement: not within a look",
+            replaced.elapsed()
+        );
+        let text = log.text();
+        assert_eq!(lines_with(&text, UP), 2, "{text}");
+
+        // Replaced by a socket another process serves: left alone. Its file
+        // is held open by `other`, so its pair names it alone.
+        std::fs::remove_file(&path).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let others = file_at(&path);
+        let deadline = Instant::now() + LONG;
+        while lines_with(&log.text(), "path no longer names it") < 2 {
+            assert!(Instant::now() < deadline, "the listener did not end");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(pause / 2).await;
+        assert_eq!(file_at(&path), others, "the other process's socket stays");
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_ok(),
+            "and still answers"
+        );
+        let text = log.text();
+        assert!(lines_with(&text, "retrying later") >= 1, "{text}");
+        assert_eq!(
+            lines_with(&text, UP),
+            2,
+            "nothing was bound over it: {text}"
+        );
+
+        // It goes, leaving its file: after the pause, served again.
+        drop(other);
+        until_served(&path, true, "the person's socket again").await;
+        let text = log.text();
+        assert_eq!(lines_with(&text, UP), 3, "{text}");
+        stop_following(stop, poll).await;
+    }
+
+    /// #2531 — the seat shows the person before logind has made their
+    /// runtime directory, as a log-in can. The bind is tried again at the
+    /// next look, not after the pause (the pause here is `LONG`), it is said
+    /// once, and the socket is up as soon as the directory exists. After a
+    /// log-out (nobody at the seat, the directory removed) the next log-in's
+    /// missing directory is said once again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_runtime_directory_not_there_yet_is_tried_again_at_the_next_look() {
+        let Some(me) = me() else { return };
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow_pausing(&state, dir.path(), EVERY, LONG);
+        // Several looks with no directory to bind in.
+        tokio::time::sleep(SEVERAL_LOOKS / 2).await;
+        let path = socket_for(dir.path(), me);
+        let made = Instant::now();
+        until_served(&path, true, "the socket, once the directory is there").await;
+        assert!(
+            made.elapsed() < SEVERAL_LOOKS,
+            "served {:?} after the directory was made: not at the next look",
+            made.elapsed()
+        );
+        let text = log.text();
+        assert_eq!(
+            lines_with(&text, "runtime directory is not there yet"),
+            1,
+            "{text}"
+        );
+        assert_eq!(lines_with(&text, "retrying later"), 0, "{text}");
+
+        // A log-out: nobody at the seat, and logind removes the directory.
+        seat.finds(Look::Nobody);
+        let deadline = Instant::now() + LONG;
+        while file_at(&path).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the socket stayed after the log-out"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        // The next log-in shows the person before the directory again.
+        seat.finds(Look::Person(me));
+        let deadline = Instant::now() + LONG;
+        while lines_with(&log.text(), "runtime directory is not there yet") < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the next log-in's missing directory was not said: {}",
+                log.text()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let path = socket_for(dir.path(), me);
+        until_served(&path, true, "the socket at the next log-in").await;
+        let text = log.text();
+        assert_eq!(
+            lines_with(&text, "runtime directory is not there yet"),
+            2,
+            "{text}"
+        );
+        assert_eq!(lines_with(&text, "retrying later"), 0, "{text}");
         stop_following(stop, poll).await;
     }
 }
