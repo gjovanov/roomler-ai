@@ -295,16 +295,16 @@ pub(crate) async fn close_call_media(
     }
 }
 
-/// DB half of a call leave, shared by HTTP `call/leave` and the WS
-/// disconnect path (which historically skipped it entirely — the "1 Active
-/// call after refresh" bug): close the session, and only when the user's
-/// LAST session closed broadcast the new count / auto-end the call.
+/// DB half of a call leave, shared by HTTP `call/leave`, the WS disconnect
+/// path (once skipped: the "1 Active call after refresh" bug), an org
+/// membership's end and the seat check: close the session, and settle the
+/// call only when the user's LAST session closed. Answers whether it settled.
 pub async fn finalize_call_leave_db(
     state: &ConferenceState,
     rid: ObjectId,
     user_id: ObjectId,
     connection_id: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let outcome = state
         .rooms
         .leave_participant(rid, user_id, connection_id)
@@ -318,9 +318,9 @@ pub async fn finalize_call_leave_db(
     if !outcome.was_last_session {
         // Another session of this user is still open (or nothing was closed):
         // the distinct-user count is unchanged — nothing to broadcast.
-        return Ok(());
+        return Ok(false);
     }
-    settle_call_after_departure(state, rid).await
+    settle_call_after_departure(state, rid).await.map(|()| true)
 }
 
 /// Someone's last call session in `rid` has closed, and the room's
