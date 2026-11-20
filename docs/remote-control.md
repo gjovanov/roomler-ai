@@ -2660,44 +2660,90 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    window, no capture exclusion — X has no equivalent), macOS
    (`viewer-indicator-macos`, AppKit). The macOS panel is a question's surface
    only while the window server serves its process (#4053). At each question
-   `prompt` (`agents/roomlerd/src/indicator/mac.rs:178`) asks a gate
-   (`indicator/panel_gate.rs:205`) two things, with no lock held:
-   - whether a 1×1 probe window, never shown, gets a window device
-     (`window_number` above 0, `indicator/mac.rs:848`). The main thread makes
-     it, and the question waits 500 ms at most.
-   - in a root process only, whether another console session has started
-     since the pump's start: notify(3) on CoreGraphics'
+   `prompt` (`agents/roomlerd/src/indicator/mac.rs:190`) asks a gate
+   (`indicator/panel_gate.rs:330`), with no lock held. Three things decide, in
+   this order, and since #4119 the first two make no window:
+   - in a root process only, **the seat**: whether it has emptied or changed
+     hands since the gate's first look at it (a log-out, a login as someone
+     else, a user switch). The person socket's poll of `/dev/console`'s owner
+     tells the gate every 5 s (`person_socket.rs:730`, `indicator/mac.rs:892`,
+     `indicator/panel_gate.rs:275`). The change is held for the process's
+     life and never read at a question, since after the login someone is at
+     the seat again. A seat that goes from nobody to a person (a boot, then a
+     login) ends nothing, and a look that could not tell changes nothing.
+   - in a root process only, **the console session**: whether another one has
+     started since the pump's start, by notify(3) on CoreGraphics'
      `GUIConsoleSessionChanged` and `GUISessionUserChanged`
-     (`indicator/console_watch.rs:40`). A root `notifyutil` in the lab (macOS
-     15, 2026-11-19) saw neither name at a lock, a display sleep or the screen
-     saver, and one or both at a log-out, a login, a fast user switch and the
-     switch back.
+     (`indicator/console_watch.rs:40`). Another session answers before the
+     window is made. A root `notifyutil` in the lab (macOS 15, 2026-11-19) saw
+     neither name at a lock, a display sleep or the screen saver, and one or
+     both at a log-out, a login, a fast user switch and the switch back.
+   - **the connection**: whether a 1×1 probe window, never shown, gets a
+     window device (`window_number` above 0, `indicator/mac.rs:911`). The main
+     thread makes it, and the question waits 500 ms at most. Just before it
+     makes the window, the main thread asks the gate again whether the panel
+     has ended (`probe`, `indicator/mac.rs:879`).
 
-   Only a root process reads the console session (`reads_console_session`,
-   `indicator/panel_gate.rs:98`): a one-row Mac's daemon and a two-row Mac's
-   root half. Its window-server connection belongs to the console session it
-   started in, so another one since leaves its panel reaching nobody. A
-   per-user process, a two-row Mac's per-user half, belongs to a GUI session
-   of its own, which a fast user switch away and back leaves alive: a read
-   there would end its panel at the first switch, and its row's questions
-   would go to the app until it restarted. It reads none, so the window
-   device alone decides for it, and its lines say `console_session=none`.
+   The order is #4119's. The 0.4.228 lab found a third shape: a log-out that
+   killed a two-row Mac's root half's window-server port ("received
+   notification of WindowServer event port death"). At the first question
+   after the login, AppKit ended the process with exit 0 while it made the
+   probe window (`_CGSCreateWindow returned 268435459`), with no line of ours.
+   launchd relaunches the daemon only after a non-zero exit, so the root half
+   stayed down until the next boot. Both console-session names posted at
+   that log-out in both runs, so the session's read alone would have answered
+   first. The seat is the second guard, for a Mac where the names do not
+   post.
+
+   Only a root process follows the seat and reads the console session
+   (`reads_console_session`, `indicator/panel_gate.rs:129`): a one-row Mac's
+   daemon and a two-row Mac's root half. Its window-server connection belongs
+   to the console session it started in, so another one since leaves its
+   panel reaching nobody. A per-user process, a two-row Mac's per-user half,
+   belongs to a GUI session of its own, which a fast user switch away and
+   back leaves alive: a read there would end its panel at the first switch,
+   and its row's questions would go to the app until it restarted. It reads
+   neither, so the window device alone decides for it, and its lines say
+   `console_session=none`.
 
    A root daemon that launchd started before anyone signed in is refused when
-   it starts, and a log-out detaches one that was served. Either way, and when
-   a root process's console session has changed, the panel answers `false`
-   for the rest of the process's life. A read with no answer in time gives
-   `false` for that question alone. `false` is the answer of a panel already
-   showing another question: the question is marked `companion` and goes on
-   down this chain to the person's app, over the relay on a one-row Mac and
-   through the announcement on a two-row Mac. It is never a refusal. The panel
-   comes back at the root daemon's next start with someone signed in. Nothing
-   restarts it, and drawing it from the person's own session is FR-149
-   (#4054). Each change is logged once, with `window_number` and
-   `console_session`: `macOS consent panel available` at the start, or in its
-   place a WARN that the process could not put a window on the screen, then a
-   WARN when the connection is lost or a root process's console session
-   changes.
+   it starts, and a log-out detaches one that was served, or kills its port.
+   Either way, and when a root process's seat or console session has changed,
+   the panel answers `false` for the rest of the process's life. A read with
+   no answer in time gives `false` for that question alone. `false` is the
+   answer of a panel already showing another question: the question is
+   marked `companion` and goes on down this chain to the person's app, over
+   the relay on a one-row Mac and through the announcement on a two-row Mac.
+   It is never a refusal. The panel comes back at the root daemon's next
+   start with someone signed in. Nothing restarts it, and drawing it from the
+   person's own session is FR-149 (#4054).
+
+   **The exit net (#4119).** A root process registers an `atexit` hook when
+   the pump starts (`indicator/exit_net.rs:82`, armed at
+   `indicator/mac.rs:410`). The main thread marks itself while it is inside
+   one of the panel's AppKit calls: the probe window, the panel's window, and
+   the event fetch and dispatch (`indicator/mac.rs:912`, `:474`, `:446`). An
+   exit that begins on that thread inside such a call, and that our code did
+   not choose, writes one line to stderr and leaves with 9, which launchd
+   relaunches (`the_net`, `indicator/exit_net.rs:131`). Every other exit
+   keeps its code: the clean stop after a SIGTERM, which exits 0 on the
+   `roomlerd-main` thread (#3195), a requested restart, an error, the quit
+   backstop, the watchdog, and AppKit's exit 0 after the delegate answers a
+   log-out's quit with `NSTerminateNow`, which the delegate marks as chosen
+   (`indicator/mac.rs:319`, #3164). The hook cannot see an `_exit`, a signal
+   or an exit on another thread. There the seat and the console session,
+   read before any window, are what hold.
+
+   Each change is logged once, with `window_number` and `console_session`:
+   `macOS consent panel available` at the start, or in its place a WARN that
+   the process could not put a window on the screen, then a WARN when the
+   connection is lost or a root process's console session changes. When the
+   console session answered first, no probe window was made, and that WARN
+   says `window_number=none`. A seat change logs its own WARN when the poll
+   sees it, with `seat_was` and `seat_now` (a uid, or `nobody`). The net's
+   line on stderr names the call it caught (`roomlerd: an exit began inside
+   the probe window …`). §10.8.2 of `docs/desktop-companion.md` has the parts
+   and the cells.
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`). On Linux,
    Windows and macOS that start runs off the async worker, one start in
@@ -2949,8 +2995,11 @@ draws the panel too: a LaunchDaemon's window reaches the console (measured on
 the operator's MacBook, macOS 27; FR-97 §8, 2026-10-22). It does so only while
 the window server serves the process: the 0.4.226 lab found a root daemon
 started before login refused, and one that a log-out detached still on
-connection 0 after the next login (#4053). The panel then takes no question,
-and each goes to the person's app (item 1 of "Prompt surfaces" above).
+connection 0 after the next login (#4053). The 0.4.228 lab found a log-out
+that killed a two-row Mac's root half's port, after which the next window it
+made ended the process with exit 0 (#4119). The panel then takes no question,
+after a log-out it makes no window, and each question goes to the person's app
+(item 1 of "Prompt surfaces" above).
 ⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
 ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
 consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
@@ -6257,8 +6306,8 @@ The constraint that shapes it is the thread. Text Input Sources (Carbon's
 HIToolbox) is called on the main thread only; recent macOS asserts it. A daemon
 built with `viewer-indicator-macos` gives its main thread to AppKit for its
 whole life (`main.rs`'s swap, FR-27), so every read and switch is queued for it:
-`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:137`) parks a
-closure that the pump runs on its next pass (`mac.rs:437`), at most 120 ms
+`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:149`) parks a
+closure that the pump runs on its next pass (`mac.rs:464`), at most 120 ms
 later, and sends the answer back.
 
 ```mermaid
