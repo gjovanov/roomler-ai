@@ -3145,6 +3145,15 @@ pub trait LocalApiState: Send + Sync {
     fn rc_sessions(&self) -> Vec<RcSessionInfo> {
         Vec::new()
     }
+    /// #2531 — [`Self::rc_sessions`], read by `uid`, the person the person
+    /// socket serves, over that socket ([`Scope::Person`]; the dispatcher
+    /// admits nobody else, root included). The daemon notes when that person
+    /// last read the live sessions: it is what shows that their companion is
+    /// listening, so that its banner can say a session is viewed. Default:
+    /// the list, with nothing noted.
+    fn rc_sessions_for_person(&self, _uid: u32) -> Vec<RcSessionInfo> {
+        self.rc_sessions()
+    }
     /// FR-27 — tear down a live remote-control session from the device side.
     /// Returns whether a session with that id was found and asked to stop.
     /// Default: no-op `false`.
@@ -4140,6 +4149,18 @@ where
                     _ => Response::Error {
                         message: CONSENT_RELAYING_NOT_HERE.into(),
                     },
+                },
+                // #2531 — the live sessions, as the person this socket serves
+                // reads them: the daemon notes the read, which is what shows
+                // that their companion is listening. Root, and every other
+                // endpoint, reads them as before, and nothing is noted.
+                Ok(Request::RcSessions) => match scope {
+                    Scope::Person { owner_uid }
+                        if owner_uid != 0 && peer.uid == Some(owner_uid) =>
+                    {
+                        Response::RcSessions(state.rc_sessions_for_person(owner_uid))
+                    }
+                    _ => Response::RcSessions(state.rc_sessions()),
                 },
                 Ok(Request::Ping {
                     target,
@@ -5149,6 +5170,18 @@ pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
 /// and on the way out unlinks only the entry it bound (`lstat`, never
 /// following a link).
 ///
+/// #2531 — **and on Linux it lives only while its path names it.** Every
+/// `check_every` it looks at its path: once the path is gone, or names
+/// anything but the socket it bound ([`BoundSocket`]), it stops, and so does
+/// every connection it serves. That is what a log-out and log-in does
+/// underneath it: logind removes the person's runtime directory and makes a
+/// new one, so the old socket is reachable by no path. Before, it went on
+/// listening there until the daemon restarted, and the person's companion
+/// could not reach the daemon at all (measured on 0.4.228). It ends with
+/// `Ok`, as it does when `stop` says so; the caller serves the person again.
+/// A Mac's is not watched: its directory is root's alone, and no log-out
+/// removes it.
+///
 /// FR-97 P2g — a Mac's root half serves one too, at [`person_socket_path`]
 /// in a directory only root can write ([`bind_person_socket`]), with the same
 /// per-connection uid check and the same [`Scope::Person`].
@@ -5158,54 +5191,132 @@ pub async fn serve_person_socket(
     owner_uid: u32,
     state: Arc<dyn LocalApiState>,
     mut stop: watch::Receiver<bool>,
+    check_every: std::time::Duration,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
     use tokio::net::UnixListener;
 
     if *stop.borrow() {
         return Ok(());
     }
-    let (std_listener, bound_ino) = bind_person_socket(path.clone(), owner_uid).await?;
+    let (std_listener, bound) = bind_person_socket(path.clone(), owner_uid).await?;
     std_listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(std_listener)?;
     tracing::info!(
         path = %path.display(), uid = owner_uid,
         "localapi: person-at-the-device socket up (FR-27 P11)"
     );
-    let served = serve_person_listener(listener, owner_uid, state, &mut stop).await;
-    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
+    // A Mac's person socket sits in a directory only root writes, which no
+    // log-out removes, so its path is not watched and the Mac serves as it
+    // did before #2531.
+    #[cfg(target_os = "macos")]
+    let lost = {
+        let _ = check_every;
+        std::future::pending::<()>()
+    };
+    #[cfg(target_os = "linux")]
+    let lost = async {
+        // The first check one period after the bind, never at once: a path
+        // emptied as fast as it is bound is served again at most once a
+        // period, not in a loop.
+        let mut every =
+            tokio::time::interval_at(tokio::time::Instant::now() + check_every, check_every);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            if !bound.named_by(&path) {
+                return;
+            }
+        }
+    };
+    let served = serve_person_listener(&listener, owner_uid, state, &mut stop, lost).await;
+    // ⚠️ #2531 — compared while the listener is still open, and only then
+    // closed. The open socket pins its own filesystem, so no other file can
+    // have its device and inode yet; once it is closed, a new runtime
+    // directory can take that device number back, with inode numbers that
+    // start over, and a socket bound there since could match.
+    if bound.named_by(&path) {
         let _ = std::fs::remove_file(&path);
     }
+    drop(listener);
+    if matches!(served, Ok(PersonListenerEnd::PathLost)) {
+        tracing::info!(
+            path = %path.display(), uid = owner_uid,
+            "localapi: the person-at-the-device socket's path no longer names it (#2531)"
+        );
+    }
     tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
-    served
+    served.map(|_| ())
+}
+
+/// #2531 — the socket file a person socket bound, as its filesystem's device
+/// and its inode. Both: a runtime directory that logind removes and makes
+/// again is a new filesystem, whose inode numbers start over, and whose
+/// device number can be one an earlier directory had (measured on a re-login
+/// lab guest: 54, 53, 54, 53 across three re-logins, root inode 1 each time).
+/// While the daemon holds the socket open, the pair names that socket alone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundSocket {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl BoundSocket {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    /// Whether `path` names this socket now (`lstat`, never following a link).
+    fn named_by(self, path: &std::path::Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| Self::of(&m) == self)
+    }
+}
+
+/// #2531 — why [`serve_person_listener`] stopped serving.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonListenerEnd {
+    /// `stop` said so.
+    Stopped,
+    /// Its path no longer names its socket.
+    PathLost,
 }
 
 /// FR-27 P11 — [`serve_person_socket`]'s accept loop, on a listener already
 /// bound: a connection whose kernel-read uid is neither `owner_uid` nor root
 /// is dropped before a byte of it is read ([`person_peer_ok`]), and every
-/// other one is served as [`Scope::Person`] until `stop`. Kept apart from the
-/// bind so a test can hand it a listener of its own and connect as an account
-/// that is not the socket's person (#2871).
+/// other one is served as [`Scope::Person`] until `stop`, or (#2531) until
+/// `lost` completes. Kept apart from the bind so a test can hand it a listener
+/// of its own and connect as an account that is not the socket's person
+/// (#2871). It borrows the listener, so the caller decides when it closes.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn serve_person_listener(
-    listener: tokio::net::UnixListener,
+    listener: &tokio::net::UnixListener,
     owner_uid: u32,
     state: Arc<dyn LocalApiState>,
     stop: &mut watch::Receiver<bool>,
-) -> std::io::Result<()> {
+    lost: impl std::future::Future<Output = ()>,
+) -> std::io::Result<PersonListenerEnd> {
     // ⚠️ Connections are held HERE, not detached: when the person at the seat
     // changes this listener is stopped, and a connection the previous person
     // still holds open must not keep answering consent for the new person's
     // screen. Stopping aborts every one of them.
     let mut conns = tokio::task::JoinSet::new();
+    tokio::pin!(lost);
     let served = loop {
         tokio::select! {
             biased;
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
-                    break Ok(());
+                    break Ok(PersonListenerEnd::Stopped);
                 }
             }
+            () = &mut lost => break Ok(PersonListenerEnd::PathLost),
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accept = listener.accept() => match accept {
                 Ok((stream, _addr)) => {
@@ -5247,7 +5358,7 @@ async fn serve_person_listener(
 async fn bind_person_socket(
     path: std::path::PathBuf,
     owner_uid: u32,
-) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+) -> std::io::Result<(std::os::unix::net::UnixListener, BoundSocket)> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::MetadataExt;
     let dir = path
@@ -5278,7 +5389,7 @@ async fn bind_person_socket(
 async fn bind_person_socket(
     path: std::path::PathBuf,
     owner_uid: u32,
-) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+) -> std::io::Result<(std::os::unix::net::UnixListener, BoundSocket)> {
     tokio::task::spawn_blocking(move || bind_root_owned(&path, owner_uid))
         .await
         .map_err(|e| std::io::Error::other(format!("person socket: the bind task failed: {e}")))?
@@ -5299,12 +5410,12 @@ fn root_only_dir(is_dir: bool, is_symlink: bool, uid: u32, mode: u32) -> bool {
 /// that, and every connection is checked against the person or root
 /// ([`person_peer_ok`]) whatever the mode was in between. The `chmod` follows
 /// links, which is safe only because nobody but root can change an entry in
-/// this directory. Returns the listener and its inode.
+/// this directory. Returns the listener and the socket file it bound.
 #[cfg(target_os = "macos")]
 fn bind_root_owned(
     path: &std::path::Path,
     uid: u32,
-) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+) -> std::io::Result<(std::os::unix::net::UnixListener, BoundSocket)> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     let dir = path
@@ -5347,13 +5458,13 @@ fn bind_root_owned(
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     std::os::unix::fs::lchown(path, Some(uid), None)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let ino = std::fs::symlink_metadata(path)?.ino();
-    Ok((listener, ino))
+    let bound = BoundSocket::of(&std::fs::symlink_metadata(path)?);
+    Ok((listener, bound))
 }
 
 /// FR-27 P11 — make the person socket AS the person: check the path, clear a
 /// stale socket, bind, and chmod 0600, all with THIS thread's filesystem ids
-/// switched to theirs. Returns the listener and the inode it bound.
+/// switched to theirs. Returns the listener and the socket file it bound.
 ///
 /// ⚠️ Load-bearing, not tidiness. The socket's directory belongs to the
 /// person, so they can swap its entry between any two calls the daemon makes
@@ -5370,9 +5481,9 @@ fn bind_as_person(
     path: &std::path::Path,
     uid: u32,
     gid: u32,
-) -> std::io::Result<(std::os::unix::net::UnixListener, u64)> {
+) -> std::io::Result<(std::os::unix::net::UnixListener, BoundSocket)> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     struct Restore {
         uid: u32,
@@ -5428,8 +5539,8 @@ fn bind_as_person(
     }
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let ino = std::fs::symlink_metadata(path)?.ino();
-    Ok((listener, ino))
+    let bound = BoundSocket::of(&std::fs::symlink_metadata(path)?);
+    Ok((listener, bound))
 }
 
 // ---------------------------------------------------------------------------
@@ -6806,6 +6917,10 @@ pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2531 — how often a test's person socket checks its path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const CHECK: std::time::Duration = std::time::Duration::from_millis(20);
 
     /// #2511 — one process behind both sockets is one daemon (a system daemon
     /// older than #3736 also binds a per-user path), and only that case goes
@@ -11683,7 +11798,7 @@ mod tests {
         // A plain file at the path is not a socket: left alone, refused.
         std::fs::write(&path, b"x").unwrap();
         let (_tx0, rx0) = watch::channel(false);
-        let e = serve_person_socket(path.clone(), me, state.clone(), rx0)
+        let e = serve_person_socket(path.clone(), me, state.clone(), rx0, CHECK)
             .await
             .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
@@ -11693,7 +11808,13 @@ mod tests {
         // A stale socket (bound, then abandoned) is cleared and replaced.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         let (tx, rx) = watch::channel(false);
-        let srv = tokio::spawn(serve_person_socket(path.clone(), me, state.clone(), rx));
+        let srv = tokio::spawn(serve_person_socket(
+            path.clone(),
+            me,
+            state.clone(),
+            rx,
+            CHECK,
+        ));
         let mut up = false;
         for _ in 0..100 {
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
@@ -11744,7 +11865,7 @@ mod tests {
 
         // A second server at the same path must not take the live one over.
         let (_tx2, rx2) = watch::channel(false);
-        let e = serve_person_socket(path.clone(), me, state.clone(), rx2)
+        let e = serve_person_socket(path.clone(), me, state.clone(), rx2, CHECK)
             .await
             .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
@@ -11766,13 +11887,163 @@ mod tests {
         // created in it (skipped as root, where `/` would be "owned").
         if me != 0 {
             let (_tx3, rx3) = watch::channel(false);
-            let e = serve_person_socket("/roomler-p11-never.sock".into(), me, state, rx3)
+            let e = serve_person_socket("/roomler-p11-never.sock".into(), me, state, rx3, CHECK)
                 .await
                 .unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(!std::path::Path::new("/roomler-p11-never.sock").exists());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2531 — a person socket lives only while its path names it. With its
+    /// file unlinked it ends within a few checks, and a connection it was
+    /// serving ends with it. With its file replaced by another socket (live,
+    /// as another process's would be), it ends too, and its way out leaves the
+    /// other socket's file where it is: it unlinks only the file it bound.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_person_socket_ends_when_its_path_no_longer_names_it() {
+        use std::os::unix::fs::MetadataExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        /// Far more than a few checks of 20 ms, on a loaded runner.
+        const WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-2531-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roomler.sock");
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let up = |path: std::path::PathBuf| async move {
+            for _ in 0..250 {
+                if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the person socket did not come up");
+        };
+
+        // Unlinked: it ends, and so does the connection it was serving.
+        let (_tx, rx) = watch::channel(false);
+        let srv = tokio::spawn(serve_person_socket(
+            path.clone(),
+            me,
+            state.clone(),
+            rx,
+            CHECK,
+        ));
+        up(path.clone()).await;
+        let held = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (rd, mut wr) = tokio::io::split(held);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let r: Response = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+        std::fs::remove_file(&path).unwrap();
+        let ended = tokio::time::timeout(WITHIN, srv)
+            .await
+            .expect("a person socket whose file was unlinked ends")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        let _ = wr.write_all(b"{\"t\":\"status\"}\n").await;
+        let after = tokio::time::timeout(WITHIN, lines.next_line()).await;
+        assert!(
+            matches!(after, Ok(Ok(None)) | Ok(Err(_))),
+            "its connection ends with it: {after:?}"
+        );
+        assert!(
+            !path.exists(),
+            "nothing was made at the path on the way out"
+        );
+
+        // Replaced by another socket: it ends, and leaves that socket alone.
+        let (_tx, rx) = watch::channel(false);
+        let srv = tokio::spawn(serve_person_socket(
+            path.clone(),
+            me,
+            state.clone(),
+            rx,
+            CHECK,
+        ));
+        up(path.clone()).await;
+        std::fs::remove_file(&path).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let other_file = std::fs::symlink_metadata(&path).unwrap();
+        let ended = tokio::time::timeout(WITHIN, srv)
+            .await
+            .expect("a person socket whose file was replaced ends")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        let now = std::fs::symlink_metadata(&path).expect("the other socket's file is still there");
+        assert_eq!(
+            (now.dev(), now.ino()),
+            (other_file.dev(), other_file.ino()),
+            "the way out unlinked nothing it did not bind"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_ok(),
+            "and the other socket still answers"
+        );
+        drop(other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2531 — the person this socket serves reading the live sessions over
+    /// it is noted as theirs ([`LocalApiState::rc_sessions_for_person`]). Root
+    /// over the same socket, and anyone on the daemon's own endpoint, reads
+    /// them as before, with nothing noted.
+    #[tokio::test]
+    async fn the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs() {
+        /// Each read of the live sessions: `Some(uid)` noted for that person,
+        /// `None` with nothing noted.
+        #[derive(Clone, Default)]
+        struct Reads(Arc<std::sync::Mutex<Vec<Option<u32>>>>);
+        #[async_trait]
+        impl LocalApiState for Reads {
+            fn status(&self) -> NodeStatus {
+                Mock.status()
+            }
+            fn peers(&self) -> Vec<PeerInfo> {
+                Vec::new()
+            }
+            fn flows(&self) -> Vec<FlowInfo> {
+                Vec::new()
+            }
+            fn rc_sessions(&self) -> Vec<RcSessionInfo> {
+                self.0.lock().unwrap().push(None);
+                Vec::new()
+            }
+            fn rc_sessions_for_person(&self, uid: u32) -> Vec<RcSessionInfo> {
+                self.0.lock().unwrap().push(Some(uid));
+                Vec::new()
+            }
+        }
+        const READ: &str = r#"{"t":"rc_sessions"}"#;
+        let person = ClientPeer {
+            uid: Some(501),
+            ..ClientPeer::UNKNOWN
+        };
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let reads = Reads::default();
+        for (scope, peer, noted) in [
+            (SEAT, person.clone(), Some(501)),
+            (SEAT, root, None),
+            (Scope::Full, person, None),
+        ] {
+            let uid = peer.uid;
+            let r = ask_state_scoped_as(reads.clone(), scope, peer, READ).await;
+            assert!(matches!(r, Response::RcSessions(_)), "{scope:?}: {r:?}");
+            assert_eq!(
+                reads.0.lock().unwrap().pop(),
+                Some(noted),
+                "{scope:?} as uid {uid:?}"
+            );
+        }
     }
 
     /// #2871 — the person socket's own accept loop, over a real unix socket:
@@ -11843,7 +12114,9 @@ mod tests {
             let state: Arc<dyn LocalApiState> = counted.clone();
             let (tx, mut rx) = watch::channel(false);
             let srv = tokio::spawn(async move {
-                serve_person_listener(listener, owner_uid, state, &mut rx).await
+                serve_person_listener(&listener, owner_uid, state, &mut rx, std::future::pending())
+                    .await
+                    .map(|_| ())
             });
             (counted, tx, srv)
         }

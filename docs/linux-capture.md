@@ -351,7 +351,9 @@ switches DRM and `uinput` on by itself only when all of these hold:
   (`indicator::notify::can_tell`): the desktop companion runs for them, or
   their session's notification server shows buttons. That is FR-93 P6g's
   notice: the companion's banner, else a critical notification, *This screen
-  is being viewed*, with **Disconnect**.
+  is being viewed*, with **Disconnect**. Since #2531 the banner counts only
+  once the companion has read the session from the daemon within 6 s, else
+  the notification goes up ([`desktop-companion.md`](desktop-companion.md) §12.5).
 
 ```mermaid
 flowchart TD
