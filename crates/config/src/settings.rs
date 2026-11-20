@@ -73,8 +73,9 @@ pub struct Settings {
 /// `setup_features`). Each is the operator's assertion about a RELEASED
 /// client, not a fact about this server, so each defaults **off** and is
 /// flipped in the deploy env — later a default change — once the field run
-/// that proves the client is on record.
-#[derive(Debug, Deserialize, Clone, Default)]
+/// that proves the client is on record. The one exception is
+/// `wizard_reinstall_guard`, a kill switch for a guard, which ships on.
+#[derive(Debug, Deserialize, Clone)]
 pub struct SetupSettings {
     /// "The released Roomler Setup installs the full daemon on Linux, and it
     /// is field-proven" (FR-129 B1; AC11). One switch per OS (B1-s2), so
@@ -110,6 +111,32 @@ pub struct SetupSettings {
     /// Env: `ROOMLER__SETUP__WIZARD_PAIRING`.
     #[serde(default)]
     pub wizard_pairing: bool,
+    /// FR-141 P3 — the wizard's one-row guard: on a Mac whose root daemon
+    /// says it is one row already, the released wizard installs nothing and
+    /// pairs nothing (`agents/roomler-setup/src/reinstall_guard.rs`). Unlike
+    /// the claims above it is a kill switch for a guard, so it ships **on**,
+    /// and a wizard reads anything but a JSON `false` as on. `false` gives
+    /// back the wizard's install from before the guard, which over a one-row
+    /// Mac leaves three rows (FR-141 P0, cell M5).
+    /// Env: `ROOMLER__SETUP__WIZARD_REINSTALL_GUARD`.
+    #[serde(default = "reinstall_guard_default_on")]
+    pub wizard_reinstall_guard: bool,
+}
+
+impl Default for SetupSettings {
+    fn default() -> Self {
+        Self {
+            wizard_linux_daemon: false,
+            wizard_macos_daemon: false,
+            wizard_unix_daemon: false,
+            wizard_pairing: false,
+            wizard_reinstall_guard: reinstall_guard_default_on(),
+        }
+    }
+}
+
+fn reinstall_guard_default_on() -> bool {
+    true
 }
 
 impl SetupSettings {
@@ -1887,6 +1914,19 @@ mod setup_settings_tests {
         let legacy_and_off: SetupSettings =
             toml::from_str("wizard_unix_daemon = true\nwizard_macos_daemon = false").unwrap();
         assert!(legacy_and_off.macos_daemon());
+    }
+
+    /// FR-141 P3 — the one-row guard's kill switch ships ON, built whole and
+    /// from a file without the key; only an explicit `false` turns it off,
+    /// and it is no claim about the daemon cards.
+    #[test]
+    fn the_reinstall_guard_is_on_until_turned_off() {
+        assert!(SetupSettings::default().wizard_reinstall_guard);
+        let absent: SetupSettings = toml::from_str("").expect("every key defaults");
+        assert!(absent.wizard_reinstall_guard, "a file without the key");
+        let off: SetupSettings = toml::from_str("wizard_reinstall_guard = false").unwrap();
+        assert!(!off.wizard_reinstall_guard);
+        assert!(!off.linux_daemon() && !off.macos_daemon() && !off.wizard_pairing);
     }
 }
 
