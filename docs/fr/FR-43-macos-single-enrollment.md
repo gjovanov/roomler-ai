@@ -75,6 +75,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P3b | A secondary org's session is delegated, each worker reply goes to the org that asked, and the person's floor crosses to the daemon. | the same switch |
 | P3c | `sudo roomlerd one-row` migrates a two-row Mac; a person deletes the retired row through the ordinary route. | `--revert`, until that delete. Since FR-147 P1 ([FR-147](FR-147-root-out-of-homes-macos.md), #3834) root changes nothing in a home: each person's files change through that person's own process, and root keeps its records in `/etc/roomler/one-row/` |
 | P3d | `--one-row` at install: one token, one row. | `--daemon-token` keeps working (the two-row install stays reachable) |
+| P3e | The wizard's one-row form: on a Mac that is not enrolled yet, the recommended option pairs one half (`halves: 1`) or takes one pasted token, the root half enrolls as the Mac's one row with both switches, and no `--user-steps` kickstart runs. Built as [FR-141](FR-141-one-run-one-row.md) P2 (#P2PR). The wizard's switch flips first, the script's default after the same field read (FR-141 D2) | `wizard_macos_one_row` in `/api/setup/features`, default off: off = B2's two rows |
 
 ## P2 design — session delegation over LocalAPI
 
@@ -669,6 +670,7 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 | P3b | Secondary orgs, the routing, the floor | AC15, AC16 |
 | P3c | The command | AC5, AC12, AC17 |
 | P3d | `--one-row` | AC1 |
+| P3e ([FR-141](FR-141-one-run-one-row.md) P2, #P2PR) | The wizard's one-row form | P3e's criterion |
 
 Each is default-off, so none waits for the FR-63 read. All the field proof runs on throwaway tart Macs, one at a time, and a Mac's `roomler ssh` half of AC1 shares AC3's wait on the vmtest org's switch.
 
@@ -852,6 +854,9 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       *(2026-11-05, released 0.4.200, tart Mac. RED: before the switch-on, no line on the daemon's
       row came from the worker, and on the Mac's two-row layout that day none of its 510 did. GREEN: from the switch-on at 02:40:57Z, 159 lines marked
       `gui-worker` on the row, the first at the switch-on.)*
+- [ ] P3e: a fresh Mac set up through the wizard's recommended option, with the server's
+      `wizard_macos_one_row` on, is one row ([FR-141](FR-141-one-run-one-row.md) AC1 by pairing,
+      AC2 by a pasted token).
 
 ## Dead hypotheses — do not re-run these
 

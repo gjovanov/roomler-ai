@@ -1,6 +1,6 @@
 # FR-141: The Setup wizard installs remote desktop and the private network in one run, on one device row, as a choice the person sees (macOS and Linux)
 
-**Issue:** [#3679](https://github.com/gjovanov/roomler-ai/issues/3679) · **Status:** claimed 2026-11-11. P0 done the same day: the field read, on Linux and on macOS, is recorded in the [field log](#field-log). D1 to D3 decided the same day. P1 onwards not started, and nothing is built
+**Issue:** [#3679](https://github.com/gjovanov/roomler-ai/issues/3679) · **Status:** claimed 2026-11-11. P0 done the same day: the field read, on Linux and on macOS, is recorded in the [field log](#field-log). D1 to D3 decided the same day. 2026-11-20: P2 (the one-row form, behind `wizard_macos_one_row`, default off) and P3's one-row guard are built, each with its field read owed; P1, P4 and P6 are not started, and P5 is in part
 **Builds on:** FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), B2: the wizard's macOS root half), FR-43 ([#971](https://github.com/gjovanov/roomler-ai/issues/971), P3: one macOS row behind `macos_one_row`)
 **Related:** [FR-142](FR-142-linux-system-install-full-desktop.md) (the Linux system install's full desktop, which this FR does not wait on), #3247, #3240, #2892, #3660, #3535
 
@@ -124,6 +124,27 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 The switch's default flips to on once P2's field read holds (AC1, AC2, AC4): that flip is the operator's. Where
 one row does not hold, the switch stays off and the wizard installs today's two rows.
 
+- **2026-11-20, built (#P2PR), with the operator's rulings D4-A, D5-A and D9-A of that day:** the form is open only
+  where four facts hold, read on the Welcome page, at pairing start, at install, and again in the install's preflight
+  before the token is spent (`agents/roomler-setup/src/one_row_form.rs:139`, `decide`): the server's
+  `wizard_macos_one_row` is a JSON `true`; there is no `/etc/roomler/config.toml`, unless this run's own one-row
+  attempt placed it (a Retry); the person's `config.toml`, in either config tree, names no device; and the release the
+  install half takes (the first macOS `.pkg` with a download URL in `/api/agent/latest-release`, as `install.sh` picks
+  it) is 0.4.201 or later. That floor (D4-A) is the first release whose served `install.sh --one-row` made a fresh Mac
+  one row (FR-43 P3d, field-verified 2026-11-05) and whose `roomlerd enroll --help` lists `--one-row`. An older one
+  would stop only after the token is spent, so the wizard compares first, and the script's own `enroll --help` check
+  stays as the belt (`scripts/install.sh:1162`). Closed, the page says why under the card and the box makes today's
+  two rows: a Mac whose root is enrolled is pointed to `sudo roomlerd one-row` (D1), and one with a person's
+  enrollment to the install script's `--one-row` with a new token. Open, the box makes one device. One token, pasted
+  or paired (`halves: 1`), enrolls root's config under the device's own name (D9-A, no `-daemon`), with the overlay on
+  and both FR-43 switches. The privileged half, `install.sh --privileged-steps --one-row --config-from FILE`, places
+  that config before the one package run, whose guard removes the LaunchAgent and starts root
+  (`scripts/install.sh:1124-1167`), and no person's enrollment and no user half run. Before root's enroll the wizard
+  makes the person's folders as the person and writes into each (D5-A); one it cannot write stops the run, naming the
+  folder and its owner, with nothing enrolled and the token not spent. Nothing as root makes or changes a folder in a
+  home (FR-147). On the pasted path the page sends the form it showed, and an install whose fresh read differs is
+  refused before anything is spent; a pairing holds its layout, as B2's does.
+
 ### 3. A re-install lands on the same row(s) (P3)
 
 P0 decides its shape. What the code already gives: the root half's hardware id and `adopt-enrollment`'s fold
@@ -159,7 +180,7 @@ person's half on it and says why.
 |---|---|---|---|
 | P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | done 2026-11-11: Linux and macOS (cells M1 to M5), in the [field log](#field-log) |
 | P1 | The question on the first page (design 1), with `front_tests` | server key `wizard_mesh_choice` in `/api/setup/features`, default on: off restores today's layout | not started |
-| P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | not started |
+| P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | built 2026-11-20 (#P2PR, design 2's dated line); field read owed (AC1, AC2, AC4's one-row cell, AC6) on the first `setup-v*` that carries it, with the switch on (the open decision) |
 | P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | in progress 2026-11-20: the one-row guard (design 3's 2026-11-20 line) built, field read owed (AC4's one-row cell, on the first `setup-v*` that carries it); the same-row re-install not started |
 | P4 | `install.sh --overlay` on Linux; the dialog's Linux note and macOS block | the flag is opt-in; the dialog rolls back with the image | not started |
 | P5 | Docs: `docs/installation.md` (the wizard's macOS and Linux sections, the dialog, `--overlay`), `docs/platform-support.md` §2 and §4, `docs/device-pairing.md` | none | not started |
@@ -206,7 +227,8 @@ on the Devices page.
 
 ## Open decisions
 
-None is open. The operator decided all three on 2026-11-11, each as recommended.
+The operator decided D1 to D3 on 2026-11-11, each as recommended. One is open since 2026-11-20: how P2's field read
+runs (the last item).
 
 - **D1. Macs that already have two rows: stay, or move to one row, and how? Decided 2026-11-11, as recommended:**
   they stay two rows until a person runs `sudo roomlerd one-row` (FR-43 P3c, field-verified on 0.4.200), and the
@@ -223,6 +245,11 @@ None is open. The operator decided all three on 2026-11-11, each as recommended.
   and promise nothing on Wayland beyond the clipboard: a per-user install does not read or switch the layout or
   match the display under Wayland either. Cost: a longer card. The other way, saying nothing, keeps today's
   surprise.
+- **Open since 2026-11-20: how P2's field read runs with the switch on.** `wizard_macos_one_row` is a server key, one
+  per deployment (`/api/setup/features`), so turning it on for a lab run turns it on for every new Mac that runs the
+  wizard against that server meanwhile. Two ways: a flip window the operator names (the switch on, the lab's cells
+  read, the switch off again), or a wizard-side lever that only the lab's runs set and a person's wizard never has.
+  P2 builds neither; the operator decides.
 
 ## Out of scope
 
