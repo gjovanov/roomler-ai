@@ -167,7 +167,7 @@ executes a rung only at a settle.
 | P3 LinkLoop / P4 drain / FR-15 AgeLoop | folded (drain: constrained-only, ≤ 300 ms, never on direct; the age floor ring stays as `path_floor_ms`) |
 | viewer-rate divisor | kept, fed by `struggling` only |
 | encode pressure / FpsPace / downscale tier / refine / settle KF / kf_gate / plan_dims / rate_plan | kept (tier → `QualityRung` later) |
-| byte gates; shared split | kept, denominated in `ctl.reference_bps()`; applied to `ceiling` before `RateDomain` |
+| byte gates; shared split | kept, denominated in `ctl.reference_bps()`; applied to `ceiling` before `RateDomain`; FR-148 superseded FR-63: under D46's `on` (B3, #4139) the relay byte gate gives way to the in-flight budget on relay sessions, and FR-148's P5 retires it |
 
 **B0 — the simulator + trace replay** (`encode/sim.rs`, `#[cfg(test)]`): `PipeSim { rate_bps,
 buffer_bytes, loss_pct, rtt_ms, stalls }` (token-bucket FIFO, arrival = `max(prev, at+rtt/2) +
