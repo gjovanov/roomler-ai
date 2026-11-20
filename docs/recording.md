@@ -757,7 +757,7 @@ flowchart LR
   (`recording/launch.rs:1468`).
 - **An attended recording is never asked.** The watch over a remote recording
   asks who is signed in only while the recording is unattended: `follow`
-  (`recording/remote.rs:2135`), and `grace_watch` for a detached recording
+  (`recording/remote.rs:2141`), and `grace_watch` for a detached recording
   (`recording/remote.rs:430`). A local recording has no watch at all. So a
   person's own recording, or a recording of their screen with the banner up,
   runs on through a hung logind. logind cannot switch sessions while it hangs.
@@ -1469,10 +1469,10 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:475` (`SessionParams::record`), `signaling.rs:4250` (sent AFTER the consent mode is resolved), `signaling.rs:3169` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1102`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1870` (`effective_record`), `signaling.rs:7094` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
-| An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:622-641` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
-| The worker's account of a recording | `delegate.rs:1783` (noted where the grant crosses), `delegate.rs:2457` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:799`). The server bounds it again to a live session of this agent |
+| The record context crosses | `delegate.rs:481` (`SessionParams::record`), `signaling.rs:4253` (sent AFTER the consent mode is resolved), `signaling.rs:3172` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1102`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1961` (`effective_record`), `signaling.rs:7109` (`Announcer::now`, which the hello and every heartbeat announce, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:625-644` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| The worker's account of a recording | `delegate.rs:1874` (noted where the grant crosses), `delegate.rs:2548` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:805`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
   worker runs without `--config`, so it reads the user's. The companion's
