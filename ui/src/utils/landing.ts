@@ -131,7 +131,7 @@ export const PILLARS: LandingPillar[] = [
       {
         icon: 'mdi-video-outline',
         title: 'HD video conferencing',
-        description: 'Built-in SFU for crystal-clear meetings with screen sharing and recordings.',
+        description: 'Built-in SFU for crystal-clear meetings with screen sharing.',
         color: '#ef5350',
       },
       {
@@ -226,7 +226,7 @@ export const FALLBACK_PLANS: Plan[] = [
       'Everything in Pro',
       '5,000 devices',
       'Unlimited remote sessions',
-      'Meetings with 100 people, and recordings',
+      'Meetings with 100 people',
       '100 GB of relay traffic per user each month',
       '50 GB storage per user',
       'Priority support',

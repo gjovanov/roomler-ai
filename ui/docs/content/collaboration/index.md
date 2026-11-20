@@ -14,7 +14,7 @@ already there.
 
 :::cards
 - **[Rooms and chat](/docs/collaboration/rooms-and-chat/)** icon:video — Organised rooms, threaded replies, reactions, mentions and search.
-- **[Video conferencing](/docs/collaboration/video-conferencing/)** icon:monitor — HD calls with screen sharing and recording.
+- **[Video conferencing](/docs/collaboration/video-conferencing/)** icon:monitor — HD calls with screen sharing.
 - **[Files](/docs/collaboration/files/)** icon:copy — Attachments, per-room libraries and full-text search.
 - **[Notifications](/docs/collaboration/notifications/)** icon:info — Who gets told what, and where.
 :::
