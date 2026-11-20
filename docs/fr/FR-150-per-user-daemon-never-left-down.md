@@ -327,10 +327,10 @@ corporate laptops, and this FR makes no per-user install on them.
 | C6b | P0 | a medium task whose one-shots `/Run` a task the account cannot replace, with end boundaries and `DeleteExpiredTaskAfter` | **read**: the first one-shot started the task; the second was dropped by its `IgnoreNew` (`0x800710E0`); the medium task was gone after its last end boundary | |
 | C6c | P0 | how such a task goes, read by its query, COM, its file and its registry key | **read**: query, COM and file gone within seconds of its end boundary; the registry key stays until a `/Delete` of the name, which succeeds | |
 | C6d | P0 | the same name registered again at medium after it went | **read**: accepted over the key it left; it ran its one-shot and went again | |
-| C7 | P1a | per-user installed from an elevated token, then a self-update | **RED**, read: 0.4.227 → 0.4.228, no daemon at +16 min, the record `SucceededVerified` | candidate A → B: back within the one-shots; the task's descriptor gives the account full access |
-| C7b | P1a | the first hop: a task 0.4.228 registered elevated, updated to candidate A | the same RED | **GREEN**, read on A and on A2: back at the first one-shot (61 s and 60 s), through `Roomler start-<SID>`, which is gone after its end; on A2's hop it was gone 4 min after it was registered (field log) |
-| C8 | P1a | the same from a medium token (control): an administrator's filtered token, and a standard account signed in at the console | back at the first one-shot | the same |
-| C9 | P1a | a refused registration | **RED**, read: no line in any log of ours | **GREEN**, read: `installer step failed` in the person's log, its error naming the task the account cannot replace, the elevated registration that owns it and the repair; the daemon's start WARN |
+| C7 | P1a | per-user installed from an elevated token, then a self-update | **RED**, read: 0.4.227 → 0.4.228, no daemon at +16 min, the record `SucceededVerified` | **GREEN**, read on A3 → B3: back at B3's first one-shot, 60 s after its install; A3's task owned by the account, with full access for it; B3's `service stop --for-upgrade` exit 0, no ERROR |
+| C7b | P1a | the first hop: a task 0.4.228 registered elevated, updated to candidate A | the same RED | **GREEN**, read on A, A2 and A3: back at the first one-shot (61 s, 60 s and 61 s), through `Roomler start-<SID>`, which is gone after its end; on A2's hop it was gone 4 min after it was registered (field log) |
+| C8 | P1a | the same from a medium token (control): an administrator's filtered token, and a standard account signed in at the console | **read**: 0.4.227 → 0.4.228 back at the first one-shot from both accounts, the MSI log still reading `StopOldDaemon returned actual error code 1` | **GREEN**, read on A3 → B3 from both accounts: every hop back at the new version's first one-shot, 60 s after its install, each step exit 0 and no ERROR |
+| C9 | P1a | a refused registration | **RED**, read: no line in any log of ours | **GREEN**, read on A and on A3: `installer step failed` in the person's log, its error naming the task the account cannot replace, the elevated registration that owns it and the repair; the daemon's start WARN |
 | C10 | P1a | the repair: an elevated `service install` from A over a task a release before P1a registered elevated | | **GREEN**, read: the task registered again with the descriptor, the legacy task gone, the running daemon left running, and the next update (A → B) came back at the first one-shot |
 | C11 | P1b | the second hop on a task the account cannot replace, with `ROOMLERD_TASK_SD=0` so no `Roomler start-<SID>` is left: registered elevated by 0.4.228, updated to A, then to B | **RED**, read on A → B: offline at +15 min, and no log line after the install | **GREEN**, read on A2 → B2: back 122 s after the install, through the account's task; the record `"how": "started through the task"` |
 | C12 | P1b | the task deleted after a successful install | **RED**, read on A → B: no daemon and no task at +10 min, the row offline, the record silent on the daemon (the next sign-in not tried) | **GREEN**, read on A2 → B2: back 153 s after the install; the record `"how": "after the task was registered again"` |
@@ -350,15 +350,22 @@ own session: from an elevated Windows OpenSSH session on a workgroup machine, `U
 task's principal becomes `WORKGROUP\<user>`, which maps to no SID, and the registration fails (master's
 `current_user_qualified`, field log).
 
+A known limit, read before C8: on a host where a release before P1a registered the task elevated, a per-user
+uninstall from a normal prompt cannot delete that task. Its `service uninstall` logs `ERROR installer step failed:
+roomlerd service uninstall exit_code=1 … schtasks /Delete failed … Access is denied`, and the task stays behind. That
+is C2's refused `/Delete`, which P1a does not change, and not a cell failure. The remedy is the uninstall from an
+elevated prompt; after P1a's repair (C10) the task is the account's own, and a removal from a normal prompt deletes
+it (C5c).
+
 ## Phases
 
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
-| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | in review (#4135); C7 RED on the release, C7b, C9 and C10 GREEN on candidates (field log); C7 and C8 on candidates from its head next |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | in review (#4135); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
 | P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | in review (#4159); C11 and C12 GREEN on candidates (field log) |
 | P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | not started; after P1a, independent of P1b |
-| Field | each phase's cells on its candidates, then C19 on the release | read only | P1a's and P1b's cells being read (field log) |
+| Field | each phase's cells on its candidates, then C19 on the release | read only | P1a's and P1b's cells read on candidates (field log); P2's cells and C19 to come |
 | Docs | each phase's docs in its own pull request | none | not started |
 
 - **P1a leaves working by itself**: no new task is registered that its account cannot replace, a self-update over
@@ -391,8 +398,11 @@ The docs:
   elevated token leaves no daemon at +10 min while the record reads success. Read 2026-11-20 on 0.4.227 → 0.4.228:
   no daemon at +16 min, the record `SucceededVerified`
   ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)).
-- [ ] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
-  one-shots, with the task registered elevated and at medium.
+- [x] **AC3** (#3507 GREEN, P1a): C7 and C8 pass on candidates: a self-update brings the daemon back within the
+  one-shots, with the task registered elevated and at medium. Read 2026-11-20 on candidates A3 → B3 (P1a at
+  `b08045b5b`): C7 from an elevated install, C8 from an administrator's filtered token and from a standard account,
+  each hop back at the new version's first one-shot, 60 s after its install
+  ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7052262225)).
 - [x] **AC4** (P1a, the log): C9 passes: a refused registration reaches the person's log with its error, instead of
   being discarded, and the daemon names at its start a task its account cannot replace. Read 2026-11-20 on
   candidate A ([P1a's cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7047442304)).
@@ -470,3 +480,7 @@ recommendation is now the decision.
 | 2026-11-20 | C11 GREEN: A2 → B2 with `ROOMLERD_TASK_SD=0`, over the same task | B2's `service install` was refused with `Access is denied`, and no start task was registered. P1b's watcher found no daemon 120 s after the install and ran `service start`. The daemon 0.4.253 was up 122 s after the install, as the person, under the account's task, and the row came online. The record read `SucceededVerified` with `"daemon": {"running": true, "how": "started through the task"}` |
 | 2026-11-20 | C12 RED: A, installed at medium so the account owns its task, updated to B; a lab task running as SYSTEM deleted `Roomler-<SID>` as soon as the record's verdict was written | B's install succeeded and the record read `SucceededVerified`, with no word on the daemon. The task was deleted 0.06 s after the verdict, before its first one-shot. There was no daemon and no task to +10 min, and the row stayed offline on A. The next sign-in was not tried |
 | 2026-11-20 | C12 GREEN: A2 → B2, with the same deletion | P1b's watcher: not up 120 s after the install; `service start` refused, since no auto-start task is registered; not up 30 s later; `service install`, which registered the task again, owned by the account; `service start`. The daemon 0.4.253 was up 153 s after the MSI ended, as the person, and the row came online. The record read `"daemon": {"running": true, "how": "after the task was registered again"}`. Both of C12's hops logged the false `service stop --for-upgrade` ERROR above: they start from a task the account owns, and their candidates predate `618b0c2a3` |
+| 2026-11-20 | C7 GREEN on candidates from P1a's head with the fix, A3 (0.4.254) and B3 (0.4.255) at `b08045b5b`, the same guest: A3 installed per-user from an elevated prompt on a clean guest, then self-updated to B3 | A3's task was owned by the account with full access, with one-shots at +1, +3 and +10 min, and the daemon came up at the first. On the hop, B3's `service stop --for-upgrade` exited 0 with no ERROR, while the same log holds the RED of the hop to 0.4.253, built before the fix. The daemon was back at B3's first one-shot, 60 s after its `service install`, `service status` read `Auto-start: installed`, and the row came online on B3 ([the cells](https://github.com/gjovanov/roomler-ai/issues/4128#issuecomment-7052262225)) |
+| 2026-11-20 | C7b and C9 on A3: 0.4.228 installed per-user from an elevated prompt, then self-updated to A3 | as on A: A3's `service install` was refused, logged `installer step failed` with the task and the repair, and registered `Roomler start-<SID>`, whose first one-shot started the daemon 61 s after the old one stopped. The start WARN and `service status`'s `Note:` named the elevated owner and the repair, and the row came online on A3 |
+| 2026-11-20 | Before C8a: A3 removed from a normal prompt over the task 0.4.228 had registered elevated | its `service uninstall` failed with `Access is denied`, logged as `ERROR installer step failed: roomlerd service uninstall exit_code=1 … schtasks /Delete failed`, and the task stayed behind until an elevated delete. A known limit, not a cell failure (Lab cells) |
+| 2026-11-20 | C8 GREEN on A3 and B3, from an administrator's filtered token (C8a) and from a standard account signed in at the console (C8b, a local user in Users only, its token at medium): 0.4.227 installed per-user, then self-updated to the released 0.4.228 (the control), to A3 and to B3 | every hop was back at the new version's first one-shot, 60 s after its install, the release's too. On the hops to A3 and to B3, `service stop --for-upgrade` and `service install` exited 0 with no ERROR, while the release's own MSI log still reads `StopOldDaemon returned actual error code 1 but will be translated to success`. Each task stayed the account's own, `Limited`, with full access for it, `service status` read `Auto-start: installed`, and both rows came online on B3. C8b's 0.4.227 was installed before its enrollment, so its task had no one-shots (they are added only for an enrolled account), and its daemon first ran at the hop's `service start` |
