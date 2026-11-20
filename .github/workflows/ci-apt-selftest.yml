@@ -184,8 +184,7 @@ jobs:
               [ ! -e /tmp/ci-apt.docker-dns ] || { echo "::error title=ci-apt self-test::container DNS arguments on a healthy runner: its containers would not run as they do today"; exit 1; } ;;
             runner-dead | arm64-names)
               grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not fail over to a public resolver"; exit 1; }
-              echo "container DNS arguments: $(tr '
-' ' ' </tmp/ci-apt.docker-dns 2>/dev/null)"
+              echo "container DNS arguments: $(tr '\n' ' ' </tmp/ci-apt.docker-dns 2>/dev/null)"
               grep -qx -- --dns /tmp/ci-apt.docker-dns 2>/dev/null || { echo "::error title=ci-apt self-test::the failover wrote no container DNS arguments to /tmp/ci-apt.docker-dns"; exit 1; } ;;
             all-dead)
               grep -q '::warning title=apt mirrors unreachable' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not report the mirrors unreachable"; exit 1; }

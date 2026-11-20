@@ -333,8 +333,7 @@ run_case reach-failover "$FX_2604" x86_64 -- cmd_reach
 expect_eq "$RC" 0 "rc after a failover that helped"
 expect_has "$OUT" "::warning title=apt mirror DNS::"
 expect_has "$CALLS" "resolvectl dns eth0 1.1.1.1 8.8.8.8"
-expect_eq "$(tr '
-' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments"
+expect_eq "$(tr '\n' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments"
 expect_has "$OUT" "containers get: --dns 1.1.1.1 --dns 8.8.8.8"
 
 # A public resolver answers, but the switch does not heal the system resolver:
@@ -375,8 +374,7 @@ SETUP='echo ALL >"$S/dead-system"; : >"$S/heal-on-switch"; echo 168.63.129.16 >"
 run_case prepare-failover "$FX_2204" x86_64 -- cmd_prepare
 expect_eq "$RC" 0 rc
 expect_has "$OUT" "::warning title=apt mirror DNS::"
-expect_eq "$(tr '
-' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments a later step reads"
+expect_eq "$(tr '\n' ' ' <"$S/docker-dns" 2>/dev/null)" "--dns 1.1.1.1 --dns 8.8.8.8 " "the container DNS arguments a later step reads"
 expect_has "$APT" "update -qq" "the refresh after the failover"
 
 SETUP='echo ALL >"$S/dead-system"; echo ALL >"$S/dead-dig"'
