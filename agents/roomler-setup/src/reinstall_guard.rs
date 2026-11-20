@@ -24,10 +24,22 @@
 //! read. Unknown — no root config, no daemon, an older one, a silent one — is
 //! never one row: the wizard then does what it did before.
 //!
+//! A wizard started as root (a person's `sudo`, its only root road on a Mac:
+//! it never elevates itself there) has no person socket, so it asks the
+//! system socket, the root daemon's own, in the same way ([`socket_to_ask`]).
+//! A person with no person socket asks nothing, never the system socket.
+//!
+//! The stop says how to go on ([`stop_text`]), naming only what works as typed
+//! on that Mac: removing Roomler and starting Setup again everywhere, and
+//! `sudo roomlerd one-row --revert` only where a migration's copy is there to
+//! put back ([`migration_copy`]).
+//!
 //! The kill switch is the server's `wizard_reinstall_guard` (default on,
 //! [`crate::features::SetupFeatures::reinstall_guard_on`]), NOT the wizard's
 //! one-row switch: the terminal makes one-row Macs whatever that switch says,
 //! so the guard has to hold with it off.
+
+use std::path::{Path, PathBuf};
 
 use crate::role::{HostOs, Role};
 
@@ -40,8 +52,8 @@ pub struct OneRowMac {
     /// The device row's name, as the root daemon reports it (may be empty).
     pub name: String,
     /// `sudo roomlerd one-row` made it one row and root's copy of the file
-    /// from before is still there, so `sudo roomlerd one-row --revert` has
-    /// two rows to put back.
+    /// from before is still there ([`migration_copy`]), so `sudo roomlerd
+    /// one-row --revert` has rows to put back.
     pub migrated: bool,
 }
 
@@ -61,13 +73,31 @@ pub fn one_row_from(status: &roomler_localapi::NodeStatus) -> Option<OneRowMac> 
     })
 }
 
-/// RED stub: today's road, the person socket whoever asks.
+/// Which socket answers for this Mac's root daemon (#4133's second note). A
+/// person asks the person socket root serves them and nothing else, so a
+/// person with none asks nothing, never the system socket. Root has no person
+/// socket and asks the system socket, the root daemon's own. Whatever answers
+/// is believed only if root serves it, and only through [`one_row_from`].
 pub fn socket_to_ask(
-    _is_root: bool,
-    own_person_socket: Option<std::path::PathBuf>,
-    _system_socket: std::path::PathBuf,
-) -> Option<std::path::PathBuf> {
-    own_person_socket
+    is_root: bool,
+    own_person_socket: Option<PathBuf>,
+    system_socket: PathBuf,
+) -> Option<PathBuf> {
+    if is_root {
+        Some(system_socket)
+    } else {
+        own_person_socket
+    }
+}
+
+/// Root's copy of its file from before `sudo roomlerd one-row`, as that
+/// command names it. Only that command writes it, and only a finished
+/// `--revert` or the command's own undo removes it, so while it is there the
+/// revert has rows to put back. `/etc/roomler` is 0755, so the person's
+/// `stat` reaches it; a `stat` that fails reads as no copy, which only leaves
+/// the revert out of the stop.
+pub fn migration_copy() -> PathBuf {
+    roomlerd::one_row::kept_path(Path::new(roomlerd::one_row::ROOT_CONFIG))
 }
 
 /// Ask this Mac's root daemon. `None` off macOS, with no root config, and
@@ -78,10 +108,14 @@ pub async fn one_row_here() -> Option<OneRowMac> {
         if !crate::unix_daemon::system_config_path().is_file() {
             return None;
         }
-        tokio::time::timeout(QUERY_TIMEOUT, query_macos())
+        let mac = tokio::time::timeout(QUERY_TIMEOUT, query_macos())
             .await
             .ok()
-            .flatten()
+            .flatten()?;
+        Some(OneRowMac {
+            migrated: migration_copy().is_file(),
+            ..mac
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -92,8 +126,12 @@ pub async fn one_row_here() -> Option<OneRowMac> {
 #[cfg(target_os = "macos")]
 async fn query_macos() -> Option<OneRowMac> {
     // The person socket root serves THIS account (the companion's and the
-    // CLI's own road to it); `None` as root, who has none to ask.
-    let path = roomler_localapi::own_person_socket_path()?;
+    // CLI's own road to it), or, as root, who has none, the system socket.
+    let path = socket_to_ask(
+        roomler_localapi::process_is_root(),
+        roomler_localapi::own_person_socket_path(),
+        roomler_localapi::system_socket_path(),
+    )?;
     // Only a socket ROOT serves: a per-user daemon of this person, or anyone
     // else, would be speaking for itself, not for the machine.
     let mut client = roomler_localapi::connect_unix_served_by_root(path)
@@ -145,19 +183,41 @@ pub async fn stop_for(role: Role, server: &str) -> Option<String> {
     stop(os, guard_on, Some(&mac), server)
 }
 
-/// What the person reads, on the page and in a refusal.
-pub fn stop_text(mac: &OneRowMac, _server: &str) -> String {
+/// What the person reads, on the page and in a refusal: the stop, then how to
+/// go on (#4133's first note), naming only what works as typed on this Mac.
+/// Every one-row Mac can start again from nothing: remove Roomler with the
+/// script's `--uninstall` (`docs/installation.md`, Uninstall), from `server`,
+/// the one the person chose, then start Setup again. That is the road to a new
+/// enrollment after the row was deleted (launchd starts the daemon again after
+/// its exit 7, #2293, so the stop can still show), and to two rows on a Mac the
+/// terminal installed as one row. A Mac a migration made one row is also
+/// offered the revert, while its copy is there: anywhere else the revert says
+/// only "nothing to revert".
+pub fn stop_text(mac: &OneRowMac, server: &str) -> String {
     let name = mac.name.trim();
     let named = if name.is_empty() {
         String::new()
     } else {
         format!(" («{name}»)")
     };
+    let revert = if mac.migrated {
+        " `sudo roomlerd one-row` made it one device, and `sudo roomlerd one-row --revert` \
+         in Terminal puts back the devices it was before, except any deleted since."
+    } else {
+        ""
+    };
+    let server = match server.trim().trim_end_matches('/') {
+        "" => crate::commands::cmd_default_server_url(),
+        chosen => chosen.to_string(),
+    };
     format!(
         "This Mac is one device already{named}: its screen sharing, remote control and \
          private network run there, and it updates itself. Roomler Setup installs nothing \
          over it, because another install would add devices beside it. The tunnel client \
-         can still be installed."
+         can still be installed.{revert} To start again from nothing, after its device was \
+         deleted or to set it up as two devices, remove Roomler in Terminal with \
+         `curl -fsSL {server}/api/setup/install.sh | sh -s -- --uninstall`, then start \
+         Roomler Setup again."
     )
 }
 
@@ -300,6 +360,16 @@ mod tests {
             socket_to_ask(true, Some(person), system.clone()),
             Some(system),
             "root never asks a person socket"
+        );
+    }
+
+    /// The copy that offers the revert is the one `sudo roomlerd one-row`
+    /// keeps of root's file, and the one its `--revert` puts back.
+    #[test]
+    fn the_revert_is_offered_on_the_copy_the_migration_keeps() {
+        assert_eq!(
+            migration_copy(),
+            std::path::PathBuf::from("/etc/roomler/config.toml.pre-one-row")
         );
     }
 
