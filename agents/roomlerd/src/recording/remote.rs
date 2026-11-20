@@ -2831,9 +2831,10 @@ mod console_lookup_tests {
         }
 
         /// The lookups begun, once `want` of them have, waited for `within`
-        /// at most. A lookup counts when its own thread runs it, and the ask
-        /// that starts it does not wait for that thread, so a count read
-        /// straight after the asks can come before it (#4134). The caller
+        /// at most. A lookup counts when its own thread runs it, and an ask
+        /// can answer before that thread has run: `now` at once, and an ask
+        /// that waits once its wait is out. So a count read straight after
+        /// the asks can miss a lookup they started (#4134). The caller
         /// asserts the exact count, so one lookup more than `want` still
         /// fails.
         fn began_within(&self, want: usize, within: Duration) -> usize {
