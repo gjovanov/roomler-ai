@@ -85,7 +85,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:247`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10163–10356`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10164–10356`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:30`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -102,7 +102,7 @@ Windows by injecting `PATCHES` into the copied portfile's `vcpkg_from_github(` (
 technique :75–95). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
 the asset and `release-agent.yml`'s three fetch steps (:341–352, :1002–1004, :1926–1934) assert it
 matches `.github/ffmpeg-patches/*`. `const NVENC_RECONFIG_FORCES_IDR: bool` flips to false in the
-asset-bump PR; the pump's `held_increase` arm (`peer.rs:9505–9508`) keys on it.
+asset-bump PR; the pump's `held_increase` arm (`peer.rs:9506–9508`) keys on it.
 
 **A3 — VideoToolbox / AMF.** From A0 on a Mac: patch 0002 + `InPlace`, or keep `Rebuild` on a
 simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same rule.
@@ -111,9 +111,9 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 
 | PR | delete | anchors | precondition |
 |---|---|---|---|
-| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5105, 5088–5095, 6475–6522, 6533–6569, 6639–6644`; `encode/mod.rs:423–480` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7269–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `encode/mod.rs:509–520` | VT measured or kept on the settle rule |
-| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1259–1263`; `peer.rs:4825` | — (#3472 measured the divergence as a defect) |
+| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5106, 5088–5095, 6475–6522, 6533–6569, 6639–6644`; `encode/mod.rs:423–480` | A0 pass on QSV, switch ON one release |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7271–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `encode/mod.rs:509–520` | VT measured or kept on the settle rule |
+| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1259–1263`; `peer.rs:4826` | — (#3472 measured the divergence as a defect) |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:2497–2609`, parser `peer.rs:11183–11257`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:2497–2609`, parser `peer.rs:11184–11257`): `frames_lost`
 (chunk gaps, already in `rc-dc-worker.ts:459`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
@@ -194,7 +194,7 @@ observe-only), fed at the live positions (`pre_encode_tick` entry :482 → `obse
 floor/ceiling resolve :622 → `set_domain`; `on_backpressure_skip` :465, `on_send_overflow` :645,
 `note_send_stall` :667 → events; `tick_viewer_window` after the unpacks :738/:748/:785 →
 `fold_window`); `pre_encode_tick` grows `bytes_inflight, queue_budget` at both pumps
-(`peer.rs:9476`, `:5008`). Heartbeat adds `shadow_target_bps, shadow_state, shadow_measured_bps,
+(`peer.rs:9477`, `:5009`). Heartbeat adds `shadow_target_bps, shadow_state, shadow_measured_bps,
 shadow_disagree_pct, shadow_pauses, shadow_reason`. `scripts/rc-shadow-report.py` reads a week of
 `agent_logs` by session and reports per `PathClass`: disagreement p50/p90 and its sign in
 elevated-age vs clean windows. **Flip criterion:** ≥ 20 constrained + 20 direct sessions, shadow
@@ -241,7 +241,7 @@ before B2: done in #4061).
    `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:1004–1013`).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:247`)
-and in the FR-35 memory key (`peer.rs:4784` → `"{ip}|{class}"`, which fixes "a fast day carried
+and in the FR-35 memory key (`peer.rs:4785` → `"{ip}|{class}"`, which fixes "a fast day carried
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
