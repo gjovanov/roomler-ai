@@ -601,6 +601,45 @@ pub struct LastInstallStatus {
     /// daemon resolved no log dir at all (a checkout run with no home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// FR-150 P1b — a Windows per-user daemon after the install, as the
+    /// watcher found it and brought it back ([`InstallDaemon`]). `None` from a
+    /// watcher that predates P1b, and on every other flavour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<InstallDaemon>,
+}
+
+/// FR-150 P1b — the post-install watcher's last act on a Windows per-user
+/// device: whether a daemon runs once the verdict is written, how it came
+/// back, and what each rung of the relaunch answered. The verdict words are
+/// unchanged: an install that went through and left no daemon is
+/// `SucceededVerified` with `running: false` here (#3507).
+///
+/// Additive in `last-install.json` and on this wire: a watcher before P1b
+/// writes no key, an older client ignores it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InstallDaemon {
+    /// A daemon for this config holds its stop event: it runs.
+    pub running: bool,
+    /// How it came back, when it did, in [`Self::BY_THE_TASK`]'s words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how: Option<String>,
+    /// Each rung the watcher took and its answer, in order. Empty when the
+    /// daemon came back by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rungs: Vec<String>,
+}
+
+impl InstallDaemon {
+    /// The install's own registration started it: the task's one-shot.
+    pub const BY_THE_TASK: &'static str = "by the task";
+    /// `service start`, a `/Run` of the account's task, started it.
+    pub const STARTED_THROUGH_THE_TASK: &'static str = "started through the task";
+    /// `service install` registered the task again, and its start started it.
+    pub const AFTER_THE_TASK_WAS_REGISTERED_AGAIN: &'static str =
+        "after the task was registered again";
+    /// The watcher started the launcher itself: the daemon runs outside its
+    /// task, which `rungs` says could not start it (D2).
+    pub const OUTSIDE_ITS_TASK: &'static str = "outside its task";
 }
 
 impl LastInstallStatus {
@@ -8060,6 +8099,7 @@ mod tests {
             installer_exit_code: None,
             note: None,
             path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+            daemon: None,
         };
         st.last_install = Some(absent.clone());
         let with = serde_json::to_string(&st).unwrap();
@@ -8087,6 +8127,42 @@ mod tests {
         assert_ne!(back.status, absent.status, "the two words never collapse");
     }
 
+    /// FR-150 P1b — `daemon` is additive: a record without it parses and
+    /// writes no key, and one with it round-trips, its rungs in order.
+    #[test]
+    fn last_install_daemon_is_additive_and_round_trips() {
+        let old = r#"{"status":"SucceededVerified","expected_version":"agent-v0.4.228"}"#;
+        let back: LastInstallStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(back.daemon, None);
+        assert!(!serde_json::to_string(&back).unwrap().contains("daemon"));
+
+        let with = LastInstallStatus {
+            daemon: Some(InstallDaemon {
+                running: true,
+                how: Some(InstallDaemon::STARTED_THROUGH_THE_TASK.into()),
+                rungs: vec![
+                    "not up 120 s after the install".into(),
+                    "service start: asked".into(),
+                ],
+            }),
+            ..back
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(
+                r#""daemon":{"running":true,"how":"started through the task","rungs":["not up"#
+            ),
+            "{json}"
+        );
+        let again: LastInstallStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(again, with);
+
+        let came_back_by_itself: InstallDaemon =
+            serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert_eq!(came_back_by_itself.how, None);
+        assert!(came_back_by_itself.rungs.is_empty());
+    }
+
     /// FR-67 P3 — `InProgress` is a verdict still being written only while
     /// the watcher can still be alive; past its whole budget it is an install
     /// that never reported, and a record with no start time cannot be fresh.
@@ -8102,6 +8178,7 @@ mod tests {
             installer_exit_code: None,
             note: None,
             path: None,
+            daemon: None,
         };
         assert!(li.in_progress());
         assert!(

@@ -271,8 +271,8 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
 | the panic file (`:1107-1128`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
 | the stderr file (`:798-804`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
 | the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:316-328`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
-| the install outcome (`agents/roomlerd/src/post_install.rs:173-175`, `:190-196`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
-| the wedged MSI log (`post_install.rs:629-637`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
+| the install outcome (`agents/roomlerd/src/post_install.rs:178-180`, `:195-201`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
+| the wedged MSI log (`post_install.rs:639-647`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
 | the update-attempt marker (`agents/roomlerd/src/updater.rs:230-232`, `:242-256`) | `create_dir_all`, `fs::write` | `write_file("update-attempt", ..)` |
 
 The uploader's verdicts ledger (`crash-verdicts.txt`) is a `service-logs` writer too, and P1's since the review
