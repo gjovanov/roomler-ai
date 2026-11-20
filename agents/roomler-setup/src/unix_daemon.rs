@@ -1594,7 +1594,7 @@ mod tests {
         let blocked = home.path().join("blocked");
         std::fs::write(&blocked, "").unwrap();
         let under = blocked.join("config");
-        let said = make_writable_folders(&[under.clone()]).unwrap_err();
+        let said = make_writable_folders(std::slice::from_ref(&under)).unwrap_err();
         assert!(said.contains(&under.display().to_string()), "{said}");
         assert!(said.contains("the token is not spent"), "{said}");
         #[cfg(unix)]
