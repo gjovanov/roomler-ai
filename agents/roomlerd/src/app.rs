@@ -1450,6 +1450,31 @@ fn is_installer_step(command: &Command) -> bool {
     }
 }
 
+/// FR-150 P1a — a step the per-user MSI runs as the person: each of its custom
+/// actions (`wix/main.wxs`). It keeps the profile's log and its role (none),
+/// and writes the same start and end lines as an installer step there, because
+/// Windows Installer throws its output away and a refused registration left
+/// nothing but `returned actual error code 1` (#3507). The same verb run by
+/// hand writes them too. `every_per_user_msi_step_writes_its_record` holds
+/// every per-user custom action to this rule.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_per_user_step(command: &Command) -> bool {
+    use roomlerd::install_cleanup::TargetFlavour;
+    match command {
+        Command::Service {
+            action:
+                ServiceAction::Install { as_service }
+                | ServiceAction::Uninstall { as_service }
+                | ServiceAction::Start { as_service }
+                | ServiceAction::Stop { as_service, .. },
+        } => !*as_service,
+        Command::CleanupLegacyInstall { target_flavour, .. } => {
+            TargetFlavour::parse(target_flavour) == Some(TargetFlavour::PerUser)
+        }
+        _ => false,
+    }
+}
+
 /// The code a process exits with when `main` returns an `Err`: std's
 /// `ExitCode::FAILURE`, which its `Termination` gives such a result.
 #[cfg_attr(
@@ -1607,9 +1632,12 @@ async fn daemon_main() -> Result<()> {
 
     // #3230 — a per-Machine MSI step's start line, before the step does anything
     // (`resolve_config_path` below already repairs the machine tree). Its end
-    // line is written in `main`, after the step returns.
+    // line is written in `main`, after the step returns. FR-150 P1a: a per-user
+    // MSI step's too, in the person's log.
     #[cfg(target_os = "windows")]
-    if log_role == Some(logging::ServiceLogRole::Installer) {
+    if log_role == Some(logging::ServiceLogRole::Installer)
+        || cli.command.as_ref().is_some_and(is_per_user_step)
+    {
         let command: Vec<String> = std::env::args_os()
             .skip(1)
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1627,6 +1655,13 @@ async fn daemon_main() -> Result<()> {
     #[cfg(target_os = "windows")]
     if matches!(&cli.command, Some(Command::Run { supervisor: Some(s), .. }) if s == "task") {
         logging::send_stderr_to_the_log();
+        // FR-150 P1a (#3507) — the task that started this daemon, when its own
+        // account cannot replace it: the next self-update could not register
+        // it again. Said once, in the person's log, with the repair; nothing
+        // goes to the server.
+        if let Some(note) = service::unreplaceable_task_note() {
+            tracing::warn!("{note}");
+        }
     }
 
     // FR-46 P2b — the retired env prefix is no longer READ, so a host that
@@ -5886,6 +5921,10 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
         ServiceAction::Status { as_service: false } => {
             let s = service::status().context("querying auto-start status")?;
             println!("Auto-start: {s}");
+            // FR-150 P1a (#3507): a task its account cannot replace.
+            if let Some(note) = service::unreplaceable_task_note() {
+                println!("Note: {note}.");
+            }
             Ok(())
         }
         ServiceAction::Start { as_service: false } => {
@@ -7807,6 +7846,54 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// FR-150 P1a — every custom action of the per-user MSI runs a step that
+    /// writes its start and end lines in the person's log, and keeps no role
+    /// (the profile's log), while no per-Machine one is such a step: a refused
+    /// registration (#3507) reaches a log a person can read. A new per-user
+    /// custom action is held to the same rule.
+    #[test]
+    fn every_per_user_msi_step_writes_its_record() {
+        fn exe_commands(wxs: &str) -> Vec<String> {
+            wxs.match_indices("ExeCommand='")
+                .map(|(at, key)| {
+                    let rest = &wxs[at + key.len()..];
+                    rest[..rest.find('\'').expect("a closing quote")].to_string()
+                })
+                .collect()
+        }
+        let per_user = exe_commands(include_str!("../wix/main.wxs"));
+        let per_machine = exe_commands(include_str!("../wix-perMachine/main.wxs"));
+        assert!(per_user.len() >= 7, "{per_user:?}");
+        assert!(per_machine.len() >= 7, "{per_machine:?}");
+        let parse = |exe: &str| {
+            let argv = std::iter::once("roomlerd").chain(exe.split_whitespace());
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("`{exe}`: {e}"))
+        };
+        let mut wrong = Vec::new();
+        for exe in &per_user {
+            let cli = parse(exe);
+            let command = cli.command.as_ref().expect("a verb");
+            if !is_per_user_step(command) || service_log_role(Some(command)).is_some() {
+                wrong.push(format!("per-user `{exe}`"));
+            }
+        }
+        for exe in &per_machine {
+            let cli = parse(exe);
+            if cli.command.as_ref().is_some_and(is_per_user_step) {
+                wrong.push(format!("per-Machine `{exe}`"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The verbs a person runs that are no MSI step keep no record.
+        for argv in ["service status", "run", "service install --as-service"] {
+            let cli = parse(argv);
+            assert!(
+                !cli.command.as_ref().is_some_and(is_per_user_step),
+                "{argv}"
+            );
+        }
     }
 
     /// #3230 — the log role of the commands around those the MSIs run: the same
