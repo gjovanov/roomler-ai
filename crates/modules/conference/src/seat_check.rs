@@ -53,9 +53,11 @@
 //! and the room guard's reads: `2 × (SEAT_CHECK_SECS + 2 × READ_TIMEOUT)`,
 //! 40 s. A guard that does not answer keeps the seat for two more passes.
 //!
-//! **The switch.** [`SWITCH`] (`ROOMLER__CONFERENCE__SEAT_CHECK`) set to
-//! `false`, `0`, `off` or `no` turns the check off on a pod; it is read once,
-//! as the pod starts, and the check is on by default.
+//! **The switch.** [`SWITCH`] (`ROOMLER__CONFERENCE__SEAT_CHECK`) is read
+//! from the environment only, once, as the pod starts ([`spawn`]). `false`,
+//! `0`, `off` or `no`, in any case, turns the check off on that pod; unset,
+//! empty, `true`, `1`, `on` or `yes` leaves it on; any other value leaves it
+//! on and warns ([`SWITCH_UNKNOWN`]), so a typo never turns it off unseen.
 //!
 //! **The log.** Every seat the check ends is one warning in one wording,
 //! [`ENDED`], with the org, the room, the person, how many connections closed
@@ -103,6 +105,11 @@ const FAILED_READS_TO_WARN: u32 = 3;
 
 /// The environment setting that turns the check off on a pod.
 pub const SWITCH: &str = "ROOMLER__CONFERENCE__SEAT_CHECK";
+
+/// The one wording of the warning for a value of [`SWITCH`] that is neither
+/// an on value nor an off value: the check runs.
+pub const SWITCH_UNKNOWN: &str =
+    "seat check: the switch has a value it does not know; the check runs on this pod";
 
 /// The one wording of the warning for every seat the check ends.
 pub const ENDED: &str = "seat check: ended a call seat whose admission is gone";
@@ -223,34 +230,71 @@ pub fn seats_to_end(
     ended
 }
 
+/// What a value of [`SWITCH`] says, case and the space around it aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Switch {
+    /// Unset, empty, `true`, `1`, `on` or `yes`: the check runs.
+    On,
+    /// `false`, `0`, `off` or `no`: the check does not run on this pod.
+    Off,
+    /// Any other value: the check runs, and its start warns
+    /// ([`SWITCH_UNKNOWN`]).
+    Unknown,
+}
+
+/// What `value`, the switch's value, says.
+pub fn switch_of(value: Option<&str>) -> Switch {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "true" | "1" | "on" | "yes") => Switch::On,
+        Some("false" | "0" | "off" | "no") => Switch::Off,
+        Some(_) => Switch::Unknown,
+    }
+}
+
 /// Whether the check runs, given [`SWITCH`]'s value: on unless it says
 /// `false`, `0`, `off` or `no`.
 pub fn switched_on(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("false" | "0" | "off" | "no")
-    )
+    switch_of(value) != Switch::Off
 }
 
-/// Start the check on this pod, in a loop of its own, unless [`SWITCH`]
-/// turns it off. Called once, as the module's state is built.
+/// Start the check on this pod as [`SWITCH`] says. The switch is read from
+/// the environment only (no config file sets it), once, here, as the
+/// module's state is built.
 pub(crate) fn spawn(state: &ConferenceState) {
-    if !switched_on(std::env::var(SWITCH).ok().as_deref()) {
-        info!(
+    let value = std::env::var_os(SWITCH).map(|v| v.to_string_lossy().into_owned());
+    start(state, value.as_deref());
+}
+
+/// Start the check's loop on this pod as `value`, the switch's value, says:
+/// no loop for an off value, a loop for an on value, and a loop with a
+/// warning for a value it does not know. Public so a test drives it with
+/// each value. Returns the loop's task, if it started one.
+pub fn start(state: &ConferenceState, value: Option<&str>) -> Option<tokio::task::JoinHandle<()>> {
+    match switch_of(value) {
+        Switch::Off => {
+            info!(
+                switch = SWITCH,
+                "seat check: off on this pod; a seat no withdrawal reached keeps its call"
+            );
+            return None;
+        }
+        Switch::Unknown => warn!(
             switch = SWITCH,
-            "seat check: off on this pod; a seat no withdrawal reached keeps its call"
-        );
-        return;
+            value = value.unwrap_or_default(),
+            alert = "seat_check_switch_unknown",
+            "{SWITCH_UNKNOWN}"
+        ),
+        Switch::On => {}
     }
     let st = state.clone();
     info!(every_secs = SEAT_CHECK_SECS, "seat check: on this pod");
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut memory = SeatCheckMemory::default();
         loop {
             tokio::time::sleep(Duration::from_secs(SEAT_CHECK_SECS)).await;
             check_seats_once(&st, &mut memory).await;
         }
-    });
+    }))
 }
 
 /// A connection seated on this pod, with the seat it held when the pass
@@ -1065,6 +1109,32 @@ mod tests {
         assert!(switched_on(Some("1")));
         for off in ["false", "0", "off", "no", " FALSE ", "Off"] {
             assert!(!switched_on(Some(off)), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_switch_knows_its_on_and_off_values_and_no_others() {
+        for on in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("1"),
+            Some("on"),
+            Some(" YES "),
+        ] {
+            assert_eq!(switch_of(on), Switch::On, "{on:?}");
+        }
+        for off in ["false", "0", "off", "no", " OFF ", "No"] {
+            assert_eq!(switch_of(Some(off)), Switch::Off, "{off:?}");
+        }
+        // A typo, another word for off, a number, a value that was not
+        // Unicode (read lossily): the check stays on, and its start warns.
+        for unknown in ["of", "disabled", "2", "\u{fffd}"] {
+            assert_eq!(switch_of(Some(unknown)), Switch::Unknown, "{unknown:?}");
+            assert!(
+                switched_on(Some(unknown)),
+                "{unknown:?} leaves the check on"
+            );
         }
     }
 

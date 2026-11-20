@@ -13,7 +13,9 @@
 //! - an ended seat settles its call once (T8);
 //! - the room guard decides each end, whatever the reads found (T9, T10);
 //! - a pass ends only the seats it read (T11, T12), and a withdrawal that
-//!   reached them first leaves it nothing to end (T13).
+//!   reached them first leaves it nothing to end (T13);
+//! - the switch decides inside `spawn`, and a value it does not know leaves
+//!   the check on and warns (T14).
 //!
 //! The check's own loop runs beside these on every pod, every 10 s, with a
 //! memory of its own, so it ends a seat no sooner than 10 s after its
@@ -27,8 +29,8 @@ use bson::{Bson, Document, doc};
 use roomler_ai_mod_conference::ConferenceState;
 use roomler_ai_mod_conference::guards::require_room_in_tenant;
 use roomler_ai_mod_conference::seat_check::{
-    Gone, ODD_DOCUMENT, READ_TIMEOUT, Reading, SeatCheckMemory, SeatKey, SeatRead, Verdict,
-    check_seats_once, end_seats, read_readings, read_seats,
+    Gone, ODD_DOCUMENT, READ_TIMEOUT, Reading, SWITCH_UNKNOWN, SeatCheckMemory, SeatKey, SeatRead,
+    Verdict, check_seats_once, end_seats, read_readings, read_seats, start,
 };
 use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
 use roomler_core::ApiError;
@@ -1122,4 +1124,42 @@ async fn a_room_row_of_no_org_does_not_hide_the_seat_it_names() {
     within_the_loops_window(since);
     host.close(None).await.ok();
     in_x.close(None).await.ok();
+}
+
+/// T14 (with the fix). The switch decides inside `spawn`: the seam it hands
+/// the environment's value to starts no loop for each off value, starts one
+/// for each on value, and starts one with a warning for a value it does not
+/// know. The read of the environment itself is `spawn`'s one line.
+#[tokio::test]
+async fn the_switch_decides_inside_spawn() {
+    let app = TestApp::spawn().await;
+    let state = conf(&app);
+    for off in ["false", "0", "off", "no", " OFF ", "No"] {
+        assert!(
+            start(state, Some(off)).is_none(),
+            "{off:?} turns the check off: no loop"
+        );
+    }
+    for (value, warns) in [
+        (None, false),
+        (Some(""), false),
+        (Some("true"), false),
+        (Some("1"), false),
+        (Some("on"), false),
+        (Some("YES"), false),
+        (Some("of"), true),
+        (Some("disabled"), true),
+        (Some("2"), true),
+    ] {
+        let log = Captured::default();
+        let started = tracing::dispatcher::with_default(&log.dispatch(), || start(state, value));
+        let task = started.unwrap_or_else(|| panic!("{value:?} leaves the check on: a loop"));
+        task.abort();
+        let text = log.text();
+        assert_eq!(
+            text.contains(SWITCH_UNKNOWN) && text.contains("seat_check_switch_unknown"),
+            warns,
+            "{value:?}: the warning for a value the switch does not know: {text}"
+        );
+    }
 }
