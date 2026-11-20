@@ -1679,7 +1679,7 @@ heuristics exist only to ration that cost
 ([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
 AIMD target to `FfmpegEncoder::set_bitrate`
 (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3018`), which snaps it to the
-ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
+ladder first (`encode/aimd.rs:503` — 100 k … 25 M, `coarsen_bitrate` at `:523`)
 and returns when the rung is the one already running. Only a rung crossing reaches
 the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
 

@@ -113,7 +113,7 @@ rejected there is NO data plane crossing pods), keyspace notifications
   `controller_tx` on the creating pod; relaying is a durable bidirectional
   proxy with new failure modes, for a signaling-only channel whose media
   is P2P). **Reversed since by PR-2:** a session-request miss is now relayed first: the controller's `rc:*` frames cross the per-pod bus to the owning pod's hub (`crates/modules/remote/src/relay.rs`), and media stays P2P. The rehome reply above is the fallback when the relay is unavailable (`crates/modules/remote/src/controller.rs`). Consent + admin-kick become broadcast control events every pod
-  applies to its local hub.
+  applies to its local hub. A viewer's own hang-up is not broadcast: it rides the relay to the pod that holds its session, at every resume window ([below](#a-viewers-hang-up-across-pods-4042)).
 - **tunnel (C-3)** — same pattern: open-path miss ⇒
   `TunnelOpenReject{reason:"rehome"}` ⇒ the headless CLI redials itself
   (it owns its WS; tid from its JWT) + retry-once. No post-open relay:
@@ -213,6 +213,98 @@ mesh rebuilds that path before ICE gives up on the pair, as a Windows session's 
 the cut on 2026-11-12, and it redials otherwise, with no `agent_busy` either way. The switches, and
 what an operator reads before and after a roll, are in
 [deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138).
+
+### A viewer's hang-up across pods (#4042)
+
+When the viewer's socket is on one pod and the device's on the other, the session lives in the hub
+of the device's pod. The viewer's pod keeps only the socket's route: the owner pods it relayed a
+frame to that they took (`remote_rc_conns`, recorded at `crates/modules/remote/src/relay.rs:500-504`).
+A hub answers the terminate of a session it does not hold with `Ok`, on purpose, because the agent's
+teardown races rely on it (`crates/modules/fleet/src/hub.rs:3701-3708`). So a viewer's
+`rc:terminate` never errs on its own pod. The session-scoped relay forwards only a frame that missed
+there with `SessionNotFound` (`crates/modules/remote/src/controller.rs:415-423`), so it never sees a
+hang-up either. Before #4042, nothing else carried the hang-up at the window's default of 0. The
+device was not told, and the session lived on until the socket closed or the device gave up on its
+peer. The same tab's next Connect was coalesced back into it (`hub.rs:1685`). With the window on,
+the `controller_terminate` event carried it.
+
+The controller's dispatch is now `relay::dispatch` (`relay.rs:871`, called at `controller.rs:271`).
+It gives every frame to the local hub, as before. Then it relays an `rc:terminate` of a session that
+hub does not hold, over `rc.cmd`, to **every** owner pod the socket's route names, at every resume
+window. It asks them all, because an owner answers `dispatched` whether it held the session or not
+(`relay.rs:305`): one answer says nothing of where the session was (`hang_up_to_each`,
+`relay.rs:843`). The owner's proxy dispatches the frame as the viewer (`relay.rs:295`), so the party
+check holds as it does on one pod.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as The viewer's pod
+    participant B as The device's pod
+    participant D as Device
+    V->>A: rc:terminate controller_hangup, the socket kept open
+    A->>A: the local hub holds no such session and answers Ok
+    opt the window is on
+        A->>B: controller_terminate on the rc ctrl lane, after the row write
+    end
+    A->>B: rc.cmd to every owner pod in the route, awaited
+    B->>B: the proxy dispatches as the viewer, and the hub ends the session
+    par the device is told
+        B->>D: rc:terminate controller_hangup
+    and the viewer is told
+        B-->>A: rc:terminate, conn-addressed through the proxy's pump
+        A-->>V: rc:terminate
+    and the bus reply
+        B-->>A: dispatched
+    end
+    Note over A: one info line, hang-up relayed to the socket's owner pods
+```
+
+How each kind of hang-up reaches the pod that holds the session:
+
+| Hang-up | How it reaches that pod | Window 0 | Window on |
+|---|---|---|---|
+| The viewer's `rc:terminate`, with its socket open: Disconnect, leaving the viewer for another page of the app, the reconnect ladder's hang-up before a retry, a ghost release, a refusal's hang-up | `relay::dispatch`: `rc.cmd` to every owner pod in the route, awaited | the owner's hub ends it `controller_hangup` and tells the device | the row is written and `controller_terminate` published first (`controller_end`, `crates/modules/remote/src/row_end.rs:166`). The owner applies that (`crates/modules/fleet/src/ctrl.rs:146`) or the relay ends it, whichever lands first; the other finds it gone. One end, the device told once |
+| The viewer's socket closes: a closed tab, a reload, leaving the app | `rc.conn_closed` to every owner pod in the route (`forward_conn_closed`, `relay.rs:534`), then `remove_proxy` (`relay.rs:404`) and `unregister_controller` | ended `controller_hangup` | held for the window (`viewer_gone`, `crates/modules/fleet/src/hub/hold.rs:102`), then ended `controller_hangup` with `limit: hold_expired` if nobody rejoins |
+| The viewer's pod dies without a word | the owner pod's janitor: every 60 s it asks the origin pod about each proxy quiet for 120 s (`rc.conn_alive`, judged by `probe_verdict`, `relay.rs:714`). It reaps a proxy whose socket is gone, or whose pod does not answer, as a close does. It never reaps while the socket lives | as a close | as a close |
+| The device ends it | the device's pod ends it, and the proxy's pump tells the viewer | the same | the same |
+| An admin ends it (`POST …/session/{id}/terminate`) | the local hub, and the ctrl lane's `terminate` (published at `crates/modules/remote/src/routes.rs:133`), which a pod applies to a session of that org it holds (`ctrl.rs:108`) | the same | the row is written first (`admin_end`, `row_end.rs:141`) |
+| Another member's `rc:terminate` of a session that is not theirs, from a socket whose route names that pod | relayed as the viewer's | refused there by the party check (`check_session_party`, `hub.rs:3443`). The refusal reaches the sender as on one pod (`rc:error`, `session_id` null), and the session stays live | the same: the row names another person, so `controller_end` writes and publishes nothing |
+
+An external viewer's `rc:terminate` takes the same dispatch. `extauth::intercept` takes only
+`rc:extauth.*` frames (`crates/modules/remote/src/extauth.rs:1466`), and the extauth relay records
+the socket's route like any relayed frame (`extauth.rs:316`).
+
+**The bound.** The relay is awaited, and a socket's frames are read one at a time
+(`crates/api/src/ws/handler.rs:261-274`). So the owner pod has ended the session before the tab's
+next frame is read, and a Connect right after a Disconnect gets a new session. A hang-up across pods
+reaches the device within the same-pod time plus `RPC_DEADLINE` (2 s,
+`crates/core/src/cluster/bus.rs:41`), the longest one relayed frame waits on a live bus. The tests
+measure both times in one run and hold the cross-pod one to that bound (`bound_from`,
+`crates/tests/src/rc_cross_pod_hangup_tests.rs:145`).
+
+**The log line.** Each relayed hang-up writes ONE line at info on the viewer's pod:
+`rc relay: hang-up relayed to the socket's owner pods` (`HANGUP_RELAYED_LINE`, `relay.rs:827`). Its
+fields are `session` (the last 6 characters), `owners` (the pods it went to), `took` (how many
+answered `dispatched`) and `refused`. On a two-pod deployment a hang-up the owner took reads
+`owners=1 took=1 refused=false`, whether the relay or the ctrl lane ended the session. The owner pod
+logs nothing new. With the window on, it logs
+`rc ctrl: a controller's end applied from another pod` (`ctrl.rs:147`) when the ctrl lane lands
+first, and nothing when the relay does.
+
+**When the relay fails.** An owner's refusal reaches the viewer as above. A relay that Redis lost is
+dropped with `rc relay: frame dropped, Redis failed its relay` and `frame=rc:terminate`
+([below](#a-redis-that-stops-answering-3840)). The route is kept and the viewer is told nothing,
+and the session ends as it did before #4042: at the socket's close, or by the device's own end once
+its peer is gone. An owner that does not answer costs `RPC_DEADLINE` once, and its route is
+forgotten (`settle_failed_relay`, `relay.rs:681`).
+
+**What did not change.** The relay acts on an explicit `rc:terminate` only. A lost socket is still a
+hold with the window on, and `rc.conn_closed`, the janitor and the rejoin work as they did. There is
+no new wire frame and no new bus verb, and nothing new is written at window 0. An owner pod that
+predates #4042 dispatches a relayed `rc:terminate` as it does any relayed frame (`relay.rs:88`). So
+while a roll serves old and new side by side, the hang-up still ends the session, unless it was sent
+through a viewer's pod still on the old image: at window 0 that one is lost, as before.
 
 ### A Redis that stops answering (#3840)
 
@@ -330,7 +422,7 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 | DERP registration (`crates/modules/network/src/derp_cluster.rs:72`, `:352`) | Lua LWW claim, SADD, convergence reads | the registration keeps its token whatever the claim answered, and its socket goes on; `finish_registration` writes what the error left owed once Redis answers, 1 s apart doubling to 30 s: the record by `claim_if_newer`, which never takes it from a later registration, and which is released again by its token when the registration ended while the claim was in flight (`keep_late_claim`); the index member; a convergence sweep (measured: settled 9.2 s after Redis answered) | the record holds this registration's own token: the heartbeat refreshes it |
 | Tunnel ownership record (`crates/modules/network/src/tunnel.rs:800-815`) | Lua LWW claim | the session keeps its token whatever the claim answered; the 30 s heartbeat re-sets an absent record (`refresh_if_mine`, `crates/modules/network/src/lib.rs:391-402`); only the split-evidence probe reads it | the record holds the session's own token: the heartbeat refreshes it |
 | Pod bus (`bus.rs:225`, `:317`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
-| Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A deadline, or the owner's answer (`alive: false`; a NACK, which to a relayed frame is also the owner's refusal of that one frame), still reaps a proxy or forgets a route. A deadline says only that the owner did not answer: until #3952, after a Redis lost without a reset, it can be this pod's own deaf bus subscriber | nothing is written |
+| Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A hang-up is dropped the same way, and its session then ends at the socket's close or by the device's own end, as before #4042 ([above](#a-viewers-hang-up-across-pods-4042)). A deadline, or the owner's answer (`alive: false`; a NACK, which to a relayed frame is also the owner's refusal of that one frame), still reaps a proxy or forgets a route. A deadline says only that the owner did not answer: until #3952, after a Redis lost without a reset, it can be this pod's own deaf bus subscriber | nothing is written |
 | Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error, or a set full only by stale leases Redis did not let go (`crates/modules/remote/src/slots.rs:206-210`), lets the session proceed uncounted (fails open, as the code intends); a keep is tried again 1, 2, 4, 8, 16 s apart while its lease can still exist (`keep_retrying`, `session_slots.rs:417`); renew and release log | a lease lapses in 90 s; a keep only lengthens a live lease, so trying it again is harmless |
 | Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:1984`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
 
@@ -357,7 +449,7 @@ are 1 + `suppressed`. On a healthy pod every count is 0.
 |---|---|---|
 | `redis: no answer within the timeout` (`redis_conn.rs:71`) | Redis took the bytes and said nothing: a command, or a replacement's connection attempt (`command="connect"`), got no answer within its bound | `command`, `timeout_ms`, `timeouts`, `suppressed` |
 | `redis: no connection could be made` (`redis_conn.rs:77`) | Redis refused or closed the connection: a replacement's attempt failed for another reason than a timeout (`error`, `retry_in_ms`), or a command timed out while it waited for the crate's reconnect after one (`command`, `waited_ms`) | those, `connect_failures`, `suppressed` |
-| `rc relay: frame dropped, Redis failed its relay` (`crates/modules/remote/src/relay.rs:648`) | a session frame the relay could not publish; the route is kept | `frame`, `session`, `suppressed` |
+| `rc relay: frame dropped, Redis failed its relay` (`crates/modules/remote/src/relay.rs:648`) | a session frame the relay could not publish, a viewer's hang-up (`frame=rc:terminate`) among them; the route is kept | `frame`, `session`, `suppressed` |
 | `rc relay: sweep stopped, Redis failed a probe` (`relay.rs:652`) | a janitor sweep that Redis stopped; its proxies are kept and asked about at the next sweep | `unsettled` |
 
 A replacement that succeeds logs `redis: the shared connection was replaced after a timeout` at

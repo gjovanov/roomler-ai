@@ -2958,7 +2958,7 @@ account owns is refused (`:605`). An answer from the tray, from `roomlerd consen
 or from a native panel reaches the broker in process (`record_decision`, `:925`),
 which writes it there. `roomlerd consent` writes the file itself only when it
 cannot reach the device service, and then only a console-run agent in the same
-profile sees it (`consent_cmd`, [`app.rs:2542`](../agents/roomlerd/src/app.rs#L2542)).
+profile sees it (`consent_cmd`, [`app.rs:2544`](../agents/roomlerd/src/app.rs#L2544)).
 
 | The daemon's own folder | the file channel | questions and answers | the log, once at start |
 |---|---|---|---|

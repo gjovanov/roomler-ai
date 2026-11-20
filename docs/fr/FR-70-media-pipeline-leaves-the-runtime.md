@@ -1439,7 +1439,7 @@ flowchart TD
   after the open, a rung crossed on that tick re-rated the new encoder at once,
   a second open on a rebuild-bound backend. It also opens at the controller's
   target rather than `ceiling.min(target)`: where the controller's floor lifts
-  it over the frame's ceiling (`aimd.rs:188-193`), the next tick would apply that
+  it over the frame's ceiling (`aimd.rs:370-381`), the next tick would apply that
   target anyway.
 - **What it costs, or still does.** (1) After an M2 swap to a larger geometry
   is adopted on a still screen, on a backend that scaled the last frame and

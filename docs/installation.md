@@ -1662,7 +1662,7 @@ What a step writes, in order. Its own lines have the target `roomler_node_core::
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
-exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2316`).
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2318`).
 
 One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1437`). It gives the role to `service install` and
@@ -2092,7 +2092,7 @@ the loader check is all a bare image can ask of it.
 | Lane | What goes through it |
 |---|---|
 | `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
-| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190, for that reason. A container that cannot refresh its index from the mirror is not a package failure: it prints `MIRROR UNREACHABLE` and the script exits 3, while a package that does not start prints `DOES NOT START: <package>` and exits 1. In CI, `ci-apt.sh reach --containers` runs first, so a dead runner resolver fails over before any container starts ([build-caches.md](build-caches.md#5-how-apt-reaches-the-mirrors), #3710) |
 
 ⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
 not the package. Its package list is written by hand, so it named the real ALSA
@@ -2217,6 +2217,25 @@ sequenceDiagram
     (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
     into its last good copy (`config.toml.prev`) when that one loads, and keeps
     the damaged file as `config.toml.unreadable`.
+  - `adopt-enrollment`'s **last line says what was at the target** (#3589). The
+    outcome alone cannot: a target that was not there and one that was there
+    and held no enrollment both end as a fresh primary, so the verb records what
+    its merge-base read found and words only that arm from it. What is written
+    and kept is the same on every row; only the words differ.
+
+    | At the target | The last line says | Where |
+    |---|---|---|
+    | nothing | *"written fresh (no config was here)"* | `agents/roomlerd/src/app/adopt_line.rs:54` |
+    | a config that loads and holds no enrollment | *"written into the config here, which held no enrollment (its settings kept)"* | `:55-57` |
+    | a config that does not load, with no usable `.prev` | *"written fresh: the config here could not be read and had no usable last good copy (kept as …`.unreadable`)"* | `:58-65` |
+    | a config that does not load, whose `.prev` loads and holds no enrollment | *"written into the config's last good copy, which held no enrollment (its settings kept); the config here could not be read (kept as …`.unreadable`)"* | `:66-73` |
+    | Windows, the machine-global config, not private to its administrators (#3609) | *"written fresh: the config here was not private to this computer's administrators, so nothing of it was carried over"* | `:74-76` |
+    | an enrolled config | the words it always had: refreshed, replaced, refreshed org, appended | `agents/roomlerd/src/app.rs:3263-3270` |
+
+    The record is made where the read is matched
+    (`agents/roomlerd/src/app.rs:3191-3216`) and the words are chosen at
+    `:3227`. A copy that could not be kept says why instead of where, and the
+    WARNING above it is unchanged.
   - A system scope's machine id is **derived from the host name** (the person
     cannot read the one in root's config). On a renamed host, or a VM cloned
     together with its config, the server therefore enrolls a **new device**: the
@@ -3560,7 +3579,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2278`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2280`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
