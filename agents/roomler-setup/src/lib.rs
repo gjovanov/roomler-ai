@@ -195,6 +195,50 @@ mod front_tests {
         }
     }
 
+    /// FR-141 P2 — a Mac where the one-row form is open: the card and the
+    /// box say ONE device, the paste takes one token (root's, rule 3), the
+    /// pairing's own answer and the form the page showed go to Rust, and
+    /// Done names one device. Where the form is closed, the note under the
+    /// card names this Mac's own road. No one-row text says two devices, a
+    /// second one or a half (rule 5).
+    #[test]
+    fn a_one_row_mac_asks_for_one_token_and_says_one_device() {
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("<p class=\"muted\" id=\"role-note-daemon-user\" hidden></p>"),
+            "the closed form's note, under the Mac card"
+        );
+        let js = include_str!("front/app.js");
+        for line in [
+            "return state.os === \"macos\" && !!f && f.server === state.server && f.oneRowOpen === true;",
+            "return wantsRootHalf() && oneRowOpen();",
+            "oneRow && c.descOneRow ? c.descOneRow : c.desc;",
+            "const closedNote = oneRowStop === null ? oneRowClosedNote() : null;",
+            "const rootHalf = wantsRootHalf() && !oneRowForm();",
+            "p.oneRow = view.oneRow === true;",
+            "const oneRow = rootHalf && (paired ? state.pair.oneRow === true : oneRowForm());",
+            "rootToken: !paired && rootHalf && !oneRow ? state.rootToken : null,",
+            "oneRow: !paired && rootHalf ? oneRow : null,",
+            "if (done.oneRow === true) {",
+        ] {
+            assert!(js.contains(line), "app.js lacks {line:?}");
+        }
+        for marker in [
+            "descOneRow: \"",
+            "joins as one device. Untick it",
+            "This Mac joins as one device, “",
+            "This Mac joined as one device",
+        ] {
+            let line = js
+                .lines()
+                .find(|l| l.contains(marker))
+                .unwrap_or_else(|| panic!("app.js lacks {marker:?}"));
+            for word in ["two devices", "second", "half"] {
+                assert!(!line.contains(word), "{line:?} says {word:?}");
+            }
+        }
+    }
+
     /// #3247 item 11 — `install.ps1 -Uninstall` removes the service and leaves
     /// its hardened folder, so a limited wizard showed "Daemon: no existing
     /// install detected." and, under it, "This device already has the

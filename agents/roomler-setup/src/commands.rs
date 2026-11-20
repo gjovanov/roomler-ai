@@ -322,15 +322,25 @@ fn detect_unix(
         // FR-141 P2: a Mac that is one row already installs nothing, so no
         // form is open or explained there.
         one_row_open: one_row_stop.is_none() && form.is_ok(),
-        one_row_note: if one_row_stop.is_some() {
-            None
-        } else {
-            form.as_ref()
-                .err()
-                .and_then(crate::one_row_form::Closed::note)
-        },
+        one_row_note: closed_form_note(form, one_row),
         one_row_stop,
     }
+}
+
+/// FR-141 P2 — the closed form's note for the page, or `None`. Never to a Mac
+/// whose root daemon says it is one row, the reinstall guard on or off: the
+/// note speaks of a Mac with two rows or a person's row, and such a Mac hears
+/// P3's stop instead (or, with the guard off, nothing new).
+fn closed_form_note(
+    form: &Result<(), crate::one_row_form::Closed>,
+    one_row: Option<&crate::reinstall_guard::OneRowMac>,
+) -> Option<String> {
+    if one_row.is_some() {
+        return None;
+    }
+    form.as_ref()
+        .err()
+        .and_then(crate::one_row_form::Closed::note)
 }
 
 /// FR-129 B1 — the server's switches, for the Server page: when the URL
@@ -348,9 +358,15 @@ pub async fn cmd_setup_features(server: String) -> crate::features::FeaturesView
         crate::unix_daemon::kept_one_row(&server),
     )
     .await;
+    // As on the Welcome page; the root daemon is asked only when there is a
+    // note to hold back.
+    let one_row = match &form {
+        Err(closed) if closed.note().is_some() => crate::reinstall_guard::one_row_here().await,
+        _ => None,
+    };
     crate::features::FeaturesView {
         one_row_open: form.is_ok(),
-        one_row_note: form.err().and_then(|closed| closed.note()),
+        one_row_note: closed_form_note(&form, one_row.as_ref()),
         ..asked.view(crate::role::HostOs::current())
     }
 }
@@ -1231,6 +1247,35 @@ mod tests {
         assert!(
             !d.one_row_open && d.one_row_note.is_none(),
             "P3's stop alone"
+        );
+
+        // With the guard off a one-row Mac has no stop, and still hears no
+        // note written for a Mac with two rows.
+        let guard_off = Asked {
+            features: SetupFeatures {
+                reinstall_guard_off: true,
+                ..said.features
+            },
+            answered: true,
+        };
+        let enrolled = Err(Closed::RootEnrolled);
+        let d = detect_unix(
+            HostOs::Macos,
+            server,
+            guard_off,
+            false,
+            Some(&mac),
+            &enrolled,
+        );
+        assert!(d.one_row_stop.is_none(), "the operator's off");
+        assert!(
+            d.one_row_note.is_none(),
+            "no two-device note to a one-row Mac"
+        );
+        let d = detect_unix(HostOs::Macos, server, guard_off, false, None, &enrolled);
+        assert!(
+            d.one_row_note.is_some(),
+            "a Mac with two rows hears its road"
         );
     }
 
