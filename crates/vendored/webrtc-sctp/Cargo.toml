@@ -122,6 +122,24 @@
 #     src/association/association_internal/association_internal_test.rs
 #     hold its tests (two lone packets, each acknowledged within the
 #     interval; a late timeout delivered in the race's order).
+#   - src/stream/mod.rs (#4116): `read_sctp` registers its wait (an
+#     enabled `Notified`) before it checks `read_shutdown` and the
+#     reassembly queue. Both shutdowns, `Stream::shutdown` and the
+#     association's `unregister_stream`, set that flag and then wake the
+#     waiters of that instant with `notify_waiters()`, which stores no
+#     permit. Upstream made its wait only once it had found nothing to
+#     read, so a shutdown that landed between the check and the wait was
+#     lost, and the read waited for good for data that never came: a
+#     data channel's read loop, kept with its stream by a closed channel
+#     (#4103's class, one layer down). A chunk's `notify_one()` still
+#     stores a permit when nobody waits, and one that reaches the
+#     registered wait of a read that then finds data is passed on as the
+#     `Notified` drops (tokio 1.52.3, `src/sync/notify.rs:1365-1375`).
+#     src/stream/stream_test.rs and
+#     src/association/association_internal/association_internal_test.rs
+#     hold its tests (a channel's close and the association's close, each
+#     landing between a read's check and its wait; a chunk that races a
+#     read for the queue's lock, both ways round).
 
 [package]
 edition = "2021"
