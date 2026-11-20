@@ -28,7 +28,7 @@ Read on master `b4e72ff0d` and on production, 2026-10-27/28.
 ### The token step is a dead end for anyone without an account
 
 The wizard's step 3 is a text box: "Paste a fresh token from the Roomler admin UI"
-(`agents/roomler-setup/src/front/index.html:179`). Nothing on it opens a browser, names a
+(`agents/roomler-setup/src/front/index.html:182`). Nothing on it opens a browser, names a
 signup page or says where a token comes from. To get one, a new person must:
 
 1. register — production answers with a message and **no session**
@@ -66,13 +66,13 @@ them:
 
 | Step | Where | Why it is not optional |
 |---|---|---|
-| package format follows the host | `scripts/install.sh:438-457` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
-| the macOS root-half marker | `scripts/install.sh:575-584` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
-| the per-user half as the console user | `scripts/install.sh:202-222` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
-| the macOS second enrollment | `scripts/install.sh:606-636` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
-| the FR-96 update helper | `scripts/install.sh:360-378` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:893`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
-| digest verification | `scripts/install.sh:232-241` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
+| package format follows the host | `scripts/install.sh:453-472` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
+| the macOS root-half marker | `scripts/install.sh:590-599` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
+| the per-user half as the console user | `scripts/install.sh:204-224` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
+| the macOS second enrollment | `scripts/install.sh:621-651` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
+| the FR-96 update helper | `scripts/install.sh:375-393` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
+| the desktop companion | `scripts/install.sh:912`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| digest verification | `scripts/install.sh:234-243` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
 
@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:773`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:788`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the
@@ -671,7 +671,7 @@ flowchart TB
    shows the terminal command. That command carries no secret; the wizard enrolls in-process
    once it detects the installed daemon.
 3. **Fail closed on a missing digest** when elevated, unlike the terminal's soft-skip
-   (`install.sh:445-466`). A root install of an unverified package is the thing to refuse.
+   (`install.sh:460-481`). A root install of an unverified package is the thing to refuse.
 4. **Roles.**
    - **Linux per-user** (the default for a desktop): screen sharing, plus the overlay through
      the userspace netstack.
@@ -734,7 +734,7 @@ operator did exactly that the same day, and C1's default sends more reinstalls t
 #### C1 — The wizard preselects the background service
 
 **Rust decides, the SPA applies**, as for `daemonRoles`: `role::default_role`
-(`agents/roomler-setup/src/role.rs:287`), pure and unit-tested, is carried on the detection as
+(`agents/roomler-setup/src/role.rs:331`), pure and unit-tested, is carried on the detection as
 `defaultRole` (`agents/roomler-setup/src/commands.rs:90`, `null` = no preselection). It
 chooses among what the OS offers right now — its daemon roles when `supported` (on Linux and
 macOS the server's switch), and the tunnel client:
@@ -750,18 +750,18 @@ macOS the server's switch), and the tunnel client:
   screen remotely controllable, so an attended service stays attended unless the person picks
   otherwise. The switch is `ROOMLERD_ENABLE_SYSTEM_SWAP` in the `Roomler` service's SCM
   Environment, read as the updater reads it
-  (`agents/roomler-setup/src/commands.rs:214`, `roomlerd::win_service::environment`), and on is
-  what the daemon itself reads as on (`role::system_context_switch`, `role.rs:173`: `1`, `true`,
+  (`agents/roomler-setup/src/commands.rs:241`, `roomlerd::win_service::environment`), and on is
+  what the daemon itself reads as on (`role::system_context_switch`, `role.rs:217`: `1`, `true`,
   `yes`, `on`) — the posture the device runs in. It is asked only for a Windows perMachine or
   ambiguous install. A flavour the server does not offer right now gets no preselection: the
   tunnel client would be another product than the one the device has. This supersedes B.4's
   "Linux per-user (the default for a desktop)".
 - **The SPA** preselects `defaultRole` when nothing is picked and the card is shown
-  (`agents/roomler-setup/src/front/app.js:653`, `isOfferedRole` `:730`), never saves it (a
+  (`agents/roomler-setup/src/front/app.js:704`, `isOfferedRole` `:781`), never saves it (a
   click does), and evaluates the Continue gate as before — the cross-flavour acknowledgement
   and #3116's elevation note included. The overlay box keeps its per-OS default, already ticked
   for every preselected daemon role.
-- **A run resumes only from the Server or the Token page** (`RESUMABLE_STEPS`, `app.js:186`):
+- **A run resumes only from the Server or the Token page** (`RESUMABLE_STEPS`, `app.js:191`):
   there the saved role and device name come back with the step. A run that finished, stopped on
   Welcome or was cut off during the install starts again at Welcome with no role and the
   default device name. The server URL is the person's setting and is always kept.
@@ -770,7 +770,7 @@ macOS the server's switch), and the tunnel client:
   desktop", which would contradict it. The wizard's own text never calls the daemon an "agent"
   (the operator, 2026-10-30): the token step names the dashboard's Devices → Enroll, the
   checklist and the Done page say "device" and show a version (`roomlerd 0.4.188`), never a
-  release tag (`app.js:1929-1934`). Tags, API paths and wire strings stay as they are: they are
+  release tag (`app.js:2010-2015`). Tags, API paths and wire strings stay as they are: they are
   compatibility surfaces.
 
 #### C2 — `/api/setup/windows` serves the signed EXE
@@ -781,7 +781,7 @@ macOS the server's switch), and the tunnel client:
   (`.github/workflows/release-setup.yml:618`); the publish job copies `*.exe` too (`:691`), so
   the GPG step signs it and the attestation covers it. ⚠️ A tag run executes the workflow as it
   stood at the tag: the first EXE asset appears at the first `setup-v*` cut after this merges, which was `setup-v0.4.197`.
-- **The server** (`crates/modules/fleet/src/setup_release.rs:66`, `SetupFormat`; `:319`,
+- **The server** (`crates/modules/fleet/src/setup_release.rs:66`, `SetupFormat`; `:328`,
   `pick_setup_asset`) prefers the `.exe` for `windows-x86_64` and falls back to the `.zip`, so a
   release without the EXE (every one before the first that publishes it) is served as before; a sidecar is
   never a pick. `?format=zip` forces the zip — for a network whose proxy refuses an EXE —
@@ -833,10 +833,10 @@ sequenceDiagram
     end
 ```
 
-- **Where.** #3116's note (`agents/roomler-setup/src/front/index.html:104`) carries a **Restart as
+- **Where.** #3116's note (`agents/roomler-setup/src/front/index.html:107`) carries a **Restart as
   administrator** button inside it, so it shows exactly when the note does: the pre-logon role,
   on a reinstall whose config folder a limited wizard cannot open. It runs
-  `cmd_relaunch_elevated` (`agents/roomler-setup/src/commands.rs:396`), Windows-only: `runas`
+  `cmd_relaunch_elevated` (`agents/roomler-setup/src/commands.rs:462`), Windows-only: `runas`
   on `std::env::current_exe()`, one UAC prompt
   (`crates/roomler-setup-core/src/elevation.rs:112`), with
   `--role <role> [--server <url>] [--session-data <folder>] --after-elevation <pid>` — the server
@@ -866,9 +866,9 @@ sequenceDiagram
   `%LOCALAPPDATA%` in `--session-data` and a different one here says so
   (`launch::on_another_account`, `agents/roomler-setup/src/launch.rs:315`). It then offers only
   the machine-wide service, with a note saying why (`RoleLimit::AnotherAccount`,
-  `agents/roomler-setup/src/role.rs:191`): the other roles would install into that administrator's
+  `agents/roomler-setup/src/role.rs:235`): the other roles would install into that administrator's
   profile and still report Done. `cmd_install` and `cmd_pair_start` hold the same rule for a run
-  that resumes past Welcome (`agents/roomler-setup/src/commands.rs:342`).
+  that resumes past Welcome (`agents/roomler-setup/src/commands.rs:408`).
 - **"Open the page" goes through Explorer.** A browser started directly takes the wizard's token.
   Under over-the-shoulder credentials that was Edge as the administrator, at high integrity, on
   the standard user's desktop (the log, 2026-11-02): a browser the person at the screen could use
@@ -958,7 +958,7 @@ sequenceDiagram
 - **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any
   other failure shows its reason and the right-click way; a started copy makes this one exit.
   The elevated copy opens on Welcome with the handed role, which wins over C1's default
-  (`applyLaunchOptions`, `app.js:213`), and passes the Continue gate like any other pick.
+  (`applyLaunchOptions`, `app.js:218`), and passes the Continue gate like any other pick.
 - **Nothing else self-elevates.** A fresh install still gets the MSI's own UAC prompt.
 
 ## The pairing API
@@ -1326,7 +1326,7 @@ All seven open decisions were resolved as the spec recommended
 | A4-5 | **the tunnel role does not pair from the scripts** (`--role tunnel --pair` and `-Role tunnel-client -Pair` are refused, naming `--token` and the wizard) | the `roomler` CLI's enroll is its own code (`agents/roomler-cli`) and has no `--pair` yet; a script cannot pair on its behalf without holding the token itself, which is the thing `--pair` exists to avoid. A CLI `--pair` is a follow-up. |
 | A4-6 | **`--pair-org` matches the approved slug byte for byte** — no case folding, no trimming of the server's value, no Unicode normalisation; only the person's own value is trimmed | the server takes a slug as sent (`crates/api/src/routes/tenant.rs:60-68` passes it straight to the DAO; only `ui/src/composables/useValidation.ts:10` constrains it) under the binary-collated unique index of `crates/db/src/indexes.rs:132`, so `ACME`, `acme ` and a Cyrillic `аcme` are three orgs anyone can create beside `acme`. The first A4 draft trimmed and case-folded the server's slug, which let `ACME` through with no question asked: the flag that was the guard would have been the bypass. |
 | A4-7 | **server-sent text is escaped on the terminal, and a lookalike handle is flagged** | the org's name and slug and the approver's name and username are typed by whoever made the org and the account. Printed raw, an ANSI sequence (cursor up, clear line) in an org's name can repaint the `Join …?` line with another org's; a bidi override can reorder it. Escaping controls and invisible characters keeps every byte visible, and the warnings catch what escaping cannot (a slug in capitals, a Cyrillic letter). On Windows the question goes out through `WriteConsoleW`, so the `«»` and a non-ASCII name are not garbled by the console's code page. |
-| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1307-1319`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
+| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1371-1383`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
 | A4-9 | **the existing config is read after the pairing, not before it** | the first draft read it before the wait and merged into that copy after: a running daemon's own writes in between (token renewal, remote configuration, the companion's settings) would be saved over. Reading after makes the paired enroll's read-to-save window the `--token` one, and every line of it the `--token` code. |
 | A4-10 | **`install.sh` gives the paired enroll `/dev/null` as stdin** | under `curl … \| sh` the shell's stdin is the rest of the script. Nothing reads it today — the daemon asks on `/dev/tty`, and sudo 1.9.15 passed a piped script through untouched by default and with `log_input` or `log_stdin` set (the log below) — so this is a belt, kept because the cost of being wrong is an install that silently stops halfway. |
 

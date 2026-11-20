@@ -94,7 +94,7 @@ the design:
 | # | Fact | Evidence | Consequence |
 |---|---|---|---|
 | 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4369`) and `merge_unknown_keys` (`:4503`), locked by `:5065` | Removing the 23 keys strands nothing, and a rollback finds them again. |
-| 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1575`, deserialized at `:1696`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
+| 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1587`, deserialized at `:1708`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
 | 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:605`; no handler (`:612`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4411`) and `crates/modules/fleet/src/socket.rs:801` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
 | 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:2988`, `:2993`, "Deliberately not fatal" (`:2985`) | The agent needs no stub variant. |
 | 5 | `ClientMsg` ignores unknown fields. | `crates/remote_control/src/signaling.rs:523-525` | If P2 dropped `ssh_ticket` or `net_grant`, an old agent's ticketed request would parse as **the owner's own**. Hence S-B3. |
@@ -238,7 +238,7 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
    - New roles' presets lack the bits.
    - Production's `ROOMLER__HIVE__*`, `ROOMLER__VAULT__*` and `ROOMLER__KNOWHOW__*` are ignored, and must
      stay until P1 is past rollback (D3). The vault's key-encryption key is never deleted: it alone opens
-     the parked secrets (`crates/config/src/settings.rs:230`).
+     the parked secrets (`crates/config/src/settings.rs:242`).
 4. **An agent rolled back from P2 to Hive.**
    - The updater only moves up (fact 11). On Windows the MSI also refuses a downgrade, so a rollback is a
      new release built from P2's revert.
