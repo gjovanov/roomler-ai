@@ -22,6 +22,11 @@
 //   |            | `ffmpeg open_as_with rejected the quality options…` (ffmpeg/encoder.rs)  |
 //   | rate       | `FFmpeg DC pump heartbeat (≈2s window)`, `VP9-444 DC pump heartbeat…`    |
 //   |            | (peer.rs): bytes_written and frames_sent are CUMULATIVE per pump         |
+//   | target     | `VP9-444 set_bitrate (AIMD)`, `VP9-444 AIMD decrease (DC buffer over     |
+//   |            | high watermark)` and `FFmpeg DC pump set_bitrate (AIMD)`, each a move    |
+//   |            | handed out, and `FFmpeg DC pump: deferred bitrate …`, a held target      |
+//   |            | landing (peer.rs). From 0.4.230 (FR-148 P0, #4161) each carries `why`,   |
+//   |            | and each heartbeat `target_moves`: the moves since the one before it     |
 //   | delivery   | `path delivery (FR-148 P0, shadow, ≈10s)`, `path model (…)`              |
 //   |            | (media_delivery.rs); a delivery line with a queued sample prints as a    |
 //   |            | `queue` event: `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low`   |
@@ -41,12 +46,42 @@
 //   that matched "pump heartbeat" anywhere printed `undefined` and NaN for it).
 //   A field a line does not carry prints `-`, never 0, `undefined` or NaN.
 //
+// THE TARGET (FR-148 P0)
+//
+//   A move of the live target prints as a `target` row, with why:
+//   - at its own target line, `a -> b bps why=…`, the `why` as the line
+//     carries it: the causes in the order they happened, joined by `+`, from
+//     open; increase(app-limited|loaded|no-window); decrease(full|overflow|
+//     stall|age|link|transit-stall); hard-decrease; ceiling(plan|pipe|learned|
+//     arrival|opener); floor(area|relief|ramp); reapply; or `none`, and
+//     `+more` past eight (encode/aimd.rs `Cause`, encode/governor.rs `Why`;
+//     the self-test reads these words from the source). A line without `why`,
+//     from an agent before 0.4.230, prints "(reason: not logged)";
+//   - else at the first heartbeat that shows the number changed, `a -> b bps,
+//     no target line`, with that heartbeat's `target_moves`, or "(reason: not
+//     logged)" when it carries none.
+//   A held FFmpeg target landing (`deferred bitrate …`) prints `held b bps …`
+//   with the `why` it was handed out with. It is no new move.
+//
+//   `target_moves` counts every move the governor handed out since the
+//   heartbeat before it (`record_applied`, `take_moves`: governor.rs), as
+//   `why:n` joined by `,`. The pumps write a target line for only some: the
+//   FFmpeg pump only when the number changed (a re-apply is in the count
+//   alone; the VP9-444 pump writes one when the quality changed with it) and
+//   not for the tick a rebuild's open runs first; neither pump at the gate's
+//   skip; the FFmpeg pump not at a send overflow. A line lost on upload is
+//   lost too. So over a session read whole, the target lines that hand a
+//   move out are at most the heartbeats' total, plus the moves after a pump's
+//   last heartbeat, which no heartbeat counts, unless a heartbeat line was
+//   lost. The session summary prints both, each by `why`.
+//
 // WHAT IT CANNOT TELL
 //
-//   - Why the target moved. The governor sets the applied target in
-//     `record_applied` (agents/roomlerd/src/encode/governor.rs, `fn
-//     record_applied`) and no line says why; a target move prints "reason: not
-//     logged".
+//   - Why the target moved, on an agent before 0.4.230: its target lines carry
+//     no `why` and its heartbeats no `target_moves`, so its moves print
+//     "(reason: not logged)". From 0.4.230 the reason is told (THE TARGET). A
+//     cause names what moved the number, never what the path carries
+//     (docs/rate-control.md, "Why the target moved").
 //   - Which session a line belongs to when the line names none: the encoder
 //     lines and the rate-memory line. Such a line goes to the session of this
 //     agent whose lines span its time (from OPEN_LAG_MS before the session's
@@ -80,7 +115,10 @@
 //     could name an address, a host or a person removed on the server
 //     (DENY_KEY). Ids print as their last 4 hex in the report and in --rows
 //     alike (`masks`), and every printed line, like every string --rows
-//     prints, is scrubbed of addresses and 24-hex ids again.
+//     prints, is scrubbed of addresses and 24-hex ids again. `why` and
+//     `target_moves` leave as written: the agent builds both from fixed words
+//     and counts only (encode/aimd.rs `Cause`, encode/governor.rs `Why` and
+//     `Moves`), never an id, an address or free text.
 //
 //   THE ESTIMATE, a ten-hour window with eight hours of sessions, FFmpeg pump:
 //   heartbeats one per ≈2 s (14,400), delivery and model lines one each per
@@ -93,6 +131,13 @@
 //   hour, 10 a minute), through the index. DEFAULT_LIMIT (60,000) is about
 //   three such days of one device; a VP9-444 pump doubles the heartbeats.
 //   Split a longer window with --from/--to.
+//   The target lines add one a move a pump writes a line for: an increase at
+//   most every 5 s, a ×0.85 at most every 500 ms and only while congested
+//   above the floor (encode/aimd.rs AI_SETTLE, MD_MIN_INTERVAL), a bound's
+//   move when its number crosses the target (the measured bounds change at
+//   most once a ≈1 s window). That is a few a minute where a session climbs
+//   and backs off; even one a second for all eight hours adds 28,800 rows of
+//   about 200 bytes, about 50,000 rows in all, under DEFAULT_LIMIT.
 //
 // RUN
 //
@@ -135,6 +180,9 @@ const ISO_TIME = /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]
  *  literal the self-test finds in the source. */
 const KINDS = [
   { k: 'heartbeat', re: /^(FFmpeg|VP9-444) DC pump heartbeat/, src: ['peer.rs', 'FFmpeg DC pump heartbeat (≈2s window)', 'VP9-444 DC pump heartbeat (≈1s window)'] },
+  // FR-148 P0: the lines that hand a move of the target out, and a held one landing.
+  { k: 'target', re: /^(VP9-444 set_bitrate \(AIMD\)|VP9-444 AIMD decrease \(DC buffer over high watermark\)|FFmpeg DC pump set_bitrate \(AIMD\))/, src: ['peer.rs', 'VP9-444 set_bitrate (AIMD)', 'VP9-444 AIMD decrease (DC buffer over high watermark)', 'FFmpeg DC pump set_bitrate (AIMD)'] },
+  { k: 'landed', re: /^FFmpeg DC pump: deferred bitrate (scheduled|applied at quiet)/, src: ['peer.rs', 'FFmpeg DC pump: deferred bitrate scheduled (background rebuild)', 'FFmpeg DC pump: deferred bitrate applied at quiet'] },
   { k: 'carrier', re: /^session carrier recorded/, src: ['session_carrier.rs', 'session carrier recorded (FR-102 P9c)'] },
   { k: 'ice', re: /^per-session ICE path detected/, src: ['carrier_rank.rs', 'per-session ICE path detected (adaptive bitrate)'] },
   { k: 'rank', re: /^rc ICE: carrier rank/, src: ['rc_overlay.rs', 'rc ICE: carrier rank (FR-148 P4)', 'rc ICE: carrier rank, the mesh link 10 s on (FR-148 P4)'] },
@@ -167,91 +215,80 @@ const ID_KEYS = new Map([
  *  addresses, which stays in the database. */
 const NUMBER_ONLY = ['viewers'];
 
-/** Named fields that leave the database, by the line that carries them. */
-const FIELDS = [
-  // ids: printed as their last 4 hex
-  'session_id',
-  'session',
-  // heartbeat (peer.rs)
-  'codec_label',
-  'encoder',
-  'constrained',
-  'target_bps',
-  'target_fps',
-  'width',
-  'height',
-  'frames_sent',
-  'bytes_written',
-  'maxrate_bps',
-  'pipe_state',
-  'pipe_measured',
-  'readings_refuted',
-  'link_unoffered',
-  'frames_keepalive',
-  'keepalive_bytes',
-  'window_ms',
+/**
+ * The named fields that leave the database, by the row that prints them: a
+ * line of a kind (KINDS) prints as a row of `k=v` in this order, a field the
+ * line does not carry left out (the model row prints it as `-`). Adding a field
+ * to a line kind is ONE entry here and nothing else: the read projects every
+ * field named here (`named`), and the row prints its list. The path-memory
+ * lines are the exception the other way: every field they carry leaves and
+ * prints (MEM_PATTERN), named here or not.
+ */
+const FIELDS = {
+  // Projected, and printed only where the code reads them: the ids (as their
+  // last 4 hex), the heartbeat's (the minute rows, the pipe row, the summary)
+  // and a target line's new target (`a -> b bps`). The rank lines' `read_ms`
+  // and the capture-timing line's two print nowhere.
+  read: [
+    'session_id',
+    'session',
+    // heartbeat (peer.rs)
+    'codec_label',
+    'encoder',
+    'constrained',
+    'target_bps',
+    'target_fps',
+    'width',
+    'height',
+    'frames_sent',
+    'bytes_written',
+    'maxrate_bps',
+    'pipe_state',
+    'pipe_measured',
+    'readings_refuted',
+    'link_unoffered',
+    'frames_keepalive',
+    'keepalive_bytes',
+    'window_ms',
+    // FR-148 P0: the moves since the heartbeat before, `why:n` joined by `,`
+    'target_moves',
+    // the VP9-444 watermark line's new target (the other target lines': target_bps)
+    'new_target',
+    'read_ms',
+    // capture timing (system_context/capture_pump.rs)
+    'worker_avg_capture_ms',
+    'calls',
+  ],
   // carrier + ICE (session_carrier.rs, carrier_rank.rs)
-  'carrier',
-  'relay_transport',
-  'local_typ',
-  'remote_typ',
-  'relay',
-  'local_proto',
-  'remote_proto',
-  'waited_ms',
-  'opening',
-  // carrier rank + overlay (rc_overlay.rs, peer.rs)
-  'carrier_rank',
-  'link',
-  'link_at_offer',
-  'upgrading',
-  'stalled',
-  'viewers', // a number only (NUMBER_ONLY)
-  'viewers_from',
-  'ranked_last',
-  'read_ms',
-  'overlay_blocks',
+  carrier: ['carrier', 'relay_transport', 'local_typ', 'remote_typ'],
+  ice: ['relay', 'local_typ', 'local_proto', 'remote_typ', 'remote_proto', 'waited_ms', 'opening'],
+  // carrier rank + overlay (rc_overlay.rs, peer.rs); `viewers` a number only (NUMBER_ONLY)
+  rank: ['carrier_rank', 'link', 'link_at_offer', 'upgrading', 'stalled', 'viewers', 'viewers_from', 'ranked_last'],
+  overlay: ['overlay_blocks'],
   // encoder (ffmpeg/encoder.rs)
-  'rate_control',
-  'fallback',
-  'bit_rate_bps',
-  'fps',
-  'cq',
-  'input',
-  'open_err',
-  // delivery + model (media_delivery.rs)
-  'span_ms',
-  'delivery_samples',
-  'backlogged_bps',
-  'app_limited_bps',
-  'stalled_ms',
-  // the standing queue (FR-148 P0), on a delivery line that carries it; its
-  // `cwnd`, a pair there, leaves under the open line's name below
-  'standing_ms',
-  'queued',
-  'inflight',
-  'rwnd_low',
-  'viewer_rx_bps',
-  'model_capacity_bps',
-  'model_floor_bps',
-  // open path (media_delivery.rs, FR-148 O10)
-  'pump',
-  'open_path',
-  'ssthresh',
-  'rwnd',
-  'cwnd',
-  'inflight_bytes',
-  'pending_bytes',
-  'max_payload',
-  'fast_retransmits',
-  't3_expiries',
+  qsv: ['encoder', 'rate_control', 'fallback', 'bit_rate_bps', 'maxrate_bps'],
+  encOpen: ['encoder', 'width', 'height', 'fps', 'cq', 'maxrate_bps', 'input'],
+  rejected: ['encoder', 'open_err'],
+  // delivery (media_delivery.rs): a window with stalled time prints `stall`,
+  // one with a queued sample `queue` (FR-148 P0's standing queue, as `emit`
+  // names it; its `cwnd` is a pair there, a number on the open line)
+  stall: ['span_ms', 'delivery_samples', 'backlogged_bps', 'app_limited_bps', 'stalled_ms'],
+  queue: ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low'],
+  model: ['viewer_rx_bps', 'model_capacity_bps', 'model_floor_bps'],
+  // open path (media_delivery.rs, FR-148 O10), in the order `emit_open` writes them
+  open: ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'],
+  // FR-148 P0: the target lines (peer.rs), after `a -> b bps`
+  target: ['why', 'deferred'],
+  landed: ['why'],
   // rate memory (encode/rate_memory.rs) — its `peer` never leaves
-  'assumed_bps',
-  'age_s',
-  // capture timing (system_context/capture_pump.rs)
-  'worker_avg_capture_ms',
-  'calls',
-];
+  rateMem: ['assumed_bps', 'age_s'],
+};
+
+/** Every field FIELDS names, once: what the read projects. Built on each call,
+ *  so it never lags FIELDS. */
+function named() {
+  return Array.from(new Set(Object.keys(FIELDS).reduce((all, k) => all.concat(FIELDS[k]), [])));
+}
 
 /** The close line's sample counts, both generations (0.4.225 carries
  *  `samples_not_counted` only; #4029 adds the rest). FR-148 O7. */
@@ -261,12 +298,6 @@ const O7_ASIDE = ['samples_unread', 'samples_viewer_late', 'samples_under_plan',
 /** The open line's answers, as the device row counts them (FR-148 O10):
  *  path C, path I, a loss before the first write, no gauges. */
 const OPEN_PATHS = ['cookie_echo', 'init_ack', 'unknown', 'unread'];
-/** The open line's fields, in the order media_delivery.rs `emit_open` writes
- *  them. Each is in FIELDS too. */
-const OPEN_FIELDS = ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'];
-/** What a `queue` event prints of a delivery line with a queued sample, as
- *  media_delivery.rs `emit` names them (FR-148 P0). Each is in FIELDS too. */
-const QUEUE_FIELDS = ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low'];
 
 // ---------------------------------------------------------------- values
 
@@ -330,6 +361,19 @@ function shown(v) {
   if (!s) return null;
   const m = /^(\d+)\/([^/]+)(?:\/(\d+)ms)?$/.exec(s);
   return m ? { bps: Number(m[1]), basis: m[2], ageMs: m[3] === undefined ? null : Number(m[3]) } : { raw: s };
+}
+
+/** A heartbeat's `target_moves` (governor.rs `Moves`: `why:n` joined by `,`,
+ *  then `more:n` past 16 whys, or `none`) as [why, n] pairs; null on a line
+ *  without it. A part that is not `why:n` counts once as `unreadable`. */
+function tally(v) {
+  const s = text(v);
+  if (s === null) return null;
+  if (s === 'none') return [];
+  return s.split(',').map((part) => {
+    const m = /^(.+):(\d+)$/.exec(part);
+    return m ? [m[1], Number(m[2])] : ['unreadable', 1];
+  });
 }
 
 function epochMs(t) {
@@ -408,6 +452,13 @@ function secs(ms) {
   return ms === null || ms === undefined ? '-' : (ms / 1000).toFixed(0) + ' s';
 }
 
+/** Counts by `why`, the commonest first and a tie in the order first seen:
+ *  `increase(app-limited) 6, decrease(full) 3`; `-` for none. */
+function whyCells(counts) {
+  const keys = Object.keys(counts);
+  return keys.length ? keys.sort((a, b) => counts[b] - counts[a]).map((k) => `${k} ${counts[k]}`).join(', ') : '-';
+}
+
 /** A line's fields as `k=v`, ids masked, in the order stored. */
 function kv(f, keys) {
   const out = [];
@@ -456,7 +507,9 @@ function fold(rows, opts) {
     const kind = kindOf(m);
     const t = epochMs(r && r.t);
     if (!kind || t === null) return;
-    const f = Object.assign({}, r.f || {}, r.fm || {});
+    // A path-memory line's fields in the order it wrote them (fm), so a named
+    // field it also carries (its `why`) keeps its place there.
+    const f = Object.assign({}, r.fm || {}, r.f || {}, r.fm || {});
     recs.push({ i, t, kind, m, f, mem: !!r.fm });
   });
   recs.sort((a, b) => a.t - b.t || a.i - b.i);
@@ -485,9 +538,18 @@ function finishSession(s, windowEnd) {
   const ev = [];
   const push = (t, what, line) => ev.push({ t, what, line });
   const hb = { n: 0, noCounters: 0, resets: 0, holes: 0, ivs: [], prev: null, firstT: null, lastT: null };
+  // The last target any line gave: a heartbeat's applied target, or a target
+  // line's new one. A held target landing gives none: it was handed out before.
   let lastTarget = null;
   let targetMax = null;
-  let targetMoves = 0;
+  // FR-148 P0: the target lines that hand a move out, by `why`, the held
+  // targets landing, and the changes a heartbeat showed with no target line;
+  // and the heartbeats' own count of every move (`target_moves`), by `why`.
+  const tl = { moves: 0, byWhy: {}, landed: 0, unlined: 0 };
+  const tm = { carried: 0, total: 0, byWhy: {} };
+  // A target row's cause: the row's fields (`why=…`), after "(reason: not
+  // logged)" on a line without `why`.
+  const cause = (f, kind) => [text(f.why) === null ? '(reason: not logged)' : '', kv(f, FIELDS[kind])].filter(Boolean).join(' ');
   let lastPipeKey = null;
   const ka = { frames: 0, bytes: 0, carried: 0, missing: 0 };
   const cap = { judged: 0, at: 0, nominal: 0 };
@@ -546,10 +608,19 @@ function finishSession(s, windowEnd) {
           }
           hb.prev = { t: r.t, bw, fs };
         }
+        const moves = tally(f.target_moves);
+        if (moves !== null) {
+          tm.carried++;
+          for (const [why, n] of moves) {
+            tm.total += n;
+            tm.byWhy[why] = (tm.byWhy[why] || 0) + n;
+          }
+        }
         if (target !== null) {
+          // A move no target line printed: its cause is in this heartbeat's count.
           if (lastTarget !== null && target !== lastTarget) {
-            targetMoves++;
-            push(r.t, 'target', `target ${lastTarget} -> ${target} bps (reason: not logged)`);
+            tl.unlined++;
+            push(r.t, 'target', `${lastTarget} -> ${target} bps, no target line (${moves !== null ? `target_moves=${text(f.target_moves)}` : 'reason: not logged'})`);
           }
           lastTarget = target;
           targetMax = targetMax === null ? target : Math.max(targetMax, target);
@@ -573,36 +644,54 @@ function finishSession(s, windowEnd) {
         }
         break;
       }
+      case 'target': {
+        // A move handed out: its new target (the watermark line's `new_target`).
+        const bps = num(f.target_bps) !== null ? num(f.target_bps) : num(f.new_target);
+        tl.moves++;
+        const why = text(f.why) === null ? 'reason not logged' : text(f.why);
+        tl.byWhy[why] = (tl.byWhy[why] || 0) + 1;
+        push(r.t, 'target', `${lastTarget !== null ? `${lastTarget} -> ` : ''}${dash(bps)} bps ${cause(f, 'target')}`);
+        if (bps !== null) {
+          lastTarget = bps;
+          targetMax = targetMax === null ? bps : Math.max(targetMax, bps);
+        }
+        break;
+      }
+      case 'landed':
+        // A held FFmpeg target reaching the encoder: no new move.
+        tl.landed++;
+        push(r.t, 'target', `held ${dash(num(f.target_bps))} bps ${r.m.replace(/^FFmpeg DC pump: deferred bitrate /, '')} ${cause(f, 'landed')}`);
+        break;
       case 'carrier':
         carrier = text(f.carrier);
         if (carrierAt === null) carrierAt = r.t - s.first;
-        push(r.t, 'carrier', kv(f, ['carrier', 'relay_transport', 'local_typ', 'remote_typ']));
+        push(r.t, 'carrier', kv(f, FIELDS.carrier));
         break;
       case 'ice':
-        push(r.t, 'ice', kv(f, ['relay', 'local_typ', 'local_proto', 'remote_typ', 'remote_proto', 'waited_ms', 'opening']));
+        push(r.t, 'ice', kv(f, FIELDS.ice));
         break;
       case 'rank': {
         rankSeen = true;
         const cr = text(f.carrier_rank);
         if (cr !== null && !/^(off|0|false|none)$/i.test(cr)) rankOn = true;
-        push(r.t, 'rank', kv(f, ['carrier_rank', 'link', 'link_at_offer', 'upgrading', 'stalled', 'viewers', 'viewers_from', 'ranked_last']));
+        push(r.t, 'rank', kv(f, FIELDS.rank));
         break;
       }
       case 'overlay':
-        push(r.t, 'overlay', [r.m.slice(0, 120), kv(f, ['overlay_blocks'])].filter(Boolean).join(' '));
+        push(r.t, 'overlay', [r.m.slice(0, 120), kv(f, FIELDS.overlay)].filter(Boolean).join(' '));
         break;
       case 'qsv':
         enc.qsv++;
-        push(r.t, 'encoder', `QVBR open: ${kv(f, ['encoder', 'rate_control', 'fallback', 'bit_rate_bps', 'maxrate_bps'])}`);
+        push(r.t, 'encoder', `QVBR open: ${kv(f, FIELDS.qsv)}`);
         break;
       case 'encOpen':
         enc.opens++;
         // The message's own rest, "(constant-quality + maxrate cap)", has its parentheses.
-        push(r.t, 'encoder', `${enc.opens > 1 ? 'REOPEN' : 'open'}: ${kv(f, ['encoder', 'width', 'height', 'fps', 'cq', 'maxrate_bps', 'input'])} ${r.m.replace(/^ffmpeg encoder opened /, '')}`);
+        push(r.t, 'encoder', `${enc.opens > 1 ? 'REOPEN' : 'open'}: ${kv(f, FIELDS.encOpen)} ${r.m.replace(/^ffmpeg encoder opened /, '')}`);
         break;
       case 'rejected':
         enc.rejected++;
-        push(r.t, 'encoder', `quality options rejected, retried with defaults: ${kv(f, ['encoder', 'open_err'])}`);
+        push(r.t, 'encoder', `quality options rejected, retried with defaults: ${kv(f, FIELDS.rejected)}`);
         break;
       case 'delivery': {
         del.windows++;
@@ -611,7 +700,7 @@ function finishSession(s, windowEnd) {
           del.stalled++;
           del.stalledMs += st;
           del.longestMs = Math.max(del.longestMs, st);
-          push(r.t, 'stall', kv(f, ['span_ms', 'delivery_samples', 'backlogged_bps', 'app_limited_bps', 'stalled_ms']));
+          push(r.t, 'stall', kv(f, FIELDS.stall));
         }
         // FR-148 P0: the standing queue, on a line that carries it (an older
         // agent's does not). The highest standing is over every such line.
@@ -622,7 +711,7 @@ function finishSession(s, windowEnd) {
           if (standing) del.standingHigh = del.standingHigh === null ? standing[1] : Math.max(del.standingHigh, standing[1]);
           if (queued >= 1) {
             del.queued++;
-            push(r.t, 'queue', kv(f, QUEUE_FIELDS));
+            push(r.t, 'queue', kv(f, FIELDS.queue));
           }
         }
         break;
@@ -637,14 +726,14 @@ function finishSession(s, windowEnd) {
         const key = [rx ? rx.basis || rx.raw : null, mc ? mc.basis || mc.raw : null].join('|');
         if (key !== lastModelKey) {
           lastModelKey = key;
-          push(r.t, 'model', `viewer_rx_bps=${dash(text(f.viewer_rx_bps))} model_capacity_bps=${dash(text(f.model_capacity_bps))} model_floor_bps=${dash(text(f.model_floor_bps))}`);
+          push(r.t, 'model', FIELDS.model.map((k) => `${k}=${dash(text(f[k]))}`).join(' '));
         }
         break;
       }
       case 'open':
         // One a pump: the session's first is its answer.
         if (open.n++ === 0) Object.assign(open, { path: text(f.open_path), ssthresh: num(f.ssthresh), rwnd: num(f.rwnd) });
-        push(r.t, 'open', kv(f, OPEN_FIELDS));
+        push(r.t, 'open', kv(f, FIELDS.open));
         break;
       case 'memOpen':
         mem.open.push(f);
@@ -656,7 +745,7 @@ function finishSession(s, windowEnd) {
         break;
       case 'rateMem':
         mem.rate.push(f);
-        push(r.t, 'memory', `rate memory, assumed: ${kv(f, ['assumed_bps', 'age_s'])}`);
+        push(r.t, 'memory', `rate memory, assumed: ${kv(f, FIELDS.rateMem)}`);
         break;
       case 'capTiming':
         capTiming++;
@@ -682,8 +771,9 @@ function finishSession(s, windowEnd) {
     whole,
     after30,
     last60,
-    targetMoves,
     targetMax,
+    targetLines: tl,
+    targetMoves: tm,
     cap,
     ka,
     enc,
@@ -828,7 +918,14 @@ function render(r) {
     L.push(`| heartbeat windows by pipe state / transit-stalled share | ${pc.list} / ${pc.share} |`);
     L.push(`| sent: whole / after the first 30 s / last 60 s | ${mbps(x.whole && x.whole.bps)} / ${mbps(x.after30 && x.after30.bps)} / ${mbps(x.last60 && x.last60.bps)} |`);
     L.push(`| frame rate, whole | ${x.whole ? x.whole.fps.toFixed(1) + ' fps' : '-'} |`);
-    L.push(`| target: highest / moves / time at the encoder's cap (target = maxrate_bps) / time at >= 3 Mbit/s | ${dash(x.targetMax)} / ${x.targetMoves} / ${pct(x.cap.at, x.cap.judged)} / ${pct(x.cap.nominal, x.whole ? x.whole.ms : 0)} |`);
+    L.push(`| target: highest / time at the encoder's cap (target = maxrate_bps) / time at >= 3 Mbit/s | ${dash(x.targetMax)} / ${pct(x.cap.at, x.cap.judged)} / ${pct(x.cap.nominal, x.whole ? x.whole.ms : 0)} |`);
+    // FR-148 P0: the moves by why, as the target lines print them and as the
+    // heartbeats count them (THE TARGET in the header says how the two relate).
+    const tl = x.targetLines;
+    const tm = x.targetMoves;
+    L.push(`| target moves on the target lines, by why | moves ${tl.moves}${tl.moves ? ': ' + whyCells(tl.byWhy) : ''} |`);
+    L.push(`| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | ${tm.carried ? `moves ${tm.total}${tm.total ? ': ' + whyCells(tm.byWhy) : ''}` : '-'} (${tm.carried} of ${x.heartbeats}) |`);
+    L.push(`| held targets landing / target changes a heartbeat showed with no target line | ${tl.landed} / ${tl.unlined} |`);
     L.push(`| heartbeats / without counters / counter resets / holes | ${x.heartbeats} / ${x.heartbeatsWithoutCounters} / ${x.resets} / ${x.holes} |`);
     L.push(`| encoder: opens / QVBR opens / rejected quality options | ${x.enc.opens} / ${x.enc.qsv} / ${x.enc.rejected} |`);
     L.push(`| delivery: windows / stalled / share / longest stall | ${x.del.windows} / ${x.del.stalled} / ${pct(x.del.stalled, x.del.windows)} / ${x.del.windows ? x.del.longestMs + ' ms' : '-'} |`);
@@ -884,7 +981,7 @@ function render(r) {
  */
 function timelinePipeline(o) {
   const project = {};
-  for (const k of FIELDS) {
+  for (const k of named()) {
     const v = '$lines.fields.' + k;
     project[k] = NUMBER_ONLY.includes(k) ? { $cond: [{ $isNumber: v }, v, '$$REMOVE'] } : v;
   }
@@ -1181,6 +1278,54 @@ function hbRow(sec, sid, o) {
   };
 }
 
+/** FR-148 P0: every cause a `why` is written with, as the agent writes it.
+ *  The self-test compares this list with the source (`whyWordsOf`) and puts
+ *  each on a fixture target line. */
+const WHY_WORDS = [
+  'open',
+  'increase(app-limited)',
+  'increase(loaded)',
+  'increase(no-window)',
+  'decrease(full)',
+  'decrease(overflow)',
+  'decrease(stall)',
+  'decrease(age)',
+  'decrease(link)',
+  'decrease(transit-stall)',
+  'hard-decrease',
+  'ceiling(plan)',
+  'ceiling(pipe)',
+  'ceiling(learned)',
+  'ceiling(arrival)',
+  'ceiling(opener)',
+  'floor(area)',
+  'floor(relief)',
+  'floor(ramp)',
+  'reapply',
+];
+
+/** The causes a `why` is written with, read from the agent's source, sorted:
+ *  encode/aimd.rs `Cause`'s Display (a cause with a parameter writes its
+ *  enum's `as_str` words) and encode/governor.rs `Why`'s, which writes an
+ *  increase with the last window's verdict. Both texts with LF line ends. */
+function whyWordsOf(aimd, gov) {
+  const block = (src, head) => {
+    const i = src.indexOf(head);
+    return i < 0 ? '' : src.slice(i, src.indexOf('\n}\n', i));
+  };
+  const strs = (name) => Array.from(block(aimd, `impl ${name} {`).matchAll(new RegExp(`${name}::\\w+ => "([^"]+)"`, 'g')), (m) => m[1]);
+  const param = {};
+  for (const m of block(aimd, 'pub enum Cause {').matchAll(/^\s*(\w+)\((\w+)\),$/gm)) param[m[1]] = m[2];
+  const words = [];
+  for (const m of block(aimd, 'impl fmt::Display for Cause {').matchAll(/Cause::(\w+)(?:\(\w+\))? => (?:f\.write_str\("([^"]+)"\)|write!\(f, "([\w-]+)\(\{\}\)", \w+\.as_str\(\)\))/g)) {
+    if (m[2] === 'increase') continue;
+    if (m[2]) words.push(m[2]);
+    else for (const w of strs(param[m[1]])) words.push(`${m[3]}(${w})`);
+  }
+  for (const m of block(gov, 'impl std::fmt::Display for Why {').matchAll(/\(Cause::Increase, (?:Some\((?:true|false)\)|None)\) => f\.write_str\("([^"]+)"\)/g)) words.push(m[1]);
+  return words.sort();
+}
+
 function selfTest() {
   let fails = 0;
   let cases = 0;
@@ -1206,12 +1351,53 @@ function selfTest() {
     const pm = fs.readFileSync(path.join(src, 'media_pair_memory.rs'), 'utf8');
     for (const k of O7_COUNTED.concat(O7_ASIDE, ['taken', 'taken_why', 'wrote', 'why'])) check(`source: close/open field ${k}`, pm.includes(`"${k}"`));
     const md = fs.readFileSync(path.join(src, 'media_delivery.rs'), 'utf8');
-    for (const k of OPEN_FIELDS) check(`source: open line field ${k}`, md.includes(`${k} = `));
+    for (const k of FIELDS.open) check(`source: open line field ${k}`, md.includes(`${k} = `));
     for (const k of OPEN_PATHS) check(`source: open line answer ${k}`, md.includes(`"${k}"`));
     // FR-148 P0: the delivery line's standing-queue fields, as `emit` writes them.
-    for (const k of QUEUE_FIELDS) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??q\\.${k},`).test(md));
+    for (const k of FIELDS.queue) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??q\\.${k},`).test(md));
     const sc = fs.readFileSync(path.join(src, 'session_carrier.rs'), 'utf8');
     check('source: carrier line field relay_transport', /\brelay_transport = relay\.as_str\(\),/.test(sc));
+    // FR-148 P0: the target lines' fields and the heartbeats' count, as the
+    // pumps write them, and the words a `why` is made of, from the code that
+    // writes them.
+    const peer = fs.readFileSync(path.join(src, 'peer.rs'), 'utf8');
+    for (const lit of ['target_bps = applied.bps, why = %applied.why,', 'new_target = applied.bps, why = %applied.why,', 'target_bps = held.bps, why = %held.why,', 'deferred = deferred_bps.is_some(),']) {
+      check(`source: target line fields ${lit}`, peer.includes(lit));
+    }
+    check('source: both heartbeats carry target_moves', peer.split('target_moves = %governor.take_moves(),').length - 1 === 2);
+    // A checkout can have CRLF line ends.
+    const lf = (s) => s.replace(/\r\n/g, '\n');
+    const aimd = lf(fs.readFileSync(path.join(src, 'encode', 'aimd.rs'), 'utf8'));
+    const gov = lf(fs.readFileSync(path.join(src, 'encode', 'governor.rs'), 'utf8'));
+    const words = whyWordsOf(aimd, gov);
+    check("source: the why words are the code's, every one", words.join(' ') === WHY_WORDS.slice().sort().join(' '), words.join(' '));
+    // The written forms the parse reads: a why's causes joined by `+`, `none`,
+    // `+more`; a count's `why:n` joined by `,`, `more:n`, `none`.
+    for (const lit of ['sep = "+";', '("", _) => f.write_str("none"),', '(_, true) => f.write_str("+more"),', 'write!(f, "{sep}{why}:{n}")?;', 'sep = ",";', 'write!(f, "{sep}more:{}", self.more)?;', 'return f.write_str("none");']) {
+      check(`source: the written form ${lit}`, gov.includes(lit));
+    }
+    // `why` leaves by its name from every line read, so every line read that
+    // writes one must write the governor's `Why` (a target line) or the path
+    // memory's word (the close line): fixed words, never free text. A line
+    // read that writes any other `why` fails here. A call's message is its
+    // first string literal at the start of a line after the field, a
+    // `{CONST}` in it read from its file.
+    const whyOk = ['%applied.why', '%held.why', '%why.word()'];
+    const whyRead = [];
+    for (const file of Array.from(new Set(KINDS.map((d) => d.src[0])))) {
+      const body = lf(fs.readFileSync(path.join(src, file), 'utf8'));
+      for (const w of body.matchAll(/(?<!let |let mut |\.)\bwhy = ([^,\n]+),/g)) {
+        const lit = /^\s*"((?:[^"\\]|\\[\s\S])*)"/m.exec(body.slice(w.index + w[0].length));
+        const msg = (lit ? lit[1] : '').replace(/\{([A-Z_]+)\}/g, (x, name) => {
+          const c = new RegExp(`const ${name}: &str = "([^"]*)";`).exec(body);
+          return c ? c[1] : x;
+        });
+        if (!new RegExp(MSG_PATTERN).test(msg)) continue;
+        whyRead.push(`${file}: ${w[1]}`);
+        check(`source: a line read writes why from fixed words (${file}: ${msg.slice(0, 40)})`, whyOk.includes(w[1]), w[1]);
+      }
+    }
+    check('source: the lines read that write why: the five target lines and the close line', whyRead.length === 6 && whyRead.filter((x) => x.startsWith('peer.rs: ')).length === 5, whyRead.join('; '));
   } catch (e) {
     check('source files readable', false, e.message);
   }
@@ -1294,7 +1480,7 @@ function selfTest() {
   check('cumulative counters -> 25 fps', w && Math.abs(w.fps - 25) < 0.01, w && String(w.fps));
   check('after 30 s and last 60 s rated', s1.summary.after30 && s1.summary.last60 && Math.abs(s1.summary.last60.bps - 2000000) < 1);
   check('session 2 at 4 Mbit/s', s2.summary.whole && Math.abs(s2.summary.whole.bps - 4000000) < 1);
-  check('a target move with its reason unlogged', s1.ev.some((e) => e.what === 'target' && /3000000 -> 2000000 bps \(reason: not logged\)/.test(e.line)));
+  check('a target move with no target line and its reason unlogged', s1.ev.some((e) => e.what === 'target' && e.line === '3000000 -> 2000000 bps, no target line (reason: not logged)'));
   check('highest target', s1.summary.targetMax === 3000000 && s2.summary.targetMax === 6000000);
   check('time at the cap: all of it', s1.summary.cap.judged > 0 && s1.summary.cap.at === s1.summary.cap.judged);
   check('pipe state changes in order', s1.ev.filter((e) => e.what === 'pipe').length === 3);
@@ -1394,6 +1580,128 @@ function selfTest() {
     /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| 1 \/ 2 \/ 610 ms \|$/m.test(sqOut) &&
       /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| - \/ 0 \/ - \|$/m.test(sqOut),
   );
+  // FR-148 P0: why the target moved. A VP9-444 session from 0.4.230 whose
+  // target lines carry every cause there is, one each, a heartbeat after
+  // every fifth counting the five; an FFmpeg session with a folded why,
+  // `none`, `+more`, a held target landing both ways, a move no target line
+  // printed and a count past the whys the governor keeps; and a session from
+  // an agent before 0.4.230, whose lines carry neither `why` nor
+  // `target_moves`.
+  const sv = oid('7a01');
+  const sf = oid('7a02');
+  const so = oid('7a03');
+  const row = (sec) => `  ${clock(epochMs(at(sec)))}  target   `;
+  const moved = [{ t: at(600), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: sv, carrier: 'direct', local_typ: 'Host', remote_typ: 'Srflx' } }];
+  const wantV = [];
+  let bps = null;
+  let since = [];
+  WHY_WORDS.forEach((w, i) => {
+    const sec = 600.5 + i;
+    const prev = bps;
+    bps = w === 'open' ? 3000000 : w === 'reapply' ? bps : /^(increase|floor)/.test(w) ? bps + 250000 : w === 'hard-decrease' ? Math.round(bps / 2000) * 1000 : Math.round((bps * 0.85) / 1000) * 1000;
+    // A ×0.85 at the DC buffer's watermark has a line of its own, with `new_target`.
+    moved.push(
+      w === 'decrease(overflow)'
+        ? { t: at(sec), m: 'VP9-444 AIMD decrease (DC buffer over high watermark)', f: { session_id: sv, new_target: bps, why: w } }
+        : { t: at(sec), m: 'VP9-444 set_bitrate (AIMD)', f: { session_id: sv, target_bps: bps, why: w } },
+    );
+    wantV.push(`${row(sec)}${prev === null ? '' : prev + ' -> '}${bps} bps why=${w}`);
+    since.push(`${w}:1`);
+    if (since.length === 5) {
+      moved.push({ t: at(sec + 0.5), m: 'VP9-444 DC pump heartbeat (≈1s window)', f: { session_id: sv, codec_label: 'VP9-444', target_bps: bps, target_fps: 30, bytes_written: 400000 * (i + 1), frames_sent: 30 * (i + 1), target_moves: since.join(',') } });
+      since = [];
+    }
+  });
+  const FOLD = 'decrease(stall)+ceiling(plan)';
+  const MORE = 'floor(area)+ceiling(plan)+decrease(full)+decrease(stall)+ceiling(learned)+floor(ramp)+decrease(age)+ceiling(arrival)+more';
+  const ffSet = (sec, sid, o) => ({ t: at(sec), m: 'FFmpeg DC pump set_bitrate (AIMD)', f: Object.assign({ session_id: sid, codec_label: 'HEVC' }, o) });
+  const ffLand = (sec, sid, how, o) => ({ t: at(sec), m: `FFmpeg DC pump: deferred bitrate ${how}`, f: Object.assign({ session_id: sid, codec_label: 'HEVC' }, o) });
+  const ffHb = (sec, sid, from, target, moves) => hbRow(sec, sid, Object.assign({ target_bps: target, maxrate_bps: `Some(${target})`, bytes_written: 250000 * (sec - from), frames_sent: 25 * (sec - from) }, moves === undefined ? {} : { target_moves: moves }));
+  moved.push(
+    { t: at(700), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: sf, carrier: 'turn', relay_transport: 'udp', local_typ: 'Relay', remote_typ: 'Srflx' } },
+    ffSet(700.5, sf, { target_bps: 2000000, why: 'open', deferred: false }),
+    ffHb(701, sf, 700, 2000000, 'open:1'),
+    ffSet(702.5, sf, { target_bps: 1500000, why: FOLD, deferred: true }),
+    ffHb(703, sf, 700, 1500000, `${FOLD}:1`),
+    ffLand(704.2, sf, 'applied at quiet', { target_bps: 1500000, why: FOLD }),
+    // The gate's skip handed a ×0.85 out: no line, the heartbeat counts it.
+    ffHb(705, sf, 700, 1275000, 'decrease(full):1'),
+    ffSet(706.5, sf, { target_bps: 1400000, why: 'none', deferred: true }),
+    ffHb(707, sf, 700, 1400000, 'none:1'),
+    ffLand(708.1, sf, 'scheduled (background rebuild)', { target_bps: 1400000, why: 'none' }),
+    // The rebuilt encoder told its target again: counted, no line, no change.
+    ffHb(709, sf, 700, 1400000, 'reapply:1'),
+    ffSet(710.5, sf, { target_bps: 1100000, why: MORE, deferred: false }),
+    ffHb(711, sf, 700, 1100000, `${MORE}:1,more:2`),
+    ffHb(713, sf, 700, 1100000, 'none'),
+    { t: at(800), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: so, carrier: 'direct', local_typ: 'Host', remote_typ: 'Host' } },
+    ffSet(800.5, so, { target_bps: 2500000, deferred: false }),
+    ffHb(801, so, 800, 2500000),
+    ffHb(803, so, 800, 2000000),
+    ffLand(804.5, so, 'applied at quiet', { target_bps: 2000000 }),
+    ffHb(805, so, 800, 2000000),
+  );
+  const wr = fold(moved.slice().reverse(), { to: at(900) });
+  const wo = render(wr);
+  const wl = wo.split('\n');
+  const [xv, xf, xo] = wr.sessions;
+  // The target rows of session n, as printed.
+  const targetRows = (n) => {
+    const a = wl.findIndex((l) => l.startsWith(`## session ${n}: `));
+    const b = wl.findIndex((l, i) => i > a && /^## /.test(l));
+    return wl.slice(a, b < 0 ? wl.length : b).filter((l) => /^ {2}\S+ {2}target {3}/.test(l));
+  };
+  check('target: three sessions, in order', wr.sessions.length === 3 && xv.sid === sv && xf.sid === sf && xo.sid === so, wr.sessions.map((x) => x.sid).join(','));
+  const missing = wantV.filter((l) => !wl.includes(l));
+  check('target: every why there is, on its own line, printed as the line carries it', missing.length === 0, missing.join(' | '));
+  check('target: the watermark line takes its new target from new_target', wl.includes(wantV[WHY_WORDS.indexOf('decrease(overflow)')]), wantV[WHY_WORDS.indexOf('decrease(overflow)')]);
+  check('target: a row per move, nothing more, where every move has its line', targetRows(1).length === 20 && xv.summary.targetLines.unlined === 0, String(targetRows(1).length));
+  check('target: an old agent prints its three rows and no more', targetRows(3).length === 3, targetRows(3).join(' | '));
+  check(
+    'target: the session counts the moves by why, on the lines and in the heartbeats',
+    wl.includes(`| target moves on the target lines, by why | moves 20: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} |`) &&
+      wl.includes(`| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | moves 20: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} (4 of 4) |`),
+  );
+  const wantF = [
+    `${row(700.5)}2000000 bps why=open deferred=false`,
+    `${row(702.5)}2000000 -> 1500000 bps why=${FOLD} deferred=true`,
+    `${row(704.2)}held 1500000 bps applied at quiet why=${FOLD}`,
+    `${row(705)}1500000 -> 1275000 bps, no target line (target_moves=decrease(full):1)`,
+    `${row(706.5)}1275000 -> 1400000 bps why=none deferred=true`,
+    `${row(708.1)}held 1400000 bps scheduled (background rebuild) why=none`,
+    `${row(710.5)}1400000 -> 1100000 bps why=${MORE} deferred=false`,
+  ];
+  const gotF = targetRows(2);
+  check("target: the FFmpeg session's moves in order: a folded why, a held target landing both ways, a move with no line, none, +more", gotF.join('\n') === wantF.join('\n'), gotF.join(' | '));
+  const tlf = xf.summary.targetLines;
+  const tmf = xf.summary.targetMoves;
+  check(
+    'target: lines handing a move out 4, landings 2, a change with no line 1; the heartbeats counted 8 in 7, more than the lines',
+    tlf.moves === 4 && tlf.landed === 2 && tlf.unlined === 1 && tmf.total === 8 && tmf.carried === 7 && tmf.byWhy.more === 2 && tlf.moves <= tmf.total,
+    JSON.stringify([tlf, tmf]),
+  );
+  check(
+    "target: the FFmpeg session's rows",
+    wl.includes(`| target moves on the target lines, by why | moves 4: open 1, ${FOLD} 1, none 1, ${MORE} 1 |`) &&
+      wl.includes(`| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | moves 8: more 2, open 1, ${FOLD} 1, decrease(full) 1, none 1, reapply 1, ${MORE} 1 (7 of 7) |`) &&
+      wl.includes('| held targets landing / target changes a heartbeat showed with no target line | 2 / 1 |'),
+  );
+  const wantO = [`${row(800.5)}2500000 bps (reason: not logged) deferred=false`, `${row(803)}2500000 -> 2000000 bps, no target line (reason: not logged)`, `${row(804.5)}held 2000000 bps applied at quiet (reason: not logged)`];
+  check("target: an agent before 0.4.230: its moves print '(reason: not logged)'", wantO.every((l) => wl.includes(l)), wantO.filter((l) => !wl.includes(l)).join(' | '));
+  check(
+    'target: an agent before 0.4.230: its rows',
+    wl.includes('| target moves on the target lines, by why | moves 1: reason not logged 1 |') &&
+      wl.includes("| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | - (0 of 3) |") &&
+      wl.includes('| held targets landing / target changes a heartbeat showed with no target line | 1 / 1 |'),
+  );
+  check('target: highest target from the lines and the heartbeats', xv.summary.targetMax === 3750000 && xf.summary.targetMax === 2000000 && xo.summary.targetMax === 2500000, [xv, xf, xo].map((x) => x.summary.targetMax).join(','));
+  check('target: no undefined or NaN', !/undefined|NaN/.test(wo), (wo.match(/.{0,40}(undefined|NaN).{0,40}/) || [''])[0]);
+  check(
+    'tally: why:n joined by `,`, `none` for no move, `more:n`, an unreadable part counted once',
+    JSON.stringify([tally(`open:1,${FOLD}:1`), tally('none'), tally('none:1'), tally('more:3'), tally(undefined), tally('x')]) ===
+      JSON.stringify([[['open', 1], [FOLD, 1]], [], [['none', 1]], [['more', 3]], null, [['unreadable', 1]]]),
+  );
+  check('scrub: every why and every count as written', WHY_WORDS.concat([FOLD, MORE, 'none', `${MORE}:1,more:2`, `open:1,${FOLD}:1,hard-decrease:12`]).every((s) => scrub(s) === s));
   // 3. Masking: a full id and an address in a field print neither.
   const leak = fold(
     [
@@ -1425,7 +1733,7 @@ function selfTest() {
   const ro = rowOut({ t: new Date(at(5)), m: 'FR-148 P1 path memory: what the close wrote', f: { session_id: FX.s1, peer: '198.51.100.7|turn' }, fm: { local_addr: '198.51.100.7:1', wrote: 'floor' } });
   check('rowOut: ts as ISO, no address key in f or fm', ro.t === at(5) && !('peer' in ro.f) && !('local_addr' in ro.fm) && ro.fm.wrote === 'floor');
   check('the capture-timing line is no heartbeat', kindOf('system-context capture: worker-side scrap frame() timing (compare to pump heartbeat avg_capture_ms)') === 'capTiming');
-  check('no address key in the named fields', FIELDS.every((k) => !DENY_KEY.test(k)));
+  check('no address key in the named fields', named().every((k) => !DENY_KEY.test(k)));
   let threw = 0;
   for (const bad of [{}, { RC_PATH_TENANT: FX.tenant, RC_PATH_AGENTS: FX.agent + ',' + FX.agent, RC_PATH_SINCE: at(0), RC_PATH_UNTIL: at(10) }, { RC_PATH_TENANT: FX.tenant, RC_PATH_AGENTS: FX.agent, RC_PATH_SINCE: at(0), RC_PATH_UNTIL: at(90000) }]) {
     try {
@@ -1438,17 +1746,62 @@ function selfTest() {
   const fv = p[4].$project.f;
   check(
     'viewers leaves only as a number, every other named field as stored',
-    JSON.stringify(fv.viewers) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.viewers' }, '$lines.fields.viewers', '$$REMOVE'] }) && FIELDS.every((k) => k === 'viewers' || fv[k] === '$lines.fields.' + k),
+    JSON.stringify(fv.viewers) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.viewers' }, '$lines.fields.viewers', '$$REMOVE'] }) && named().every((k) => k === 'viewers' || fv[k] === '$lines.fields.' + k),
     JSON.stringify(fv.viewers),
   );
+  check('the read projects the named fields and nothing else', Object.keys(fv).sort().join(',') === named().sort().join(','), Object.keys(fv).length + ' / ' + named().length);
   check(
     "open: the query's filter keeps the line, and its fields leave as stored",
-    new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && OPEN_FIELDS.every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
+    new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && FIELDS.open.every((k) => named().includes(k) && fv[k] === '$lines.fields.' + k),
   );
   check(
     "queue and relay transport: the delivery line's queue fields and the carrier line's relay_transport leave as stored",
-    QUEUE_FIELDS.concat(['relay_transport']).every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
+    FIELDS.queue.concat(['relay_transport']).every((k) => named().includes(k) && fv[k] === '$lines.fields.' + k),
   );
+  // FR-148 P0: the target lines are read, and their `why`, the heartbeats'
+  // `target_moves`, the watermark line's `new_target` and the FFmpeg line's
+  // `deferred` leave as stored; the capture-wait line, which writes a `why`
+  // of its own, is not read.
+  const msgRe = new RegExp(cond[0].$regexMatch.regex);
+  check(
+    'target: the query keeps the five target lines',
+    [
+      'VP9-444 set_bitrate (AIMD)',
+      'VP9-444 AIMD decrease (DC buffer over high watermark)',
+      'FFmpeg DC pump set_bitrate (AIMD)',
+      'FFmpeg DC pump: deferred bitrate scheduled (background rebuild)',
+      'FFmpeg DC pump: deferred bitrate applied at quiet',
+    ].every((m) => msgRe.test(m)),
+  );
+  check('target: the capture-wait line is not read', !msgRe.test('capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller'));
+  check('target: why, target_moves, new_target and deferred leave as stored', ['why', 'target_moves', 'new_target', 'deferred'].every((k) => fv[k] === '$lines.fields.' + k));
+  // Adding a field to a line kind is ONE entry in FIELDS: the read projects
+  // it and the kind's row prints it, nothing else changed. A made-up field on
+  // the ICE path line and on the path model line, taken out again after.
+  FIELDS.ice.push('probe_extra');
+  FIELDS.model.push('probe_extra');
+  try {
+    const pf = timelinePipeline({ tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(60)), limit: 7 })[4].$project.f;
+    const po = render(
+      fold(
+        [
+          { t: at(1), m: 'per-session ICE path detected (adaptive bitrate)', f: { session_id: FX.s1, relay: false, local_typ: 'Host', probe_extra: 'p1' } },
+          { t: at(2), m: 'path model (FR-148 P0, shadow, ≈10s)', f: { session_id: FX.s1, viewer_rx_bps: 'None', model_capacity_bps: 'None', model_floor_bps: 'None', probe_extra: 'p2' } },
+        ],
+        { to: at(60) },
+      ),
+    );
+    check('one FIELDS entry: the read projects the field', pf.probe_extra === '$lines.fields.probe_extra');
+    check(
+      'one FIELDS entry: the row prints it',
+      /^ {2}07:00:01\.000 {2}ice {6}relay=false local_typ=Host probe_extra=p1$/m.test(po) && /^ {2}07:00:02\.000 {2}model {4}viewer_rx_bps=- model_capacity_bps=- model_floor_bps=- probe_extra=p2$/m.test(po),
+      (po.match(/^ {2}07:00:0[12].*$/gm) || []).join(' | '),
+    );
+  } finally {
+    FIELDS.ice.pop();
+    FIELDS.model.pop();
+  }
+  check('one FIELDS entry: taken out again', !named().includes('probe_extra'));
   // 6. --rows: one read's rows, masked as the report masks them. A third
   //    session whose id ends as session 1's does, its key as session 1's key,
   //    and the overlay-auto line's addresses as an older read sent them.
@@ -1463,7 +1816,10 @@ function selfTest() {
       fm: { session_id: s3, key_id: 'f148f149a001', key_carrier: 'turn', entry: 'none', taken: 'today', taken_why: 'shadow_mode', note: 'via 198.51.100.7:3478 and 2001:db8::7' },
     },
     hbRow(302, s3, { bytes_written: 0, frames_sent: 0 }),
-    hbRow(304, s3, { bytes_written: 500000, frames_sent: 50 }),
+    // FR-148 P0: a move held, its count, and the held target landing.
+    { t: at(303), m: 'FFmpeg DC pump set_bitrate (AIMD)', f: { session_id: s3, codec_label: 'HEVC', target_bps: 2550000, why: 'decrease(transit-stall)+ceiling(pipe)', deferred: true } },
+    hbRow(304, s3, { bytes_written: 500000, frames_sent: 50, target_bps: 2550000, target_moves: 'decrease(transit-stall)+ceiling(pipe):1' }),
+    { t: at(305), m: 'FFmpeg DC pump: deferred bitrate applied at quiet', f: { session_id: s3, codec_label: 'HEVC', target_bps: 2550000, why: 'decrease(transit-stall)+ceiling(pipe)' } },
   ];
   const readIn = rows.concat(more);
   const set = { tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(400)), limit: readIn.length };
@@ -1494,6 +1850,14 @@ function selfTest() {
     return i < 0 ? `lengths ${x.length} / ${y.length}` : `line ${i + 1}: ${x[i]} | ${y[i]}`;
   };
   check('the masked --rows, read back offline, renders byte for byte as the direct read', offline === direct && !/[0-9a-fA-F]{24}/.test(full), firstDiff(direct, offline));
+  check(
+    '--rows: why, target_moves and deferred as the lines carry them, and the rows they print',
+    /"why":"decrease\(transit-stall\)\+ceiling\(pipe\)","deferred":true/.test(body) &&
+      /"target_moves":"decrease\(transit-stall\)\+ceiling\(pipe\):1"/.test(body) &&
+      /^ {2}07:05:03\.000 {2}target {3}3000000 -> 2550000 bps why=decrease\(transit-stall\)\+ceiling\(pipe\) deferred=true$/m.test(offline) &&
+      /^ {2}07:05:05\.000 {2}target {3}held 2550000 bps applied at quiet why=decrease\(transit-stall\)\+ceiling\(pipe\)$/m.test(offline),
+    (body.match(/^.*"why".*$/m) || [''])[0],
+  );
   const sids = fold(printed, {}).sessions.map((x) => x.sid);
   check('two ids with one last 4 hex stay two sessions (…5e51, …5e51~2)', sids.join(',') === '…5e51,…5e52,…5e51~2' && /^## session 3: …5e51~2, /m.test(direct) && /^## session 3: …5e51~2, /m.test(offline), sids.join(','));
   const cut = 40;
@@ -1588,6 +1952,8 @@ if (typeof module !== 'undefined' && module.exports) {
     CARRIER_OPTIONS,
     KINDS,
     FIELDS,
+    named,
+    tally,
     MSG_PATTERN,
     ISO_TIME,
     MAX_LIMIT,
