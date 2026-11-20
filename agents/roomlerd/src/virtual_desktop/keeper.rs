@@ -166,6 +166,35 @@ pub(super) struct Job {
     pub(super) apps: Vec<String>,
     /// How long the keeper's teardown waits after SIGTERM before SIGKILL.
     pub(super) grace_ms: u64,
+    /// #4099 — the window manager's restart delay after its first exit, in
+    /// milliseconds. A job without it (a daemon from before the field) gets
+    /// the X server's own, [`super::RESTART_DELAY_FLOOR`].
+    #[serde(default = "server_delay_floor_ms")]
+    pub(super) wm_delay_floor_ms: u64,
+    /// #4099 — the longest restart delay, in milliseconds: the X server's
+    /// [`super::RESTART_DELAY_CEIL`] when the job does not say.
+    #[serde(default = "server_delay_ceil_ms")]
+    pub(super) wm_delay_ceil_ms: u64,
+    /// #4099 — how long, in milliseconds, a window manager must have run for
+    /// its exit to start the delays over: the X server's
+    /// [`super::STABLE_AFTER`] when the job does not say.
+    #[serde(default = "server_stable_after_ms")]
+    pub(super) wm_stable_after_ms: u64,
+}
+
+/// The X server's [`super::RESTART_DELAY_FLOOR`], in a job's milliseconds.
+fn server_delay_floor_ms() -> u64 {
+    super::RESTART_DELAY_FLOOR.as_millis() as u64
+}
+
+/// The X server's [`super::RESTART_DELAY_CEIL`], in a job's milliseconds.
+fn server_delay_ceil_ms() -> u64 {
+    super::RESTART_DELAY_CEIL.as_millis() as u64
+}
+
+/// The X server's [`super::STABLE_AFTER`], in a job's milliseconds.
+fn server_stable_after_ms() -> u64 {
+    super::STABLE_AFTER.as_millis() as u64
 }
 
 impl Job {
@@ -886,6 +915,9 @@ pub(super) mod tests {
             wm: "/opt/my wm/openbox".into(),
             apps: vec!["xterm".into(), "/tmp/it's \"quoted\"\\ and\nnewline".into()],
             grace_ms: 1500,
+            wm_delay_floor_ms: 250,
+            wm_delay_ceil_ms: 4000,
+            wm_stable_after_ms: 30_000,
         };
         let line = job.line();
         assert_eq!(line.matches('\n').count(), 1, "one line: {line:?}");

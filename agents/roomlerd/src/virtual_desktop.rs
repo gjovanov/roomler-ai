@@ -1034,6 +1034,14 @@ struct Plan {
     delay_floor: Duration,
     delay_ceil: Duration,
     stable_after: Duration,
+    /// #4099 — the window manager's restart delays, which the desktop's
+    /// keeper gets in its job: the X server's numbers in the daemon. Its own,
+    /// because the tests' window manager (`true`) exits at once, and the
+    /// tests' 20 ms server delays would start it again every few
+    /// milliseconds in every keeper test.
+    wm_delay_floor: Duration,
+    wm_delay_ceil: Duration,
+    wm_stable_after: Duration,
     /// Who starts the window manager and the startup apps (#3665).
     clients: Clients,
     /// How long a start waits for the keeper to say it is ready.
@@ -1059,6 +1067,9 @@ impl Plan {
             delay_floor: RESTART_DELAY_FLOOR,
             delay_ceil: RESTART_DELAY_CEIL,
             stable_after: STABLE_AFTER,
+            wm_delay_floor: RESTART_DELAY_FLOOR,
+            wm_delay_ceil: RESTART_DELAY_CEIL,
+            wm_stable_after: STABLE_AFTER,
             clients: if tunnel_core::env::flag("VIRTUAL_DESKTOP_KEEPER", true) {
                 Clients::Keeper(KeeperCmd::daemon())
             } else {
@@ -1765,6 +1776,9 @@ impl Desktop {
             wm: cfg.wm.clone(),
             apps: cfg.startup.clone(),
             grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: self.plan.wm_delay_floor.as_millis() as u64,
+            wm_delay_ceil_ms: self.plan.wm_delay_ceil.as_millis() as u64,
+            wm_stable_after_ms: self.plan.wm_stable_after.as_millis() as u64,
         }
         .line();
         if job.len() > KEEPER_JOB_MAX {
@@ -4044,6 +4058,11 @@ mod supervise_tests {
             delay_floor: Duration::from_millis(20),
             delay_ceil: Duration::from_millis(80),
             stable_after: Duration::from_secs(60),
+            // #4099 — `true` exits at once: an hour, so that no test but
+            // those that set these sees the window manager started again.
+            wm_delay_floor: Duration::from_secs(3600),
+            wm_delay_ceil: Duration::from_secs(3600),
+            wm_stable_after: Duration::from_secs(3600),
             // The daemon's default (#3665). The keeper is this test binary,
             // re-run in its role; generous, since a loaded host starts it
             // late.
@@ -7454,6 +7473,9 @@ mod supervise_tests {
             wm,
             apps: vec![],
             grace_ms: KEEPER_GRACE.as_millis() as u64,
+            wm_delay_floor_ms: 3_600_000,
+            wm_delay_ceil_ms: 3_600_000,
+            wm_stable_after_ms: 3_600_000,
         };
         let mut input = keeper.stdin.take().unwrap();
         input.write_all(job.line().as_bytes()).unwrap();
