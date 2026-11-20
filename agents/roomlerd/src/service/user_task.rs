@@ -21,10 +21,10 @@
 //!
 //! | Path | What it acts on |
 //! |---|---|
-//! | `service install` (the MSI's `RegisterAutostart`, the tray, by hand) | registers [`autostart`], then deletes a legacy task that is its own, never before the new one is registered ([`register`]) |
+//! | `service install` (the MSI's `RegisterAutostart`, the tray, by hand) | registers [`autostart`] with a security descriptor of the account's own (FR-150), then deletes a legacy task that is its own, never before the new one is registered ([`register`]). An elevated run registers again a task its account cannot replace; a replace refused over a task that is there leaves [`start_task`] |
 //! | `service start` (the wizard, a restart by the tray or `roomler restart`, the updater's watcher after a failed install, the Start menu entry) and the hard stop's `schtasks /End` | its own task, else a legacy one that is its own ([`own_autostart`]) |
 //! | `service status` | the same, read without acting ([`status`]) |
-//! | `service uninstall` (the MSI's `UnregisterAutostart`) | its own tasks, and the legacy ones that are its own ([`unregister`]) |
+//! | `service uninstall` (the MSI's `UnregisterAutostart`) | its own tasks, its start task, and the legacy ones that are its own ([`unregister`]) |
 //! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session, each ended and then deleted, and then that account's daemon still running (`install_cleanup.rs`, #3885) |
 //!
 //! An install from before #3801 keeps its `Roomler` until its own account's
@@ -32,11 +32,24 @@
 //! did, and the new `RegisterAutostart` registers `Roomler-<SID>`. Until then it
 //! starts that account's daemon, and no other account's code acts on it.
 //!
+//! FR-150 P1a (#3507) — a task registered from an elevated token was owned by
+//! Administrators and only readable by its account, so every self-update's
+//! registration, which runs at medium, was refused (`Access is denied`) and the
+//! daemon stayed down until the next sign-in. Task Scheduler applies a
+//! descriptor named in the definition when it creates a task, and only then
+//! (#4128's P0, C3 and C5), so each definition now names the account as the
+//! owner with full access: a new task stays its account's to replace,
+//! whichever token registers it. A task an earlier elevated registration left
+//! keeps its descriptor through a replace, so an elevated run deletes it and
+//! registers it again; a medium run, refused, still brings the daemon back
+//! through [`start_task`], because a medium process may run a task it cannot
+//! replace (C2).
+//!
 //! The decisions are pure over [`Library`], the task library's seam: the real
 //! one runs `schtasks.exe` from System32 (`service.rs`), the tests' is a list.
 
 use super::AutostartStatus;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// The name every per-user install registered before #3801, whichever account
 /// it ran as.
@@ -62,6 +75,17 @@ pub(crate) fn autostart(sid: &str) -> String {
 /// The launcher check of the account `sid`.
 pub(crate) fn launcher_check(sid: &str) -> String {
     format!("{SHARED_CHECK}-{sid}")
+}
+
+/// FR-150 P1a — the start task's name before its account's SID.
+pub(crate) const START: &str = "Roomler start";
+
+/// FR-150 P1a — the start task of the account `sid`: a task of the account's
+/// own that a refused registration leaves, whose one-shots run `service start`
+/// and which deletes itself an hour later. [`account_of`] reads no account in
+/// it.
+pub(crate) fn start_task(sid: &str) -> String {
+    format!("{START}-{sid}")
 }
 
 /// The account an autostart task's name is for: `Roomler-<SID>`, the whole
@@ -110,6 +134,27 @@ pub(crate) trait Library {
     /// task started, and through the launcher's kill-on-close job the daemon
     /// (#3885, `agents/roomlerdw`).
     fn end(&mut self, name: &str) -> Result<()>;
+    /// FR-150 P1a — may this process's account, from a medium token, replace
+    /// and delete `name`? A self-update registers the task from such a token.
+    /// An elevated process is answered for the account behind it. `None`: the
+    /// question could not be asked (no such task, or its descriptor could not
+    /// be read).
+    fn may_replace(&self, _name: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// FR-150 P1a — what `service install` registers for an account.
+pub(crate) struct Registration<'a> {
+    /// The account's task.
+    pub(crate) xml: &'a str,
+    /// The definition names a descriptor of the account's own
+    /// (`ROOMLERD_TASK_SD`, on unless set to 0). Off, the registration is the
+    /// one before FR-150: no repair and no start task.
+    pub(crate) own_descriptor: bool,
+    /// [`start_task`]'s definition, when the daemon should start after this
+    /// registration (a config exists).
+    pub(crate) start: Option<&'a str>,
 }
 
 /// Is the task `name` the account `sid`'s, by its principal? A task this
@@ -152,12 +197,39 @@ pub(crate) fn status(lib: &impl Library, sid: &str) -> Result<AutostartStatus> {
     Ok(AutostartStatus::NotInstalled)
 }
 
-/// `service install` for the account `sid`: register its task as `xml`, then
-/// delete a legacy task of its own, best effort, once the new one is there.
-/// Never another account's, and never before its own task registered: a
+/// `service install` for the account `sid`: register its task, then delete a
+/// legacy task of its own, best effort, once the new one is there. Never
+/// another account's, and never before its own task registered: a
 /// registration that fails leaves the old task to start the daemon.
-pub(crate) fn register(lib: &mut impl Library, sid: &str, xml: &str) -> Result<()> {
-    lib.create(&autostart(sid), xml)?;
+///
+/// FR-150 P1a, with the account's own descriptor ([`Registration`]):
+/// - a replace that went through but left a task its account cannot replace
+///   (an elevated run over a task an elevated registration made: the replace
+///   keeps the old descriptor, #4128's C5) deletes the task and registers it
+///   again, so the descriptor applies (C5c). A daemon running under the
+///   deleted task runs on (C5d).
+/// - a replace refused over a task that is there registers [`start_task`],
+///   when a daemon should start, and still fails, with the repair when the
+///   account cannot replace its task.
+/// - a registration that succeeds deletes a start task left before it.
+pub(crate) fn register(lib: &mut impl Library, sid: &str, reg: &Registration) -> Result<()> {
+    let name = autostart(sid);
+    let start = start_task(sid);
+    if let Err(e) = lib.create(&name, reg.xml) {
+        if !reg.own_descriptor {
+            return Err(e);
+        }
+        return Err(refused(lib, &name, &start, reg.start, e));
+    }
+    if reg.own_descriptor && lib.may_replace(&name) == Some(false) {
+        repair(lib, &name, reg.xml)?;
+    }
+    if reg.own_descriptor
+        && lib.exists(&start)
+        && let Err(e) = lib.delete(&start)
+    {
+        tracing::warn!(task = %start, error = %format!("{e:#}"), "the start task could not be removed: it deletes itself within the hour");
+    }
     for name in LEGACY {
         if is_own(lib, name, sid)
             && let Err(e) = lib.delete(name)
@@ -173,9 +245,100 @@ pub(crate) fn register(lib: &mut impl Library, sid: &str, xml: &str) -> Result<(
     Ok(())
 }
 
-/// `service uninstall` for the account `sid`: its task and launcher check, and
-/// the legacy ones whose principal is `sid`.
+/// FR-150 P1a — `name` is registered with its new definition, and its account
+/// still cannot replace it: an elevated registration before FR-150 left it, and
+/// the replace kept that descriptor (#4128's C5). Delete it and register it
+/// again, so the definition's descriptor applies (C5c); a daemon running under
+/// it runs on (C5d). A delete that fails leaves the task as the replace left
+/// it, which starts the daemon, so it is a warning. A registration that fails
+/// after the delete is tried once more, and then fails the step, since then no
+/// task starts the daemon.
+fn repair(lib: &mut impl Library, name: &str, xml: &str) -> Result<()> {
+    if let Err(e) = lib.delete(name) {
+        tracing::warn!(
+            task = %name,
+            error = %format!("{e:#}"),
+            "this account's task could not be deleted to be registered again with its own \
+             descriptor: its updates still cannot replace it"
+        );
+        return Ok(());
+    }
+    if let Err(first) = lib.create(name, xml) {
+        lib.create(name, xml).with_context(|| {
+            format!(
+                "{name} was deleted to be registered again with the account's own descriptor, \
+                 and its registration failed twice (first: {first:#}). Run `roomlerd service \
+                 install` again: until then no task starts the daemon"
+            )
+        })?;
+    }
+    match lib.may_replace(name) {
+        Some(true) => tracing::info!(
+            task = %name,
+            "registered this account's task again with its own descriptor: its updates can \
+             replace it now"
+        ),
+        answer => tracing::warn!(
+            task = %name,
+            ?answer,
+            "registered this account's task again, and its account still cannot replace it"
+        ),
+    }
+    Ok(())
+}
+
+/// FR-150 P1a — the account's task is there and its replace was refused. A
+/// medium process may still run it (#4128's C2), so when a daemon should start,
+/// [`start_task`] does it at the one-shots, and the error says how the task is
+/// repaired when its account cannot replace it.
+fn refused(
+    lib: &mut impl Library,
+    name: &str,
+    start: &str,
+    start_xml: Option<&str>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let started = match start_xml {
+        Some(xml) if lib.exists(name) => match lib.create(start, xml) {
+            Ok(()) => {
+                tracing::warn!(
+                    task = %name,
+                    start_task = %start,
+                    "this account's task could not be replaced; the start task starts the daemon \
+                     at the one-shots, then deletes itself"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    start_task = %start,
+                    error = %format!("{e:#}"),
+                    "the start task could not be registered either"
+                );
+                false
+            }
+        },
+        _ => false,
+    };
+    if lib.may_replace(name) != Some(false) {
+        return error;
+    }
+    let until = if started {
+        format!("; until then {start} starts the daemon after each update")
+    } else {
+        String::new()
+    };
+    error.context(format!(
+        "this account cannot replace its task {name}: an elevated registration owns it (#3507). \
+         Run `roomlerd service install` once from an elevated prompt, or the installer as \
+         administrator, to repair it{until}"
+    ))
+}
+
+/// `service uninstall` for the account `sid`: its task, its start task and
+/// launcher check, and the legacy ones whose principal is `sid`.
 pub(crate) fn unregister(lib: &mut impl Library, sid: &str) -> Result<()> {
+    let _ = lib.delete(&start_task(sid));
     lib.delete(&autostart(sid))?;
     for name in LEGACY {
         if is_own(lib, name, sid) {
@@ -363,6 +526,11 @@ pub(crate) mod fake {
         /// see it at all, as with Task Scheduler's default security on a task
         /// a person registers.
         pub(crate) seen_by_all: bool,
+        /// FR-150 — its descriptor gives its account read only: an elevated
+        /// registration whose definition named no descriptor (#3507). Its
+        /// account may read, run and end it, and may not replace or delete
+        /// it; a replace keeps the descriptor, whoever asks (#4128's C2, C5).
+        pub(crate) locked: bool,
     }
 
     impl Task {
@@ -406,13 +574,29 @@ pub(crate) mod fake {
             self.with_task(name, principal, true)
         }
 
+        /// FR-150 — with a task `name` of `principal`'s that an elevated
+        /// registration before FR-150 left: that account cannot replace it.
+        pub(crate) fn with_locked(mut self, name: &str, principal: &str) -> Self {
+            self = self.with_task(name, Some(principal), false);
+            if let Some(task) = self.tasks.last_mut() {
+                task.locked = true;
+            }
+            self
+        }
+
         fn with_task(mut self, name: &str, principal: Option<&str>, seen_by_all: bool) -> Self {
             self.tasks.push(Task {
                 name: name.into(),
                 principal: principal.map(str::to_string),
                 seen_by_all,
+                locked: false,
             });
             self
+        }
+
+        /// FR-150 — is the task `name` there, and locked?
+        pub(crate) fn locked(&self, name: &str) -> Option<bool> {
+            self.find(name).map(|i| self.tasks[i].locked)
         }
 
         /// Now the process of `caller`; what the last one asked is forgotten.
@@ -440,11 +624,17 @@ pub(crate) mod fake {
         }
 
         fn may_change(&self, task: &Task) -> bool {
+            self.elevated || (task.runs_as(&self.caller) && !task.locked)
+        }
+
+        /// Read its definition, run it and end it: what a locked task's own
+        /// account keeps (#4128's C2).
+        fn may_read(&self, task: &Task) -> bool {
             self.elevated || task.runs_as(&self.caller)
         }
 
         fn sees(&self, task: &Task) -> bool {
-            self.may_change(task) || task.seen_by_all
+            self.may_read(task) || task.seen_by_all
         }
     }
 
@@ -455,7 +645,7 @@ pub(crate) mod fake {
 
         fn principal(&self, name: &str) -> Option<String> {
             let task = &self.tasks[self.find(name)?];
-            if self.may_change(task) {
+            if self.may_read(task) {
                 task.principal.clone()
             } else {
                 None
@@ -480,7 +670,11 @@ pub(crate) mod fake {
             })
         }
 
-        fn create(&mut self, name: &str, _xml: &str) -> Result<()> {
+        /// A replace keeps the task's descriptor, whoever asks (#4128's C1b,
+        /// C5). A new task is locked when an elevated process registers a
+        /// definition that names no descriptor of its own (C2), and not when
+        /// it names one (C3).
+        fn create(&mut self, name: &str, xml: &str) -> Result<()> {
             self.asked.push(("create", name.into()));
             if self.refuse.iter().any(|r| r.eq_ignore_ascii_case(name)) {
                 bail!("ERROR: the task is refused");
@@ -492,6 +686,7 @@ pub(crate) mod fake {
                     name: name.into(),
                     principal: Some(self.caller.clone()),
                     seen_by_all: false,
+                    locked: self.elevated && !xml.contains("<SecurityDescriptor>"),
                 }),
             }
             Ok(())
@@ -512,10 +707,18 @@ pub(crate) mod fake {
         fn end(&mut self, name: &str) -> Result<()> {
             self.asked.push(("end", name.into()));
             match self.find(name) {
-                Some(i) if self.may_change(&self.tasks[i]) => Ok(()),
+                Some(i) if self.may_read(&self.tasks[i]) => Ok(()),
                 Some(i) if self.sees(&self.tasks[i]) => bail!("ERROR: Access is denied."),
                 _ => bail!("ERROR: The system cannot find the file specified."),
             }
+        }
+
+        /// The account's own task that is not locked, as the medium access
+        /// check answers it; nothing for a task this process may not read.
+        fn may_replace(&self, name: &str) -> Option<bool> {
+            let task = &self.tasks[self.find(name)?];
+            self.may_read(task)
+                .then(|| task.runs_as(&self.caller) && !task.locked)
         }
     }
 }
@@ -529,11 +732,205 @@ mod tests {
     /// Two made-up accounts of one machine.
     const A: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
     const B: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
-    const XML: &str = "<Task/>";
+    /// FR-150 P1a's definition: it names a descriptor of its own.
+    const XML: &str = "<Task><SecurityDescriptor>O:S-1-5-21-1D:</SecurityDescriptor></Task>";
+    /// The definition before FR-150, and with `ROOMLERD_TASK_SD=0`.
+    const MASTER_XML: &str = "<Task/>";
+    const START_XML: &str = "<Task><SecurityDescriptor>O:S-1-5-21-1D:</SecurityDescriptor></Task>";
 
     /// An account's own autostart task, spelled out.
     fn named(sid: &str) -> String {
         format!("Roomler-{sid}")
+    }
+
+    /// FR-150 P1a's registration, with no config (no start task).
+    fn p1a() -> Registration<'static> {
+        Registration {
+            xml: XML,
+            own_descriptor: true,
+            start: None,
+        }
+    }
+
+    /// FR-150 P1a's registration on an enrolled device.
+    fn p1a_enrolled() -> Registration<'static> {
+        Registration {
+            start: Some(START_XML),
+            ..p1a()
+        }
+    }
+
+    /// The registration before FR-150: what `ROOMLERD_TASK_SD=0` restores.
+    fn master() -> Registration<'static> {
+        Registration {
+            xml: MASTER_XML,
+            own_descriptor: false,
+            start: None,
+        }
+    }
+
+    /// FR-150 (#3507), the model of the release before it: a task registered
+    /// from an elevated token is its account's to read, run and end, not to
+    /// replace. So the account's own update, at medium, is refused, and an
+    /// elevated replace keeps the task as it was.
+    #[test]
+    fn an_elevated_registration_before_p1a_cannot_be_replaced_by_its_update() {
+        let mut lib = Fake::new(A, true);
+        register(&mut lib, A, &master()).unwrap();
+        assert_eq!(lib.locked(&named(A)), Some(true));
+        lib.switch(A, false);
+        let update = register(&mut lib, A, &master());
+        assert!(
+            format!("{:#}", update.unwrap_err()).contains("Access is denied"),
+            "{:?}",
+            lib.asked
+        );
+        assert_eq!(lib.asked, [("create", named(A))]);
+        assert_eq!(own_autostart(&lib, A), Some(named(A)));
+        lib.switch(A, true);
+        register(&mut lib, A, &master()).unwrap();
+        assert_eq!(lib.asked, [("create", named(A))]);
+        assert_eq!(lib.locked(&named(A)), Some(true));
+    }
+
+    /// FR-150 P1a — a definition that names the account's own descriptor
+    /// gives a new task its account can replace, from an elevated token
+    /// (#4128's C3) and a medium one (C3b, C3c), so the next update's
+    /// registration and an uninstall at medium succeed.
+    #[test]
+    fn a_task_with_its_own_descriptor_stays_its_accounts_to_replace() {
+        for elevated in [true, false] {
+            let mut lib = Fake::new(A, elevated);
+            register(&mut lib, A, &p1a()).unwrap();
+            assert_eq!(lib.locked(&named(A)), Some(false), "elevated {elevated}");
+            lib.switch(A, false);
+            register(&mut lib, A, &p1a()).unwrap();
+            assert_eq!(lib.asked, [("create", named(A))], "elevated {elevated}");
+            unregister(&mut lib, A).unwrap();
+            assert_eq!(lib.owner(&named(A)), None, "elevated {elevated}");
+        }
+    }
+
+    /// FR-150 P1a — over a task an elevated registration before P1a left, an
+    /// elevated `service install` deletes the task and registers it again, so
+    /// its descriptor applies (#4128's C5c), and a start task left before goes
+    /// too. At medium the replace is refused and the task is left as it was.
+    #[test]
+    fn an_elevated_install_registers_a_locked_task_again() {
+        let mut lib = Fake::new(A, true)
+            .with_locked(&named(A), A)
+            .with(&start_task(A), Some(A))
+            .with(SHARED, Some(A));
+        register(&mut lib, A, &p1a_enrolled()).unwrap();
+        assert_eq!(
+            lib.asked,
+            [
+                ("create", named(A)),
+                ("delete", named(A)),
+                ("create", named(A)),
+                ("delete", start_task(A)),
+                ("delete", SHARED.to_string()),
+            ]
+        );
+        assert_eq!(lib.locked(&named(A)), Some(false));
+        assert_eq!(lib.owner(&start_task(A)), None);
+        assert_eq!(lib.owner(SHARED), None);
+        lib.switch(A, false);
+        register(&mut lib, A, &p1a_enrolled()).unwrap();
+        assert_eq!(lib.asked, [("create", named(A))]);
+
+        let mut lib = Fake::new(A, false).with_locked(&named(A), A);
+        assert!(register(&mut lib, A, &p1a()).is_err());
+        assert!(
+            !lib.asked.iter().any(|(verb, _)| *verb == "delete"),
+            "{:?}",
+            lib.asked
+        );
+        assert_eq!(lib.locked(&named(A)), Some(true));
+    }
+
+    /// FR-150 P1a — a replace refused over the account's task, which is there,
+    /// leaves `Roomler start-<SID>` on an enrolled device, and the step still
+    /// fails, with the repair when the account cannot replace its task. A
+    /// later registration that succeeds deletes it, and so does `unregister`.
+    /// No start task without a config, for a task that is not there, or with
+    /// `ROOMLERD_TASK_SD=0`.
+    #[test]
+    fn a_refused_replace_leaves_a_start_of_the_accounts_own() {
+        let mut lib = Fake::new(A, false).with_locked(&named(A), A);
+        let refused = format!("{:#}", register(&mut lib, A, &p1a_enrolled()).unwrap_err());
+        assert!(refused.contains("cannot replace its task"), "{refused}");
+        assert!(refused.contains("elevated prompt"), "{refused}");
+        assert!(refused.contains(&start_task(A)), "{refused}");
+        assert!(refused.contains("Access is denied"), "{refused}");
+        assert_eq!(lib.asked, [("create", named(A)), ("create", start_task(A))]);
+        assert_eq!(lib.owner(&start_task(A)), Some(Some(A.to_string())));
+        assert_eq!(lib.locked(&start_task(A)), Some(false));
+        // The start task is no account's autostart, and the start still runs
+        // the account's own task.
+        assert_eq!(account_of(&start_task(A)), None);
+        assert_eq!(own_autostart(&lib, A), Some(named(A)));
+        // The next update, refused again, replaces it.
+        lib.switch(A, false);
+        assert!(register(&mut lib, A, &p1a_enrolled()).is_err());
+        assert_eq!(lib.asked, [("create", named(A)), ("create", start_task(A))]);
+        // The repair deletes it.
+        lib.switch(A, true);
+        register(&mut lib, A, &p1a_enrolled()).unwrap();
+        assert_eq!(lib.owner(&start_task(A)), None, "{:?}", lib.asked);
+        // An uninstall deletes one left behind, even where the task itself
+        // cannot be deleted.
+        let mut lib = Fake::new(A, false)
+            .with_locked(&named(A), A)
+            .with(&start_task(A), Some(A));
+        assert!(unregister(&mut lib, A).is_err());
+        assert_eq!(lib.owner(&start_task(A)), None);
+
+        // A refused registration for another reason: a start task, and no
+        // repair named.
+        let mut lib = Fake::new(A, false).with(&named(A), Some(A));
+        lib.refuse.push(named(A));
+        let refused = format!("{:#}", register(&mut lib, A, &p1a_enrolled()).unwrap_err());
+        assert!(!refused.contains("elevated prompt"), "{refused}");
+        assert_eq!(lib.owner(&start_task(A)), Some(Some(A.to_string())));
+
+        for (case, mut lib, reg) in [
+            (
+                "no config",
+                Fake::new(A, false).with_locked(&named(A), A),
+                p1a(),
+            ),
+            (
+                "the switch",
+                Fake::new(A, false).with_locked(&named(A), A),
+                Registration {
+                    start: Some(START_XML),
+                    ..master()
+                },
+            ),
+            ("no task", Fake::new(A, false), p1a_enrolled()),
+        ] {
+            if case == "no task" {
+                lib.refuse.push(named(A));
+            }
+            assert!(register(&mut lib, A, &reg).is_err(), "{case}");
+            assert_eq!(lib.asked, [("create", named(A))], "{case}");
+            assert_eq!(lib.owner(&start_task(A)), None, "{case}");
+        }
+    }
+
+    /// FR-150 P1a — `ROOMLERD_TASK_SD=0` registers the task as before FR-150:
+    /// an elevated run over a task its account cannot replace neither deletes
+    /// it nor registers it again, and a start task left before stays.
+    #[test]
+    fn the_switch_registers_masters_task() {
+        let mut lib = Fake::new(A, true)
+            .with_locked(&named(A), A)
+            .with(&start_task(A), Some(A));
+        register(&mut lib, A, &master()).unwrap();
+        assert_eq!(lib.asked, [("create", named(A))]);
+        assert_eq!(lib.locked(&named(A)), Some(true));
+        assert_eq!(lib.owner(&start_task(A)), Some(Some(A.to_string())));
     }
 
     /// #3801 — two accounts with a per-user install each register a task each,
@@ -544,9 +941,9 @@ mod tests {
     fn each_account_registers_a_task_of_its_own() {
         for elevated in [false, true] {
             let mut lib = Fake::new(A, false);
-            register(&mut lib, A, XML).unwrap();
+            register(&mut lib, A, &p1a()).unwrap();
             lib.switch(B, elevated);
-            let registered = register(&mut lib, B, XML);
+            let registered = register(&mut lib, B, &p1a());
             assert!(
                 registered.is_ok(),
                 "elevated {elevated}: {registered:?}, {:?}",
@@ -604,7 +1001,7 @@ mod tests {
     fn an_account_on_its_own_task_never_acts_on_anothers_shared_one() {
         for elevated in [false, true] {
             let mut lib = Fake::new(A, elevated).with(SHARED, Some(B));
-            register(&mut lib, A, XML).unwrap();
+            register(&mut lib, A, &p1a()).unwrap();
             assert_eq!(own_autostart(&lib, A), Some(named(A)), "{elevated}");
             assert_eq!(status(&lib, A).unwrap(), Installed, "{elevated}");
             unregister(&mut lib, A).unwrap();
@@ -633,14 +1030,14 @@ mod tests {
             .with(SHARED, Some(A))
             .with(RETIRED, Some(A));
         lib.refuse.push(named(A));
-        assert!(register(&mut lib, A, XML).is_err(), "{:?}", lib.asked);
+        assert!(register(&mut lib, A, &p1a()).is_err(), "{:?}", lib.asked);
         assert_eq!(lib.owner(SHARED), Some(Some(A.to_string())));
         assert_eq!(own_autostart(&lib, A), Some(SHARED.to_string()));
         assert_eq!(status(&lib, A).unwrap(), Installed);
 
         lib.refuse.clear();
         lib.switch(A, false);
-        register(&mut lib, A, XML).unwrap();
+        register(&mut lib, A, &p1a()).unwrap();
         assert_eq!(
             lib.asked,
             [
@@ -677,7 +1074,7 @@ mod tests {
         for (case, mut lib) in cases {
             assert_eq!(own_autostart(&lib, A), None, "{case}");
             assert_eq!(status(&lib, A).unwrap(), NotInstalled, "{case}");
-            register(&mut lib, A, XML).unwrap();
+            register(&mut lib, A, &p1a()).unwrap();
             assert_eq!(own_autostart(&lib, A), Some(named(A)), "{case}");
             unregister(&mut lib, A).unwrap();
             assert!(!lib.asked_for(SHARED), "{case}: {:?}", lib.asked);
@@ -693,11 +1090,14 @@ mod tests {
         assert_eq!(account_of(&autostart(A)), Some(A));
         assert_eq!(account_of(&autostart(B)), Some(B));
         let check = launcher_check(A);
+        let start = start_task(A);
         for name in [
             SHARED,
             RETIRED,
             SHARED_CHECK,
             check.as_str(),
+            START,
+            start.as_str(),
             "Roomler-",
             "Roomler-S-1-",
             "Roomler-S-1-5-x",
