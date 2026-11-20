@@ -1313,7 +1313,7 @@ All seven open decisions were resolved as the spec recommended
 | 4 | anchoring from `/pair` (FR-104) | **not offered** — a paired token never anchors (`anchor = false`); anchoring stays a deliberate act through the enrollment dialog |
 | 5 | the seam for B | **(ii) a privileged/user split** of `install.sh`; B0's spike still confirms it under `pkexec` and `osascript` before B1 code |
 | 6 | embedded or served `install.sh` | **embedded** in the wizard, which is signed and cut with every agent release (FR-84 S1); a server-side hotfix reaches the wizard at the next agent release |
-| 7 | macOS root half | **two tokens from one approval** (`halves: 2`, B2), until FR-43's single enrollment lands. *(2026-11-20: for a new Mac, superseded by FR-43's one row ([#971](https://github.com/gjovanov/roomler-ai/issues/971)) where the server's `wizard_macos_one_row` is on: one token, `halves: 1`, built as [FR-141](FR-141-one-run-one-row.md) P2 (#P2PR). B2's `halves: 2` road stays for a Mac that keeps two rows: the switch off, or a Mac enrolled already, which keeps its layout.)* |
+| 7 | macOS root half | **two tokens from one approval** (`halves: 2`, B2), until FR-43's single enrollment lands. *(2026-11-20: for a new Mac, superseded by FR-43's one row ([#971](https://github.com/gjovanov/roomler-ai/issues/971)) where the server's `wizard_macos_one_row` is on: one token, `halves: 1`, built as [FR-141](FR-141-one-run-one-row.md) P2 (#4152). B2's `halves: 2` road stays for a Mac that keeps two rows: the switch off, or a Mac enrolled already, which keeps its layout.)* |
 
 ### Judgement calls recorded by A4 (the terminal; not operator decisions)
 

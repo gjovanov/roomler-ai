@@ -124,7 +124,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 The switch's default flips to on once P2's field read holds (AC1, AC2, AC4): that flip is the operator's. Where
 one row does not hold, the switch stays off and the wizard installs today's two rows.
 
-- **2026-11-20, built (#P2PR), with the operator's rulings D4-A, D5-A and D9-A of that day:** the form is open only
+- **2026-11-20, built (#4152), with the operator's rulings D4-A, D5-A and D9-A of that day:** the form is open only
   where four facts hold, read on the Welcome page, at pairing start, at install, and again in the install's preflight
   before the token is spent (`agents/roomler-setup/src/one_row_form.rs:139`, `decide`): the server's
   `wizard_macos_one_row` is a JSON `true`; there is no `/etc/roomler/config.toml`, unless this run's own one-row
@@ -180,7 +180,7 @@ person's half on it and says why.
 |---|---|---|---|
 | P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | done 2026-11-11: Linux and macOS (cells M1 to M5), in the [field log](#field-log) |
 | P1 | The question on the first page (design 1), with `front_tests` | server key `wizard_mesh_choice` in `/api/setup/features`, default on: off restores today's layout | not started |
-| P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | built 2026-11-20 (#P2PR, design 2's dated line); field read owed (AC1, AC2, AC4's one-row cell, AC6) on the first `setup-v*` that carries it, with the switch on (the open decision) |
+| P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | built 2026-11-20 (#4152, design 2's dated line); field read owed (AC1, AC2, AC4's one-row cell, AC6) on the first `setup-v*` that carries it, with the switch on (the open decision) |
 | P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | in progress 2026-11-20: the one-row guard (design 3's 2026-11-20 line) built, field read owed (AC4's one-row cell, on the first `setup-v*` that carries it); the same-row re-install not started |
 | P4 | `install.sh --overlay` on Linux; the dialog's Linux note and macOS block | the flag is opt-in; the dialog rolls back with the image | not started |
 | P5 | Docs: `docs/installation.md` (the wizard's macOS and Linux sections, the dialog, `--overlay`), `docs/platform-support.md` §2 and §4, `docs/device-pairing.md` | none | not started |
