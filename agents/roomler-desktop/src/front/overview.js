@@ -100,14 +100,16 @@
         : ip,
     );
     paintExit(st.exit_node);
-    paintDns(st.dns);
+    paintDns(st.dns, dv.dns_health);
     paintCounts(dv);
   }
 
   // S2 — MagicDNS status: hidden unless the overlay publishes a magic
-  // domain; the two failure states (resolver down / OS steer failed) are
-  // spelled out so name-resolution complaints never need log spelunking.
-  function paintDns(dns) {
+  // domain; its states are spelled out so name-resolution complaints never
+  // need log spelunking. #1363: `health` is the app's own words for the
+  // state (`DnsStatus::health`, the same `roomler status` prints), and it
+  // says `active` only when the OS was measured to reach the resolver.
+  function paintDns(dns, health) {
     const label = $('ov-dns-label');
     const dd = $('ov-dns');
     if (!label || !dd) return;
@@ -118,16 +120,11 @@
     }
     label.hidden = false;
     dd.hidden = false;
-    // FR-97 P3h — a steer the host's own resolver never asks is not active.
-    const health = !dns.resolver_bound
-      ? 'resolver DOWN'
-      : !dns.os_steer_active
-        ? 'OS steer failed'
-        : dns.os_steer_bypassed
-          ? 'steered but bypassed: ' + dns.os_steer_bypassed
-          : 'active';
     dd.textContent =
-      dns.magic_domain + ' · ' + health + (dns.answer_aaaa ? '' : ' · AAAA off');
+      dns.magic_domain +
+      ' · ' +
+      (health || 'state unknown') +
+      (dns.answer_aaaa ? '' : ' · AAAA off');
   }
 
   function paintCounts(dv) {

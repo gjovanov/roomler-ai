@@ -70,7 +70,7 @@ Sealing closes the write side only. Every reader below keeps working.
 
 | Folder | Read by | Anchor |
 |---|---|---|
-| `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1916-1921` |
+| `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1931-1936` |
 | `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder. It may not delete one there, so since #3799 the service removes what that worker's ledger says it sent | `agents/roomlerd/src/app.rs:2310-2320`, `crash_recorder.rs:345-361`, `crash_uploader.rs:18-23` |
 | the SystemContext attempt record | Setup, as the person who started it (Users read, `record_aces`) | `machine_tree.rs:537-551` |
 
@@ -476,7 +476,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2310-2320`, `crash_recorder.rs:568`); without read
+  drains the supervisor's records from that folder (`app.rs:2308-2318`, `crash_recorder.rs:568`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope
