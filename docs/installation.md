@@ -2228,7 +2228,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3488`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2332,6 +2332,23 @@ platform UUID, and on a virtual Mac its `en0` address too, since a cloned VM
 keeps the original's UUID. So a reinstall finds its row however the network has
 renamed the Mac. Unticked, the wizard installs the per-user half alone. The
 two privacy grants below remain the person's; the Done page says so.
+
+**A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
+it offers the device install, the wizard asks the root daemon over the person
+socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
+answers `status` (`crates/localapi/src/lib.rs:3683-3685`) with
+`gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
+Welcome page says "This Mac is one device already", Continue stays off for every
+device card, and pairing start and the install's preflight refuse with the same
+words, so no token is asked for (`agents/roomler-setup/src/reinstall_guard.rs`).
+Before the guard, a wizard run over a Mac the terminal had made one row left three
+rows: the root half enrolled again under the hardware id, where the script had
+used a derived one, and the person's half made a row that never came online
+(FR-141 P0, cell M5). Only a socket root serves is believed, and the read is
+bounded to 3 s. A Mac whose root daemon does not answer reads as before: unknown
+is never one row. The tunnel client can still be installed. The server's
+`wizard_reinstall_guard` turns the guard off; it is on by default, and the wizard
+reads anything but a JSON `false` as on (`agents/roomler-setup/src/features.rs`).
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
@@ -2983,7 +3000,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5538`).
+(`crates/localapi/src/lib.rs:5649`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3012,7 +3029,7 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3488`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
 read-only and refuses to set by name (`localapi::person_may`, `:3551`). Whether
 the console user should flip those from the app is the decision left open on

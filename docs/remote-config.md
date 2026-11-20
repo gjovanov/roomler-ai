@@ -343,7 +343,7 @@ pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
 `crates/remote_control/src/models.rs:9690`); a prefix match would refuse the
-kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way, and neither is `path_model`, FR-148 P1's switch that lets the path memory open a relayed session ([rate-control.md](rate-control.md#the-switch-d28)), nor `inflight_budget`, FR-148 D46's switch that computes the in-flight budget on the data-channel pumps ([rate-control.md](rate-control.md#the-budgets-switch)).
+kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way, and neither is `path_model`, FR-148 P1's switch that lets the path memory open a relayed session ([rate-control.md](rate-control.md#the-switch-d28)), nor `inflight_budget`, FR-148 D46's switch that computes the in-flight budget on the data-channel pumps and, under `on`, lets it hold a relayed session's frames in place of the relay byte gate and the VP9-444 watermark ([rate-control.md](rate-control.md#the-budgets-switch)).
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
 restart after it.** A device that is offline picks it up at its next connect, and
@@ -648,7 +648,7 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3488`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3497`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
