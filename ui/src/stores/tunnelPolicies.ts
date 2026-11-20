@@ -24,9 +24,9 @@ function isRefusal(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 403
 }
 
-// Snake-case + adjacently-tagged enums match the Rust wire shape —
-// see `crates/modules/network/src/routes/tunnel.rs::TunnelPolicyResponse` and
-// `crates/remote_control/src/models.rs`.
+// The answer's shape (`TunnelPolicyResponse` and `PolicySubjectView` in
+// `crates/modules/network/src/routes/tunnel.rs`): snake_case `kind` tags, every
+// id its 24-hex string (#3636), which a save sends back as it is.
 
 export interface ExactHost {
   kind: 'exact'
