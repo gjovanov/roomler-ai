@@ -51,7 +51,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 
 - **The wizard** (code): one paragraph on Done, "One manual step remains: macOS grants Screen Recording and
   Accessibility by hand…", which also says to choose Quit & Reopen and to allow the local-network prompt
-  (`agents/roomler-setup/src/front/app.js:1930-1934`). No live state, no button, nothing about prompt 4. Field
+  (`agents/roomler-setup/src/front/app.js:1947-1951`). No live state, no button, nothing about prompt 4. Field
   (11 Nov, 0.4.211): it names "Accessibility", which macOS 27 calls "Device Control and Data Access", and it says
   the same after a re-install with both grants on.
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —

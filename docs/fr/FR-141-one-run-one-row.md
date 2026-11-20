@@ -36,18 +36,18 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 - One daemon card, "Be accessed — this Mac (recommended)", whose text says the Mac "joins as two devices" and
   that screen-only means unticking a box under Advanced (`agents/roomler-setup/src/front/app.js:75-83`).
 - The "both" control is that box, "Join the overlay network", inside the collapsed "Advanced options" on the
-  Server page (`agents/roomler-setup/src/front/index.html:166-175`), ticked by default for the macOS daemon
+  Server page (`agents/roomler-setup/src/front/index.html:169-178`), ticked by default for the macOS daemon
   (`app.js:490-494`). It drives `role::wants_root_half` (`agents/roomler-setup/src/role.rs:124-132`), mirrored in
   the SPA (`app.js:496-503`).
 - Both token paths add the root half: pairing asks `halves: 2` (`role.rs:134-140`) and refuses an install whose
   halves differ from the approval's (`agents/roomler-setup/src/pairing.rs:262-305`); the paste path shows a
-  second token field (`index.html:282-292`) and refuses a missing or repeated second token
-  (`agents/roomler-setup/src/commands.rs:798-838`).
+  second token field (`index.html:302-313`) and refuses a missing or repeated second token
+  (`agents/roomler-setup/src/commands.rs:821-861`).
 - The server accepts `halves: 2` only for a macOS daemon (`crates/modules/fleet/src/pairing.rs:326-334`) and mints
   that many single-use tokens (`:985-1004`). Each half counts against the device cap
   (`docs/fr/FR-129-guided-cross-platform-installer.md:580-584`).
 - One run: the root half enrolls in the wizard's process as `<name>-daemon` (`role.rs:142-147`) under a machine id
-  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:867-916`); one administrator prompt runs the
+  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:876-925`); one administrator prompt runs the
   privileged half (marker, package, config placed, daemon started: `scripts/install.sh:886-893`, `:951-985`); the
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:940-949`). Two rows.
@@ -94,7 +94,7 @@ row starts with defaults (inferred). P0 shows which case the lab hit.
 
 ### 1. The question on the first page (P1)
 
-- Under the daemon card on the Welcome page (`index.html:53-88`), on macOS and Linux, two options: **"Screen and
+- Under the daemon card on the Welcome page (`index.html:56-91`), on macOS and Linux, two options: **"Screen and
   private network"** (default) and **"Screen only"**. They set the state the Advanced box sets today
   (`state.overlayChoice`, `app.js:510-515`), and the box stays and mirrors them.
 - Each option says what it installs on this OS and card: on a Mac one row, or two rows and two plan slots while
@@ -105,7 +105,7 @@ row starts with defaults (inferred). P0 shows which case the lab hit.
   clipboard on GNOME and KDE (Wayland and X11) and the layout and display match on X11 only; the other X11
   desktops wait for a way to see their lock, and Wayland's layout and display match are not planned. Decided
   as D3.
-- Done names every row it made (`app.js:1862-1865`, `:1907-1913` already carry a root half).
+- Done names every row it made (`app.js:1879-1882`, `:1924-1930` already carry a root half).
 
 ### 2. One row from the wizard, on a Mac (P2)
 
@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:867-937`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8922-8928`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:876-946`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8922-8928`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1045-1050`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1074-1078`, `postinstall:355-388`); on a Mac that is one row already, the package only (`install.sh:1015-1033`) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -127,8 +127,8 @@ one row does not hold, the switch stays off and the wizard installs today's two 
 ### 3. A re-install lands on the same row(s) (P3)
 
 P0 decides its shape. What the code already gives: the root half's hardware id and `adopt-enrollment`'s fold
-(`orchestrator_unix.rs:867-875`), and the warning a Linux re-install gets from `root_identity`
-(`orchestrator_unix.rs:832-862`). What it lacks on a Mac: any look at the root daemon before the enroll
+(`orchestrator_unix.rs:876-884`), and the warning a Linux re-install gets from `root_identity`
+(`orchestrator_unix.rs:841-871`). What it lacks on a Mac: any look at the root daemon before the enroll
 (`root_identity.rs:67-79`). The privileged half runs as root and can read the root's config as
 `root_config_says` does (`install.sh:987-991`), and the root daemon's `Status` already reports `gui_worker.one_row`
 (`crates/localapi/src/lib.rs:490`, `:530-542`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
