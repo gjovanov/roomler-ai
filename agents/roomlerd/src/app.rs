@@ -1780,7 +1780,9 @@ async fn daemon_main() -> Result<()> {
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
-        Command::AdoptEnrollment { from, take } => adopt_enrollment_cmd(&config_path, &from, &take),
+        Command::AdoptEnrollment { from, take } => {
+            adopt_enrollment_cmd(&config_path, &from, &take).map(|line| println!("{line}"))
+        }
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
             let action = match action {
@@ -3128,7 +3130,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 /// and the overlay join refuses to share — is retired, so the daemon mints a
 /// fresh one, and the previous row is named for the operator
 /// ([`enrollment::retire_key_of_previous_row`]).
-fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
+fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<String> {
     let from_path = from.to_path_buf();
     let Some(fresh) = config::read_if_present(&from_path) else {
         bail!(
@@ -3235,7 +3237,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         }
     };
     tracing::info!(path = %target.display(), ?outcome, taken = taken.len(), "enrollment adopted");
-    println!(
+    Ok(format!(
         "Enrollment adopted: {what}{}. Config written to: {}",
         if taken.is_empty() {
             String::new()
@@ -3251,8 +3253,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             )
         },
         target.display()
-    );
-    Ok(())
+    ))
 }
 
 /// rc.53 Phase 7 predicate: should the `--machine-global` enroll
@@ -9109,3 +9110,7 @@ mod no_enrollment_exit_tests {
         assert_eq!(step_outcome(&fault).1, EXIT_CODE_OF_AN_ERR);
     }
 }
+
+/// #3589 — what the last line of `adopt-enrollment` says was at the target.
+#[cfg(test)]
+mod adopt_line;
