@@ -306,7 +306,9 @@ if [ "$ONE_ROW" = 1 ]; then
         echo "error: --privileged-steps --one-row places the root config its caller enrolled: pass --config-from FILE" >&2
         exit 1
     fi
-    if [ -n "$CONFIG_TAKE" ]; then
+    # Only the half places a config: on the terminal route --config-take meets
+    # the refusals every install gets (--config-from belongs to the half).
+    if [ "$PRIV_STEPS" = 1 ] && [ -n "$CONFIG_TAKE" ]; then
         echo "error: --one-row places the root config whole and folds nothing into it: run it without --config-take" >&2
         exit 1
     fi
