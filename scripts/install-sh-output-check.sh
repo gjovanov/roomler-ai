@@ -719,6 +719,17 @@ for SH in $SHELLS; do
     # the person (sudo -H -u), and a Mac not enrolled yet is one row.
     AS_ROOT=1 run pkg-default-root/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    # Paired, not pasted (--pair): one approval is the one row of a Mac that is
+    # not enrolled yet. With --per-user it pairs the per-user half, and the NOTE
+    # names the root half's own pairing after it (two rows).
+    prow="==> pairing this Mac as 'check-host' with https://roomler.example, as its one row, overlay on — open the page below and type the code"
+    run pkg-default-pair/normal Darwin arm64 0 normal "$new" 0 --role daemon --pair
+    says agent-v0.4.221 0.4.221 0; want "$prow"; want "==> done."; done_case
+    ppu="==> pairing this machine as 'check-host' with https://roomler.example — open the page below and type the code"
+    rootpair="==>       as root afterwards (a second approval), then install its service:"
+    run pkg-per-user-pair/normal Darwin arm64 0 normal "$new" 0 --role daemon --pair --per-user
+    says agent-v0.4.221 0.4.221 0; want "$ppu"; want "$pu"; want "$rootpair"; lines "as its one row" 0
+    want "==> done."; done_case
     # Download only reads nothing on the Mac: given a token, the default's
     # plan is the one-row plan, with what a Mac enrolled already does; a flag
     # that names the layout plans that layout.

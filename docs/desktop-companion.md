@@ -508,7 +508,8 @@ sequenceDiagram
 
 ### A two-half Mac asks its root half (FR-97 P2g)
 
-A Mac with both halves (FR-43) is **two devices**, and only the root half is on the private
+A Mac with both halves on two rows (`--daemon-token`, the wizard for now, or a Mac enrolled that
+way before FR-43's one-row default) is **two devices**, and only the root half is on the private
 network: only root can hold a utun. The companion talks to the per-user half, whose own answer
 is `no_node`, so the page listed the Mac and nothing else. The per-user half now asks the root
 half for the machine's view, over a person socket the root half serves the console user:

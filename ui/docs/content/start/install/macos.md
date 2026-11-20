@@ -1,6 +1,6 @@
 ---
 title: Install on macOS
-description: Install the Roomler agent on macOS, grant the two privacy permissions it needs, and add the root half if you want the machine on the private mesh.
+description: Install the Roomler agent on macOS as one device, with screen sharing and the private mesh, and grant the two privacy permissions it needs.
 tags: [install, macos, getting-started, enrollment, permissions]
 order: 11
 ---
@@ -22,25 +22,30 @@ creating a `utun` interface and installing routes **requires root**. They also
 cannot share one enrollment, because a second control connection for the same
 device displaces the first.
 
-:::warning A fully-featured Mac appears as TWO devices
-The root half is its own enrollment, so it gets its own row — named
-`<name>-daemon`. That is expected. If you only want screen sharing, install the
-user half alone and you get one device row.
+:::note Two processes, one device
+The one-line install makes a Mac that is not enrolled yet **one device row**:
+the root half holds the enrollment and starts the user half in your login
+session itself, so the user half needs none of its own. A Mac enrolled before
+keeps its layout. Two rows, `<name>` and `<name>-daemon`, come from
+`--daemon-token` and, for now, from the graphical installer: there each half is
+its own enrollment, and the second row is expected.
 :::
 
 ## Install
 
 Mint a token under **Devices → Enroll device**.
 
-**Screen sharing only** — one token, one device row:
+**Screen sharing, input *and* the private mesh, as one device** — one token:
 
 ```bash
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --server https://roomler.ai --name "$(hostname)"
 ```
 
-**Screen sharing *and* the private mesh** — mint a **second** token and pass it
-as `--daemon-token`:
+**Screen sharing alone**, with no root service and no mesh: add `--per-user`.
+
+**Two device rows**, the user half and the root half each its own — mint a
+**second** token and pass it as `--daemon-token`:
 
 ```bash
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
@@ -50,7 +55,8 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 :::note Or use the graphical installer, with no token to copy
 [Roomler Setup](https://roomler.ai/api/setup/macos) installs both halves behind
-one administrator password, and the Mac joins as the two devices above. Safari
+one administrator password, and for now the Mac joins as two devices, as with
+`--daemon-token`. Safari
 saves the download as a `.tar`: open it, open the folder it makes, then open
 **Roomler Setup** and confirm macOS's question about an app from the internet.
 **Be accessed — this Mac** is already selected; untick **Join the overlay network**
@@ -63,13 +69,13 @@ answer the administrator prompt. A code lasts 15 minutes; when it runs out,
 **Start again** gives you a new one.
 :::
 
-`--daemon-token` is what installs the root LaunchDaemon *and* turns the overlay
-on — installing that half is itself the opt-in. Without it the Mac never joins
-the mesh, and it is **absent from `roomler peers` entirely** rather than showing
-as offline.
+Installing the root LaunchDaemon is what turns the overlay on: the one-line
+install and `--daemon-token` both do. With `--per-user` the Mac never joins the
+mesh, and it is **absent from `roomler peers` entirely** rather than showing as
+offline.
 
 Running the one-liner under `sudo` is fine: the script resolves the console user
-itself and enrolls the user half as them.
+itself, and enrolls a user half as them.
 
 ## Grant the two permissions — nothing works until you do
 
@@ -93,7 +99,15 @@ pane. The agent also probes both at startup, logs what is missing, and reports
 it to the server — so the device list shows *"No screen access"* / *"No input
 access"* rather than letting you discover it by connecting to a blank desktop.
 
-Then restart the user half:
+Then restart the agent; the installer prints the line for your Mac. On one
+device:
+
+```bash
+sudo launchctl kickstart -k system/com.roomler.daemon
+```
+
+With a user half of its own (`--per-user`, `--daemon-token`, the graphical
+installer):
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.roomler.agent
@@ -122,7 +136,9 @@ Configuration lives at `/etc/roomler/config.toml` for the root half.
 The two halves listen on **different local sockets**. `roomler status` and
 `roomler peers` reach the **user** half; `sudo roomler …` reaches the **root**
 half. If a command reports that the daemon is not running, try it with and
-without `sudo` before assuming anything is broken.
+without `sudo` before assuming anything is broken. On one device, `roomler …`
+without `sudo` is answered by the screen worker the root half starts for you,
+and its note says which of your settings it changes and which need `sudo`.
 :::
 
 ## Known limits on macOS
@@ -155,13 +171,13 @@ not remove and exits non-zero.
 |---|---|
 | `--keep-config` | Keep the config and the two grants: a reinstall comes back as the same device |
 
-Then remove the device row — or **both** rows, if you installed the root half —
-in the dashboard under **Devices**. That revokes the credentials and releases
-the mesh address.
+Then remove the device row in the dashboard under **Devices** — or **both**
+rows on a Mac installed as two. That revokes the credentials and releases the
+mesh address.
 
 ## Troubleshooting
 
 - **Screen is the wallpaper and nothing else** → the Screen Recording grant. See above.
 - **Clicks and keys do nothing** → the Accessibility grant.
-- **The Mac is missing from `roomler peers`** → you installed the user half only. Add the root half with `--daemon-token`, or enroll it (`sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`) and run `sudo roomlerd service install --as-service`.
+- **The Mac is missing from `roomler peers`** → it has the user half only (`--per-user`, or installed that way before one device became the default). For one device, run the install again with `--one-row` and a new token, then remove the old row under **Devices**. Or add the root half as a device of its own: `--daemon-token`, or enroll it (`sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`) and run `sudo roomlerd service install --as-service`.
 - **More** → [Troubleshooting](/docs/troubleshooting/).

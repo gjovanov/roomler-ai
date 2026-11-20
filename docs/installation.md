@@ -1895,7 +1895,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2018-2097`):
+exit code (`scripts/install.sh:2175-2254`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -1910,19 +1910,19 @@ exit code (`scripts/install.sh:2018-2097`):
 
 | Line | What it says | When its source cannot be read |
 |---|---|---|
-| `release named by the server's feed: <tag>` (`name_release`, called at `:677` on Linux and `:847` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
-| `installed daemon's own --version: <v>` (`report_installed_version`, `:2067`, called at `:2157`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
+| `release named by the server's feed: <tag>` (`name_release`, called at `:712` on Linux and `:882` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
+| `installed daemon's own --version: <v>` (`report_installed_version`, `:2224`, called at `:2314`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
 | `NOTE: the installed daemon's <v> differs from the release this script resolved, <tag>` | printed only when both are readable and the tag without `agent-v` is not `<v>` | not printed |
 
 What the feed or the binary says is printed only when it fits the alphabet `A-Z a-z 0-9 . _ + -` and
-64 characters (`fits_alphabet`, `:2024`), so a tag cannot carry terminal control onto the screen. The
+64 characters (`fits_alphabet`, `:2181`), so a tag cannot carry terminal control onto the screen. The
 tag is read from the line its release object starts on, which begins with `"tag_name"` as the server
 writes it; any other shape reads as unreadable, never as another release's tag. The tunnel role prints
-neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1268`).
+neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1425`).
 
 `scripts/install-sh-output-check.sh` pipes the real script into the shell as the one-liner does, under
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
-feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
+feed, the downloads, `sudo`, `dscl` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
 records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3138-3145`).
 
@@ -1967,7 +1967,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1488`), and the wizard's root half is the same code:
+`scripts/install.sh:1645`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -1999,7 +1999,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1222`, #2472).
+(`scripts/install.sh:1379`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -2316,7 +2316,9 @@ hands that file to the privileged half, which places it at
 platform UUID, and on a virtual Mac its `en0` address too, since a cloned VM
 keeps the original's UUID. So a reinstall finds its row however the network has
 renamed the Mac. Unticked, the wizard installs the per-user half alone. The
-two privacy grants below remain the person's; the Done page says so.
+two privacy grants below remain the person's; the Done page says so. So the
+wizard's Mac is two rows, where the one-liner's default is one (below); the
+wizard's one-row form follows in FR-43's next phase.
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
@@ -2345,11 +2347,16 @@ stream bunched ([FR-119 §4.11](fr/FR-119-high-refresh-streaming.md)).
 `sudo launchctl print system/com.roomler.daemon` reads `spawn type = interactive (4)` on a fixed
 install, and `daemon (3)` on an older one. The update helper keeps the default: it is background work.
 
-They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
-second control-WS connection displaces the first. **Each half is its own
-enrollment, so a Mac appears as two devices** — the second named
-`<name>-daemon`. Two processes are forced by macOS; two rows are not, and
-[FR-43](fr/FR-43-macos-single-enrollment.md) P3 removes the second one.
+Two processes that each hold an enrollment cannot share one: the hub keys
+sessions on `agent_id`, so a second control-WS connection displaces the first.
+On **two rows** each half is its own enrollment, so the Mac appears as two
+devices, the second named `<name>-daemon`: `--daemon-token` installs that
+layout, and so does the wizard until its one-row form. Two processes are forced
+by macOS; two rows are not. Since the operator's flip on 2026-11-19
+([FR-43](fr/FR-43-macos-single-enrollment.md)), the one-liner installs a Mac
+that is not enrolled yet as **one row**: the root half holds the only
+enrollment and serves the screen through a worker that holds none ("One token,
+one row" below). A Mac enrolled already keeps its layout.
 
 With `macos_supervise_gui_worker = true` in the daemon's config, the daemon's row
 serves remote desktop as well:
@@ -2435,10 +2442,13 @@ the hello, or changes later, wakes the heartbeat of each org's connection at onc
 ([`delegate.rs:1345`](../agents/roomlerd/src/delegate.rs#L1345)): its caps, the person's
 floor and its leaving reach the row then, not up to 30 s later at the next one.
 
-The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
-([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
-and the default flips only on the operator's word. It doesn't give one row alone: the
-switch leaves a person's enrollment in their file, so their row stays.
+The switch is off in a config that does not name it, and an update never turns it on.
+What flipped, on the operator's word on 2026-11-19, is the install script's default: it
+writes both switches with a Mac's first enrollment ("One token, one row" below). The
+switch's field proof ran on released 0.4.200 on 2026-11-05
+([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)).
+It doesn't give one row alone: the switch leaves a person's enrollment in their file, so
+their row stays.
 
 **The migration (FR-43 P3c).** `sudo roomlerd one-row` makes a two-row Mac one row. It
 says its plan first and asks: `--dry-run` stops after the plan, and `--yes` goes ahead
@@ -2449,6 +2459,10 @@ the root doesn't hold is **moved** into the root's `[[orgs]]` with its token and
 WireGuard key, so its row stays, with its overlay off until `roomlerd org overlay` turns
 it on. Then the LaunchAgent goes, the root's file gets both switches, and the daemon
 restarts, which ends live sessions.
+
+⚠️ On 0.4.228, a run begun within five minutes of the person's own agent starting, as
+right after an update, a login or an install, stops with "this Mac changed after the
+plan was said" and leaves the Mac as it was. Run it again five minutes later (#4097).
 
 **Root changes nothing in a home (FR-147).** From the release that carries FR-147's
 root side, the command running as root lists `/Users`, `stat`s each entry and reads
@@ -2500,7 +2514,7 @@ records, or `put-back-legacy`, which renames back the copies an older release ke
 the person's folder. A person who fails is named and keeps their record, the others go
 on, and the command exits 1; the next `--revert` finishes them. When nobody's `read`
 answers and nothing else is left, it exits 1 before it asks and restarts nothing. The
-one-token install is P3d.
+one-token install, the default since the flip, is P3d ("One token, one row" below).
 
 ⚠️ On 0.4.200 the command stops before it changes anything on a Mac where an entry
 under `/Users` links to another account's folder, as a tart image's `/Users/runner`
@@ -2508,38 +2522,47 @@ does: it plans that person's file twice, and the second copy fails with `File ex
 #3498 has it read each folder once.
 
 ```bash
-# Screen sharing only (one token, one device row):
+# The default: screen sharing, input AND the overlay mesh on ONE device row, from
+# one token (FR-43, a Mac not enrolled yet; a Mac enrolled already keeps its layout):
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --server https://roomler.ai --name "$(hostname)"
 
-# Screen sharing AND the overlay mesh — mint a SECOND enrollment token:
-curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
-  --role daemon --token <token> --daemon-token <second-token> \
-  --server https://roomler.ai --name "$(hostname)"
-
-# Both on ONE device row, from one token (FR-43 P3d, off by default; see below):
+# The same, by name: where it cannot give one row it stops rather than keep a layout:
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --one-row \
   --server https://roomler.ai --name "$(hostname)"
 
-# Or pair in the browser instead of pasting a token (FR-129 A4): the per-user half …
+# Screen sharing alone, with no root service and no overlay mesh (the per-user half):
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --per-user \
+  --server https://roomler.ai --name "$(hostname)"
+
+# TWO device rows, the per-user half and the root half: mint a SECOND enrollment token:
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --daemon-token <second-token> \
+  --server https://roomler.ai --name "$(hostname)"
+
+# Or pair in the browser instead of pasting a token (FR-129 A4): one approval, one row …
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --pair --server https://roomler.ai --name "$(hostname)"
-# … then, for the overlay, pair the root half as root (its own approval):
+# … or pair the per-user half alone (--pair --per-user), then, for the overlay, pair
+# the root half as root, its own approval and its own row:
 sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml \
   enroll --pair --server https://roomler.ai --name "$(hostname)-daemon" --overlay
 sudo roomlerd service install --as-service
 ```
 
-`--daemon-token` also turns the overlay on (`enroll --overlay`) — installing a
-root daemon is itself the opt-in, and the overlay is the only reason that half
-exists. Without it the Mac never sends `rc:overlay.join`, so it is **absent
-from `roomler peers` entirely** rather than showing as offline.
+A root half always enrolls with the overlay on (`enroll --overlay`), on one row and
+with `--daemon-token` alike: installing a root daemon is itself the opt-in, and the
+overlay is a reason that half exists. A Mac with the per-user half alone never sends
+`rc:overlay.join`, so it is **absent from `roomler peers` entirely** rather than
+showing as offline.
 
-Running the one-liner under `sudo` is fine: the script resolves the console
-user itself and enrolls the per-user half as them.
+Running the one-liner under `sudo` is fine: the script resolves the console user
+itself, reads that person's config as them to tell whether the Mac is enrolled, and
+enrolls a per-user half as them. One row's enrollment is root's.
 
-The root half can also be added after the fact (FR-97 P6c). Enroll it with
+The root half can also be added after the fact, as a row of its own (FR-97 P6c). Enroll it with
 `sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`,
 then `sudo roomlerd service install --as-service` writes the enable marker and
 the LaunchDaemon and bootstraps it. `service stop --as-service` is a SIGTERM
@@ -2547,27 +2570,67 @@ that stays down until the next boot or `service start --as-service`: the plist
 restarts only a failed exit, and the clean stop exits 0 (measured). The
 per-user `roomlerd service stop` works the same way.
 
-**One token, one row (FR-43 P3d).** `install.sh --one-row` installs a Mac that is not
-enrolled yet as one row, from one token or one `--pair` approval. It runs the package as
-a per-user install runs it, then writes the marker and enrolls the root half with the
-overlay on and both switches (`roomlerd enroll --one-row`), then runs the package again.
-On that second run the package's guard reads the switch, removes the per-user
-LaunchAgent and its plist, and starts the root half, which starts the person's worker.
-The guard decides it here as it does at every update after.
+**One token, one row: the default (FR-43 P3d; the default since the operator's flip,
+2026-11-19).** The one-liner installs a Mac that is not enrolled yet as one row, from
+one token or one `--pair` approval, and `--one-row` asks for the same by name. It runs
+the package as a per-user install runs it, then writes the marker and enrolls the root
+half with the overlay on and both switches (`roomlerd enroll --one-row`), then runs the
+package again. On that second run the package's guard reads the switch, removes the
+per-user LaunchAgent and its plist, and starts the root half, which starts the person's
+worker. The guard decides it here as it does at every update after.
 
-| The Mac | What `install.sh --one-row` does |
+A Mac changes layout only by its person's own command (the operator's ruling on #971,
+2026-11-02), so a Mac that is enrolled already keeps its layout. The script reads it
+before it changes anything. With no layout flag, an enrolled Mac gets what the
+one-liner gave it before the flip, call for call; `--one-row` stops instead, or goes
+ahead where only the person's half was enrolled.
+
+| The Mac | The one-liner, no layout flag | With `--one-row` |
+|---|---|---|
+| Not enrolled yet, given `--token` or `--pair` | The three steps above: one row | The same |
+| Not enrolled yet, nothing to enroll with | The package and the per-user half, not enrolled; the NOTE says a token or `--pair` gives one row | Stops before the package: it needs `--token` or `--pair` |
+| One row already | Updates the package and keeps the enrollment; no token needed | The same |
+| Its root half is a row of its own: two rows, or P2's supervised worker | Keeps its layout. The NOTE names the migration: wait five minutes after the install, then `sudo roomlerd one-row` (#4097) | Stops before changing anything and names `sudo roomlerd one-row`, the migration above |
+| Its person's half enrolled, the root half not | Keeps its layout. The NOTE says: for one row, `--one-row` with a new token, then delete the old row | Goes ahead, and says the old row now stays offline, to be deleted in the device list |
+| The agent release predates P3d | The package and the per-user half, as before the flip, with a WARNING | Installs the package, then stops before the marker: nothing enrolled, the token not spent |
+
+What "enrolled" reads, each file as its owner: root's `/etc/roomler/config.toml` as
+root, where both switches on are one row and any other root config is a row of its own,
+as the package's guard reads it; and the person's own config, in both trees
+(`live.roomler.roomler`, and `live.roomler.roomler-agent` from before the rename), as
+that person, never with root's rights (FR-147). The person is the console user, and the
+caller too when the script runs as another person. A home the account database does not
+name, or a config there that its own person cannot read, counts as enrolled: the safe
+side keeps the layout.
+
+**`--per-user`** is the per-user half alone: screen sharing and input, with no root
+service and no overlay mesh. It is what the one-liner gave a Mac before the flip, call
+for call, and it is for a person who wants no root daemon on their Mac. The package
+still needs sudo. It is refused off macOS, with `--role tunnel`, beside `--one-row` or
+`--daemon-token`, and with `--privileged-steps` or `--user-steps`. `--one-row` is
+refused, with a message that names the flag, off macOS, with `--role tunnel`, beside
+`--daemon-token`, with `--privileged-steps` or `--user-steps`, and with `--no-enroll`.
+`--download-only` reads nothing on the Mac, so given a token or `--pair` it plans the
+one-row steps, and says that a Mac enrolled already keeps its layout.
+
+Which route gives which layout:
+
+| Route | A Mac not enrolled yet becomes |
 |---|---|
-| Not enrolled yet | The three steps above: one row |
-| One row already | Updates the package and keeps the enrollment; no token needed |
-| Its root half is a row of its own | Stops before changing anything and names `sudo roomlerd one-row`, the migration above |
-| The agent release predates P3d | Installs the package, then stops before the marker: nothing enrolled, the token not spent |
-| Its person enrolled in an earlier install | Goes ahead, and says that row now stays offline, to be deleted in the device list |
+| The one-liner, the dashboard's command (its note names the other two flags), `--one-row`, `--pair` | One row |
+| `--daemon-token <second-token>`, or `--pair --per-user` then the root half's own pairing | Two rows |
+| The wizard with "Join the overlay network" ticked (B2 above), until its one-row form follows in FR-43's next phase | Two rows |
+| `--per-user`, or the wizard with it unticked | The per-user half alone |
 
-It is refused, with a message that names the flag, off macOS, with `--role tunnel`,
-beside `--daemon-token`, with `--privileged-steps` or `--user-steps`, and with
-`--no-enroll`. It is the script's alone for now: the wizard has no one-row control, and
-FR-129's next phase decides whether it gets one. The script a server hands out changes
-with that server's roll.
+The script a server hands out changes with that server's roll.
+
+**Without admin rights.** The package needs an administrator whatever the layout:
+`installer -pkg` runs as root, and so do the root half's enrollment and service. An
+administrator installs it (the `.pkg`, or the one-liner with `--no-enroll`). The person
+then enrolls the per-user half in their own login, with no sudo: the dashboard's
+"Already installed? Enroll manually" command, then
+`launchctl kickstart -k gui/$(id -u)/com.roomler.agent`, the two steps the script's
+per-user route runs. That gives screen sharing alone; the overlay and one row need root.
 
 Read on released 0.4.201, a fresh Mac and the script roomler.ai serves: one row at the
 first start, then, once both permissions were on and the root half had restarted as the
@@ -2631,8 +2694,8 @@ on macOS 15.7). Restart it in any of three ways:
 
 A one-row Mac has no LaunchAgent to kickstart. There `sudo launchctl kickstart -k
 system/com.roomler.daemon` restarts the root half, and since a worker never outlives its
-daemon, the worker it starts next holds the grant. That is the line `install.sh
---one-row` prints.
+daemon, the worker it starts next holds the grant. That is the line a one-row install
+prints, by default or with `--one-row`.
 
 Accessibility is read live: input works from the next remote event, with no
 restart (up to 0.4.189 the first session's failed input backend was kept until
@@ -2711,7 +2774,7 @@ console user are skipped and every root row runs as on any install
 | Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:366` |
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
-| The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
+| The enrollment a one-row install runs under `sudo` (`install.sh`'s default, or `--one-row`), and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
 | `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:2885`, `agents/roomlerd/src/one_row_home.rs:3-60` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:143` |
 
@@ -2943,8 +3006,9 @@ the job prints or checks a `sudo` line.
 The two halves are **two enrollments with two configuration files**, and that
 stays true with the FR-43 supervisor on (`macos_supervise_gui_worker = true`):
 the root daemon spawns the GUI worker as the console user, but the worker still
-runs on *that person's* enrollment and file (FR-43's default; a one-row Mac, P3
-above, is the exception at the end of this section). So a supervised Mac has:
+runs on *that person's* enrollment and file (with `macos_one_row` off; a one-row
+Mac, P3 above and the one-liner's default since the flip, is the exception at the
+end of this section). So a supervised Mac has:
 
 | Half | Config file | Edited by | Owns |
 |---|---|---|---|
@@ -3169,8 +3233,9 @@ per-user half, and it resets the two privacy grants while the bundle that names
 them still exists, so a fresh install asks again instead of showing a toggle
 that is ON for a binary that is gone.
 
-Remove the device row(s) in the admin UI too: a Mac that ran the root half is
-two rows, and deleting them releases the overlay lease.
+Remove the device row(s) in the admin UI too: a Mac that ran the root half as a
+row of its own is two rows, a one-row Mac is one, and deleting them releases the
+overlay lease.
 
 ## After install: the companion opens, and starts at login (FR-84 D6)
 
@@ -3436,8 +3501,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1430` (the section) — `uninstall_linux` at `:1874`,
-`uninstall_macos` at `:1939`.
+`scripts/install.sh:1587` (the section) — `uninstall_linux` at `:2031`,
+`uninstall_macos` at `:2096`.
 
 ```mermaid
 flowchart TD
@@ -3454,8 +3519,8 @@ flowchart TD
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1149`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`:1340`) |
-| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1078`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1868`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2059`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1797`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
 | 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
 | 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
 

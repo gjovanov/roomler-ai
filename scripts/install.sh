@@ -1047,8 +1047,8 @@ macos_default_layout() {
 }
 
 # Run a command as ACCOUNT: directly when this is that account, else through
-# sudo (root needs no password for it). FR-147: nothing of ours reads or
-# writes inside a person's home with root's rights.
+# sudo (root needs no password for it). FR-147: the layout's reads in a
+# person's home run as that person, never with root's rights.
 as_account() {
     acct="$1"; shift
     if [ "$(id -un)" = "$acct" ]; then "$@"; else sudo -H -u "$acct" "$@"; fi

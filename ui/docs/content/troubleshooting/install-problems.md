@@ -68,11 +68,15 @@ roomlerd service uninstall
 ```
 
 @macos
-**The Mac shows as two devices.** Expected — the root half is its own
-enrollment. See [Install on macOS](/docs/start/install/macos/).
+**The Mac shows as two devices.** Expected on a Mac installed with
+`--daemon-token` or the graphical installer: there the root half is its own
+enrollment. The one-line install makes one device. See
+[Install on macOS](/docs/start/install/macos/).
 
-**The Mac is missing from `roomler peers` entirely.** You installed the user half
-only. Add the root half by re-running with a second token as `--daemon-token`.
+**The Mac is missing from `roomler peers` entirely.** It has the user half only
+(`--per-user`, or installed that way before one device became the default).
+Re-run the install with `--one-row` and a new token for one device, then remove
+the old row; or add the root half as a second device with `--daemon-token`.
 
 **Everything installed, screen is wallpaper.** A privacy grant, not an install
 problem — see [black screen](/docs/troubleshooting/black-screen/).
