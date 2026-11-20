@@ -17,6 +17,9 @@
 #   ci-apt-fault.sh hits               fails unless the DROP rules matched packets
 #   ci-apt-fault.sh source-hosts       the Ubuntu archive hosts apt's sources name,
 #                                      read here independently of ci-apt.sh
+#   ci-apt-fault.sh container-reach [DOCKER-RUN-ARG...]
+#                                      does a container started now reach its
+#                                      mirror (D2 of #3710)
 #
 #   runner  *.ubuntu.com, only from the runner's own upstream resolver(s)
 #   all     *.ubuntu.com, from every source (no public resolver helps)
@@ -162,11 +165,26 @@ cmd_source_hosts() {
   done | sed -E 's#^[a-z+]+://##; s#[/:].*##' | grep -E '(^|\.)(archive|ports|security)\.ubuntu\.com$' | sort -u
 }
 
+# Whether a container started NOW reaches its mirror: its resolv.conf, and its
+# own `apt-get update`, judged by rc and output (a timeout prints nothing).
+# Extra arguments go to `docker run` (e.g. --dns 1.1.1.1). Prints REACHED=yes|no.
+cmd_container_reach() {
+  docker run --rm "$@" ubuntu:24.04 sh -c '
+    echo "--- the container'"'"'s resolv.conf"; grep -v "^#" /etc/resolv.conf
+    timeout -k 10 90 apt-get update -qq >/tmp/u 2>&1; rc=$?
+    tail -3 /tmp/u; echo "container apt-get update rc=$rc"
+    if [ "$rc" -ne 0 ] || grep -qE "Temporary failure resolving|Could not resolve|Failed to fetch" /tmp/u; then echo REACHED=no; else echo REACHED=yes; fi'
+}
+
 case "${1:-}" in
   facts) cmd_facts ;;
+  container-reach)
+    shift
+    cmd_container_reach "$@"
+    ;;
   inject) cmd_inject "${2:-}" ;;
   prove) cmd_prove "${2:-}" ;;
   hits) cmd_hits ;;
   source-hosts) cmd_source_hosts ;;
-  *) die "usage: ci-apt-fault.sh facts | inject MODE | prove MODE | hits | source-hosts" ;;
+  *) die "usage: ci-apt-fault.sh facts | inject MODE | prove MODE | hits | source-hosts | container-reach [ARG...]" ;;
 esac

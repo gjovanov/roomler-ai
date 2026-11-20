@@ -131,25 +131,39 @@ jobs:
           bash "$H/ci-apt-fault.sh" prove "$m"
 
       - name: "Negative control: today's bare apt-get fails under the fault"
+        # Today's shape is a bare update and install. Under the fault it either
+        # fails on the resolver or hangs on it (here: until the timeout).
         if: matrix.cell == 'runner-dead'
         run: |
           set +e
           SECONDS=0
-          timeout 150 sudo apt-get update -qq >/tmp/nc-update.log 2>&1
+          sudo timeout --kill-after=10 120 apt-get update -qq >/tmp/nc-update.log 2>&1
           urc=$?
-          timeout 120 sudo apt-get install -y --no-install-recommends "$PKG" >/tmp/nc-install.log 2>&1
+          sudo timeout --kill-after=10 90 apt-get install -y --no-install-recommends "$PKG" >/tmp/nc-install.log 2>&1
           irc=$?
           tail -5 /tmp/nc-update.log /tmp/nc-install.log
-          echo "bare update rc=$urc, bare install rc=$irc, in ${SECONDS} s"
-          grep -q 'Temporary failure resolving\|Could not resolve' /tmp/nc-update.log /tmp/nc-install.log \
-            || { echo "::error title=ci-apt self-test::the bare apt-get met no resolver failure: the fault did not reach apt"; exit 1; }
+          echo "bare update rc=$urc, bare install rc=$irc (124 = timed out), in ${SECONDS} s"
           [ "$irc" -ne 0 ] || { echo "::error title=ci-apt self-test::the bare install succeeded under the fault, so this cell proves nothing"; exit 1; }
+          if [ "$urc" -ne 124 ] && [ "$irc" -ne 124 ] && ! grep -q 'Temporary failure resolving\|Could not resolve' /tmp/nc-update.log /tmp/nc-install.log; then
+            echo "::error title=ci-apt self-test::the bare apt-get neither waited nor met a resolver failure: the fault did not reach apt"; exit 1
+          fi
 
-      - name: "D2: does a container started under the fault reach the mirror?"
+      - name: "D2: a container started under the fault"
+        if: matrix.cell == 'runner-dead'
+        run: bash "$H/ci-apt-fault.sh" container-reach | tee /tmp/ctr-before.log
+
+      - name: "deb-bare-check under the fault: a mirror failure, never a package failure"
+        # An empty package, so the only thing that can fail is the mirror.
         if: matrix.cell == 'runner-dead'
         run: |
-          docker run --rm ubuntu:24.04 sh -c 'echo "--- resolv.conf"; cat /etc/resolv.conf; timeout 90 apt-get update -qq 2>&1 | tail -3' | tee /tmp/ctr-before.log
-          if grep -q 'Temporary failure resolving\|Could not resolve' /tmp/ctr-before.log; then echo "D2 before failover: the container did NOT reach the mirror"; else echo "D2 before failover: the container reached the mirror"; fi
+          mkdir -p /tmp/dummy/DEBIAN
+          printf 'Package: ci-apt-dummy\nVersion: 1.0\nArchitecture: all\nMaintainer: ci-apt self-test <noreply@example.invalid>\nDescription: an empty package for the ci-apt self-test\n' >/tmp/dummy/DEBIAN/control
+          dpkg-deb --build /tmp/dummy /tmp/ci-apt-dummy_1.0_all.deb
+          rc=0
+          timeout -k 10 420 bash scripts/deb-bare-check.sh --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb >/tmp/dbc-before.log 2>&1 || rc=$?
+          cat /tmp/dbc-before.log
+          echo "deb-bare-check under the fault: rc=$rc"
+          [ "$rc" -eq 3 ] && grep -q '^MIRROR UNREACHABLE' /tmp/dbc-before.log || { echo "::error title=ci-apt self-test::deb-bare-check did not read the dead mirror as a mirror failure (rc=$rc, want 3)"; exit 1; }
 
       - name: ci-apt.sh prepare
         run: |
@@ -167,7 +181,7 @@ jobs:
           case "$CELL" in
             healthy)
               ! grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::a failover on a healthy runner"; exit 1; } ;;
-            runner-dead)
+            runner-dead | arm64-names)
               grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not fail over to a public resolver"; exit 1; } ;;
             all-dead)
               grep -q '::warning title=apt mirrors unreachable' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not report the mirrors unreachable"; exit 1; }
@@ -175,13 +189,26 @@ jobs:
           esac
           echo "prepare judged ok for $CELL ($s s)"
 
+      - name: "The probe asks the names apt uses (#3710)"
+        run: |
+          want=$(bash "$H/ci-apt-fault.sh" source-hosts | tr '\n' ' ')
+          probed=$(grep -m1 'ci-apt: system resolver:' /tmp/prepare.log | sed 's/.*system resolver://; s/=[^ ]*//g')
+          echo "apt's sources name:   $want"
+          echo "the helper probed:   $probed"
+          [ -n "$want" ] || { echo "::error title=ci-apt self-test::found no Ubuntu archive host in apt's sources"; exit 1; }
+          for h in $want; do
+            case " $probed " in
+              *" $h "*) ;;
+              *) echo "::error title=ci-apt self-test::the helper probed [$probed ] but apt's sources name [$want]: its probe passed while apt could not resolve $h, so no failover ran and the install waited on the resolver (#3710)"; exit 1 ;;
+            esac
+          done
+
       - name: Install one package through the helper
-        id: install
         continue-on-error: true
         run: |
           set +e
           SECONDS=0
-          bash "$H/ci-apt.sh" fallback "$PKG" 2>&1 | tee /tmp/install.log
+          bash "$H/ci-apt.sh" install -y --no-install-recommends -- "$PKG" 2>&1 | tee /tmp/install.log
           rc=${PIPESTATUS[0]}
           echo "install: rc=$rc in ${SECONDS} s"
           echo "$rc $SECONDS" >/tmp/install.res
@@ -201,19 +228,42 @@ jobs:
           esac
           echo "install judged ok for $CELL (rc=$rc, $s s, $errors ::error)"
 
-      - name: "The probe asks the names apt uses (#3710)"
-        if: always() && matrix.cell == 'arm64-names'
+      - name: ci-apt.sh reach --containers
         run: |
-          want=$(bash "$H/ci-apt-fault.sh" source-hosts | tr '\n' ' ')
-          probed=$(grep -m1 'ci-apt: system resolver:' /tmp/prepare.log | sed 's/.*system resolver://; s/=[^ ]*//g')
-          echo "apt's sources name:   $want"
-          echo "the helper probed:   $probed"
-          for h in $want; do
-            case " $probed " in
-              *" $h "*) ;;
-              *) echo "::error title=ci-apt self-test::the helper probed [$probed ] but apt's sources name [$want]: its probe passed while apt could not resolve $h, so no failover ran and the install waited on the resolver (#3710)"; exit 1 ;;
-            esac
-          done
+          set +e
+          SECONDS=0
+          bash "$H/ci-apt.sh" reach --containers 2>&1 | tee /tmp/reach.log
+          rc=${PIPESTATUS[0]}
+          errors=$(grep -c '^::error' /tmp/reach.log || true)
+          echo "reach: rc=$rc in ${SECONDS} s, $errors ::error"
+          if [ "$CELL" = all-dead ]; then
+            [ "$rc" -ne 0 ] && [ "$errors" -eq 1 ] && [ "$SECONDS" -le 120 ] || { echo "::error title=ci-apt self-test::reach must fail within its bound with exactly one ::error here"; exit 1; }
+          else
+            [ "$rc" -eq 0 ] && grep -q 'resolvers in use' /tmp/reach.log || { echo "::error title=ci-apt self-test::reach failed (rc=$rc)"; exit 1; }
+          fi
+
+      - name: "apt-seed-install as release-setup calls it (healthy: the wiring; all dead: Q7)"
+        # The wizard lane's own family and package list, on the two images that
+        # lane runs on. Healthy, it must install. With every resolver dead it
+        # can only install from the restored seed, offline: whether it does is
+        # what Q7 of #3710 asks, so that outcome is read, not required.
+        if: matrix.runner != 'ubuntu-22.04' && (matrix.cell == 'healthy' || matrix.cell == 'all-dead')
+        id: seed
+        continue-on-error: ${{ matrix.cell == 'all-dead' }}
+        uses: ./.github/actions/apt-seed-install
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: ${{ matrix.runner == 'ubuntu-22.04-arm' && 'setup-linux-arm64' || 'setup-linux' }}
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+
+      - name: "Q7: read apt-seed-install's outcome"
+        if: matrix.runner != 'ubuntu-22.04' && (matrix.cell == 'healthy' || matrix.cell == 'all-dead')
+        run: |
+          echo "apt-seed-install on ${{ matrix.runner }}, cell $CELL: ${{ steps.seed.outcome }}"
+          if [ "$CELL" = healthy ]; then
+            pkg-config --exists webkit2gtk-4.1 || { echo "::error title=ci-apt self-test::apt-seed-install reported success but webkit2gtk-4.1 is missing"; exit 1; }
+          fi
 
       - name: "The stand-in fails and leaves the action nothing to save"
         if: matrix.cell == 'all-dead'
@@ -224,16 +274,38 @@ jobs:
           echo "stand-in failed as it must, in ${SECONDS} s"
           [ ! -e ~/cache-apt-pkgs ] || { echo "::error title=ci-apt self-test::~/cache-apt-pkgs survived: the action would save a failed install"; exit 1; }
 
-      - name: "D2: does a container started after the failover reach the mirror?"
+      - name: "Q4: the cached-apt action, missing, in front of the stand-in"
+        # A key no run has saved, so the action takes its cold path into the
+        # stand-in, which cannot reach a mirror. Question: does the step still
+        # exit 0 (lib.sh's `set +e`), and does it save nothing?
+        if: matrix.cell == 'all-dead'
+        id: q4
+        continue-on-error: true
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: hello
+          version: ci-apt-selftest-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+
+      - name: "Q4: read the outcome"
+        if: matrix.cell == 'all-dead'
+        run: |
+          echo "cache-apt-pkgs-action outcome with the stand-in failing: ${{ steps.q4.outcome }}"
+          [ "${{ steps.q4.outcome }}" = success ] || echo "::warning title=ci-apt self-test::the cached-apt action's step FAILED when its install failed: a caller without continue-on-error stops there"
+          ! dpkg -s "$PKG" >/dev/null 2>&1 || { echo "::error title=ci-apt self-test::$PKG installed with every resolver dead"; exit 1; }
+
+      - name: "D2: a container started after the failover"
         if: matrix.cell == 'runner-dead'
         run: |
-          docker run --rm ubuntu:24.04 sh -c 'echo "--- resolv.conf"; cat /etc/resolv.conf; timeout 90 apt-get update -qq 2>&1 | tail -3' | tee /tmp/ctr-after.log
-          if grep -q 'Temporary failure resolving\|Could not resolve' /tmp/ctr-after.log; then
-            echo "D2 after failover: the container did NOT reach the mirror; with --dns:"
-            docker run --rm --dns 1.1.1.1 --dns 8.8.8.8 ubuntu:24.04 sh -c 'timeout 90 apt-get update -qq 2>&1 | tail -3'
-          else
-            echo "D2 after failover: the container reached the mirror"
+          bash "$H/ci-apt-fault.sh" container-reach | tee /tmp/ctr-after.log
+          if grep -q REACHED=no /tmp/ctr-after.log; then
+            echo "D2: the container did not take the failover; with --dns:"
+            bash "$H/ci-apt-fault.sh" container-reach --dns 1.1.1.1 --dns 8.8.8.8
           fi
+          echo "D2 summary on ${{ matrix.runner }}: before the failover $(grep -o 'REACHED=.*' /tmp/ctr-before.log), after it $(grep -o 'REACHED=.*' /tmp/ctr-after.log)"
+
+      - name: "deb-bare-check after the failover: the same package passes"
+        if: matrix.cell == 'runner-dead'
+        run: timeout -k 10 300 bash scripts/deb-bare-check.sh --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb
 
       - name: The fault was hit while the cell ran
         if: always() && matrix.cell != 'healthy'

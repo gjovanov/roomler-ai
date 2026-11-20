@@ -107,7 +107,9 @@ chmod +x "$STUB"/*
 
 # --- fixtures: the three runner images' apt sources ---------------------------
 # Copied from the self-test's healthy cells (the `image facts` step logs each
-# image's sources whole), so a change of image shows up here as a diff.
+# image's sources whole; read on run 44673192052: ubuntu26 20261111.196.1,
+# ubuntu22 20261116.365.1, ubuntu22-arm64 20261111.190.1). The deb822 file's
+# comment and Signed-By/Components lines are abridged.
 fixture() { # <name> -> $ROOT/fx/<name>/etc/apt
   local d="$ROOT/fx/$1/etc/apt"
   mkdir -p "$d/sources.list.d"
@@ -135,16 +137,21 @@ https://archive.ubuntu.com/ubuntu/	priority:2
 https://security.ubuntu.com/ubuntu/	priority:3
 EOF
 cat >"$FX_2604/sources.list.d/microsoft-prod.list" <<'EOF'
-deb [arch=amd64,armhf,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main
+deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/26.04/prod resolute main
 EOF
 
 FX_2204=$(fixture ubuntu-2204)
 cat >"$FX_2204/sources.list" <<'EOF'
 deb mirror+file:/etc/apt/apt-mirrors.txt jammy main restricted
-# deb-src http://archive.ubuntu.com/ubuntu/ jammy main restricted
 deb mirror+file:/etc/apt/apt-mirrors.txt jammy-updates main restricted
 deb mirror+file:/etc/apt/apt-mirrors.txt jammy universe
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy-updates universe
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy multiverse
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy-updates multiverse
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy-backports main restricted universe multiverse
 deb mirror+file:/etc/apt/apt-mirrors.txt jammy-security main restricted
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy-security universe
+deb mirror+file:/etc/apt/apt-mirrors.txt jammy-security multiverse
 EOF
 cat >"$FX_2204/apt-mirrors.txt" <<'EOF'
 http://azure.archive.ubuntu.com/ubuntu/	priority:1
@@ -152,19 +159,31 @@ https://archive.ubuntu.com/ubuntu/	priority:2
 https://security.ubuntu.com/ubuntu/	priority:3
 EOF
 cat >"$FX_2204/sources.list.d/microsoft-prod.list" <<'EOF'
-deb [arch=amd64,armhf,arm64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main
+deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main
 EOF
 
 FX_ARM=$(fixture ubuntu-2204-arm)
 cat >"$FX_ARM/sources.list" <<'EOF'
-deb http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted
-deb http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted
-## deb-src http://ports.ubuntu.com/ubuntu-ports/ jammy universe
-deb http://ports.ubuntu.com/ubuntu-ports/ jammy universe
-deb http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted
+deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted
+deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted
+deb http://ports.ubuntu.com/ubuntu-ports jammy universe
+deb http://ports.ubuntu.com/ubuntu-ports jammy-updates universe
+deb http://ports.ubuntu.com/ubuntu-ports jammy multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-updates multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted
+deb http://ports.ubuntu.com/ubuntu-ports jammy-security universe
+deb http://ports.ubuntu.com/ubuntu-ports jammy-security multiverse
 EOF
 cat >"$FX_ARM/sources.list.d/microsoft-prod.list" <<'EOF'
-deb [arch=amd64,armhf,arm64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main
+deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main
+EOF
+# The arm64 image HAS this file, naming the amd64 trio, and no source names it:
+# reading it is how the probe tested the wrong names until #3710.
+cat >"$FX_ARM/apt-mirrors.txt" <<'EOF'
+http://azure.archive.ubuntu.com/ubuntu/	priority:1
+https://archive.ubuntu.com/ubuntu/	priority:2
+https://security.ubuntu.com/ubuntu/	priority:3
 EOF
 
 # Shapes no image ships today, each a parsing rule.
@@ -190,6 +209,8 @@ FX_EMPTY=$(fixture empty)
 
 # --- per-case harness ----------------------------------------------------------
 # run_case NAME FIXTURE ARCH -- COMMAND...   sets OUT (stdout+stderr) and RC.
+# The helper's globals are set in its sourced scope, which shellcheck does not follow.
+# shellcheck disable=SC2034
 run_case() {
   CASE=$1 fx=$2 arch=$3
   shift 4
