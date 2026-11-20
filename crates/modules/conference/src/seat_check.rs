@@ -28,13 +28,16 @@
 //!   [`READ_TIMEOUT`], only its refusal ends the seat, and an admission
 //!   ([`GUARD_ADMITS`]), a failure or no answer keeps it. The reads pick the
 //!   seats to ask about; the guard's own answer decides. A seat ends the way
-//!   a withdrawal that reached it ends
-//!   (`revoke::withdraw_these_seats_here`): its connections hear
-//!   `room:call_ended` with `reason: "not_a_member"`, everyone left hears
-//!   `media:peer_left`. Then the call's books, as a hang-up's: the person's
-//!   open call sessions close, and a call they were the last one in ends. Each
-//!   step finds nothing to do where the pod that took the membership's end did
-//!   it already, so nothing counts twice.
+//!   a withdrawal that reached it ends (`revoke::withdraw_these_seats_here`),
+//!   for each connection still holding the seat the pass read (the same
+//!   person, the same send transport, which every join makes anew), so a
+//!   rejoin since stays: the connection hears `room:call_ended` with
+//!   `reason: "not_a_member"`, everyone left hears `media:peer_left`. Then the
+//!   call's books, as a hang-up's: the person's open call sessions close, and
+//!   the call is settled once (by `call::finalize_call_leave_db` when it
+//!   closed their last session, else here), so a call they were the last one
+//!   in ends. Where the pod that took an org membership's end settled the
+//!   call already, this pod's settle repeats the same count.
 //! - A read that fails, breaks off or is late changes nothing; from the
 //!   [`FAILED_READS_TO_WARN`]th in a row each one warns. A document that does
 //!   not decode fails no read: the seats it bears on get no verdict
@@ -72,6 +75,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bson::{Bson, Document, doc, oid::ObjectId};
+use mediasoup::prelude::{Transport as _, TransportId};
 use mongodb::options::{ReadPreference, SelectionCriteria};
 use roomler_ai_db::models::RoomVisibility;
 use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
@@ -249,17 +253,22 @@ pub(crate) fn spawn(state: &ConferenceState) {
     });
 }
 
+/// A connection seated on this pod, with the seat it held when the pass
+/// looked: its send transport's id, which every join makes anew, so a rejoin
+/// on the same connection is another seat.
+type HeldSeat = (String, TransportId);
+
 /// The seats this pod serves, each person in each room with their
-/// connections, read into owned values: no guard of the room manager
-/// outlives this call.
-fn seats_here(state: &ConferenceState) -> HashMap<SeatKey, Vec<String>> {
-    let mut seats: HashMap<SeatKey, Vec<String>> = HashMap::new();
+/// connections and the seat each holds, read into owned values: no guard of
+/// the room manager outlives this call.
+fn seats_here(state: &ConferenceState) -> HashMap<SeatKey, Vec<HeldSeat>> {
+    let mut seats: HashMap<SeatKey, Vec<HeldSeat>> = HashMap::new();
     for room in state.room_manager.rooms_ref().iter() {
         for seat in room.participants.iter() {
             seats
                 .entry((*room.key(), seat.value().user_id))
                 .or_default()
-                .push(seat.key().clone());
+                .push((seat.key().clone(), seat.value().send_transport.id()));
         }
     }
     seats
@@ -286,8 +295,9 @@ pub struct SeatRead {
     pub verdicts: Vec<Verdict>,
     /// Why the read failed, when it did: then there is no verdict at all.
     pub failed: Option<String>,
-    /// Each person in each room, with the connections the pass saw them on.
-    seats: HashMap<SeatKey, Vec<String>>,
+    /// Each person in each room, with the connections the pass saw them on
+    /// and the seat each held.
+    seats: HashMap<SeatKey, Vec<HeldSeat>>,
     /// The org of each room the read found a document for.
     tenants: HashMap<ObjectId, ObjectId>,
 }
@@ -392,11 +402,13 @@ pub async fn end_seats(
                 continue;
             }
         };
-        let conns = read.seats.get(&verdict.key).cloned().unwrap_or_default();
+        let seats = read.seats.get(&verdict.key).cloned().unwrap_or_default();
         let closed =
-            crate::revoke::withdraw_these_seats_here(state, room_id, user_id, &conns).await;
+            crate::revoke::withdraw_these_seats_here(state, room_id, user_id, &seats).await;
         if closed.is_empty() {
-            // Closed meanwhile: a hang-up, or a withdrawal that came late.
+            // Nothing the pass read is left: closed meanwhile (a hang-up, a
+            // withdrawal that came late), or taken again since (a rejoin),
+            // and a seat taken since is the next passes' to judge.
             continue;
         }
         warn!(

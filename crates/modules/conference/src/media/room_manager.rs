@@ -1269,6 +1269,36 @@ pub fn media_codecs() -> Vec<RtpCodecCapability> {
     ]
 }
 
+impl RoomManager {
+    /// Removes ONE connection's media state while it still holds the seat a
+    /// reader saw: the same person on it, and the same send transport, which
+    /// every join makes anew (`create_transports`). One `remove_if` decides
+    /// and removes under one shard lock, so a seat taken on the connection
+    /// since, a rejoin, stays. The seat check ends the seats it read this way
+    /// (`seat_check`, through `revoke::withdraw_these_seats_here`). Returns
+    /// whether an entry was removed.
+    pub fn close_participant_seat(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        user_id: &ObjectId,
+        seat: &TransportId,
+    ) -> bool {
+        let removed = self.rooms.get(room_id).is_some_and(|room| {
+            room.participants
+                .remove_if(connection_id, |_, p| {
+                    &p.user_id == user_id && p.send_transport.id() == *seat
+                })
+                .is_some()
+        });
+        if removed {
+            self.connection_rooms.remove(connection_id);
+            debug!(?room_id, %connection_id, "participant media closed (seat-checked)");
+        }
+        removed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! FR-127 P1.1 — the meeting that froze a pod (2026-10-27).
@@ -1757,6 +1787,53 @@ mod tests {
                     "the person's own close left the seats {seats:?}, expected the other's alone"
                 )),
             }
+        });
+    }
+
+    /// `close_participant_seat` closes a connection's seat only while it is
+    /// the one a reader saw. After a rejoin on the same connection (a new send
+    /// transport), the old seat's close reports false and keeps the new seat,
+    /// as does a close of it as someone else; the new seat's own close
+    /// reports true.
+    #[test]
+    fn a_close_of_a_seat_taken_again_on_its_connection_reports_false_and_keeps_it() {
+        on_two_threads(|| async {
+            let rm = manager().await?;
+            let rid = ObjectId::new();
+            rm.create_room(rid).await.map_err(|e| e.to_string())?;
+            let person = ObjectId::new();
+            let seat_now = || rm.participant(&rid, &conn(0), |p| p.send_transport.id());
+            let held = || {
+                rm.holds_seat(&rid, &conn(0), &person)
+                    && rm.get_connection_room(&conn(0)) == Some(rid)
+            };
+            rm.create_transports(rid, person, conn(0), true)
+                .await
+                .map_err(|e| format!("join: {e}"))?;
+            let read = seat_now().ok_or("the seat a reader saw")?;
+            rm.create_transports(rid, person, conn(0), true)
+                .await
+                .map_err(|e| format!("re-join: {e}"))?;
+            let new = seat_now().ok_or("the new seat")?;
+            if new == read {
+                return Err("a rejoin kept its send transport".into());
+            }
+            if rm.close_participant_seat(&rid, &conn(0), &person, &read) {
+                return Err("the seat a reader saw closed the seat taken since".into());
+            }
+            if rm.close_participant_seat(&rid, &conn(0), &ObjectId::new(), &new) {
+                return Err("a close of the new seat as someone else reported a close".into());
+            }
+            if !held() {
+                return Err("a close that reported false changed the new seat".into());
+            }
+            if !rm.close_participant_seat(&rid, &conn(0), &person, &new) {
+                return Err("the new seat's own close reported none".into());
+            }
+            if held() || rm.get_connection_room(&conn(0)).is_some() {
+                return Err("the closed seat is still held".into());
+            }
+            Ok(())
         });
     }
 }

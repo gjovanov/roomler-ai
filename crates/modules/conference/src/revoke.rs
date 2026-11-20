@@ -364,25 +364,25 @@ pub(crate) async fn withdraw_seats_here(
     closed
 }
 
-/// End the seats `conns` of `user_id` in `room_id`'s media on this pod, those
-/// of them it still holds as that person's, and tell everyone as
-/// [`withdraw_seats_here`] does. The seat check's way to end the seats it
-/// read: a seat taken after its read, such as a person added back who joins
-/// again, is not one of `conns`. Returns the closed connections.
+/// End the seats `seats` of `user_id` in `room_id`'s media on this pod: each
+/// connection whose seat is still the one the seat check read (the same
+/// person, the same send transport), and tell everyone as
+/// [`withdraw_seats_here`] does. A seat taken after the read, a rejoin on the
+/// same connection included, stays. Returns the closed connections.
 pub(crate) async fn withdraw_these_seats_here(
     state: &ConferenceState,
     room_id: ObjectId,
     user_id: ObjectId,
-    conns: &[String],
+    seats: &[(String, mediasoup::prelude::TransportId)],
 ) -> Vec<String> {
-    let closed: Vec<String> = conns
+    let closed: Vec<String> = seats
         .iter()
-        .filter(|conn| {
+        .filter(|(conn, seat)| {
             state
                 .room_manager
-                .close_participant_of_user(&room_id, conn, &user_id)
+                .close_participant_seat(&room_id, conn, &user_id, seat)
         })
-        .cloned()
+        .map(|(conn, _)| conn.clone())
         .collect();
     tell_seats_withdrawn(state, room_id, user_id, &closed).await;
     closed

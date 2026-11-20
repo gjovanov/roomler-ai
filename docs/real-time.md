@@ -689,7 +689,7 @@ it was rolled back. Two nets now catch it, and neither catches everything:
   it: `consume` holding an `Option<RefMut>` across its awaits passed clippy. Read what the
   await needs into owned values first, and `rooms_ref()` is crate-private so every caller
   is behind the same gate.
-- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1528`). A burst of
+- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1558`). A burst of
   joins, publishes, consumes and view reports in one room, behind a watchdog: on the old
   code both threads park in dashmap's lock and the test fails at 60 s, and the review's
   `Option<RefMut>` variant froze it too. Fixed, the conference unit suite finishes in under
