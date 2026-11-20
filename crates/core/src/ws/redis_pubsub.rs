@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::redis_conn::{RedisBounds, RedisConnection, bound_ms};
-use super::sub_probe::ProbeSettings;
+use super::sub_probe::{Lifetime, ProbeSettings, Prober, Subscriber};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -391,25 +391,32 @@ return 0
     /// whether a subscription is currently established — read by
     /// `/health/ready`.
     ///
-    /// #3952 — `publisher` is the shared command connection a probe goes out
-    /// on, and `probe` how often (S0: taken, not used yet).
+    /// #3952 — the subscription probes its own connection over `publisher`,
+    /// the shared command connection, every `probe`
+    /// (`crate::ws::sub_probe`). A deaf one is dropped and subscribed again,
+    /// and `alive` reads false from the verdict to the new subscription. The
+    /// connect and each subscribe are bounded by `publisher`'s bounds.
     pub fn subscribe_with_reconnect(
         redis_url: String,
         tx: broadcast::Sender<String>,
         alive: Arc<AtomicBool>,
-        _publisher: RedisConnection,
-        _probe: ProbeSettings,
+        publisher: RedisConnection,
+        probe: ProbeSettings,
     ) {
         tokio::spawn(async move {
+            let mut prober = Prober::new(Subscriber::Fanout, publisher, probe);
             let mut backoff_secs = 1u64;
             loop {
-                match Self::run_subscription(&redis_url, &tx, &alive).await {
-                    Ok(()) => {
+                match Self::run_subscription(&redis_url, &tx, &alive, &mut prober).await {
+                    Ok(Lifetime::Ended) => {
                         // A live subscription ended (Redis restart / network
                         // blip) — retry promptly.
                         backoff_secs = 1;
                         warn!("Redis Pub/Sub subscription stream ended; reconnecting");
                     }
+                    // Deaf: the verdict wrote its own line. Retry promptly,
+                    // as for any subscription that was established.
+                    Ok(Lifetime::Deaf) => backoff_secs = 1,
                     Err(e) => {
                         warn!("Redis Pub/Sub subscribe failed: {e}; retrying in {backoff_secs}s");
                     }
@@ -422,23 +429,24 @@ return 0
     }
 
     /// One subscription lifetime: connect, subscribe, pump messages until the
-    /// stream ends. `Ok(())` = the subscription was established and later
-    /// ended; `Err` = it never got established.
+    /// stream ends or the probe finds the connection deaf. `Ok` = the
+    /// subscription was established, and how it ended; `Err` = it never got
+    /// established.
     async fn run_subscription(
         redis_url: &str,
         tx: &broadcast::Sender<String>,
         alive: &AtomicBool,
-    ) -> Result<(), redis::RedisError> {
+        prober: &mut Prober,
+    ) -> Result<Lifetime, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let mut pubsub = client.get_async_pubsub().await?;
-        pubsub.subscribe(CHANNEL_NAME).await?;
+        let subscription = prober.subscribe(&client, &[CHANNEL_NAME], &[]).await?;
         alive.store(true, Ordering::Relaxed);
-        info!("Redis Pub/Sub subscribed to channel: {}", CHANNEL_NAME);
-
-        use futures::StreamExt;
-        let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
-            match msg.get_payload::<String>() {
+        info!(
+            probe_ms = prober.interval_ms(),
+            "Redis Pub/Sub subscribed to channel: {}", CHANNEL_NAME
+        );
+        Ok(prober
+            .run(subscription, |msg| match msg.get_payload::<String>() {
                 Ok(payload) => {
                     // broadcast::send only fails if there are no receivers,
                     // which is fine — it means no one is listening yet.
@@ -447,9 +455,8 @@ return 0
                 Err(e) => {
                     error!("Failed to decode Redis Pub/Sub payload: {}", e);
                 }
-            }
-        }
-        Ok(())
+            })
+            .await)
     }
 
     /// #3840 — [`RedisPubSub::new`] with the URL and the bounds of the
