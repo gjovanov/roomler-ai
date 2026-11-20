@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3988`, `crates/agent-core/src/config.rs:4434`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3988`, `crates/agent-core/src/config.rs:4477`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -569,32 +569,63 @@ Enrollment successful. Agent id: …
 ### "The host must be re-enrolled" — when to believe it
 
 Re-enrolling is **destructive**: removal is final, and a re-enrolled device
-never gets its old overlay address back. So the one log line that prescribes it
-has to be true whenever it appears. Since FR-66 it is: `roomlerd` reads its
+never gets its old overlay address back. So the log lines that prescribe it
+have to be true whenever they appear. Since FR-66 they are: `roomlerd` reads its
 `config.toml` two ways, and which one a caller uses states whether a missing
 file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3579`) |
-| `config::read_if_present` (`:3570`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3613`, `:3621`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`:3652`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
     Q["a caller needs config.toml"] --> A{"is 'no file' a normal answer<br/>for THIS caller?"}
     A -->|"yes — an optional-flag probe,<br/>a first enrollment"| P["read_if_present<br/>→ None · debug at most"]
     A -->|"no — the config the<br/>process runs on"| L["load"]
-    L --> T{"live file parses?"}
+    L --> T{"live file loads?"}
     T -->|"yes"| OK["the config"]
     T -->|"no"| V{"config.toml.prev parses?"}
-    V -->|"yes"| R["promoted to live<br/>ERROR 'RECOVERED' — no action needed"]
-    V -->|"no"| E["ERROR 'the host must be re-enrolled'<br/>— believe it"]
+    V -->|"yes"| W{"was the live file there?<br/>(the read's own error)"}
+    W -->|"no — NotFound"| RM["promoted to live<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
+    W -->|"yes"| R["promoted to live<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
+    V -->|"no"| X{"was the live file there?<br/>(the read's own error)"}
+    X -->|"no — NotFound"| EM["the load fails<br/>ERROR 'config missing … must be enrolled (again)'<br/>— believe it"]
+    X -->|"yes"| E["the load fails<br/>ERROR 'config unreadable … must be re-enrolled'<br/>— believe it"]
 ```
+
+The recovery's line says what happened to the live file (#4058). Both are ERROR: either way the
+host now runs on an older config, and that must never look like a normal boot.
+
+| The live file | ERROR line | Where |
+|---|---|---|
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3581` |
+| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3589` |
+
+"Not there" is read off the read's own error (`not_found`, `:3821`), never off an `exists()`
+that could race the read, and a parse error is never read as missing. Before #4058 a live file
+that a person or a test had removed took the second line, which named a truncation that never
+happened.
+
+With no usable previous copy the load fails with the live file's own error, and its line tells
+the same two cases apart (#4102). Both stay ERROR and keep their advice, because this is the
+config the process runs on (FR-66). The missing line's words also fit a device that was never
+enrolled. Both lines carry `path`, `error` (the live file's), `prev` and `prev_error` (why the
+copy could not be used).
+
+| The live file | ERROR line | Where |
+|---|---|---|
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3613` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3621` |
+
+Before #4102 both took the second line, so a device with no config at all, such as one never
+enrolled where `roomlerd org ls` ran, was told its config was unreadable.
 
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1143`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1270`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -614,7 +645,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
 (`record_clean_run_at`, `:2570`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4352`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4429`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -626,7 +657,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4097`):
+ignores (`serialise_for`, `:4249`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -652,14 +683,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3929`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4055`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3997`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3981`), never one read off the entry on disk. A newer build's
+`:4123`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4107`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -680,11 +711,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4075`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4201`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4163`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4395`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -862,7 +893,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4721`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4764`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -1609,7 +1640,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1941`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1956`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7816`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7849`)
 pin the role per command and the end line of a failure.
@@ -1908,7 +1939,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3133-3140`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3138-3145`).
 
 ### What a bare host needs (#3204)
 
@@ -2197,7 +2228,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3463`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2301,6 +2332,23 @@ platform UUID, and on a virtual Mac its `en0` address too, since a cloned VM
 keeps the original's UUID. So a reinstall finds its row however the network has
 renamed the Mac. Unticked, the wizard installs the per-user half alone. The
 two privacy grants below remain the person's; the Done page says so.
+
+**A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
+it offers the device install, the wizard asks the root daemon over the person
+socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
+answers `status` (`crates/localapi/src/lib.rs:3683-3685`) with
+`gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
+Welcome page says "This Mac is one device already", Continue stays off for every
+device card, and pairing start and the install's preflight refuse with the same
+words, so no token is asked for (`agents/roomler-setup/src/reinstall_guard.rs`).
+Before the guard, a wizard run over a Mac the terminal had made one row left three
+rows: the root half enrolled again under the hardware id, where the script had
+used a derived one, and the person's half made a row that never came online
+(FR-141 P0, cell M5). Only a socket root serves is believed, and the read is
+bounded to 3 s. A Mac whose root daemon does not answer reads as before: unknown
+is never one row. The tunnel client can still be installed. The server's
+`wizard_reinstall_guard` turns the guard off; it is on by default, and the wizard
+reads anything but a JSON `false` as on (`agents/roomler-setup/src/features.rs`).
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
@@ -2441,7 +2489,7 @@ that person's own process: `roomlerd one-row-home <verb>`, the package's binary
 (`/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`), which root starts with the
 person's uid, primary gid and no other group, an empty environment and `/` as its folder,
 one per account in uid order, 30 s each, and which checks its own identity before it
-touches anything (`agents/roomlerd/src/one_row.rs:2885`,
+touches anything (`agents/roomlerd/src/one_row.rs:3009`,
 `agents/roomlerd/src/one_row_home.rs:3-60`). Root keeps its own copies and records in
 its own tree: `/etc/roomler/config.toml.pre-one-row` and `/etc/roomler/one-row/`
 (root:wheel 700, files 600: `root.json` and one folder per uid, its `record.json`
@@ -2467,9 +2515,11 @@ sequenceDiagram
     C-->>R: the new config's sha256, the plist removed
     R->>R: kickstart -k, then within 60 s connected, worker attached, screen-capture
     alt a step or the verify fails
+        R->>R: root's file back
         R->>C: put-back, for every person started
-        R->>D: bootstrap gui/uid
-        R->>R: root's file back, restart, then the records go
+        R->>R: the restart, if the conversion restarted, until it answers
+        R->>D: bootstrap gui/uid once the old screen worker is gone, then kickstart without -k
+        R->>R: then the records go
     end
 ```
 
@@ -2477,8 +2527,10 @@ Once it goes ahead it can't be stopped halfway: a detached copy of it applies th
 so it outlives the restart of the daemon that carried a `roomler exec`, and a Ctrl-C
 ends only the command that waits for it. Its account also goes to
 `/var/log/roomler/one-row.log`. `sudo roomlerd one-row --revert` puts back
-every copy, the plist and the LaunchAgent, and restarts: two rows again, until a person
-deletes a retired row, whose token then cannot come back. Root's file goes back first;
+every copy and the plist, and restarts: two rows again, until a person deletes a retired
+row, whose token then cannot come back. The LaunchAgent comes last, as in the undo: only
+once the restart has answered and the one-row screen worker, which holds the person's
+single-instance lock, has stopped is it bootstrapped and then kickstarted (#4092). Root's file goes back first;
 then each person in uid order, by that person's own process: `put-back` from root's
 records, or `put-back-legacy`, which renames back the copies an older release kept in
 the person's folder. A person who fails is named and keeps their record, the others go
@@ -2696,7 +2748,7 @@ console user are skipped and every root row runs as on any install
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
-| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:2885`, `agents/roomlerd/src/one_row_home.rs:3-60` |
+| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3009`, `agents/roomlerd/src/one_row_home.rs:3-60` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:143` |
 
 - **`sudo roomlerd one-row` writes nothing in a home as root (FR-147).** A home whose
@@ -2774,7 +2826,7 @@ console user are skipped and every root row runs as on any install
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
     (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1152-1194`,
     started by `--revert` where that person's `read` reports them,
-    `agents/roomlerd/src/one_row.rs:2185`), the command stages first and
+    `agents/roomlerd/src/one_row.rs:2293`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
     sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
     '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
@@ -2948,7 +3000,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5513`).
+(`crates/localapi/src/lib.rs:5649`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -2977,7 +3029,7 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3463`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
 read-only and refuses to set by name (`localapi::person_may`, `:3551`). Whether
 the console user should flip those from the app is the decision left open on
@@ -3298,7 +3350,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3131-3132`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3136-3137`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 

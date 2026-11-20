@@ -84,7 +84,15 @@ under both:
 
 :::steps
 1. **Screen & System Audio Recording** — without it, capture returns the desktop picture and nothing else.
-2. **Accessibility** — without it, your keyboard and mouse input is dropped on the floor.
+2. **Accessibility**, which macOS 27 calls **Device Control and Data Access** — without it, your keyboard and mouse input is dropped on the floor.
+:::
+
+:::note Turn on roomlerd, not Roomler
+A **Roomler** entry, if a list shows one, is the menu-bar app, and its toggle
+changes nothing. On macOS 27, Privacy & Security has no Accessibility row: the
+input grant is listed under **Device Control and Data Access**. The
+**Accessibility** page in the sidebar is a different one, for assistive
+settings.
 :::
 
 You do not have to hunt for these. The **Roomler menu-bar app** names whichever
@@ -162,6 +170,6 @@ the mesh address.
 ## Troubleshooting
 
 - **Screen is the wallpaper and nothing else** → the Screen Recording grant. See above.
-- **Clicks and keys do nothing** → the Accessibility grant.
+- **Clicks and keys do nothing** → the Accessibility grant (Device Control and Data Access on macOS 27).
 - **The Mac is missing from `roomler peers`** → you installed the user half only. Add the root half with `--daemon-token`, or enroll it (`sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml enroll … --overlay`) and run `sudo roomlerd service install --as-service`.
 - **More** → [Troubleshooting](/docs/troubleshooting/).

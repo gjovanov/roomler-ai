@@ -120,6 +120,14 @@ pub struct NetworkState {
     /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
     /// a size-capped retain sweep — see [`overlay::PairChurn`].
     pub relay_pair_churn: Arc<DashMap<String, overlay::PairChurn>>,
+    /// #2992 — nodes whose last relay request reported `derp_mux_failed`
+    /// (they cannot hold `/derp`), with when they said so. FR-115 P4c-1 does
+    /// not keep such a node's pairs on DERP: the server remembers the report
+    /// per node, because the wire carries it only on a relay request. Cleared
+    /// by the node's next request that reports `/derp` up; read with a TTL
+    /// (`overlay::DERP_REPORT_MEMORY`). Pod-local for the same reason
+    /// `relay_pair_churn` is.
+    pub derp_unservable: Arc<DashMap<ObjectId, std::time::Instant>>,
     /// FR-19 — the org-relay mint's pod-local state: minted sessions (keyed
     /// by pair), per-relay VNI cursors, the server-wide generation clock,
     /// join extras (primary-org flag, relay port) and reachability reports.
@@ -295,6 +303,7 @@ impl Module for NetworkState {
             derp_acl: Arc::new(DashMap::new()),
             derp_cancels: Arc::new(DashMap::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
+            derp_unservable: Arc::new(DashMap::new()),
             org_relay: Arc::new(org_relay::OrgRelayState::new()),
             overlay_ctrl_tx,
             ssh_audit: Arc::new(SshAuditDao::new(db)),

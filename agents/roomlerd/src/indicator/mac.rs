@@ -26,15 +26,26 @@
 //! before that is #4053's probe ([`window_device`]), a job the main thread
 //! runs too ([`on_main`]).
 //!
-//! ## When the panel takes no question (#4053)
+//! ## When the panel takes no question (#4053, #4119)
 //!
 //! A root daemon that launchd started before anyone signed in was refused by
 //! the window server, and a log-out detaches one that was served: either way
 //! its windows reach no screen for the rest of its life. So `prompt` asks
-//! [`super::panel_gate`] first: whether a probe window gets a window device,
-//! and in a root process whether another console session has started since
-//! the pump's start ([`super::console_watch`]). Its `false` is a taken
-//! panel's, and the question goes to the person's app.
+//! [`super::panel_gate`] first: in a root process, whether another console
+//! session has started since the pump's start ([`super::console_watch`]) and
+//! whether the seat has emptied or changed hands since ([`seat_looked`], from
+//! the person socket's poll), and only then whether a probe window gets a
+//! window device. Its `false` is a taken panel's, and the question goes to
+//! the person's app.
+//!
+//! #4119 — that order is load-bearing. A log-out can also KILL the
+//! window-server port, and a window made on a dead port is where AppKit ends
+//! the process with exit 0, which launchd does not relaunch: the probe itself
+//! took a two-row Mac's root half down at its first question after a log-out
+//! (0.4.228). So the session and the seat answer before any window is made,
+//! and the net ([`super::exit_net`]) is under them: an exit AppKit starts
+//! inside one of these window calls, on this thread, that our code did not
+//! choose, leaves with a code of its own, which launchd relaunches.
 //!
 //! ## The application delegate (#3164)
 //!
@@ -79,7 +90,8 @@ use objc2_foundation::{
 };
 
 use super::console_watch::ConsoleWatch;
-use super::panel_gate::{Connection, PanelGate, Screen, reads_console_session};
+use super::exit_net;
+use super::panel_gate::{Connection, PanelGate, Screen, Seat, reads_console_session};
 use super::{ConsentSender, PromptView};
 use crate::macos_quit::{self, QuitReply};
 
@@ -181,7 +193,8 @@ impl Inner {
         }
         // #4053 — not where this process cannot reach the screen now: the
         // window server refused it at the start, its connection is gone (a
-        // log-out), or another console session has started since. Asked
+        // log-out), another console session has started since, or (#4119)
+        // the seat has emptied or changed hands since. Asked
         // before the shared lock is taken, never under it: the connection's
         // read waits for the main thread, `PROBE_WAIT` at most, and the pump
         // and `dismiss` take that lock. This `false` is a taken panel's: the
@@ -301,6 +314,9 @@ fn should_terminate() -> NSApplicationTerminateReply {
                 sender = %sender_text,
                 "terminating the way AppKit does: exit 0, which launchd does not relaunch (#3164)"
             );
+            // #4119 — this exit 0 is ours (a log-out's quit from loginwindow,
+            // a quit under no supervisor): the exit net leaves it alone.
+            exit_net::exit_chosen();
             // AppKit exits as soon as this returns; the log's file layer
             // writes from its own thread, so give it a moment to keep this
             // line (a log-out's quit is diagnosed from it).
@@ -407,6 +423,14 @@ pub fn run_main_loop() -> ! {
     // leaves NSApplication half-initialised and windows behave erratically.
     app.finishLaunching();
 
+    // #4119 — the exit net (`exit_net`), in a root process only: armed before
+    // this thread's first window call (the reads below), and after launching,
+    // as `exit` runs the last-registered hook first: ahead of any launching made.
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    if exit_net::arms_in(unsafe { libc::geteuid() }) {
+        exit_net::arm();
+    }
+
     // #4053 — the panel's first reads, after `finishLaunching` and never
     // before it: whether the window server serves this process, and the
     // console session it serves. Made before PUMPING is set, so a panel that
@@ -417,6 +441,9 @@ pub fn run_main_loop() -> ! {
     let mut panel: Option<Panel> = None;
     loop {
         pump(mtm, &mut panel);
+        // #4119 — the event fetch and its dispatch, where AppKit runs what it
+        // queued (the delegate's answer to a quit included): the net's.
+        let _inside = exit_net::inside("the event fetch and dispatch");
         unsafe {
             let until = NSDate::dateWithTimeIntervalSinceNow(0.12);
             if let Some(ev) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
@@ -442,6 +469,9 @@ fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
         }
     }
 
+    // #4119 — from here on, the panel's own window: made, refreshed, read for
+    // a click, and closed. The net's (`exit_net`).
+    let _inside = exit_net::inside("the panel's window");
     let (view, dirty) = {
         let mut s = shared().lock().unwrap();
         let d = std::mem::take(&mut s.dirty);
@@ -499,15 +529,15 @@ struct Panel {
 impl Panel {
     fn new(mtm: MainThreadMarker, v: &PromptView) -> Result<Self> {
         unsafe {
-            // Top-centre of the main screen: out of the way of most content,
-            // and where a notification is expected. AppKit's origin is
-            // BOTTOM-left, so "48 px below the top" is `max_y - H - 48`.
-            let frame = NSScreen::mainScreen(mtm)
-                .map(|s| s.frame())
-                .unwrap_or(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(1440.0, 900.0),
-                ));
+            // #3999 — the top centre of the screen that holds the pointer,
+            // else of the primary (`question_screen`), as the app's prompt
+            // chooses: out of the way of most content, and where a
+            // notification is expected. AppKit's origin is BOTTOM-left, so
+            // "48 px below the top" is `max_y - H - 48`.
+            let frame = question_screen(mtm).unwrap_or(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(1440.0, 900.0),
+            ));
             let origin = NSPoint::new(
                 frame.origin.x + (frame.size.width - W) / 2.0,
                 frame.origin.y + frame.size.height - H - 48.0,
@@ -805,16 +835,19 @@ static PANEL_SCREEN: OnceLock<PanelScreen> = OnceLock::new();
 
 impl PanelScreen {
     /// The reads at the pump's start, on the main thread. A per-user process
-    /// (a two-row Mac's per-user half) makes no console reader: its gate
-    /// starts with no console session, and the connection alone decides.
+    /// (a two-row Mac's per-user half) makes no console reader and follows
+    /// no seat: its gate starts with no console session, and the connection
+    /// alone decides. A root process's gate follows the seat too (#4119).
     fn at_start(mtm: MainThreadMarker) -> Self {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let console = reads_console_session(euid).then(ConsoleWatch::console);
+        let root = reads_console_session(euid);
+        let console = root.then(ConsoleWatch::console);
         let gate = PanelGate::new(
             window_device(mtm),
             console.as_ref().and_then(ConsoleWatch::session),
-        );
+        )
+        .following_the_seat(root);
         Self { gate, console }
     }
 
@@ -829,13 +862,36 @@ impl Screen for PanelScreen {
         match MainThreadMarker::new() {
             // No caller asks from the main thread today, and one that did
             // would wait for itself through `on_main`.
-            Some(mtm) => window_device(mtm),
-            None => on_main(PROBE_WAIT, window_device).unwrap_or(Connection::NotKnown),
+            Some(mtm) => probe(mtm),
+            None => on_main(PROBE_WAIT, probe).unwrap_or(Connection::NotKnown),
         }
     }
 
     fn console_session(&self) -> Option<u64> {
         self.console.as_ref().and_then(ConsoleWatch::session)
+    }
+}
+
+/// #4119 — the probe window, unless the panel ended while the question
+/// waited for the main thread (the seat, told meanwhile by the person
+/// socket's poll): then no window is made, and the gate answers what ended
+/// it. On the main thread.
+fn probe(mtm: MainThreadMarker) -> Connection {
+    if PANEL_SCREEN.get().is_some_and(|s| s.gate.has_ended()) {
+        return Connection::NotKnown;
+    }
+    window_device(mtm)
+}
+
+/// #4119 — the person socket's look at the seat, from its poll in a root
+/// process (`person_socket::follow_the_seat`, every 5 s): a seat that empties
+/// or changes hands ends the panel for this process's life
+/// ([`PanelGate::seat_looked`]), and a look that could not tell changes
+/// nothing. Any thread: no AppKit call and no window. A look before the pump
+/// has started has no gate to tell; the gate's first look is then a later one.
+pub(crate) fn seat_looked(look: &crate::person_socket::Look) {
+    if let (Some(screen), Some(seat)) = (PANEL_SCREEN.get(), Seat::of(look)) {
+        screen.gate.seat_looked(seat);
     }
 }
 
@@ -845,7 +901,15 @@ impl Screen for PanelScreen {
 /// only with a window device, so a process the window server refused, before
 /// login or after a log-out, reads 0 or less. The panel's own window is made
 /// the same way, at each question it shows (`Panel::new`).
+///
+/// ⚠️ #4119 — a log-out that KILLS the window-server port leaves no number
+/// to read: AppKit ends the process while it makes this window (0.4.228,
+/// `_CGSCreateWindow returned 268435459`, exit 0). So the gate asks the
+/// console session and the seat first, and makes this window only when
+/// neither has changed; the net ([`exit_net`]) turns an exit begun here into
+/// one that launchd relaunches, with a code of its own.
 fn window_device(mtm: MainThreadMarker) -> Connection {
+    let _inside = exit_net::inside("the probe window");
     // SAFETY: a window made outside a window controller must not be released
     // when it closes (objc2-app-kit), and `setReleasedWhenClosed(false)` right
     // after it is made keeps that: its `Retained` releases it once, here.
@@ -867,4 +931,29 @@ fn window_device(mtm: MainThreadMarker) -> Connection {
     } else {
         Connection::Refused(number)
     }
+}
+
+/// #3999 — the frame of the screen a question opens on: the one that holds
+/// the pointer, else the primary screen, by the rule the app's prompt follows
+/// (`roomler_node_core::consent_screen`). Read on the main thread, as the app
+/// reads them. `None` with no screen at all.
+fn question_screen(mtm: MainThreadMarker) -> Option<NSRect> {
+    use roomler_node_core::consent_screen::{self, Frame, Point};
+    let frames: Vec<NSRect> = NSScreen::screens(mtm)
+        .to_vec()
+        .iter()
+        .map(|s| s.frame())
+        .collect();
+    let screens: Vec<Frame> = frames
+        .iter()
+        .map(|f| Frame {
+            x: f.origin.x,
+            y: f.origin.y,
+            w: f.size.width,
+            h: f.size.height,
+        })
+        .collect();
+    let p = objc2_app_kit::NSEvent::mouseLocation();
+    let chosen = consent_screen::choose(Point { x: p.x, y: p.y }, &screens)?;
+    frames.get(chosen).copied()
 }

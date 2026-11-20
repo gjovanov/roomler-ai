@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11407`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11408`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -513,10 +513,12 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3621`),
-not `load`: `load` self-heals — an unreadable live file logs *the host must be
-re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
-must never write the device's config as a side effect of being run.
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3652`),
+not `load`, because `load` self-heals. When the live file is unreadable and its
+`.prev` copy loads, `load` promotes that copy back over it and logs
+*RECOVERED from the previous good copy* at ERROR. When no usable copy exists, it
+logs *the host must be re-enrolled* at ERROR and fails. A diagnostic must never
+write the device's config as a side effect of being run.
 
 ## 9. Code map
 

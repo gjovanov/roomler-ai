@@ -52,7 +52,7 @@ behaviour too. Adding a transport behind the existing `RelayConn` seam (`OrgRela
 changed none of the send path, the router or the carrier plane.
 
 Which relay a pair uses is decided in this order
-([`relay_link.rs:1161`](../crates/tunnel-core/src/overlay/relay_link.rs#L1161)):
+([`relay_link.rs:1325`](../crates/tunnel-core/src/overlay/relay_link.rs#L1325)):
 
 | priority | source | why it sits there |
 |---|---|---|
@@ -88,7 +88,7 @@ the relay node for the member.
 
 ⚠️ **An unreadable policy set is a refusal, never a grant.** The mint reads policies
 through `try_load_acl`
-([`overlay.rs:2417`](../crates/modules/network/src/overlay.rs#L2417)), which returns
+([`overlay.rs:2442`](../crates/modules/network/src/overlay.rs#L2442)), which returns
 `Result`. The older `load_acl` fails open, byte-identical to "no ACL configured", and a
 gate written against it would have granted on a Mongo blip. `PolicyUnreadable` is its
 own deny reason, so a blip is never mistaken for a policy decision.
@@ -394,7 +394,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
-| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1161`, `org_request_bind` `:2055`, `commit_org_bind` `:2081` |
+| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1325`, `org_request_bind` `:2275`, `commit_org_bind` `:2301` |
 | pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:65`](../crates/api/src/cluster/metrics.rs#L65) |
 
 ## Not built

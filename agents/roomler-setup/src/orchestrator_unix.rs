@@ -341,6 +341,15 @@ async fn run_install_inner(
             )),
         ));
     }
+    // FR-141 P3 — a Mac that is one row already: nothing is installed, and the
+    // token the person brought is not used (D2-A).
+    if let Some(stop) = crate::reinstall_guard::stop(
+        os,
+        features.reinstall_guard_on(),
+        crate::reinstall_guard::one_row_here().await.as_ref(),
+    ) {
+        return Err(steps.fail(ErrorCode::Preflight, Said(stop)));
+    }
     steps.ok();
 
     // Between two steps, so a failure here is the preflight's (#3432), and

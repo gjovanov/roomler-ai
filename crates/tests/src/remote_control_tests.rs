@@ -57,7 +57,7 @@ async fn enroll_agent_full_round_trip() {
         .json(&json!({
             "enrollment_token": enrollment_token,
             "machine_id": "mach-rcflow1-A",
-            "machine_name": "Goran's Laptop",
+            "machine_name": "Casey's Laptop",
             "os": "linux",
             "agent_version": "0.1.0",
         }))
@@ -88,7 +88,7 @@ async fn enroll_agent_full_round_trip() {
         .json(&json!({
             "enrollment_token": et2["enrollment_token"].as_str().unwrap(),
             "machine_id": "mach-rcflow1-A",
-            "machine_name": "Goran's Laptop (reinstall)",
+            "machine_name": "Casey's Laptop (reinstall)",
             "os": "linux",
             "agent_version": "0.1.1",
         }))

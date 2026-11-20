@@ -326,7 +326,7 @@ fn show<R: Runtime>(
             // #3987 — placed again only when it comes up from hidden; its
             // question comes to the front either way.
             if placed_on_show(win.is_visible().ok()) {
-                position_consent(&win, w, h);
+                place_consent(&win, w, h);
             }
             note_consent_raised();
         }
@@ -388,7 +388,7 @@ fn show<R: Runtime>(
     if label == VIEWING {
         position_top_centre(&win, w);
     } else {
-        position_consent(&win, w, h);
+        place_consent(&win, w, h);
         note_consent_raised();
     }
     present(&win, focus);
@@ -761,6 +761,92 @@ pub fn click_armed(in_front: Option<Duration>) -> bool {
     in_front.is_none_or(|d| d >= CONSENT_ARMING)
 }
 
+// ── #3999: on a Mac, the screen the prompt opens on ───────────────────────
+
+/// #3999 — the consent prompt on its screen, where [`consent_origin`] puts it
+/// there. On a Mac that screen is the one holding the pointer, else the
+/// primary: the rule the daemon's own panel follows
+/// (`roomler_node_core::consent_screen`). While the pointer stays on one
+/// screen, the two open there, and the prompt keeps clear of the panel on it.
+/// Everywhere else, and on a Mac whose screens cannot be read, the primary
+/// monitor, as before ([`position_consent`]).
+fn place_consent<R: Runtime>(win: &tauri::WebviewWindow<R>, logical_w: f64, logical_h: f64) {
+    // AppKit only on the main thread. The job runs before the show that
+    // `present` queues after it: both reach the main thread in order.
+    #[cfg(target_os = "macos")]
+    {
+        let w = win.clone();
+        let queued = win.run_on_main_thread(move || {
+            if !place_on_pointer_screen(&w, logical_w, logical_h) {
+                position_consent(&w, logical_w, logical_h);
+            }
+        });
+        if queued.is_ok() {
+            return;
+        }
+    }
+    position_consent(win, logical_w, logical_h);
+}
+
+/// #3999 — on the main thread: the pointer and the screens as AppKit gives
+/// them, the screen [`roomler_node_core::consent_screen::choose`] picks, and
+/// the prompt's window moved there through AppKit. Not Tauri's monitors and
+/// positions: across screens of different scale, their pixels are not
+/// AppKit's points. `false` when the window or a screen cannot be had.
+#[cfg(target_os = "macos")]
+fn place_on_pointer_screen<R: Runtime>(win: &tauri::WebviewWindow<R>, w: f64, h: f64) -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen, NSWindow};
+    use objc2_foundation::NSPoint;
+    use roomler_node_core::consent_screen::{self, Frame, Point};
+
+    let (Some(mtm), Ok(ptr)) = (MainThreadMarker::new(), win.ns_window()) else {
+        return false;
+    };
+    let screens: Vec<Frame> = NSScreen::screens(mtm)
+        .to_vec()
+        .iter()
+        .map(|s| {
+            let f = s.frame();
+            Frame {
+                x: f.origin.x,
+                y: f.origin.y,
+                w: f.size.width,
+                h: f.size.height,
+            }
+        })
+        .collect();
+    let p = NSEvent::mouseLocation();
+    let chosen = consent_screen::choose(Point { x: p.x, y: p.y }, &screens);
+    let Some(screen) = chosen.and_then(|i| screens.get(i).copied()) else {
+        return false;
+    };
+    let (x, y) = appkit_origin(screen, w, h);
+    // SAFETY: as in `show_without_focus`.
+    let ns = unsafe { &*ptr.cast::<NSWindow>() };
+    ns.setFrameOrigin(NSPoint::new(x, y));
+    true
+}
+
+/// #3999 — where the prompt's window goes on a Mac's screen, given that
+/// screen's frame in AppKit's coordinates (its bottom-left corner, y up), as
+/// AppKit's frame origin: [`consent_origin`] on that screen, clear of where
+/// [`daemon_panel`] says the daemon's panel is, worked out with y down and
+/// turned back.
+#[cfg(any(target_os = "macos", test))]
+fn appkit_origin(screen: roomler_node_core::consent_screen::Frame, w: f64, h: f64) -> (f64, f64) {
+    // AppKit's y negated is y down: the screen's top edge at -(y + h).
+    let area = Area {
+        x: screen.x,
+        y: -(screen.y + screen.h),
+        w: screen.w,
+        h: screen.h,
+    };
+    let (x, top) = consent_origin(area, w, h, daemon_panel(area));
+    // The prompt's top edge, y down, back to its bottom-left corner, y up.
+    (x, -top - h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1187,103 @@ mod tests {
         // Only one known: that one counts.
         assert_eq!(in_front_for(None, just), just);
         assert_eq!(in_front_for(just, None), just);
+    }
+
+    /// #3999 — a frame in AppKit's coordinates, y up, as the y-down [`Area`]
+    /// that [`Area::near`] reads: y negated.
+    fn y_down(x: f64, y: f64, w: f64, h: f64) -> Area {
+        Area {
+            x,
+            y: -(y + h),
+            w,
+            h,
+        }
+    }
+
+    /// #3999 — on a Mac the prompt is placed through AppKit, on the screen
+    /// `consent_screen::choose` picks. On a secondary with an origin of its
+    /// own (right and lower, left and higher, above), it lies inside that
+    /// screen and clear of the area the daemon's panel takes there, placed as
+    /// `indicator/mac.rs` places it: the top centre, 48 down, in AppKit's y.
+    #[test]
+    fn on_a_secondary_with_its_own_origin_the_prompt_opens_on_it_clear_of_the_daemons_panel() {
+        use roomler_node_core::consent_screen::Frame;
+        let secondaries = [
+            Frame {
+                x: 1440.0,
+                y: -200.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            Frame {
+                x: -1024.0,
+                y: 300.0,
+                w: 1024.0,
+                h: 768.0,
+            },
+            Frame {
+                x: -240.0,
+                y: 900.0,
+                w: 2560.0,
+                h: 1440.0,
+            },
+        ];
+        for s in secondaries {
+            let (x, y) = appkit_origin(s, CONSENT_W, CONSENT_H);
+            assert!(x >= s.x && x + CONSENT_W <= s.x + s.w, "{s:?}: ({x}, {y})");
+            assert!(y >= s.y && y + CONSENT_H <= s.y + s.h, "{s:?}: ({x}, {y})");
+            let panel = y_down(
+                s.x + (s.w - PANEL_W) / 2.0,
+                s.y + s.h - PANEL_H - PANEL_TOP,
+                PANEL_W,
+                PANEL_H,
+            );
+            let prompt = y_down(x, y, CONSENT_W, CONSENT_H);
+            assert!(!prompt.near(panel, PANEL_GAP - 0.5), "{s:?}: ({x}, {y})");
+        }
+        // The 768-pt secondary meets the panel at its middle, like the lab's
+        // Mac: 16 below the panel, its top edge 304 below the screen's.
+        assert_eq!(
+            appkit_origin(secondaries[1], CONSENT_W, CONSENT_H),
+            (-1024.0 + 282.0, 300.0 + 768.0 - 304.0 - CONSENT_H)
+        );
+        // On the primary, the place the prompt had before #3999, in AppKit's
+        // terms: (282, 304) from the top-left of a 1024 × 768 screen.
+        let primary = Frame {
+            x: 0.0,
+            y: 0.0,
+            w: 1024.0,
+            h: 768.0,
+        };
+        assert_eq!(
+            appkit_origin(primary, CONSENT_W, CONSENT_H),
+            (282.0, 768.0 - 304.0 - CONSENT_H)
+        );
+    }
+
+    /// #3999 — the daemon's panel and the app's prompt choose their screen by
+    /// one rule: each reads the pointer and the screens from AppKit and asks
+    /// `consent_screen::choose`, whose own tests are the rule. Read from the
+    /// sources (the daemon's panel compiles only on a Mac), so a call site
+    /// that goes back to the focused window's screen fails here.
+    #[test]
+    fn the_daemons_panel_and_the_prompt_choose_their_screen_by_one_rule() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        let mac = flat(include_str!("../../roomlerd/src/indicator/mac.rs"));
+        let app = include_str!("panels.rs");
+        let app = flat(&app[..app.find("mod tests {").expect("the tests module")]);
+        for (who, src) in [("the daemon's panel", &mac), ("the app's prompt", &app)] {
+            for call in [
+                "consent_screen::choose(",
+                "NSEvent::mouseLocation()",
+                "NSScreen::screens(mtm)",
+            ] {
+                assert!(src.contains(call), "{who} does not call {call}");
+            }
+        }
+        assert!(
+            !mac.contains("NSScreen::mainScreen"),
+            "the daemon's panel: the focused window's screen"
+        );
     }
 }

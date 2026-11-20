@@ -4501,7 +4501,8 @@ async fn media_pump_vp9_444_dc(
             warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
             return;
         }
-        if send_tx.capacity() == 0 || pipeline.followers_congested() {
+        delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
@@ -4513,7 +4514,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -4521,7 +4522,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
         // software encoder cannot hold the target, take frames on an even grid
@@ -5193,8 +5194,9 @@ async fn media_pump_vp9_444_dc(
         // queue. On webrtc-rs this rarely fires (dc.send().await blocks first,
         // keeping buffered_amount low), but it's a cheap belt-and-suspenders
         // check that also preserves the shed-on-overflow behaviour.
+        // FR-148 D46 B3 — under `on`, on a relay, the budget's hold replaces it.
         let buffered = dc.buffered_amount().await as u64;
-        if buffered > dc_buffered_high {
+        if delivery.sheds(buffered > dc_buffered_high) {
             if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                 enc.set_bitrate(applied.bps).await;
                 info!(
@@ -5391,7 +5393,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, None); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -8105,7 +8107,8 @@ async fn media_pump_ffmpeg_dc(
         // produced on 2026-09-04 (662 ms and 782 ms passes with both at zero),
         // and it is why this whole block is timed rather than just its sleep.
         let gate_start = watch.start();
-        if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
+        delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
                 info!(
@@ -8162,12 +8165,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            let bp_applied = if constrained && !opener_grace_done {
-                grace_bp_skips += 1;
-                None
-            } else {
-                governor.on_backpressure_skip(std::time::Instant::now())
-            };
+            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            let in_grace = constrained && !opener_grace_done;
+            grace_bp_skips += u32::from(in_grace);
+            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
@@ -8196,7 +8197,7 @@ async fn media_pump_ffmpeg_dc(
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
         PassWatch::stop(gate_start, &mut gate_us);
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -10357,7 +10358,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, seed_age); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block
@@ -13077,7 +13078,8 @@ pub fn attach_files_handler(
     dc.on_close(Box::new(move || {
         let h = handler_for_close.clone();
         Box::pin(async move {
-            h.abort().await;
+            // #3682 — and a listing still running drops its answer.
+            h.channel_closed().await;
         })
     }));
     let handler_for_end = handler.clone();
@@ -13317,39 +13319,9 @@ async fn handle_files_control(
                 .await;
                 return;
             }
-            match crate::files::list_dir(&path).await {
-                Ok(listing) => {
-                    info!(
-                        %session_id, ?req_id,
-                        path = ?listing.path,
-                        entries = listing.entries.len(),
-                        "files: dir listed"
-                    );
-                    let parent_owned = listing.parent.clone();
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirList {
-                            req_id: &req_id,
-                            path: &listing.path,
-                            parent: parent_owned.as_deref(),
-                            entries: &listing.entries,
-                        },
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
-                    let msg = format!("{e}");
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirError {
-                            req_id: &req_id,
-                            message: &msg,
-                        },
-                    )
-                    .await;
-                }
-            }
+            // #3682 (D1-B) — never awaited here: this loop reads the
+            // channel's next message only once this one is handled.
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13390,6 +13362,73 @@ async fn handle_files_control(
                     .await;
                 }
             }
+        }
+    }
+}
+
+/// #3682 (D1-B) — a folder listing, in a task of its own. The files channel's
+/// read loop hands `files:dir` here and goes on reading, so a cancel or a
+/// chunk sent behind a listing that waits on a share is read at once. The
+/// listing is bounded as a whole and takes the channel's lane, one step at a
+/// time ([`crate::files::FilesHandler::list_dir`]). Its answer carries the
+/// request's `req_id`, which the viewer matches, so a later listing's answer
+/// may come first.
+fn spawn_dir_listing(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
+    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+}
+
+/// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
+/// or the session ends it stops and drops its answer, and it never sends on a
+/// channel that has closed. The answer's send races that end too
+/// ([`or_stopped`], #1730): after a network drop a send can park for good on
+/// a channel that still reads open, and the task kept the channel and the
+/// handler for as long as the agent ran.
+async fn answer_dir_listing<S: DownloadSink>(
+    dc: S,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
+    let closed = handler.listings_closed();
+    let listed = tokio::select! {
+        () = closed.cancelled() => return,
+        listed = handler.list_dir(&path) => listed,
+    };
+    if closed.is_cancelled() || dc.gone() {
+        return;
+    }
+    match listed {
+        Ok(listing) => {
+            info!(
+                %session_id, ?req_id,
+                path = ?listing.path,
+                entries = listing.entries.len(),
+                "files: dir listed"
+            );
+            let parent_owned = listing.parent.clone();
+            let msg = crate::files::FilesOutgoing::DirList {
+                req_id: &req_id,
+                path: &listing.path,
+                parent: parent_owned.as_deref(),
+                entries: &listing.entries,
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+        }
+        Err(e) => {
+            warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
+            let message = format!("{e}");
+            let msg = crate::files::FilesOutgoing::DirError {
+                req_id: &req_id,
+                message: &message,
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
         }
     }
 }
@@ -17786,5 +17825,128 @@ mod wire_text_log_tests {
             broken.is_empty(),
             "lines a line break from the viewer broke: {broken:#?}\n{text}"
         );
+    }
+}
+
+/// #3682 (D1-B) — a folder listing never holds the files channel's read
+/// loop. It waited there for its folder, so while a share did not answer, no
+/// later message on the channel was read: not a download's cancel, not the
+/// next request. The listing's seam is the lib's (`files::drawer_edges`), so
+/// the loopback channel is too ([`files_channel_tests::Pair`]), not the one
+/// in `tests/file_dc.rs`.
+#[cfg(test)]
+mod dir_listing_tests {
+    use super::files_channel_tests::Pair;
+    use super::*;
+    use crate::files::drawer_edges::seams;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::json;
+
+    /// Messages of other kinds, sent behind a listing whose folder's entries
+    /// do not come, are acted on at once: a cancel naming an id that is not
+    /// one plain name is refused, and a download of a file that is not there
+    /// fails, each answered while the listing still waits.
+    #[tokio::test]
+    async fn messages_behind_a_held_listing_are_acted_on_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let slow = temp.path().join("slow");
+        std::fs::create_dir(&slow).expect("a folder");
+        std::fs::write(slow.join("a.txt"), b"a").expect("a file in it");
+        let held = seams::hold_entries(&slow);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let gone = temp.path().join("not-there.txt");
+        pair.ask(&json!({"t": "files:dir", "req_id": "held", "path": slow}))
+            .await;
+        let reached = held.reached_within(Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:cancel", "id": "not/one-name"}))
+            .await;
+        pair.ask(&json!({"t": "files:get", "id": "get-1", "path": gone}))
+            .await;
+        let behind = tokio::time::timeout(Duration::from_secs(1), pair.heard(2)).await;
+        let waited = started.elapsed();
+        // The share answers: the listing's thread goes free before anything
+        // is asserted.
+        held.release();
+        let listed = pair.heard(1).await;
+        pair.close().await;
+        assert!(reached, "the listing's entries were asked for");
+        let Ok(behind) = behind else {
+            panic!("nothing behind the listing was answered within 1 s");
+        };
+        let answered: Vec<(&str, &str)> = behind
+            .iter()
+            .map(|f| {
+                (
+                    f["t"].as_str().unwrap_or(""),
+                    f["id"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        for expected in [("files:error", "not/one-name"), ("files:error", "get-1")] {
+            assert!(
+                answered.contains(&expected),
+                "{expected:?} is not in {behind:?} ({waited:?})"
+            );
+        }
+        assert_eq!(
+            listed.first().and_then(|f| f["req_id"].as_str()),
+            Some("held"),
+            "the listing answered once its folder did: {listed:?}"
+        );
+    }
+
+    /// A channel whose peer vanished after the listing found it open: the
+    /// answer's send parks for good while the channel still reads open, the
+    /// shape #1730 met in the field.
+    struct AnswerParks {
+        parked: Arc<tokio::sync::Notify>,
+    }
+
+    impl DownloadSink for AnswerParks {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A listing whose answer cannot be sent ends once its session ends. Its
+    /// send parked with nothing racing it, so the task kept the channel and
+    /// the handler for as long as the daemon lived.
+    #[tokio::test]
+    async fn a_listing_whose_answer_cannot_be_sent_ends_with_its_session() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let handler = crate::files::FilesHandler::new();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(answer_dir_listing(
+            AnswerParks {
+                parked: parked.clone(),
+            },
+            handler.clone(),
+            bson::oid::ObjectId::new(),
+            "parks".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ));
+        let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
+        handler.end_session().await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(sent.is_ok(), "the listing's answer was never sent");
+        let Ok(ended) = ended else {
+            panic!("the listing outlived its session, parked in its answer's send");
+        };
+        ended.expect("the listing's task");
     }
 }

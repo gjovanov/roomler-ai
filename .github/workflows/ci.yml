@@ -1655,11 +1655,11 @@ jobs:
       # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
       # `sudo roomlerd one-row` and the person's own child, whose plans, lines
       # and records every lane tests, on the platform they serve; the `mac`
-      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4071: and `daemon_error::` with `app::no_enrollment_exit_tests::`: a `run --supervised` with no config leaves with 78 on a Mac, the one platform where `detect_here` answers FR-43's supervisor.
+      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks). #4071: and `daemon_error::` with `app::no_enrollment_exit_tests::`: a `run --supervised` with no config leaves with 78 on a Mac, the one platform where `detect_here` answers FR-43's supervisor.
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch:: daemon_error:: app::no_enrollment_exit_tests::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch:: indicator::exit_net:: daemon_error:: app::no_enrollment_exit_tests::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only
@@ -1700,7 +1700,7 @@ jobs:
       - name: cargo test the files channel on a Mac's root daemon (#3757)
         run: |
           set -eu
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer --nocapture
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer files::drawer_edges:: --nocapture
           cargo test -p roomlerd --lib --features clipboard,enigo-input --no-run --message-format=json > /tmp/files3757.json
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
@@ -1948,11 +1948,12 @@ jobs:
       # refusal: `appdirs`' Windows tests run in no other lane.
       # #4067 — and the log uploader's, the pool's idle timeout among them: they
       # ran only on Linux.
+      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them).
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |

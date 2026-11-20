@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 use super::WgKeypair;
 use super::direct;
 use super::dns;
+use super::dns_probe;
 use super::hosts as dns_hosts;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
@@ -1287,11 +1288,12 @@ pub struct OverlayRuntime {
     /// [`with_netstack_socks`](Self::with_netstack_socks).
     netstack_socks: Option<u16>,
     /// Phase D (DERP) — a factory that OPENS this node's `/derp` WS + returns
-    /// its demux, called LAZILY by [`run`](Self::run) only when the node is
-    /// itself UDP-blocked (its srflx gather found nothing). A UDP-capable node
-    /// can never be in a both-UDP-blocked pair, so it never needs DERP — this
-    /// way it doesn't hold an idle `/derp` WS. `None` (no factory / not called)
-    /// ⇒ no DERP; the coordinator falls through to both-allocate. Set via
+    /// its demux. [`run`](Self::run) hands it to the relay coordinator, which
+    /// calls it at start only when the node is itself UDP-blocked (its srflx
+    /// gather found nothing) or its DERP floor is on, and otherwise on the
+    /// first DERP verdict that finds no mux (P7, #2992), so a UDP-capable
+    /// node holds no idle `/derp` WS. `None` (no factory) ⇒ no DERP; a DERP
+    /// verdict then reports `derp_mux_failed`. Set via
     /// [`with_derp_mux_factory`](Self::with_derp_mux_factory).
     derp_mux_factory: Option<DerpMuxFactory>,
     /// Multi-region DERP — per-URL regional mux opener (agent-provided, like
@@ -1346,8 +1348,10 @@ pub struct OverlayRuntime {
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
 /// `tokio_tungstenite`) and returns the connected [`DerpMux`]. Boxed +
-/// agent-provided so `tunnel-core` stays WebSocket-free; [`OverlayRuntime::run`]
-/// calls it AT MOST ONCE, and only for a UDP-blocked node (lazy `/derp`).
+/// agent-provided so `tunnel-core` stays WebSocket-free. Called AT MOST ONCE:
+/// [`OverlayRuntime::run`] hands it to the relay coordinator, which opens it at
+/// start for a UDP-blocked or floor-on node, and otherwise on the first DERP
+/// verdict that finds no mux (#2992).
 ///
 /// `Send + Sync`: the `run` future keeps `&self` alive across awaits and is
 /// spawned onto the multi-thread runtime, so `OverlayRuntime` (and thus this
@@ -2403,6 +2407,15 @@ impl OverlayRuntime {
         // reach our resolver (a corporate DNS-enforcement layer refusing the
         // host's own queries), put the names in the hosts file instead.
         let mut dns_ladder: Option<dns_hosts::Ladder> = None;
+        // #1363 — the OS path, MEASURED: a lookup of a name only an overlay
+        // resolver answers, on its own task (never this loop), shared by the
+        // ladder and the status. `active` is said only on its answer.
+        let mut dns_probe: Option<dns_probe::OsProbe> = None;
+        // The probe's switch (`ROOMLERD_MAGICDNS_PROBE=0`): for a host where
+        // even a backed-off lookup of the probe name is unwanted. The status
+        // then says what was attempted, never `active`. The hosts rung needs
+        // the readings, so an operator who switched it on gets the probe anyway.
+        let dns_probe_on = crate::env::flag("MAGICDNS_PROBE", true);
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2486,10 +2499,32 @@ impl OverlayRuntime {
             // FR-72 P6. Constructed even when the switch is off, because the
             // constructor is also the BOOT RECONCILER: a block left by a
             // previous process must be cleared whether or not we will write one.
-            dns_ladder = Some(dns_hosts::Ladder::new(
+            let ladder = dns_hosts::Ladder::new(
                 magic_domain.clone(),
                 crate::env::node_env("MAGICDNS_HOSTS").as_deref() == Some("1"),
-            ));
+            );
+            // #1363 — measure whenever there is something to measure: the
+            // ladder is on (it needs the probe whatever the steer's state, as
+            // it always did, and at its cadence), or the steer is written (the
+            // status needs the outcome) and the probe is not switched off.
+            // With neither, nothing points the OS at this resolver, the status
+            // names that state without a reading, and a lookup would only send
+            // the tenant's domain to the upstream DNS. A late steer starts it
+            // (the tick arm).
+            if ladder.enabled() {
+                dns_probe = Some(dns_probe::OsProbe::spawn(
+                    magic_domain.clone(),
+                    self_v4,
+                    dns_probe::Cadence::Ladder,
+                ));
+            } else if dns_probe_on && _dns_os_guard.as_ref().is_some_and(|g| g.active()) {
+                dns_probe = Some(dns_probe::OsProbe::spawn(
+                    magic_domain.clone(),
+                    self_v4,
+                    dns_probe::Cadence::Status,
+                ));
+            }
+            dns_ladder = Some(ladder);
             Some(names)
         } else {
             None
@@ -2497,6 +2532,8 @@ impl OverlayRuntime {
         // S2 — record the DNS bring-up outcome for the LocalAPI view
         // (`roomler status` / the desktop's DNS section). `answer_aaaa`
         // recomputes the same expression the resolver was configured with.
+        // #1363 — the tick arm keeps it current from here on (the bound
+        // signal, the steer, the probe's reading, the hosts rung).
         self.dns_status = dns_magic.clone().map(|magic_domain| DnsStatus {
             magic_domain,
             resolver_bound: dns_bound,
@@ -2506,7 +2543,13 @@ impl OverlayRuntime {
             os_steer_bypassed: _dns_os_guard
                 .as_ref()
                 .and_then(|g| g.bypassed().map(str::to_string)),
+            probe: Some(dns_probe::Reading::idle(dns_probe_on).to_wire()),
+            hosts_fallback: false,
         });
+        // #1363 — the resolver's bound signal as the last tick saw it, so a
+        // socket that comes back re-measures at once instead of showing the
+        // reading taken while it was gone for up to a minute.
+        let mut dns_bound_seen = dns_bound;
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
         // netstate PR-2 — subscribe to the process-wide network monitor
@@ -2577,21 +2620,16 @@ impl OverlayRuntime {
         // (the rc.393 deadlock class). One idle WSS per org; the server's
         // 30 s keepalive (#509) carries it.
         //
-        // P7 — the factory is RETAINED (moved into a local, not consumed at
-        // startup unless needed): a UDP-capable node can now be force-pinned
-        // onto DERP mid-run by the server's `OverlayForceDerp` push, and the
-        // handler invokes the factory at-most-once THEN — see the ForceDerp
-        // arm.
-        let mut derp_factory = self.derp_mux_factory.take();
+        // P7 — the factory is RETAINED, not consumed at startup unless needed:
+        // a UDP-capable node can be pinned onto DERP mid-run by the server.
+        // #2992 — the RELAY COORDINATOR holds it (`set_derp_opener` below), so
+        // every DERP verdict that finds no mux opens it there, once: the P7
+        // push, and the server's stamp on a live TURN pair or at
+        // establishment. Before, only the ForceDerp arm could reach it.
+        let derp_factory = self.derp_mux_factory.take();
         // Multi-region DERP — reusable per-URL opener for regional relays.
         let regional_derp_factory = self.regional_derp_factory.take();
-        let derp_mux = if matches!(self.mode, CarrierMode::Relay)
-            && (srflx_advertised.is_empty() || super::direct::derp_floor_enabled())
-        {
-            derp_factory.take().map(|f| f())
-        } else {
-            None
-        };
+        let open_derp_at_start = srflx_advertised.is_empty() || super::direct::derp_floor_enabled();
         let mut relay = match self.mode {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
@@ -2610,8 +2648,12 @@ impl OverlayRuntime {
                         .as_ref()
                         .map(|c| c.endpoints.clone())
                         .unwrap_or_default(),
-                    derp_mux,
+                    None,
                 );
+                r.set_derp_opener(derp_factory);
+                if open_derp_at_start {
+                    r.open_derp_mux_at_start();
+                }
                 // W6 phase-2 — the full coturn worker IP set (uncapped
                 // A-record resolve of the STUN hosts): the single-relay
                 // dialer positively identifies the anchor's relayed address
@@ -3023,11 +3065,25 @@ impl OverlayRuntime {
                     // FR-72 P6 — pick the resolution rung by measurement. Cheap
                     // (one `getaddrinfo` a minute) and it climbs back to DNS on
                     // its own, so a host that is only briefly enforced does not
-                    // keep hosts entries.
+                    // keep hosts entries. #1363: the lookup is the probe task's,
+                    // so this reads its latest reading and never waits.
+                    let dns_reading = dns_probe
+                        .as_ref()
+                        .map(dns_probe::OsProbe::reading)
+                        .unwrap_or_else(|| dns_probe::Reading::idle(dns_probe_on));
                     if let (Some(l), Some(names)) = (dns_ladder.as_mut(), dns_names.as_ref()) {
-                        l.tick(names, crate::env::node_env("DNS_AAAA").as_deref() != Some("0"))
-                            .await;
+                        l.tick(
+                            &dns_reading,
+                            names,
+                            crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+                        );
                     }
+                    // #1363 — the resolver's own bound signal, read for the
+                    // whole session (not only at its first bind).
+                    let bound_now = dns_bound_rx.as_ref().is_some_and(|rx| *rx.borrow());
+                    let came_back = bound_now && !dns_bound_seen;
+                    dns_bound_seen = bound_now;
+                    let mut steered_late = false;
                     if _dns_os_guard.is_none()
                         && let Some(rx) = dns_bound_rx.as_mut()
                         && *rx.borrow_and_update()
@@ -3039,16 +3095,44 @@ impl OverlayRuntime {
                         );
                         // The exit-DNS "." steer is gated on the same fact.
                         exit_state.dns_bound = true;
-                        self.dns_status = Some(DnsStatus {
-                            magic_domain: magic_domain.clone(),
-                            resolver_bound: true,
-                            os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
-                            upstream: dns_upstream.to_string(),
-                            answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
-                            os_steer_bypassed: _dns_os_guard
-                                .as_ref()
-                                .and_then(|g| g.bypassed().map(str::to_string)),
-                        });
+                        steered_late = true;
+                        // #1363 — the steer changed what the OS does: measure
+                        // it, now that it is written. A probe started here
+                        // waits its settle time first.
+                        match dns_probe.as_ref() {
+                            Some(p) => p.kick(),
+                            None if dns_probe_on
+                                && _dns_os_guard.as_ref().is_some_and(|g| g.active()) =>
+                            {
+                                dns_probe = Some(dns_probe::OsProbe::spawn(
+                                    magic_domain.clone(),
+                                    self_v4,
+                                    dns_probe::Cadence::Status,
+                                ));
+                            }
+                            None => {}
+                        }
+                    }
+                    if came_back
+                        && !steered_late
+                        && let Some(p) = dns_probe.as_ref()
+                    {
+                        // The socket came back: what the last reading saw
+                        // while it was gone is not the state now.
+                        p.kick();
+                    }
+                    // #1363 — the status follows what is true NOW, every tick:
+                    // the bound signal, the steer, the probe's latest reading
+                    // and the hosts rung.
+                    if let Some(st) = self.dns_status.as_mut() {
+                        dns_probe::refresh_status(
+                            st,
+                            bound_now,
+                            _dns_os_guard.as_ref().is_some_and(|g| g.active()),
+                            _dns_os_guard.as_ref().and_then(|g| g.bypassed()),
+                            &dns_reading,
+                            dns_ladder.as_ref().is_some_and(dns_hosts::Ladder::is_active),
+                        );
                     }
                     // FR-19 P4b — expire org-relay sessions past their lifetime
                     // and spawn the binds `request` decided on since the last
@@ -3403,6 +3487,17 @@ impl OverlayRuntime {
                 } => {
                     match net_evt {
                         Ok(delta) => {
+                            // #1363 — a network that materially moved (a VPN
+                            // connected, a new uplink) may send this host's
+                            // lookups somewhere else: measure the OS path again
+                            // rather than wait out a backed-off probe. netstate
+                            // publishes at most one such Major per 120 s.
+                            if delta.material
+                                && delta.severity == super::netstate::Severity::Major
+                                && let Some(p) = dns_probe.as_ref()
+                            {
+                                p.kick();
+                            }
                             // R3 — an ADDRESS/INTERFACE-classed burst (N4) is
                             // the roam signal: gate on the ONLY thing that
                             // justifies a plane rebuild — the sorted LAN IP
@@ -4264,13 +4359,10 @@ impl OverlayRuntime {
                         self.shadow(|s| s.mon.on_forced_derp(&peer_node_id, Duration::from_millis(ttl_ms), Instant::now()));
                         if let Some(r) = relay.as_mut() {
                             // P7 — a UDP-capable node skipped the startup
-                            // `/derp` open; lazily invoke the retained factory
-                            // (at-most-once) before pinning.
-                            if !r.has_derp_mux()
-                                && let Some(f) = derp_factory.take()
-                            {
-                                r.set_derp_mux(f());
-                            }
+                            // `/derp` open; open it now, through the
+                            // coordinator's opener (at-most-once, #2992),
+                            // before pinning.
+                            r.open_derp_mux_for_verdict(&peer_node_id, "the server's force-DERP pin (P7)");
                             // Multi-region DERP — a push carrying a regional
                             // url: open (once per URL) via the reusable
                             // factory. An unopenable region (no ticket yet /
@@ -4386,6 +4478,10 @@ impl OverlayRuntime {
         // line is not merely dead — it can route to a different machine.
         if let Some(mut l) = dns_ladder.take() {
             l.shutdown();
+        }
+        // #1363 — the probe task is this session's like the resolver beside it.
+        if let Some(p) = dns_probe.take() {
+            p.shutdown().await;
         }
         if let Some(h) = dns_task {
             h.abort();

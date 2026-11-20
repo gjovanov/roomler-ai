@@ -690,15 +690,19 @@ removal that follows a link has no safe old way to return to.
 On a Windows background-service install the worker is LocalSystem. What a
 viewer's file transfer touches on the person's side runs through `FsAs`
 (`agents/roomlerd/src/files.rs`): a received file is placed, and a download, a
-folder download and the drawer's listing are read, as the person signed in to
-the session the worker serves, their token impersonated on a blocking thread for
-one step at a time. With nobody signed in, each is refused with a reason the
-viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). A
+folder download and the drawer's listing, its drive list included (#3682), are
+read, as the person signed in to the session the worker serves, their token
+impersonated on a blocking thread for one step at a time. With nobody signed in,
+each is refused with a reason the viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). A
 worker that cannot read its own token is taken for LocalSystem here: the answer
-is then the person or nobody, never the worker itself. Only the service's own
+is then the person or nobody, never the worker itself. The person is looked up
+off the async worker, 1.5 s at most; a lookup that gives no answer in that time
+refuses the read or the write, saying it could not tell who is signed in, and
+never falls back to the worker itself (#3682). Only the service's own
 staging is written as the service. A new file verb takes the
-same path: `FsAs::now()` for a write, `FsAs::for_read()` for a read, and every
-call on the person's side inside `FsAs::run`. The person's token is the boundary;
+same path: `FsAs::for_write()` for a write and `FsAs::for_read()` for a read
+from an async task (`FsAs::now()` only on a blocking thread), and every call on
+the person's side inside `FsAs::run`. The person's token is the boundary;
 `validate_outgoing_path`'s denylists and `is_agent_secret` stay, as a second
 line.
 
@@ -727,7 +731,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1652`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1667`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -754,8 +758,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11450`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10787`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11451`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10788`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -808,13 +812,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:4986`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:5021`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:5299`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:5334`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -825,11 +829,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:5080`). There root still never places into a
+  (`stage_held`, `files.rs:5115`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:5200`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:5235`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and
@@ -1117,7 +1121,7 @@ the daemon shows, below), and a consent answer
 (`ConsentDecide`, an approval or a denial) and a Disconnect (`RcDisconnect`) require the
 person at the screen the daemon shows, `SYSTEM` or an elevated administrator
 (`peer_may_decide_for_the_screen`,
-[`lib.rs:2654`](../crates/localapi/src/lib.rs#L2654)). An approval lets someone see and
+[`lib.rs:2679`](../crates/localapi/src/lib.rs#L2679)). An approval lets someone see and
 control the screen, and the pipe admits every interactive user, so the ACL alone does not
 say whose screen a caller is at. The peer is what the OS read at accept: the client's
 session, and its account and elevation from its token. `SYSTEM` is named by its SID
@@ -1127,10 +1131,10 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   signed in, over RDP too. The person at the console is then someone else and is refused.
   A daemon in session 0 takes the console session; with neither known, only `SYSTEM` and
   an elevated administrator are taken (`screen_session`,
-  [`lib.rs:2627`](../crates/localapi/src/lib.rs#L2627)).
+  [`lib.rs:2652`](../crates/localapi/src/lib.rs#L2652)).
 - **Fail closed**: a peer whose session and account the pipe could not read is refused,
   in words, with a warn line, and nothing reaches the daemon (`not_the_screens_person`,
-  [`lib.rs:3891`](../crates/localapi/src/lib.rs#L3891)).
+  [`lib.rs:3925`](../crates/localapi/src/lib.rs#L3925)).
 - **On Unix nothing changes**: the daemon's own account or root are taken, who its
   owner-only socket admits. The person socket keeps its own seat check (below).
 - The tray's Approve, Deny and Disconnect and `roomlerd consent` run as the person in their
@@ -1139,8 +1143,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 - **The console person's gates follow the same screen.** A console person's `ConfigSet`
   key (`CONSOLE_PERSON_KEYS`), the recording verbs, keep busy on and the external-access
   password's set and clear take, on Windows, a peer in the screen's session
-  (`peer_is_console_user`, [`lib.rs:2552`](../crates/localapi/src/lib.rs#L2552);
-  `peer_may_start_keep_busy`, [`lib.rs:2496`](../crates/localapi/src/lib.rs#L2496)).
+  (`peer_is_console_user`, [`lib.rs:2577`](../crates/localapi/src/lib.rs#L2577);
+  `peer_may_start_keep_busy`, [`lib.rs:2521`](../crates/localapi/src/lib.rs#L2521)).
   Nothing else about them changed: keep busy on still takes only a person's account
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
@@ -1150,30 +1154,30 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:5406`](../crates/localapi/src/lib.rs#L5406)), and
+through `localapi::connect()` ([`lib.rs:5542`](../crates/localapi/src/lib.rs#L5542)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4838`](../crates/localapi/src/lib.rs#L4838) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5432`](../crates/localapi/src/lib.rs#L5432) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5681`](../crates/localapi/src/lib.rs#L5681) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5713`](../crates/localapi/src/lib.rs#L5713) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4884`](../crates/localapi/src/lib.rs#L4884) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5568`](../crates/localapi/src/lib.rs#L5568) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5817`](../crates/localapi/src/lib.rs#L5817) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5849`](../crates/localapi/src/lib.rs#L5849) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
-  anyone else ([`lib.rs:4812`](../crates/localapi/src/lib.rs#L4812)
+  anyone else ([`lib.rs:4858`](../crates/localapi/src/lib.rs#L4858)
   `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
   macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
   with no such directory (root under `sudo`, a cron job, a system service) has no
   per-user candidate and goes straight to the system socket.
 - **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
   alone. A per-user daemon serves its own per-user socket, and with no private directory
-  it serves none and logs why ([`lib.rs:4852`](../crates/localapi/src/lib.rs#L4852)
+  it serves none and logs why ([`lib.rs:4898`](../crates/localapi/src/lib.rs#L4898)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
   ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:5693`](../crates/localapi/src/lib.rs#L5693)). It works
+  never act as it ([`lib.rs:5829`](../crates/localapi/src/lib.rs#L5829)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1207,7 +1211,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3463`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3497`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
@@ -1275,7 +1279,7 @@ for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and l
 install pending a separate policy call. The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
-  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2595`, by
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2620`, by
   `person_peer_ok`, `:4903`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
@@ -1301,7 +1305,7 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
-An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4272`),
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4318`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would

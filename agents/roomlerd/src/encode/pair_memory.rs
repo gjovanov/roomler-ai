@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ceiling_learn::{CONTRADICTION_FACTOR, SEED_PCT};
-use super::pipe::{Basis, PathModel};
+use super::pipe::{Basis, PathModel, PushedBy};
 use super::pipe_state::PipeState;
 use crate::session_carrier::{CandidateKind, SessionCarrier};
 
@@ -852,6 +852,11 @@ pub struct SessionMemory {
     /// to `counted`.
     counted_overproduced: u32,
     counted_clear: u32,
+    /// FR-148 D46 B2 — the counted samples that were a delivery sample's
+    /// push-back, P1 and P3: (all, from a `Clear` window). They are in
+    /// `counted` and its split as well.
+    counted_p1: (u32, u32),
+    counted_p3: (u32, u32),
     /// A delivery ended the record in this session.
     ended: bool,
     /// A valid window gave any measured reading.
@@ -892,6 +897,10 @@ pub struct Closing {
     /// (QR3's measurement of the open class): they sum to `counted`.
     pub counted_overproduced: u32,
     pub counted_clear: u32,
+    /// FR-148 D46 B2 — of `counted`, the delivery samples' push-backs, P1 and
+    /// P3: (all, from a `Clear` window).
+    pub counted_p1: (u32, u32),
+    pub counted_p3: (u32, u32),
     pub ended: bool,
     pub measured: bool,
     /// The Unix second this was taken: the close reads the entry's TTL at it.
@@ -979,6 +988,20 @@ impl SessionMemory {
     /// `read` is the state of the sample's window; a counted sample is counted
     /// under it too.
     pub fn pushed_back(&mut self, bps: u32, basis: Basis, read: Read, now: Instant) {
+        self.pushed_back_by(bps, basis, read, None, now);
+    }
+
+    /// [`Self::pushed_back`], and FR-148 D46 B2's delivery sample when `by`
+    /// says one gave it: counted by the same test and split by the same
+    /// window state, its floor law [`PathModel::sample_pushed_back`].
+    fn pushed_back_by(
+        &mut self,
+        bps: u32,
+        basis: Basis,
+        read: Read,
+        by: Option<PushedBy>,
+        now: Instant,
+    ) {
         match basis {
             Basis::Assumed => {}
             Basis::AppLimited => self.delivered(bps, basis, now),
@@ -995,6 +1018,17 @@ impl SessionMemory {
                         }
                         Read::Clear => self.counted_clear = self.counted_clear.saturating_add(1),
                     }
+                    let of_by = match by {
+                        Some(PushedBy::P1) => Some(&mut self.counted_p1),
+                        Some(PushedBy::P3) => Some(&mut self.counted_p3),
+                        None => None,
+                    };
+                    if let Some((all, clear)) = of_by {
+                        *all = all.saturating_add(1);
+                        if read == Read::Clear {
+                            *clear = clear.saturating_add(1);
+                        }
+                    }
                     self.own = Some(match self.own {
                         Some(o) => Own {
                             bps: o.bps.max(bps),
@@ -1009,7 +1043,10 @@ impl SessionMemory {
                             windows: 1,
                         },
                     });
-                    self.floor.pushed_back(bps, basis, now);
+                    match by {
+                        Some(by) => self.floor.sample_pushed_back(bps, by, now),
+                        None => self.floor.pushed_back(bps, basis, now),
+                    }
                 } else {
                     self.not_counted = self.not_counted.saturating_add(1);
                 }
@@ -1025,6 +1062,24 @@ impl SessionMemory {
     /// more: it moves neither the record nor the floor, and its bytes already
     /// reached [`Self::delivered`] as the same window's delivery.
     pub fn pushed_back_in(&mut self, bps: u32, basis: Basis, take: Take, now: Instant) {
+        self.pushed_back_in_by(bps, basis, take, None, now);
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3, under the
+    /// last valid window's [`Take`]: counted, or counted for the close line
+    /// only, as [`Self::pushed_back_in`] files a window's.
+    pub fn sample_pushed_back_in(&mut self, bps: u32, by: PushedBy, take: Take, now: Instant) {
+        self.pushed_back_in_by(bps, Basis::Backlogged, take, Some(by), now);
+    }
+
+    fn pushed_back_in_by(
+        &mut self,
+        bps: u32,
+        basis: Basis,
+        take: Take,
+        by: Option<PushedBy>,
+        now: Instant,
+    ) {
         // The test laws' samples are filed as `Clear`: no split is read
         // under them.
         #[cfg(test)]
@@ -1035,7 +1090,7 @@ impl SessionMemory {
         };
         let backlogged = basis == Basis::Backlogged && bps > 0;
         match take {
-            Take::Sample(read) => self.pushed_back(bps, basis, read, now),
+            Take::Sample(read) => self.pushed_back_by(bps, basis, read, by, now),
             Take::Unread if backlogged => self.unread = self.unread.saturating_add(1),
             Take::ViewerLate if backlogged => {
                 self.viewer_late = self.viewer_late.saturating_add(1);
@@ -1092,6 +1147,8 @@ impl SessionMemory {
             counted: self.counted,
             counted_overproduced: self.counted_overproduced,
             counted_clear: self.counted_clear,
+            counted_p1: self.counted_p1,
+            counted_p3: self.counted_p3,
             ended: self.ended,
             measured: self.measured,
             at_unix: now_unix,
@@ -2048,6 +2105,8 @@ mod tests {
             counted,
             counted_overproduced: 0,
             counted_clear: counted,
+            counted_p1: (0, 0),
+            counted_p3: (0, 0),
             ended: false,
             measured: true,
             at_unix,

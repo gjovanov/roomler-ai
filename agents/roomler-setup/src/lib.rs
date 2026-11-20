@@ -51,6 +51,9 @@ pub mod package_step;
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;
 pub mod proxy;
+/// FR-141 P3 (D2-A) — a Mac that is one row already gets no install and no
+/// pairing: the root daemon says so over its person socket.
+pub mod reinstall_guard;
 pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
@@ -164,6 +167,29 @@ mod front_tests {
             "the button has no visibility of its own"
         );
         assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
+    }
+
+    /// FR-141 P3 — a Mac that is one row already: the Welcome page shows the
+    /// stop Rust worded, and Continue stays off for every card but the tunnel
+    /// client's.
+    #[test]
+    fn a_one_row_mac_goes_no_further_than_the_note() {
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("<p id=\"one-row-note\" class=\"warning\" hidden></p>"),
+            "the note, hidden until Rust sends a stop"
+        );
+        let js = include_str!("front/app.js");
+        for line in [
+            "const oneRowStop = oneRowStopOf(a);",
+            "oneRowNote.hidden = oneRowStop === null;",
+            "oneRowNote.textContent = oneRowStop ?? \"\";",
+            "const oneRowHolds = oneRowStop !== null && state.role !== null && state.role !== \"tunnel-client\";",
+            "state.role !== null && (warning === null || state.roleAck) && !needsElevation && !oneRowHolds;",
+            "return typeof said === \"string\" && said !== \"\" ? said : null;",
+        ] {
+            assert!(js.contains(line), "app.js lacks {line:?}");
+        }
     }
 
     /// #3247 item 11 — `install.ps1 -Uninstall` removes the service and leaves
