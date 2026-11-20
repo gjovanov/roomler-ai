@@ -2779,6 +2779,11 @@ mod console_lookup_tests {
     /// What "at once" may take on a busy CI runner: the bar #3830 sets for
     /// `roomler status` while logind is paused.
     const AT_ONCE: Duration = Duration::from_millis(500);
+    /// How long a test waits for the lookups it started to begin (#4134):
+    /// far longer than a busy runner takes to schedule a thread. A count
+    /// already there returns at once, so only a lookup that never begins
+    /// waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// Lookups, counted as they begin. The first `quick` answer at once; every
     /// later one holds until the gate opens, as a stopped logind holds
@@ -2823,6 +2828,27 @@ mod console_lookup_tests {
 
         fn began(&self) -> usize {
             self.0.began.load(Ordering::SeqCst)
+        }
+
+        /// The lookups begun, once `want` of them have, waited for `within`
+        /// at most. A lookup counts when its own thread runs it, and the ask
+        /// that starts it does not wait for that thread, so a count read
+        /// straight after the asks can come before it (#4134). The caller
+        /// asserts the exact count, so one lookup more than `want` still
+        /// fails.
+        fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} lookups began within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -2938,7 +2964,7 @@ mod console_lookup_tests {
             }
             worst
         });
-        let began = held.began();
+        let began = held.began_within(1, BEGINS);
         let (worst, _) = late.expect("a 10 ms timer kept waking while the console lookup hung");
         assert!(
             worst < AT_ONCE,
@@ -2987,7 +3013,11 @@ mod console_lookup_tests {
             assert!(took < AT_ONCE, "the caps took {took:?}");
             assert!(caps.contains(&available), "{caps:?}");
         }
-        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one lookup in flight, however many asked"
+        );
     }
 
     /// #3830 — FR-85 P1f's guards ask who is signed in afresh, and a fresh
@@ -3041,7 +3071,7 @@ mod console_lookup_tests {
             "{started:?}"
         );
         assert_eq!(
-            held.began(),
+            held.began_within(2, BEGINS),
             2,
             "the held lookup, and only it, since the first"
         );
