@@ -39,6 +39,10 @@ pub use crate::root_identity::QUERY_TIMEOUT;
 pub struct OneRowMac {
     /// The device row's name, as the root daemon reports it (may be empty).
     pub name: String,
+    /// `sudo roomlerd one-row` made it one row and root's copy of the file
+    /// from before is still there, so `sudo roomlerd one-row --revert` has
+    /// two rows to put back.
+    pub migrated: bool,
 }
 
 /// The root daemon's status read as a one-row Mac's, or `None`. One row only
@@ -53,7 +57,17 @@ pub fn one_row_from(status: &roomler_localapi::NodeStatus) -> Option<OneRowMac> 
         .is_none_or(|p| p == crate::unix_daemon::SYSTEM_CONFIG);
     (one_row && system).then(|| OneRowMac {
         name: status.name.clone(),
+        migrated: false,
     })
+}
+
+/// RED stub: today's road, the person socket whoever asks.
+pub fn socket_to_ask(
+    _is_root: bool,
+    own_person_socket: Option<std::path::PathBuf>,
+    _system_socket: std::path::PathBuf,
+) -> Option<std::path::PathBuf> {
+    own_person_socket
 }
 
 /// Ask this Mac's root daemon. `None` off macOS, with no root config, and
@@ -102,11 +116,16 @@ pub fn installs_a_device(role: Role) -> bool {
 /// pairing start, the install's preflight): the words to stop a daemon
 /// install with, or `None` to go on as before. Only a Mac, only with the
 /// guard on, and only when the root daemon said one row.
-pub fn stop(os: HostOs, guard_on: bool, one_row: Option<&OneRowMac>) -> Option<String> {
+pub fn stop(
+    os: HostOs,
+    guard_on: bool,
+    one_row: Option<&OneRowMac>,
+    server: &str,
+) -> Option<String> {
     if os != HostOs::Macos || !guard_on {
         return None;
     }
-    one_row.map(stop_text)
+    one_row.map(|mac| stop_text(mac, server))
 }
 
 /// [`stop`] for `role` on this host, asked where an install would begin
@@ -123,11 +142,11 @@ pub async fn stop_for(role: Role, server: &str) -> Option<String> {
         .await
         .features
         .reinstall_guard_on();
-    stop(os, guard_on, Some(&mac))
+    stop(os, guard_on, Some(&mac), server)
 }
 
 /// What the person reads, on the page and in a refusal.
-pub fn stop_text(mac: &OneRowMac) -> String {
+pub fn stop_text(mac: &OneRowMac, _server: &str) -> String {
     let name = mac.name.trim();
     let named = if name.is_empty() {
         String::new()
@@ -146,9 +165,15 @@ pub fn stop_text(mac: &OneRowMac) -> String {
 mod tests {
     use super::*;
 
+    const SERVER: &str = "https://roomler.example";
+    const UNINSTALL: &str =
+        "`curl -fsSL https://roomler.example/api/setup/install.sh | sh -s -- --uninstall`";
+    const REVERT: &str = "`sudo roomlerd one-row --revert`";
+
     fn mac() -> OneRowMac {
         OneRowMac {
             name: "Studio Mac".into(),
+            migrated: false,
         }
     }
 
@@ -157,7 +182,8 @@ mod tests {
     /// names the row and says nothing is installed.
     #[test]
     fn a_one_row_mac_gets_no_install_and_no_pairing() {
-        let said = stop(HostOs::Macos, true, Some(&mac())).expect("a one-row Mac is stopped");
+        let said =
+            stop(HostOs::Macos, true, Some(&mac()), SERVER).expect("a one-row Mac is stopped");
         assert!(said.contains("«Studio Mac»"), "{said}");
         assert!(said.contains("installs nothing"), "{said}");
     }
@@ -166,26 +192,115 @@ mod tests {
     /// and it is a Mac's alone.
     #[test]
     fn unknown_is_never_one_row_and_the_switch_turns_it_off() {
-        assert_eq!(stop(HostOs::Macos, true, None), None, "unknown");
+        assert_eq!(stop(HostOs::Macos, true, None, SERVER), None, "unknown");
         assert_eq!(
-            stop(HostOs::Macos, false, Some(&mac())),
+            stop(HostOs::Macos, false, Some(&mac()), SERVER),
             None,
             "the operator's off"
         );
-        assert_eq!(stop(HostOs::Linux, true, Some(&mac())), None);
-        assert_eq!(stop(HostOs::Windows, true, Some(&mac())), None);
-        assert_eq!(stop(HostOs::Other, true, Some(&mac())), None);
+        assert_eq!(stop(HostOs::Linux, true, Some(&mac()), SERVER), None);
+        assert_eq!(stop(HostOs::Windows, true, Some(&mac()), SERVER), None);
+        assert_eq!(stop(HostOs::Other, true, Some(&mac()), SERVER), None);
     }
 
     /// A nameless row is still named as one device, without empty quotes.
     #[test]
     fn a_nameless_row_reads_without_quotes() {
-        let said = stop_text(&OneRowMac { name: " ".into() });
+        let said = stop_text(
+            &OneRowMac {
+                name: " ".into(),
+                migrated: false,
+            },
+            SERVER,
+        );
         assert!(
             said.starts_with("This Mac is one device already:"),
             "{said}"
         );
         assert!(!said.contains('«'), "{said}");
+    }
+
+    /// #4133's first note: the stop names a way forward that works as typed
+    /// on every Mac it shows on. Removing Roomler and starting Setup again is
+    /// the road to a fresh enrollment (the row was deleted) and to two rows
+    /// (a Mac the terminal installed as one row, with no copy to put back),
+    /// so every stop names it, with the server the person chose. The revert
+    /// would only say "nothing to revert" there, so it is not offered.
+    #[test]
+    fn the_stop_names_a_way_forward() {
+        for name in ["Studio Mac", " "] {
+            let one_row = OneRowMac {
+                name: name.into(),
+                migrated: false,
+            };
+            let said = stop_text(&one_row, SERVER);
+            assert!(said.starts_with("This Mac is one device already"), "{said}");
+            assert!(said.contains("installs nothing"), "{said}");
+            assert!(said.contains(UNINSTALL), "{said}");
+            assert!(said.contains("start Roomler Setup again"), "{said}");
+            assert!(!said.contains("--revert"), "nothing to revert: {said}");
+        }
+        assert!(
+            stop_text(&mac(), SERVER).contains("already («Studio Mac»): "),
+            "the name stays where it was"
+        );
+        // A trailing slash makes no `//api`, and a blank server names the
+        // wizard's default.
+        assert!(stop_text(&mac(), "https://roomler.example/").contains(UNINSTALL));
+        assert!(stop_text(&mac(), " ").contains(
+            "`curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --uninstall`"
+        ));
+    }
+
+    /// A Mac `sudo roomlerd one-row` made one row, with root's copy of the
+    /// file from before still there, is also offered the way back to two
+    /// rows, and told that a deleted row does not come back.
+    #[test]
+    fn a_migrated_mac_is_offered_the_revert() {
+        let migrated = OneRowMac {
+            name: "Studio Mac".into(),
+            migrated: true,
+        };
+        let said = stop_text(&migrated, SERVER);
+        assert!(
+            said.starts_with("This Mac is one device already («Studio Mac»)"),
+            "{said}"
+        );
+        assert!(said.contains("installs nothing"), "{said}");
+        assert!(said.contains(REVERT), "{said}");
+        assert!(said.contains("deleted since"), "{said}");
+        assert!(said.contains(UNINSTALL), "the fresh start stays: {said}");
+    }
+
+    /// #4133's second note: the wizard started as root asks the system
+    /// socket, the root daemon's own; a person asks only the person socket
+    /// root serves them, and a person with none asks nothing, never the
+    /// system socket.
+    #[test]
+    fn root_asks_the_system_socket_and_a_person_only_their_own() {
+        use std::path::PathBuf;
+        let person = PathBuf::from("/var/run/roomler-person/501.sock");
+        let system = PathBuf::from("/var/run/roomler/roomler.sock");
+        assert_eq!(
+            socket_to_ask(false, Some(person.clone()), system.clone()),
+            Some(person.clone()),
+            "a person: the person socket"
+        );
+        assert_eq!(
+            socket_to_ask(false, None, system.clone()),
+            None,
+            "a person with none: never the system socket"
+        );
+        assert_eq!(
+            socket_to_ask(true, None, system.clone()),
+            Some(system.clone()),
+            "root: the system socket"
+        );
+        assert_eq!(
+            socket_to_ask(true, Some(person), system.clone()),
+            Some(system),
+            "root never asks a person socket"
+        );
     }
 
     fn status(extra: &str) -> roomler_localapi::NodeStatus {
