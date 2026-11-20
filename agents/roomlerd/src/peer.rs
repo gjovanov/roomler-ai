@@ -5020,7 +5020,7 @@ async fn media_pump_vp9_444_dc(
                         quality = quality::label(q_now),
                         base_bps = base,
                         ceiling_bps = ceiling,
-                        target_bps = applied.bps,
+                        target_bps = applied.bps, why = %applied.why,
                         "VP9-444 set_bitrate (AIMD)"
                     );
                 }
@@ -5202,7 +5202,7 @@ async fn media_pump_vp9_444_dc(
                 info!(
                     %session_id,
                     buffered,
-                    new_target = applied.bps,
+                    new_target = applied.bps, why = %applied.why,
                     "VP9-444 AIMD decrease (DC buffer over high watermark)"
                 );
             }
@@ -5336,7 +5336,7 @@ async fn media_pump_vp9_444_dc(
                 avg_scale_ms,
                 avg_encode_ms,
                 paced_fps = ?governor.paced_software_fps(),
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
                 // FR-15 — the viewer's own paint age + the learned path
@@ -7248,7 +7248,7 @@ async fn media_pump_ffmpeg_dc(
     // STATIC image — invisible). The governor's mirror advances at emit
     // time, so heartbeat `target_bps` shows the target while the encoder
     // briefly runs the old maxrate — an accepted, bounded skew.
-    let mut deferred_bps: Option<u32> = None;
+    let mut deferred_bps: Option<crate::encode::governor::AppliedBitrate> = None;
     // Seeded "a minute ago" so the first apply lands at once — through the
     // boot-safe helper: `Instant::now() - 60 s` panics on a host up for less
     // than a minute, and a session that starts that early is exactly what a
@@ -8187,7 +8187,7 @@ async fn media_pump_ffmpeg_dc(
                     deferred_bps = None;
                     swap_wanted = Some(applied.bps);
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -9509,7 +9509,7 @@ async fn media_pump_ffmpeg_dc(
                 && enc.reconfig_forces_idr()
                 && applied.bps > enc.current_maxrate_bps();
             if held_increase {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             } else if enc.supports_dynamic_bitrate() {
                 deferred_bps = None;
                 if constrained && relay_idr_thrift {
@@ -9563,22 +9563,22 @@ async fn media_pump_ffmpeg_dc(
                         timed_apply!(enc.set_bitrate(applied.bps).await);
                     }
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             } else {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             }
             if applied.changed {
                 info!(
                     %session_id,
                     codec_label,
                     ceiling_bps = ceiling,
-                    target_bps = applied.bps,
+                    target_bps = applied.bps, why = %applied.why,
                     deferred = deferred_bps.is_some(),
                     "FFmpeg DC pump set_bitrate (AIMD)"
                 );
             }
-        } else if let Some(bps) = deferred_bps
+        } else if let Some(held) = deferred_bps
             && last_motion_at.elapsed() >= DEFER_QUIET
         {
             // FR-10 — relay IDR thrift: each flush is a re-open whose first
@@ -9592,7 +9592,7 @@ async fn media_pump_ffmpeg_dc(
                 relay_idr_thrift,
                 last_deferred_apply_at.map(|t| t.elapsed()),
                 enc.current_maxrate_bps(),
-                bps,
+                held.bps,
             );
             if allow {
                 // Quiet flush: the held QSV/AMF target applies now, while the
@@ -9610,11 +9610,11 @@ async fn media_pump_ffmpeg_dc(
                     // inside the window is dead air. The quiet-gated adoption
                     // still bumps `send_epoch` and still ships the IDR on a
                     // static scene; only the freeze goes away.
-                    swap_wanted = Some(bps);
+                    swap_wanted = Some(held.bps);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate scheduled (background rebuild)"
                     );
                 } else {
@@ -9623,11 +9623,11 @@ async fn media_pump_ffmpeg_dc(
                     if !enc.supports_dynamic_bitrate() {
                         send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    timed_apply!(enc.set_bitrate(bps).await);
+                    timed_apply!(enc.set_bitrate(held.bps).await);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate applied at quiet"
                     );
                 }
@@ -9968,7 +9968,7 @@ async fn media_pump_ffmpeg_dc(
                             deferred_bps = None;
                             swap_wanted = Some(applied.bps);
                         } else {
-                            deferred_bps = Some(applied.bps);
+                            deferred_bps = Some(applied);
                         }
                     }
                 }
@@ -10166,7 +10166,7 @@ async fn media_pump_ffmpeg_dc(
                 codec_label,
                 target_fps,
                 constrained,
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 width = w,
                 height = h,
                 encoder = enc.name(),

@@ -283,6 +283,12 @@ mod privacy_activity_tests;
 mod privacy_gate_tests;
 #[cfg(test)]
 mod rate_limit_tests;
+/// #4042 — a viewer's hang-up of a session that runs through the cross-pod
+/// relay reaches the pod that holds it, at the window's default of 0 and with
+/// it on, within a bound measured from a same-pod hang-up; the next Connect
+/// gets a new session; and another member's hang-up is refused as on one pod.
+#[cfg(test)]
+mod rc_cross_pod_hangup_tests;
 #[cfg(test)]
 mod rc_idle_limit_tests;
 #[cfg(test)]
@@ -364,6 +370,11 @@ mod role_reconcile_tests;
 mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
+/// #3950 — the seat check's follow-ups: a document that does not decode costs
+/// only the seats it bears on their verdict, the room guard decides each end,
+/// a pass ends only the seats it read, and an ended seat settles its call once.
+#[cfg(test)]
+mod seat_check_tests;
 /// FR-102 P9c — the carrier a session rides: the agent records it on
 /// `rc:session.stats` once Active, and the server stores it on
 /// `remote_sessions.carrier` — a code only, absent read as unknown, never
