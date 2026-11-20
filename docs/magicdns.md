@@ -71,7 +71,7 @@ sequenceDiagram
         D-->>R: watch = true (late)
         R->>OS: steer installed on the next loop tick
     end
-    opt the socket fails for good (#1363)
+    opt the socket fails for good
         D-->>R: watch = false, at once
         Note over R,OS: the steer stays: the rebind brings<br/>the answers back at the same address
         loop retry 1s → 60s
