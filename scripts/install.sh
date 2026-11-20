@@ -2163,7 +2163,7 @@ say "done."
 #   - piped from curl, the script is the shell's stdin, which bash reads one
 #     byte at a time and dash 8 KiB at a time. A command that read its stdin
 #     ate the lines the shell had not read yet, and the shell went on without
-#     them, often to exit 0 (#3917, #3924, #3930, #3926 guarded one call each).
+#     them, often to exit 0 (#3917, #3924, #3930, #3926 guarded their calls).
 #   - a download cut short either does not parse (the brace never closes) or
 #     never reaches the call, so it runs nothing at all.
 # main's first statement gives the shell /dev/null as its stdin, so whatever
