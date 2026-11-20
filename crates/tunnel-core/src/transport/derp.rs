@@ -343,6 +343,10 @@ pub struct DerpMux {
     /// path distinguish a reconnect blip from a sustained WSS outage — the
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
+    /// #2992 — the WS has registered at least once (`mark_up` ran). Read only
+    /// under the `down_since` lock, so [`Self::begin_connecting`] can never
+    /// mark a mux down that has already registered.
+    registered: AtomicBool,
     peers: PeerTable,
     /// #27/#28 — where this mux reports [`MuxEvent`]s to the runtime. `None`
     /// until the runtime arms it (tests, and the tunnel-only paths that never
@@ -378,6 +382,7 @@ impl DerpMux {
             ws_out,
             alive: Arc::new(AtomicBool::new(true)),
             down_since: Mutex::new(None),
+            registered: AtomicBool::new(false),
             peers: Arc::new(Mutex::new(HashMap::new())),
             events_tx: Mutex::new(None),
             dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -603,10 +608,52 @@ impl DerpMux {
     /// a level-triggered emit would fire a spurious walk at startup; `swap`
     /// makes the edge the condition rather than a comment.
     pub fn mark_up(&self) {
-        let was_down = !self.alive.swap(true, Ordering::Relaxed);
-        *self.down_since.lock().unwrap() = None;
+        // #2992 — under the `down_since` lock, which `begin_connecting` takes
+        // too: either it ran first and this is the down→up edge it set up, or
+        // this ran first and `registered` makes it a no-op.
+        let was_down = {
+            let mut since = self.down_since.lock().unwrap();
+            self.registered.store(true, Ordering::Relaxed);
+            *since = None;
+            !self.alive.swap(true, Ordering::Relaxed)
+        };
         if was_down {
             self.emit(MuxEvent::Recovered);
+        }
+    }
+
+    /// #2992 — a mux opened ON DEMAND, for a DERP verdict, is not up until its
+    /// WS registers: read it as down from the open.
+    ///
+    /// [`Self::new`] starts a mux alive, and the WS owner marks it down only
+    /// once a socket it had closes, never when a connect fails. That suits the
+    /// startup mux, whose floors are built at birth and queue until the WS
+    /// comes up, and it leaves a mux whose WS never connects reading alive
+    /// forever. A verdict must instead wait for the WS (`is_alive` gates every
+    /// DERP build), wake when it registers (the first `mark_up` is then a
+    /// down→up edge and emits [`MuxEvent::Recovered`]), and report a WS that
+    /// never comes (`down_for` counts from the open, which is what the
+    /// `derp_mux_failed` evidence reads).
+    ///
+    /// A no-op once the WS has registered, so it can never mark down a mux
+    /// that is already up, whichever of the two calls runs first.
+    pub fn begin_connecting(&self) {
+        let mut since = self.down_since.lock().unwrap();
+        if self.registered.load(Ordering::Relaxed) {
+            return;
+        }
+        self.alive.store(false, Ordering::Relaxed);
+        if since.is_none() {
+            *since = Some(Instant::now());
+        }
+    }
+
+    /// Test seam: move the current outage's start `by` into the past, so a
+    /// bound on `down_for` can be crossed without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn backdate_down_since(&self, by: Duration) {
+        if let Some(t) = self.down_since.lock().unwrap().as_mut() {
+            *t -= by;
         }
     }
 
@@ -972,6 +1019,47 @@ mod tests {
         // Redundant repeats stay quiet.
         mux.mark_up();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// #2992 — a mux opened on demand reads DOWN until its WS registers: no
+    /// DERP build rides it, the outage clock runs from the open (which the
+    /// `derp_mux_failed` evidence reads), and the first registration is a
+    /// down→up edge, so it wakes the runtime's walk. Once the WS has
+    /// registered, `begin_connecting` changes nothing, so a mux whose WS beat
+    /// it can never be left reading down.
+    #[tokio::test]
+    async fn an_on_demand_mux_is_down_until_its_first_registration() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x02));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        mux.begin_connecting();
+        assert!(!mux.is_alive(), "no DERP build may ride an unregistered WS");
+        assert!(
+            mux.down_for().is_some(),
+            "the outage clock runs from the open"
+        );
+        mux.backdate_down_since(Duration::from_secs(61));
+        assert!(mux.down_for().is_some_and(|d| d >= Duration::from_secs(60)));
+
+        mux.mark_up();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Recovered),
+            "the first registration wakes the walk"
+        );
+        assert!(mux.is_alive());
+        assert_eq!(mux.down_for(), None);
+
+        // The WS registered first: a late `begin_connecting` is a no-op.
+        let (up, _out_rx2) = DerpMux::new(pk(0x03));
+        up.mark_up();
+        up.begin_connecting();
+        assert!(
+            up.is_alive(),
+            "a registered mux must never be marked down by the opener"
+        );
+        assert_eq!(up.down_for(), None);
     }
 
     /// #27/#32 — a peer whose DERP carrier was replaced by a better tier must

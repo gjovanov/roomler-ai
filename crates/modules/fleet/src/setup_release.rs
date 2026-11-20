@@ -143,6 +143,9 @@ pub struct SetupFeatures {
     /// pairs (A3), so a homepage may say "sign in from your browser" — with
     /// `pairing`, never on its own.
     pub wizard_pairing: bool,
+    /// `[setup] wizard_reinstall_guard` (FR-141 P3): the wizard's one-row
+    /// guard, ON by default, the one switch here that is not a claim.
+    pub wizard_reinstall_guard: bool,
 }
 
 /// `GET /api/setup/features` — the server-wide switches a client reads before
@@ -151,7 +154,8 @@ pub struct SetupFeatures {
 ///
 /// ```json
 /// {"pairing": true, "wizard_linux_daemon": false, "wizard_macos_daemon": false,
-///  "wizard_unix_daemon": false, "wizard_pairing": false}
+///  "wizard_unix_daemon": false, "wizard_pairing": false,
+///  "wizard_reinstall_guard": true}
 /// ```
 ///
 /// * `pairing` mirrors `[pairing] enabled` — a fact about THIS SERVER:
@@ -183,8 +187,14 @@ pub struct SetupFeatures {
 ///     by default, and a server image promoted before the first `setup-v*`
 ///     that carries A3 would otherwise promise a flow the download cannot
 ///     do.
+/// * `wizard_reinstall_guard` (FR-141 P3) is a kill switch, not a claim: the
+///   released wizard's one-row guard (on a Mac whose root daemon says it is
+///   one row, it installs and pairs nothing), **on** by default, and a wizard
+///   that knows it reads anything but a JSON `false` as on. `false` gives the
+///   wizard's install from before the guard back.
 ///
-/// ⚠️ Every consumer reads anything but a JSON `true` as **false**: an older
+/// ⚠️ Every consumer reads anything but a JSON `true` as **false** (the guard
+/// above the other way round): an older
 /// server (404), a server with the fleet module unmounted (503), a proxy's
 /// HTML error page, a timeout, a string `"true"`. Absent means "offer what
 /// the client could do before this route existed" — the daemon wizard on
@@ -207,6 +217,7 @@ pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatur
         // What the wizards released before the split read for both OSes.
         wizard_unix_daemon: linux && macos,
         wizard_pairing: setup.wizard_pairing,
+        wizard_reinstall_guard: setup.wizard_reinstall_guard,
     })
 }
 

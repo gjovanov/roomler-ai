@@ -3798,7 +3798,7 @@ mod tests {
             .create_session(
                 agent_id,
                 owner,
-                "Goran".into(),
+                "Casey".into(),
                 ctl_a,
                 Permissions::default(),
                 Vec::new(),
@@ -3824,7 +3824,7 @@ mod tests {
             .create_session(
                 agent_id,
                 owner,
-                "Goran".into(),
+                "Casey".into(),
                 ctl_b,
                 Permissions::default(),
                 Vec::new(),
@@ -3883,7 +3883,7 @@ mod tests {
         let res = hub.create_session(
             ObjectId::new(),
             ObjectId::new(),
-            "Goran".into(),
+            "Casey".into(),
             tx,
             Permissions::default(),
             Vec::new(),
@@ -4000,7 +4000,7 @@ mod tests {
             .create_session(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
@@ -4048,7 +4048,7 @@ mod tests {
             .create_session(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
@@ -4111,7 +4111,7 @@ mod tests {
             .create_session(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
@@ -4161,7 +4161,7 @@ mod tests {
             .create_session(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
@@ -4212,7 +4212,7 @@ mod tests {
             .create_session(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
@@ -6481,7 +6481,7 @@ mod tests {
             .create_session_full(
                 agent_id,
                 ObjectId::new(),
-                "Goran".into(),
+                "Casey".into(),
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),

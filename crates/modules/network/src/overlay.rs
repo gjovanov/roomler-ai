@@ -1160,15 +1160,40 @@ async fn handle_overlay_relay_request(
     // one keeps exactly the path it has today.
     crate::org_relay::maybe_mint(state, &self_node, &peer).await;
 
+    // #2992 — keep what this request says about the requester's `/derp`, per
+    // node: only a relay request carries it, and the P4c-1 pin reads it for
+    // every pair the node is in, on both ends. A change re-stamps the node's
+    // pairs, while its org is over the allowance, the one time it moves a
+    // verdict, so the pin lets go of (or takes back) the pairs at once.
+    let now = Instant::now();
+    if note_derp_report(
+        &state.derp_unservable,
+        self_id,
+        evidence.derp_mux_failed,
+        now,
+    ) && self_node.supports_derp
+        && turn_withheld(state, &self_node)
+    {
+        tracing::info!(
+            %self_id, derp_mux_failed = evidence.derp_mux_failed,
+            "overlay relay: the node's /derp report changed — re-stamping its pairs (P4c-1 keeps no pair on DERP whose end cannot hold /derp)"
+        );
+        refan_node(state, &self_node).await;
+    }
+    let an_end_cannot_hold_derp = reported_unservable(&state.derp_unservable, &self_id, now)
+        || reported_unservable(&state.derp_unservable, &peer_node_id, now);
+
     // FR-115 P4c-1 — an org over its relay allowance keeps this pair on the
     // DERP floor: no TURN grant, the verdict stamped DERP on both ends now,
     // and a pin for ends too old to read the verdict. The org relay offer
-    // above still stands, because an org relay is never metered.
+    // above still stands, because an org relay is never metered. #2992 — not
+    // a pair with an end that reported it cannot hold `/derp`: that pair is
+    // granted TURN, the tier it would have had.
     if keeps_pair_on_derp(
         turn_withheld(state, &self_node),
         self_node.supports_derp,
         peer.supports_derp,
-        evidence.derp_mux_failed,
+        an_end_cannot_hold_derp,
     ) {
         if forced_derp_enabled() {
             for (to, other_id) in [(&self_node, peer_node_id), (&peer, self_id)] {
@@ -2634,16 +2659,29 @@ fn server_relay_verdict(
 ) -> Option<RelayStrategyWire> {
     // Force-DERP pin wins first (the server owns it), gated on both ends'
     // DERP support exactly as the client's pin check is. FR-115 P4c-1 pins
-    // the same way while the org is over its relay allowance.
-    let pinned = recipient.supports_derp
-        && peer.supports_derp
-        && (turn_withheld(state, recipient)
-            || turn_withheld(state, peer)
-            || matches!((recipient.id, peer.id), (Some(a), Some(b))
-                if state
-                    .relay_pair_churn
-                    .get(&pair_key(a, b))
-                    .is_some_and(|pc| forced_active(&pc, Instant::now()))));
+    // the same way while the org is over its relay allowance, except a pair
+    // with an end that reported it cannot hold `/derp` (#2992).
+    let both_derp = recipient.supports_derp && peer.supports_derp;
+    let over_allowance =
+        both_derp && (turn_withheld(state, recipient) || turn_withheld(state, peer));
+    let now = Instant::now();
+    let an_end_cannot_hold_derp = over_allowance
+        && [recipient.id, peer.id]
+            .into_iter()
+            .flatten()
+            .any(|id| reported_unservable(&state.derp_unservable, &id, now));
+    let p7_forced = both_derp
+        && matches!((recipient.id, peer.id), (Some(a), Some(b))
+            if state
+                .relay_pair_churn
+                .get(&pair_key(a, b))
+                .is_some_and(|pc| forced_active(&pc, now)));
+    let pinned = pair_pinned_to_derp(
+        both_derp,
+        over_allowance,
+        p7_forced,
+        an_end_cannot_hold_derp,
+    );
     // FR-19 — an ACTIVE org-relay session for this pair outranks every rule
     // below: the mint already applied the gates, and the client cascade picks
     // Org over Turn/Derp when a session exists (§6). Gated on BOTH ends'
@@ -2672,16 +2710,75 @@ fn turn_withheld(state: &NetworkState, node: &OverlayNode) -> bool {
 
 /// FR-115 P4c-1 — keep a relay request's pair on the DERP floor instead of
 /// granting it TURN? Only while the org is over its allowance (`withheld`),
-/// both ends can ride DERP, and the requester's `/derp` is up. Any other
-/// pair is granted TURN as before: withholding it there would refuse the
-/// pair, which the allowance never does.
+/// both ends can ride DERP, and neither end has reported that it cannot hold
+/// `/derp` (#2992: the requester on this request, or either end on an
+/// earlier one, see [`reported_unservable`]). Any other pair is granted TURN
+/// as before: withholding it there would refuse the pair, which the
+/// allowance never does.
 fn keeps_pair_on_derp(
     withheld: bool,
     requester_derp: bool,
     peer_derp: bool,
-    derp_mux_failed: bool,
+    an_end_cannot_hold_derp: bool,
 ) -> bool {
-    withheld && requester_derp && peer_derp && !derp_mux_failed
+    withheld && requester_derp && peer_derp && !an_end_cannot_hold_derp
+}
+
+/// The netmap verdict's pin, resolved: is the pair stamped DERP whatever its
+/// capability says? A P7 force-DERP pin, or FR-115 P4c-1 while the org is
+/// over its allowance; both only when both ends can ride DERP. #2992 — P4c-1
+/// skips a pair with an end that reported it cannot hold `/derp`, as the
+/// TURN grant does ([`keeps_pair_on_derp`]), so the pair takes the tier its
+/// capability gives it. P7 is left to its own U1 healer, which clears the
+/// pin on the pair's own report.
+fn pair_pinned_to_derp(
+    both_derp: bool,
+    over_allowance: bool,
+    p7_forced: bool,
+    an_end_cannot_hold_derp: bool,
+) -> bool {
+    both_derp && ((over_allowance && !an_end_cannot_hold_derp) || p7_forced)
+}
+
+/// #2992 — how long the server remembers that a node reported it cannot hold
+/// `/derp`. Each relay request from the node replaces the report, so this
+/// bounds only a node that stopped asking: once it lapses the node's pairs may
+/// be stamped DERP again, and the agent's next establishment re-reports within
+/// its own bound (60 s of a `/derp` WS that does not come up).
+const DERP_REPORT_MEMORY: Duration = Duration::from_secs(30 * 60);
+
+/// #2992 — record what a relay request says about its requester's `/derp`
+/// (`derp_mux_failed`): a failure remembers the node from `now`, a request
+/// with `/derp` up forgets it. Returns whether the node's standing changed,
+/// so the caller can re-stamp its pairs.
+fn note_derp_report(
+    map: &dashmap::DashMap<ObjectId, Instant>,
+    node: ObjectId,
+    derp_mux_failed: bool,
+    now: Instant,
+) -> bool {
+    let was = reported_unservable(map, &node, now);
+    if derp_mux_failed {
+        // A node that reported and left keeps no row past the memory: the
+        // sweep runs only on a failure, which is rare, and the map holds at
+        // most one row per node this pod serves.
+        map.retain(|_, at| now.saturating_duration_since(*at) < DERP_REPORT_MEMORY);
+        map.insert(node, now);
+    } else {
+        map.remove(&node);
+    }
+    was != derp_mux_failed
+}
+
+/// #2992 — has `node` reported, within [`DERP_REPORT_MEMORY`], that it cannot
+/// hold `/derp`?
+fn reported_unservable(
+    map: &dashmap::DashMap<ObjectId, Instant>,
+    node: &ObjectId,
+    now: Instant,
+) -> bool {
+    map.get(node)
+        .is_some_and(|at| now.saturating_duration_since(*at) < DERP_REPORT_MEMORY)
 }
 
 /// U2 — the node-level verdict (the pin resolved to a bool by the caller so
@@ -3507,7 +3604,7 @@ mod tests {
     /// the allowance throttles and never refuses.
     #[test]
     fn only_a_pair_with_a_derp_floor_is_kept_off_turn() {
-        // (withheld, requester DERP, peer DERP, requester's /derp failed)
+        // (withheld, requester DERP, peer DERP, an end cannot hold /derp)
         assert!(keeps_pair_on_derp(true, true, true, false));
         assert!(
             !keeps_pair_on_derp(false, true, true, false),
@@ -3523,8 +3620,77 @@ mod tests {
         );
         assert!(
             !keeps_pair_on_derp(true, true, true, true),
-            "a requester whose /derp failed keeps TURN, or the pair would go dark"
+            "a pair with an end whose /derp failed keeps TURN, or the pair would go dark"
         );
+    }
+
+    /// #2992 — once an end has reported that it cannot hold `/derp`, the
+    /// P4c-1 pin no longer stamps its pairs DERP: they take the tier their
+    /// capability gives them, as the TURN grant does. A P7 pin is untouched
+    /// here (its U1 healer clears it on the pair's own report).
+    #[test]
+    fn the_allowance_pin_skips_a_pair_with_an_end_that_cannot_hold_derp() {
+        // (both DERP, over the allowance, P7 forced, an end cannot hold /derp)
+        assert!(pair_pinned_to_derp(true, true, false, false), "P4c-1 pins");
+        assert!(
+            !pair_pinned_to_derp(true, true, false, true),
+            "a reported end lets the P4c-1 pin go"
+        );
+        assert!(pair_pinned_to_derp(true, false, true, false), "P7 pins");
+        assert!(
+            pair_pinned_to_derp(true, true, true, true),
+            "a P7 pin stands until its own healer clears it"
+        );
+        assert!(
+            !pair_pinned_to_derp(false, true, true, false),
+            "never a pair that cannot ride DERP"
+        );
+        assert!(!pair_pinned_to_derp(true, false, false, false));
+    }
+
+    /// #2992 — the server's memory of a node's `/derp` report: a failure is
+    /// remembered from when it was made, a request with `/derp` up forgets it,
+    /// the memory lapses on its own, and the return says when the node's
+    /// standing changed (the caller re-stamps its pairs then, and only then).
+    #[test]
+    fn a_derp_report_is_remembered_per_node_until_it_is_replaced_or_lapses() {
+        let map = dashmap::DashMap::new();
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        let t0 = Instant::now();
+        assert!(!reported_unservable(&map, &a, t0));
+        assert!(
+            !note_derp_report(&map, a, false, t0),
+            "/derp up on a node never reported changes nothing"
+        );
+        assert!(
+            note_derp_report(&map, a, true, t0),
+            "the first failure changes it"
+        );
+        assert!(reported_unservable(&map, &a, t0));
+        assert!(!reported_unservable(&map, &b, t0), "per node");
+        let later = t0 + Duration::from_secs(60);
+        assert!(
+            !note_derp_report(&map, a, true, later),
+            "a repeat refreshes the memory without a re-stamp"
+        );
+        assert!(reported_unservable(
+            &map,
+            &a,
+            later + DERP_REPORT_MEMORY - Duration::from_secs(1)
+        ));
+        assert!(
+            !reported_unservable(&map, &a, later + DERP_REPORT_MEMORY),
+            "the memory lapses"
+        );
+        assert!(
+            note_derp_report(&map, a, false, later),
+            "/derp up again forgets it"
+        );
+        assert!(!reported_unservable(&map, &a, later));
+        // A lapsed row is swept by the next failure, of any node.
+        assert!(note_derp_report(&map, b, true, t0));
+        assert!(note_derp_report(&map, a, true, t0 + DERP_REPORT_MEMORY * 2));
+        assert!(map.get(&b).is_none(), "the lapsed report is gone");
     }
 
     /// U2 — the PARITY LOCK: the server's pure verdict core must reproduce the
