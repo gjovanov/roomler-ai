@@ -267,20 +267,20 @@ package.
 container the host's resolv.conf without its loopback entries. Where `/etc/resolv.conf`
 links to the stub, Docker reads `/run/systemd/resolve/resolv.conf` instead, which the
 switch rewrites, so the container inherits the switch. The 11-20 self-test measured that on
-ubuntu-latest and ubuntu-22.04 (D2 of #3710). ubuntu-22.04-arm image 20261116.196.1 ships a
-static `/etc/resolv.conf` instead: an egress proxy on `127.0.0.100`, the stub, then the
+ubuntu-latest and ubuntu-22.04 (D2 of #3710). Some ubuntu-22.04-arm runners have a static
+`/etc/resolv.conf` instead, per runner and not per image: an egress proxy on `127.0.0.100`, the stub, then the
 Azure upstream. A container's copy then holds only the upstream the switch went around,
 and its `apt-get update` timed out after the failover. So a switch that helped also writes
 its resolvers to `/tmp/ci-apt.docker-dns` as `docker run` arguments (`--dns`, then an
 address, one per line; `ci-apt.sh:171`). Every container step passes them:
 `deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns`, and the two bundle checks read the
-file into an array on the line after `reach`. With no failover there is no file, and a
+file into an array on their `reach` line. With no failover there is no file, and a
 container starts exactly as before.
 
 | Runner image | `/etc/resolv.conf` | A container after the switch, by itself | With the helper's arguments |
 |---|---|---|---|
 | ubuntu-latest (26.04), ubuntu-22.04 | link to the stub | reaches its mirror | reaches its mirror |
-| ubuntu-22.04-arm 20261116.196.1 | static file, written by `repoint-resolv-conf` | `apt-get update` times out | reaches its mirror in about 3 s |
+| ubuntu-22.04-arm, some runners (seen on image 20261116.196.1) | static file, written by `repoint-resolv-conf` | `apt-get update` times out | reaches its mirror in about 3 s |
 
 ### The subcommands and where each runs
 

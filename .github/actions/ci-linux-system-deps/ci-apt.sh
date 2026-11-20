@@ -163,7 +163,7 @@ FAILOVER_FAILED=/tmp/ci-apt.failover-failed
 # Written by a failover that helped: the resolvers it switched to, as
 # `docker run` arguments, one per line (`--dns`, then an address). Docker gives
 # a container the host's /etc/resolv.conf minus its loopback entries, and where
-# that file is static (ubuntu-22.04-arm since image 20261116.196.1: an egress
+# that file is static (some ubuntu-22.04-arm runners since 2026-11-16: an egress
 # proxy, the stub, then the upstream) the copy holds only the upstream the
 # switch went around, so a container started after it still cannot resolve
 # (#3710). No failover, no file: a healthy job passes containers nothing new.
