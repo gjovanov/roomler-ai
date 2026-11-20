@@ -2666,7 +2666,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    - in a root process only, **the seat**: whether it has emptied or changed
      hands since the gate's first look at it (a log-out, a login as someone
      else, a user switch). The person socket's poll of `/dev/console`'s owner
-     tells the gate every 5 s (`person_socket.rs:730`, `indicator/mac.rs:892`,
+     tells the gate every 5 s (`person_socket.rs:855`, `indicator/mac.rs:892`,
      `indicator/panel_gate.rs:275`). The change is held for the process's
      life and never read at a question, since after the login someone is at
      the seat again. A seat that goes from nobody to a person (a boot, then a
