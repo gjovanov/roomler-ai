@@ -1159,6 +1159,7 @@ mod tests {
             wizard_linux_daemon: true,
             wizard_macos_daemon: true,
             wizard_unix_daemon: true,
+            reinstall_guard_off: false,
         });
         let detect_unix = |os, server, asked| detect_unix(os, server, asked, false);
         // FR-129 C1 — the default follows the same switch; the kind is

@@ -51,6 +51,9 @@ pub mod package_step;
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;
 pub mod proxy;
+/// FR-141 P3 (D2-A) — a Mac that is one row already gets no install and no
+/// pairing: the root daemon says so over its person socket.
+pub mod reinstall_guard;
 pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
