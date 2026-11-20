@@ -602,8 +602,8 @@ impl Inner {
 }
 
 /// Compute a 1–2 character initials label from a controller's display
-/// name for the overlay badge. "Goran Jovanov" → "GJ", "gjovanov" →
-/// "GJ", "alice" → "AL", "" → "?". Splits on whitespace + common
+/// name for the overlay badge. "Casey Jackson" → "CJ", "cjackson" →
+/// "CJ", "alice" → "AL", "" → "?". Splits on whitespace + common
 /// separators, takes the first letter of the first two tokens (or the
 /// The consent countdown, human-readable. `"30s"` under a minute, `"4:47"`
 /// above it — because the plain-`prompt` window is now 5 min (a locked host,
@@ -676,20 +676,20 @@ mod tests {
 
     #[test]
     fn initials_two_tokens() {
-        assert_eq!(initials_of("Goran Jovanov"), "GJ");
-        assert_eq!(initials_of("goran jovanov"), "GJ");
+        assert_eq!(initials_of("Casey Jackson"), "CJ");
+        assert_eq!(initials_of("casey jackson"), "CJ");
     }
 
     #[test]
     fn initials_separators() {
-        assert_eq!(initials_of("goran.jovanov"), "GJ");
-        assert_eq!(initials_of("goran_jovanov"), "GJ");
-        assert_eq!(initials_of("goran-jovanov"), "GJ");
+        assert_eq!(initials_of("casey.jackson"), "CJ");
+        assert_eq!(initials_of("casey_jackson"), "CJ");
+        assert_eq!(initials_of("casey-jackson"), "CJ");
     }
 
     #[test]
     fn initials_single_token() {
-        assert_eq!(initials_of("gjovanov"), "GJ");
+        assert_eq!(initials_of("cjackson"), "CJ");
         assert_eq!(initials_of("alice"), "AL");
         assert_eq!(initials_of("x"), "X");
     }

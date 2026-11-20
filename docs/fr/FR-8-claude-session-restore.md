@@ -18,7 +18,7 @@ Two parts + two spawn targets, all under `~/.claude/session-restore/`:
 
 `SessionStart`/`SessionEnd` hooks in the **user-level** `~/.claude/settings.json` (so every project folder is covered) maintain one JSON per session in `registry/`: session id, cwd, transcript path, start time, and the owning claude **PID + full command line** (found by walking the hook's parent-process chain). A clean `SessionEnd` stamps `ended_at`; a reboot kills processes without the hook ever firing — **an open entry with no clean end is precisely a restore candidate**. `/clear`/fork supersede the prior entry with the same PID; entries GC after 14 days; the hook always exits 0 (a broken hook must never break a session).
 
-- ⚠️ Claude Code hooks on this machine execute through **Git Bash**, not PowerShell — the settings command uses forward slashes (`pwsh -NoProfile -NoLogo -File C:/Users/goran/.claude/session-restore/hook.ps1`; bash eats backslashes in unquoted words), and the parent walk treats `bash`/`sh` as walkable shell wrappers.
+- ⚠️ Claude Code hooks on this machine execute through **Git Bash**, not PowerShell — the settings command uses forward slashes (`pwsh -NoProfile -NoLogo -File ~/.claude/session-restore/hook.ps1`; bash eats backslashes in unquoted words), and the parent walk treats `bash`/`sh` as walkable shell wrappers.
 - Field-proven: ✕-closing a terminal **does** fire `SessionEnd` (`reason: other`); only hard kills (reboot) leave entries open. Headless `-p` runs and subagent hook invocations are filtered out.
 
 ### 2. Restore CLI (`Restore-ClaudeSessions.ps1`, alias `crestore` in `$PROFILE`)

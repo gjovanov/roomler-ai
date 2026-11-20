@@ -4050,13 +4050,13 @@ mod tests {
         // each group holding only its own rows.
         let multi = vec![
             peer("p1", "primary"),
-            peer("j1", "jovanov"),
+            peer("j1", "contoso"),
             peer("p2", "primary"),
         ];
         let g = group_peers_by_org(&multi);
         assert_eq!(
             g.iter().map(|(o, _)| o.unwrap()).collect::<Vec<_>>(),
-            vec!["primary", "jovanov"]
+            vec!["primary", "contoso"]
         );
         assert_eq!(g[0].1.len(), 2);
         assert_eq!(g[1].1.len(), 1);
