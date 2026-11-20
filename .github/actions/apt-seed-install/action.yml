@@ -58,10 +58,14 @@ runs:
         fi
         rm -rf "$dl"
         echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries >/dev/null
-        sudo apt-get update -qq || { echo "::error::apt-get update failed"; exit 1; }
-        # Keep-Downloaded-Packages: whatever apt fetches here stays in the
-        # archive directory for apt-seed-save to publish.
+        # ci-apt.sh install (#3710): the mirror probe and public-resolver
+        # failover, a bounded refresh (a bare `apt-get update` exits 0 when no
+        # mirror resolves), then the install, bounded, with exactly these options
+        # on both of its phases. With no resolver at all it still installs from
+        # the restored seed if that holds every package, and otherwise fails at
+        # once with one ::error. Keep-Downloaded-Packages: whatever apt fetches
+        # here stays in the archive directory for apt-seed-save to publish.
         # shellcheck disable=SC2086
-        sudo apt-get install -y --no-install-recommends \
-          -o APT::Keep-Downloaded-Packages=true $PACKAGES \
-          || { echo "::error::apt-get install failed"; exit 1; }
+        bash "${{ github.action_path }}/../ci-linux-system-deps/ci-apt.sh" install --refresh-bound 300 --download-bound 600 \
+          -y --no-install-recommends -o APT::Keep-Downloaded-Packages=true -- $PACKAGES \
+          || exit 1
