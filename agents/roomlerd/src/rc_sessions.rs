@@ -99,12 +99,19 @@ struct Entry {
     /// FR-85 P3b-3 — the session ended while recording, and the entry stays
     /// for the recording's re-attach grace: the banner says "reconnecting".
     detached: bool,
+    /// #2531 — when the session was first registered here, which is when a
+    /// client's read of the live sessions can first list it. A re-announce
+    /// keeps it.
+    registered: Instant,
 }
 
 /// Cheap to clone; every clone sees the same map.
 #[derive(Clone, Default)]
 pub struct RcSessionRegistry {
     inner: Arc<Mutex<HashMap<ObjectId, Entry>>>,
+    /// #2531 — per person (uid), when a client of theirs last read the live
+    /// sessions over the person socket ([`Self::list_for_person`]).
+    person_reads: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl RcSessionRegistry {
@@ -131,6 +138,9 @@ impl RcSessionRegistry {
         // ⚠️ A re-announce must not clear a recording in progress: the banner
         // saying "recording" is the host's only notice of it.
         let recording = map.get(&session).is_some_and(|e| e.recording);
+        let registered = map
+            .get(&session)
+            .map_or_else(Instant::now, |e| e.registered);
         map.insert(
             session,
             Entry {
@@ -142,8 +152,18 @@ impl RcSessionRegistry {
                 recording,
                 recording_read: None,
                 detached: false,
+                registered,
             },
         );
+    }
+
+    /// #2531 — when `session` was registered here, if it is.
+    pub fn registered_at(&self, session: &ObjectId) -> Option<Instant> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|e| e.registered)
     }
 
     pub fn remove(&self, session: &ObjectId) {
@@ -216,6 +236,33 @@ impl RcSessionRegistry {
             }
         }
         self.list()
+    }
+
+    /// #2531 — [`Self::list_for_client`], read by `uid`'s own client over the
+    /// person socket, and noted as that person's last read. The time is taken
+    /// before the list, so a read counts only for sessions it could list, and
+    /// the note only moves forward: of two reads at once, the later one's time
+    /// stays whichever ends first.
+    pub fn list_for_person(&self, uid: u32) -> Vec<RcSessionInfo> {
+        let at = Instant::now();
+        let list = self.list_for_client();
+        self.person_reads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(uid)
+            .and_modify(|last| *last = (*last).max(at))
+            .or_insert(at);
+        list
+    }
+
+    /// #2531 — when `uid`'s client last read the live sessions over the
+    /// person socket, if it ever did.
+    pub fn person_read_at(&self, uid: u32) -> Option<Instant> {
+        self.person_reads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&uid)
+            .copied()
     }
 
     /// FR-85 P3d — when a client first read `session` as recording.
@@ -336,9 +383,150 @@ pub fn log_host_ended(session_id: ObjectId, via: Via) {
     tracing::info!(%session_id, via = via.label(), "the person at the device ended the session");
 }
 
+/// #2531 — how long the companion of the person at the screen has to show
+/// that it lists a viewed session (FR-93 P6g): a read of the live sessions
+/// over the person socket ([`RcSessionRegistry::list_for_person`]) after the
+/// session was registered, at most this long after the capture opened, or
+/// after the registration where that came later (a banner can list a session
+/// only once it is registered). And a told session whose companion then reads
+/// nothing for longer than this gets the notification too.
+///
+/// The companion sleeps 750 ms between reads and gives one read 5 s, so a
+/// companion that works never goes this long without one. One started for
+/// the session that is slower than this to its first read gets the
+/// notification as well as its banner: the bound errs toward telling.
+pub const TOLD_WITHIN: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// #2531 — what the being-viewed notice knows, at a moment, of whether the
+/// companion has shown it lists a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Told {
+    /// The person's companion read the live sessions after the session was
+    /// registered: its banner lists it.
+    Yes,
+    /// Not yet, and there is time left.
+    NotYet,
+    /// The time ran out with no such read: the notification says it.
+    No,
+}
+
+/// #2531 — [`Told`] at `now`, for a session registered at `registered`
+/// whose companion has until `deadline`, given the person's `last_read`. A
+/// read taken before the registration, or at the same instant, does not
+/// count: it could not list the session.
+pub fn told(
+    now: Instant,
+    registered: Instant,
+    deadline: Instant,
+    last_read: Option<Instant>,
+) -> Told {
+    if last_read.is_some_and(|read| read > registered) {
+        Told::Yes
+    } else if now >= deadline {
+        Told::No
+    } else {
+        Told::NotYet
+    }
+}
+
+/// #2531 — a told session's companion has gone quiet: no read of the live
+/// sessions for longer than `bound` at `now`.
+pub fn gone_quiet(now: Instant, last_read: Option<Instant>, bound: std::time::Duration) -> bool {
+    last_read.is_none_or(|read| now.saturating_duration_since(read) > bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// #2531 — with a stubbed clock and record: a session is told only by a
+    /// read of the person's that came after its registration. None inside
+    /// the bound, and the notification goes up; one before the registration,
+    /// or at the same instant, is no read of it.
+    #[test]
+    fn a_session_is_told_only_by_a_read_after_its_registration() {
+        let opened = Instant::now();
+        let registered = opened + Duration::from_millis(40);
+        let deadline = registered + TOLD_WITHIN;
+        let at = |ms: u64| opened + Duration::from_millis(ms);
+        // No read at all: waiting, then the notification.
+        assert_eq!(told(at(100), registered, deadline, None), Told::NotYet);
+        assert_eq!(told(deadline, registered, deadline, None), Told::No);
+        // A read before the registration, and one at its instant, list it not.
+        for read in [at(10), registered] {
+            assert_eq!(
+                told(at(500), registered, deadline, Some(read)),
+                Told::NotYet
+            );
+            assert_eq!(told(deadline, registered, deadline, Some(read)), Told::No);
+        }
+        // A read after it: told, the moment it comes.
+        assert_eq!(
+            told(at(900), registered, deadline, Some(at(800))),
+            Told::Yes
+        );
+        // Inside the bound, however late in it.
+        let last_moment = deadline - Duration::from_millis(1);
+        assert_eq!(
+            told(last_moment, registered, deadline, Some(last_moment)),
+            Told::Yes
+        );
+    }
+
+    /// #2531 — with a stubbed clock and record: a told session's companion
+    /// that reads nothing for longer than the bound has gone quiet, and one
+    /// that reads within it has not. Never read at all is quiet.
+    #[test]
+    fn a_companion_that_stops_reading_for_longer_than_the_bound_has_gone_quiet() {
+        let read = Instant::now();
+        assert!(!gone_quiet(read, Some(read), TOLD_WITHIN));
+        assert!(!gone_quiet(read + TOLD_WITHIN, Some(read), TOLD_WITHIN));
+        assert!(gone_quiet(
+            read + TOLD_WITHIN + Duration::from_millis(1),
+            Some(read),
+            TOLD_WITHIN
+        ));
+        assert!(gone_quiet(read, None, TOLD_WITHIN));
+        // A clock that reads earlier than the read (a read noted just now on
+        // another thread) is no gap.
+        assert!(!gone_quiet(
+            read,
+            Some(read + Duration::from_millis(5)),
+            TOLD_WITHIN
+        ));
+    }
+
+    /// #2531 — the record: a person's read of the live sessions is noted as
+    /// theirs, at a time taken before the list, and lists what a client read
+    /// lists. Another person's read, or any client's other read, is not
+    /// theirs. A re-announce keeps the session's registration.
+    #[test]
+    fn a_persons_read_is_noted_for_them_and_a_reannounce_keeps_the_registration() {
+        let (reg, ids, _rx) = reg_with(1);
+        let registered = reg.registered_at(&ids[0]).expect("registered");
+        assert_eq!(reg.person_read_at(1000), None);
+        let before = Instant::now();
+        let listed = reg.list_for_person(1000);
+        let after = Instant::now();
+        assert_eq!(listed.len(), 1);
+        let read = reg.person_read_at(1000).expect("noted for 1000");
+        assert!(before <= read && read <= after, "taken around the list");
+        assert!(read > registered);
+        assert_eq!(reg.person_read_at(1001), None, "nobody else's");
+        let _ = reg.list_for_client();
+        let _ = reg.list();
+        assert_eq!(
+            reg.person_read_at(1000),
+            Some(read),
+            "other reads are not theirs"
+        );
+
+        let (tx, _rx2) = tokio::sync::mpsc::channel(1);
+        reg.insert(ids[0], "viewer0".into(), "VIEW".into(), String::new(), tx);
+        assert_eq!(reg.registered_at(&ids[0]), Some(registered));
+        assert_eq!(reg.registered_at(&ObjectId::new()), None);
+    }
 
     fn reg_with(
         n: usize,
