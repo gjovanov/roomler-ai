@@ -692,9 +692,9 @@ main() {
   fi
   case "${1:-}" in
     prepare | fallback | install | reach)
-      local c=$1
+      local sub=$1
       shift
-      "cmd_$c" "$@"
+      "cmd_$sub" "$@"
       ;;
     *)
       echo "usage: ci-apt.sh prepare [BOUND...] | fallback PACKAGE... | install [BOUND...] [APT-OPTION...] -- PACKAGE... | reach [--containers] [HOST...]" >&2
