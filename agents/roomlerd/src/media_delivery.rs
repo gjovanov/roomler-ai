@@ -75,7 +75,7 @@ use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::governor::RateGovernor;
-use crate::encode::pipe::{PathNumber, PathView, PushedBy};
+use crate::encode::pipe::{PathNumber, PathRate, PathView, PushedBy, Ruled};
 use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
@@ -249,11 +249,24 @@ impl Sample {
 }
 
 /// FR-148 D46 B2 — a delivery sample's push-back on the shadow model: a
-/// capacity at `bps`, and which rule of D46 item 10 made it one.
+/// capacity at `bps`, and which rule of D46 item 10 made it one. FR-148 D48:
+/// `reread` when rule 1 raised a P3 to the budget's rate at its close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SamplePushBack {
     pub bps: u32,
     pub by: PushedBy,
+    pub reread: bool,
+}
+
+/// FR-148 D48 — what a closed sample gives the shadow model
+/// ([`sample_read_of`]): a push-back, or a P3 that rule 4 kept out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleRead {
+    /// P1, or P3 at its own rate or re-read by rule 1.
+    Push(SamplePushBack),
+    /// A P3 with no loss in it and a hold SCTP's congestion window sized
+    /// ([`Over::ramp`]): the association's ramp bound it, not the path.
+    Ramp,
 }
 
 /// FR-148 D46 B2 — how a sample that a stall's still span met is read: its
@@ -323,14 +336,37 @@ pub fn settle(b: &Budget) -> Duration {
 /// every 2 s, and [`settle`] passes 2 s only past a least of about 1.65 s.
 const WAITING_MAX: usize = 4;
 
-/// FR-148 D46 B2 — a sample's push-back (D46 item 10), or `None`. `over` is
-/// what the in-flight budget saw over the sample (`Budget::over`), `None`
-/// while the budget is off:
+/// FR-148 D48 — what the budget's last step read, as the shadow model's
+/// window rules take it: its rate, whether this association's figures gave
+/// it, and SCTP's loss count. `None` before the association's first step.
+pub fn path_rate(s: &Shadow) -> Option<PathRate> {
+    let b = s.budget();
+    Some(PathRate {
+        bps: b.rate_bps().map(|r| u32::try_from(r).unwrap_or(u32::MAX)),
+        measured: b.rate_measured(),
+        loss: b.loss()?,
+    })
+}
+
+/// FR-148 D46 B2 — a sample's push-back (D46 item 10), or `None`:
+/// [`sample_read_of`]'s, when it gives one.
+pub fn push_back_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<SamplePushBack> {
+    match sample_read_of(s, over, burst)? {
+        SampleRead::Push(p) => Some(p),
+        SampleRead::Ramp => None,
+    }
+}
+
+/// FR-148 D46 B2 — what a sample gives the shadow model (D46 item 10), or
+/// `None`. `over` is what the in-flight budget saw over the sample
+/// (`Budget::over`), `None` while the budget is off:
 ///
 /// | | budget off | budget on or in shadow |
 /// |---|---|---|
 /// | P1: queued ([`QueueReading::queued`]) | at its own rate | at its own rate |
-/// | P3: counted, backlogged (SCTP's class, or a hold in each second), no still span of the least and S in it, and it starts at or after the budget's first measured rate | nothing | at its own rate |
+/// | P3: counted, backlogged (SCTP's class, or holds in a share of each second's grains, [`Over::held`]), no still span of the least and S in it, and it starts at or after the budget's first measured rate | nothing | at its own rate |
+/// | FR-148 D48 rule 1: such a P3 with a loss in it ([`QueueReading::loss`]) | nothing | at the larger of its own rate and the budget's at its close ([`Over::rate`]) |
+/// | FR-148 D48 rule 4: such a P3 with no loss in it and a hold SCTP's congestion window sized ([`Over::ramp`]) | nothing | nothing: [`SampleRead::Ramp`] |
 /// | a still span met it ([`Burst::Exclude`]) | (not seen) | nothing |
 /// | anything else, an application-limited sample or one the opening held among them | nothing | nothing |
 ///
@@ -339,8 +375,12 @@ const WAITING_MAX: usize = 4;
 /// sampler's to apply ([`DeliverySampler::heartbeat`]). A sample that starts
 /// in the budget's opening ([`Over::opening`]) is no P3 capacity: the opening
 /// rate stood in and SCTP's window was still opening, so its holds and its
-/// backlog were the opening's, not the path's.
-pub fn push_back_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<SamplePushBack> {
+/// backlog were the opening's, not the path's. A P3's two D48 rules take a
+/// loss first: a loss says the path was full, and the budget's rate, the
+/// most of the same clock's one-second figures, reads the second the
+/// recovery cost least; with no loss, a hold the congestion window sized
+/// says only that the association was still ramping.
+pub fn sample_read_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<SampleRead> {
     let q = s.queue?;
     let by = match over {
         None => q.queued().then_some(PushedBy::P1)?,
@@ -368,10 +408,26 @@ pub fn push_back_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<Sam
         _ => (s.bytes, s.ms),
     };
     let bps = bytes.saturating_mul(8_000).checked_div(ms)?;
-    Some(SamplePushBack {
+    let p = SamplePushBack {
         bps: u32::try_from(bps).unwrap_or(u32::MAX),
         by,
-    })
+        reread: false,
+    };
+    if let (PushedBy::P3, Some(o)) = (by, over) {
+        if q.loss != (0, 0) {
+            let rate = o.rate.map_or(0, |r| u32::try_from(r).unwrap_or(u32::MAX));
+            if rate > p.bps {
+                return Some(SampleRead::Push(SamplePushBack {
+                    bps: rate,
+                    reread: true,
+                    ..p
+                }));
+            }
+        } else if o.ramp {
+            return Some(SampleRead::Ramp);
+        }
+    }
+    Some(SampleRead::Push(p))
 }
 
 /// One line: the samples since the last, folded.
@@ -543,8 +599,10 @@ pub struct DeliverySampler {
     /// with the time [`settle`] ends; a stall the budget marks before then
     /// drops it ([`Self::on_frame`]), and the heartbeat hands the governor's
     /// shadow model each whose time has come. With the budget off a push-back
-    /// waits for nothing.
-    waiting: VecDeque<(SamplePushBack, Instant)>,
+    /// waits for nothing. FR-148 D48: a P3 that rule 4 kept out waits in its
+    /// place ([`SampleRead::Ramp`]), so that the `path model` line names the
+    /// rule when the push-back would have been handed.
+    waiting: VecDeque<(SampleRead, Instant)>,
     /// FR-148 D46 B3 — the pass [`Self::gate`] answered last, for the gate's
     /// terms; and, under `on`, whether the budget acted when the pump last
     /// said which mode acted (`None` before it first said).
@@ -630,20 +688,29 @@ impl DeliverySampler {
                 || pc.sctp().delivery_clock(),
                 || pc.sctp().gauges(),
             );
-            while let Some(p) = self.due_push_back(now) {
-                governor.on_sample_push_back(p.bps, p.by, now);
+            while let Some(read) = self.due_read(now) {
+                match read {
+                    SampleRead::Push(p) => {
+                        governor.on_sample_push_back(p.bps, p.by, now);
+                        if p.reread {
+                            governor.on_sample_ruled(Ruled::ReRead, now);
+                        }
+                    }
+                    SampleRead::Ramp => governor.on_sample_ruled(Ruled::Ramp, now),
+                }
             }
             self.on_view(now, session_id, |t| governor.path_view(t, seed_age));
         }
     }
 
     /// FR-148 D46 B2 — the oldest waiting push-back whose [`settle`] has passed
-    /// by `now`, taken; `None` when none has.
-    fn due_push_back(&mut self, now: Instant) -> Option<SamplePushBack> {
-        let &(p, until) = self.waiting.front()?;
+    /// by `now`, taken; `None` when none has. FR-148 D48: or a P3 rule 4 kept
+    /// out.
+    fn due_read(&mut self, now: Instant) -> Option<SampleRead> {
+        let &(read, until) = self.waiting.front()?;
         (until <= now).then(|| {
             self.waiting.pop_front();
-            p
+            read
         })
     }
 
@@ -654,10 +721,22 @@ impl DeliverySampler {
     }
 
     /// FR-148 D46 B2 — the next push-back the heartbeat would hand at `now`:
-    /// the tests' look at what reaches the governor.
+    /// the tests' look at what reaches the governor. FR-148 D48: a P3 that
+    /// rule 4 kept out is passed over ([`Self::take_read`] sees it).
     #[cfg(test)]
     pub(crate) fn take_push_back(&mut self, now: Instant) -> Option<SamplePushBack> {
-        self.due_push_back(now)
+        while let Some(read) = self.due_read(now) {
+            if let SampleRead::Push(p) = read {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// FR-148 D48 — the next [`SampleRead`] the heartbeat would hand at `now`.
+    #[cfg(test)]
+    pub(crate) fn take_read(&mut self, now: Instant) -> Option<SampleRead> {
+        self.due_read(now)
     }
 
     /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock` and
@@ -742,12 +821,12 @@ impl DeliverySampler {
         // the budget has had `settle` to mark a stall the close fell in.
         let budget = self.budget.as_deref().map(Shadow::budget);
         let over = budget.map(|b| b.over(since, now, from.acked_bytes));
-        if let Some(p) = push_back_of(&sample, over.as_ref(), BURST) {
+        if let Some(read) = sample_read_of(&sample, over.as_ref(), BURST) {
             let until = now + budget.map_or(Duration::ZERO, settle);
             if self.waiting.len() == WAITING_MAX {
                 self.waiting.pop_front();
             }
-            self.waiting.push_back((p, until));
+            self.waiting.push_back((read, until));
         }
         self.fold.add(sample);
         self.base = Some((now, reading, to_gauges));
@@ -871,7 +950,9 @@ impl DeliverySampler {
     /// ([`RateGovernor::note_path_stall`]), and drops each push-back still
     /// inside its [`settle`]. Off, it reads nothing. FR-148 D46 B3: under
     /// `on`, on a constrained session, the step ran at [`Self::gate`], before
-    /// the gate, and this reads nothing.
+    /// the gate, and this reads nothing. FR-148 D48: beside the mark, the
+    /// step's rate and SCTP's loss count go to the shadow model's window
+    /// rules ([`RateGovernor::note_path_rate`]).
     pub fn on_frame(&mut self, pc: &RTCPeerConnection, governor: &mut RateGovernor) {
         if self.pass.acts() {
             return;
@@ -883,6 +964,17 @@ impl DeliverySampler {
         if marked {
             governor.note_path_stall();
             self.on_mark(Instant::now());
+        }
+        self.note_path_rate(governor);
+    }
+
+    /// FR-148 D48 — the budget's last step, to the governor's shadow model:
+    /// its rate, whether this association's figures gave it, and SCTP's loss
+    /// count ([`path_rate`]). Off, or before the association's first step,
+    /// nothing.
+    fn note_path_rate(&self, governor: &mut RateGovernor) {
+        if let Some(rate) = self.budget.as_deref().and_then(path_rate) {
+            governor.note_path_rate(rate);
         }
     }
 
@@ -938,6 +1030,9 @@ impl DeliverySampler {
         };
         if self.gated(Instant::now(), session_id, pass) {
             governor.note_path_stall();
+        }
+        if pass.acts() {
+            self.note_path_rate(governor);
         }
     }
 
@@ -1222,6 +1317,20 @@ impl std::fmt::Display for Shown {
     }
 }
 
+/// FR-148 D48 — the rule that last kept a reading out of the shadow model,
+/// re-read it or bounded it, as the line writes it: `<word>/<age>ms`, or `-`
+/// while none has.
+struct RuledShown(Option<(Ruled, Duration)>);
+
+impl std::fmt::Display for RuledShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some((rule, age)) => write!(f, "{}/{}ms", rule.word(), age.as_millis()),
+            None => f.write_str("-"),
+        }
+    }
+}
+
 /// Step 3's line. Each field is the heartbeat's field of the same name with
 /// its tag; `viewer_rx_bps` and `seed_bps` have none there, and the `model_`
 /// fields are the shadow model's. Their names and order are pinned by a test.
@@ -1245,6 +1354,10 @@ pub fn emit_model(session_id: ObjectId, v: &PathView) {
         // lowered the model's floor last, or set its capacity; `-` otherwise.
         model_floor_push_back = %PushedBy::word_of(v.model_floor_by),
         model_capacity_push_back = %PushedBy::word_of(v.model_capacity_by),
+        // FR-148 D48 — the rule that last kept a reading out of the model,
+        // re-read it or bounded it (`stall`, `reread`, `ramp`, `bound` or
+        // `hole`), and how long ago; `-` while none has.
+        model_rule = %RuledShown(v.model_ruled),
         "{MODEL_LINE}"
     );
 }
@@ -2543,6 +2656,7 @@ mod tests {
         Some(SamplePushBack {
             bps: kbps * 1_000,
             by,
+            reread: false,
         })
     }
 
@@ -2573,7 +2687,7 @@ mod tests {
     /// in it is a capacity with the budget on or in shadow, and nothing with
     /// it off: SCTP's `Backlogged` class alone feeds nothing then. Under the
     /// budget a sample whose SCTP queue ran empty is backlogged too when the
-    /// verdicts held a frame in each of its seconds.
+    /// verdicts held a frame in a share of each of its seconds.
     #[test]
     fn a_backlogged_sample_with_no_still_span_pushes_back_with_the_budget_and_not_without() {
         let quiet = Over::default();
@@ -2609,6 +2723,7 @@ mod tests {
             held: true,
             released_from: None,
             opening: false,
+            ..Over::default()
         };
         let s = read_sample(Class::Backlogged, 1_200, Some(40));
         for burst in [Burst::Exclude, Burst::Stood, Burst::Correct, Burst::Own] {
@@ -2629,6 +2744,7 @@ mod tests {
             held: false,
             released_from: Some((Duration::from_millis(800), 200_000)),
             opening: false,
+            ..Over::default()
         };
         let s = read_sample(Class::Backlogged, 2_600, Some(300));
         assert_eq!(push_back_of(&s, Some(&burst), Burst::Exclude), None);
@@ -2648,7 +2764,7 @@ mod tests {
     }
 
     /// FR-148 D46 B2 — an application-limited sample (SCTP's queue ran
-    /// empty, no standing queue, no hold in each second) is no push-back
+    /// empty, no standing queue, not held in each second) is no push-back
     /// under any setting of the budget, so it never lowers the floor.
     #[test]
     fn an_application_limited_sample_never_lowers_the_floor() {
@@ -2670,6 +2786,130 @@ mod tests {
             }
         }
         assert_eq!(pipe.model().floor(now).map(|f| f.bps), Some(2_000_000));
+    }
+
+    /// FR-148 D48 — `s` with SCTP's fast retransmits and T3-rtx expiries
+    /// over it.
+    fn lossy(s: Sample, loss: (u64, u64)) -> Sample {
+        Sample {
+            queue: s.queue.map(|q| QueueReading { loss, ..q }),
+            ..s
+        }
+    }
+
+    /// FR-148 D48 — a P3 that rule 1 re-read at `kbps`.
+    fn reread(kbps: u32) -> Option<SamplePushBack> {
+        Some(SamplePushBack {
+            bps: kbps * 1_000,
+            by: PushedBy::P3,
+            reread: true,
+        })
+    }
+
+    /// FR-148 D48, rule 1 — a P3 sample with a loss in it is re-read at the
+    /// budget's rate at its close when that is more: its own mean is what
+    /// SCTP's recovery let through, and the rate, the most of the same
+    /// clock's one-second figures, reads the second the recovery cost least.
+    /// A fast retransmit and a T3-rtx expiry alike are a loss. A rate under
+    /// its own, or none known, leaves it as read; so does no loss; and P1,
+    /// which read its own queue, is never re-read.
+    #[test]
+    fn a_p3_sample_with_a_loss_in_it_is_re_read_at_the_budget_s_rate() {
+        let at = |rate: Option<u64>| Over {
+            held: true,
+            rate,
+            ..Over::default()
+        };
+        let p3 = read_sample(Class::Backlogged, 1_200, Some(40));
+        for loss in [(1, 0), (0, 1), (3, 2)] {
+            let s = lossy(p3, loss);
+            assert_eq!(
+                push_back_of(&s, Some(&at(Some(1_900_000))), BURST),
+                reread(1_900),
+                "{loss:?}"
+            );
+            assert_eq!(
+                sample_read_of(&s, Some(&at(Some(1_900_000))), BURST),
+                reread(1_900).map(SampleRead::Push)
+            );
+            for under in [Some(1_000_000), Some(1_200_000), None] {
+                assert_eq!(
+                    push_back_of(&s, Some(&at(under)), BURST),
+                    pushed(PushedBy::P3, 1_200),
+                    "{loss:?} {under:?}"
+                );
+            }
+        }
+        assert_eq!(
+            push_back_of(&p3, Some(&at(Some(1_900_000))), BURST),
+            pushed(PushedBy::P3, 1_200),
+            "no loss"
+        );
+        let queued = lossy(read_sample(Class::Backlogged, 1_200, Some(340)), (1, 0));
+        assert_eq!(
+            push_back_of(&queued, Some(&at(Some(1_900_000))), BURST),
+            pushed(PushedBy::P1, 1_200)
+        );
+    }
+
+    /// FR-148 D48, rule 4 — a P3 sample with no loss in it and a hold SCTP's
+    /// congestion window sized ([`Over::ramp`]) is kept out: the
+    /// association's ramp bound it, not the path. Kept out, it still takes
+    /// the sampler's slot ([`SampleRead::Ramp`]), which the `path model`
+    /// line names. With a loss in it rule 1 reads it first. A hold the
+    /// receive window sized leaves `ramp` unset (`media_inflight::tests`),
+    /// and the P3 stands. P1 reads its own queue either way, and with the
+    /// budget off no rule reads anything.
+    #[test]
+    fn a_p3_sample_the_ramp_bound_is_kept_out_and_one_with_a_loss_is_re_read() {
+        let ramp = Over {
+            held: true,
+            ramp: true,
+            rate: Some(1_900_000),
+            ..Over::default()
+        };
+        let p3 = read_sample(Class::Backlogged, 1_200, Some(40));
+        assert_eq!(
+            sample_read_of(&p3, Some(&ramp), BURST),
+            Some(SampleRead::Ramp)
+        );
+        assert_eq!(push_back_of(&p3, Some(&ramp), BURST), None);
+        let viewer = Over {
+            ramp: false,
+            ..ramp
+        };
+        assert_eq!(
+            push_back_of(&p3, Some(&viewer), BURST),
+            pushed(PushedBy::P3, 1_200)
+        );
+        for loss in [(1, 0), (0, 1)] {
+            assert_eq!(
+                push_back_of(&lossy(p3, loss), Some(&ramp), BURST),
+                reread(1_900),
+                "{loss:?}"
+            );
+        }
+        // A loss and a rate under its own: as read, not kept out.
+        let slow = Over {
+            rate: Some(1_000_000),
+            ..ramp
+        };
+        assert_eq!(
+            push_back_of(&lossy(p3, (1, 0)), Some(&slow), BURST),
+            pushed(PushedBy::P3, 1_200)
+        );
+        let queued = read_sample(Class::Backlogged, 1_200, Some(340));
+        assert_eq!(
+            push_back_of(&queued, Some(&ramp), BURST),
+            pushed(PushedBy::P1, 1_200)
+        );
+        assert_eq!(sample_read_of(&p3, None, BURST), None);
+        // The opening's is no P3 to rule on.
+        let opening = Over {
+            opening: true,
+            ..ramp
+        };
+        assert_eq!(sample_read_of(&p3, Some(&opening), BURST), None);
     }
 
     /// FR-148 D46 B2 — the sampler's own push-back, by what its budget saw: a
@@ -2727,6 +2967,83 @@ mod tests {
                 vec![(6, PushedBy::P1, 2_000_000)]
             };
             assert_eq!(pushed, want, "budget {budget}");
+        }
+    }
+
+    /// FR-148 D48, rule 4, through the sampler — the run above in shadow,
+    /// its least 60 ms throughout, with one frame at 3 s that holds: SCTP's
+    /// congestion window of 6 kB over the least carries 800 kbit/s, under
+    /// the 2 Mbit/s rate, and 21 kB out holds. The P3 the sample closes into
+    /// at 4 s is kept out, its slot handed at 5 s as the ramp's; the next is
+    /// P3 again. The receive window sizing the same hold, the P3 stands. A
+    /// fast retransmit over the sample reads it by rule 1 first: not kept
+    /// out, and at no less than its own rate.
+    #[test]
+    fn the_sampler_keeps_out_a_p3_the_ramp_bound() {
+        let t0 = Instant::now();
+        let base = Gauges {
+            max_payload: 1_200,
+            cwnd: 1 << 20,
+            rwnd: 1 << 20,
+            inflight_bytes: 50_000,
+            pending_bytes: 1,
+            ack_delay: Some(Duration::from_millis(60)),
+            ack_delay_min: Some(Duration::from_millis(60)),
+            ..Gauges::default()
+        };
+        let held = Gauges {
+            inflight_bytes: 6_000,
+            pending_bytes: 15_000,
+            ..base
+        };
+        let ramp = Gauges {
+            cwnd: 6_000,
+            ..held
+        };
+        let viewer = Gauges { rwnd: 0, ..held };
+        let p3 = SampleRead::Push(SamplePushBack {
+            bps: 2_000_000,
+            by: PushedBy::P3,
+            reread: false,
+        });
+        for (hold, fast) in [(ramp, 0), (viewer, 0), (ramp, 1)] {
+            let mut s = DeliverySampler::new(true).with_budget();
+            let mut reads = Vec::new();
+            for frame in 0..=210u64 {
+                let now = at(t0, frame * 1_000 / 30);
+                let acked = frame * 250_000 / 30;
+                let g = if frame == 90 { hold } else { base };
+                let g = Gauges {
+                    fast_retransmits: if frame >= 90 { fast } else { 0 },
+                    ..g
+                };
+                s.on_frame_reading(now, acked, g, 2_000_000);
+                if frame % 30 == 0 {
+                    let reading = Delivery {
+                        acked_bytes: acked,
+                        queue_fills: 1,
+                        queue_empties: 0,
+                    };
+                    s.on_reading_with(now, reading, || Some(g));
+                    while let Some(read) = s.take_read(now) {
+                        reads.push((frame / 30, read));
+                    }
+                }
+            }
+            if fast > 0 {
+                assert!(
+                    matches!(
+                        reads.as_slice(),
+                        [(5, SampleRead::Push(p)), (7, _)]
+                            if p.by == PushedBy::P3 && p.bps >= 2_000_000
+                    ),
+                    "a loss: {reads:?}"
+                );
+            } else if hold.cwnd == ramp.cwnd {
+                assert_eq!(reads, [(5, SampleRead::Ramp), (7, p3)]);
+            } else {
+                assert_eq!(reads, [(5, p3), (7, p3)], "the viewer's window");
+            }
         }
     }
 
@@ -2797,7 +3114,7 @@ mod tests {
     /// FR-148 D46 B2 — a sampler with the budget in shadow for `secs`
     /// seconds at 30 fps: 2 Mbit/s acknowledged, the opening rate 2 Mbit/s,
     /// `out(ms)` bytes in flight, a reading once a second whose SCTP queue
-    /// ran empty (so only a hold in each second makes a sample backlogged).
+    /// ran empty (so only the budget's holds make a sample backlogged).
     /// Returns each push-back the heartbeat would hand, and when (ms).
     fn opening_run(secs: u64, out: impl Fn(u64) -> u64) -> Vec<(u64, SamplePushBack)> {
         let t0 = Instant::now();
@@ -3188,6 +3505,7 @@ mod tests {
             model_stand_in: floor,
             model_floor_by: None,
             model_capacity_by: Some(PushedBy::P3),
+            model_ruled: Some((Ruled::Hole, Duration::from_millis(3_400))),
         }
     }
 
@@ -3230,6 +3548,7 @@ mod tests {
             "model_stand_in_bps=1399272/app-limited/41300ms",
             "model_floor_push_back=-",
             "model_capacity_push_back=p3",
+            "model_rule=hole/3400ms",
         ] {
             let at = rest
                 .find(want)
@@ -3252,6 +3571,7 @@ mod tests {
             "model_stand_in_bps=None",
             "model_floor_push_back=-",
             "model_capacity_push_back=-",
+            "model_rule=-",
         ] {
             assert!(idle.contains(want), "{want:?} is not in {idle:?}");
         }
@@ -3264,6 +3584,30 @@ mod tests {
                 l.len() as u64 * per_hour
             );
             assert!(l.len() < 800, "{} bytes: {l:?}", l.len());
+        }
+    }
+
+    /// FR-148 D48 — the line's one new field names the rule that last kept a
+    /// reading out of the shadow model, re-read it or bounded it: B2's stall
+    /// gate, rule 1's re-read, rule 4's ramp, rule 2's bound, rule 3's hole,
+    /// with its age; `-` while none has (`the_model_line_names_its_fields`).
+    #[test]
+    fn the_model_line_names_each_rule() {
+        for (rule, word) in [
+            (Ruled::Stall, "stall"),
+            (Ruled::ReRead, "reread"),
+            (Ruled::Ramp, "ramp"),
+            (Ruled::Bound, "bound"),
+            (Ruled::Hole, "hole"),
+        ] {
+            let view = PathView {
+                model_ruled: Some((rule, Duration::from_millis(1_250))),
+                ..busy_view()
+            };
+            let out = logged(|| emit_model(sid(), &view));
+            let want = format!("model_rule={word}/1250ms");
+            assert!(out.contains(&want), "{want:?} is not in {out:?}");
+            assert_eq!(out.matches("model_rule=").count(), 1, "{out:?}");
         }
     }
 
@@ -4550,7 +4894,7 @@ pub(crate) mod shaped_link {
         use super::*;
         use crate::encode::goodput::{GoodputEstimator, GoodputSink};
         use crate::encode::pair_memory::{Closing, Take};
-        use crate::encode::pipe::{Basis, Pipe};
+        use crate::encode::pipe::{Basis, PathRate, Pipe};
         use crate::encode::pipe_state::PipeState;
         use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
         use crate::media_inflight::{
@@ -4649,6 +4993,13 @@ pub(crate) mod shaped_link {
             /// FR-148 D46, the drop step — the agent's direction falls to this
             /// rate this long after the run's start ([`stepped`]).
             step: Option<(Duration, u64)>,
+            /// FR-148 D48 — the link's round trip: [`RTT`], or a longer one.
+            rtt: Duration,
+            /// FR-148 D48 — a viewer that reads slower than the link: its read
+            /// rate, bit/s of payload, through a receive window of this many
+            /// bytes. `None` reads each message as it arrives, through the
+            /// vendored default window (1 MiB).
+            viewer: Option<(u64, u32)>,
         }
 
         impl Shape {
@@ -4682,7 +5033,7 @@ pub(crate) mod shaped_link {
                     ),
                     Budgeted::On => format!("{skip}, in-flight budget on (B3's gate)"),
                 };
-                let stalls = match (self.stalls, self.outages, self.step) {
+                let mut stalls = match (self.stalls, self.outages, self.step) {
                     (Some((every, stall)), _, _) => format!(", a {stall:?} stall every {every:?}"),
                     (None, Some((every, len)), _) => format!(", a {len:?} outage every {every:?}"),
                     (None, None, Some((at, to))) => {
@@ -4690,6 +5041,16 @@ pub(crate) mod shaped_link {
                     }
                     (None, None, None) => String::new(),
                 };
+                if self.rtt != RTT {
+                    stalls.push_str(&format!(", a {} ms round trip", ms(self.rtt)));
+                }
+                if let Some((bps, window)) = self.viewer {
+                    stalls.push_str(&format!(
+                        ", the viewer reading {} kbit/s through {} KiB",
+                        bps / 1000,
+                        window / 1024
+                    ));
+                }
                 if self.sparse {
                     return format!(
                         "{} Mbit/s, {queue} queue, path {path}, one {SPARSE_LEN}-byte message a second",
@@ -4703,8 +5064,13 @@ pub(crate) mod shaped_link {
                 )
             }
 
-            /// The link's payload rate: after the fall, on a link that falls.
+            /// The link's payload rate: after the fall, on a link that falls;
+            /// FR-148 D48: the viewer's read rate, where the viewer reads
+            /// slower than the link and is the session's limit.
             fn payload_bps(&self) -> u64 {
+                if let Some((bps, _)) = self.viewer {
+                    return bps;
+                }
                 self.step.map_or(self.bps, |(_, to)| to) * PAYLOAD / PACKET
             }
 
@@ -4729,7 +5095,7 @@ pub(crate) mod shaped_link {
                 shape.frame_len() as u64
             };
             let wire = len + len.div_ceil(PAYLOAD) * (PACKET - PAYLOAD);
-            ms(RTT / 2) + wire * 8_000 / shape.bps
+            ms(shape.rtt / 2) + wire * 8_000 / shape.bps
         }
 
         /// FR-148 D46 — the writer's core: the pumps' shadow, or the core
@@ -4835,12 +5201,28 @@ pub(crate) mod shaped_link {
             measured: bool,
             window_sized: bool,
             cwnd: u32,
+            /// FR-148 D48 — the viewer's receive window SCTP last heard of,
+            /// bytes: with `inflight`, what says whether the congestion
+            /// window or the receive window sized a window-sized hold.
+            rwnd: u32,
             /// FR-148 D46, the drop step — SCTP's slow start threshold, and
             /// its fast retransmits and T3-rtx expiries since the association
             /// began, at the step's peek.
             ssthresh: u32,
             fast_rtx: u64,
             t3: u64,
+        }
+
+        impl Step {
+            /// FR-148 D48, rule 4 — a hold SCTP's congestion window sized: a
+            /// window-sized hold (`by_window < rate`) whose window was the
+            /// congestion window, `cwnd <= rwnd + inflight`. One the receive
+            /// window sized is the viewer's, and does not count.
+            fn ramp_held(&self) -> bool {
+                self.verdict.holds()
+                    && self.window_sized
+                    && u64::from(self.cwnd) <= u64::from(self.rwnd).saturating_add(self.inflight)
+            }
         }
 
         /// One message the viewer read: when it arrived and when it was
@@ -5160,14 +5542,17 @@ pub(crate) mod shaped_link {
 
         /// FR-148 D46 B2 — the holding core's steps over a sample's span,
         /// from the trace: steps, holds, the holds at the opening's stand-in
-        /// rate and those SCTP's window sized, and SCTP's window at its least
-        /// and most. All 0 for a core that leaves no trace (the shadow).
+        /// rate and those SCTP's window sized, of them those its congestion
+        /// window sized (`ramp`, FR-148 D48's rule 4), and SCTP's window at
+        /// its least and most. All 0 for a core that leaves no trace (the
+        /// shadow).
         #[derive(Debug, Clone, Copy, Default)]
         struct Holds {
             steps: u32,
             held: u32,
             stand_in: u32,
             window: u32,
+            ramp: u32,
             cwnd: (u32, u32),
         }
 
@@ -5189,6 +5574,7 @@ pub(crate) mod shaped_link {
                     h.held += 1;
                     h.stand_in += u32::from(!s.measured);
                     h.window += u32::from(s.window_sized);
+                    h.ramp += u32::from(s.ramp_held());
                 }
             }
             h
@@ -5211,33 +5597,86 @@ pub(crate) mod shaped_link {
             }
         }
 
+        /// FR-148 D48 — the rule sets a run is folded under: B2's (`c`), the
+        /// drop step's first pick (`rr+bm0+u90+l`: rules 1 to 3, the product
+        /// without rule 4), and the product's (`d48`), each on the budget's
+        /// [`Over`] as the product reads it, B2's `held` share included. The
+        /// product's own code applies each: a sample's read through
+        /// [`sample_read_of`] on the budget's [`Over`], and a window's through
+        /// `Pipe`'s window rules, which read the budget's rate as the fold
+        /// notes it before each window's close ([`Pipe::note_path_rate`]).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Rules {
+            /// B2 as built: no D48 rule.
+            B2,
+            /// Rules 1 to 3.
+            Pick,
+            /// The product: rules 1 to 4.
+            D48,
+        }
+
+        impl Rules {
+            /// What a sample's read takes of the budget's `Over`: B2 knows
+            /// neither the budget's rate nor the ramp, the first pick no ramp.
+            fn over(self, o: Over) -> Over {
+                match self {
+                    Rules::B2 => Over {
+                        ramp: false,
+                        rate: None,
+                        ..o
+                    },
+                    Rules::Pick => Over { ramp: false, ..o },
+                    Rules::D48 => o,
+                }
+            }
+
+            /// Whether the fold notes the budget's rate for `Pipe`'s window
+            /// rules (2 and 3).
+            fn windows(self) -> bool {
+                self != Rules::B2
+            }
+        }
+
+        /// The rule sets, by the word the drop lines print.
+        const RULES: [(&str, Rules); 3] = [
+            ("c", Rules::B2),
+            ("rr+bm0+u90+l", Rules::Pick),
+            ("d48", Rules::D48),
+        ];
+
         /// FR-148 D46 B2 — when the sampler hands sample `i`'s push-back
-        /// under `burst` and `open` (µs from `t0`): at its close, or, under
-        /// the rule, once its settle has passed. Or why it never does: the
-        /// opening's (`opening`), a still span met it (`stood`), none under
-        /// any rule (`none`), a stall mark inside the wait (`marked`), or the
-        /// writer stopped inside it (`ended`), as a session's close drops
-        /// what its sampler still holds.
+        /// under `burst`, `open` and `rules` (µs from `t0`): at its close, or,
+        /// under the rule, once its settle has passed. Or why it never does:
+        /// rule 4 kept it out (`ramp`), the opening's (`opening`), a still
+        /// span met it (`stood`), none under any rule (`none`), a stall mark
+        /// inside the wait (`marked`), or the writer stopped inside it
+        /// (`ended`), as a session's close drops what its sampler still holds.
         fn handed(
             r: &TcpRun,
             i: usize,
             burst: Burst,
             open: Open,
+            rules: Rules,
         ) -> Result<(u64, SamplePushBack), &'static str> {
             let c = &r.samples[i];
-            let with = |opening: bool| c.over.map(|o| Over { opening, ..o });
-            let over = with(opening_of(r, i, open));
-            let Some(p) = push_back_of(&c.sample, over.as_ref(), burst) else {
-                let open_off = with(false);
-                return Err(
-                    if push_back_of(&c.sample, open_off.as_ref(), burst).is_some() {
-                        "opening"
-                    } else if push_back_of(&c.sample, open_off.as_ref(), Burst::Own).is_some() {
-                        "stood"
-                    } else {
-                        "none"
-                    },
-                );
+            let with =
+                |opening: bool, rules: Rules| c.over.map(|o| rules.over(Over { opening, ..o }));
+            let over = with(opening_of(r, i, open), rules);
+            let p = match sample_read_of(&c.sample, over.as_ref(), burst) {
+                Some(SampleRead::Push(p)) => p,
+                Some(SampleRead::Ramp) => return Err("ramp"),
+                None => {
+                    let open_off = with(false, Rules::B2);
+                    return Err(
+                        if push_back_of(&c.sample, open_off.as_ref(), burst).is_some() {
+                            "opening"
+                        } else if push_back_of(&c.sample, open_off.as_ref(), Burst::Own).is_some() {
+                            "stood"
+                        } else {
+                            "none"
+                        },
+                    );
+                }
             };
             if !burst.waits() {
                 return Ok((c.end_us, p));
@@ -5252,187 +5691,20 @@ pub(crate) mod shaped_link {
             Ok((until, p))
         }
 
+        /// The product's fold: its rules, under `burst`, `gate` and `open`.
         fn model_fold(r: &TcpRun, burst: Burst, gate: u8, open: Open) -> ModelFold {
-            fold_with(r, burst, gate, open, DropRules::B2, &mut Vec::new())
+            fold_with(r, burst, gate, open, Rules::D48, &mut Vec::new())
         }
 
-        /// FR-148 D46, the drop step — what else the model makes of a sample's
-        /// P3, beside B2's burst and opening rules: kept out, or re-read.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum P3Rule {
-            /// B2's rules alone.
-            B2,
-            /// A hold in it that SCTP's window sized, not the rate: `cw`.
-            Window,
-            /// A T3-rtx expiry in it (the sample's `loss`).
-            T3,
-            /// A fast retransmit or a T3-rtx expiry in it.
-            Loss,
-            /// A hold SCTP's window sized, or a T3-rtx expiry.
-            WindowOrT3,
-            /// A hold SCTP's window sized, or any loss: what is left the rate
-            /// held, with nothing lost.
-            LossOrWindow,
-            /// One with a fast retransmit or a T3-rtx expiry in it re-read at
-            /// the budget's rate at its close when that is more: the most of
-            /// its one-second figures over two seconds, against the sample's
-            /// mean over its span.
-            ReRate,
-            /// As `ReRate`, and one with a hold SCTP's window sized too.
-            ReRateWindow,
-        }
-
-        impl P3Rule {
-            /// The push-back the model takes for P3 sample `i`, or `None`.
-            fn read(self, r: &TcpRun, i: usize, p: SamplePushBack) -> Option<SamplePushBack> {
-                let c = &r.samples[i];
-                let loss = c.sample.queue.map_or((0, 0), |q| q.loss);
-                let window = || holds_over(r, c).window > 0;
-                let out = match self {
-                    P3Rule::B2 | P3Rule::ReRate | P3Rule::ReRateWindow => false,
-                    P3Rule::Window => window(),
-                    P3Rule::T3 => loss.1 > 0,
-                    P3Rule::Loss => loss.0 + loss.1 > 0,
-                    P3Rule::WindowOrT3 => loss.1 > 0 || window(),
-                    P3Rule::LossOrWindow => loss.0 + loss.1 > 0 || window(),
-                };
-                if out {
-                    return None;
-                }
-                let reread = match self {
-                    P3Rule::ReRate => loss.0 + loss.1 > 0,
-                    P3Rule::ReRateWindow => loss.0 + loss.1 > 0 || window(),
-                    _ => false,
-                };
-                if reread {
-                    let rate = step_at(r, c.end_us).map_or(0, |s| s.rate_bps);
-                    let rate = u32::try_from(rate).unwrap_or(u32::MAX);
-                    return Some(SamplePushBack {
-                        bps: p.bps.max(rate),
-                        ..p
-                    });
-                }
-                Some(p)
+        /// FR-148 D48 — what the budget's step read, as the governor notes it
+        /// for `Pipe`'s window rules (`media_delivery::path_rate`): one
+        /// association a run, so its loss count is the budget's.
+        fn path_rate_at(s: &Step) -> PathRate {
+            PathRate {
+                bps: (s.rate_bps > 0).then(|| u32::try_from(s.rate_bps).unwrap_or(u32::MAX)),
+                measured: s.measured,
+                loss: s.fast_rtx + s.t3,
             }
-        }
-
-        /// FR-148 D46, the drop step — what the model takes of a viewer window
-        /// that read over the rate SCTP's acknowledgements gave, beside B2's
-        /// stall gate.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum WinRule {
-            /// B2's stall gate alone.
-            B2,
-            /// Kept out when it read over this many percent of the budget's
-            /// rate at its close (its last step at or before the close).
-            OverRate(u64),
-            /// Taken at no more than this many percent of that rate.
-            Bound(u64),
-            /// Taken at no more than this many percent of that rate when the
-            /// association's figures gave it; over a rate the opening's stood
-            /// in for, kept out.
-            BoundMeasured(u64),
-            /// Taken at no more than this many percent of what SCTP's clock
-            /// counted acknowledged over the window's own span.
-            Acked(u64),
-        }
-
-        /// What the model takes of one window: its delivery at this rate, or
-        /// nothing (gated, as a stall's window is).
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum WinRead {
-            Take(u32),
-            Out,
-        }
-
-        impl WinRule {
-            fn read(self, r: &TcpRun, w: &ViewerWindow) -> WinRead {
-                let rx = w.rx_bps;
-                let over = |bound: u64, pct: u64| bound > 0 && u64::from(rx) * 100 > bound * pct;
-                let cap = |bound: u64, pct: u64| {
-                    let b = u32::try_from(bound * pct / 100).unwrap_or(u32::MAX);
-                    WinRead::Take(rx.min(b))
-                };
-                let step = step_at(r, w.end_us);
-                match self {
-                    WinRule::B2 => WinRead::Take(rx),
-                    WinRule::OverRate(pct) => match step {
-                        Some(s) if over(s.rate_bps, pct) => WinRead::Out,
-                        _ => WinRead::Take(rx),
-                    },
-                    WinRule::Bound(pct) => match step {
-                        Some(s) if over(s.rate_bps, pct) => cap(s.rate_bps, pct),
-                        _ => WinRead::Take(rx),
-                    },
-                    WinRule::BoundMeasured(pct) => match step {
-                        Some(s) if over(s.rate_bps, pct) && s.measured => cap(s.rate_bps, pct),
-                        Some(s) if over(s.rate_bps, pct) => WinRead::Out,
-                        _ => WinRead::Take(rx),
-                    },
-                    WinRule::Acked(pct) => {
-                        let from = step_at(r, w.end_us.saturating_sub(w.ms * 1_000));
-                        let acked = match (from, step) {
-                            (Some(a), Some(b)) if b.t_us > a.t_us => {
-                                b.acked.saturating_sub(a.acked) * 8_000_000 / (b.t_us - a.t_us)
-                            }
-                            _ => 0,
-                        };
-                        if over(acked, pct) {
-                            cap(acked, pct)
-                        } else {
-                            WinRead::Take(rx)
-                        }
-                    }
-                }
-            }
-        }
-
-        /// FR-148 D46, the drop step — the fold's rules for a path that drops:
-        /// P3's, the windows' over the rate, and `under`: the link push-back
-        /// of a window that read under this many percent of the budget's
-        /// measured rate at its close is no reading for the model (it read a
-        /// hole the viewer waited on, not the path); its delivery still is.
-        /// With `on_loss`, the window rules read only a window SCTP lost
-        /// something near ([`lost_near`]): on a path that loses nothing they
-        /// change nothing.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        struct DropRules {
-            p3: P3Rule,
-            win: WinRule,
-            under: Option<u64>,
-            on_loss: bool,
-        }
-
-        impl DropRules {
-            const B2: Self = Self {
-                p3: P3Rule::B2,
-                win: WinRule::B2,
-                under: None,
-                on_loss: false,
-            };
-
-            /// Whether the window rules read window `w` at all.
-            fn reads(self, r: &TcpRun, w: &ViewerWindow) -> bool {
-                !self.on_loss || lost_near(r, w)
-            }
-
-            /// Whether the rules keep window `w`'s link push-back out.
-            fn under(self, r: &TcpRun, w: &ViewerWindow) -> bool {
-                self.under.is_some_and(|pct| {
-                    step_at(r, w.end_us)
-                        .is_some_and(|s| s.measured && u64::from(w.rx_bps) * 100 < s.rate_bps * pct)
-                }) && self.reads(r, w)
-            }
-        }
-
-        /// Whether SCTP fast-retransmitted or expired its T3-rtx timer over
-        /// window `w` or the window's length before it: a hole's release
-        /// reaches the viewer a round trip or so after the retransmission
-        /// the counters count, which can fall in the window before.
-        fn lost_near(r: &TcpRun, w: &ViewerWindow) -> bool {
-            let from = w.end_us.saturating_sub(2 * w.ms * 1_000);
-            let lost = |s: Option<&Step>| s.map_or(0, |s| s.fast_rtx + s.t3);
-            lost(step_at(r, w.end_us)) > lost(step_at(r, from))
         }
 
         /// The holding core's last step at or before `t_us`.
@@ -5445,7 +5717,9 @@ pub(crate) mod shaped_link {
         /// its floor raised or lowered, or its capacity set, by what (`win` a
         /// valid window's delivery, `goodput` or `link` a window's push-back,
         /// `p1` or `p3` a sample's), when (µs from `t0`), at what rate, the
-        /// floor before and after, and the window's or sample's index.
+        /// floor before and after, and the window's or sample's index. FR-148
+        /// D48: and the rule that re-read the sample or bounded the window
+        /// (`reread`, `bound`), or none.
         #[derive(Debug, Clone, Copy)]
         struct FoldEvent {
             t_us: u64,
@@ -5454,6 +5728,7 @@ pub(crate) mod shaped_link {
             floor: (Option<u32>, Option<u32>),
             capacity: bool,
             of: usize,
+            rule: &'static str,
         }
 
         fn fold_with(
@@ -5461,7 +5736,7 @@ pub(crate) mod shaped_link {
             burst: Burst,
             gate: u8,
             open: Open,
-            rules: DropRules,
+            rules: Rules,
             log: &mut Vec<FoldEvent>,
         ) -> ModelFold {
             let mut pipe = Pipe::default();
@@ -5470,15 +5745,11 @@ pub(crate) mod shaped_link {
             let mut offer = OfferLoop::default();
             let mut goodput = r.goodput_at.iter().peekable();
             let mut marks = r.marks.iter().peekable();
-            // Each push-back at the time the sampler hands it; a P3 the drop
-            // rule keeps out never, and one it re-reads at its new rate.
+            // Each push-back at the time the sampler hands it; a P3 rule 4
+            // keeps out never, and one rule 1 re-reads at its new rate.
             let mut due: Vec<(u64, SamplePushBack, usize)> = (0..r.samples.len())
                 .filter_map(|i| {
-                    let (t, p) = handed(r, i, burst, open).ok()?;
-                    let p = match p.by {
-                        PushedBy::P3 => rules.p3.read(r, i, p)?,
-                        PushedBy::P1 => p,
-                    };
+                    let (t, p) = handed(r, i, burst, open, rules).ok()?;
                     Some((t, p, i))
                 })
                 .collect();
@@ -5519,6 +5790,7 @@ pub(crate) mod shaped_link {
                     floor: (before, after),
                     capacity: true,
                     of: i,
+                    rule: if p.reread { "reread" } else { "" },
                 });
             };
             // A window's push-back that the model took sets its capacity now.
@@ -5543,27 +5815,14 @@ pub(crate) mod shaped_link {
                     pipe.note_stall();
                     left = gate;
                 }
-                // FR-148 D46, the drop step — a window the rules keep out is
-                // no reading for the model, as a stall's window is not; one
-                // they bound reaches the model, its delivery and its link
-                // push-back, at the bound. Here `Pipe`'s own law takes the
-                // bound too, so `own_floor` is not today's under a rule that
-                // bounds (`print_drop` reads only the model's numbers).
-                let read = if left == 0 && w.rx_bps > 0 && rules.reads(r, w) {
-                    rules.win.read(r, w)
-                } else {
-                    WinRead::Take(w.rx_bps)
-                };
-                let bounded = read == WinRead::Out;
-                if bounded {
-                    pipe.set_stall_gate(1);
-                    pipe.note_stall();
-                    pipe.set_stall_gate(gate);
+                // FR-148 D48 — the budget's last step before the window's
+                // close, as the governor notes it: `Pipe`'s window rules read
+                // it there. B2's fold notes nothing, as with the budget off.
+                if rules.windows()
+                    && let Some(s) = step_at(r, w.end_us)
+                {
+                    pipe.note_path_rate(path_rate_at(s));
                 }
-                let rx = match read {
-                    WinRead::Take(bps) => bps,
-                    WinRead::Out => w.rx_bps,
-                };
                 let stalled = w.excess_ms >= TRANSIT_OVER_MS;
                 let valid = !stalled && !prev_stalled;
                 prev_stalled = stalled;
@@ -5578,8 +5837,13 @@ pub(crate) mod shaped_link {
                 };
                 let t = Take::of(state, true, w.sent_bps, offer_bps);
                 let before = floor_of(&pipe, now);
-                pipe.observe_delivered_in(rx, Basis::of_window(offered), valid, now);
+                pipe.observe_delivered_in(w.rx_bps, Basis::of_window(offered), valid, now);
                 let after = floor_of(&pipe, now);
+                // What the model took of the window's delivery under the rule
+                // `Pipe` ruled at its close: at the bound, or none of it.
+                let ([taken_rx, _, _], word) = pipe.window_takes(w.rx_bps);
+                let rx = taken_rx.unwrap_or(w.rx_bps);
+                let rule = if taken_rx == Some(w.rx_bps) { "" } else { word };
                 if after != before {
                     log.push(FoldEvent {
                         t_us: w.end_us,
@@ -5588,20 +5852,31 @@ pub(crate) mod shaped_link {
                         floor: (before, after),
                         capacity: false,
                         of: j,
+                        rule,
                     });
                 }
                 if w.rx_bps > 0 {
-                    let kept_out = left > 0 || bounded;
+                    let kept_out = left > 0 || taken_rx.is_none();
                     left = left.saturating_sub(1);
                     gated += u32::from(kept_out);
                     if valid && !kept_out {
                         max_taken_rx = max_taken_rx.max(rx);
                     }
                 }
-                let mut push = |pipe: &mut Pipe, by: &'static str, bps: u32| {
+                // A window's push-back, through the call the governor makes:
+                // the goodput fold's (`k` 1) or the link loop's (`k` 2), which
+                // the model takes as `Pipe::window_takes` says.
+                let mut push = |pipe: &mut Pipe, by: &'static str, k: usize, bps: u32| {
                     let before = floor_of(pipe, now);
-                    pipe.observe_capacity_in(bps, Basis::Backlogged, t, now);
-                    let set = set_now(pipe, bps, now);
+                    if k == 2 {
+                        pipe.observe_link_capacity_in(bps, Basis::Backlogged, t, now);
+                    } else {
+                        pipe.observe_capacity_in(bps, Basis::Backlogged, t, now);
+                    }
+                    let (takes, word) = pipe.window_takes(bps);
+                    let rule = if takes[k] == Some(bps) { "" } else { word };
+                    let set = takes[k].is_some_and(|b| set_now(pipe, b, now));
+                    let bps = takes[k].unwrap_or(bps);
                     if set {
                         window_cap = Some((by, w.end_us, bps));
                     }
@@ -5614,21 +5889,18 @@ pub(crate) mod shaped_link {
                             floor: (before, after),
                             capacity: set,
                             of: j,
+                            rule,
                         });
                     }
                 };
                 while let Some(&(_, bps)) = goodput.next_if(|g| g.0 <= w.end_us) {
                     if valid {
-                        push(&mut pipe, "goodput", bps);
+                        push(&mut pipe, "goodput", 1, bps);
                     }
                 }
                 let growth = i16::try_from(w.growth_ms.clamp(-30_000, 30_000)).unwrap();
-                if link.observe(w.rx_bps, growth).congested
-                    && valid
-                    && offer_held
-                    && !rules.under(r, w)
-                {
-                    push(&mut pipe, "link", rx);
+                if link.observe(w.rx_bps, growth).congested && valid && offer_held {
+                    push(&mut pipe, "link", 2, w.rx_bps);
                 }
                 take = valid.then_some(t);
             }
@@ -5665,7 +5937,9 @@ pub(crate) mod shaped_link {
         /// then each opening rule's floor and capacity under the burst rule
         /// built ([`OPENS`]), and what last set the capacity. The rules that
         /// read the holding core's trace print `?` for the shadow, which
-        /// leaves none.
+        /// leaves none. FR-148 D48: each fold is the product's, its four
+        /// rules in ([`model_fold`]); the samples listed are B2's push-backs,
+        /// each with what the product made of it.
         fn print_b2(r: &TcpRun) {
             let link = r.shape.payload_bps() as f64;
             let x = |f: Option<u32>| {
@@ -5705,7 +5979,7 @@ pub(crate) mod shaped_link {
                     .iter()
                     .map(|&(word, open)| {
                         let fate = if known(open) {
-                            handed(r, i, BURST, open)
+                            handed(r, i, BURST, open, Rules::D48)
                                 .map_or_else(|why| why.to_owned(), |(_, p)| x(Some(p.bps)))
                         } else {
                             "?".to_owned()
@@ -5755,9 +6029,11 @@ pub(crate) mod shaped_link {
             // steps over it, and what the rule and each opening rule make of
             // it.
             for (i, c) in r.samples.iter().enumerate() {
-                let open_off = c.over.map(|o| Over {
-                    opening: false,
-                    ..o
+                let open_off = c.over.map(|o| {
+                    Rules::B2.over(Over {
+                        opening: false,
+                        ..o
+                    })
                 });
                 let Some(p) = push_back_of(&c.sample, open_off.as_ref(), Burst::Own) else {
                     continue;
@@ -5768,7 +6044,7 @@ pub(crate) mod shaped_link {
                 println!(
                     "D46 B2 sample | {} | {}-{} ms {} {} class={:?} standing={:?} stood={} \
                      inside={} held={} from={:?} opening={} holds={}/{} stand_in={} window={} \
-                     cwnd={}-{} | rule={} | {}",
+                     ramp={} cwnd={}-{} | rule={} | {}",
                     r.shape.name(),
                     to.saturating_sub(c.sample.ms),
                     to,
@@ -5785,18 +6061,21 @@ pub(crate) mod shaped_link {
                     h.steps,
                     h.stand_in,
                     h.window,
+                    h.ramp,
                     h.cwnd.0,
                     h.cwnd.1,
-                    handed(r, i, BURST, Open::Start)
+                    handed(r, i, BURST, Open::Start, Rules::D48)
                         .map_or_else(|why| why.to_owned(), |(_, p)| x(Some(p.bps))),
                     fates(i),
                 );
             }
             // The session's first sample, under each opening rule.
             if let Some(c) = r.samples.first() {
-                let open_off = c.over.map(|o| Over {
-                    opening: false,
-                    ..o
+                let open_off = c.over.map(|o| {
+                    Rules::B2.over(Over {
+                        opening: false,
+                        ..o
+                    })
                 });
                 let p = push_back_of(&c.sample, open_off.as_ref(), Burst::Own);
                 let to = c.end_us / 1_000;
@@ -5817,6 +6096,123 @@ pub(crate) mod shaped_link {
             }
         }
 
+        /// FR-148 D48 — B2's `Over::held` against the holding core's trace,
+        /// on each sample it read held, B2's edge-grain rule read held, or P3
+        /// took: the holds inside the span (the first few, ms after its start)
+        /// and in its two edge grains outside it, and the grains wholly inside
+        /// it that held, in all and in each of `held`'s stretches (one per
+        /// whole second). The grains count from the core's first step, as its
+        /// mask's do; `whole` is a hold in any grain wholly inside each
+        /// stretch (the edge fix alone), `edge` with the span's two edge grains
+        /// too (B2's), and `held` the product's, a share of each stretch's
+        /// whole grains (`HELD_SHARE_PERCENT`). P3 is B2's rules on the
+        /// product's `held`; `rgrains` counts the held whole grains with a
+        /// hold SCTP's congestion window sized (rule 4's fact) against all of
+        /// them, and `d48` says what the product made of the sample.
+        fn print_held(r: &TcpRun) {
+            let Some(epoch) = r.trace.first().map(|s| s.t_us) else {
+                return;
+            };
+            let grain = us(crate::media_inflight::GRAIN);
+            let link = r.shape.payload_bps() as f64;
+            let name = r.shape.name();
+            let all: std::collections::BTreeSet<u64> = r
+                .trace
+                .iter()
+                .filter(|s| s.verdict.holds())
+                .map(|s| s.t_us.saturating_sub(epoch) / grain)
+                .collect();
+            for c in &r.samples {
+                let Some(o) = c.over else {
+                    continue;
+                };
+                let p = push_back_of(&c.sample, Some(&Rules::B2.over(o)), BURST);
+                let d48 = match sample_read_of(&c.sample, Some(&o), BURST) {
+                    Some(SampleRead::Ramp) => "ramp",
+                    Some(SampleRead::Push(q)) if q.reread => "reread",
+                    Some(SampleRead::Push(q)) => q.by.word(),
+                    None => "none",
+                };
+                let (a, b) = (
+                    c.from_us.saturating_sub(epoch),
+                    c.end_us.saturating_sub(epoch),
+                );
+                let (lo, hi) = (a / grain, b / grain);
+                let parts = ((b - a) / 1_000_000).max(1);
+                let edge_n = hi - lo + 1;
+                let edge = (0..parts).all(|k| {
+                    let first = lo + k * edge_n / parts;
+                    let last = (lo + (k + 1) * edge_n / parts).max(first + 1);
+                    all.range(first..last).next().is_some()
+                });
+                if !o.held && !edge && !p.is_some_and(|p| p.by == PushedBy::P3) {
+                    continue;
+                }
+                let (wlo, whi) = (a.div_ceil(grain), b / grain);
+                let mut held = std::collections::BTreeSet::new();
+                let mut ramped = std::collections::BTreeSet::new();
+                let (mut inside, mut before, mut after) = (0_u32, 0_u32, 0_u32);
+                let (mut wsized, mut ramp) = (0_u32, 0_u32);
+                let mut at = Vec::new();
+                for s in r.trace.iter().filter(|s| s.verdict.holds()) {
+                    let t = s.t_us.saturating_sub(epoch);
+                    let g = t / grain;
+                    if (a..=b).contains(&t) {
+                        inside += 1;
+                        wsized += u32::from(s.window_sized);
+                        ramp += u32::from(s.ramp_held());
+                        if at.len() < 6 {
+                            at.push((t - a) / 1_000);
+                        }
+                    } else if g == lo && t < a {
+                        before += 1;
+                    } else if g == hi && t > b {
+                        after += 1;
+                    }
+                    if (wlo..whi).contains(&g) {
+                        held.insert(g);
+                        if s.ramp_held() {
+                            ramped.insert(g);
+                        }
+                    }
+                }
+                let n = whi.saturating_sub(wlo);
+                let stretches: Vec<(usize, u64)> = (0..parts)
+                    .map(|k| {
+                        let first = wlo + k * n / parts;
+                        let last = (wlo + (k + 1) * n / parts).max(first + 1);
+                        (held.range(first..last).count(), last - first)
+                    })
+                    .collect();
+                let whole = n > 0 && stretches.iter().all(|&(h, _)| h > 0);
+                println!(
+                    "D48 held | {name} | {}-{} ms {:?} {} {} loss={:?} | held={} edge={edge} \
+                     whole={whole} parts={parts} inside={inside} wsized={wsized} ramp={ramp} \
+                     at={at:?} before={before} after={after} grains={}/{n} share={:.3} \
+                     by_second={} rgrains={}/{} d48={d48}",
+                    c.from_us / 1_000,
+                    c.end_us / 1_000,
+                    c.sample.class,
+                    p.map_or("none", |p| p.by.word()),
+                    p.map_or_else(
+                        || "-".to_owned(),
+                        |p| format!("{:.3}", f64::from(p.bps) / link)
+                    ),
+                    c.sample.queue.map(|q| q.loss),
+                    o.held,
+                    held.len(),
+                    held.len() as f64 / n.max(1) as f64,
+                    stretches
+                        .iter()
+                        .map(|&(h, m)| format!("{h}/{m}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    ramped.len(),
+                    held.len(),
+                );
+            }
+        }
+
         /// FR-148 D46, the drop step — what the holding core's trace read over
         /// a span (µs from `t0`): its steps; the holds, those SCTP's window
         /// sized and the `WindowBinds` verdicts; SCTP's window and what it had
@@ -5828,6 +6224,8 @@ pub(crate) mod shaped_link {
             steps: u32,
             holds: u32,
             window_holds: u32,
+            /// FR-148 D48 — the holds SCTP's congestion window sized.
+            ramp_holds: u32,
             binds: u32,
             cwnd: (u32, u32),
             ssthresh: u32,
@@ -5862,6 +6260,7 @@ pub(crate) mod shaped_link {
                 if s.verdict.holds() {
                     g.holds += 1;
                     g.window_holds += u32::from(s.window_sized);
+                    g.ramp_holds += u32::from(s.ramp_held());
                 }
                 g.binds += u32::from(s.verdict == Verdict::WindowBinds);
             }
@@ -5877,101 +6276,6 @@ pub(crate) mod shaped_link {
             g
         }
 
-        /// FR-148 D46, the drop step — the rule sets measured, each a fold
-        /// with B2's burst rule, its stall gate and its opening rule (`c`).
-        /// P3: B2's built (`c`), `cw`, a T3 in the sample (`t3`), any loss in
-        /// it (`loss`), `cw` or a T3 (`wt3`), `cw` or any loss (`lw`), or one
-        /// with a loss re-read at the budget's rate (`rr`), or one with a loss
-        /// or a hold SCTP's window sized re-read so (`rrw`). The windows over
-        /// the rate: kept out over 105 % of the budget's rate (`r5`), taken at
-        /// no more than 100 % or 105 % of it (`b0`, `b5`), of its measured one
-        /// (`bm0`), or of what SCTP counted acknowledged over the window
-        /// (`a0`, `a5`). And the link push-back of a window under 90 % or 80 %
-        /// of the budget's measured rate kept out (`u90`, `u80`). `+l`: the
-        /// window rules only where SCTP lost something near the window.
-        const DROPS: [(&str, DropRules); 50] = {
-            const fn d(p3: P3Rule, win: WinRule, under: Option<u64>) -> DropRules {
-                DropRules {
-                    p3,
-                    win,
-                    under,
-                    on_loss: false,
-                }
-            }
-            const fn l(p3: P3Rule, win: WinRule, under: Option<u64>) -> DropRules {
-                DropRules {
-                    p3,
-                    win,
-                    under,
-                    on_loss: true,
-                }
-            }
-            use P3Rule::{
-                B2 as C, Loss, LossOrWindow as Lw, ReRate, ReRateWindow as Rrw, T3, Window as Cw,
-                WindowOrT3 as Wt3,
-            };
-            const NO: WinRule = WinRule::B2;
-            const R5: WinRule = WinRule::OverRate(105);
-            const B0: WinRule = WinRule::Bound(100);
-            const B5: WinRule = WinRule::Bound(105);
-            const BM0: WinRule = WinRule::BoundMeasured(100);
-            const A0: WinRule = WinRule::Acked(100);
-            const A5: WinRule = WinRule::Acked(105);
-            const U90: Option<u64> = Some(90);
-            [
-                ("c", d(C, NO, None)),
-                ("cw", d(Cw, NO, None)),
-                ("t3", d(T3, NO, None)),
-                ("loss", d(Loss, NO, None)),
-                ("wt3", d(Wt3, NO, None)),
-                ("c+r5", d(C, R5, None)),
-                ("cw+r5", d(Cw, R5, None)),
-                ("loss+r5", d(Loss, R5, None)),
-                ("c+b0", d(C, B0, None)),
-                ("cw+b0", d(Cw, B0, None)),
-                ("t3+b0", d(T3, B0, None)),
-                ("loss+b0", d(Loss, B0, None)),
-                ("rr+b0", d(ReRate, B0, None)),
-                ("c+b5", d(C, B5, None)),
-                ("loss+b5", d(Loss, B5, None)),
-                ("loss+bm0", d(Loss, BM0, None)),
-                ("loss+a0", d(Loss, A0, None)),
-                ("loss+a5", d(Loss, A5, None)),
-                ("loss+u90", d(Loss, NO, U90)),
-                ("c+b0+u90", d(C, B0, U90)),
-                ("cw+b0+u90", d(Cw, B0, U90)),
-                ("t3+b0+u90", d(T3, B0, U90)),
-                ("loss+b0+u90", d(Loss, B0, U90)),
-                ("rr+b0+u90", d(ReRate, B0, U90)),
-                ("loss+b5+u90", d(Loss, B5, U90)),
-                ("loss+bm0+u90", d(Loss, BM0, U90)),
-                ("loss+a0+u90", d(Loss, A0, U90)),
-                ("loss+r5+u90", d(Loss, R5, U90)),
-                ("loss+b0+u80", d(Loss, B0, Some(80))),
-                ("lw", d(Lw, NO, None)),
-                ("lw+b0", d(Lw, B0, None)),
-                ("lw+u90", d(Lw, NO, U90)),
-                ("lw+b0+u90", d(Lw, B0, U90)),
-                ("lw+bm0+u90", d(Lw, BM0, U90)),
-                ("lw+a0+u90", d(Lw, A0, U90)),
-                ("lw+r5+u90", d(Lw, R5, U90)),
-                ("lw+b5+u90", d(Lw, B5, U90)),
-                ("rr+u90", d(ReRate, NO, U90)),
-                ("rr+bm0+u90", d(ReRate, BM0, U90)),
-                ("rr+a0+u90", d(ReRate, A0, U90)),
-                ("rrw", d(Rrw, NO, None)),
-                ("rrw+b0", d(Rrw, B0, None)),
-                ("rrw+b0+u90", d(Rrw, B0, U90)),
-                ("rrw+bm0+u90", d(Rrw, BM0, U90)),
-                ("lw+b0+u90+l", l(Lw, B0, U90)),
-                ("rr+b0+u90+l", l(ReRate, B0, U90)),
-                ("rrw+b0+u90+l", l(Rrw, B0, U90)),
-                ("loss+b0+u90+l", l(Loss, B0, U90)),
-                ("lw+bm0+u90+l", l(Lw, BM0, U90)),
-                ("rr+bm0+u90+l", l(ReRate, BM0, U90)),
-            ]
-        };
-
         /// AC2's bracket (D45): the floor at 0.80 to 1.05 times the link's
         /// payload rate, and the capacity absent or at least 0.95.
         fn on_bar(r: &TcpRun, m: &ModelFold) -> bool {
@@ -5985,17 +6289,17 @@ pub(crate) mod shaped_link {
 
         /// FR-148 D46, the drop step — each rule set's bracket at the run's
         /// end (floor / capacity, times the link's payload rate, and `on` or
-        /// `OFF` AC2's bar); and on a shallow queue under a holding budget,
-        /// the reading: every change B2's built fold made to the model, what
-        /// SCTP's gauges and the budget's verdicts read over the window or
-        /// the sample that made it, and each window that read over 1.05 times
-        /// the link, with its fate.
+        /// `OFF` AC2's bar; [`RULES`]); and under a holding budget, the
+        /// product's reading on a shallow queue and on any run it leaves off
+        /// the bar: every change its fold made to the model, with the rule
+        /// that re-read or bounded it, and what SCTP's gauges and the budget's
+        /// verdicts read over the window or the sample that made it.
         fn print_drop(r: &TcpRun) {
             let link = r.shape.payload_bps();
             let x = |v: u64| format!("{:.3}", v as f64 / link.max(1) as f64);
             let xo = |f: Option<u32>| f.map_or_else(|| "-".to_owned(), |f| x(u64::from(f)));
             let gate = crate::encode::pipe::STALL_WINDOWS;
-            let rules: Vec<String> = DROPS
+            let rules: Vec<String> = RULES
                 .iter()
                 .map(|&(word, rules)| {
                     let m = fold_with(r, BURST, gate, Open::Start, rules, &mut Vec::new());
@@ -6012,32 +6316,15 @@ pub(crate) mod shaped_link {
             if r.trace.is_empty() {
                 return;
             }
-            // The rule sets picked: every change each made to the model, on a
-            // shallow queue, and on any run it leaves off the bar.
-            let shallow = r.shape.queue < DEEP;
-            for (word, rules) in PICKS {
-                let mut log = Vec::new();
-                let m = fold_with(r, BURST, gate, Open::Start, rules, &mut log);
-                let tag = match (shallow, on_bar(r, &m)) {
-                    (_, false) => "pick miss",
-                    (true, true) => "pick event",
-                    (false, true) => continue,
-                };
-                print_events(r, &format!("{tag} {word}"), &log, &m);
-            }
-            if !shallow {
-                return;
-            }
             let mut log = Vec::new();
-            let m = fold_with(r, BURST, gate, Open::Start, DropRules::B2, &mut log);
-            print_events(r, "event", &log, &m);
-            print_over(r);
+            let m = fold_with(r, BURST, gate, Open::Start, Rules::D48, &mut log);
+            let tag = match (r.shape.queue < DEEP, on_bar(r, &m)) {
+                (_, false) => "pick miss",
+                (true, true) => "pick event",
+                (false, true) => return,
+            };
+            print_events(r, &format!("{tag} d48"), &log, &m);
         }
-
-        /// FR-148 D46, the drop step — the rule set the prototype picks,
-        /// `rr+bm0+u90+l`, and its twin that bounds a window by a stand-in
-        /// rate too, `rr+b0+u90+l`, by their words in [`DROPS`].
-        const PICKS: [(&str, DropRules); 2] = [DROPS[49], DROPS[45]];
 
         /// What the holding core's trace read from `from_us` to `to_us`, as
         /// the drop lines write it.
@@ -6046,7 +6333,7 @@ pub(crate) mod shaped_link {
             let g = gauged(r, from_us, to_us);
             format!(
                 "cwnd={}-{} ssthresh_lo={} inflight={}-{} fr={} t3={} holds={}/{} wholds={} \
-                 binds={} rate={:.3}{}",
+                 cwholds={} binds={} rate={:.3}{}",
                 g.cwnd.0,
                 g.cwnd.1,
                 g.ssthresh,
@@ -6057,6 +6344,7 @@ pub(crate) mod shaped_link {
                 g.holds,
                 g.steps,
                 g.window_holds,
+                g.ramp_holds,
                 g.binds,
                 g.rate_bps as f64 / link.max(1) as f64,
                 if g.measured { "" } else { " (stand-in)" },
@@ -6118,8 +6406,13 @@ pub(crate) mod shaped_link {
                         gauges_line(r, from, w.end_us),
                     )
                 };
+                let rule = if e.rule.is_empty() {
+                    String::new()
+                } else {
+                    format!(" rule={}", e.rule)
+                };
                 println!(
-                    "D46 drop {tag} | {name} | {} ms {} {} floor {}->{}{}{} | {what}",
+                    "D46 drop {tag} | {name} | {} ms {} {}{rule} floor {}->{}{}{} | {what}",
                     ms_of(e.t_us),
                     e.by,
                     x(u64::from(e.bps)),
@@ -6127,58 +6420,6 @@ pub(crate) mod shaped_link {
                     xo(e.floor.1),
                     if e.capacity { " cap" } else { "" },
                     sets,
-                );
-            }
-        }
-
-        /// FR-148 D46, the drop step — each window that read over 1.05 times
-        /// the link, under B2's rules: taken, or why not.
-        fn print_over(r: &TcpRun) {
-            let link = r.shape.payload_bps();
-            let x = |v: u64| format!("{:.3}", v as f64 / link.max(1) as f64);
-            let name = r.shape.name();
-            let gate = crate::encode::pipe::STALL_WINDOWS;
-            let ms_of = |us: u64| us / 1_000;
-            let mut prev_stalled = false;
-            let mut marks = r.marks.iter().peekable();
-            let mut left = 0_u8;
-            for (j, w) in r.windows.iter().enumerate() {
-                let stalled = w.excess_ms >= TRANSIT_OVER_MS;
-                let valid = !stalled && !prev_stalled;
-                prev_stalled = stalled;
-                let mut marked = false;
-                while marks.next_if(|&&m| m <= w.end_us).is_some() {
-                    marked = true;
-                }
-                if marked {
-                    left = gate;
-                }
-                let kept = w.rx_bps > 0 && left > 0;
-                if w.rx_bps > 0 {
-                    left = left.saturating_sub(1);
-                }
-                if u64::from(w.rx_bps) * 100 <= link * 105 {
-                    continue;
-                }
-                let fate = if kept {
-                    "gated by a mark"
-                } else if !valid {
-                    "invalid (transit)"
-                } else {
-                    "taken"
-                };
-                let from = w.end_us.saturating_sub(w.ms * 1_000);
-                let before = r.windows[..j].last().map_or(0, |p| p.excess_ms);
-                println!(
-                    "D46 drop over | {name} | window {}-{} ms rx={} sent={} excess={} (before {}) \
-                     {fate} | {}",
-                    ms_of(from),
-                    ms_of(w.end_us),
-                    x(u64::from(w.rx_bps)),
-                    x(u64::from(w.sent_bps)),
-                    w.excess_ms,
-                    before,
-                    gauges_line(r, from, w.end_us),
                 );
             }
         }
@@ -6214,6 +6455,9 @@ pub(crate) mod shaped_link {
             sample: Sample,
             /// When the sample closed, µs from the run's `t0`.
             end_us: u64,
+            /// FR-148 D48 — when it started, µs from `t0`: the instant the
+            /// budget's [`Budget::over`] read it from, to the µs.
+            from_us: u64,
             /// FR-148 D46 B2 — what the writer's in-flight budget saw over
             /// it (`Budget::over`); `None` with the budget off. And its
             /// [`settle`] at the close, µs (0 with the budget off).
@@ -6441,29 +6685,34 @@ pub(crate) mod shaped_link {
 
         /// As [`pair_opened`] with the default windows (1 MiB), and the viewer
         /// logs when each message arrived and the write time it carries in
-        /// its first 8 bytes.
+        /// its first 8 bytes. FR-148 D48: with `slow`, the viewer reads at that
+        /// rate (bit/s) through a receive window of that many bytes, so the
+        /// window fills and the viewer is the session's limit; a message
+        /// arrives when the viewer reads it.
         async fn pair_timed(
             a: Arc<dyn Conn + Send + Sync>,
             b: Arc<dyn Conn + Send + Sync>,
             path: OpenPath,
             t0: Instant,
             log: Arc<StdMutex<Vec<Arrival>>>,
+            slow: Option<(u64, u32)>,
         ) -> (Association, Arc<Association>) {
-            let config = |net_conn, name: &str| Config {
+            let window = slow.map_or(0, |(_, window)| window);
+            let config = |net_conn, rwnd, name: &str| Config {
                 net_conn,
-                max_receive_buffer_size: 0,
+                max_receive_buffer_size: rwnd,
                 max_message_size: 0,
                 name: name.to_owned(),
             };
             let (agent, viewer) = match path {
                 OpenPath::InitAck => {
-                    let agent = tokio::spawn(Association::client(config(a, "agent")));
-                    let viewer = Association::server(config(b, "viewer")).await;
+                    let agent = tokio::spawn(Association::client(config(a, 0, "agent")));
+                    let viewer = Association::server(config(b, window, "viewer")).await;
                     (agent.await.unwrap().unwrap(), viewer.unwrap())
                 }
                 OpenPath::CookieEcho => {
-                    let viewer = tokio::spawn(Association::client(config(b, "viewer")));
-                    let agent = Association::server(config(a, "agent")).await;
+                    let viewer = tokio::spawn(Association::client(config(b, window, "viewer")));
+                    let agent = Association::server(config(a, 0, "agent")).await;
                     (agent.unwrap(), viewer.await.unwrap().unwrap())
                 }
             };
@@ -6474,14 +6723,23 @@ pub(crate) mod shaped_link {
                     let log = Arc::clone(&log);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65_536];
+                        // The slow viewer's next free read: never faster than
+                        // its rate, and no catching up after a wait.
+                        let mut free = Instant::now();
                         while let Ok(n @ 8..) = stream.read(&mut buf).await {
-                            let at_us = us(t0.elapsed());
+                            let at = Instant::now();
                             let sent_us = u64::from_le_bytes(buf[..8].try_into().unwrap());
                             log.lock().unwrap().push(Arrival {
-                                at_us,
+                                at_us: us(at.saturating_duration_since(t0)),
                                 sent_us,
                                 len: n as u64,
                             });
+                            if let Some((bps, _)) = slow {
+                                free = free.max(at)
+                                    + Duration::from_micros(n as u64 * 8_000_000 / bps);
+                                tokio::time::sleep_until(tokio::time::Instant::from_std(free))
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -6500,7 +6758,7 @@ pub(crate) mod shaped_link {
                 (Some((every, stall)), _, _) => stalling(shape.bps, shape.queue, t0, every, stall),
                 (None, Some((every, len)), _) => outaged(shape.bps, shape.queue, t0, every, len),
                 (None, None, Some((at, to))) => stepped(shape.bps, shape.queue, t0 + at, to),
-                (None, None, None) => shaped(shape.bps, RTT / 2, shape.queue),
+                (None, None, None) => shaped(shape.bps, shape.rtt / 2, shape.queue),
             };
             let a = Arc::new(a);
             let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
@@ -6510,6 +6768,7 @@ pub(crate) mod shaped_link {
                 shape.path,
                 t0,
                 Arc::clone(&arrivals),
+                shape.viewer,
             )
             .await;
             let stream = agent
@@ -6612,6 +6871,7 @@ pub(crate) mod shaped_link {
                                         measured: b.rate_measured(),
                                         window_sized: b.window_sized(&r.gauges),
                                         cwnd: r.gauges.cwnd,
+                                        rwnd: r.gauges.rwnd,
                                         ssthresh: r.gauges.ssthresh,
                                         fast_rtx: r.gauges.fast_retransmits,
                                         t3: r.gauges.t3_expiries,
@@ -6801,6 +7061,7 @@ pub(crate) mod shaped_link {
                         rows: covered..rows.len(),
                         sample,
                         end_us: us(now - t0),
+                        from_us: us(base.0.saturating_duration_since(t0)),
                         over: seen.map(|(o, _)| o),
                         settle_us: seen.map_or(0, |(_, s)| s),
                     });
@@ -7061,6 +7322,8 @@ pub(crate) mod shaped_link {
                 sparse: false,
                 seconds: SAMPLES,
                 step: None,
+                rtt: RTT,
+                viewer: None,
             }
         }
 
@@ -7363,7 +7626,8 @@ pub(crate) mod shaped_link {
             /// The floor of the run's fold; with a push-back at each queued
             /// sample (P1), and their count; and, under a holding budget, with
             /// one at each sample that counted, was backlogged (SCTP's own
-            /// class, or the budget held a frame in each of its seconds) and
+            /// class, or the budget held a frame in a share of each of its
+            /// seconds) and
             /// held no span of a still clock (P3).
             floor: Option<u32>,
             floor_p1: (Option<u32>, usize),
@@ -7486,6 +7750,7 @@ pub(crate) mod shaped_link {
                 let s = summary(&r);
                 print_summary(&r, &s);
                 print_b2(&r);
+                print_held(&r);
                 print_drop(&r);
                 print_releases(&r);
                 out.push((r, s));
@@ -7813,6 +8078,84 @@ pub(crate) mod shaped_link {
         #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the drop rules on a link whose rate halves"]
         async fn the_budget_when_a_deep_2_mbps_link_halves_path_i() {
             measured(&[budgeted(halving(DEEP)), as_b1(halving(DEEP))]).await;
+        }
+
+        /// FR-148 D48 — an opener at four times a 0.4 Mbit/s shallow link:
+        /// the budget's rate is a stand-in (the opening rate) well over the
+        /// link while the first holes are released.
+        fn opener(path: OpenPath) -> Shape {
+            Shape {
+                offer_pct: 400,
+                ..shape(400_000, SHALLOW, path)
+            }
+        }
+
+        /// FR-148 D48 — a viewer that reads at half a 2 Mbit/s shallow link
+        /// through a 128 KiB receive window: the window fills, and the
+        /// session's limit is the viewer, not the link.
+        fn slow_viewer(path: OpenPath) -> Shape {
+            Shape {
+                viewer: Some((2_000_000 * PAYLOAD / PACKET / 2, 128 * 1024)),
+                ..shape(2_000_000, SHALLOW, path)
+            }
+        }
+
+        /// FR-148 D48 — a 2 Mbit/s shallow link with a 200 ms round trip:
+        /// SCTP's window takes longer to fill the link, so a sample can be
+        /// window-sized with nothing lost.
+        fn long_round_trip(path: OpenPath) -> Shape {
+            Shape {
+                rtt: Duration::from_millis(200),
+                ..shape(2_000_000, SHALLOW, path)
+            }
+        }
+
+        /// FR-148 D48 — the opener under the two budget writers, printed
+        /// only: the drop lines read the model's floor against the link.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model at an opener over a shallow link"]
+        async fn the_budget_opening_at_4_x_a_shallow_0_4_mbps_link_path_i() {
+            let s = opener(OpenPath::InitAck);
+            measured(&[budgeted(s), as_b1(s)]).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model at an opener over a shallow link"]
+        async fn the_budget_opening_at_4_x_a_shallow_0_4_mbps_link_path_c() {
+            let s = opener(OpenPath::CookieEcho);
+            measured(&[budgeted(s), as_b1(s)]).await;
+        }
+
+        /// FR-148 D48 — the slow viewer under the two budget writers, printed
+        /// only: the drop lines read the model against the viewer's rate.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model behind a viewer slower than the link"]
+        async fn the_budget_when_the_viewer_reads_at_half_a_shallow_2_mbps_link_path_i() {
+            let s = slow_viewer(OpenPath::InitAck);
+            measured(&[budgeted(s), as_b1(s)]).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model behind a viewer slower than the link"]
+        async fn the_budget_when_the_viewer_reads_at_half_a_shallow_2_mbps_link_path_c() {
+            let s = slow_viewer(OpenPath::CookieEcho);
+            measured(&[budgeted(s), as_b1(s)]).await;
+        }
+
+        /// FR-148 D48 — the long round trip under the two budget writers,
+        /// printed only.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model on a long round trip over a shallow link"]
+        async fn the_budget_on_a_shallow_2_mbps_link_with_a_200_ms_round_trip_path_i() {
+            let s = long_round_trip(OpenPath::InitAck);
+            measured(&[budgeted(s), as_b1(s)]).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the path model on a long round trip over a shallow link"]
+        async fn the_budget_on_a_shallow_2_mbps_link_with_a_200_ms_round_trip_path_c() {
+            let s = long_round_trip(OpenPath::CookieEcho);
+            measured(&[budgeted(s), as_b1(s)]).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
