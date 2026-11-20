@@ -81,16 +81,16 @@ ahead) used to refuse tokens the server would still accept. The server verifies 
 token at enrollment either way.
 
 - **The reading** is the `Date` header of the server's answer to the setup-features
-  request the page sends when it opens (`agents/roomler-setup/src/features.rs:242`). It
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:259`). It
   counts only when the answer is the server's own: a 2xx JSON object from the origin that
-  was asked (`agents/roomler-setup/src/features.rs:197`, `tells_the_servers_clock`). The
+  was asked (`agents/roomler-setup/src/features.rs:214`, `tells_the_servers_clock`). The
   target of a redirect to another origin, a proxy's or a captive portal's page, and an
   older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
   arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
   clock, so a wall-clock step does not move it. It is used for 5
   minutes by either clock; after that the check asks the server again
   (`agents/roomler-setup/src/server_clock.rs:112`).
-- **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
+- **The verdict** (`agents/roomler-setup/src/commands.rs:548`, `judge_expiry`):
 
 | The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
 |---|---|---|---|
@@ -98,7 +98,7 @@ token at enrollment either way.
 | unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
 
 A token with no `exp` blocks, as before. The macOS second token follows the same rule
-(`agents/roomler-setup/src/front/app.js:1030`, `rootTokenProblem`). The expiry the page shows
+(`agents/roomler-setup/src/front/app.js:1047`, `rootTokenProblem`). The expiry the page shows
 ("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
 
 ### The install page: a list of steps, and a failure that says why (#3432, #3590)
@@ -138,8 +138,8 @@ did not apply. After every change the tracker sends the whole checklist as one
 `ProgressEvent::Steps { rows }` snapshot
 (`crates/roomler-setup-core/src/progress.rs:227`, each row a
 `StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
-the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1671`;
-`renderInstall`, `app.js:1750`).
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1688`;
+`renderInstall`, `app.js:1767`).
 
 | Row state | When | The page shows |
 |---|---|---|
@@ -163,12 +163,12 @@ panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
 in a person's words (`label_existing`, `orchestrator_agent.rs:1881`,
-`orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
+`orchestrator_unix.rs:1236`; `orchestrator_tunnel.rs:410`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
 `steps.rs:479`, into `DoneReport.warnings`,
-`agents/roomler-setup/src/commands.rs:662`; `renderDone`, `app.js:1839`): the
+`agents/roomler-setup/src/commands.rs:685`; `renderDone`, `app.js:1856`): the
 anchor's note there carries only its manual command.
 
 **The failure.** An error site hands over the error itself (`.or_fail(code)`
@@ -182,7 +182,7 @@ site's say. One function sends the terminal
 `ProgressEvent::Error { step, kind, status, words, chain }`
 (`progress.rs:216`) to the page and the replay log and writes the same line to
 the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
-failed at: ‹the failed row's label›" (`app.js:1793`), shows the words, and keeps
+failed at: ‹the failed row's label›" (`app.js:1810`), shows the words, and keeps
 the whole chain under Details.
 
 The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and
@@ -2094,7 +2094,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:77-83`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:84-90`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
