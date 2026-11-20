@@ -1531,9 +1531,9 @@ async fn daemon_main() -> Result<()> {
         return if as_service {
             service_status_as_service()
         } else {
-            let s = service::status().context("querying auto-start status")?;
-            println!("Auto-start: {s}");
-            Ok(())
+            // FR-150 P1a: a person's own `service status` takes this path too,
+            // so it prints what the `Status` arm prints, the note included.
+            service::print_status()
         };
     }
 
@@ -5919,13 +5919,13 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
             Ok(())
         }
         ServiceAction::Status { as_service: false } => {
-            let s = service::status().context("querying auto-start status")?;
-            println!("Auto-start: {s}");
-            // FR-150 P1a (#3507): a task its account cannot replace.
-            if let Some(note) = service::unreplaceable_task_note() {
-                println!("Note: {note}.");
-            }
-            Ok(())
+            // FR-150 P1a (#3507): `Auto-start: …`, then the note of a task its
+            // account cannot replace. A plain `service status` is answered by
+            // the companion probe in `daemon_main` with the same helper; this
+            // arm answers every other spelling of it (`--config` given, say),
+            // so the two never say different things. `--as-service` asks
+            // about the SCM service instead, which has no per-user task.
+            service::print_status()
         }
         ServiceAction::Start { as_service: false } => {
             service::start().context("starting the auto-start hook")?;

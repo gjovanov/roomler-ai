@@ -2834,6 +2834,29 @@ mod macos {
     }
 }
 
+/// FR-150 P1a (#3507) — the answer to a plain `service status`: the
+/// `Auto-start:` line, then the note of [`unreplaceable_task_note`] when there
+/// is one. The companion's probe ([`companion_probe`]) matches a person's own
+/// `service status` too, so it and the `Status` arm both print this, and
+/// neither drops the note. The note's check reads one file's descriptor in
+/// this process: no child process and no log line on the probe's 10 s. The
+/// companion finds the `Auto-start:` line by its prefix, scanning from the
+/// last line up (#1682), so a `Note:` line after it changes nothing there.
+pub fn print_status() -> Result<()> {
+    let s = status().context("querying auto-start status")?;
+    for line in status_lines(&s, unreplaceable_task_note().as_deref()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// [`print_status`]'s lines: the answer first, the note after it.
+fn status_lines(s: &AutostartStatus, note: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("Auto-start: {s}")];
+    lines.extend(note.map(|n| format!("Note: {n}.")));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2972,6 +2995,22 @@ mod tests {
         assert_eq!(AutostartStatus::Installed.to_string(), "installed");
         assert_eq!(AutostartStatus::NotInstalled.to_string(), "not installed");
         assert_eq!(AutostartStatus::Unknown.to_string(), "unknown");
+    }
+
+    /// FR-150 P1a (#3507) — `service status` prints its answer line first and
+    /// the note after it, a sentence of its own. The companion reads the
+    /// answer by its prefix (roomler-desktop's
+    /// `a_note_after_the_answer_line_changes_nothing`).
+    #[test]
+    fn service_status_prints_its_answer_then_the_note() {
+        assert_eq!(
+            status_lines(&AutostartStatus::Installed, None),
+            ["Auto-start: installed"]
+        );
+        assert_eq!(
+            status_lines(&AutostartStatus::Installed, Some("an elevated task")),
+            ["Auto-start: installed", "Note: an elevated task."]
+        );
     }
 
     #[test]

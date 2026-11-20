@@ -4367,6 +4367,24 @@ mod tests {
         assert_eq!(got, ("scheduledTask".to_string(), false));
     }
 
+    /// FR-150 P1a (#3507) — a daemon whose task its account cannot replace
+    /// prints a `Note:` line after its answer (roomlerd's `print_status`). The
+    /// answer is read all the same, and the note's own words ("its auto-start
+    /// task") are never taken for an answer.
+    #[test]
+    fn a_note_after_the_answer_line_changes_nothing() {
+        let said = out("Auto-start: installed\n\
+             Note: this account cannot replace its auto-start task Roomler-S-1-5-21-1-2-3-1001: \
+             an elevated registration owns it, so a self-update cannot register it again \
+             (#3507). Run `roomlerd service install` once from an elevated prompt, or the \
+             installer as administrator, to repair it.");
+        let got = classify_service_state(Some(&said), Some(&out("Roomler: NotInstalled")));
+        assert_eq!(got, ("scheduledTask".to_string(), false));
+        let said = out("Auto-start: not installed\nNote: an elevated task.");
+        let got = classify_service_state(Some(&said), Some(&out("Roomler: NotInstalled")));
+        assert_eq!(got, ("none".to_string(), false));
+    }
+
     #[test]
     fn log_noise_alone_is_no_service_at_all() {
         // Neither probe answered: the word "running" in a log line is not a state.

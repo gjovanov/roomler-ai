@@ -193,7 +193,9 @@ exists); the step names the repair only where the account cannot replace its tas
 **The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor from the task's file
 under `%SystemRoot%\System32\Tasks` (the scheduler's copy in the registry is not readable at medium, C6) and checks it
 with a medium copy of its own token (`win_token::restricted_medium_copy`, `AccessCheck`). When its account cannot
-replace the task, it logs one WARN at start with the repair, and `service status` says so. Nothing is sent to the
+replace the task, it logs one WARN at start with the repair, and `service status` says so in a `Note:` line after its
+answer (`print_status`, `service.rs:2845-2851`). The companion's probe answers a plain `service status` with the same
+lines, and reads its answer by the `Auto-start:` prefix, so the note changes nothing there. Nothing is sent to the
 server (D5). `register` asks the same check.
 
 **Kill switch:** `ROOMLERD_TASK_SD=0` in the environment of `service install`. It registers master's task: no
