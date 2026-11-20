@@ -24,6 +24,9 @@ Every line below was read on `origin/master` at `861d4557`.
 
 ### Consent
 
+Anchors in items 1 to 4 are master `861d4557` (0.4.15), the code this list was read on. Item 5
+was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
+
 1. **The owner is never prompted, in any mode.** `resolve_session_authz` returns
    `ConsentMode::Auto` for `owner_user_id == controller_user_id` *before* the
    device policy is consulted, and the UI does not say so. Every GROX device is
@@ -33,14 +36,14 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2283`,
+   deny. — `agents/roomlerd/src/signaling.rs:1884`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
    `EndReason::UserDenied`. The hub's own `ConsentTimeout` branch exists, but
    which of the two fires is a *race*: the agent's prompt window is set from the
    same `consent_timeout_secs` the hub is waiting on.
-   — `agents/roomlerd/src/consent.rs:79`, `crates/remote_control/src/hub.rs:967`
+   — `agents/roomlerd/src/consent.rs:76`, `crates/remote_control/src/hub.rs:967`
 
    ⚠️ **Corrected after the 2026-08-29 baseline.** This finding originally said
    the hub "loses the race every time". Measured on `mars`, it *wins*: the hub
@@ -67,7 +70,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:5819`, `ssh.rs:2187` vs `git grep write_pending`
+   — `signaling.rs:2756`, `ssh.rs:1633` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on

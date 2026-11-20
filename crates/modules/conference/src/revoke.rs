@@ -226,8 +226,8 @@ async fn room_membership_ended(
     room_id: ObjectId,
     user_id: ObjectId,
 ) -> anyhow::Result<()> {
-    // Not reached: reported where it happened; the pod serving the call
-    // ends the seat and settles the call there (`seat_check`).
+    // Not reached, and warned: the serving pod's seat check ends the seat and
+    // settles there; a request only late closed it and leaves the call unsettled.
     let Withdrawal::Closed(closed) = withdraw_seats(state, tenant_id, room_id, user_id).await
     else {
         return Ok(());
@@ -272,8 +272,8 @@ async fn org_membership_ended(
 
     let mut first_error = None;
     for (rid, in_session) in rooms {
-        // Not reached: reported where it happened; the pod serving the call
-        // ends the seat by its own check (`seat_check`).
+        // Not reached, and warned: the serving pod's seat check ends the seat,
+        // unless a late request closed it; the books are kept below, either way.
         if let Withdrawal::Closed(closed) = withdraw_seats(state, tenant_id, rid, user_id).await
             && closed > 0
         {
@@ -300,10 +300,10 @@ enum Withdrawal {
     /// The pod serving the call's media closed this many of them (none when
     /// the person held no seat there).
     Closed(usize),
-    /// The pod the call's claim names could not be asked: no answer within
-    /// the bus deadline, or no bus. Reported where it happened; that pod's
-    /// seat check ends the seat once the membership reads as gone there
-    /// (`seat_check`), and a pod that is gone took its media with it.
+    /// The claim's pod gave no answer within the bus deadline, or there is no
+    /// bus. Its seat check ends the seats it read once the guard refuses them,
+    /// and a gone pod took its media along. A request only late closed them and
+    /// settled nothing, so a room leave's emptied call stays `in_progress`.
     NotReached,
 }
 
@@ -329,7 +329,7 @@ async fn withdraw_seats(
         warn!(
             tenant = %tenant_id, room = %room_id, user = %user_id, pod = %owner,
             e = "no cluster bus on this pod", alert = "membership_seat_unreached",
-            "call seat withdrawal did not reach the pod serving the call; its seat check ends the seat"
+            "call seat withdrawal did not reach the pod serving the call; that pod's seat check ends the seat where it runs one, and a pod without the check keeps it"
         );
         return Withdrawal::NotReached;
     };
@@ -342,7 +342,7 @@ async fn withdraw_seats(
             warn!(
                 tenant = %tenant_id, room = %room_id, user = %user_id, pod = %owner,
                 %e, alert = "membership_seat_unreached",
-                "call seat withdrawal did not reach the pod serving the call; its seat check ends the seat"
+                "call seat withdrawal did not reach the pod serving the call; that pod's seat check ends the seat where it runs one, and a pod without the check keeps it"
             );
             Withdrawal::NotReached
         }
@@ -364,25 +364,25 @@ pub(crate) async fn withdraw_seats_here(
     closed
 }
 
-/// End the seats `conns` of `user_id` in `room_id`'s media on this pod, those
-/// of them it still holds as that person's, and tell everyone as
-/// [`withdraw_seats_here`] does. The seat check's way to end the seats it
-/// read: a seat taken after its read, such as a person added back who joins
-/// again, is not one of `conns`. Returns the closed connections.
+/// End the seats `seats` of `user_id` in `room_id`'s media on this pod: each
+/// connection whose seat is still the one the seat check read (the same
+/// person, the same send transport), and tell everyone as
+/// [`withdraw_seats_here`] does. A seat taken after the read, a rejoin on the
+/// same connection included, stays. Returns the closed connections.
 pub(crate) async fn withdraw_these_seats_here(
     state: &ConferenceState,
     room_id: ObjectId,
     user_id: ObjectId,
-    conns: &[String],
+    seats: &[(String, mediasoup::prelude::TransportId)],
 ) -> Vec<String> {
-    let closed: Vec<String> = conns
+    let closed: Vec<String> = seats
         .iter()
-        .filter(|conn| {
+        .filter(|(conn, seat)| {
             state
                 .room_manager
-                .close_participant_of_user(&room_id, conn, &user_id)
+                .close_participant_seat(&room_id, conn, &user_id, seat)
         })
-        .cloned()
+        .map(|(conn, _)| conn.clone())
         .collect();
     tell_seats_withdrawn(state, room_id, user_id, &closed).await;
     closed
