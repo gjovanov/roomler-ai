@@ -7,7 +7,7 @@
 #     50-100 ms RTT, 1 MB caps single-stream DC throughput at
 #     ~80-167 Mbps; the tunnel CLI needs 8 MB to keep
 #     native-to-native DCs link-bound on home-broadband paths.
-#   - src/sctp_transport/mod.rs:159: pulls the value out of
+#   - src/sctp_transport/mod.rs:171: pulls the value out of
 #     SettingEngine instead of hardcoding 0 (which falls back to the
 #     1 MB upstream default).
 #   - src/api/setting_engine/setting_engine_test.rs: round-trip test
@@ -44,6 +44,18 @@
 #     relay_transport`, a patch of the vendored webrtc-ice), on the pairs the
 #     selection reads and its change handler hands over. Read only by the
 #     agent's carrier line.
+#   - src/sctp_transport/mod.rs (#4103): the transport's stop is a `watch`
+#     value that `stop()` sets first and keeps, in place of upstream's
+#     `Notify`, whose `notify_waiters()` wakes only the waiters of that
+#     instant. A stop that came while the data-channel accept task was in
+#     its loop body (awaiting the app's `on_data_channel` handler) was lost,
+#     and the task waited for good, holding the association and the DTLS
+#     conn under it. The accept loop and `start()` read the value before
+#     they wait, and `start()` reads it again under the association's slot
+#     lock, so it closes an association whose handshake ended as the stop
+#     came instead of storing it. Hence tokio 1.39 below (was 1.32), the
+#     first with `Default` for `watch::Sender`, which `#[derive(Default)]`
+#     on `RTCSctpTransport` needs.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only
@@ -189,7 +201,7 @@ version = "1"
 version = "0.3"
 
 [dependencies.tokio]
-version = "1.32.0"
+version = "1.39.0"
 features = [
     "fs",
     "io-util",

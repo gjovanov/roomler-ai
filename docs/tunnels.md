@@ -406,6 +406,27 @@ viewer first. On a runtime both peers shared, the healthy-close test read them a
 and failed (`3 tasks alive after both closes, 1 before the peers`). The agent's runtime never
 kept a task past its baseline in those 90 runs.
 
+**A close while a channel is still being taken up (#4103).** The SCTP transport takes up each
+channel the browser opens on a task of its own (`accept_data_channels`,
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:243`), and the loop's body awaits the agent's
+`on_data_channel` handler (`:328`), which awaits in turn (`agents/roomlerd/src/peer.rs:1260`).
+Upstream's stop woke that task with one `notify_waiters()`, which wakes only the waiters of that
+instant and stores nothing, and the loop made its next wait after the body. So a stop that came
+while the task was in its body was lost: the task waited for good, holding the association, the
+DTLS conn under it and that conn's outgoing loop, two tasks over the baseline. Under load that
+was 2 runs in 2,958 and 2 in 5,652 of a test that closes as its channel opens. By reading, the
+conn also holds the ICE conn, and with it the session's UDP sockets, as a peer that was never
+closed does. The stop is now a `watch` value that `stop` sets first and keeps
+(`sctp_transport/mod.rs:228`). The loop and `start` read it before they wait (`stopped`,
+`:107`), so a stop from any moment before is seen. `start` reads it again under the
+association's slot lock (`:186`), so an association whose handshake ended as the stop came is
+closed instead of stored. With the fix, none of 12,000 runs of that test, six at once on two
+CPUs, left a task.
+
+| Test | Holds | Before the fix |
+|---|---|---|
+| `a_close_while_a_channel_is_being_accepted_leaves_nothing` (`peer_close_tests.rs:703`) | the viewer opens a second channel, and the agent's handler for it waits at a gate (`AcceptGate`, `:659`) while the agent's close (`peer_close::close`) runs to its end; then the gate opens, and nothing is left | `3 tasks alive after both closes, 1 before the peers`, in 12 runs of 12 |
+
 **How the dead-path test reads the wire.** The vnet router counts a packet on a task of its own,
 after the send that queued it has returned. On a loaded CI runner that task started late, and
 the close's own DTLS close_notify, sent before `close()` returned, was counted inside the 2 s
@@ -530,7 +551,7 @@ the fix is there and no caller changed:
 
 ⚠️ **The product reaches only the first two.** The agent's associations keep the default
 maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
-(`crates/vendored/webrtc/src/sctp_transport/mod.rs:162`), which means the default
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:174`), which means the default
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
 `association/mod.rs:65`), and `prepare_write` refuses a larger write before it waits
 (`stream/mod.rs:317`). So every agent and tunnel send is below the large threshold and is all
