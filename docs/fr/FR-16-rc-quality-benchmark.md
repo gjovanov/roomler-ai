@@ -430,9 +430,9 @@ the idle check were read and printed in the command's output, and no longer stop
 check still could: at 50 % or more over three reads it would read again five minutes later, and
 skip if the load was still that high. It read 23 % on desktop 2 and 8 % on desktop 3. Agent
 0.4.229, the quick profile of 2026-10-31, through `roomler exec` as SYSTEM in the console
-session. The remote session on desktop 2 was left alone. Both runs read `clock=unthrottled`:
-since FR-112 the bench takes its encoding thread out of Windows power throttling, and the
-2026-10-31 runs read `n/a`.
+session. The remote session on desktop 2 was left alone, and at 22:06Z the server's record still
+held it open, the same session. Both runs read `clock=unthrottled`: since FR-112 the bench takes
+its encoding thread out of Windows power throttling, and the 2026-10-31 runs read `n/a`.
 
 An entry is what opened, its verdict, encode p50 / p95 in ms and the Mbps produced, as in
 [the 2026-10-31 table](#l1-fleet-run-2026-10-31), whose desktop column is repeated here.
