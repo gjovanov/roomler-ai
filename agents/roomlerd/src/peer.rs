@@ -4501,7 +4501,8 @@ async fn media_pump_vp9_444_dc(
             warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
             return;
         }
-        if send_tx.capacity() == 0 || pipeline.followers_congested() {
+        delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
@@ -4513,7 +4514,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -5193,8 +5194,9 @@ async fn media_pump_vp9_444_dc(
         // queue. On webrtc-rs this rarely fires (dc.send().await blocks first,
         // keeping buffered_amount low), but it's a cheap belt-and-suspenders
         // check that also preserves the shed-on-overflow behaviour.
+        // FR-148 D46 B3 — under `on`, on a relay, the budget's hold replaces it.
         let buffered = dc.buffered_amount().await as u64;
-        if buffered > dc_buffered_high {
+        if delivery.sheds(buffered > dc_buffered_high) {
             if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                 enc.set_bitrate(applied.bps).await;
                 info!(
@@ -8105,7 +8107,8 @@ async fn media_pump_ffmpeg_dc(
         // produced on 2026-09-04 (662 ms and 782 ms passes with both at zero),
         // and it is why this whole block is timed rather than just its sleep.
         let gate_start = watch.start();
-        if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
+        delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate); // FR-148 D46
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
                 info!(
@@ -8162,12 +8165,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            let bp_applied = if constrained && !opener_grace_done {
-                grace_bp_skips += 1;
-                None
-            } else {
-                governor.on_backpressure_skip(std::time::Instant::now())
-            };
+            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            let in_grace = constrained && !opener_grace_done;
+            grace_bp_skips += u32::from(in_grace);
+            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {

@@ -76,7 +76,7 @@ use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::governor::RateGovernor;
 use crate::encode::pipe::{PathNumber, PathView, PushedBy};
-use crate::media_inflight::{Bound, Budget, Over, PumpCount, Shadow, WindowReport};
+use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -545,6 +545,11 @@ pub struct DeliverySampler {
     /// shadow model each whose time has come. With the budget off a push-back
     /// waits for nothing.
     waiting: VecDeque<(SamplePushBack, Instant)>,
+    /// FR-148 D46 B3 — the pass [`Self::gate`] answered last, for the gate's
+    /// terms; and, under `on`, whether the budget acted when the pump last
+    /// said which mode acted (`None` before it first said).
+    pass: Pass,
+    said: Option<bool>,
 }
 
 impl DeliverySampler {
@@ -579,6 +584,8 @@ impl DeliverySampler {
             opened: false,
             budget: None,
             waiting: VecDeque::new(),
+            pass: Pass::default(),
+            said: None,
         }
     }
 
@@ -587,6 +594,14 @@ impl DeliverySampler {
     #[cfg(test)]
     pub(crate) fn with_budget(mut self) -> Self {
         self.budget = Shadow::for_pump(crate::media_inflight::Mode::Shadow, self.on).map(Box::new);
+        self
+    }
+
+    /// FR-148 D46 B3 — a sampler with the in-flight budget `on`, as
+    /// `ROOMLERD_INFLIGHT_BUDGET=on` gives one.
+    #[cfg(test)]
+    pub(crate) fn with_budget_on(mut self) -> Self {
+        self.budget = Shadow::for_pump(crate::media_inflight::Mode::On, self.on).map(Box::new);
         self
     }
 
@@ -854,8 +869,13 @@ impl DeliverySampler {
     /// still span stand for the least and S, or read a release, keeps the next
     /// window out of the governor's shadow model and pair memory
     /// ([`RateGovernor::note_path_stall`]), and drops each push-back still
-    /// inside its [`settle`]. Off, it reads nothing.
+    /// inside its [`settle`]. Off, it reads nothing. FR-148 D46 B3: under
+    /// `on`, on a constrained session, the step ran at [`Self::gate`], before
+    /// the gate, and this reads nothing.
     pub fn on_frame(&mut self, pc: &RTCPeerConnection, governor: &mut RateGovernor) {
+        if self.pass.acts() {
+            return;
+        }
         let marked = self.budget.as_mut().is_some_and(|b| {
             b.on_frame(pc, governor.applied_bps(), governor.open_at_bps());
             b.take_mark()
@@ -877,14 +897,105 @@ impl DeliverySampler {
 
     /// FR-148 D46 B1 — today's capacity gate held a pass: `full` when the send
     /// channel was full, `ledger` when the FFmpeg ledger's byte gate was shut.
+    /// FR-148 D46 B3: while the budget acts, [`Self::gate`] counted the byte
+    /// gate's firing at every pass, whatever shut it.
     pub fn note_gate(&mut self, full: bool, ledger: bool) {
         if let Some(b) = self.budget.as_mut() {
             if full {
                 b.note_bound(Bound::ChannelFull);
             }
-            if ledger {
+            if ledger && !self.pass.acts() {
                 b.note_bound(Bound::Ledger);
             }
+        }
+    }
+
+    /// FR-148 D46 B3 — the pump's call before its capacity gate decides, with
+    /// the session's transport and today's byte gate for the pass (`false` on
+    /// VP9-444). Under `on`, on a constrained session, the budget's step runs
+    /// here, before the gate, and a stall it marks is handled as
+    /// [`Self::on_frame`] handles one; the pass then acts through
+    /// [`Self::shuts`], [`Self::on_skip`] and [`Self::sheds`]. Otherwise it
+    /// reads nothing, and those answer as today. Under `on` the pump says once
+    /// which mode acted on the session, and again when that changes.
+    pub fn gate(
+        &mut self,
+        pc: &RTCPeerConnection,
+        governor: &mut RateGovernor,
+        session_id: ObjectId,
+        constrained: bool,
+        byte_gate: bool,
+    ) {
+        let pass = match self.budget.as_mut() {
+            Some(b) => b.gate(
+                pc,
+                governor.applied_bps(),
+                governor.open_at_bps(),
+                constrained,
+                byte_gate,
+            ),
+            None => Pass::today(byte_gate),
+        };
+        if self.gated(Instant::now(), session_id, pass) {
+            governor.note_path_stall();
+        }
+    }
+
+    /// The pass [`Self::gate`] answered, kept for the gate's terms. A stall
+    /// the acting budget marked drops each push-back still inside its
+    /// [`settle`], as [`Self::on_frame`] does; returns whether it marked one,
+    /// for the governor.
+    fn gated(&mut self, now: Instant, session_id: ObjectId, pass: Pass) -> bool {
+        self.pass = pass;
+        let Some(b) = self.budget.as_mut() else {
+            return false;
+        };
+        let marked = pass.acts() && b.take_mark();
+        let on = b.is_on();
+        if marked {
+            self.on_mark(now);
+        }
+        if on && self.said != Some(pass.acts()) {
+            self.said = Some(pass.acts());
+            say_budget_mode(session_id, pass.acts());
+        }
+        marked
+    }
+
+    /// FR-148 D46 B3 — the capacity gate's last term, after the send channel's
+    /// and the followers': the budget's hold while it acts, counted on the
+    /// line when it shut the pass by itself; today's byte gate otherwise.
+    pub fn shuts(&mut self) -> bool {
+        match self.budget.as_mut() {
+            Some(b) => b.shut(&mut self.pass),
+            None => self.pass.shuts(),
+        }
+    }
+
+    /// FR-148 D46 B3 — the gate's skip: `decrease` (the governor's
+    /// `on_backpressure_skip`, at the time it is given) runs unless FR-35's
+    /// opener grace is open (`grace`), or the pass is the budget's hold in a
+    /// still span, a stall of the carrier (D46's no-decrease rule). Anything
+    /// else decreases as today.
+    pub fn on_skip<T>(
+        &self,
+        grace: bool,
+        decrease: impl FnOnce(Instant) -> Option<T>,
+    ) -> Option<T> {
+        if self.pass.decreases(grace) {
+            decrease(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    /// FR-148 D46 B3 — whether the VP9-444 watermark arm sheds a frame `over`
+    /// its mark: as today, but never while the budget acts; then the firing is
+    /// counted on the line and nothing is shed.
+    pub fn sheds(&mut self, over: bool) -> bool {
+        match self.budget.as_mut() {
+            Some(b) => b.shed(&self.pass, over),
+            None => self.pass.sheds(over),
         }
     }
 
@@ -919,10 +1030,33 @@ impl DeliverySampler {
             .unwrap_or_default()
     }
 
+    /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
+    /// [`Self::on_frame_reading`] reads one; returns whether the acting budget
+    /// marked a stall, which the pump hands the governor.
+    #[cfg(test)]
+    pub(crate) fn gate_reading(
+        &mut self,
+        now: Instant,
+        acked: u64,
+        g: Gauges,
+        open_bps: u64,
+        constrained: bool,
+        byte_gate: bool,
+    ) -> bool {
+        let pass = match self.budget.as_mut() {
+            Some(b) => b.gate_reading(now, acked, g, open_bps, constrained, byte_gate),
+            None => Pass::today(byte_gate),
+        };
+        self.gated(now, ObjectId::from_bytes([0; 12]), pass)
+    }
+
     /// One frame's reading for the budget, as [`Self::on_frame`] reads it from
     /// the association, its mark taken as that takes it.
     #[cfg(test)]
     pub(crate) fn on_frame_reading(&mut self, now: Instant, acked: u64, g: Gauges, open_bps: u64) {
+        if self.pass.acts() {
+            return;
+        }
         let marked = self.budget.as_mut().is_some_and(|b| {
             b.on_reading(now, acked, g, open_bps);
             b.take_mark()
@@ -951,6 +1085,27 @@ impl Drop for DeliverySampler {
         if let Some(view) = self.view.take() {
             emit_model(session_id, &view);
         }
+    }
+}
+
+/// FR-148 D46 B3 — under `on`, which mode acted on the session: said by the
+/// pump once, and again when a change of transport changes it.
+fn say_budget_mode(session_id: ObjectId, acts: bool) {
+    if acts {
+        tracing::info!(
+            %session_id,
+            budget_acts = "on",
+            "the in-flight budget acts on this relay session (FR-148 D46 B3): its hold \
+             skips a pass before capture, and the relay byte gate and the VP9-444 \
+             watermark arm hold nothing"
+        );
+    } else {
+        tracing::info!(
+            %session_id,
+            budget_acts = "shadow",
+            "the in-flight budget is on and runs as shadow on this direct session \
+             (FR-148 D46 B3), beside its own gates"
+        );
     }
 }
 
@@ -1020,6 +1175,8 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             bound_full = b.bounds.2,
             budget_released = ?b.released,
             budget_still_admitted = b.still_admitted,
+            budget_acted = ?b.acted,
+            budget_acted_stalled = b.acted_stalled,
             "{LINE}"
         ),
         (None, Some(b)) => tracing::info!(
@@ -1043,6 +1200,8 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             bound_full = b.bounds.2,
             budget_released = ?b.released,
             budget_still_admitted = b.still_admitted,
+            budget_acted = ?b.acted,
+            budget_acted_stalled = b.acted_stalled,
             "{LINE}"
         ),
     }
@@ -1576,6 +1735,8 @@ mod tests {
             bounds: (0, 37, 4),
             released: (2, 1),
             still_admitted: 23,
+            acted: (140, 300),
+            acted_stalled: 12,
         }
     }
 
@@ -1598,6 +1759,8 @@ mod tests {
             "bound_full=4",
             "budget_released=(2, 1)",
             "budget_still_admitted=23",
+            "budget_acted=(140, 300)",
+            "budget_acted_stalled=12",
         ];
         let line = LineReport {
             budget: Some(budget_window()),
@@ -1643,31 +1806,60 @@ mod tests {
         assert!(out.len() < 1_024, "{} bytes: {out:?}", out.len());
     }
 
-    /// FR-148 D46 B1 — `on` runs as `shadow`, with one warning a pump; and a
-    /// sampler that is off carries no budget.
+    /// FR-148 D46 B3 — `on` no longer runs as `shadow`: no warning where a
+    /// pump reads the switch; the pump says once which mode acted on its
+    /// session, and again when a change of transport changes it; `shadow`
+    /// says nothing. A sampler that is off carries no budget, `on` or not.
     #[test]
-    fn the_inflight_budget_on_runs_as_shadow_with_one_warning() {
+    fn the_inflight_budget_on_says_once_which_mode_acted() {
         use crate::media_inflight::Mode as BudgetMode;
         let mut pumps = Vec::new();
         let out = logged(|| {
-            pumps.push(Shadow::for_pump(BudgetMode::On, true).is_some());
-            pumps.push(Shadow::for_pump(BudgetMode::Shadow, true).is_some());
-            pumps.push(Shadow::for_pump(BudgetMode::Off, true).is_some());
+            pumps.push(Shadow::for_pump(BudgetMode::On, true).is_some_and(|s| s.is_on()));
+            pumps.push(Shadow::for_pump(BudgetMode::Shadow, true).is_some_and(|s| !s.is_on()));
+            pumps.push(Shadow::for_pump(BudgetMode::Off, true).is_none());
         });
-        assert_eq!(pumps, [true, true, false]);
-        assert_eq!(out.matches(" WARN ").count(), 1, "{out:?}");
-        assert!(
-            out.contains("ROOMLERD_INFLIGHT_BUDGET=on runs as shadow"),
-            "{out:?}"
+        assert_eq!(pumps, [true, true, true]);
+        assert!(out.is_empty(), "{out:?}");
+        let t0 = Instant::now();
+        let nothing = Gauges {
+            max_payload: 1_200,
+            ..Gauges::default()
+        };
+        let mut on = DeliverySampler::new(true).with_budget_on();
+        let mut shadow = DeliverySampler::new(true).with_budget();
+        let said = logged(|| {
+            // A relay session, then a direct one, then a relay again.
+            for (frame, relay) in (0..30u64).map(|f| (f, !(10..20).contains(&f))) {
+                for s in [&mut on, &mut shadow] {
+                    s.gate_reading(at(t0, frame * 33), 0, nothing, 2_000_000, relay, false);
+                }
+            }
+        });
+        assert_eq!(said.lines().count(), 3, "{said:?}");
+        assert_eq!(said.matches(" INFO ").count(), 3, "{said:?}");
+        assert_eq!(
+            said.matches("the in-flight budget acts on this relay session")
+                .count(),
+            2,
+            "{said:?}"
         );
-        let off = logged(|| assert!(Shadow::for_pump(BudgetMode::Shadow, false).is_none()));
+        assert_eq!(
+            said.matches("runs as shadow on this direct session")
+                .count(),
+            1,
+            "{said:?}"
+        );
+        assert_eq!(said.matches("budget_acts=\"on\"").count(), 2, "{said:?}");
+        let off = logged(|| assert!(Shadow::for_pump(BudgetMode::On, false).is_none()));
         assert!(off.contains("the in-flight budget stays off"), "{off:?}");
-        assert!(
-            DeliverySampler::new(false)
-                .with_budget()
-                .budget_mut()
-                .is_none()
-        );
+        for s in [
+            DeliverySampler::new(false).with_budget(),
+            DeliverySampler::new(false).with_budget_on(),
+        ] {
+            let mut s = s;
+            assert!(s.budget_mut().is_none());
+        }
     }
 
     /// FR-148 D46 B1 — shadow acts on nothing. Over a recorded sequence of a
@@ -1740,6 +1932,595 @@ mod tests {
         assert_eq!(a.map(|a| a.span_ms), b.map(|b| b.span_ms));
         assert!(lines >= 2, "{lines} lines");
         assert!(held > 0, "the budget never held on a megabyte out");
+    }
+
+    /// FR-148 D46 B3 — frame `frame` at 30 fps of TURN over TCP, as in
+    /// `the_inflight_budget_in_shadow_answers_every_pump_call_as_off_does`: 2
+    /// Mbit/s acknowledged while a megabyte stands in flight. The budget holds
+    /// each.
+    fn deep_frame(frame: u64) -> (u64, Gauges) {
+        let g = Gauges {
+            max_payload: 1_200,
+            cwnd: 1_048_576,
+            ssthresh: 1_048_576,
+            rwnd: 131_072,
+            inflight_bytes: 1_000_000,
+            pending_bytes: 131_072,
+            ack_delay: Some(Duration::from_millis(60 + frame)),
+            ack_delay_min: Some(Duration::from_millis(60 + frame / 2)),
+            ..Gauges::default()
+        };
+        (frame * 250_000 / 30, g)
+    }
+
+    /// As [`deep_frame`], but every third frame finds 10 000 bytes in flight
+    /// and nothing pending, under the budget: it admits.
+    fn deep_or_drained(frame: u64) -> (u64, Gauges) {
+        let (acked, mut g) = deep_frame(frame);
+        if frame.is_multiple_of(3) {
+            g.inflight_bytes = 10_000;
+            g.pending_bytes = 0;
+        }
+        (acked, g)
+    }
+
+    /// One pass's facts at a pump's capacity gate: the session on a relay,
+    /// today's byte gate, a full send channel, FR-35's opener grace open, and
+    /// the encoded frame over the VP9-444 watermark.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Facts {
+        relay: bool,
+        byte_gate: bool,
+        full: bool,
+        grace: bool,
+        over: bool,
+    }
+
+    /// What the passes did: skipped at the gate, with the decreases their
+    /// skips called; marked a stall for the governor at the gate; shed at the
+    /// watermark arm; or went to the send channel.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Passes {
+        skipped: u64,
+        decreases: u64,
+        marked: u64,
+        shed: u64,
+        went: u64,
+    }
+
+    /// One pass through a sampler as both pumps run it from B3
+    /// (`peer.rs`): the budget's gate, the capacity gate with the budget's
+    /// term last, the skip's decrease through it (no keyframe asked), or the
+    /// step after the gate, the watermark arm through it, and the frame
+    /// handed.
+    fn pass(
+        s: &mut DeliverySampler,
+        now: Instant,
+        (acked, g): (u64, Gauges),
+        f: Facts,
+        n: &mut Passes,
+    ) {
+        n.marked += u64::from(s.gate_reading(now, acked, g, 2_000_000, f.relay, f.byte_gate));
+        if f.full || s.shuts() {
+            n.skipped += 1;
+            s.note_gate(f.full, f.byte_gate);
+            let _ = s.on_skip(f.grace, |_| {
+                n.decreases += 1;
+                Some(())
+            });
+            return;
+        }
+        s.on_frame_reading(now, acked, g, 2_000_000);
+        handed(s, n, f.over);
+    }
+
+    /// One pass as both pumps ran it at B2 (`8df1957e1`): the capacity gate
+    /// with today's terms, the skip's decrease outside the grace, the step
+    /// after the gate, the watermark arm, and the frame handed.
+    fn pass_at_b2(
+        s: &mut DeliverySampler,
+        now: Instant,
+        (acked, g): (u64, Gauges),
+        f: Facts,
+        n: &mut Passes,
+    ) {
+        if f.full || f.byte_gate {
+            n.skipped += 1;
+            s.note_gate(f.full, f.byte_gate);
+            n.decreases += u64::from(!f.grace);
+            return;
+        }
+        s.on_frame_reading(now, acked, g, 2_000_000);
+        let over = f.over;
+        if over {
+            n.shed += 1;
+            s.note_watermark();
+            return;
+        }
+        hand(s, n);
+    }
+
+    /// The watermark arm through the budget's pass, then the frame handed.
+    fn handed(s: &mut DeliverySampler, n: &mut Passes, over: bool) {
+        if s.sheds(over) {
+            n.shed += 1;
+            s.note_watermark();
+            return;
+        }
+        hand(s, n);
+    }
+
+    fn hand(s: &mut DeliverySampler, n: &mut Passes) {
+        n.went += 1;
+        s.on_handed(8_000);
+        let count = s.pump_count();
+        let mut chunk = count.unsent(8_000);
+        chunk.sent(8_000);
+    }
+
+    /// The heartbeat's reading once a second and the line when it is due, as
+    /// the protected shadow test takes them.
+    fn heartbeat_at(s: &mut DeliverySampler, frame: u64, now: Instant) -> Option<LineReport> {
+        let (acked, g) = deep_frame(frame);
+        let reading = Delivery {
+            acked_bytes: acked,
+            queue_fills: frame / 30 + 1,
+            queue_empties: 0,
+        };
+        let _ = s.on_reading_with(now, reading, || Some(g));
+        s.take_line(now)
+    }
+
+    /// FR-148 D46 B3 — the hold. Under `on`, on a relay session, over a deep
+    /// queue's readings: each pass the budget holds skips before capture with
+    /// one decrease call (FR-35's grace closed) and no keyframe asked, the
+    /// watermark arm (which asks one) sheds no frame that went, and the line
+    /// counts the holds that acted beside the passes the budget was asked
+    /// about, and the watermark's firings.
+    #[test]
+    fn under_on_the_budget_s_hold_skips_a_relay_pass_and_decreases_once_per_hold() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget_on();
+        let mut n = Passes::default();
+        let relay = Facts {
+            relay: true,
+            over: true,
+            ..Facts::default()
+        };
+        for frame in 0..300u64 {
+            pass(
+                &mut s,
+                at(t0, frame * 1_000 / 30),
+                deep_or_drained(frame),
+                relay,
+                &mut n,
+            );
+        }
+        let w = s.budget_mut().unwrap().take_window();
+        assert_eq!(
+            n,
+            Passes {
+                skipped: 200,
+                decreases: 200,
+                went: 100,
+                ..Passes::default()
+            }
+        );
+        assert_eq!((w.acted, w.acted_stalled), ((200, 300), 0), "{w:?}");
+        assert_eq!(w.held, (200, 300), "every hold of the core's acted");
+        assert_eq!(w.bounds, (100, 0, 0), "the watermark's firings, counted");
+    }
+
+    /// FR-148 D46 B3 — the no-decrease rule through the sampler. Under `on`, on
+    /// a relay session, the clock stands still for a second with the megabyte
+    /// out: each hold skips its pass, and from the least and S on (210 ms)
+    /// none calls a decrease; the gate marks the stall for the governor at
+    /// those steps, as the shadow's step does after the gate; the line counts
+    /// the stalled holds apart.
+    #[test]
+    fn under_on_a_stall_hold_calls_no_decrease_and_marks_the_stall() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget_on();
+        let mut n = Passes::default();
+        let relay = Facts {
+            relay: true,
+            ..Facts::default()
+        };
+        for frame in 0..60u64 {
+            pass(
+                &mut s,
+                at(t0, frame * 1_000 / 30),
+                deep_frame(frame),
+                relay,
+                &mut n,
+            );
+        }
+        assert_eq!((n.skipped, n.decreases, n.marked), (60, 60, 0), "{n:?}");
+        // From 2 s the clock stands at its count then.
+        let (stood, _) = deep_frame(60);
+        for frame in 60..90u64 {
+            let (_, g) = deep_frame(frame);
+            pass(
+                &mut s,
+                at(t0, frame * 1_000 / 30),
+                (stood, g),
+                relay,
+                &mut n,
+            );
+        }
+        // Frames 60 to 66 hold before the span is 210 ms old, 67 to 89 in it.
+        assert_eq!((n.skipped, n.decreases, n.marked), (90, 67, 23), "{n:?}");
+        assert_eq!((n.shed, n.went), (0, 0));
+        let w = s.budget_mut().unwrap().take_window();
+        assert_eq!((w.acted, w.acted_stalled), ((90, 90), 23), "{w:?}");
+    }
+
+    /// FR-148 D46 B3 — a direct session under `on` computes the budget as
+    /// shadow does, beside its own gates: through the same passes as a shadow
+    /// sampler, the byte gate shuts what it shuts, the watermark sheds what it
+    /// sheds, every skip decreases, and the two write the same lines, the
+    /// budget's fields included.
+    #[test]
+    fn under_on_a_direct_session_runs_as_shadow() {
+        let t0 = Instant::now();
+        let mut on = DeliverySampler::new(true).with_budget_on();
+        let mut shadow = DeliverySampler::new(true).with_budget();
+        let (mut a, mut b) = (Passes::default(), Passes::default());
+        let mut lines = 0;
+        for frame in 0..900u64 {
+            let now = at(t0, frame * 1_000 / 30);
+            let direct = Facts {
+                byte_gate: frame % 11 == 0,
+                full: frame % 7 == 0,
+                over: frame % 13 == 0,
+                ..Facts::default()
+            };
+            pass(&mut on, now, deep_or_drained(frame), direct, &mut a);
+            pass(&mut shadow, now, deep_or_drained(frame), direct, &mut b);
+            if frame % 30 == 0 {
+                let (x, y) = (
+                    heartbeat_at(&mut on, frame, now),
+                    heartbeat_at(&mut shadow, frame, now),
+                );
+                assert_eq!(x, y, "frame {frame}");
+                lines += usize::from(x.is_some());
+            }
+        }
+        assert_eq!(a, b);
+        assert!(a.skipped > 0 && a.shed > 0 && a.went > 0, "{a:?}");
+        assert_eq!(a.decreases, a.skipped, "every skip decreases");
+        assert!(lines >= 2, "{lines} lines");
+        let (x, y) = (on.take_rest(), shadow.take_rest());
+        assert_eq!(x, y);
+    }
+
+    /// FR-148 D46 B3 — `off` and `shadow` act as today. Through the same
+    /// passes, a sampler driven with B3's calls (the budget's gate, its term
+    /// in the capacity gate, the skip's decrease and the watermark arm through
+    /// it) does what one driven as the pumps were at B2 does: the byte gate
+    /// shuts what it shut, the watermark sheds what it shed, each skip outside
+    /// the grace decreases, and the lines are the same, the budget's fields
+    /// included. On a relay session and on a direct one.
+    #[test]
+    fn off_and_shadow_gate_as_today() {
+        let t0 = Instant::now();
+        for shadowed in [false, true] {
+            let mk = || {
+                let s = DeliverySampler::new(true);
+                if shadowed { s.with_budget() } else { s }
+            };
+            let (mut b3, mut b2) = (mk(), mk());
+            let (mut x, mut y) = (Passes::default(), Passes::default());
+            let mut lines = 0;
+            for frame in 0..900u64 {
+                let now = at(t0, frame * 1_000 / 30);
+                let f = Facts {
+                    relay: frame % 5 != 0,
+                    byte_gate: frame % 3 == 1,
+                    full: frame % 7 == 0,
+                    grace: frame < 60,
+                    over: frame % 13 == 0,
+                };
+                pass(&mut b3, now, deep_or_drained(frame), f, &mut x);
+                pass_at_b2(&mut b2, now, deep_or_drained(frame), f, &mut y);
+                if frame % 30 == 0 {
+                    let (p, q) = (
+                        heartbeat_at(&mut b3, frame, now),
+                        heartbeat_at(&mut b2, frame, now),
+                    );
+                    assert_eq!(p, q, "shadow {shadowed}, frame {frame}");
+                    lines += usize::from(p.is_some());
+                }
+            }
+            assert_eq!(x, y, "shadow {shadowed}");
+            assert!(x.skipped > 0 && x.shed > 0 && x.went > 0, "{x:?}");
+            assert!(x.decreases < x.skipped, "the grace kept some: {x:?}");
+            assert!(lines >= 2, "{lines} lines");
+            assert_eq!(b3.take_rest(), b2.take_rest(), "shadow {shadowed}");
+        }
+    }
+
+    /// FR-148 D46 B3 — today's two bounds: out under `on` on a relay session,
+    /// in under `off`, `shadow` and `on` on a direct one. A pass with nothing
+    /// out and the byte gate shut goes only under `on` on a relay, and a frame
+    /// over the watermark is shed everywhere else. Where a line is written,
+    /// each bound's firing is counted on it.
+    #[test]
+    fn the_byte_gate_and_the_watermark_are_out_under_on_and_in_under_off_and_shadow() {
+        let t0 = Instant::now();
+        let nothing = (
+            0,
+            Gauges {
+                max_payload: 1_200,
+                ..Gauges::default()
+            },
+        );
+        let today = Passes {
+            skipped: 1,
+            decreases: 1,
+            shed: 1,
+            ..Passes::default()
+        };
+        for (what, s, relay, want) in [
+            ("off", DeliverySampler::new(true), true, &today),
+            (
+                "shadow",
+                DeliverySampler::new(true).with_budget(),
+                true,
+                &today,
+            ),
+            (
+                "on, direct",
+                DeliverySampler::new(true).with_budget_on(),
+                false,
+                &today,
+            ),
+            (
+                "on, relay",
+                DeliverySampler::new(true).with_budget_on(),
+                true,
+                &Passes {
+                    went: 2,
+                    ..Passes::default()
+                },
+            ),
+        ] {
+            let mut s = s;
+            let mut n = Passes::default();
+            let shut = Facts {
+                relay,
+                byte_gate: true,
+                ..Facts::default()
+            };
+            let over = Facts {
+                relay,
+                over: true,
+                ..Facts::default()
+            };
+            pass(&mut s, t0, nothing, shut, &mut n);
+            pass(&mut s, at(t0, 33), nothing, over, &mut n);
+            assert_eq!(&n, want, "{what}");
+            let bounds = s.budget_mut().map(|b| {
+                let w = b.take_window();
+                (w.bounds.0, w.bounds.1)
+            });
+            let counted = (what != "off").then_some((1, 1));
+            assert_eq!(
+                bounds, counted,
+                "{what}: the watermark's and the byte gate's firings"
+            );
+        }
+    }
+
+    /// FR-148 D46 B3 — FR-35's opener grace under `on`: on a relay session the
+    /// budget's holds inside the grace skip their passes and call no decrease,
+    /// as today's skips there do; once the grace is over each hold decreases
+    /// once. The pumps hand the grace to the same call (`peer.rs`, pinned by
+    /// `both_pumps_gate_on_the_budget_s_pass`).
+    #[test]
+    fn fr35_s_opener_grace_keeps_the_aimd_through_the_budget_s_holds_under_on() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget_on();
+        let mut n = Passes::default();
+        let grace = Facts {
+            relay: true,
+            grace: true,
+            ..Facts::default()
+        };
+        for frame in 0..60u64 {
+            pass(
+                &mut s,
+                at(t0, frame * 1_000 / 30),
+                deep_frame(frame),
+                grace,
+                &mut n,
+            );
+        }
+        assert_eq!((n.skipped, n.decreases), (60, 0), "inside the grace: {n:?}");
+        let after = Facts {
+            grace: false,
+            ..grace
+        };
+        for frame in 60..120u64 {
+            pass(
+                &mut s,
+                at(t0, frame * 1_000 / 30),
+                deep_frame(frame),
+                after,
+                &mut n,
+            );
+        }
+        assert_eq!((n.skipped, n.decreases), (120, 60), "after it: {n:?}");
+        let w = s.budget_mut().unwrap().take_window();
+        assert_eq!(w.acted, (120, 120));
+    }
+
+    /// FR-148 D46 B3 — FR-70's `plan_divergences` read as today under `on`.
+    /// The FFmpeg pump hands its plan check today's relay byte gate, computed
+    /// as before and before the budget's gate, and the budget takes that gate
+    /// by value. Over passes where the budget holds while the ledger's gate is
+    /// open and admits while it is shut, a plan shadow beside an `on` sampler
+    /// counts what one beside an `off` sampler counts: none. A pump that
+    /// handed the plan the budget's answer would count a divergence at every
+    /// such pass. The pump's text is pinned by
+    /// `both_pumps_gate_on_the_budget_s_pass`.
+    #[test]
+    fn plan_divergences_read_today_s_byte_gate_under_on() {
+        use crate::encode::plan::{PlanDivergences, PlanInputs, PlanKnobs, Shadow as PlanShadow};
+        use crate::encode::policy::DimsInputs;
+        let knobs = PlanKnobs {
+            relay_max_bps: 3_000_000,
+            constrained_queue_ms: 450,
+            constrained_queue_measured: true,
+            direct_queue_ms: 150,
+            direct_hrd_pct: 100,
+            refined_cap: None,
+            priority_caps: Default::default(),
+        };
+        let inputs = PlanInputs {
+            constrained: true,
+            target_fps: 30,
+            paced_fps: None,
+            pipe_bps: None,
+            ceiling_reference_bps: 3_000_000,
+            hrd_pct: 200,
+            target_bps: 0,
+            dims: DimsInputs {
+                native_w: 1920,
+                native_h: 1200,
+                merged_target: crate::peer::TargetResolution::Native,
+                merged_priority_cap: None,
+                slow_link_cap: None,
+                refined: false,
+                refined_cap: None,
+                soft_cap: None,
+            },
+        };
+        let mut beside_off = PlanShadow::default();
+        let mut beside_on = PlanShadow::default();
+        let mut fed_the_budget = PlanShadow::default();
+        let budget = beside_off.produce(&inputs, &knobs).queue_budget_bytes;
+        beside_on.produce(&inputs, &knobs);
+        fed_the_budget.produce(&inputs, &knobs);
+        let mut off = DeliverySampler::new(true);
+        let mut on = DeliverySampler::new(true).with_budget_on();
+        let t0 = Instant::now();
+        let mut differ = 0;
+        for frame in 0..300u64 {
+            let now = at(t0, frame * 1_000 / 30);
+            // The ledger under its budget, then at twice it: the pump's relay
+            // gate is `inflight_now >= queue_budget`.
+            let inflight = if frame % 2 == 0 {
+                budget / 2
+            } else {
+                budget * 2
+            };
+            let byte_gate = inflight >= budget;
+            let _ = beside_off.check_gate_verdict(inflight, 0.0, byte_gate);
+            let _ = beside_on.check_gate_verdict(inflight, 0.0, byte_gate);
+            // The budget holds where the ledger's gate is open, and has
+            // nothing out where it is shut.
+            let (acked, mut g) = deep_frame(frame);
+            if byte_gate {
+                (g.inflight_bytes, g.pending_bytes) = (0, 0);
+            }
+            off.gate_reading(now, acked, g, 2_000_000, true, byte_gate);
+            on.gate_reading(now, acked, g, 2_000_000, true, byte_gate);
+            assert_eq!(off.shuts(), byte_gate, "frame {frame}");
+            let acted = on.shuts();
+            differ += u32::from(acted != byte_gate);
+            let _ = fed_the_budget.check_gate_verdict(inflight, 0.0, acted);
+        }
+        assert_eq!(beside_off.counts(), PlanDivergences::default());
+        assert_eq!(beside_on.counts(), beside_off.counts());
+        assert_eq!(differ, 300, "the budget answered otherwise at every pass");
+        assert_eq!(fed_the_budget.counts().gate, differ);
+    }
+
+    /// FR-148 D46 B3 — both pumps act on the budget's pass, read from
+    /// `peer.rs` as compiled: the budget's gate comes before the capacity
+    /// gate decides; its term is the gate's last, after the send channel's and
+    /// the followers'; the arm's decrease goes through it and FR-35's grace,
+    /// and the arm asks for no keyframe; the step after the gate is there as
+    /// before; and the VP9-444 watermark arm goes through it. The FFmpeg pump
+    /// hands FR-70's plan check today's byte gate before the budget's gate,
+    /// and never sets it again.
+    #[test]
+    fn both_pumps_gate_on_the_budget_s_pass() {
+        const PEER_RS: &str = include_str!("peer.rs");
+        const GATE: &str =
+            "if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {";
+        const STEP: &str = "delivery.on_frame(&pc, &mut governor);";
+        let src = PEER_RS.replace("\r\n", "\n");
+        let pump = |head: &str| {
+            assert_eq!(src.matches(head).count(), 1, "one {head:?} in peer.rs");
+            let rest = &src[src.find(head).unwrap()..];
+            rest[..rest.find("\n}\n").expect("the pump's end")].to_owned()
+        };
+        let vp9 = pump("async fn media_pump_vp9_444_dc(");
+        let ffmpeg = pump("async fn media_pump_ffmpeg_dc(");
+        for (name, body, gate, skip) in [
+            (
+                "VP9-444",
+                &vp9,
+                "delivery.gate(&pc, &mut governor, session_id, constrained_transport, false);",
+                "delivery.on_skip(false, |t| governor.on_backpressure_skip(t))",
+            ),
+            (
+                "FFmpeg",
+                &ffmpeg,
+                "delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate);",
+                "delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t))",
+            ),
+        ] {
+            assert_eq!(body.matches("delivery.gate(").count(), 1, "{name}");
+            assert_eq!(body.matches(gate).count(), 1, "{name}: {gate}");
+            assert_eq!(body.matches(GATE).count(), 1, "{name}: the capacity gate");
+            let at = body.find(GATE).unwrap();
+            assert!(
+                body.find(gate).unwrap() < at,
+                "{name}: the budget's gate first"
+            );
+            let arm = &body[at..];
+            let arm = &arm[..arm.find("continue;").expect("the arm's continue")];
+            assert!(
+                arm.contains(skip),
+                "{name}: the decrease through the budget"
+            );
+            assert!(
+                !arm.contains("keyframe_requested") && !arm.contains("note_keyframe"),
+                "{name}: the arm asks no keyframe"
+            );
+            assert_eq!(
+                body.matches("on_backpressure_skip(").count(),
+                1,
+                "{name}: one decrease at the gate, the budget's"
+            );
+            assert!(body[at..].contains(STEP), "{name}: the step after the gate");
+        }
+        assert!(vp9.contains("if delivery.sheds(buffered > dc_buffered_high) {"));
+        assert!(ffmpeg.contains("let in_grace = constrained && !opener_grace_done;"));
+        let check = "plan_shadow.check_gate_verdict(inflight_now, measured_wait_ms, byte_gate)";
+        assert_eq!(
+            ffmpeg.matches(check).count(),
+            1,
+            "FR-70's check of today's gate"
+        );
+        assert!(ffmpeg.find(check).unwrap() < ffmpeg.find("delivery.gate(").unwrap());
+        assert_eq!(
+            ffmpeg
+                .matches(
+                    "let byte_gate = if constrained {\n            inflight_now >= queue_budget"
+                )
+                .count(),
+            1,
+            "today's relay byte gate, computed as before"
+        );
+        assert_eq!(
+            ffmpeg.matches("byte_gate =").count(),
+            1,
+            "set once, at its let"
+        );
     }
 
     /// FR-148 D46 B2 — a sample read with gauges: `standing_ms` over the
@@ -3763,7 +4544,7 @@ pub(crate) mod shaped_link {
         use crate::encode::pipe_state::PipeState;
         use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
         use crate::media_inflight::{
-            BURST_WITHIN, Budget, Classifier, Reading, Release, Verdict, WindowReport,
+            BURST_WITHIN, Budget, Classifier, Mode, Reading, Release, Verdict, WindowReport,
         };
 
         /// The lab slice's round trip.
@@ -3824,6 +4605,10 @@ pub(crate) mod shaped_link {
             /// FR-148 D46 — as `Holds`, but a still span writes through only
             /// after two head-of-line releases in a row.
             HoldsAfterTwo(Duration),
+            /// FR-148 D46 B3 — the pumps' own [`Shadow`] under `on`, on a
+            /// relay session: its gate's pass holds the frame
+            /// ([`Shadow::gate_with`], [`Shadow::shut`]).
+            On,
         }
 
         /// One cell at a time: the cells are timed.
@@ -3882,6 +4667,7 @@ pub(crate) mod shaped_link {
                         "{skip}, in-flight budget after two releases, slack {} ms",
                         ms(slack)
                     ),
+                    Budgeted::On => format!("{skip}, in-flight budget on (B3's gate)"),
                 };
                 let stalls = match (self.stalls, self.outages) {
                     (Some((every, stall)), _) => format!(", a {stall:?} stall every {every:?}"),
@@ -3931,11 +4717,13 @@ pub(crate) mod shaped_link {
         }
 
         /// FR-148 D46 — the writer's core: the pumps' shadow, or the core
-        /// itself where its verdict holds the frame.
+        /// itself where its verdict holds the frame, or (B3) the pumps'
+        /// shadow under `on`, whose gate holds it.
         #[derive(Debug)]
         enum Core {
             Shadow(Box<Shadow>),
             Holds(Box<Budget>),
+            On(Box<Shadow>),
         }
 
         impl Core {
@@ -3943,6 +4731,7 @@ pub(crate) mod shaped_link {
                 match budget {
                     Budgeted::No => None,
                     Budgeted::Shadow => Some(Self::Shadow(Box::default())),
+                    Budgeted::On => Shadow::for_pump(Mode::On, true).map(|s| Self::On(Box::new(s))),
                     Budgeted::Holds(slack) => {
                         Some(Self::Holds(Box::new(Budget::with_slack(slack))))
                     }
@@ -3965,14 +4754,14 @@ pub(crate) mod shaped_link {
 
             fn budget(&self) -> &Budget {
                 match self {
-                    Self::Shadow(s) => s.budget(),
+                    Self::Shadow(s) | Self::On(s) => s.budget(),
                     Self::Holds(b) => b,
                 }
             }
 
             fn take_window(&mut self) -> WindowReport {
                 match self {
-                    Self::Shadow(s) => s.take_window(),
+                    Self::Shadow(s) | Self::On(s) => s.take_window(),
                     Self::Holds(b) => b.take_window(),
                 }
             }
@@ -4824,6 +5613,11 @@ pub(crate) mod shaped_link {
             marks: Vec<u64>,
             start_us: u64,
             stop_us: u64,
+            /// FR-148 D46 B3 — under `on`, over the run's windows: the holds
+            /// that shut a pass by themselves, the passes the budget acted on,
+            /// and the holds among the first that fell in a still span (a
+            /// stall: the pump calls no decrease for them).
+            acted: (u64, u64, u64),
         }
 
         fn us(d: Duration) -> u64 {
@@ -5065,6 +5859,25 @@ pub(crate) mod shaped_link {
                                     }
                                     false
                                 }
+                                // FR-148 D46 B3 — the pumps' call under `on`, on
+                                // a relay session: the gate's step, and its pass
+                                // as the capacity gate's last term (the writer
+                                // has no send channel to fill: its write waits).
+                                Core::On(s) => {
+                                    let mut pass = s.gate_with(
+                                        began,
+                                        shape.offer_bps(),
+                                        || Some(clock.clone()),
+                                        || Some(gauges.clone()),
+                                        true,
+                                        false,
+                                    );
+                                    if s.take_mark() {
+                                        let t = us(began.saturating_duration_since(t0));
+                                        stats.marks.lock().unwrap().push(t);
+                                    }
+                                    s.shut(&mut pass)
+                                }
                                 Core::Holds(b) => {
                                     let r = Reading {
                                         acked_bytes: clock.read().acked_bytes,
@@ -5302,6 +6115,9 @@ pub(crate) mod shaped_link {
             let released =
                 budget_windows().fold((0, 0), |(h, d), b| (h + b.released.0, d + b.released.1));
             let still_admitted: u64 = budget_windows().map(|b| b.still_admitted).sum();
+            let acted = budget_windows().fold((0, 0, 0), |(h, a, s), b| {
+                (h + b.acted.0, a + b.acted.1, s + b.acted_stalled)
+            });
             let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
             let from_us = us(start - t0);
             let silent: Vec<(u64, u64)> = stats
@@ -5356,6 +6172,7 @@ pub(crate) mod shaped_link {
                 marks,
                 start_us: from_us,
                 stop_us,
+                acted,
             }
         }
 
@@ -5898,7 +6715,10 @@ pub(crate) mod shaped_link {
                 floor_p1: fold(r.samples.iter().filter(|c| c.queued()).map(at).collect()),
                 floor_p3: matches!(
                     r.shape.budget,
-                    Budgeted::Holds(_) | Budgeted::HoldsAsB1(_) | Budgeted::HoldsAfterTwo(_)
+                    Budgeted::Holds(_)
+                        | Budgeted::HoldsAsB1(_)
+                        | Budgeted::HoldsAfterTwo(_)
+                        | Budgeted::On
                 )
                 .then(|| fold(r.samples.iter().filter(p3).map(at).collect())),
             }
@@ -6126,6 +6946,16 @@ pub(crate) mod shaped_link {
         fn shadowed(shape: Shape) -> Shape {
             Shape {
                 budget: Budgeted::Shadow,
+                ..shape
+            }
+        }
+
+        /// FR-148 D46 B3 — the pumps' own budget under `on`, on a relay
+        /// session, where the watermark arm sheds nothing.
+        fn turned_on(shape: Shape) -> Shape {
+            Shape {
+                skip_over: false,
+                budget: Budgeted::On,
                 ..shape
             }
         }
@@ -6435,6 +7265,79 @@ pub(crate) mod shaped_link {
                     r.held
                 );
             }
+        }
+
+        /// FR-148 D46 B3 — a shape off and under `on`: the frames held of the
+        /// writer's ticks; the holds the line counts as acted, of the passes
+        /// acted on, and those in still spans; the core's stall marks; the
+        /// transit and the standing queue (median / most); and the read and
+        /// fresh delivery, percent of the link.
+        fn print_b3(off: &(TcpRun, Summary), on: &(TcpRun, Summary)) {
+            let ((a, x), (b, y)) = (off, on);
+            println!(
+                "D46 B3 | {} | held {} of {} ticks (off {} of {}); acted holds {} of {} \
+                 passes, {} in still spans; stall marks {} | transit {} / {} ms (off {} / \
+                 {}) | standing link {} / {} ms (off {} / {}) | read {} %, fresh {} % (off \
+                 {} %, {} %)",
+                b.shape.name(),
+                b.held,
+                b.ticks,
+                a.held + a.skipped,
+                a.ticks,
+                b.acted.0,
+                b.acted.1,
+                b.acted.2,
+                b.marks.len(),
+                y.transit_ms.0,
+                y.transit_ms.1,
+                x.transit_ms.0,
+                x.transit_ms.1,
+                y.link_ms.0,
+                y.link_ms.1,
+                x.link_ms.0,
+                x.link_ms.1,
+                pct(y.rx_bps, b),
+                pct(y.fresh_bps, b),
+                pct(x.rx_bps, a),
+                pct(x.fresh_bps, a),
+            );
+        }
+
+        /// FR-148 D46 B3 — the budget under `on` holds frames on a relay
+        /// session. Today's plain writer on the deep 2 Mbit/s path I shape and
+        /// on the stall shape, off and then under `on` through the pumps' own
+        /// [`Shadow`] and its gate ([`Shadow::gate_with`], [`Shadow::shut`]):
+        /// off holds nothing; under `on` the gate holds frames, each a hold the
+        /// line counts as acted, and sheds none; on the deep shape the standing
+        /// queue and the transit are on the bar, and on the stall shape fresh
+        /// delivery is at least 0.95 of off's (D46 item 11's bar).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget on against off"]
+        async fn the_inflight_budget_on_holds_frames_on_a_shaped_relay() {
+            let deep = shape(2_000_000, DEEP, OpenPath::InitAck);
+            let stall = stalled(OpenPath::InitAck);
+            let s = measured(&[deep, turned_on(deep), stall, turned_on(stall)]).await;
+            for pair in s.chunks(2) {
+                let (off, on) = (&pair[0], &pair[1]);
+                print_b3(off, on);
+                print_fresh_ratio(&off.1, on);
+                let name = on.0.shape.name();
+                assert_eq!((off.0.held, off.0.skipped), (0, 0), "{name}: off held");
+                assert!(on.0.held > 0, "{name}: the gate held nothing");
+                assert_eq!(
+                    on.0.held, on.0.acted.0,
+                    "{name}: each hold is one the line counts"
+                );
+                assert_eq!(on.0.skipped, 0, "{name}: the watermark is out");
+            }
+            on_the_bar(&s[1].0, &s[1].1);
+            assert!(
+                s[3].1.fresh_bps * 100 >= s[2].1.fresh_bps * 95,
+                "{}: {:?} against {:?}",
+                s[3].0.shape.name(),
+                s[3].1,
+                s[2].1
+            );
         }
     }
 }

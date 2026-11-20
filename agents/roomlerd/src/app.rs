@@ -10,7 +10,7 @@
 //!
 //! CLI:
 //!   roomlerd enroll --server <url> --token <enrollment-jwt> \
-//!                        --name "Goran's Laptop" [--config <path>]
+//!                        --name "Casey's Laptop" [--config <path>]
 //!   roomlerd run    [--config <path>]
 
 use anyhow::{Context, Result, bail};
