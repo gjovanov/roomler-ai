@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::redis_conn::{RedisBounds, RedisConnection, bound_ms};
+use super::sub_probe::ProbeSettings;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -389,10 +390,15 @@ return 0
     /// error log, then silent local-only delivery forever). `alive` mirrors
     /// whether a subscription is currently established — read by
     /// `/health/ready`.
+    ///
+    /// #3952 — `publisher` is the shared command connection a probe goes out
+    /// on, and `probe` how often (S0: taken, not used yet).
     pub fn subscribe_with_reconnect(
         redis_url: String,
         tx: broadcast::Sender<String>,
         alive: Arc<AtomicBool>,
+        _publisher: RedisConnection,
+        _probe: ProbeSettings,
     ) {
         tokio::spawn(async move {
             let mut backoff_secs = 1u64;

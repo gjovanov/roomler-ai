@@ -30,6 +30,8 @@ pub mod dispatcher;
 pub mod redis_conn;
 pub mod redis_pubsub;
 pub mod storage;
+// #3952 — a subscriber's probe of its own connection.
+pub mod sub_probe;
 // FR-69 P7b — what every upgrade shares (the frame ceiling, the query shape,
 // the affinity check, the "say why, then close" refusal); the upgrades
 // themselves live with their owners.

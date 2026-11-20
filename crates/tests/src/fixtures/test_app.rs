@@ -516,6 +516,7 @@ fn test_settings() -> Settings {
             url: "redis://127.0.0.1:6379".to_string(),
             response_timeout_ms: 3000,
             connection_timeout_ms: 3000,
+            subscriber_probe_ms: 15_000,
         },
         s3: roomler_ai_config::S3Settings {
             // Tests run on the local-disk backend — the file_tests suite

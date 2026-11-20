@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::ws::redis_conn::RedisConnection;
+use crate::ws::sub_probe::ProbeSettings;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -99,11 +100,13 @@ pub struct PodBus {
 impl PodBus {
     /// Construct + spawn the subscriber and the pod-alive heartbeat.
     /// `redis_url` gets its own subscription connection (a pub/sub
-    /// connection can't multiplex commands).
+    /// connection can't multiplex commands). #3952 — `probe` is how often
+    /// the subscription probes itself (S0: taken, not used yet).
     pub fn start(
         identity: PodIdentity,
         publisher: RedisConnection,
         redis_url: String,
+        _probe: ProbeSettings,
     ) -> Arc<Self> {
         let bus = Arc::new(Self {
             identity,
