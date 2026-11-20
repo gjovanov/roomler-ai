@@ -401,7 +401,7 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:454`, `:488`, called at `agents/roomlerd/src/watchdog.rs:700`, `:793` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
+| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:454`, `:488`, called at `agents/roomlerd/src/watchdog.rs:749`, `:842` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
 | A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:923` (`purge_exit_dns_before_exit`), `:1074` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
 | If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:923` | The bound is only safe with the handoff |
 | The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:994`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |

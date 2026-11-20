@@ -2660,44 +2660,95 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    window, no capture exclusion — X has no equivalent), macOS
    (`viewer-indicator-macos`, AppKit). The macOS panel is a question's surface
    only while the window server serves its process (#4053). At each question
-   `prompt` (`agents/roomlerd/src/indicator/mac.rs:178`) asks a gate
-   (`indicator/panel_gate.rs:205`) two things, with no lock held:
-   - whether a 1×1 probe window, never shown, gets a window device
-     (`window_number` above 0, `indicator/mac.rs:848`). The main thread makes
-     it, and the question waits 500 ms at most.
-   - in a root process only, whether another console session has started
-     since the pump's start: notify(3) on CoreGraphics'
+   `prompt` (`agents/roomlerd/src/indicator/mac.rs:190`) asks a gate
+   (`indicator/panel_gate.rs:330`), with no lock held. Three things decide, in
+   this order, and since #4119 the first two make no window:
+   - in a root process only, **the seat**: whether it has emptied or changed
+     hands since the gate's first look at it (a log-out, a login as someone
+     else, a user switch). The person socket's poll of `/dev/console`'s owner
+     tells the gate every 5 s (`person_socket.rs:730`, `indicator/mac.rs:892`,
+     `indicator/panel_gate.rs:275`). The change is held for the process's
+     life and never read at a question, since after the login someone is at
+     the seat again. A seat that goes from nobody to a person (a boot, then a
+     login) ends nothing, and a look that could not tell changes nothing.
+   - in a root process only, **the console session**: whether another one has
+     started since the pump's start, by notify(3) on CoreGraphics'
      `GUIConsoleSessionChanged` and `GUISessionUserChanged`
-     (`indicator/console_watch.rs:40`). A root `notifyutil` in the lab (macOS
-     15, 2026-11-19) saw neither name at a lock, a display sleep or the screen
-     saver, and one or both at a log-out, a login, a fast user switch and the
-     switch back.
+     (`indicator/console_watch.rs:40`). Another session answers before the
+     window is made. A root `notifyutil` in the lab (macOS 15, 2026-11-19) saw
+     neither name at a lock, a display sleep or the screen saver, and one or
+     both at a log-out, a login, a fast user switch and the switch back.
+   - **the connection**: whether a 1×1 probe window, never shown, gets a
+     window device (`window_number` above 0, `indicator/mac.rs:911`). The main
+     thread makes it, and the question waits 500 ms at most. Just before it
+     makes the window, the main thread asks the gate again whether the panel
+     has ended (`probe`, `indicator/mac.rs:879`).
 
-   Only a root process reads the console session (`reads_console_session`,
-   `indicator/panel_gate.rs:98`): a one-row Mac's daemon and a two-row Mac's
-   root half. Its window-server connection belongs to the console session it
-   started in, so another one since leaves its panel reaching nobody. A
-   per-user process, a two-row Mac's per-user half, belongs to a GUI session
-   of its own, which a fast user switch away and back leaves alive: a read
-   there would end its panel at the first switch, and its row's questions
-   would go to the app until it restarted. It reads none, so the window
-   device alone decides for it, and its lines say `console_session=none`.
+   The order is #4119's. The 0.4.228 lab found a third shape: a log-out that
+   killed a two-row Mac's root half's window-server port ("received
+   notification of WindowServer event port death"). At the first question
+   after the login, AppKit ended the process with exit 0 while it made the
+   probe window (`_CGSCreateWindow returned 268435459`), with no line of ours.
+   launchd relaunches the daemon only after a non-zero exit, so the root half
+   stayed down until the next boot. In the lab run that watched them, both
+   console-session names posted at that log-out, so the session's read alone
+   would have answered first. The seat is the second guard, for a Mac where
+   the names do not post.
+
+   Only a root process follows the seat and reads the console session
+   (`reads_console_session`, `indicator/panel_gate.rs:129`): a one-row Mac's
+   daemon and a two-row Mac's root half. Its window-server connection belongs
+   to the console session it started in, so another one since leaves its
+   panel reaching nobody. A per-user process, a two-row Mac's per-user half,
+   belongs to a GUI session of its own, which a fast user switch away and
+   back leaves alive: a read there would end its panel at the first switch,
+   and its row's questions would go to the app until it restarted. It reads
+   neither, so the window device alone decides for it, and its lines say
+   `console_session=none`.
 
    A root daemon that launchd started before anyone signed in is refused when
-   it starts, and a log-out detaches one that was served. Either way, and when
-   a root process's console session has changed, the panel answers `false`
-   for the rest of the process's life. A read with no answer in time gives
-   `false` for that question alone. `false` is the answer of a panel already
-   showing another question: the question is marked `companion` and goes on
-   down this chain to the person's app, over the relay on a one-row Mac and
-   through the announcement on a two-row Mac. It is never a refusal. The panel
-   comes back at the root daemon's next start with someone signed in. Nothing
-   restarts it, and drawing it from the person's own session is FR-149
-   (#4054). Each change is logged once, with `window_number` and
-   `console_session`: `macOS consent panel available` at the start, or in its
-   place a WARN that the process could not put a window on the screen, then a
-   WARN when the connection is lost or a root process's console session
-   changes.
+   it starts, and a log-out detaches one that was served, or kills its port.
+   Either way, and when a root process's seat or console session has changed,
+   the panel answers `false` for the rest of the process's life. A read with
+   no answer in time gives `false` for that question alone. `false` is the
+   answer of a panel already showing another question: the question is
+   marked `companion` and goes on down this chain to the person's app, over
+   the relay on a one-row Mac and through the announcement on a two-row Mac.
+   It is never a refusal. The panel comes back at the root daemon's next
+   start with someone signed in. Nothing restarts it, and drawing it from the
+   person's own session is FR-149 (#4054).
+
+   **The exit net (#4119).** A root process registers an `atexit` hook when
+   the pump starts (`indicator/exit_net.rs:89`, armed at
+   `indicator/mac.rs:431`). The main thread marks itself while it is inside
+   one of the panel's AppKit calls: the probe window, the panel's window, and
+   the event fetch and dispatch (`indicator/mac.rs:912`, `:474`, `:446`). An
+   exit that begins on that thread inside such a call, and that our code did
+   not choose, writes one line to stderr and leaves with 32, which launchd
+   relaunches (`the_net`, `indicator/exit_net.rs:138`). 32 is the net's own
+   code, `APPKIT_ENDED_EXIT_CODE` (`watchdog.rs:259`), and no other exit in
+   the tree uses it. It is not the requested restart's 9, which says no
+   failure happened: the net marks no clean shutdown, so a run it ends inside
+   the first 5 minutes counts as a crash at the next start, and the
+   crash-loop rollback counts it as it counts any other. Every other exit
+   keeps its code: the clean stop after a SIGTERM, which exits 0 on the
+   `roomlerd-main` thread (#3195), a requested restart, an error, the quit
+   backstop, the watchdog, and AppKit's exit 0 after the delegate answers a
+   log-out's quit with `NSTerminateNow`, which the delegate marks as chosen
+   (`indicator/mac.rs:319`, #3164). The hook cannot see an `_exit`, a signal
+   or an exit on another thread. There the seat and the console session,
+   read before any window, are what hold.
+
+   Each change is logged once, with `window_number` and `console_session`:
+   `macOS consent panel available` at the start, or in its place a WARN that
+   the process could not put a window on the screen, then a WARN when the
+   connection is lost or a root process's console session changes. When the
+   console session answered first, no probe window was made, and that WARN
+   says `window_number=none`. A seat change logs its own WARN when the poll
+   sees it, with `seat_was` and `seat_now` (a uid, or `nobody`). The net's
+   line on stderr names the call it caught and its code (`roomlerd: an exit
+   began inside the probe window … leaving with 32 …`). §10.8.2 of
+   `docs/desktop-companion.md` has the parts and the cells.
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`). On Linux,
    Windows and macOS that start runs off the async worker, one start in
@@ -2949,8 +3000,11 @@ draws the panel too: a LaunchDaemon's window reaches the console (measured on
 the operator's MacBook, macOS 27; FR-97 §8, 2026-10-22). It does so only while
 the window server serves the process: the 0.4.226 lab found a root daemon
 started before login refused, and one that a log-out detached still on
-connection 0 after the next login (#4053). The panel then takes no question,
-and each goes to the person's app (item 1 of "Prompt surfaces" above).
+connection 0 after the next login (#4053). The 0.4.228 lab found a log-out
+that killed a two-row Mac's root half's port, after which the next window it
+made ended the process with exit 0 (#4119). The panel then takes no question,
+after a log-out it makes no window, and each question goes to the person's app
+(item 1 of "Prompt surfaces" above).
 ⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
 ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
 consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
@@ -6257,8 +6311,8 @@ The constraint that shapes it is the thread. Text Input Sources (Carbon's
 HIToolbox) is called on the main thread only; recent macOS asserts it. A daemon
 built with `viewer-indicator-macos` gives its main thread to AppKit for its
 whole life (`main.rs`'s swap, FR-27), so every read and switch is queued for it:
-`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:137`) parks a
-closure that the pump runs on its next pass (`mac.rs:437`), at most 120 ms
+`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:149`) parks a
+closure that the pump runs on its next pass (`mac.rs:464`), at most 120 ms
 later, and sends the answer back.
 
 ```mermaid
@@ -6540,7 +6594,7 @@ where it is. The signaling loop awaits inside its `select!` arms,
 so a stall is one arm whose await never returned, and the INFO log
 is silent while it waits.
 - Every arm therefore enters a named stage first
-  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:461`):
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:510`):
   `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
@@ -6554,12 +6608,12 @@ is silent while it waits.
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
   `agents/roomlerd/src/signaling.rs:6497`). The dispatch awaits per
   message, so that is where a stall inside it shows.
-- The `StageGuard` (`watchdog.rs:475`) puts the pump back to
+- The `StageGuard` (`watchdog.rs:524`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
   leaves early cannot leave its name behind for a later stall to be
   blamed on.
 - The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
-  (`stall_summary`, `watchdog.rs:491`). The `name=Ns` prefix is
+  (`stall_summary`, `watchdog.rs:540`). The `name=Ns` prefix is
   unchanged, so a parser of the old line still finds the pump.
 - ⚠️ Read it from the crash record, not only the log. The summary
   also goes into the crash sidecar that the next worker uploads
@@ -6638,10 +6692,10 @@ sequenceDiagram
 
 | what | where |
 |---|---|
-| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:687` |
-| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:777` |
-| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:725`, `within` `:762` |
-| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:392` |
+| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:736` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:826` |
+| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:774`, `within` `:811` |
+| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:441` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
 | Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
 | Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:150` |
@@ -6654,7 +6708,7 @@ sequenceDiagram
 - As root, `sample` reads the hardened-runtime daemon: measured on a
   MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
   On macOS the stacks are read **only as root**
-  (`may_read_own_stacks`, `watchdog.rs:744`). The FR-43 GUI worker runs
+  (`may_read_own_stacks`, `watchdog.rs:793`). The FR-43 GUI worker runs
   as the signed-in person, where a request to read the hardened binary
   would be refused, and a refused debugger-style request has no business
   on someone's desktop. Its record names the stall without the stacks.
@@ -6687,8 +6741,8 @@ clocks moved. What each watchdog does with the gap:
 
 | | the async watchdog | the watchdog-of-watchdog |
 |---|---|---|
-| its sleep | 5 s on a tokio timer (`SCAN_INTERVAL`, `agents/roomlerd/src/watchdog.rs:92`) | 30 s of `std::thread::sleep` (`THREAD_WATCHDOG_CHECK_EVERY`, `:214`) |
-| a sleep that came back late | more than 60 s past it (`SUSPEND_TOLERANCE`, `:98`): pump heartbeats reset, no scan (`:561`), line `watchdog detected wall-clock jump (suspend/resume) … lag_secs=N` | more than 10 s late (`THREAD_WATCHDOG_LATE_AFTER`, `:237`): a new baseline instead of a verdict (`:624`), line `watchdog-of-watchdog: its sleep came back Ns late, so this whole process did not run … heartbeat_moved=…` |
+| its sleep | 5 s on a tokio timer (`SCAN_INTERVAL`, `agents/roomlerd/src/watchdog.rs:92`) | 30 s of `std::thread::sleep` (`THREAD_WATCHDOG_CHECK_EVERY`, `:263`) |
+| a sleep that came back late | more than 60 s past it (`SUSPEND_TOLERANCE`, `:98`): pump heartbeats reset, no scan (`:610`), line `watchdog detected wall-clock jump (suspend/resume) … lag_secs=N` | more than 10 s late (`THREAD_WATCHDOG_LATE_AFTER`, `:286`): a new baseline instead of a verdict (`:673`), line `watchdog-of-watchdog: its sleep came back Ns late, so this whole process did not run … heartbeat_moved=…` |
 | a runtime that is really stuck | exits at its pump's threshold | exits 60–90 s in, and after a late sleep one check later at most |
 
 Until #3530 the watchdog-of-watchdog had no guard, and one freeze in
@@ -6718,18 +6772,18 @@ sequenceDiagram
   late. 10 s leaves 20 s of margin and is still far above any
   scheduler's lateness. The test
   `the_late_bound_catches_every_freeze_that_would_read_as_a_stall`
-  (`watchdog.rs:1772`) walks every φ and F.
+  (`watchdog.rs:1867`) walks every φ and F.
 - **What it costs.** The new baseline throws away at most one interval
   of evidence, so a stuck runtime is caught one check later at most
   (`a_late_sleep_then_a_real_stall_exits_within_one_extra_check`,
-  `:1740`). A host so starved that a sleeping thread wakes 10 s late at
+  `:1835`). A host so starved that a sleeping thread wakes 10 s late at
   every check would put the exit off indefinitely, and it would not
   run a restarted daemon either.
 - **The line goes out on a thread of its own** (`say_the_process_did_not_run`,
-  `:655`). `tracing`'s stdout layer waits for whatever reads stdout
+  `:704`). `tracing`'s stdout layer waits for whatever reads stdout
   (journald, a console nobody reads, #3438), and the
   watchdog-of-watchdog must never wait. One line is in flight at a
-  time (`PAUSE_LINE_IN_FLIGHT`, `:645`), so a sink that never answers
+  time (`PAUSE_LINE_IN_FLIGHT`, `:694`), so a sink that never answers
   holds one thread. `heartbeat_moved=false` marks the pause that was an
   exit before #3530.
 - **Why a lab loop rarely trips the old code.** The exit needs a freeze
