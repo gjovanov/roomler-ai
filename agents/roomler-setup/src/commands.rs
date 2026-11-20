@@ -88,6 +88,11 @@ pub struct AgentDetect {
     /// with nothing installed, an existing install's own flavour otherwise.
     /// `null` = no preselection (the person picks).
     pub default_role: Option<Role>,
+    /// FR-141 P3 — this Mac is one row already, in the words the Welcome
+    /// page shows ([`crate::reinstall_guard::stop`]): no device install goes
+    /// on from it, and nothing is preselected. `None` off macOS, with the
+    /// server's guard off, and whenever the root daemon could not say.
+    pub one_row_stop: Option<String>,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -122,8 +127,13 @@ pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, 
             let server = server
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(cmd_default_server_url);
-            let asked = crate::features::ask(&server).await;
-            detect_unix(os, &server, asked, tunnel.installed)
+            // FR-141 P3 — the root daemon's word on a one-row Mac, asked
+            // beside the server (each bounded; off macOS it asks nothing).
+            let (asked, one_row) = tokio::join!(
+                crate::features::ask(&server),
+                crate::reinstall_guard::one_row_here()
+            );
+            detect_unix(os, &server, asked, tunnel.installed, one_row.as_ref())
         }
     };
     Ok(DetectResult { agent, tunnel })
@@ -168,6 +178,7 @@ fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
         role_limit: crate::role::RoleLimit::None,
         tunnel_offered: true,
         default_role: None,
+        one_row_stop: None,
     };
     match detect_existing_install() {
         ExistingInstall::Clean => base,
@@ -221,15 +232,20 @@ fn read_system_context_switch() -> crate::role::SystemContextSwitch {
 
 /// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
 /// and the server's switch for this OS — a card is shown only on its `true`.
+/// FR-141 P3: `one_row` is the root daemon's word that this Mac is one row
+/// already ([`crate::reinstall_guard::one_row_here`]).
 fn detect_unix(
     os: crate::role::HostOs,
     server: &str,
     asked: crate::features::Asked,
     tunnel_installed: bool,
+    one_row: Option<&crate::reinstall_guard::OneRowMac>,
 ) -> AgentDetect {
     let d = crate::unix_daemon::detect(os);
     let roles = crate::role::daemon_roles(os);
     let offered = asked.features.daemon_offered(os);
+    let one_row_stop =
+        crate::reinstall_guard::stop(os, asked.features.reinstall_guard_on(), one_row);
     let kind = match (d.per_user_config, d.system_config) {
         (true, true) => "ambiguous",
         (true, false) => "peruser",
@@ -256,17 +272,24 @@ fn detect_unix(
         role_limit: crate::role::RoleLimit::None,
         tunnel_offered: true,
         // FR-129 C1: the switch is Windows-only and never asked here.
-        default_role: crate::role::default_role(
-            &crate::role::WelcomeFacts {
-                os,
-                offered: if supported { roles } else { &[] },
-                kind,
-                tunnel_offered: true,
-                tunnel_installed,
-                server_answered: asked.answered,
-            },
-            read_system_context_switch,
-        ),
+        // FR-141 P3: a one-row Mac preselects nothing, not even the tunnel
+        // client: the person reads the note and picks.
+        default_role: if one_row_stop.is_some() {
+            None
+        } else {
+            crate::role::default_role(
+                &crate::role::WelcomeFacts {
+                    os,
+                    offered: if supported { roles } else { &[] },
+                    kind,
+                    tunnel_offered: true,
+                    tunnel_installed,
+                    server_answered: asked.answered,
+                },
+                read_system_context_switch,
+            )
+        },
+        one_row_stop,
     }
 }
 
@@ -950,6 +973,10 @@ pub async fn cmd_pair_start(
 ) -> Result<PairStartView, String> {
     use roomlerd::pairing::{StartOutcome, StartRequest, host_arch, host_os};
     refuse_a_role_this_run_cannot_install(role)?;
+    // FR-141 P3 — no approval for a row the install would refuse to make.
+    if let Some(stop) = crate::reinstall_guard::stop_for(role, &server).await {
+        return Err(stop);
+    }
     let halves = crate::role::pair_halves(crate::role::wants_root_half(
         crate::role::HostOs::current(),
         role,
@@ -1099,6 +1126,7 @@ mod tests {
                 role_limit: crate::role::RoleLimit::NoElevation,
                 tunnel_offered: true,
                 default_role: Some(Role::DaemonUser),
+                one_row_stop: None,
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -1161,7 +1189,7 @@ mod tests {
             wizard_unix_daemon: true,
             reinstall_guard_off: false,
         });
-        let detect_unix = |os, server, asked| detect_unix(os, server, asked, false);
+        let detect_unix = |os, server, asked| detect_unix(os, server, asked, false, None);
         // FR-129 C1 — the default follows the same switch; the kind is
         // whatever this box has, so the expectation is per kind.
         let clean_or_none = |d: &AgentDetect, clean: Option<Role>| {
@@ -1218,6 +1246,65 @@ mod tests {
         ));
     }
 
+    /// FR-141 P3 — a Mac whose root daemon says it is one row: the Welcome
+    /// page gets the stop, in its words, the card stays (with the note) and
+    /// nothing is preselected. The server's `false` and an unknown root (no
+    /// answer) give back today's page, and it is a Mac's alone.
+    #[test]
+    fn a_one_row_mac_is_told_so_on_the_welcome_page() {
+        use crate::features::{Asked, SetupFeatures};
+        use crate::reinstall_guard::OneRowMac;
+        use crate::role::HostOs;
+        let on = SetupFeatures {
+            pairing: true,
+            wizard_macos_daemon: true,
+            ..SetupFeatures::default()
+        };
+        let said = |features| Asked {
+            features,
+            answered: true,
+        };
+        let mac = OneRowMac {
+            name: "Studio Mac".into(),
+        };
+        let server = "https://a.invalid";
+
+        let d = detect_unix(HostOs::Macos, server, said(on), false, Some(&mac));
+        let stop = d.one_row_stop.as_deref().expect("the stop");
+        assert!(stop.contains("«Studio Mac»"), "{stop}");
+        assert!(d.supported, "the card stays, under the note");
+        assert_eq!(d.default_role, None, "nothing preselected");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains(r#""oneRowStop":"This Mac is one device already"#),
+            "{json}"
+        );
+
+        // Before the stop, a Mac with a card preselects it: the stop is what
+        // takes the preselection away.
+        let unknown = detect_unix(HostOs::Macos, server, said(on), false, None);
+        assert_eq!(unknown.one_row_stop, None, "unknown is never one row");
+        assert_eq!(unknown.default_role, Some(Role::DaemonUser));
+
+        let guard_off = SetupFeatures {
+            reinstall_guard_off: true,
+            ..on
+        };
+        let d = detect_unix(HostOs::Macos, server, said(guard_off), false, Some(&mac));
+        assert_eq!(d.one_row_stop, None, "the operator's off");
+        assert_eq!(d.default_role, Some(Role::DaemonUser));
+
+        // No answer from the server keeps the guard on (and the card off).
+        let d = detect_unix(HostOs::Macos, server, Asked::default(), false, Some(&mac));
+        assert!(
+            d.one_row_stop.is_some(),
+            "an unanswered server keeps the guard"
+        );
+
+        let d = detect_unix(HostOs::Linux, server, said(on), false, Some(&mac));
+        assert_eq!(d.one_row_stop, None, "a Mac's guard");
+    }
+
     /// FR-129 B1-s2 — each OS's cards follow that OS's switch, read from the
     /// server's answer as the wizard parses it. A split server with Linux on
     /// alone sends `wizard_unix_daemon: false`, the key every wizard released
@@ -1229,8 +1316,9 @@ mod tests {
         use crate::features::read_answer;
         use crate::role::HostOs;
         let server = "https://a.invalid";
-        let supported =
-            |os, body: &[u8]| detect_unix(os, server, read_answer(200, body), false).supported;
+        let supported = |os, body: &[u8]| {
+            detect_unix(os, server, read_answer(200, body), false, None).supported
+        };
 
         let linux_only = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": false, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
         assert!(supported(HostOs::Linux, linux_only), "Linux is on");

@@ -103,9 +103,27 @@ pub fn installs_a_device(role: Role) -> bool {
 /// install with, or `None` to go on as before. Only a Mac, only with the
 /// guard on, and only when the root daemon said one row.
 pub fn stop(os: HostOs, guard_on: bool, one_row: Option<&OneRowMac>) -> Option<String> {
-    // Today's wizard: no guard, whatever the Mac is.
-    let _ = (os, guard_on, one_row);
-    None
+    if os != HostOs::Macos || !guard_on {
+        return None;
+    }
+    one_row.map(stop_text)
+}
+
+/// [`stop`] for `role` on this host, asked where an install would begin
+/// (pairing start): the root daemon first, and the server's switch only on a
+/// Mac it says is one row, so every other host asks nothing more. A server
+/// that cannot be asked leaves the guard on.
+pub async fn stop_for(role: Role, server: &str) -> Option<String> {
+    let os = HostOs::current();
+    if os != HostOs::Macos || !installs_a_device(role) {
+        return None;
+    }
+    let mac = one_row_here().await?;
+    let guard_on = crate::features::ask(server)
+        .await
+        .features
+        .reinstall_guard_on();
+    stop(os, guard_on, Some(&mac))
 }
 
 /// What the person reads, on the page and in a refusal.

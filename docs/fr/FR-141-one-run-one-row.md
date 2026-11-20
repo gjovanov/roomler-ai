@@ -134,6 +134,17 @@ P0 decides its shape. What the code already gives: the root half's hardware id a
 (`crates/localapi/src/lib.rs:490`, `:530-542`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
 person's half on it and says why.
 
+- **2026-11-20, narrowed and built first (decision D2-A, the operator's 2A on #971's part 2):** a Mac whose root daemon
+  says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
+  The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
+  socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
+  (`crates/localapi/src/lib.rs:3674-3676`) and passes it through whole (`:3795-3817`). The read is bounded to 3 s and
+  believed only from a socket root serves; unknown is never one row. The stop is one decision
+  (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
+  install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes
+  one-row Macs whatever P2's switch says (#971's flip). A supervised Mac (the supervisor on, one row off) is out of
+  this step: it keeps today's road.
+
 ### 4. The terminal and the web dialog (P4)
 
 - `install.sh --overlay` on Linux, opt-in: with `--system` the TUN, per-user the netstack, as the wizard does. The
@@ -149,7 +160,7 @@ person's half on it and says why.
 | P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | done 2026-11-11: Linux and macOS (cells M1 to M5), in the [field log](#field-log) |
 | P1 | The question on the first page (design 1), with `front_tests` | server key `wizard_mesh_choice` in `/api/setup/features`, default on: off restores today's layout | not started |
 | P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | not started |
-| P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | not started |
+| P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | in progress 2026-11-20: the one-row guard (design 3's 2026-11-20 line) built, field read owed (AC4's one-row cell, on the first `setup-v*` that carries it); the same-row re-install not started |
 | P4 | `install.sh --overlay` on Linux; the dialog's Linux note and macOS block | the flag is opt-in; the dialog rolls back with the image | not started |
 | P5 | Docs: `docs/installation.md` (the wizard's macOS and Linux sections, the dialog, `--overlay`), `docs/platform-support.md` §2 and §4, `docs/device-pairing.md` | none | not started |
 | P6 | Field verification on released builds (the criteria below) | none | not started |

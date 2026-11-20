@@ -2318,6 +2318,23 @@ keeps the original's UUID. So a reinstall finds its row however the network has
 renamed the Mac. Unticked, the wizard installs the per-user half alone. The
 two privacy grants below remain the person's; the Done page says so.
 
+**A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
+it offers the device install, the wizard asks the root daemon over the person
+socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
+answers `status` (`crates/localapi/src/lib.rs:3674-3676`) with
+`gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
+Welcome page says "This Mac is one device already", Continue stays off for every
+device card, and pairing start and the install's preflight refuse with the same
+words, so no token is asked for (`agents/roomler-setup/src/reinstall_guard.rs`).
+Before the guard, a wizard run over a Mac the terminal had made one row left three
+rows: the root half enrolled again under the hardware id, where the script had
+used a derived one, and the person's half made a row that never came online
+(FR-141 P0, cell M5). Only a socket root serves is believed, and the read is
+bounded to 3 s. A Mac whose root daemon does not answer reads as before: unknown
+is never one row. The tunnel client can still be installed. The server's
+`wizard_reinstall_guard` turns the guard off; it is on by default, and the wizard
+reads anything but a JSON `false` as on (`agents/roomler-setup/src/features.rs`).
+
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
