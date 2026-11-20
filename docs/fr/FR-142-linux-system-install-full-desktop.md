@@ -137,7 +137,7 @@ flowchart TB
 - **Its supervisor is the virtual desktop's, not a new `Supervision` row** (code, corrected after review): the
   daemon already keeps a child alive on Linux for its whole life, the virtual desktop's X server: a thread waits for
   its exit, marks the desktop down first, kills and reaps the tree, and waits before the next start, 1 s doubling to
-  300 s, a run of 60 s resetting it (`virtual_desktop.rs:1991-2056`, `:984-996`, `Backoff` `:2133`). The worker's
+  300 s, a run of 60 s resetting it (`virtual_desktop.rs:2005-2070`, `:984-996`, `Backoff` `:2147`). The worker's
   supervisor reuses that loop and its `Backoff`, with the worker's own floor and ceiling (2 s to 60 s, five fast
   exits). `Supervision` names what restarts the DAEMON (`supervision.rs:240-253`); the worker is a subcommand that
   never takes `run`'s restart path, so it needs no row there.
@@ -173,7 +173,7 @@ flowchart TB
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
     guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-27`, `:353-379`),
     used today by exec (`exec.rs:2434-2439`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
-    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2739`, `:2752`). It marks every
+    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2753`, `:2766`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
     The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:3374-3377`), so it holds
     nothing of the daemon's either way.
