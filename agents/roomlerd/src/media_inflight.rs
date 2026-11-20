@@ -541,6 +541,13 @@ pub struct Budget {
     /// FR-148 D46 B2 — the last step found a still span standing for the
     /// least and S, or read a release; taken by [`Self::take_mark`].
     mark: bool,
+    /// FR-148 D46 B2 — the opening: whether this association's figures gave
+    /// the last step's rate, or the opening rate stood in (before the first
+    /// full second, and after it while the application-limited rule keeps
+    /// that rate); and the first step whose rate they gave (µs). A sample
+    /// that starts before it is no P3 capacity ([`Over::opening`]).
+    measured: bool,
+    first_measured: Option<u64>,
     /// The last step's budget, `out` and rate.
     last: (u64, u64, Option<u64>),
     window: Window,
@@ -562,6 +569,11 @@ pub struct Over {
     /// release came back: how long before the span's start that span's first
     /// still reading was, and the bytes acknowledged from there to the start.
     pub released_from: Option<(Duration, u64)>,
+    /// The span starts before the budget's first measured rate on this
+    /// association: the opening rate stood in for the rate, and SCTP's
+    /// window was still opening, so a hold or a backlog said nothing of the
+    /// path. Before the budget's first step, every span is.
+    pub opening: bool,
 }
 
 impl Default for Budget {
@@ -608,6 +620,8 @@ impl Budget {
             last_still: None,
             stood: None,
             mark: false,
+            measured: false,
+            first_measured: None,
             last: (0, 0, None),
             window: Window::new(),
         }
@@ -629,6 +643,9 @@ impl Budget {
         self.watch_still(t, r);
         let read = self.read_release(t, r.acked_bytes) || read;
         let rate = self.rate_at(t, r.acked_bytes, r.open_bps);
+        if self.measured {
+            self.first_measured.get_or_insert(t);
+        }
         let budget = self.size(rate, &r.gauges);
         let still = self.still_age(t);
         self.mark = read || still.is_some();
@@ -703,11 +720,15 @@ impl Budget {
     /// a still span of the least and S met it, from its first still reading to
     /// its release's ([`Over::stood`]), and stood that long inside it; whether
     /// the verdicts held a frame in each of its whole seconds; and whether it
-    /// starts inside the last released span, or while its release came back.
+    /// starts inside the last released span, or while its release came back;
+    /// and whether it starts before the first measured rate ([`Over::opening`]).
     /// Nothing before the first step, and nothing of an earlier association.
     pub fn over(&self, from: Instant, to: Instant, from_acked: u64) -> Over {
         let Some(epoch) = self.epoch else {
-            return Over::default();
+            return Over {
+                opening: true,
+                ..Over::default()
+            };
         };
         let at = |i: Instant| us(i.saturating_duration_since(epoch));
         let (a, b) = (at(from), at(to));
@@ -731,7 +752,15 @@ impl Budget {
                         from_acked.saturating_sub(count),
                     )
                 }),
+            opening: self.first_measured.is_none_or(|m| a < m),
         }
+    }
+
+    /// FR-148 D46 B2 — whether this association's figures gave the last
+    /// step's rate: the tcp_shape harness's look at the opening.
+    #[cfg(test)]
+    pub(crate) fn rate_measured(&self) -> bool {
+        self.measured
     }
 
     /// Whether the verdicts held a frame in each of `parts` equal stretches
@@ -761,7 +790,8 @@ impl Budget {
     }
 
     /// A new association: its clock counts from 0 and its delays are its own.
-    /// The standing rate stays, as the opening rate of the new one.
+    /// The standing rate stays, as the opening rate of the new one, which
+    /// stands in until the new one's figures give one.
     pub fn on_new_association(&mut self) {
         self.least = None;
         self.seen = (None, None);
@@ -773,6 +803,8 @@ impl Budget {
         self.last_still = None;
         self.stood = None;
         self.mark = false;
+        self.measured = false;
+        self.first_measured = None;
         self.forget_releases();
     }
 
@@ -920,6 +952,7 @@ impl Budget {
             .oldest()
             .filter(|from| t.saturating_sub(from.at) >= us(RATE_WINDOW));
         let Some(from) = from else {
+            self.measured = false;
             return opening;
         };
         // FR-148 D46 — a window that starts inside a released still span, or
@@ -940,11 +973,15 @@ impl Budget {
             self.figures.pop_oldest();
         }
         let most = self.figures.iter().map(|f| f.bps).max().unwrap_or(bps);
-        let rate = if self.held_throughout(from.at, t) {
+        let held = self.held_throughout(from.at, t);
+        let rate = if held {
             most
         } else {
             most.max(opening.unwrap_or(0))
         };
+        // FR-148 D46 B2 — the figures gave it, or the application-limited
+        // rule keeps one they gave; else the opening rate still stands in.
+        self.measured = held || most >= opening.unwrap_or(0) || self.measured;
         self.standing = Some(rate);
         Some(rate)
     }
@@ -1038,11 +1075,26 @@ impl Budget {
         }
     }
 
+    /// What SCTP's window carries in a least, bit/s: `window / least`.
+    fn by_window(&self, g: &Gauges) -> u64 {
+        let least = self.least.unwrap_or(self.slack);
+        let window = u64::from(g.cwnd).min(u64::from(g.rwnd).saturating_add(g.inflight_bytes));
+        window.saturating_mul(8_000_000) / us(least).max(1)
+    }
+
+    /// FR-148 D46 B2 — whether SCTP's window, not the rate, sized the last
+    /// step's budget, read with that step's gauges: the tcp_shape harness's
+    /// look at the opening.
+    #[cfg(test)]
+    pub(crate) fn window_sized(&self, g: &Gauges) -> bool {
+        let by_window = self.by_window(g);
+        self.last.2.is_none_or(|r| by_window < r)
+    }
+
     /// The budget, bytes, at `rate` against the gauges now.
     fn size(&self, rate: Option<u64>, g: &Gauges) -> u64 {
         let least = self.least.unwrap_or(self.slack);
-        let window = u64::from(g.cwnd).min(u64::from(g.rwnd).saturating_add(g.inflight_bytes));
-        let by_window = window.saturating_mul(8_000_000) / us(least).max(1);
+        let by_window = self.by_window(g);
         let rate = rate.map_or(by_window, |r| r.min(by_window));
         (rate.saturating_mul(us(least + self.slack)) / 8_000_000)
             .max(FLOOR_PACKETS.saturating_mul(u64::from(g.max_payload)))
@@ -2133,7 +2185,9 @@ mod tests {
     /// first still reading (2 s) to the step that read its release (2.85 s),
     /// stood its 300 ms inside one that starts before 2.5 s, and starts one
     /// inside it with the bytes back since 2 s; a span after the release, or
-    /// before the stall, saw none of it. Nothing held there.
+    /// before the stall, saw none of it, though one from the first step
+    /// starts in the opening (the first measured rate is at 1 s). Nothing
+    /// held there.
     #[test]
     fn the_budget_says_what_it_saw_over_a_samples_span() {
         let (b, t0, _) = released(true);
@@ -2148,6 +2202,7 @@ mod tests {
                 still_inside: true,
                 held: false,
                 released_from: Some((d(400), 0)),
+                opening: false,
             }
         );
         // Met by its last 200 ms of stand and its release only.
@@ -2161,12 +2216,21 @@ mod tests {
         for (from, to) in [(2_900, 4_900), (0, 1_950)] {
             assert_eq!(
                 b.over(at(t0, from), at(t0, to), count(from)),
-                Over::default(),
+                Over {
+                    opening: from == 0,
+                    ..Over::default()
+                },
                 "{from} to {to} ms"
             );
         }
-        // Before the first step it knows nothing.
-        assert_eq!(Budget::new().over(t0, at(t0, 2_000), 0), Over::default());
+        // Before the first step it knows nothing, and measured nothing.
+        assert_eq!(
+            Budget::new().over(t0, at(t0, 2_000), 0),
+            Over {
+                opening: true,
+                ..Over::default()
+            }
+        );
     }
 
     /// FR-148 D46 B2 — the holds over a sample's span: one in each of its
@@ -2188,5 +2252,38 @@ mod tests {
             "none in its second second"
         );
         assert!(!b.over(at(t0, 3_000), at(t0, 4_950), 0).held);
+    }
+
+    /// FR-148 D46 B2 — the budget's opening, which a P3 sample may not start
+    /// in: a span that starts before the association's first measured rate
+    /// is the opening's ([`Over::opening`]), one that starts at or after it
+    /// is not. Held throughout from the first step, the first figure (1 s)
+    /// gives the rate. A new association opens again, its opening rate the
+    /// old one's rate. While the application-limited rule keeps the opening
+    /// rate (the figures under it, no second held throughout), nothing is
+    /// measured, and the first second held throughout ends the opening.
+    #[test]
+    fn a_span_that_starts_before_the_first_measured_rate_is_the_opening() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        run(&mut b, t0, 0, 2_950, 0, 2_000_000, 10 << 20);
+        assert!(b.over(t0, at(t0, 2_900), 0).opening);
+        assert!(b.over(at(t0, 950), at(t0, 2_900), 0).opening);
+        assert!(!b.over(at(t0, 1_000), at(t0, 2_900), 0).opening);
+        b.on_new_association();
+        run(&mut b, t0, 3_000, 4_950, 0, 2_000_000, 10 << 20);
+        assert!(b.over(at(t0, 3_000), at(t0, 4_950), 0).opening);
+        assert!(!b.over(at(t0, 4_000), at(t0, 4_950), 0).opening);
+        // 1 Mbit/s under the 1.5 Mbit/s opening rate, one byte out: the
+        // opening rate stands, and every span is the opening's.
+        let mut kept = Budget::new();
+        let acked = run(&mut kept, t0, 0, 2_950, 0, 1_000_000, 1);
+        assert_eq!(kept.rate_bps(), Some(1_500_000));
+        assert!(kept.over(at(t0, 2_000), at(t0, 2_950), 0).opening);
+        // Held from 3 s: a second held throughout gives the rate by 4 s.
+        run(&mut kept, t0, 3_000, 4_950, acked, 1_000_000, 10 << 20);
+        assert_eq!(kept.rate_bps(), Some(1_000_000));
+        assert!(kept.over(at(t0, 2_000), at(t0, 4_950), 0).opening);
+        assert!(!kept.over(at(t0, 4_000), at(t0, 4_950), 0).opening);
     }
 }

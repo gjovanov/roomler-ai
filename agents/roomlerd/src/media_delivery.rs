@@ -58,12 +58,12 @@
 //! FR-148 D46 B2 gives a sample one reader: its push-back on the shadow model
 //! ([`push_back_of`]). A queued sample is a capacity at its own rate (P1); with
 //! the in-flight budget computing, so is a counted one that was backlogged with
-//! no still span in it (P3); and with the budget computing, a sample a still
-//! span met is none, since its release comes back as a burst, nor is one that
-//! closed in a stall the budget marks within [`settle`] after. The pump hands it
-//! to the governor's shadow model and path memory, which no rate or gate reads,
-//! and which opens a session only under `path_model = on`
-//! (`docs/rate-control.md`, § The path memory).
+//! no still span in it and starts at or after the budget's first measured rate
+//! (P3); a sample a still span met is none, since its release comes back as a
+//! burst, nor is one that closed in a stall the budget marks within [`settle`]
+//! after. The pump hands it to the governor's shadow model and path memory,
+//! which no rate or gate reads, and which opens a session only under
+//! `path_model = on` (`docs/rate-control.md`, § The path memory).
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -313,7 +313,7 @@ pub const BURST: Burst = Burst::Exclude;
 /// packet delivered as a stall begins comes back that late, inside the stall,
 /// and ends its first still span short of the least and S; the span after it
 /// is the one that stands. On the `tcp_shape` stall and outage cells the P3
-/// samples that closed in a stall before either span stood read 0.73 to 0.91
+/// samples that closed in a stall before either span stood read 0.73 to 0.90
 /// times the link over three runs: held, with no still span of the least and S.
 pub fn settle(b: &Budget) -> Duration {
     b.still_after() + Duration::from_millis(DELAYED_ACK_MS)
@@ -330,13 +330,16 @@ const WAITING_MAX: usize = 4;
 /// | | budget off | budget on or in shadow |
 /// |---|---|---|
 /// | P1: queued ([`QueueReading::queued`]) | at its own rate | at its own rate |
-/// | P3: counted, backlogged (SCTP's class, or a hold in each second), no still span of the least and S in it | nothing | at its own rate |
+/// | P3: counted, backlogged (SCTP's class, or a hold in each second), no still span of the least and S in it, and it starts at or after the budget's first measured rate | nothing | at its own rate |
 /// | a still span met it ([`Burst::Exclude`]) | (not seen) | nothing |
-/// | anything else, an application-limited sample among them | nothing | nothing |
+/// | anything else, an application-limited sample or one the opening held among them | nothing | nothing |
 ///
 /// A sample read without gauges is never one: it has no queue reading. The
 /// rule's other half, a stall marked inside [`settle`] after the close, is the
-/// sampler's to apply ([`DeliverySampler::heartbeat`]).
+/// sampler's to apply ([`DeliverySampler::heartbeat`]). A sample that starts
+/// in the budget's opening ([`Over::opening`]) is no P3 capacity: the opening
+/// rate stood in and SCTP's window was still opening, so its holds and its
+/// backlog were the opening's, not the path's.
 pub fn push_back_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<SamplePushBack> {
     let q = s.queue?;
     let by = match over {
@@ -349,7 +352,7 @@ pub fn push_back_of(s: &Sample, over: Option<&Over>, burst: Burst) -> Option<Sam
             let counted = q.standing_ms.is_some();
             if q.queued() {
                 PushedBy::P1
-            } else if counted && backlogged && !o.still_inside {
+            } else if counted && backlogged && !o.still_inside && !o.opening {
                 PushedBy::P3
             } else {
                 return None;
@@ -1824,6 +1827,7 @@ mod tests {
             still_inside: true,
             held: true,
             released_from: None,
+            opening: false,
         };
         let s = read_sample(Class::Backlogged, 1_200, Some(40));
         for burst in [Burst::Exclude, Burst::Stood, Burst::Correct, Burst::Own] {
@@ -1843,6 +1847,7 @@ mod tests {
             still_inside: false,
             held: false,
             released_from: Some((Duration::from_millis(800), 200_000)),
+            opening: false,
         };
         let s = read_sample(Class::Backlogged, 2_600, Some(300));
         assert_eq!(push_back_of(&s, Some(&burst), Burst::Exclude), None);
@@ -1890,7 +1895,9 @@ mod tests {
     /// backlogged sample on a moving clock is P3 with the budget in shadow
     /// and nothing with it off; the queued one after it is P1 either way.
     /// With the budget off a push-back is due at its close; in shadow it is
-    /// due once [`settle`] has passed, at the next reading.
+    /// due once [`settle`] has passed, at the next reading. The first sample
+    /// starts in the budget's opening, before its first measured rate (1 s):
+    /// backlogged too, it is no P3 capacity.
     #[test]
     fn the_sampler_pushes_back_by_what_its_budget_saw() {
         let t0 = Instant::now();
@@ -1901,12 +1908,12 @@ mod tests {
             }
             let mut pushed = Vec::new();
             let mut closed = Vec::new();
-            // 2 Mbit/s acknowledged for 5 s at 30 fps; the least stands
-            // 340 ms over the session's in the second sample.
-            for frame in 0..=150u64 {
+            // 2 Mbit/s acknowledged for 7 s at 30 fps; the least stands
+            // 340 ms over the session's in the third sample.
+            for frame in 0..=210u64 {
                 let now = at(t0, frame * 1_000 / 30);
                 let acked = frame * 250_000 / 30;
-                let least = if frame > 60 { 400 } else { 60 };
+                let least = if frame > 120 { 400 } else { 60 };
                 let g = Gauges {
                     max_payload: 1_200,
                     cwnd: 1 << 20,
@@ -1932,11 +1939,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(closed, [2, 4]);
+            assert_eq!(closed, [2, 4, 6]);
             let want: Vec<_> = if budget {
-                vec![(3, PushedBy::P3, 2_000_000), (5, PushedBy::P1, 2_000_000)]
+                vec![(5, PushedBy::P3, 2_000_000), (7, PushedBy::P1, 2_000_000)]
             } else {
-                vec![(4, PushedBy::P1, 2_000_000)]
+                vec![(6, PushedBy::P1, 2_000_000)]
             };
             assert_eq!(pushed, want, "budget {budget}");
         }
@@ -1947,6 +1954,8 @@ mod tests {
     /// here), and the budget marks the stall inside the wait, the still span
     /// standing the least and S: it reaches nothing. The same sample whose
     /// clock moves again 150 ms into the pause is P3 once the wait is over.
+    /// The sample is the session's second: the first starts in the budget's
+    /// opening, and is none either way.
     #[test]
     fn a_sample_that_closes_in_a_stall_is_no_capacity() {
         let t0 = Instant::now();
@@ -1954,10 +1963,10 @@ mod tests {
             let mut s = DeliverySampler::new(true).with_budget();
             let mut pushed = Vec::new();
             let mut acked = 0;
-            for ms in (0..=3_000u64).step_by(10) {
+            for ms in (0..=5_000u64).step_by(10) {
                 let now = at(t0, ms);
-                // 2 Mbit/s acknowledged, standing still from 1.95 s.
-                let still = (1_950..1_950 + pause_ms).contains(&ms);
+                // 2 Mbit/s acknowledged, standing still from 3.95 s.
+                let still = (3_950..3_950 + pause_ms).contains(&ms);
                 if !still {
                     acked += 2_500;
                 }
@@ -1986,6 +1995,117 @@ mod tests {
             }
             assert_eq!(pushed.first().copied(), want, "a {pause_ms} ms pause");
         }
+    }
+
+    /// FR-148 D46 B2 — gauges that hold at any budget: `out` bytes in flight
+    /// past a 1 MiB window with a chunk waiting, so SCTP's window binds no
+    /// frame through, and the rate, not the window, sizes the budget.
+    fn holding(out: u64) -> Gauges {
+        Gauges {
+            max_payload: 1_200,
+            cwnd: 1 << 20,
+            rwnd: 1 << 20,
+            inflight_bytes: out,
+            pending_bytes: 1,
+            ack_delay: Some(Duration::from_millis(60)),
+            ack_delay_min: Some(Duration::from_millis(60)),
+            ..Gauges::default()
+        }
+    }
+
+    /// FR-148 D46 B2 — a sampler with the budget in shadow for `secs`
+    /// seconds at 30 fps: 2 Mbit/s acknowledged, the opening rate 2 Mbit/s,
+    /// `out(ms)` bytes in flight, a reading once a second whose SCTP queue
+    /// ran empty (so only a hold in each second makes a sample backlogged).
+    /// Returns each push-back the heartbeat would hand, and when (ms).
+    fn opening_run(secs: u64, out: impl Fn(u64) -> u64) -> Vec<(u64, SamplePushBack)> {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget();
+        let mut pushed = Vec::new();
+        for frame in 0..=secs * 30 {
+            let ms = frame * 1_000 / 30;
+            let now = at(t0, ms);
+            let acked = frame * 250_000 / 30;
+            let g = holding(out(ms));
+            s.on_frame_reading(now, acked, g, 2_000_000);
+            if frame % 30 == 0 {
+                let reading = Delivery {
+                    acked_bytes: acked,
+                    queue_fills: frame / 30 + 1,
+                    queue_empties: frame / 30 + 1,
+                };
+                s.on_reading_with(now, reading, || Some(g));
+            }
+            while let Some(p) = s.take_push_back(now) {
+                pushed.push((ms, p));
+            }
+        }
+        pushed
+    }
+
+    /// FR-148 D46 B2 — the opening: the budget held in each second of the
+    /// session's first 2 s, and in its first second at the opening rate,
+    /// which stands in until its first figure (1 s). A sample that starts
+    /// there is no P3 capacity; one that starts at the first figure is, and
+    /// a queued sample is P1 either way.
+    #[test]
+    fn a_sample_the_budget_held_at_its_opening_is_no_p3_capacity() {
+        use crate::media_inflight::Reading;
+        let t0 = Instant::now();
+        let mut b = Budget::new();
+        for ms in (0..=2_000u64).step_by(10) {
+            let r = Reading {
+                acked_bytes: ms * 250,
+                gauges: holding(10 << 20),
+                pump_bytes: 0,
+                open_bps: 2_000_000,
+            };
+            b.step(at(t0, ms), &r);
+        }
+        let opening = b.over(t0, at(t0, 2_000), 0);
+        assert!(opening.held && opening.opening, "{opening:?}");
+        let s = read_sample(Class::AppLimited, 2_000, Some(0));
+        assert_eq!(push_back_of(&s, Some(&opening), BURST), None);
+        let measured = b.over(at(t0, 1_000), at(t0, 2_000), 250_000);
+        assert!(measured.held && !measured.opening, "{measured:?}");
+        assert_eq!(
+            push_back_of(&s, Some(&measured), BURST),
+            pushed(PushedBy::P3, 2_000)
+        );
+        let queued = read_sample(Class::AppLimited, 2_000, Some(340));
+        assert_eq!(
+            push_back_of(&queued, Some(&opening), BURST),
+            pushed(PushedBy::P1, 2_000)
+        );
+    }
+
+    /// FR-148 D46 B2 — the budget holds at every frame of 5 s: the first
+    /// sample (0 to 2 s) starts in its opening and is none; the second (2 to
+    /// 4 s), held in each second at the measured rate with no still span, is
+    /// P3 at its own rate, handed once its settle has passed.
+    #[test]
+    fn a_held_sample_at_a_measured_rate_with_no_still_span_is_p3() {
+        let p3 = pushed(PushedBy::P3, 2_000).unwrap();
+        assert_eq!(opening_run(5, |_| 10 << 20), [(4_433, p3)]);
+    }
+
+    /// FR-148 D46 B2 — a session whose budget held only while it opened (the
+    /// first 2 s), with one byte out after: no sample's push-back reaches
+    /// the shadow model, whose capacity stays absent.
+    #[test]
+    fn a_session_whose_only_held_sample_is_the_openers_leaves_the_capacity_absent() {
+        use crate::encode::pair_memory::{Read, Take};
+        use crate::encode::pipe::Pipe;
+        let pushed = opening_run(7, |ms| if ms < 2_000 { 10 << 20 } else { 1 });
+        let now = Instant::now();
+        let mut pipe = Pipe::default();
+        pipe.observe_delivered_in(2_000_000, Basis::AppLimited, true, now);
+        for (_, p) in &pushed {
+            pipe.observe_sample_capacity(p.bps, p.by, Take::Sample(Read::Clear), now);
+        }
+        assert_eq!(pipe.model().capacity(now), None, "{pushed:?}");
+        assert_eq!(pipe.model().floor(now).map(|f| f.bps), Some(2_000_000));
+        assert!(pushed.is_empty(), "{pushed:?}");
     }
 
     /// Gauges as a take reads them: `least` is the least delay since the take
@@ -3903,6 +4023,13 @@ pub(crate) mod shaped_link {
             budget: u64,
             still_after_us: u64,
             release: Option<Release>,
+            /// FR-148 D46 B2 — the opening's look: whether this association's
+            /// figures gave the step's rate (`Budget::rate_measured`), whether
+            /// SCTP's window and not the rate sized its budget
+            /// (`Budget::window_sized`), and SCTP's window, bytes.
+            measured: bool,
+            window_sized: bool,
+            cwnd: u32,
         }
 
         /// One message the viewer read: when it arrived and when it was
@@ -4175,6 +4302,10 @@ pub(crate) mod shaped_link {
             gated: u32,
             max_taken_rx: u32,
             closing: Closing,
+            /// What last set the model's capacity, while it stands at the
+            /// run's end: `goodput` or `link` (a window's push-back, P0's law)
+            /// or `p1` / `p3` (a sample's), when (µs from `t0`), and its rate.
+            cap_by: Option<(&'static str, u64, u32)>,
         }
 
         /// Whether the writer held, skipped or blocked in a second `w` covers.
@@ -4186,18 +4317,117 @@ pub(crate) mod shaped_link {
             })
         }
 
-        /// FR-148 D46 B2 — when the sampler hands `c`'s push-back under
-        /// `burst` (µs from `t0`): at its close, or, under the rule, once its
-        /// settle has passed. Or why it never does: no push-back under the
-        /// rule (`stood`), a stall mark inside the wait (`marked`), or the
+        /// FR-148 D46 B2 — the opening rules measured: what makes a sample
+        /// the opening's ([`Over::opening`]), so no P3 capacity.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Open {
+            /// #4115's first commit: nothing is.
+            None,
+            /// (a) a hold in the sample came at the opening's stand-in rate.
+            StandIn,
+            /// (b) a hold came at the stand-in, or while SCTP's window and not
+            /// the rate sized the budget.
+            Window,
+            /// (c) the sample starts before the budget's first measured rate:
+            /// the rule built (`Budget::over`).
+            Start,
+            /// (c), or a hold that SCTP's window sized.
+            StartOrWindow,
+            /// The session's first sample, whatever the budget saw.
+            First,
+        }
+
+        /// The opening rules, by the word the lines print.
+        const OPENS: [(&str, Open); 6] = [
+            ("n", Open::None),
+            ("a", Open::StandIn),
+            ("b", Open::Window),
+            ("c", Open::Start),
+            ("cw", Open::StartOrWindow),
+            ("f", Open::First),
+        ];
+
+        /// FR-148 D46 B2 — the holding core's steps over a sample's span,
+        /// from the trace: steps, holds, the holds at the opening's stand-in
+        /// rate and those SCTP's window sized, and SCTP's window at its least
+        /// and most. All 0 for a core that leaves no trace (the shadow).
+        #[derive(Debug, Clone, Copy, Default)]
+        struct Holds {
+            steps: u32,
+            held: u32,
+            stand_in: u32,
+            window: u32,
+            cwnd: (u32, u32),
+        }
+
+        fn holds_over(r: &TcpRun, c: &Covered) -> Holds {
+            let from = c.end_us.saturating_sub(c.sample.ms * 1_000);
+            let mut h = Holds::default();
+            for s in r
+                .trace
+                .iter()
+                .filter(|s| (from..=c.end_us).contains(&s.t_us))
+            {
+                h.cwnd = if h.steps == 0 {
+                    (s.cwnd, s.cwnd)
+                } else {
+                    (h.cwnd.0.min(s.cwnd), h.cwnd.1.max(s.cwnd))
+                };
+                h.steps += 1;
+                if s.verdict.holds() {
+                    h.held += 1;
+                    h.stand_in += u32::from(!s.measured);
+                    h.window += u32::from(s.window_sized);
+                }
+            }
+            h
+        }
+
+        /// Whether `open` makes the run's sample `i` the opening's.
+        fn opening_of(r: &TcpRun, i: usize, open: Open) -> bool {
+            let c = &r.samples[i];
+            let Some(o) = c.over else {
+                return false;
+            };
+            let h = holds_over(r, c);
+            match open {
+                Open::None => false,
+                Open::StandIn => h.stand_in > 0,
+                Open::Window => h.stand_in > 0 || h.window > 0,
+                Open::Start => o.opening,
+                Open::StartOrWindow => o.opening || h.window > 0,
+                Open::First => i == 0,
+            }
+        }
+
+        /// FR-148 D46 B2 — when the sampler hands sample `i`'s push-back
+        /// under `burst` and `open` (µs from `t0`): at its close, or, under
+        /// the rule, once its settle has passed. Or why it never does: the
+        /// opening's (`opening`), a still span met it (`stood`), none under
+        /// any rule (`none`), a stall mark inside the wait (`marked`), or the
         /// writer stopped inside it (`ended`), as a session's close drops
         /// what its sampler still holds.
         fn handed(
             r: &TcpRun,
-            c: &Covered,
+            i: usize,
             burst: Burst,
+            open: Open,
         ) -> Result<(u64, SamplePushBack), &'static str> {
-            let p = push_back_of(&c.sample, c.over.as_ref(), burst).ok_or("stood")?;
+            let c = &r.samples[i];
+            let with = |opening: bool| c.over.map(|o| Over { opening, ..o });
+            let over = with(opening_of(r, i, open));
+            let Some(p) = push_back_of(&c.sample, over.as_ref(), burst) else {
+                let open_off = with(false);
+                return Err(
+                    if push_back_of(&c.sample, open_off.as_ref(), burst).is_some() {
+                        "opening"
+                    } else if push_back_of(&c.sample, open_off.as_ref(), Burst::Own).is_some() {
+                        "stood"
+                    } else {
+                        "none"
+                    },
+                );
+            };
             if !burst.waits() {
                 return Ok((c.end_us, p));
             }
@@ -4211,7 +4441,7 @@ pub(crate) mod shaped_link {
             Ok((until, p))
         }
 
-        fn model_fold(r: &TcpRun, burst: Burst, gate: u8) -> ModelFold {
+        fn model_fold(r: &TcpRun, burst: Burst, gate: u8, open: Open) -> ModelFold {
             let mut pipe = Pipe::default();
             pipe.set_stall_gate(gate);
             let mut link = LinkLoop::new();
@@ -4219,17 +4449,17 @@ pub(crate) mod shaped_link {
             let mut goodput = r.goodput_at.iter().peekable();
             let mut marks = r.marks.iter().peekable();
             // Each push-back at the time the sampler hands it.
-            let mut due: Vec<(u64, SamplePushBack)> = r
-                .samples
-                .iter()
-                .filter_map(|c| handed(r, c, burst).ok())
+            let mut due: Vec<(u64, SamplePushBack)> = (0..r.samples.len())
+                .filter_map(|i| handed(r, i, burst, open).ok())
                 .collect();
             due.sort_by_key(|&(t, _)| t);
             let mut pushes = due.into_iter().peekable();
             let offer_bps = u32::try_from(r.shape.offer_bps()).unwrap_or(u32::MAX);
             let at = |t_us: u64| r.t0 + Duration::from_micros(t_us);
             let (mut made, mut taken, mut above) = ([0_u32; 2], [0_u32; 2], 0);
-            let mut hand = |pipe: &mut Pipe, take: Option<Take>, p: SamplePushBack, now| {
+            let mut cap_by = None;
+            let mut hand = |pipe: &mut Pipe, take: Option<Take>, p: SamplePushBack, t_us| {
+                let now = at(t_us);
                 let i = usize::from(p.by == PushedBy::P3);
                 made[i] += 1;
                 let Some(take) = take else {
@@ -4241,6 +4471,7 @@ pub(crate) mod shaped_link {
                     above += 1;
                 }
                 pipe.observe_sample_capacity(p.bps, p.by, take, now);
+                cap_by = Some((p.by.word(), t_us, p.bps));
                 // D46 item 10: a push-back never raises the floor, nor makes one.
                 let after = pipe.model().floor(now).map(|f| f.bps);
                 assert!(
@@ -4248,12 +4479,19 @@ pub(crate) mod shaped_link {
                     "{p:?} raised the floor: {before:?} to {after:?}"
                 );
             };
+            // A window's push-back that the model took sets its capacity now.
+            let set_now = |pipe: &Pipe, bps: u32, now: Instant| {
+                pipe.model()
+                    .capacity(now)
+                    .is_some_and(|c| c.bps == bps && c.age.is_zero())
+            };
             let (mut take, mut prev_stalled) = (None, false);
             let (mut left, mut gated, mut max_taken_rx) = (0_u8, 0, 0);
+            let mut window_cap = None;
             for w in &r.windows {
                 let now = at(w.end_us);
                 while let Some((end_us, p)) = pushes.next_if(|(e, _)| *e <= w.end_us) {
-                    hand(&mut pipe, take, p, at(end_us));
+                    hand(&mut pipe, take, p, end_us);
                 }
                 let mut marked = false;
                 while marks.next_if(|&&m| m <= w.end_us).is_some() {
@@ -4288,21 +4526,33 @@ pub(crate) mod shaped_link {
                 while let Some(&(_, bps)) = goodput.next_if(|g| g.0 <= w.end_us) {
                     if valid {
                         pipe.observe_capacity_in(bps, Basis::Backlogged, t, now);
+                        if set_now(&pipe, bps, now) {
+                            window_cap = Some(("goodput", w.end_us, bps));
+                        }
                     }
                 }
                 let growth = i16::try_from(w.growth_ms.clamp(-30_000, 30_000)).unwrap();
                 if link.observe(w.rx_bps, growth).congested && valid && offer_held {
                     pipe.observe_capacity_in(w.rx_bps, Basis::Backlogged, t, now);
+                    if set_now(&pipe, w.rx_bps, now) {
+                        window_cap = Some(("link", w.end_us, w.rx_bps));
+                    }
                 }
                 take = valid.then_some(t);
             }
             for (end_us, p) in pushes {
-                hand(&mut pipe, take, p, at(end_us));
+                hand(&mut pipe, take, p, end_us);
             }
             let end = r.windows.last().map_or(r.t0, |w| at(w.end_us));
+            let capacity = pipe.model().capacity(end).map(|c| c.bps);
+            let cap_by = match (cap_by, window_cap) {
+                (Some(s), Some(w)) => Some(if s.1 > w.1 { s } else { w }),
+                (s, w) => s.or(w),
+            }
+            .filter(|by| capacity == Some(by.2));
             ModelFold {
                 floor: pipe.model().floor(end).map(|f| f.bps),
-                capacity: pipe.model().capacity(end).map(|c| c.bps),
+                capacity,
                 own_floor: pipe.floor_bps(end),
                 made,
                 taken,
@@ -4310,20 +4560,26 @@ pub(crate) mod shaped_link {
                 gated,
                 max_taken_rx,
                 closing: pipe.memory().closing(end, 0),
+                cap_by,
             }
         }
 
         /// FR-148 D46 B2 — one run's shadow-model floor, as a share of the
         /// link's payload rate, under each burst rule (`e` the rule, `c` the
         /// classifier's correction, `o` none) at 0 to 3 gated windows after a
-        /// stall mark; then the rule at [`STALL_WINDOWS`](crate::encode::pipe::STALL_WINDOWS)
+        /// stall mark, with the opening rule built; then the rule at [`STALL_WINDOWS`](crate::encode::pipe::STALL_WINDOWS)
         /// in full: the push-backs, the model's capacity, the memory's
-        /// counted samples and their split, and the most a taken window read.
+        /// counted samples and their split, and the most a taken window read;
+        /// then each opening rule's floor and capacity under the burst rule
+        /// built ([`OPENS`]), and what last set the capacity. The rules that
+        /// read the holding core's trace print `?` for the shadow, which
+        /// leaves none.
         fn print_b2(r: &TcpRun) {
             let link = r.shape.payload_bps() as f64;
             let x = |f: Option<u32>| {
                 f.map_or_else(|| "-".to_owned(), |f| format!("{:.3}", f64::from(f) / link))
             };
+            let gate = crate::encode::pipe::STALL_WINDOWS;
             let mut sweep = Vec::new();
             for (word, burst) in [
                 ("e", Burst::Exclude),
@@ -4331,19 +4587,52 @@ pub(crate) mod shaped_link {
                 ("c", Burst::Correct),
                 ("o", Burst::Own),
             ] {
-                for gate in 0..=3_u8 {
+                for g in 0..=3_u8 {
                     sweep.push(format!(
-                        "{word}{gate}={}",
-                        x(model_fold(r, burst, gate).floor)
+                        "{word}{g}={}",
+                        x(model_fold(r, burst, g, Open::Start).floor)
                     ));
                 }
             }
-            let m = model_fold(r, BURST, crate::encode::pipe::STALL_WINDOWS);
+            let traced = !r.trace.is_empty() || r.samples.iter().all(|c| c.over.is_none());
+            let known = |open: Open| {
+                traced || !matches!(open, Open::StandIn | Open::Window | Open::StartOrWindow)
+            };
+            let opens: Vec<String> = OPENS
+                .iter()
+                .map(|&(word, open)| {
+                    if !known(open) {
+                        return format!("{word}=?");
+                    }
+                    let m = model_fold(r, BURST, gate, open);
+                    format!("{word}={}/{}", x(m.floor), x(m.capacity))
+                })
+                .collect();
+            let fates = |i: usize| -> String {
+                OPENS
+                    .iter()
+                    .map(|&(word, open)| {
+                        let fate = if known(open) {
+                            handed(r, i, BURST, open)
+                                .map_or_else(|why| why.to_owned(), |(_, p)| x(Some(p.bps)))
+                        } else {
+                            "?".to_owned()
+                        };
+                        format!("{word}={fate}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let m = model_fold(r, BURST, gate, Open::Start);
             let c = m.closing;
+            let cap_by = m.cap_by.map_or_else(
+                || "-".to_owned(),
+                |(by, t_us, bps)| format!("{by}@{}ms:{}", t_us / 1_000, x(Some(bps))),
+            );
             println!(
                 "D46 B2 | {} | link={} own={} | {} | p1={}/{} p3={}/{} above={} | floor={} \
                  cap={} counted={} over={} clear={} p1c={}/{} p3c={}/{} gated={} maxrx={} \
-                 marks={} samples={}",
+                 marks={} samples={} | open {} capby={}",
                 r.shape.name(),
                 kbps(r.shape.payload_bps()),
                 x(m.own_floor),
@@ -4366,18 +4655,28 @@ pub(crate) mod shaped_link {
                 x(Some(m.max_taken_rx)),
                 r.marks.len(),
                 r.samples.len(),
+                opens.join(" "),
+                cap_by,
             );
-            // Each sample that is a push-back under no rule but P3's own: its
-            // span, rate and facts, and what the rule makes of it.
-            for c in &r.samples {
-                let Some(p) = push_back_of(&c.sample, c.over.as_ref(), Burst::Own) else {
+            // Each sample that is a push-back under no rule but P3's own, the
+            // opening's aside: its span, rate and facts, the holding core's
+            // steps over it, and what the rule and each opening rule make of
+            // it.
+            for (i, c) in r.samples.iter().enumerate() {
+                let open_off = c.over.map(|o| Over {
+                    opening: false,
+                    ..o
+                });
+                let Some(p) = push_back_of(&c.sample, open_off.as_ref(), Burst::Own) else {
                     continue;
                 };
                 let to = c.end_us / 1_000;
                 let o = c.over.as_ref();
+                let h = holds_over(r, c);
                 println!(
                     "D46 B2 sample | {} | {}-{} ms {} {} class={:?} standing={:?} stood={} \
-                     inside={} held={} from={:?} | rule={}",
+                     inside={} held={} from={:?} opening={} holds={}/{} stand_in={} window={} \
+                     cwnd={}-{} | rule={} | {}",
                     r.shape.name(),
                     to.saturating_sub(c.sample.ms),
                     to,
@@ -4389,7 +4688,39 @@ pub(crate) mod shaped_link {
                     o.is_some_and(|o| o.still_inside),
                     o.is_some_and(|o| o.held),
                     o.and_then(|o| o.released_from),
-                    handed(r, c, BURST).map_or_else(|why| why.to_owned(), |(_, p)| x(Some(p.bps))),
+                    o.is_some_and(|o| o.opening),
+                    h.held,
+                    h.steps,
+                    h.stand_in,
+                    h.window,
+                    h.cwnd.0,
+                    h.cwnd.1,
+                    handed(r, i, BURST, Open::Start)
+                        .map_or_else(|why| why.to_owned(), |(_, p)| x(Some(p.bps))),
+                    fates(i),
+                );
+            }
+            // The session's first sample, under each opening rule.
+            if let Some(c) = r.samples.first() {
+                let open_off = c.over.map(|o| Over {
+                    opening: false,
+                    ..o
+                });
+                let p = push_back_of(&c.sample, open_off.as_ref(), Burst::Own);
+                let to = c.end_us / 1_000;
+                let h = holds_over(r, c);
+                println!(
+                    "D46 B2 first | {} | {}-{} ms {} {} holds={}/{} stand_in={} window={} | {}",
+                    r.shape.name(),
+                    to.saturating_sub(c.sample.ms),
+                    to,
+                    x(p.map(|p| p.bps)),
+                    p.map_or("none", |p| p.by.word()),
+                    h.held,
+                    h.steps,
+                    h.stand_in,
+                    h.window,
+                    fates(0),
                 );
             }
         }
@@ -4762,6 +5093,9 @@ pub(crate) mod shaped_link {
                                         budget: b.last_budget(),
                                         still_after_us: us(b.still_after()),
                                         release: b.last_release(),
+                                        measured: b.rate_measured(),
+                                        window_sized: b.window_sized(&r.gauges),
+                                        cwnd: r.gauges.cwnd,
                                     });
                                     // A clock that stood still with bytes out
                                     // for the least and the slack was a stall.
