@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! #4119 — the net under the macOS consent panel: an exit that AppKit starts
 //! inside one of our window calls, on the thread making that call, and that
-//! our own code did not choose, leaves with the restart code instead of 0.
+//! our own code did not choose, leaves with a code of its own instead of 0
+//! ([`crate::watchdog::APPKIT_ENDED_EXIT_CODE`]).
 //!
 //! After a log-out that killed its window-server port, a two-row Mac's root
 //! half made a window at its next question (#4053's probe), and AppKit ended
@@ -24,7 +25,7 @@
 //!   only when THAT thread is inside one of our calls, and the exit was not
 //!   chosen ([`exit_chosen`]): it writes one line to stderr with a raw
 //!   `write(2)` (the plist sends stderr to `daemon.log`, and the log's file
-//!   layer may not flush in time), then `_exit`s with the restart code.
+//!   layer may not flush in time), then `_exit`s with [`NET_EXIT_CODE`].
 //!
 //! ⚠️ **The thread, never the mark alone.** The daemon runs on its
 //! `roomlerd-main` thread, and its clean stop after a SIGTERM (#3195) calls
@@ -37,6 +38,11 @@
 //! A log-out's quit from loginwindow ends with AppKit's exit 0 on purpose
 //! (#3164's table in `crate::macos_quit`): the delegate marks that exit
 //! chosen before it answers `NSTerminateNow`, and the hook leaves it alone.
+//!
+//! The code is the net's own, never the requested restart's 9, which says no
+//! failure happened: the net marks no clean shutdown, so a run it ends before
+//! the clean-run threshold counts as a crash at the next start, as it should
+//! ([`crate::watchdog::APPKIT_ENDED_EXIT_CODE`] has the reasons and the value).
 //!
 //! What the net cannot see: an `_exit` (atexit hooks do not run), a signal,
 //! and an exit from a thread that is not inside our calls. If AppKit ends a
@@ -63,9 +69,10 @@ thread_local! {
 /// exits 0 on purpose.
 static CHOSEN: AtomicBool = AtomicBool::new(false);
 
-/// The code the net leaves with: the daemon's restart code under launchd,
-/// which `KeepAlive {SuccessfulExit: false}` relaunches after its throttle.
-const NET_EXIT_CODE: i32 = crate::watchdog::RESTART_REQUESTED_EXIT_CODE;
+/// The code the net leaves with: its own, never the requested restart's 9.
+/// launchd's `KeepAlive {SuccessfulExit: false}` relaunches it after its
+/// throttle, as it does any non-zero exit.
+const NET_EXIT_CODE: i32 = crate::watchdog::APPKIT_ENDED_EXIT_CODE;
 
 /// Whether a process with this effective uid arms the net: a root process
 /// only (a one-row Mac's daemon, a two-row Mac's root half), whose exit 0
@@ -89,7 +96,7 @@ pub(crate) fn arm() {
             tracing::warn!(
                 status,
                 "macOS consent panel: the exit net could not be registered, so an exit AppKit \
-                 starts in the panel's window calls leaves with its own code (#4119)"
+                 starts in the panel's window calls keeps AppKit's code (#4119)"
             );
         }
     });
@@ -127,7 +134,7 @@ pub(crate) fn exit_chosen() {
 
 /// The `atexit` hook. On the thread that called `exit`: inside one of our
 /// calls, and not chosen, it says so and leaves with [`NET_EXIT_CODE`];
-/// otherwise it does nothing, and the exit goes on with its own code.
+/// otherwise it does nothing, and the exit goes on with the code it began with.
 extern "C" fn the_net() {
     let Some(call) = INSIDE.try_with(Cell::get).ok().flatten() else {
         return;
@@ -142,14 +149,14 @@ extern "C" fn the_net() {
 }
 
 // The line below names the code: renumber both, or neither.
-const _: () = assert!(NET_EXIT_CODE == 9);
+const _: () = assert!(NET_EXIT_CODE == 32);
 
 /// One line on stderr, in one raw `write(2)`: no lock, no allocation.
 fn say_on_stderr(call: &str) {
     const HEAD: &[u8] = b"roomlerd: an exit began inside ";
     const TAIL: &[u8] = b" on the AppKit thread, and roomlerd did not choose it (AppKit, on a \
-        window-server port a log-out killed); leaving with 9 so launchd starts roomlerd again \
-        (#4119)\n";
+        window-server port a log-out killed); leaving with 32 (APPKIT_ENDED_EXIT_CODE) so launchd \
+        starts roomlerd again (#4119)\n";
     let mut line = [0u8; 512];
     let mut len = 0;
     for part in [HEAD, call.as_bytes(), TAIL] {
@@ -164,6 +171,7 @@ fn say_on_stderr(call: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watchdog::{APPKIT_ENDED_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE};
     use std::process::{Command, Stdio};
 
     /// Which exit a copy of this test binary plays.
@@ -172,6 +180,9 @@ mod tests {
     const STAND_IN: &str = "indicator::exit_net::tests::the_stand_in";
     /// What the stand-in marks, as `super::mac` marks a window call.
     const CALL: &str = "a test's window";
+    /// The modes where another thread is marked while the daemon thread
+    /// exits, followed by the code it exits with.
+    const ANOTHER_THREAD: &str = "another thread inside, exit ";
 
     /// In a copy of this test binary, with [`MODE`] set: arm the net, then
     /// leave the way the mode says. Without it, nothing. AppKit calls
@@ -204,8 +215,11 @@ mod tests {
                 // SAFETY: ends this stand-in process.
                 unsafe { libc::exit(0) }
             }
-            "another thread inside, exit 0" | "another thread inside, exit 3" => {
-                let code = if mode.ends_with('3') { 3 } else { 0 };
+            other if other.starts_with(ANOTHER_THREAD) => {
+                let code: i32 = other
+                    .strip_prefix(ANOTHER_THREAD)
+                    .and_then(|code| code.parse().ok())
+                    .expect("the code the daemon thread exits with");
                 let (marked, is_marked) = std::sync::mpsc::channel();
                 // The AppKit thread, inside the event fetch.
                 std::thread::spawn(move || {
@@ -216,7 +230,8 @@ mod tests {
                     }
                 });
                 is_marked.recv().expect("the mark");
-                // The daemon thread's clean stop (`app.rs`'s `main`).
+                // The daemon thread's own exit (`app.rs`'s `main`): its clean
+                // stop, a requested restart, an error.
                 std::process::exit(code)
             }
             other => panic!("no such mode: {other}"),
@@ -239,40 +254,48 @@ mod tests {
 
     /// #4119 (c) — an exit that begins inside one of our AppKit calls, on
     /// the thread making it, and that our code did not choose (AppKit's
-    /// exit 0 on a dead window-server port), leaves with 9, which launchd
-    /// relaunches, after ONE line on stderr that names the call. Armed twice,
-    /// it is still one line.
+    /// exit 0 on a dead window-server port), leaves with the net's own code,
+    /// [`APPKIT_ENDED_EXIT_CODE`], which launchd relaunches, after ONE line on
+    /// stderr that names the call and the code. Armed twice, it is still one
+    /// line.
     ///
     /// Red before #4119: the stand-in left with 0, which launchd does not
-    /// relaunch.
+    /// relaunch. Red with the net's first code: it left with 9, the requested
+    /// restart's, which says no failure happened.
     #[test]
-    fn an_exit_inside_our_call_that_we_did_not_choose_leaves_with_9() {
+    fn an_exit_inside_our_call_that_we_did_not_choose_leaves_with_its_own_code() {
         let (code, stderr) = played("inside");
-        assert_eq!(code, Some(9), "{stderr}");
+        assert_eq!(code, Some(APPKIT_ENDED_EXIT_CODE), "{stderr}");
         let said: Vec<&str> = stderr
             .lines()
             .filter(|l| l.contains("an exit began inside"))
             .collect();
         assert_eq!(said.len(), 1, "{stderr}");
         assert!(said[0].contains(CALL), "{stderr}");
-        assert!(said[0].contains("leaving with 9"), "{stderr}");
+        assert!(
+            said[0].contains(&format!("leaving with {APPKIT_ENDED_EXIT_CODE} ")),
+            "{stderr}"
+        );
     }
 
     /// #4119 (c) — every exit the net must leave alone keeps its code, and
     /// says nothing: one outside our calls, one after the call returned, one
     /// our code chose (the delegate's `NSTerminateNow` for a log-out's quit),
-    /// and the daemon thread's clean stop while the AppKit thread is inside
-    /// the event fetch (a SIGTERM's, #3195), with 0 and with another code.
+    /// and the daemon thread's exits while the AppKit thread is inside the
+    /// event fetch: the clean stop after a SIGTERM (#3195), a requested
+    /// restart's [`RESTART_REQUESTED_EXIT_CODE`], and another code.
     #[test]
     fn an_exit_the_net_leaves_alone_keeps_its_code() {
-        for (mode, expected) in [
-            ("outside", 0),
-            ("after the call", 0),
-            ("inside, chosen", 0),
-            ("another thread inside, exit 0", 0),
-            ("another thread inside, exit 3", 3),
-        ] {
-            let (code, stderr) = played(mode);
+        let mut modes = vec![
+            ("outside".to_string(), 0),
+            ("after the call".to_string(), 0),
+            ("inside, chosen".to_string(), 0),
+        ];
+        for code in [0, RESTART_REQUESTED_EXIT_CODE, 3] {
+            modes.push((format!("{ANOTHER_THREAD}{code}"), code));
+        }
+        for (mode, expected) in modes {
+            let (code, stderr) = played(&mode);
             assert_eq!(code, Some(expected), "{mode}: {stderr}");
             assert!(!stderr.contains("an exit began inside"), "{mode}: {stderr}");
         }

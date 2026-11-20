@@ -209,6 +209,55 @@ pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 /// per `supervision::RESTART_MIN_INTERVAL`, across process lifetimes.
 pub const RESTART_REQUESTED_EXIT_CODE: i32 = 9;
 
+/// #4119 — the code of an exit that AppKit began inside one of the macOS
+/// consent panel's window calls, and that our code did not choose: the exit
+/// net under the panel (`indicator::exit_net`) leaves with it in place of
+/// AppKit's 0.
+///
+/// **What emits it.** That net only, in a root process with the AppKit panel
+/// only (`viewer-indicator-macos`: a one-row Mac's daemon, a two-row Mac's
+/// root half). Its `atexit` hook acts when `exit` runs on the main thread
+/// while that thread is inside the probe window, the panel's window or the
+/// pump's event fetch and dispatch. After a log-out that killed the
+/// window-server port, AppKit ended such a process with exit 0 while it made
+/// a window (0.4.228), and launchd left it down until the next boot.
+///
+/// Per supervisor:
+///
+///   * **launchd** (`com.roomler.daemon`, `KeepAlive{SuccessfulExit:false}`)
+///     relaunches it, as any non-zero exit, throttled by `ThrottleInterval`
+///     (one start per 10 s at most).
+///   * **the FR-43 macOS supervisor** never sees it: its worker runs as the
+///     person at the console (`sudo -u '#<uid>'`, never uid 0), and the net
+///     arms in a root process only. A worker that exited with it would be an
+///     unnamed code there: a `SupervisorDetected` record
+///     (`macos_supervisor::crash_summary`) and a respawn after its backoff
+///     (1 s after a run of 30 s or more, else twice the last wait up to 30 s;
+///     five fast exits in a row and it gives up).
+///   * **systemd** and **the Windows supervisors** never see it: the net
+///     exists in the macOS panel build only.
+///
+/// **A crash, on purpose.** Unlike [`RESTART_REQUESTED_EXIT_CODE`], nothing
+/// marks a clean shutdown before it. So a run it ends inside
+/// `config::CLEAN_RUN_THRESHOLD_SECS` (5 healthy minutes) counts as a crash
+/// at the next start (`config::previous_run` reads the run's unhealthy mark
+/// and the boot, never the code), and `config::ROLLBACK_THRESHOLD_CRASHES` of
+/// them inside the crash window roll the release back. That is right: a
+/// release in which the net fires at every start must roll back. It is why
+/// this is not 9, which says "relaunch me, this was not a failure", and which
+/// the FR-43 and the Windows SCM supervisors both keep out of their crash
+/// records.
+///
+/// Why 32. No other code in the tree is 32: not 0 or 1, the sentinels above
+/// (2, 7, 8, 9), the stand-in's 10, the probe and portal helpers' 3 to 5, the
+/// no-enrollment 78, a panic's 101, nor the launchers' 127; and it is outside
+/// the Linux units' `RestartPreventExitStatus=7 8`. It is the lowest such code
+/// above Darwin's signal numbers (1 to 31), so it is not also a signal's
+/// number, as 9 is SIGKILL's; and it is below `sysexits.h` (64 to 78) and the
+/// shell's 126, 127 and 128 plus a signal, so no convention gives it another
+/// meaning. The tests below assert each of these.
+pub const APPKIT_ENDED_EXIT_CODE: i32 = 32;
+
 /// How often the watchdog-of-watchdog looks at the async watchdog's
 /// heartbeat.
 pub const THREAD_WATCHDOG_CHECK_EVERY: Duration = Duration::from_secs(30);
@@ -1176,6 +1225,7 @@ mod tests {
             AGENT_DELETED_EXIT_CODE,
             ALREADY_RUNNING_EXIT_CODE,
             RESTART_REQUESTED_EXIT_CODE,
+            APPKIT_ENDED_EXIT_CODE,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -1188,6 +1238,7 @@ mod tests {
         assert_eq!(AGENT_DELETED_EXIT_CODE, 7);
         assert_eq!(ALREADY_RUNNING_EXIT_CODE, 8);
         assert_eq!(RESTART_REQUESTED_EXIT_CODE, 9);
+        assert_eq!(APPKIT_ENDED_EXIT_CODE, 32);
         // 0 and 1 are the ordinary exits; a sentinel on either would be
         // ambiguous with "done" / "an error" to every supervisor.
         for code in all {
@@ -1195,11 +1246,50 @@ mod tests {
         }
     }
 
+    /// #4119 — the macOS panel's exit net leaves with a code of its own: no
+    /// other code in the tree, so neither a supervisor nor a person reading
+    /// `launchctl print` takes it for a requested restart (9) or for anything
+    /// else. Outside both units' `RestartPreventExitStatus`: the test below.
+    #[test]
+    fn the_appkit_ended_code_is_no_other_code_in_the_tree() {
+        let taken = [
+            0,
+            1,
+            STALL_EXIT_CODE,
+            AGENT_DELETED_EXIT_CODE,
+            ALREADY_RUNNING_EXIT_CODE,
+            RESTART_REQUESTED_EXIT_CODE,
+            crate::unenrolled::STAND_IN_LOST_EXIT_CODE,
+            crate::daemon_error::NO_ENROLLMENT_EXIT_CODE,
+            // The caps probe's and the portal helper's own exits.
+            3,
+            4,
+            5,
+            // A panic on the main thread.
+            101,
+            // `roomlerdw` and the CLI shim with no daemon to run.
+            127,
+        ];
+        assert!(
+            !taken.contains(&APPKIT_ENDED_EXIT_CODE),
+            "APPKIT_ENDED_EXIT_CODE ({APPKIT_ENDED_EXIT_CODE}) is taken: {taken:?}"
+        );
+        // Above Darwin's signal numbers (1 to 31), so not also a signal's
+        // number, as 9 is SIGKILL's; below sysexits.h (64 to 78) and the
+        // shell's 126, 127 and 128 plus a signal, so no convention gives it
+        // another meaning.
+        assert!(
+            (32..64).contains(&APPKIT_ENDED_EXIT_CODE),
+            "{APPKIT_ENDED_EXIT_CODE}"
+        );
+    }
+
     /// FR-84 D3 — the inverse of the test above for the restart sentinel: a
     /// requested restart MUST come back, so neither unit may list it in
     /// `RestartPreventExitStatus`. A unit that did would turn "Apply now" into
     /// "go offline" on every Linux host at once, with `systemctl is-active`
-    /// reading `inactive` and nothing logging why.
+    /// reading `inactive` and nothing logging why. #4119: nor the exit net's
+    /// code, an exit that must come back too wherever a supervisor sees it.
     #[test]
     fn shipped_linux_units_restart_the_restart_requested_sentinel() {
         for (name, unit) in [
@@ -1223,6 +1313,11 @@ mod tests {
             assert!(
                 !codes.contains(&RESTART_REQUESTED_EXIT_CODE),
                 "{name} must NOT list RESTART_REQUESTED_EXIT_CODE ({RESTART_REQUESTED_EXIT_CODE}); \
+                 got {codes:?}"
+            );
+            assert!(
+                !codes.contains(&APPKIT_ENDED_EXIT_CODE),
+                "{name} must NOT list APPKIT_ENDED_EXIT_CODE ({APPKIT_ENDED_EXIT_CODE}); \
                  got {codes:?}"
             );
             // And the policy must be one that restarts a non-zero exit at all.

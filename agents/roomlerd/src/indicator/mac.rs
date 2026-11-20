@@ -45,7 +45,7 @@
 //! (0.4.228). So the session and the seat answer before any window is made,
 //! and the net ([`super::exit_net`]) is under them: an exit AppKit starts
 //! inside one of these window calls, on this thread, that our code did not
-//! choose, leaves with the restart code.
+//! choose, leaves with a code of its own, which launchd relaunches.
 //!
 //! ## The application delegate (#3164)
 //!
@@ -907,7 +907,7 @@ pub(crate) fn seat_looked(look: &crate::person_socket::Look) {
 /// `_CGSCreateWindow returned 268435459`, exit 0). So the gate asks the
 /// console session and the seat first, and makes this window only when
 /// neither has changed; the net ([`exit_net`]) turns an exit begun here into
-/// a restart.
+/// one that launchd relaunches, with a code of its own.
 fn window_device(mtm: MainThreadMarker) -> Connection {
     let _inside = exit_net::inside("the probe window");
     // SAFETY: a window made outside a window controller must not be released

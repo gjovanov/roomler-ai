@@ -51,7 +51,7 @@
 //! alone would have made no window; the seat is the second guard, for
 //! a Mac where the names do not post. Under both, an exit that AppKit begins
 //! inside one of our window calls anyway, and that our code did not choose,
-//! leaves with the restart code, which launchd relaunches
+//! leaves with a code of its own, which launchd relaunches
 //! ([`super::exit_net`]). A per-user process follows neither the seat nor
 //! the console session: its connection belongs to a GUI session of its own,
 //! which a fast user switch away and back leaves alive, so the connection

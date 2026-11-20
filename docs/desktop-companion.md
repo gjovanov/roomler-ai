@@ -2374,7 +2374,7 @@ serving it, each for the rest of the process's life:
 |---|---|---|
 | launchd starts the root daemon at boot, before anyone signs in | refused at the start (0.4.226) | the gate's first read says so, and every question goes to the app (#4053) |
 | a log-out detaches the window server, and the daemon runs on | a one-row Mac still on connection 0 after the next login (0.4.226, 0.4.228) | a probe window gets no window device, or another console session has started: every question from then on goes to the app (#4053) |
-| a log-out kills the window-server port, and the daemon runs on | a two-row Mac's root half, two runs of two (0.4.228): "WindowServer event port death" at the log-out. At the first question after the login, AppKit ended the process with exit 0 while it made #4053's probe window, with no line of ours. launchd relaunches only a non-zero exit, so the `-daemon` row stayed offline until the next boot | since #4119 the seat and the console session answer before any window is made. An exit that AppKit begins inside a panel window call anyway leaves with 9, and launchd starts the daemon again |
+| a log-out kills the window-server port, and the daemon runs on | a two-row Mac's root half, two runs of two (0.4.228): "WindowServer event port death" at the log-out. At the first question after the login, AppKit ended the process with exit 0 while it made #4053's probe window, with no line of ours. launchd relaunches only a non-zero exit, so the `-daemon` row stayed offline until the next boot | since #4119 the seat and the console session answer before any window is made. An exit that AppKit begins inside a panel window call anyway leaves with 32, a code of its own, and launchd starts the daemon again |
 
 Which log-outs kill the port is not known: a one-row Mac's left it detached, a two-row Mac's root half's killed it.
 
@@ -2384,8 +2384,8 @@ Which log-outs kill the port is not known: a one-row Mac's left it detached, a t
 | the seat latch | in a root process only. The person socket's look at `/dev/console`'s owner, every 5 s, is told to the gate. A seat that the last look found a person at, and that this look finds empty or someone else's, ends the panel, with one WARN. A seat that goes from nobody to a person (a boot, then a login) ends nothing, and a look that could not tell changes nothing. The latch is held, never read at a question: after the login someone is at the seat again | `PanelGate::seat_looked`, [`panel_gate.rs:275`](../agents/roomlerd/src/indicator/panel_gate.rs#L275); `seat_looked`, [`mac.rs:892`](../agents/roomlerd/src/indicator/mac.rs#L892); called by `follow_the_seat`, [`person_socket.rs:730`](../agents/roomlerd/src/person_socket.rs#L730) |
 | the console session | in a root process only: notify(3) on CoreGraphics' `GUIConsoleSessionChanged` and `GUISessionUserChanged`, from the pump's start. Another session answers before the probe window is made, so that question makes no window. A session read with no answer leaves the probe to decide, as before | `reads_console_session`, [`panel_gate.rs:129`](../agents/roomlerd/src/indicator/panel_gate.rs#L129); the two names, [`console_watch.rs:40`](../agents/roomlerd/src/indicator/console_watch.rs#L40); `ConsoleWatch`, [`:47`](../agents/roomlerd/src/indicator/console_watch.rs#L47) |
 | the probe window | a 1×1 window, never shown, made with its window device on the main thread, 500 ms at most. A number above 0 means the window server serves the process. Just before it makes the window, the main thread asks the gate again whether the panel has ended | `probe`, [`mac.rs:879`](../agents/roomlerd/src/indicator/mac.rs#L879); `window_device`, [`mac.rs:911`](../agents/roomlerd/src/indicator/mac.rs#L911) |
-| the exit net | in a root process only: an `atexit` hook, registered once when the pump starts. The main thread marks itself while it is inside the probe window, the panel's window, or the event fetch and dispatch. An exit that begins on that thread inside one of them, and that our code did not choose, writes one line to stderr and leaves with 9, the restart code | `arm`, [`exit_net.rs:82`](../agents/roomlerd/src/indicator/exit_net.rs#L82); `inside`, [`:108`](../agents/roomlerd/src/indicator/exit_net.rs#L108); `the_net`, [`:131`](../agents/roomlerd/src/indicator/exit_net.rs#L131); armed in `run_main_loop`, after `finishLaunching`, [`mac.rs:431`](../agents/roomlerd/src/indicator/mac.rs#L431); the marks, [`mac.rs:446`](../agents/roomlerd/src/indicator/mac.rs#L446), [`:474`](../agents/roomlerd/src/indicator/mac.rs#L474), [`:912`](../agents/roomlerd/src/indicator/mac.rs#L912) |
-| a chosen exit | the delegate's `NSTerminateNow` (a log-out's quit from loginwindow, or a quit with no supervisor) marks its exit as chosen before AppKit exits 0, so the net leaves that 0 alone (#3164) | `exit_chosen`, [`exit_net.rs:124`](../agents/roomlerd/src/indicator/exit_net.rs#L124), called at [`mac.rs:319`](../agents/roomlerd/src/indicator/mac.rs#L319) |
+| the exit net | in a root process only: an `atexit` hook, registered once when the pump starts. The main thread marks itself while it is inside the probe window, the panel's window, or the event fetch and dispatch. An exit that begins on that thread inside one of them, and that our code did not choose, writes one line to stderr and leaves with 32, `APPKIT_ENDED_EXIT_CODE`: the net's own code, never the requested restart's 9 | `arm`, [`exit_net.rs:89`](../agents/roomlerd/src/indicator/exit_net.rs#L89); `inside`, [`:115`](../agents/roomlerd/src/indicator/exit_net.rs#L115); `the_net`, [`:138`](../agents/roomlerd/src/indicator/exit_net.rs#L138); the code, [`watchdog.rs:259`](../agents/roomlerd/src/watchdog.rs#L259); armed in `run_main_loop`, after `finishLaunching`, [`mac.rs:431`](../agents/roomlerd/src/indicator/mac.rs#L431); the marks, [`mac.rs:446`](../agents/roomlerd/src/indicator/mac.rs#L446), [`:474`](../agents/roomlerd/src/indicator/mac.rs#L474), [`:912`](../agents/roomlerd/src/indicator/mac.rs#L912) |
+| a chosen exit | the delegate's `NSTerminateNow` (a log-out's quit from loginwindow, or a quit with no supervisor) marks its exit as chosen before AppKit exits 0, so the net leaves that 0 alone (#3164) | `exit_chosen`, [`exit_net.rs:131`](../agents/roomlerd/src/indicator/exit_net.rs#L131), called at [`mac.rs:319`](../agents/roomlerd/src/indicator/mac.rs#L319) |
 
 ```mermaid
 flowchart TD
@@ -2397,7 +2397,7 @@ flowchart TD
     P -- "a number above 0, the session the same" --> SHOW["the panel shows the question"]
     P -- "0 or less" --> LOST["ended for the process's life (Lost)"]
     P -- "no answer in 500 ms, or the session read had none" --> ONE["false for this question only"]
-    P -. "AppKit exits inside the window call" .-> NET["the exit net: exit 9,<br/>launchd starts roomlerd again"]
+    P -. "AppKit exits inside the window call" .-> NET["the exit net: exit 32, its own code,<br/>launchd starts roomlerd again"]
     LOOK(["the person socket's look, every 5 s"]) -- "a person left the seat, or another took it" --> SEAT["ended for the process's life<br/>one WARN with seat_was and seat_now"]
     AS --> APP
     LOST --> APP
@@ -2410,7 +2410,7 @@ flowchart TD
   the person socket saw nobody at the seat a second before the port died, so either read alone would have answered
   first. The seat is the second guard, for a Mac where the names do not post. The net is the third.
 - **Only a root process.** The seat latch, the console session and the net are a root process's: a one-row Mac's
-  daemon and a two-row Mac's root half (`reads_console_session`, `arms_in`, [`exit_net.rs:76`](../agents/roomlerd/src/indicator/exit_net.rs#L76)).
+  daemon and a two-row Mac's root half (`reads_console_session`, `arms_in`, [`exit_net.rs:83`](../agents/roomlerd/src/indicator/exit_net.rs#L83)).
   A two-row Mac's per-user half belongs to a GUI session of its own, which a fast user switch away and back leaves
   alive, so its connection alone decides. Its exit 0 at a log-out is what the end of its session should bring:
   launchd starts it at the next login (#3164), and a relaunch would put it back into a session that is ending.
@@ -2420,9 +2420,17 @@ flowchart TD
   keeps its 0 wherever it begins.
 - **What the net cannot see.** An `_exit` (atexit hooks do not run), a signal, and an exit on another thread. Where
   AppKit ends a process that way, the seat and the console session, read before any window, are what hold.
-- **A restart, not a loop.** The net marks no clean shutdown, so a run that it ends before the run has been healthy
-  for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still counts it
-  (`app.rs:4315`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+- **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
+  (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
+  healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
+  counts it (`app.rs:4315`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+- **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
+  the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
+  leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'
+  `RestartPreventExitStatus=7 8`, and which is neither a Darwin signal's number nor a `sysexits.h` code. No supervisor
+  but launchd sees it: the net exists in the macOS panel build only and arms in a root process only, while the FR-43
+  supervisor's worker runs as the person at the console. The code's doc,
+  [`watchdog.rs:259`](../agents/roomlerd/src/watchdog.rs#L259), gives what each supervisor would do with it.
 - **Logs.**
   - `macOS consent panel available`, with `window_number` and `console_session`, at the start, or in its place the
     WARN that the process could not put a window on the screen (#4053).
@@ -2432,7 +2440,9 @@ flowchart TD
   - the seat's WARN, `macOS consent panel: the person at the seat has left it, or someone else has taken it, since the
     panel came up …`, with `seat_was` (a uid) and `seat_now` (a uid, or `nobody`), once, when the poll sees the change.
   - the net's line, on stderr, which the daemon's plist sends to `daemon.log`: `roomlerd: an exit began inside the probe
-    window on the AppKit thread, and roomlerd did not choose it …`, naming the call it caught.
+    window on the AppKit thread, and roomlerd did not choose it …`, naming the call it caught and the code it leaves
+    with (`leaving with 32 (APPKIT_ENDED_EXIT_CODE)`). `launchctl print system/com.roomler.daemon` then shows
+    `last exit code = 32`, where 0.4.228 showed 0.
 - **Tested**, red first in #4119's pull request:
   - the gate, in `indicator::panel_gate::tests`:
     - `another_console_session_answers_without_a_probe_window`;
@@ -2448,10 +2458,16 @@ flowchart TD
     These run in rust-agent's "Test agent under vp9-444", in windows-agent-sessions' "Agent unit tests on Windows (the
     whole --lib suite)" and in the macOS job's "cargo check + test the agent's Mac-only units".
   - the net, in `indicator::exit_net::tests`, each exit played by a copy of the test binary:
-    `an_exit_inside_our_call_that_we_did_not_choose_leaves_with_9`; `an_exit_the_net_leaves_alone_keeps_its_code`
-    (outside a call, after one, a chosen exit, and an exit 0 and an exit 3 on another thread while the main one is
-    marked); `only_a_root_process_arms_the_net`. They run on Unix only: in "Test agent under vp9-444", and in the macOS
-    job's Mac-only units, on the libc whose `exit` the net hooks.
+    `an_exit_inside_our_call_that_we_did_not_choose_leaves_with_its_own_code` (32, where the net's first code was the
+    requested restart's 9); `an_exit_the_net_leaves_alone_keeps_its_code` (outside a call, after one, a chosen exit,
+    and an exit 0, a requested restart's 9 and an exit 3 on another thread while the main one is marked);
+    `only_a_root_process_arms_the_net`. They run on Unix only: in "Test agent under vp9-444", and in the macOS job's
+    Mac-only units, on the libc whose `exit` the net hooks.
+  - the net's code, in `watchdog::tests`: `exit_code_sentinels_are_distinct_and_documented`,
+    `the_appkit_ended_code_is_no_other_code_in_the_tree` (no code the tree exits with, a code above Darwin's signal
+    numbers and below `sysexits.h`), and `shipped_linux_units_restart_the_restart_requested_sentinel`, which asserts it
+    outside both units' `RestartPreventExitStatus`. They run in "Test agent under vp9-444" and in windows-agent-sessions'
+    "Agent unit tests on Windows (the whole --lib suite)".
   - `indicator/mac.rs` itself compiles only in the macOS job's "cargo check agent (viewer-indicator-macos — the AppKit
     panel + the main-thread swap)".
 - **Field cell**, on a two-row Mac: restart the root half with the person signed in (`available window_number>0

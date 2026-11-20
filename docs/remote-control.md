@@ -2719,13 +2719,18 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    person's own session is FR-149 (#4054).
 
    **The exit net (#4119).** A root process registers an `atexit` hook when
-   the pump starts (`indicator/exit_net.rs:82`, armed at
+   the pump starts (`indicator/exit_net.rs:89`, armed at
    `indicator/mac.rs:431`). The main thread marks itself while it is inside
    one of the panel's AppKit calls: the probe window, the panel's window, and
    the event fetch and dispatch (`indicator/mac.rs:912`, `:474`, `:446`). An
    exit that begins on that thread inside such a call, and that our code did
-   not choose, writes one line to stderr and leaves with 9, which launchd
-   relaunches (`the_net`, `indicator/exit_net.rs:131`). Every other exit
+   not choose, writes one line to stderr and leaves with 32, which launchd
+   relaunches (`the_net`, `indicator/exit_net.rs:138`). 32 is the net's own
+   code, `APPKIT_ENDED_EXIT_CODE` (`watchdog.rs:259`), and no other exit in
+   the tree uses it. It is not the requested restart's 9, which says no
+   failure happened: the net marks no clean shutdown, so a run it ends inside
+   the first 5 minutes counts as a crash at the next start, and the
+   crash-loop rollback counts it as it counts any other. Every other exit
    keeps its code: the clean stop after a SIGTERM, which exits 0 on the
    `roomlerd-main` thread (#3195), a requested restart, an error, the quit
    backstop, the watchdog, and AppKit's exit 0 after the delegate answers a
@@ -2741,9 +2746,9 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    console session answered first, no probe window was made, and that WARN
    says `window_number=none`. A seat change logs its own WARN when the poll
    sees it, with `seat_was` and `seat_now` (a uid, or `nobody`). The net's
-   line on stderr names the call it caught (`roomlerd: an exit began inside
-   the probe window …`). §10.8.2 of `docs/desktop-companion.md` has the parts
-   and the cells.
+   line on stderr names the call it caught and its code (`roomlerd: an exit
+   began inside the probe window … leaving with 32 …`). §10.8.2 of
+   `docs/desktop-companion.md` has the parts and the cells.
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`). On Linux,
    Windows and macOS that start runs off the async worker, one start in
@@ -6589,7 +6594,7 @@ where it is. The signaling loop awaits inside its `select!` arms,
 so a stall is one arm whose await never returned, and the INFO log
 is silent while it waits.
 - Every arm therefore enters a named stage first
-  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:461`):
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:510`):
   `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
@@ -6603,12 +6608,12 @@ is silent while it waits.
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
   `agents/roomlerd/src/signaling.rs:6497`). The dispatch awaits per
   message, so that is where a stall inside it shows.
-- The `StageGuard` (`watchdog.rs:475`) puts the pump back to
+- The `StageGuard` (`watchdog.rs:524`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
   leaves early cannot leave its name behind for a later stall to be
   blamed on.
 - The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
-  (`stall_summary`, `watchdog.rs:491`). The `name=Ns` prefix is
+  (`stall_summary`, `watchdog.rs:540`). The `name=Ns` prefix is
   unchanged, so a parser of the old line still finds the pump.
 - ⚠️ Read it from the crash record, not only the log. The summary
   also goes into the crash sidecar that the next worker uploads
@@ -6687,10 +6692,10 @@ sequenceDiagram
 
 | what | where |
 |---|---|
-| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:687` |
-| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:777` |
-| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:725`, `within` `:762` |
-| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:392` |
+| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:736` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:826` |
+| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:774`, `within` `:811` |
+| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:441` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
 | Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
 | Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:150` |
@@ -6703,7 +6708,7 @@ sequenceDiagram
 - As root, `sample` reads the hardened-runtime daemon: measured on a
   MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
   On macOS the stacks are read **only as root**
-  (`may_read_own_stacks`, `watchdog.rs:744`). The FR-43 GUI worker runs
+  (`may_read_own_stacks`, `watchdog.rs:793`). The FR-43 GUI worker runs
   as the signed-in person, where a request to read the hardened binary
   would be refused, and a refused debugger-style request has no business
   on someone's desktop. Its record names the stall without the stacks.
@@ -6736,8 +6741,8 @@ clocks moved. What each watchdog does with the gap:
 
 | | the async watchdog | the watchdog-of-watchdog |
 |---|---|---|
-| its sleep | 5 s on a tokio timer (`SCAN_INTERVAL`, `agents/roomlerd/src/watchdog.rs:92`) | 30 s of `std::thread::sleep` (`THREAD_WATCHDOG_CHECK_EVERY`, `:214`) |
-| a sleep that came back late | more than 60 s past it (`SUSPEND_TOLERANCE`, `:98`): pump heartbeats reset, no scan (`:561`), line `watchdog detected wall-clock jump (suspend/resume) … lag_secs=N` | more than 10 s late (`THREAD_WATCHDOG_LATE_AFTER`, `:237`): a new baseline instead of a verdict (`:624`), line `watchdog-of-watchdog: its sleep came back Ns late, so this whole process did not run … heartbeat_moved=…` |
+| its sleep | 5 s on a tokio timer (`SCAN_INTERVAL`, `agents/roomlerd/src/watchdog.rs:92`) | 30 s of `std::thread::sleep` (`THREAD_WATCHDOG_CHECK_EVERY`, `:263`) |
+| a sleep that came back late | more than 60 s past it (`SUSPEND_TOLERANCE`, `:98`): pump heartbeats reset, no scan (`:610`), line `watchdog detected wall-clock jump (suspend/resume) … lag_secs=N` | more than 10 s late (`THREAD_WATCHDOG_LATE_AFTER`, `:286`): a new baseline instead of a verdict (`:673`), line `watchdog-of-watchdog: its sleep came back Ns late, so this whole process did not run … heartbeat_moved=…` |
 | a runtime that is really stuck | exits at its pump's threshold | exits 60–90 s in, and after a late sleep one check later at most |
 
 Until #3530 the watchdog-of-watchdog had no guard, and one freeze in
@@ -6767,18 +6772,18 @@ sequenceDiagram
   late. 10 s leaves 20 s of margin and is still far above any
   scheduler's lateness. The test
   `the_late_bound_catches_every_freeze_that_would_read_as_a_stall`
-  (`watchdog.rs:1772`) walks every φ and F.
+  (`watchdog.rs:1867`) walks every φ and F.
 - **What it costs.** The new baseline throws away at most one interval
   of evidence, so a stuck runtime is caught one check later at most
   (`a_late_sleep_then_a_real_stall_exits_within_one_extra_check`,
-  `:1740`). A host so starved that a sleeping thread wakes 10 s late at
+  `:1835`). A host so starved that a sleeping thread wakes 10 s late at
   every check would put the exit off indefinitely, and it would not
   run a restarted daemon either.
 - **The line goes out on a thread of its own** (`say_the_process_did_not_run`,
-  `:655`). `tracing`'s stdout layer waits for whatever reads stdout
+  `:704`). `tracing`'s stdout layer waits for whatever reads stdout
   (journald, a console nobody reads, #3438), and the
   watchdog-of-watchdog must never wait. One line is in flight at a
-  time (`PAUSE_LINE_IN_FLIGHT`, `:645`), so a sink that never answers
+  time (`PAUSE_LINE_IN_FLIGHT`, `:694`), so a sink that never answers
   holds one thread. `heartbeat_moved=false` marks the pause that was an
   exit before #3530.
 - **Why a lab loop rarely trips the old code.** The exit needs a freeze

@@ -1655,7 +1655,7 @@ jobs:
       # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
       # `sudo roomlerd one-row` and the person's own child, whose plans, lines
       # and records every lane tests, on the platform they serve; the `mac`
-      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with 9 and every other keeps its code, on the libc whose `exit` it hooks).
+      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks).
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
