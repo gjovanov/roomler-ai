@@ -657,11 +657,11 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 |---|---|---|
 | Root's config with both switches | one row already: the package only | `macos_root_layout` (`scripts/install.sh:1014-1022`), as the guard reads it |
 | Root's config without them: two rows, or P2 | its layout kept; the NOTE names `sudo roomlerd one-row`, five minutes after the install (#4097) | the same |
-| The person's config holds an enrollment, in either tree, or its person cannot read it | its layout kept, the per-user half; the NOTE names `--one-row` and a new token | `person_enrolled` (`:1062-1074`), as that person (FR-147) |
-| None of these, with `--token` or `--pair` | one row (`install_macos_one_row`, `:1157`) | |
+| The person's config holds an enrollment, in either tree, or its person cannot read it, or sudo cannot run as that person (a WARNING says so) | its layout kept, the per-user half; the NOTE names `--one-row` and a new token | `person_enrolled` (`:1062-1080`), as that person (FR-147) |
+| None of these, with `--token` or `--pair` | one row (`install_macos_one_row`, `:1163`) | |
 | None of these, nothing to enroll with | the per-user half, not enrolled, as before; the NOTE says what gives one row | |
 
-`--per-user` (named in the flip's PR) is the old plain route, byte for byte in the harness's record. `--download-only` plans the one-row steps. A release without `enroll --one-row` takes the per-user half with a WARNING (`:1198-1203`), where `--one-row` stops. The dashboard's macOS note says what the one-liner installs (`ui/src/utils/enrollCommands.ts:254-257`). `scripts/install-sh-output-check.sh` runs each row under dash, bash 5 and bash 3.2.
+`--per-user` (named in the flip's PR) is the old plain route, byte for byte in the harness's record. `--download-only` plans the one-row steps. A release without `enroll --one-row` takes the per-user half with a WARNING (`:1204-1209`), where `--one-row` stops. The dashboard's macOS note says what the one-liner installs (`ui/src/utils/enrollCommands.ts:254-257`). `scripts/install-sh-output-check.sh` runs each row under dash, bash 5 and bash 3.2.
 
 ### What does not move
 

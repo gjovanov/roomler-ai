@@ -1055,13 +1055,19 @@ as_account() {
 }
 
 # FR-43 — whether ACCOUNT's per-user config holds an enrollment, read as that
-# account. The safe side is enrolled: a home that cannot be found, or a config
-# there that its own account cannot read, keeps the Mac's layout.
-# RETIRED-NAME-ANCHOR(4): the trees the daemon resolves, new first (appdirs.rs
-# OLD_APP): live.roomler.roomler, then live.roomler.roomler-agent, pre-rename.
+# account. The safe side is enrolled: a home that cannot be found, a sudo that
+# cannot run as that account (a mistyped password, a cancel, no right to), or a
+# config there that its own account cannot read keeps the Mac's layout. sudo is
+# asked once, before the reads, and remembers a yes for them.
 person_enrolled() {
     home="$(home_of "$1")"
     [ -n "$home" ] || return 0
+    as_account "$1" true || {
+        warn "sudo could not run as $1, so this script cannot tell whether their per-user half is enrolled already: this Mac installs its per-user half, as before one row became the default"
+        return 0
+    }
+    # RETIRED-NAME-ANCHOR: the trees the daemon resolves, new first (appdirs.rs
+    # OLD_APP): live.roomler.roomler, then live.roomler.roomler-agent, pre-rename.
     for tree in live.roomler.roomler live.roomler.roomler-agent; do
         f="$home/Library/Application Support/$tree/config.toml"
         as_account "$1" test -e "$f" || continue
@@ -1202,7 +1208,7 @@ install_macos_one_row() {
             macos_after_package "$daemon_bin"
             return 0
         fi
-        echo "error:this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
+        echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
         exit 1
     fi
 

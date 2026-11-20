@@ -185,6 +185,12 @@ grep -q '^tester:' /etc/passwd || {
     echo 'tester:x:1000:' >>/etc/group
 }
 mkdir -p /home/tester && chown 1000:1000 /home/tester
+# Another person, signed in at the console of a Mac where the one-liner runs
+# as tester (CONSOLE=tester2): their config is asked about through sudo.
+grep -q '^tester2:' /etc/passwd || {
+    echo 'tester2:x:1001:1001:tester2:/home/tester2:/bin/sh' >>/etc/passwd
+    echo 'tester2:x:1001:' >>/etc/group
+}
 
 for t in awk basename cat chmod cp cut dirname env find grep gzip head id ln ls \
     mkdir mv od rm rmdir sed sha256sum sort tail tar tee touch tr wc xargs; do
@@ -225,7 +231,8 @@ case "$me" in
         esac ;;
     hostname) echo check-host ;;
     stat)
-        if [ "$*" = "-f %Su /dev/console" ]; then echo tester; else exec /usr/bin/stat "$@"; fi ;;
+        if [ "$*" != "-f %Su /dev/console" ]; then exec /usr/bin/stat "$@"; fi
+        if [ -f "$C/console" ]; then cat "$C/console"; else echo tester; fi ;;
     mktemp)
         # The same names on every run, so that two scripts' calls compare.
         d=0 t=""
@@ -398,7 +405,9 @@ SH=""
 # the daemon resolves), old (enrolled, in the tree from before the rename),
 # locked (enrolled, and not even its account can read it) or bare (no
 # enrollment in it). NO_ONE_ROW=1 makes the daemon a release from before
-# `enroll --one-row`. The records land in $RUNS/$SH/CASE.
+# `enroll --one-row`. CONSOLE=tester2 signs that other person in at the
+# console, while the script still runs as tester. The records land in
+# $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
@@ -441,6 +450,7 @@ run() {
     [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
     [ -z "${FAILS:-}" ] || printf '%s' "${FAILS#* }" >"$C/fails.${FAILS%% *}"
     [ "${NO_ONE_ROW:-0}" = 0 ] || : >"$C/no-one-row"
+    [ -z "${CONSOLE:-}" ] || printf '%s\n' "$CONSOLE" >"$C/console"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -468,9 +478,10 @@ lines() {
     got=$(grep -cF -- "$1" "$C/out.txt" || true)
     [ "$got" = "$2" ] || WHY="$WHY"$'\n'"    $got line(s) carry '$1', want $2"
 }
+# WANT_RC=<n> before done_case is the exit code the case wants (0 otherwise).
 done_case() {
     rc=$(cat "$C/rc")
-    [ "$rc" = 0 ] || WHY="$WHY"$'\n'"    exit code $rc, want 0"
+    [ "$rc" = "${WANT_RC:-0}" ] || WHY="$WHY"$'\n'"    exit code $rc, want ${WANT_RC:-0}"
     # Text, newline and tab only, on stdout and stderr alike: an ESC or any
     # other control byte there is what the alphabet is for. Bytes from 0x80
     # up stay allowed, as the script's own UTF-8 text.
@@ -669,6 +680,16 @@ for SH in $SHELLS; do
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
     READS='roomlerd [enroll] [--help]' run pkg-one-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${one[@]}"
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    # The same on a release from before P3d, which has no `enroll --one-row`:
+    # asked for by name, one row stops there, with exit 1, before anything
+    # enrolls (the token is not spent), and says what to run instead.
+    oneold="error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it."
+    NO_ONE_ROW=1 run pkg-one-row-old-release/normal Darwin arm64 0 normal "$new" 0 "${one[@]}"
+    want "$R agent-v0.4.221"; lines "$R" 1; lines "$V" 0; want "$oneold"; lines "has no 'enroll --one-row'" 1
+    lines "as its one row" 0
+    enrolls=$(cat "$C/calls.log" "$C/roomlerd.log" | grep -F '[enroll]' | grep -vcF '[enroll] [--help]' || true)
+    [ "$enrolls" = 0 ] || WHY="$WHY"$'\n'"    $enrolls enroll call(s) besides enroll --help, want none"
+    WANT_RC=1 done_case
 
     # FR-43 — --per-user: the per-user half alone, the layout a Mac got by
     # default before the flip, call for call (the record's pkg before it).
@@ -719,6 +740,16 @@ for SH in $SHELLS; do
     # the person (sudo -H -u), and a Mac not enrolled yet is one row.
     AS_ROOT=1 run pkg-default-root/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
     says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    # Another person at the console, the script run as tester: their config is
+    # asked about through sudo, once first whether sudo can run as them at
+    # all. A sudo that cannot (a mistyped password, a cancel, no right to)
+    # cannot tell, so the Mac takes the safe side, never the one-row default,
+    # and says why. A sudo that can goes on to the reads.
+    refused="WARNING: sudo could not run as tester2, so this script cannot tell whether their per-user half is enrolled already: this Mac installs its per-user half, as before one row became the default"
+    CONSOLE=tester2 FAILS='sudo [true]' run pkg-default-sudo-refused/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$refused"; want "$pu"; want "$kept"; lines "as its one row" 0; done_case
+    CONSOLE=tester2 run pkg-default-other-console/normal Darwin arm64 0 normal "$new" 0 "${usr1[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$row"; lines "sudo could not run as" 0; want "==> done."; done_case
     # Paired, not pasted (--pair): one approval is the one row of a Mac that is
     # not enrolled yet. With --per-user it pairs the per-user half, and the NOTE
     # names the root half's own pairing after it (two rows).

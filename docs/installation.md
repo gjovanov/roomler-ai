@@ -1895,7 +1895,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2175-2254`):
+exit code (`scripts/install.sh:2181-2260`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -1911,14 +1911,14 @@ exit code (`scripts/install.sh:2175-2254`):
 | Line | What it says | When its source cannot be read |
 |---|---|---|
 | `release named by the server's feed: <tag>` (`name_release`, called at `:712` on Linux and `:882` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
-| `installed daemon's own --version: <v>` (`report_installed_version`, `:2224`, called at `:2314`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
+| `installed daemon's own --version: <v>` (`report_installed_version`, `:2230`, called at `:2320`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
 | `NOTE: the installed daemon's <v> differs from the release this script resolved, <tag>` | printed only when both are readable and the tag without `agent-v` is not `<v>` | not printed |
 
 What the feed or the binary says is printed only when it fits the alphabet `A-Z a-z 0-9 . _ + -` and
-64 characters (`fits_alphabet`, `:2181`), so a tag cannot carry terminal control onto the screen. The
+64 characters (`fits_alphabet`, `:2187`), so a tag cannot carry terminal control onto the screen. The
 tag is read from the line its release object starts on, which begins with `"tag_name"` as the server
 writes it; any other shape reads as unreadable, never as another release's tag. The tunnel role prints
-neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1425`).
+neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1431`).
 
 `scripts/install-sh-output-check.sh` pipes the real script into the shell as the one-liner does, under
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
@@ -1967,7 +1967,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1645`), and the wizard's root half is the same code:
+`scripts/install.sh:1651`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -1999,7 +1999,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1379`, #2472).
+(`scripts/install.sh:1385`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -2600,8 +2600,8 @@ as the package's guard reads it; and the person's own config, in both trees
 (`live.roomler.roomler`, and `live.roomler.roomler-agent` from before the rename), as <!-- RETIRED-NAME-ANCHOR: the pre-rename tree, which the daemon still resolves (appdirs.rs OLD_APP), so the script reads it too. -->
 that person, never with root's rights (FR-147). The person is the console user, and the
 caller too when the script runs as another person. A home the account database does not
-name, or a config there that its own person cannot read, counts as enrolled: the safe
-side keeps the layout.
+name, a sudo that cannot run as that person (asked once, first; it warns), or a config
+there its own person cannot read counts as enrolled: the safe side keeps the layout.
 
 **`--per-user`** is the per-user half alone: screen sharing and input, with no root
 service and no overlay mesh. It is what the one-liner gave a Mac before the flip, call
@@ -3501,8 +3501,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1587` (the section) — `uninstall_linux` at `:2031`,
-`uninstall_macos` at `:2096`.
+`scripts/install.sh:1593` (the section) — `uninstall_linux` at `:2037`,
+`uninstall_macos` at `:2102`.
 
 ```mermaid
 flowchart TD
@@ -3519,8 +3519,8 @@ flowchart TD
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1868`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2059`) |
-| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1797`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1874`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2065`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1803`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
 | 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
 | 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
 
