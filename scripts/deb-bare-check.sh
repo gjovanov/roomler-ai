@@ -13,7 +13,7 @@
 #     on Debian 12, so this installs with --no-install-recommends: `dpkg -i`
 #     plus a dependency fix, which is how install.sh runs, skips them too.
 #
-# Usage: scripts/deb-bare-check.sh [--image IMAGE]... [--platform P] [--install-sh SCRIPT] DEB...
+# Usage: scripts/deb-bare-check.sh [--image IMAGE]... [--platform P] [--install-sh SCRIPT] [--dns-file F] DEB...
 #   --image       an image to check, repeatable. Default: every base we support.
 #   --platform    docker's --platform, for an emulated arch on a dev box.
 #   --install-sh  also drive this install.sh over the packages, as the wizard's
@@ -26,10 +26,10 @@
 # it), 1 otherwise. docs/installation.md has what each part of the daemon's
 # `depends` is for.
 #
-# A container takes its resolvers from the host (on a systemd-resolved host,
-# /run/systemd/resolve/resolv.conf). In CI, `ci-apt.sh reach --containers` runs
-# before this script, so a runner whose own resolver cannot resolve the mirrors
-# has failed over to a public one first (#3710).
+# A container takes its resolvers from the host's resolv.conf. In CI,
+# `ci-apt.sh reach --containers` runs first, and --dns-file names the `docker
+# run` arguments it writes after a failover to a public resolver, so every
+# container uses that resolver too (#3710). A missing file adds nothing.
 set -euo pipefail
 
 default_images=(ubuntu:22.04 ubuntu:24.04 ubuntu:26.04 debian:12 debian:13)
@@ -165,17 +165,30 @@ case "${1:-}" in
 esac
 
 # On the host: one container per check, in parallel, each log printed whole.
-images=() platform=() install_sh=""
+images=() platform=() install_sh="" dns_file=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) images+=("$2"); shift 2 ;;
         --platform) platform=(--platform "$2"); shift 2 ;;
         --install-sh) install_sh=$2; shift 2 ;;
+        --dns-file) dns_file=$2; shift 2 ;;
         --*) echo "unknown option: $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
-[ $# -gt 0 ] || { echo "usage: $0 [--image IMAGE]... [--platform P] [--install-sh SCRIPT] DEB..." >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: $0 [--image IMAGE]... [--platform P] [--install-sh SCRIPT] [--dns-file F] DEB..." >&2; exit 2; }
+# Only `--dns` and addresses pass into `docker run` from that file.
+dns=()
+if [ -n "$dns_file" ] && [ -s "$dns_file" ]; then
+    while IFS= read -r a; do
+        case "$a" in
+            --dns) ;;
+            '' | *[!0-9A-Fa-f:.]*) echo "not a docker DNS argument in $dns_file: '$a'" >&2; exit 2 ;;
+        esac
+        dns+=("$a")
+    done <"$dns_file"
+    echo "containers resolve through: ${dns[*]} (from $dns_file)"
+fi
 [ ${#images[@]} -gt 0 ] || images=("${default_images[@]}")
 
 # Git Bash hands docker a Windows path and must leave the container's alone.
@@ -210,7 +223,7 @@ run() { # <n> <image> <args for this script in the container>
         docker pull -q "${platform[@]}" "$image" >/dev/null 2>&1 && break
         sleep 5
     done
-    docker run --rm --name "${DEB_BARE_PREFIX:-deb-bare-$$}-$n" "${platform[@]}" "${mounts[@]}" \
+    docker run --rm --name "${DEB_BARE_PREFIX:-deb-bare-$$}-$n" "${platform[@]}" "${dns[@]}" "${mounts[@]}" \
         "$image" bash /check.sh "$@" >"$logs/$n" 2>&1
 }
 

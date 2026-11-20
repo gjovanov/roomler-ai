@@ -160,7 +160,7 @@ jobs:
           printf 'Package: ci-apt-dummy\nVersion: 1.0\nArchitecture: all\nMaintainer: ci-apt self-test <noreply@example.invalid>\nDescription: an empty package for the ci-apt self-test\n' >/tmp/dummy/DEBIAN/control
           dpkg-deb --build /tmp/dummy /tmp/ci-apt-dummy_1.0_all.deb
           rc=0
-          timeout -k 10 420 bash scripts/deb-bare-check.sh --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb >/tmp/dbc-before.log 2>&1 || rc=$?
+          timeout -k 10 420 bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb >/tmp/dbc-before.log 2>&1 || rc=$?
           cat /tmp/dbc-before.log
           echo "deb-bare-check under the fault: rc=$rc"
           [ "$rc" -eq 3 ] && grep -q '^MIRROR UNREACHABLE' /tmp/dbc-before.log || { echo "::error title=ci-apt self-test::deb-bare-check did not read the dead mirror as a mirror failure (rc=$rc, want 3)"; exit 1; }
@@ -180,14 +180,18 @@ jobs:
           s=$(cat /tmp/prepare.secs)
           case "$CELL" in
             healthy)
-              ! grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::a failover on a healthy runner"; exit 1; } ;;
+              ! grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::a failover on a healthy runner"; exit 1; }
+              [ ! -e /tmp/ci-apt.docker-dns ] || { echo "::error title=ci-apt self-test::container DNS arguments on a healthy runner: its containers would not run as they do today"; exit 1; } ;;
             runner-dead | arm64-names)
-              grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not fail over to a public resolver"; exit 1; } ;;
+              grep -q '::warning title=apt mirror DNS' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not fail over to a public resolver"; exit 1; }
+              echo "container DNS arguments: $(tr '
+' ' ' </tmp/ci-apt.docker-dns 2>/dev/null)"
+              grep -qx -- --dns /tmp/ci-apt.docker-dns 2>/dev/null || { echo "::error title=ci-apt self-test::the failover wrote no container DNS arguments to /tmp/ci-apt.docker-dns"; exit 1; } ;;
             all-dead)
               grep -q '::warning title=apt mirrors unreachable' /tmp/prepare.log || { echo "::error title=ci-apt self-test::prepare did not report the mirrors unreachable"; exit 1; }
               [ "$s" -le 120 ] || { echo "::error title=ci-apt self-test::prepare took $s s with every resolver dead (bound: about 90)"; exit 1; } ;;
           esac
-          echo "prepare judged ok for $CELL ($s s)"
+          echo "prepare judged ok for $CELL ($s s) on $ImageOS $ImageVersion"
 
       - name: "The probe asks the names apt uses (#3710)"
         run: |
@@ -296,16 +300,19 @@ jobs:
       - name: "D2: a container started after the failover"
         if: matrix.cell == 'runner-dead'
         run: |
+          # Bare: whether a container sees the switch by itself (the D2
+          # measurement). Then as the container steps start one: with the
+          # arguments the helper wrote, which must reach the mirror.
           bash "$H/ci-apt-fault.sh" container-reach | tee /tmp/ctr-after.log
-          if grep -q REACHED=no /tmp/ctr-after.log; then
-            echo "D2: the container did not take the failover; with --dns:"
-            bash "$H/ci-apt-fault.sh" container-reach --dns 1.1.1.1 --dns 8.8.8.8
-          fi
-          echo "D2 summary on ${{ matrix.runner }}: before the failover $(grep -o 'REACHED=.*' /tmp/ctr-before.log), after it $(grep -o 'REACHED=.*' /tmp/ctr-after.log)"
+          DNS=(); [ ! -s /tmp/ci-apt.docker-dns ] || mapfile -t DNS </tmp/ci-apt.docker-dns
+          echo "the helper's container arguments: ${DNS[*]:-none}"
+          bash "$H/ci-apt-fault.sh" container-reach "${DNS[@]}" | tee /tmp/ctr-helper.log
+          echo "D2 summary on ${{ matrix.runner }} ($ImageVersion): before the failover $(grep -o 'REACHED=.*' /tmp/ctr-before.log), after it bare $(grep -o 'REACHED=.*' /tmp/ctr-after.log), with the helper's arguments $(grep -o 'REACHED=.*' /tmp/ctr-helper.log)"
+          grep -q REACHED=yes /tmp/ctr-helper.log || { echo "::error title=ci-apt self-test::a container started with the helper's arguments did not reach its mirror after the failover"; exit 1; }
 
       - name: "deb-bare-check after the failover: the same package passes"
         if: matrix.cell == 'runner-dead'
-        run: timeout -k 10 300 bash scripts/deb-bare-check.sh --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb
+        run: timeout -k 10 300 bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns --image ubuntu:24.04 /tmp/ci-apt-dummy_1.0_all.deb
 
       - name: The fault was hit while the cell ran
         if: always() && matrix.cell != 'healthy'
