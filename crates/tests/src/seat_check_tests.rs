@@ -50,6 +50,11 @@ const GUARD_ADMITS: &str =
     "seat check: the room guard admits a seat its reads found gone; the seat stays";
 const GUARD_ADMITS_ALERT: &str = "seat_check_guard_admits";
 
+/// The warnings of a read, and of a room guard, that keep failing: each from
+/// the third failure in a row.
+const READ_KEEPS_FAILING: &str = "seat check: the admissions read keeps failing";
+const GUARD_KEEPS_FAILING: &str = "seat check: the room guard keeps failing to answer";
+
 /// The seat key of `user_id` in `room_id`.
 fn key(room_id: &str, user_id: &str) -> SeatKey {
     (oid_of(room_id), oid_of(user_id))
@@ -222,6 +227,14 @@ impl Captured {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// How many lines logged here carry `wording` as a warning.
+    fn warnings_of(&self, wording: &str) -> usize {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(" WARN ") && line.contains(wording))
+            .count()
     }
 }
 
@@ -551,7 +564,7 @@ async fn a_room_row_without_its_org_is_not_read() {
 
 /// T5. A read that fails ends no seat and keeps the count: the miss before
 /// it still counts, so the next complete read that finds the admission gone
-/// ends the seat.
+/// ends the seat. Three failed reads in a row: the third warns.
 #[tokio::test]
 async fn a_failed_read_ends_no_seat_and_keeps_the_count() {
     let app = TestApp::spawn().await;
@@ -567,19 +580,30 @@ async fn a_failed_read_ends_no_seat_and_keeps_the_count() {
     let since = Instant::now();
     let mut memory = SeatCheckMemory::default();
     passes_end_nothing(&app, &mut memory, 1, "the first reading").await;
-    let read = read_seats(&refused, &mut memory).await;
-    eprintln!("T5 the failed read: {:?}", read.failed);
-    assert!(read.failed.is_some(), "a read on a refusing server fails");
-    assert!(read.verdicts.is_empty(), "a failed read gives no verdict");
-    let ended = end_seats(&refused, &mut memory, &read).await;
-    assert!(ended.is_empty(), "a failed read ended {ended:?}");
-    assert_seated(&app, &conn, &r, "the member, after the failed read");
+    let log = Captured::default();
+    for n in 1..=3 {
+        let read = read_seats(&refused, &mut memory)
+            .with_subscriber(log.dispatch())
+            .await;
+        eprintln!("T5 failed read {n}: {:?}", read.failed);
+        assert!(read.failed.is_some(), "a read on a refusing server fails");
+        assert!(read.verdicts.is_empty(), "a failed read gives no verdict");
+        let ended = end_seats(&refused, &mut memory, &read).await;
+        assert!(ended.is_empty(), "a failed read ended {ended:?}");
+        assert_eq!(
+            log.warnings_of(READ_KEEPS_FAILING),
+            usize::from(n == 3),
+            "the third failed read in a row warns, and no read before it: {}",
+            log.text()
+        );
+    }
+    assert_seated(&app, &conn, &r, "the member, after the failed reads");
 
     let ended = check_seats_once(state, &mut memory).await;
     assert_eq!(
         ended,
         vec![key(&r, &member.id)],
-        "the next complete read ends the seat: the miss before the failed read was kept"
+        "the next complete read ends the seat: the miss before the failed reads was kept"
     );
     heard_seat_end_once(&mut ws, &r, "the member").await;
     within_the_loops_window(since);
@@ -791,7 +815,8 @@ async fn a_seat_the_room_guard_admits_is_not_ended_whatever_the_reads_found() {
 
 /// T10. A seat whose room guard cannot answer is kept: with a real verdict
 /// (the member's org row gone, two readings), the end half, run where
-/// whatever the guard reads cannot be reached, ends nothing.
+/// whatever the guard reads cannot be reached, ends nothing. Run three times
+/// on that verdict: the third unanswered ask in a row warns.
 #[tokio::test]
 async fn a_seat_whose_room_guard_cannot_answer_is_kept() {
     let app = TestApp::spawn().await;
@@ -812,11 +837,22 @@ async fn a_seat_whose_room_guard_cannot_answer_is_kept() {
     let read = read_seats(state, &mut memory).await;
     assert_eq!(keys(&read), vec![seat], "two readings give the verdict");
 
-    let ended = end_seats(&unreachable, &mut memory, &read).await;
-    assert!(
-        ended.is_empty(),
-        "a seat was ended though its room guard could not answer: {ended:?}"
-    );
+    let log = Captured::default();
+    for n in 1..=3 {
+        let ended = end_seats(&unreachable, &mut memory, &read)
+            .with_subscriber(log.dispatch())
+            .await;
+        assert!(
+            ended.is_empty(),
+            "a seat was ended though its room guard could not answer: {ended:?}"
+        );
+        assert_eq!(
+            log.warnings_of(GUARD_KEEPS_FAILING),
+            usize::from(n == 3),
+            "the third unanswered ask in a row warns, and no ask before it: {}",
+            log.text()
+        );
+    }
     assert_seated(&app, &conn, &r, "the member whose guard cannot answer");
     heard_no_call_end(&mut ws, &r, "the member").await;
     within_the_loops_window(since);
