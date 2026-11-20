@@ -379,3 +379,132 @@ async fn refan_tenant(state: &NetworkState, tenant_id: ObjectId) {
     // FR-19 — a policy edit can un-grant a live relay session; revoke those.
     crate::org_relay::reconcile_acl(state, tenant_id).await;
 }
+
+#[cfg(test)]
+mod tests {
+    //! #3636 — what an overlay-ACL answer carries on the wire. Every id is the
+    //! 24-hex string `docs/api.md` promises: the Overlay ACL tab names a
+    //! source or a via node by it, and its editor sends it back when it saves.
+
+    use super::*;
+    use bson::DateTime;
+    use roomler_ai_remote_control::models::{PortRange, ProtocolKind};
+    use serde_json::Value;
+
+    /// A stored rule that names every source and via kind there is: a node,
+    /// a user and a role as sources, then the catch-all; the node as the via,
+    /// then the catch-all. The three ids, in that order.
+    fn every_kind() -> (OverlayPolicy, [ObjectId; 3]) {
+        let ids = [ObjectId::new(), ObjectId::new(), ObjectId::new()];
+        let [node, user, role] = ids;
+        let now = DateTime::now();
+        let policy = OverlayPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: "every kind".into(),
+            enabled: true,
+            sources: vec![
+                OverlaySelector::NodeId { node_id: node },
+                OverlaySelector::UserId { user_id: user },
+                OverlaySelector::RoleId { role_id: role },
+                OverlaySelector::AllNodes,
+            ],
+            via: vec![
+                OverlayTarget::NodeId { node_id: node },
+                OverlayTarget::AllNodes,
+            ],
+            destinations: vec![OverlayRule {
+                cidr: "192.0.2.1/32".into(),
+                port_range: PortRange { low: 9, high: 9 },
+                proto: ProtocolKind::Tcp,
+            }],
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        (policy, ids)
+    }
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// What is wrong with `entries` as the browser reads them, against
+    /// `want`: `(kind, the id)`, `None` for a catch-all. An id must be the
+    /// 24-hex string of the stored one; a catch-all is the single key `kind`;
+    /// nothing is lost, added or reordered.
+    fn wire_problems(
+        what: &str,
+        entries: &Value,
+        want: &[(&str, Option<ObjectId>)],
+    ) -> Vec<String> {
+        let Some(got) = entries.as_array() else {
+            return vec![format!("{what}: not an array: {entries}")];
+        };
+        let mut wrong = Vec::new();
+        if got.len() != want.len() {
+            wrong.push(format!(
+                "{what}: {} entries, want {}: {entries}",
+                got.len(),
+                want.len()
+            ));
+        }
+        for (i, (entry, (kind, id))) in got.iter().zip(want).enumerate() {
+            let at = format!("{what}[{i}] ({kind})");
+            if entry["kind"] != *kind {
+                wrong.push(format!("{at}: the kind is {}", entry["kind"]));
+            }
+            let keys = entry.as_object().map_or(0, |o| o.len());
+            match id {
+                None if keys != 1 => wrong.push(format!(
+                    "{at}: a catch-all is the single key `kind`: {entry}"
+                )),
+                None => {}
+                Some(id) => match entry["id"].as_str() {
+                    None => wrong.push(format!("{at}: the id is not a string: {entry}")),
+                    Some(s) if !is_hex24(s) => {
+                        wrong.push(format!("{at}: the id is not 24 lowercase hex: {s}"))
+                    }
+                    Some(s) if s != id.to_hex() => {
+                        wrong.push(format!("{at}: the id {s} is not the stored {id}"))
+                    }
+                    Some(_) if keys != 2 => {
+                        wrong.push(format!("{at}: `kind` and `id` only: {entry}"))
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        wrong
+    }
+
+    /// The answer of every overlay-acl route that returns a rule (create,
+    /// list, get, update) is an `OverlayPolicyResponse`: its source and via
+    /// ids are hex strings, never bson's extended JSON `{"$oid": …}`, by
+    /// which the Overlay ACL tab could name no node, user or role.
+    #[test]
+    fn an_overlay_policy_answer_names_every_source_and_via_id_as_a_hex_string() {
+        let (policy, [node, user, role]) = every_kind();
+        let answer = serde_json::to_value(OverlayPolicyResponse::from(policy)).expect("serialises");
+        let mut wrong = wire_problems(
+            "sources",
+            &answer["sources"],
+            &[
+                ("node_id", Some(node)),
+                ("user_id", Some(user)),
+                ("role_id", Some(role)),
+                ("all_nodes", None),
+            ],
+        );
+        wrong.extend(wire_problems(
+            "via",
+            &answer["via"],
+            &[("node_id", Some(node)), ("all_nodes", None)],
+        ));
+        let text = answer.to_string();
+        if text.contains("$oid") {
+            wrong.push(format!("the answer carries `$oid`: {text}"));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
