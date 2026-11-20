@@ -9851,4 +9851,420 @@ mod macos_kernel_tests {
             "and nothing written"
         );
     }
+
+    // #4125 — a packet the Mac sends to its own overlay address goes into
+    // the utun (#4117's shape gives the address a host route there, and
+    // macOS adds no local route for a utun's own address). The read path
+    // hands it back to the kernel, which delivers it.
+
+    /// How long a datagram or a reply may take to arrive.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    /// The window after an exchange in which nothing more may arrive.
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+    /// The words of the one INFO line a utun logs at its first hand-back.
+    const HANDED_BACK: &str = "was handed back to the OS";
+
+    /// How many packets `tun` has handed back to the kernel. Nothing hands
+    /// back yet: the fix reads the utun's own count here.
+    fn handed_back(_tun: &SystemTun) -> u64 {
+        0
+    }
+
+    /// The read path as the runtime drives it: one task reads the utun for as
+    /// long as the receiver lives, and every packet `read_packet` returns
+    /// comes out of the receiver. A packet the read hands back never does.
+    fn read_utun(tun: std::sync::Arc<SystemTun>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(p) = tun.read_packet().await {
+                if tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    /// How many of the packets read so far are addressed to `own`, by its
+    /// IPv4 or by its derived IPv6. Drains what it counts.
+    fn reads_to(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, own: Ipv4Addr) -> usize {
+        let mut n = 0;
+        while let Ok(p) = rx.try_recv() {
+            if crate::overlay::router::Router::dst_of_ip_packet(&p) == Some(own) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A UDP socket on `ip`'s port 53, where the overlay's resolver binds, or
+    /// on a port the kernel picks when this runner cannot bind 53 (said on
+    /// stderr). A fresh IPv6 address cannot be bound until its duplicate
+    /// address check ends, so an unavailable address is tried again for a
+    /// few seconds.
+    async fn bind_port_53(ip: std::net::IpAddr) -> tokio::net::UdpSocket {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::UdpSocket::bind((ip, 53)).await {
+                Ok(s) => return s,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable
+                        && std::time::Instant::now() < until =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    let s = tokio::net::UdpSocket::bind((ip, 0))
+                        .await
+                        .unwrap_or_else(|e2| panic!("binding {ip}: {e2} (port 53: {e})"));
+                    eprintln!(
+                        "note: port 53 of {ip} cannot be bound on this runner ({e}); using port {}",
+                        s.local_addr().unwrap().port()
+                    );
+                    return s;
+                }
+            }
+        }
+    }
+
+    /// The echoes `ping`'s summary says came back (`3 packets received`).
+    fn echoes_received(summary: &str) -> Option<u32> {
+        let line = summary.lines().find(|l| l.contains("packets received"))?;
+        let head = line.split(" packets received").next()?;
+        head.rsplit(|c: char| !c.is_ascii_digit())
+            .find(|t| !t.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    /// A DNS query for `name`'s A record.
+    fn dns_query(name: &str) -> Vec<u8> {
+        let mut m = vec![0x41, 0x25, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.extend_from_slice(&[0, 0, 1, 0, 1]);
+        m
+    }
+
+    /// #4125 (a) — a UDP datagram the Mac sends to its own overlay address
+    /// reaches a socket bound there, and its reply comes back.
+    #[tokio::test]
+    async fn a_datagram_to_its_own_address_is_delivered_and_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        eprintln!(
+            "measure (#4125): route -n get {own}:\n{}",
+            sh("route", &["-n", "get", &own.to_string()])
+        );
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(WAIT, server.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("a datagram to {to} is not delivered within {WAIT:?}"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"query");
+        server.send_to(b"answer", from).await.unwrap();
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the reply from {to} to {from} never comes back"))
+            .unwrap();
+        assert_eq!(&buf[..n], b"answer");
+    }
+
+    /// #4125 (b) — `ping <own address>` on the Mac is answered, and each echo
+    /// is two hand-backs: the request and its reply.
+    #[tokio::test]
+    async fn a_ping_to_its_own_address_is_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let before = handed_back(&tun);
+        let target = own.to_string();
+        // On the blocking pool: this thread keeps polling the reader.
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("ping")
+                .args(["-c", "3", "-t", "5", target.as_str()])
+                .output()
+        })
+        .await
+        .unwrap()
+        .expect("ping runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            echoes_received(&text),
+            Some(3),
+            "ping {own} on the Mac is not answered:\n{text}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            6,
+            "two hand-backs per echo, the request and its reply:\n{text}"
+        );
+    }
+
+    /// #4125 (c) — a handed-back packet is delivered, not forwarded: one
+    /// datagram is one hand-back and its reply one more, nothing addressed to
+    /// the utun comes out of the read, and nothing comes back into the utun
+    /// for two seconds after. One INFO line, at the first hand-back.
+    #[tokio::test]
+    async fn a_handed_back_packet_is_delivered_once_and_never_read_again() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let (logs, _guard) = Logs::start();
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+
+        client.send_to(b"query", to).await.expect("send");
+        let mut sbuf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut sbuf)).await;
+        let read = reads_to(&mut reads, own);
+        assert_eq!(
+            handed_back(&tun) - before,
+            1,
+            "one datagram, one hand-back (read_packet returned {read} packet(s) to {own}; \
+             delivered: {})",
+            got.is_ok()
+        );
+        assert_eq!(read, 0, "a packet to {own} came out of read_packet");
+        let (_, from) = got.expect("delivered").unwrap();
+
+        server.send_to(b"answer", from).await.unwrap();
+        let mut cbuf = [0u8; 64];
+        tokio::time::timeout(WAIT, client.recv_from(&mut cbuf))
+            .await
+            .expect("the reply comes back")
+            .unwrap();
+        assert_eq!(handed_back(&tun) - before, 2, "and one more for its reply");
+
+        let (s, c) = tokio::join!(
+            tokio::time::timeout(QUIET, server.recv_from(&mut sbuf)),
+            tokio::time::timeout(QUIET, client.recv_from(&mut cbuf)),
+        );
+        assert!(
+            s.is_err() && c.is_err(),
+            "a datagram arrived twice: {s:?} {c:?}"
+        );
+        assert_eq!(
+            handed_back(&tun) - before,
+            2,
+            "nothing came back into the utun for {QUIET:?}"
+        );
+        assert_eq!(
+            reads_to(&mut reads, own),
+            0,
+            "and nothing to {own} was read"
+        );
+        assert_eq!(
+            logs.lines_with(HANDED_BACK).len(),
+            1,
+            "one INFO line, at the first hand-back:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4125 (d) — `ROOMLERD_OVERLAY_UTUN_SELF_DELIVERY=0`: nothing is handed
+    /// back. The datagram is read from the utun, as before the hand-back, and
+    /// never delivered. Safe to set here, as the other kill-switch tests say.
+    #[tokio::test]
+    async fn the_kill_switch_hands_nothing_back() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _restore = crate::env::test_env::Saved::cleared("OVERLAY_UTUN_SELF_DELIVERY");
+        // SAFETY: the kernel tests run on one thread; nothing else reads it.
+        unsafe { crate::env::test_env::set("OVERLAY_UTUN_SELF_DELIVERY", "0") };
+
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own.into()).await;
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(QUIET, server.recv_from(&mut buf)).await;
+        assert!(
+            got.is_err(),
+            "switched off, a datagram to {to} is not delivered: {got:?}"
+        );
+        assert_eq!(
+            reads_to(&mut reads, own),
+            1,
+            "switched off, the datagram is read from the utun"
+        );
+        assert_eq!(handed_back(&tun), 0, "switched off, nothing is handed back");
+    }
+
+    /// #4125 (e) — the same exchange with the node's derived IPv6. It also
+    /// prints what macOS does with a packet to that address: the route its
+    /// lookup answers, and whether the packet came out of the utun.
+    #[tokio::test]
+    async fn a_datagram_to_its_own_derived_v6_is_delivered_and_answered() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let own_v6 = crate::overlay::router::derive_overlay_v6(own);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let iface = tun.if_name().to_string();
+        let mut reads = read_utun(tun.clone());
+        let server = bind_port_53(own_v6.into()).await;
+        eprintln!(
+            "measure (#4125 v6): ifconfig {iface}:\n{}\nroute -n get -inet6 {own_v6}:\n{}\n\
+             netstat -rn -f inet6, the overlay's lines:\n{}",
+            sh("ifconfig", &[&iface]),
+            sh("route", &["-n", "get", "-inet6", &own_v6.to_string()]),
+            sh("netstat", &["-rn", "-f", "inet6"])
+                .lines()
+                .filter(|l| l.contains("fd72:6f6f:6d6c"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let to = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let before = handed_back(&tun);
+        client.send_to(b"query", to).await.expect("send");
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(WAIT, server.recv_from(&mut buf)).await;
+        let read = reads_to(&mut reads, own);
+        eprintln!(
+            "measure (#4125 v6): the datagram to {to}: delivered={}, read from the utun={read}, \
+             handed back={}",
+            got.is_ok(),
+            handed_back(&tun) - before
+        );
+        let (_, from) = got
+            .unwrap_or_else(|_| {
+                panic!("a datagram to {to} is not delivered (read from the utun: {read})")
+            })
+            .unwrap();
+        server.send_to(b"answer", from).await.unwrap();
+        let back = tokio::time::timeout(WAIT, client.recv_from(&mut buf)).await;
+        eprintln!(
+            "measure (#4125 v6): the reply to {from}: delivered={}, read from the utun={}, \
+             handed back={}",
+            back.is_ok(),
+            reads_to(&mut reads, own),
+            handed_back(&tun) - before
+        );
+        back.unwrap_or_else(|_| panic!("the reply to {from} never comes back"))
+            .unwrap();
+    }
+
+    /// #4125 — the overlay's own resolver, bound to the utun's address as the
+    /// runtime binds it, answers a lookup the Mac sends it: the MagicDNS case.
+    #[tokio::test]
+    async fn the_resolver_on_its_own_address_answers_a_lookup_from_the_mac() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let own = Ipv4Addr::new(100, 65, 0, 5);
+        let peer = Ipv4Addr::new(100, 65, 0, 9);
+        let tun = std::sync::Arc::new(SystemTun::up(own, MASK_22, 1280).expect("utun bring-up"));
+        let _reads = read_utun(tun.clone());
+        let names = crate::overlay::dns::NameMap::default();
+        names.write().await.insert("peer".to_string(), peer);
+        let (bound_tx, mut bound_rx) = tokio::sync::watch::channel(false);
+        let resolver = tokio::spawn(crate::overlay::dns::run(
+            crate::overlay::dns::DnsConfig {
+                bind: std::net::SocketAddr::new(own.into(), 53),
+                magic_domain: "zone.test".to_string(),
+                upstream: "127.0.0.1:9".parse().unwrap(),
+                names,
+                answer_aaaa: false,
+            },
+            bound_tx,
+        ));
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *bound_rx.borrow_and_update() {
+                    return true;
+                }
+                if bound_rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !bound {
+            eprintln!("skipping the lookup: the resolver did not bind {own}:53 on this runner");
+            resolver.abort();
+            return;
+        }
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        client
+            .send_to(&dns_query("peer.zone.test"), (own, 53))
+            .await
+            .expect("send");
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(WAIT, client.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the resolver on {own}:53 gives the Mac no answer"))
+            .unwrap();
+        resolver.abort();
+        assert!(
+            buf[..n].ends_with(&peer.octets()),
+            "the answer is the peer's address: {:02x?}",
+            &buf[..n]
+        );
+    }
 }
