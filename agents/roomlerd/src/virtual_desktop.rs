@@ -304,6 +304,31 @@ pub fn down() -> Option<String> {
     }
 }
 
+/// #4100 — who starts an X client that Remote Apps (FR-56) asked for on a
+/// display of this daemon's ([`start_x_client`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum XStart {
+    /// Remote Apps starts it itself, as before #4100.
+    Direct,
+}
+
+/// #4100 — what Remote Apps asks before it starts an X client on the daemon's
+/// own display: [`start_x_client`] in the daemon, a test's desktop in a test.
+/// The display, the program and its arguments.
+#[cfg(target_os = "linux")]
+pub(crate) type XStarter = std::sync::Arc<dyn Fn(&str, &str, &[&str]) -> XStart + Send + Sync>;
+
+/// #4100 — Remote Apps' door to this daemon's own virtual desktop: who starts
+/// `program` with `args` on `display`. [`XStart::Direct`] in a process that
+/// started no desktop.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_x_client(display: &str, program: &str, args: &[&str]) -> XStart {
+    desktop().map_or(XStart::Direct, |desk| {
+        desk.start_x_client(display, program, args)
+    })
+}
+
 /// #3671 — how many times this daemon's own virtual desktop came back on a new
 /// X server since it started: the X connection a part of the daemon made
 /// under one generation is dead in the next, although `DISPLAY` names the
@@ -1049,6 +1074,8 @@ struct Plan {
     /// Where a test reads the lines the keeper says after `ready`, as the
     /// daemon logs them; `None` in the daemon.
     keeper_lines: Option<KeeperLines>,
+    /// #4100 — how long a Remote Apps start waits for the keeper's answer.
+    x_client_wait: Duration,
 }
 
 /// The lines a keeper said, kept for a test.
@@ -1077,9 +1104,16 @@ impl Plan {
             },
             keeper_ready_timeout: KEEPER_READY_TIMEOUT,
             keeper_lines: None,
+            x_client_wait: X_CLIENT_WAIT,
         }
     }
 }
+
+/// #4100 — how long a Remote Apps start waits for the keeper's answer. A
+/// launch already waits 250 ms for its window, and runs on a blocking thread
+/// of its own, so a few seconds cost nothing a person would notice.
+#[cfg(target_os = "linux")]
+const X_CLIENT_WAIT: Duration = Duration::from_secs(3);
 
 /// How long a start waits for the keeper's `ready`. It starts nothing before
 /// it, so this is a few milliseconds on a working host; a keeper that says
@@ -1887,6 +1921,14 @@ impl Desktop {
                 warn!(%app, %e, "virtual-desktop: startup app failed to launch");
             }
         }
+    }
+
+    /// #4100 — who starts the X client `program` with `args` that Remote Apps
+    /// asked for on `display` ([`start_x_client`]). For now Remote Apps
+    /// starts every one itself, as before #4100.
+    fn start_x_client(&self, display: &str, program: &str, args: &[&str]) -> XStart {
+        let _ = (display, program, args, self.plan.x_client_wait);
+        XStart::Direct
     }
 }
 
@@ -4069,6 +4111,9 @@ mod supervise_tests {
             clients: Clients::Keeper(KeeperCmd::test()),
             keeper_ready_timeout: Duration::from_secs(20),
             keeper_lines: None,
+            // #4100 — short, so that a start the keeper never answers fails
+            // its launch within a test's wait.
+            x_client_wait: Duration::from_secs(2),
         }
     }
 

@@ -477,6 +477,23 @@ pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
     }
 }
 
+/// #4100 — the Linux backend on the virtual desktop `display`, with stand-ins
+/// for its helper programs (tmux, xterm, wmctrl and xprop, in that order) and
+/// asking `start` first, for the virtual desktop's tests (`mod linux` is
+/// private).
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code)] // #4100: the desktop's tests use it from the next commit on
+pub(crate) fn linux_backend_for_tests(
+    display: &str,
+    tools: [String; 4],
+    start: crate::virtual_desktop::XStarter,
+) -> Box<dyn WindowManager> {
+    let target = linux::Target::Daemon {
+        display: display.into(),
+    };
+    Box::new(linux::LinuxWm::with(target, tools, start))
+}
+
 // ---------------------------------------------------------------------------
 // Control-DC entrypoint
 // ---------------------------------------------------------------------------

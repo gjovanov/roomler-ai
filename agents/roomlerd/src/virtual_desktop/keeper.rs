@@ -226,6 +226,35 @@ impl Job {
     }
 }
 
+/// #4100 — an X client Remote Apps asks the keeper to start: one JSON line on
+/// the keeper's input, after the job. Unknown fields are ignored.
+#[allow(dead_code)] // #4100: written and read from the fix on
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Start {
+    /// The daemon's number for this start, which the keeper's answer names.
+    pub(super) id: u64,
+    /// What to run: the program, then its arguments. An argv, never a shell
+    /// line.
+    pub(super) argv: Vec<String>,
+    /// The `CLOCK_MONOTONIC` time, in milliseconds, after which the daemon
+    /// has given up on this start: read later, it starts nothing.
+    pub(super) deadline_ms: u64,
+}
+
+#[allow(dead_code)] // #4100: written and read from the fix on
+impl Start {
+    /// The start as the line the daemon writes.
+    pub(super) fn line(&self) -> String {
+        let mut line = serde_json::to_string(self).unwrap_or_default();
+        line.push('\n');
+        line
+    }
+
+    fn parse(line: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(line).map_err(|e| format!("a start it cannot read: {e}"))
+    }
+}
+
 /// Is this command line the keeper's: the program and [`VERB`], nothing more?
 pub(super) fn is_keeper_argv(mut args: impl Iterator<Item = OsString>) -> bool {
     let _program = args.next();
@@ -533,7 +562,7 @@ impl Book {
         self.wm_delays = WmDelays::of(job);
         self.start_wm(job);
         for app in &job.apps {
-            match spawn_client(app, &job.display) {
+            match spawn_client(app, &[], &job.display) {
                 Ok(pid) => self.apps.push((pid, app.clone())),
                 Err(e) => say(&format!("warn: startup app {app} failed to launch: {e}")),
             }
@@ -545,7 +574,7 @@ impl Book {
     /// first got. One that fails to start is tried again after the next
     /// delay, and said in one line.
     fn start_wm(&mut self, job: &Job) {
-        match spawn_client(&job.wm, &job.display) {
+        match spawn_client(&job.wm, &[], &job.display) {
             Ok(pid) => {
                 self.wm = Some(pid);
                 self.wm_since = Some(Instant::now());
@@ -693,13 +722,14 @@ fn describe_status(status: libc::c_int) -> String {
     }
 }
 
-/// Start one client with `/dev/null` on its stdio and nothing else of the
-/// keeper's open. Its `Child` is dropped: the keeper's loop waits for every
-/// child it has, by pid.
+/// Start one client, `program` with `args`, with `/dev/null` on its stdio and
+/// nothing else of the keeper's open. Its `Child` is dropped: the keeper's
+/// loop waits for every child it has, by pid.
 #[allow(clippy::zombie_processes)] // reaped by `Book::reap` (`waitpid(-1)`)
-fn spawn_client(program: &str, display: &str) -> std::io::Result<i32> {
+fn spawn_client(program: &str, args: &[String], display: &str) -> std::io::Result<i32> {
     let mut cmd = Command::new(program);
-    cmd.env("DISPLAY", display)
+    cmd.args(args)
+        .env("DISPLAY", display)
         .env_remove(TEST_ROLE_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
