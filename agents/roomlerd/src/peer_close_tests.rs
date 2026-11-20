@@ -460,8 +460,8 @@ fn a_healthy_close_still_takes_milliseconds() {
 
 /// Holds a peer's close at its first step until the test opens it. The gate
 /// is the first of the peer's interceptors ([`CloseGate::registry`]), and
-/// `RTCPeerConnection::close` closes its interceptors before anything else.
-/// So a close held here has stopped nothing yet, and it cannot end before
+/// `RTCPeerConnection::close` closes them before it stops anything else. So
+/// a close held here has stopped nothing yet, and it cannot end before
 /// [`CloseGate::open`], whichever worker runs it and whenever (#4086).
 struct CloseGate {
     /// Told when the close reaches the gate.
@@ -553,10 +553,14 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
         close_viewer(viewer_rt.handle(), viewer).await;
         drop((dc, agent));
         let left = settle_to(baseline).await;
+        // Strict on purpose: #4103's two tasks may hold a closed session's
+        // sockets, so its failures stay visible here until it is fixed.
         assert!(
             left <= baseline,
             "{left} tasks alive after both closes, {baseline} before the peers: \
-             a close its caller stopped waiting for was cut short"
+             a close its caller stopped waiting for was cut short (an inline close \
+             cut this way leaves 14). Exactly 2 more than before the peers is \
+             #4103's leftover instead, not a close cut short"
         );
     });
 }
