@@ -262,7 +262,7 @@ reads like a stale-route find.
 
 On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
 keeps the first fields that carry a length
-(`crates/tunnel-core/src/overlay/tun.rs:6406`), and iproute2 prints a host route
+(`crates/tunnel-core/src/overlay/tun.rs:7067`), and iproute2 prints a host route
 without its `/32`. The per-peer routes need no purge there, because the TUN is
 not persistent (`persist off`): the kernel removes it, and every route on it,
 when its last descriptor closes. So a Linux exit logs the exit line only when
@@ -591,12 +591,12 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:4842`, `current_uplink` `tun.rs:6824`, `bsd_default_uplink` `tun.rs:316` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:362`, `bsd_pin_row` `tun.rs:398`, `bsd_pin_holds` `tun.rs:411`, `bsd_table` `tun.rs:6619` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:5664` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:5752`, the gate `route_guard.rs:599` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
-| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:599` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
-| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:393`, `exemption_withheld_reason` `route_guard.rs:405` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
+| Capture the uplink per family, re-read before every pin | `tun.rs:5421`, `current_uplink` `tun.rs:7607`, `bsd_default_uplink` `tun.rs:322` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:368`, `bsd_pin_row` `tun.rs:404`, `bsd_pin_holds` `tun.rs:417`, `bsd_table` `tun.rs:7280` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:6325` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:6413`, the gate `route_guard.rs:600` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:600` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
+| One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:394`, `exemption_withheld_reason` `route_guard.rs:406` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 
 > ⚠️ **A lookup does not show a pin.** A destination a connection has used
 > keeps an interface-scoped clone of the default route (`WASCLONED,IFSCOPE`).
@@ -719,7 +719,7 @@ A node in netstack mode (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`, or
 mesh lives in a userspace stack inside the daemon, reached through a SOCKS5
 front on `127.0.0.1`. Selecting an exit there installs the split-default in
 that userspace router only
-([`route_guard.rs:695`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L695)),
+([`route_guard.rs:696`](../crates/tunnel-core/src/overlay/runtime/route_guard.rs#L695)),
 so the exit carries exactly what the front dials and nothing else.
 
 ```mermaid
