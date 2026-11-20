@@ -1146,12 +1146,102 @@ an installer the old daemon started is still running.
 
 | Platform | How | Window in which a fork on another thread gets a copy |
 |---|---|---|
-| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:2670`) | none |
+| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:3064`) | none |
 | macOS | a utun is a socket, and macOS takes no close-on-exec flag at `socket()`, so the descriptor is marked on the line after the create | create → mark. The long-lived children and every child that runs a caller's code sweep everything above stderr ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)) |
 | Windows | Wintun has no descriptor to inherit | — |
 
 `tun_kernel_tests` (`agents/roomlerd/src/overlay.rs:1394`) checks it against a
 real kernel in CI, as root.
+
+### A Mac's utun: its own address as peer, and the block routed on it (#4117)
+
+A utun is a point-to-point interface, and macOS routes nothing from a
+point-to-point address that has no peer. The `tun` crate sets the address and
+the netmask with no peer (SIOCSIFADDR, then SIOCSIFNETMASK), so through 0.4.228
+a Mac's utun came up without the overlay block's route:
+
+```text
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+        inet 100.65.0.5 --> 28.30.0.0 netmask 0xff000000
+```
+
+`netstat -rn -f inet` listed no IPv4 route on the utun, so the node's own
+address had no route, and neither had any address of the block that no peer
+holds. `28.30.0.0` is not an address the kernel holds: it is `ifconfig`
+printing an empty peer. Each peer's own `/32` was on the utun all along (route
+guard, above), which is why a mesh with peers kept working.
+
+The bring-up now gives the first address the shape wg-quick gives a utun on
+macOS, routes the block on it and reads both back (`shape_utun_v4`,
+`crates/tunnel-core/src/overlay/tun.rs:6761`, called from `up_with` at
+`tun.rs:4664`):
+
+```mermaid
+flowchart TD
+    up["the tun crate sets the address and the netmask, no peer"] --> peer{"is the address its own peer, with the block's mask?"}
+    peer -- no --> alias["ifconfig utunN inet self self netmask mask alias"]
+    peer -- yes --> block{"does the block's own lookup answer the utun?"}
+    alias --> block
+    block -- no --> add["route -n add -inet -net block -prefixlen plen -interface utunN"]
+    block -- yes --> read["read both back"]
+    add --> read
+    read -- "the shape holds" --> info["one INFO: utun shaped"]
+    read -- "it does not" --> warn["one WARN naming what is wrong, and the bring-up goes on"]
+```
+
+| Step | Command (argv from) | Skipped when | What the kernel does (measured on a macOS 26 CI runner) |
+|---|---|---|---|
+| The address as its own peer, with the block's mask | `ifconfig <utun> inet <self> <self> netmask <mask> alias` (`utun_self_peer_args`, `tun.rs:616`) | the `inet` line already reads `--> <self> netmask <mask>` (`parse_bsd_inet_line`, `tun.rs:563`) | changes the address in place and adds a host route for it on the utun (`UH`). The block still has no route |
+| The block on the utun | `route -n add -inet -net <block> -prefixlen <plen> -interface <utun>` (`bsd_block_add_args`, `tun.rs:651`) | `route -n get -inet -net <block> -prefixlen <plen>` already answers the utun | adds `100.65/22 utun4 USc`: every address of the block now routes on the utun, and each peer's `/32` still wins for that peer |
+| Read both back | `ifconfig <utun>` and the block's `route -n get` (`utun_v4_problems`, `tun.rs:701`) | — | — |
+
+After it, the `inet` line reads `inet <self> --> <self> netmask <block mask>`,
+`netstat -rn -f inet` lists the block and `<self>` on the utun, and `route -n
+get <self>` answers the utun. Both routes belong to the utun: the kernel removes
+them when the utun closes, with the daemon or on a re-address, so a bring-up
+never finds an old one.
+
+* **It fails open.** No step can fail the bring-up. A read-back that is not
+  this shape is ONE WARN, `overlay: the utun's IPv4 shape is not the one the
+  overlay needs; each peer still gets its own /32`. Its `problems` field says
+  what is wrong (`the address's peer is …, not itself`, `the netmask is …, not
+  the block's`, `the block's lookup answers … on …`, `the block has no route`)
+  and its `complaints` field carries what `ifconfig` or `route` printed. A
+  shaped utun logs one INFO, `overlay: utun shaped: its address is its own peer
+  and the block routes on it`. macOS `route` exits 0 when the kernel refuses a
+  write (`route: writing to routing socket: File exists`, measured), so the
+  read-back decides, never an exit status (`run_bringup`, `tun.rs:6728`).
+* **Another product may route the CGNAT range.** Another mesh on the same Mac
+  can hold `100.64.0.0/10`. A per-org block is narrower than that, so its route
+  is added beside the other one and wins by longest prefix. A route for exactly
+  the same block (a tenant on the legacy `/10`) is left where it is: the add is
+  refused with `File exists`, nothing is deleted, the WARN names the interface
+  the block answers on, and the bring-up goes on with the address's own host
+  route and every peer's `/32`. A second org on the legacy `/10` on the same
+  Mac is that case too: the first org's utun holds the block, and the second
+  org's WARN names it.
+* **The route guard is unchanged.** Both routes are written once, inside the
+  bring-up. A wave re-asserts the routes the runtime installed (peers' `/32`s,
+  subnet routes, exit `/1`s) and never the block's. It reads the block's route
+  as a cover, never as a peer's own, so a peer's `/32` is still written and
+  deleted as before.
+* **Kill switch:** `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` leaves the utun as the
+  `tun` crate made it, as through 0.4.228, and logs `overlay: utun left as
+  created` (`utun_block_route_enabled`, `tun.rs:6717`). It is read from the
+  daemon's environment; there is no `config.toml` key.
+
+The `macos_kernel_tests` run as root against a real utun in the CI step `macOS
+overlay against a real utun`: the shape
+(`the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun`,
+`tun.rs:7736`), a block another product holds
+(`a_block_another_product_holds_is_left_alone_and_the_bring_up_stands`,
+`tun.rs:7809`), the kill switch
+(`the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it`, `tun.rs:7895`) and
+a peer's `/32` beside the block
+(`a_peer_route_comes_and_goes_beside_the_block_route`, `tun.rs:7940`). The
+parsers and argv builders are pure and tested on every platform
+(`utun_shape_tests`, `tun.rs:736`), with the line the lab Mac printed on
+0.4.228 as a fixture.
 
 ---
 
@@ -1178,6 +1268,7 @@ prefix is still honoured.
 | `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 | `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
+| `…_UTUN_BLOCK_ROUTE` | **on** (#4117) | macOS: the utun's first address is its own peer and the overlay block is routed on the utun (§8); off = the utun as the `tun` crate made it, as through 0.4.228. Environment only |
 
 One DERP knob sits outside that prefix: the queue's age bound,
 `ROOMLERD_DERP_QUEUE_MAX_AGE_MS`, default 100, where `0` turns the check off
