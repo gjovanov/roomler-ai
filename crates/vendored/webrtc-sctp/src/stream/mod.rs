@@ -185,6 +185,23 @@ impl Stream {
     /// Returns `(0, PayloadProtocolIdentifier::Unknown)` if the reading half of this stream is shutdown or it (the stream) was reset.
     pub async fn read_sctp(&self, p: &mut [u8]) -> Result<(usize, PayloadProtocolIdentifier)> {
         loop {
+            // Roomler patch (#4116): the wait is registered before the checks,
+            // tokio's pattern for a flag and a `Notify` (`Notified::enable`).
+            // Both shutdowns, `shutdown` and the association's
+            // `unregister_stream`, set `read_shutdown` and then wake the
+            // waiters of that instant with `notify_waiters()`, which stores no
+            // permit. Upstream made its `notified()` only once it had found
+            // nothing to read, so a shutdown that landed between the check and
+            // the wait was lost, and the read waited for good for data that
+            // never came. Registered first, the wait catches a shutdown that
+            // lands after it, and the check sees one that landed before. A
+            // chunk's `notify_one()` that reaches the registered wait of a
+            // read that then finds data is not lost either: the `Notified`,
+            // dropped unreceived, passes it on to the next waiter, or stores
+            // it as the permit.
+            let mut notified = std::pin::pin!(self.read_notifier.notified());
+            notified.as_mut().enable();
+
             if self.read_shutdown.load(Ordering::SeqCst) {
                 return Ok((0, PayloadProtocolIdentifier::Unknown));
             }
@@ -198,7 +215,7 @@ impl Stream {
                 Ok(_) | Err(Error::ErrShortBuffer { .. }) => return result,
                 Err(_) => {
                     // wait for the next chunk to become available
-                    self.read_notifier.notified().await;
+                    notified.await;
                 }
             }
         }
