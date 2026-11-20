@@ -9,7 +9,7 @@ use roomler_ai_mod_conference::ConferenceState;
 
 /// FR-69 P4 — the mediasoup room manager and the media claim maps are the
 /// `conference` module's state now.
-fn conf(app: &TestApp) -> &ConferenceState {
+pub(crate) fn conf(app: &TestApp) -> &ConferenceState {
     app.state
         .modules
         .conference
@@ -572,7 +572,7 @@ async fn tunnel_open_rehome_cross_pod() {
 
 // ── C-4: media claim-or-route ───────────────────────────────────────
 
-type UserWs =
+pub(crate) type UserWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connect a user WS and swallow the initial `connected` frame.
@@ -587,7 +587,7 @@ async fn connect_user_ws(app: &TestApp, token: &str) -> UserWs {
 }
 
 /// Next `media:*` frame (skips room:*/presence/notification noise).
-async fn next_media_msg(ws: &mut UserWs) -> serde_json::Value {
+pub(crate) async fn next_media_msg(ws: &mut UserWs) -> serde_json::Value {
     use futures::StreamExt;
     loop {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
@@ -605,7 +605,7 @@ async fn next_media_msg(ws: &mut UserWs) -> serde_json::Value {
     }
 }
 
-async fn send_media(ws: &mut UserWs, msg_type: &str, room_id: &str) {
+pub(crate) async fn send_media(ws: &mut UserWs, msg_type: &str, room_id: &str) {
     use futures::SinkExt;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::json!({ "type": msg_type, "data": { "room_id": room_id } })
@@ -648,7 +648,7 @@ async fn seed_started_call(app1: &TestApp) -> (crate::fixtures::seed::SeededTena
 /// `call/join` as `token`, in the bodyless shape an older client sends: the
 /// media namespace admits the account's sockets only once it holds an open
 /// call session (`conference_gate_tests`).
-async fn join_call(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) {
+pub(crate) async fn join_call(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) {
     let resp = app
         .auth_post(
             &format!("/api/tenant/{tenant_id}/room/{room_id}/call/join"),
@@ -922,7 +922,7 @@ async fn media_join_is_admitted_on_both_pods() {
 }
 
 /// Connect a user WS; returns it with the connection id the server minted.
-async fn connect_user_ws_conn(app: &TestApp, token: &str) -> (UserWs, String) {
+pub(crate) async fn connect_user_ws_conn(app: &TestApp, token: &str) -> (UserWs, String) {
     use futures::StreamExt;
     let url = format!("ws://{}/ws?token={}", app.addr, token);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -938,7 +938,7 @@ async fn connect_user_ws_conn(app: &TestApp, token: &str) -> (UserWs, String) {
 }
 
 /// The next frame of type `kind`, whatever namespace it is in, within 10 s.
-async fn next_frame_of(ws: &mut UserWs, kind: &str) -> serde_json::Value {
+pub(crate) async fn next_frame_of(ws: &mut UserWs, kind: &str) -> serde_json::Value {
     use futures::StreamExt;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut seen = Vec::new();
@@ -1138,7 +1138,7 @@ async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp)
 }
 
 /// Every frame `ws` receives within `ms` milliseconds.
-async fn frames_within(ws: &mut UserWs, ms: u64) -> Vec<serde_json::Value> {
+pub(crate) async fn frames_within(ws: &mut UserWs, ms: u64) -> Vec<serde_json::Value> {
     use futures::StreamExt;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
     let mut seen = Vec::new();
@@ -2039,7 +2039,7 @@ async fn cut_off_the_pod_serving(app1: &TestApp, room_id: &str) {
 }
 
 /// The next frame of type `kind` within `within`, or `None` once it passed.
-async fn frame_of_within(
+pub(crate) async fn frame_of_within(
     ws: &mut UserWs,
     kind: &str,
     within: std::time::Duration,
@@ -2268,12 +2268,12 @@ async fn a_private_room_leave_the_pod_serving_the_call_did_not_hear_ends_the_sea
 // ends, never that only its own passes ran.
 // ---------------------------------------------------------------------------
 
-fn oid_of(hex: &str) -> bson::oid::ObjectId {
+pub(crate) fn oid_of(hex: &str) -> bson::oid::ObjectId {
     bson::oid::ObjectId::parse_str(hex).unwrap()
 }
 
 /// A new room in `tenant`, made by its admin, with a call started in it.
-async fn start_call_in_new_room(
+pub(crate) async fn start_call_in_new_room(
     app: &TestApp,
     tenant: &crate::fixtures::seed::SeededTenant,
     name: &str,
@@ -2308,7 +2308,7 @@ async fn start_call_in_new_room(
 /// `token`'s account joins `room_id`'s call (`call/join`, then `media:join`
 /// on a socket of its own) and is seated on `app`. Returns the socket and
 /// its connection.
-async fn seat_in_call(
+pub(crate) async fn seat_in_call(
     app: &TestApp,
     tenant_id: &str,
     room_id: &str,
@@ -2334,7 +2334,7 @@ async fn seat_in_call(
 }
 
 /// Set the room's visibility as its document stores it.
-async fn set_visibility(app: &TestApp, room_id: &str, visibility: &str) {
+pub(crate) async fn set_visibility(app: &TestApp, room_id: &str, visibility: &str) {
     app.db
         .collection::<bson::Document>("rooms")
         .update_one(
@@ -2347,7 +2347,7 @@ async fn set_visibility(app: &TestApp, room_id: &str, visibility: &str) {
 
 /// Remove `user_id`'s `room_members` row in `room_id` by a raw write, the way
 /// a path that tells no hook would: nothing reaches the seat but the check.
-async fn delete_room_row(app: &TestApp, room_id: &str, user_id: &str) {
+pub(crate) async fn delete_room_row(app: &TestApp, room_id: &str, user_id: &str) {
     let gone = app
         .db
         .collection::<bson::Document>("room_members")
@@ -2361,7 +2361,7 @@ async fn delete_room_row(app: &TestApp, room_id: &str, user_id: &str) {
 }
 
 /// Remove `user_id`'s `tenant_members` row in `tenant_id` by a raw write.
-async fn delete_org_row(app: &TestApp, tenant_id: &str, user_id: &str) {
+pub(crate) async fn delete_org_row(app: &TestApp, tenant_id: &str, user_id: &str) {
     let gone = app
         .db
         .collection::<bson::Document>("tenant_members")
@@ -2375,7 +2375,7 @@ async fn delete_org_row(app: &TestApp, tenant_id: &str, user_id: &str) {
 }
 
 /// `n` passes of the seat check, each ending nothing.
-async fn passes_end_nothing(
+pub(crate) async fn passes_end_nothing(
     app: &TestApp,
     memory: &mut roomler_ai_mod_conference::seat_check::SeatCheckMemory,
     n: usize,
@@ -2391,7 +2391,7 @@ async fn passes_end_nothing(
 /// No `room:call_ended` for `room_id` reached `ws` within half a second. (A
 /// call that ends tells every socket of its room's members, whatever room
 /// each sits in, so a socket is asked about one room.)
-async fn heard_no_call_end(ws: &mut UserWs, room_id: &str, what: &str) {
+pub(crate) async fn heard_no_call_end(ws: &mut UserWs, room_id: &str, what: &str) {
     let heard: Vec<serde_json::Value> = frames_within(ws, 500)
         .await
         .into_iter()
@@ -2401,7 +2401,7 @@ async fn heard_no_call_end(ws: &mut UserWs, room_id: &str, what: &str) {
 }
 
 /// The seat of `conn` is still held in `room_id`.
-fn assert_seated(app: &TestApp, conn: &str, room_id: &str, what: &str) {
+pub(crate) fn assert_seated(app: &TestApp, conn: &str, room_id: &str, what: &str) {
     assert_eq!(
         conf(app).room_manager.get_connection_room(conn),
         Some(oid_of(room_id)),
