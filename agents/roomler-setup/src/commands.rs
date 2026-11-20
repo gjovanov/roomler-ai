@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::role::Role;
+use crate::role::{Layout, Role};
 
 // ─── Probing / status ─────────────────────────────────────────────────────────
 
@@ -743,21 +743,18 @@ pub async fn cmd_install(
 ) -> Result<DoneReport, crate::failure::Failure> {
     refuse_a_role_this_run_cannot_install(role).map_err(refused_before_the_run)?;
     let store = crate::pairing::PairStore::global();
-    let root_half = crate::role::wants_root_half(
+    let layout = crate::role::layout(
         crate::role::HostOs::current(),
         role,
         advanced.as_ref().and_then(|a| a.overlay_enabled),
+        false,
     );
-    let (tokens, paired) = resolve_install_tokens(
-        store, role, &server, token, root_token, use_paired, root_half,
-    )
-    .map_err(refused_before_the_run)?;
-    let crate::pairing::InstallTokens {
-        main: token,
-        root_half: root_token,
-    } = tokens;
+    let (tokens, paired) =
+        resolve_install_tokens(store, role, &server, token, root_token, use_paired, layout)
+            .map_err(refused_before_the_run)?;
     let report = match role {
         Role::TunnelClient => {
+            let token = tokens.into_device().map_err(refused_before_the_run)?;
             // Advanced options are daemon-config keys — the SPA hides the
             // section for this role; ignore whatever arrives.
             crate::orchestrator_tunnel::run_install(role, server, token, device_name, on_event)
@@ -768,6 +765,7 @@ pub async fn cmd_install(
         // implement, and a server that does not allow it).
         Role::DaemonSystem | Role::DaemonUser | Role::DaemonMachine => {
             if crate::role::HostOs::current() == crate::role::HostOs::Windows {
+                let token = tokens.into_device().map_err(refused_before_the_run)?;
                 crate::orchestrator_agent::run_install(
                     role,
                     server,
@@ -778,6 +776,15 @@ pub async fn cmd_install(
                 )
                 .await
             } else {
+                let (token, root_token) = match tokens {
+                    crate::pairing::InstallTokens::Device(token) => (token, None),
+                    crate::pairing::InstallTokens::TwoRows { person, root } => (person, Some(root)),
+                    crate::pairing::InstallTokens::OneRow { .. } => {
+                        return Err(refused_before_the_run(
+                            "this wizard cannot make a Mac one device yet".to_string(),
+                        ));
+                    }
+                };
                 crate::orchestrator_unix::run_install(
                     role,
                     server,
@@ -812,12 +819,13 @@ fn refused_before_the_run(words: String) -> crate::failure::Failure {
 }
 
 /// Which tokens `cmd_install` enrolls with: the pasted ones as given, or —
-/// `use_paired` — the ones the pairing delivered for this role and server,
-/// cloned out of the store. `root_half` (FR-129 B2): the install adds the
-/// macOS root half, which needs a second token — the pairing's second, or
-/// the second one pasted. Returns the tokens and whether they came from the
-/// pairing (so a success can close the session). A pasted call never reads
-/// the store, so a pairing left behind cannot leak into a paste.
+/// `use_paired` — the ones the pairing delivered for this role, server and
+/// layout, cloned out of the store. [`Layout::TwoRows`] (FR-129 B2): the
+/// install adds the macOS root half, which needs a second token — the
+/// pairing's second, or the second one pasted. Returns the tokens and whether
+/// they came from the pairing (so a success can close the session). A pasted
+/// call never reads the store, so a pairing left behind cannot leak into a
+/// paste.
 fn resolve_install_tokens(
     store: &crate::pairing::PairStore,
     role: Role,
@@ -825,13 +833,18 @@ fn resolve_install_tokens(
     pasted: String,
     pasted_root: Option<String>,
     use_paired: Option<bool>,
-    root_half: bool,
+    layout: Layout,
 ) -> Result<(crate::pairing::InstallTokens, bool), String> {
+    use crate::pairing::InstallTokens;
     if use_paired.unwrap_or(false) {
-        return Ok((store.tokens_for(role, server, root_half)?, true));
+        return Ok((store.tokens_for(role, server, layout)?, true));
     }
-    let root_half = if root_half {
-        let root = pasted_root
+    let tokens = match layout {
+        Layout::Device => InstallTokens::Device(pasted),
+        // Today's one-token paste: the screen half's.
+        Layout::OneRow => InstallTokens::Device(pasted),
+        Layout::TwoRows => {
+            let root = pasted_root
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .ok_or_else(|| {
@@ -840,24 +853,20 @@ fn resolve_install_tokens(
                  screen sharing only"
                     .to_string()
             })?;
-        if root == pasted.trim() {
-            return Err(
-                "the two tokens are the same token — each enrolls one device and works once, so \
-                 the private network needs a second, different one"
-                    .to_string(),
-            );
+            if root == pasted.trim() {
+                return Err(
+                    "the two tokens are the same token — each enrolls one device and works once, \
+                     so the private network needs a second, different one"
+                        .to_string(),
+                );
+            }
+            InstallTokens::TwoRows {
+                person: pasted,
+                root,
+            }
         }
-        Some(root)
-    } else {
-        None
     };
-    Ok((
-        crate::pairing::InstallTokens {
-            main: pasted,
-            root_half,
-        },
-        false,
-    ))
+    Ok((tokens, false))
 }
 
 /// Pre-spawn cancel: flips the process-wide
@@ -977,17 +986,13 @@ pub async fn cmd_pair_start(
     if let Some(stop) = crate::reinstall_guard::stop_for(role, &server).await {
         return Err(stop);
     }
-    let halves = crate::role::pair_halves(crate::role::wants_root_half(
-        crate::role::HostOs::current(),
-        role,
-        root_half,
-    ));
+    let layout = crate::role::layout(crate::role::HostOs::current(), role, root_half, false);
     let request = StartRequest {
         machine_name: device_name,
         os: host_os(),
         arch: host_arch(),
         role: role.pair_role(),
-        halves,
+        halves: layout.halves(),
         client: "wizard".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -1009,7 +1014,7 @@ pub async fn cmd_pair_start(
         expires_in: started.expires_in,
         interval: started.interval,
     };
-    crate::pairing::PairStore::global().begin(server, role, halves, started);
+    crate::pairing::PairStore::global().begin(server, role, layout, started);
     Ok(view)
 }
 
@@ -1770,7 +1775,7 @@ mod tests {
         assert!(!is_web_address(""));
     }
 
-    /// One token, no root half: what `cmd_install` enrolls with.
+    /// One token, one device: what `cmd_install` enrolls with.
     fn resolve_install_token(
         store: &crate::pairing::PairStore,
         role: Role,
@@ -1778,12 +1783,16 @@ mod tests {
         pasted: String,
         use_paired: Option<bool>,
     ) -> Result<(String, bool), String> {
-        resolve_install_tokens(store, role, server, pasted, None, use_paired, false).map(
-            |(t, paired)| {
-                assert!(t.root_half.is_none());
-                (t.main, paired)
-            },
+        resolve_install_tokens(
+            store,
+            role,
+            server,
+            pasted,
+            None,
+            use_paired,
+            Layout::Device,
         )
+        .map(|(t, paired)| (t.into_device().expect("one device's token"), paired))
     }
 
     fn started_pairing() -> roomlerd::pairing::Started {
@@ -1835,7 +1844,12 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("no pairing in progress"), "{e}");
 
-        let generation = store.begin(server.to_string(), Role::DaemonSystem, 1, started_pairing());
+        let generation = store.begin(
+            server.to_string(),
+            Role::DaemonSystem,
+            Layout::Device,
+            started_pairing(),
+        );
         let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
             .unwrap_err();
         assert!(e.contains("not been approved"), "{e}");
@@ -1891,12 +1905,17 @@ mod tests {
             "eyJ.user.sig".into(),
             Some(" eyJ.root.sig\n".into()),
             None,
-            true,
+            Layout::TwoRows,
         )
         .unwrap();
         assert!(!paired);
-        assert_eq!(t.main, "eyJ.user.sig");
-        assert_eq!(t.root_half.as_deref(), Some("eyJ.root.sig"));
+        assert_eq!(
+            t,
+            crate::pairing::InstallTokens::TwoRows {
+                person: "eyJ.user.sig".into(),
+                root: "eyJ.root.sig".into(),
+            }
+        );
 
         for missing in [None, Some(String::new()), Some("  \n".into())] {
             let e = resolve_install_tokens(
@@ -1906,7 +1925,7 @@ mod tests {
                 "eyJ.user.sig".into(),
                 missing,
                 None,
-                true,
+                Layout::TwoRows,
             )
             .unwrap_err();
             assert!(
@@ -1921,7 +1940,7 @@ mod tests {
             "eyJ.same.sig".into(),
             Some("eyJ.same.sig ".into()),
             None,
-            true,
+            Layout::TwoRows,
         )
         .unwrap_err();
         assert!(e.contains("same token"), "{e}");
@@ -1934,13 +1953,21 @@ mod tests {
             "eyJ.user.sig".into(),
             Some("eyJ.root.sig".into()),
             None,
-            false,
+            Layout::Device,
         )
         .unwrap();
-        assert!(t.root_half.is_none());
+        assert_eq!(
+            t,
+            crate::pairing::InstallTokens::Device("eyJ.user.sig".into())
+        );
 
         // Paired: the two the approval delivered, in order.
-        let generation = store.begin(server.to_string(), Role::DaemonUser, 2, started_pairing());
+        let generation = store.begin(
+            server.to_string(),
+            Role::DaemonUser,
+            Layout::TwoRows,
+            started_pairing(),
+        );
         store.apply_poll(generation, approved_with(&["eyJ.p1.sig", "eyJ.p2.sig"]), 5);
         let (t, paired) = resolve_install_tokens(
             &store,
@@ -1949,12 +1976,73 @@ mod tests {
             String::new(),
             None,
             Some(true),
-            true,
+            Layout::TwoRows,
         )
         .unwrap();
         assert!(paired);
-        assert_eq!(t.main, "eyJ.p1.sig");
-        assert_eq!(t.root_half.as_deref(), Some("eyJ.p2.sig"));
+        assert_eq!(
+            t,
+            crate::pairing::InstallTokens::TwoRows {
+                person: "eyJ.p1.sig".into(),
+                root: "eyJ.p2.sig".into(),
+            }
+        );
+    }
+
+    /// FR-141 P2, rules 1 and 3 — the paste is the one-row form's kill-switch
+    /// and offline-mint fallback, so it must make the same Mac a pairing
+    /// makes: its ONE token is root's, and a second paste goes nowhere (the
+    /// field is gone). Paired, the approval's one token goes to root just the
+    /// same.
+    #[test]
+    fn a_one_row_install_gives_its_one_token_to_root_pasted_or_paired() {
+        use crate::pairing::InstallTokens;
+        let store = crate::pairing::PairStore::new();
+        let server = "https://example.invalid";
+        for second in [None, Some("eyJ.second.sig".to_string())] {
+            let (t, paired) = resolve_install_tokens(
+                &store,
+                Role::DaemonUser,
+                server,
+                "eyJ.root.sig".into(),
+                second,
+                None,
+                Layout::OneRow,
+            )
+            .unwrap();
+            assert!(!paired);
+            assert_eq!(
+                t,
+                InstallTokens::OneRow {
+                    root: "eyJ.root.sig".into()
+                }
+            );
+        }
+
+        let generation = store.begin(
+            server.to_string(),
+            Role::DaemonUser,
+            Layout::OneRow,
+            started_pairing(),
+        );
+        store.apply_poll(generation, approved_with(&["eyJ.paired.sig"]), 5);
+        let (t, paired) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            String::new(),
+            None,
+            Some(true),
+            Layout::OneRow,
+        )
+        .unwrap();
+        assert!(paired);
+        assert_eq!(
+            t,
+            InstallTokens::OneRow {
+                root: "eyJ.paired.sig".into()
+            }
+        );
     }
 
     #[test]

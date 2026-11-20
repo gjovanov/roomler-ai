@@ -139,6 +139,50 @@ pub fn pair_halves(root_half: bool) -> u8 {
     if root_half { 2 } else { 1 }
 }
 
+/// FR-141 P2 — what one install makes of this machine, decided before the
+/// pairing starts and held by it ([`crate::pairing::PairStore::begin`]): the
+/// token mapping, the halves the approval covers and the install's steps all
+/// follow it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Layout {
+    /// The one device the role installs: every role off macOS, and on a Mac
+    /// the screen alone (the private-network box unticked, FR-129 B1).
+    Device,
+    /// FR-129 B2 — a Mac as two rows: the person's screen half and the root
+    /// half beside it, one approval for both (`halves: 2`).
+    TwoRows,
+    /// FR-141 P2 (FR-43) — a Mac as ONE row: root's daemon, which owns the
+    /// overlay and supervises the person's screen worker, enrolled with the
+    /// one token; the person's config holds no enrollment (FR-43 P3a).
+    OneRow,
+}
+
+impl Layout {
+    /// How many enrollments one approval covers: two for [`Layout::TwoRows`]
+    /// ([`pair_halves`]), one otherwise — a one-row Mac is one device, so the
+    /// server needs nothing new for it (`halves: 1`, every platform's
+    /// default).
+    pub fn halves(self) -> u8 {
+        pair_halves(self == Layout::TwoRows)
+    }
+}
+
+/// FR-141 P2 — the layout an install of `role` makes here. A macOS daemon
+/// with the private-network box ticked (the macOS default) is one row when
+/// `one_row_open` (the server's `wizard_macos_one_row` switch, on a Mac that
+/// is not enrolled, with a release that can make one row:
+/// `crate::reinstall_guard::one_row_open`), else B2's two rows; unticked it
+/// is the screen alone. Every other install is one device.
+pub fn layout(os: HostOs, role: Role, overlay_box: Option<bool>, one_row_open: bool) -> Layout {
+    if !wants_root_half(os, role, overlay_box) {
+        Layout::Device
+    } else if one_row_open {
+        Layout::OneRow
+    } else {
+        Layout::TwoRows
+    }
+}
+
 /// FR-129 B2 — the root half's device name: the person's name for the Mac
 /// with `-daemon`, as the terminal path names it (`install.sh`'s
 /// `$NAME-daemon`), so a Mac installed either way shows the same two rows.
@@ -580,6 +624,40 @@ mod tests {
         assert_eq!(pair_halves(true), 2);
         assert_eq!(pair_halves(false), 1);
         assert_eq!(root_half_name("studio-mac"), "studio-mac-daemon");
+    }
+
+    /// FR-141 P2 — the box ticked on a macOS daemon is one row only while the
+    /// one-row form is open, else B2's two rows; unticked (or an older SPA's
+    /// silence) it is the screen alone; every other install is one device,
+    /// open or not. One row is one enrollment: `halves: 1` (rule 10).
+    #[test]
+    fn the_layout_follows_the_box_and_the_one_row_switch() {
+        let mac = |overlay_box, open| layout(HostOs::Macos, Role::DaemonUser, overlay_box, open);
+        assert_eq!(mac(Some(true), true), Layout::OneRow);
+        assert_eq!(mac(Some(true), false), Layout::TwoRows);
+        for open in [true, false] {
+            assert_eq!(mac(Some(false), open), Layout::Device, "screen only");
+            assert_eq!(mac(None, open), Layout::Device, "an older SPA");
+            for os in [HostOs::Linux, HostOs::Windows, HostOs::Other] {
+                for role in [
+                    Role::DaemonSystem,
+                    Role::DaemonUser,
+                    Role::DaemonMachine,
+                    Role::TunnelClient,
+                ] {
+                    assert_eq!(layout(os, role, Some(true), open), Layout::Device);
+                }
+            }
+            for role in [Role::DaemonSystem, Role::DaemonMachine, Role::TunnelClient] {
+                assert_eq!(
+                    layout(HostOs::Macos, role, Some(true), open),
+                    Layout::Device
+                );
+            }
+        }
+        assert_eq!(Layout::TwoRows.halves(), 2);
+        assert_eq!(Layout::OneRow.halves(), 1);
+        assert_eq!(Layout::Device.halves(), 1);
     }
 
     /// [`default_role`] with what a plain run has: the cards this OS implements
