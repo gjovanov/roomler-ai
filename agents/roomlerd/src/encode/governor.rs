@@ -338,6 +338,11 @@ pub struct RateGovernor {
     /// it against `pipe_bps` before anything acts. The one exception is V5b,
     /// which reads a rise of the floor as a veto on a reading ([`Self::refute_readings`]).
     belief: super::pipe::Pipe,
+    /// FR-148 D46 B2 — the last window's [`Take`](super::pair_memory::Take)
+    /// when the gate found it valid, `None` when it did not (or before the
+    /// first): what a delivery sample's push-back is filed under
+    /// ([`Self::on_sample_push_back`]).
+    sample_take: Option<super::pair_memory::Take>,
     /// FR-79 V5b — how many times a delivery took out what stood below it, for
     /// the heartbeat.
     readings_refuted: u32,
@@ -538,6 +543,7 @@ impl RateGovernor {
             window_sender: None,
             evidence: super::evidence::Rejections::default(),
             belief: super::pipe::Pipe::default(),
+            sample_take: None,
             readings_refuted: 0,
             last_reading_bps: None,
             window_hard_stall: false,
@@ -1435,6 +1441,7 @@ impl RateGovernor {
             sent_bps,
             self.applied_bps,
         );
+        self.sample_take = valid.then_some(take);
         // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
         // reads only the window's facts: `Pipe` takes it whatever the verdict, the
         // shadow model and the pair memory only from a valid window.
@@ -2097,7 +2104,30 @@ impl RateGovernor {
             model_floor: model.floor(now).map(aged),
             model_capacity: model.capacity(now),
             model_stand_in: model.stand_in(prior, now).map(aged),
+            model_floor_by: model.floor_by(),
+            model_capacity_by: model.capacity_by(now),
         }
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3, at the pump's
+    /// heartbeat: to the shadow model and the pair memory only
+    /// ([`super::pipe::Pipe::observe_sample_capacity`]), filed under the last
+    /// window's take. After a window the gate rejected, nothing: the sample
+    /// ran beside a stall the viewer saw. No rate or gate reads it, and the
+    /// path memory it reaches opens a session only under `path_model = on`.
+    pub fn on_sample_push_back(&mut self, bps: u32, by: super::pipe::PushedBy, now: Instant) {
+        if let Some(take) = self.sample_take {
+            self.belief.observe_sample_capacity(bps, by, take, now);
+        }
+    }
+
+    /// FR-148 D46 B2 — the in-flight budget, computing on or in shadow, saw
+    /// the clock stand still for the least and S with bytes out, or read a
+    /// release: the next [`super::pipe::STALL_WINDOWS`] windows are no reading
+    /// for the shadow model or the pair memory
+    /// ([`super::pipe::Pipe::note_stall`]). Nothing else moves.
+    pub fn note_path_stall(&mut self) {
+        self.belief.note_stall();
     }
 
     /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged
@@ -5920,6 +5950,71 @@ mod tests {
         assert_eq!((c.floor, c.record, c.best), (None, None, None));
         assert_eq!(close(None, &c), (None, Why::NothingMeasured));
         assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
+    }
+
+    /// FR-148 D46 B2 — a delivery sample's push-back reaches the shadow model
+    /// and the pair memory only, filed under the last window the gate
+    /// accepted: the applied rate and `Pipe`'s own law do not move. Before any
+    /// window, and after one the gate rejected, it reaches nothing. A stall
+    /// the in-flight budget saw keeps the next window out of the model, while
+    /// `Pipe`'s own floor still takes it.
+    #[test]
+    fn a_sample_push_back_moves_only_the_shadow_model() {
+        use crate::encode::pipe::PushedBy;
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let model = |s: &V5bSession| {
+            let m = s.g.belief.model();
+            (
+                m.floor(s.t).map(|f| f.bps),
+                m.capacity(s.t).map(|c| c.bps),
+                m.floor_by(),
+            )
+        };
+        s.g.on_sample_push_back(500_000, PushedBy::P1, s.t);
+        assert_eq!(model(&s), (None, None, None), "no window yet");
+        let link = viewer_rate::pack_link(1_200_000, 0);
+        for _ in 0..5 {
+            s.window(150_000, Some(28), link, false);
+        }
+        assert_eq!(model(&s), (Some(1_200_000), None, None));
+        let (applied, own) = (s.g.applied_bps(), s.g.belief_bps(s.t));
+        s.g.on_sample_push_back(900_000, PushedBy::P1, s.t);
+        let (floor, capacity, by) = model(&s);
+        assert!(
+            floor.is_some_and(|f| (900_000..1_200_000).contains(&f)),
+            "{floor:?}"
+        );
+        assert_eq!((capacity, by), (Some(900_000), Some(PushedBy::P1)));
+        let m = s.g.belief.model();
+        assert_eq!(m.capacity_by(s.t), Some(PushedBy::P1));
+        assert_eq!((s.g.applied_bps(), s.g.belief_bps(s.t)), (applied, own));
+        // The memory filed it once, under the window's take: counted, or set
+        // aside as D29 says.
+        let filed = |s: &V5bSession| {
+            let c = s.g.memory().closing(s.t, P1_NOW_UNIX);
+            c.counted + c.not_counted + c.unread + c.viewer_late + c.under_plan
+        };
+        assert_eq!(filed(&s), 1);
+        // A stall the viewer saw: the sample beside it reaches nothing.
+        s.stall();
+        let before = model(&s);
+        s.g.on_sample_push_back(400_000, PushedBy::P3, s.t);
+        assert_eq!(model(&s), before);
+        assert_eq!(filed(&s), 1);
+        // The stall's shadow, then a valid window back at the floor.
+        for _ in 0..2 {
+            s.window(150_000, Some(28), link, false);
+        }
+        assert_eq!(model(&s).0, Some(1_200_000));
+        // The budget saw a stall: its release reaches `Pipe`'s own floor only.
+        s.g.note_path_stall();
+        let more = viewer_rate::pack_link(1_500_000, 0);
+        s.window(187_500, Some(28), more, false);
+        assert_eq!(model(&s).0, Some(1_200_000), "kept out of the model");
+        assert_eq!(s.g.belief_bps(s.t).1, Some(1_500_000), "Pipe's own floor");
+        s.window(187_500, Some(28), more, false);
+        assert_eq!(model(&s).0, Some(1_500_000));
     }
 
     /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:

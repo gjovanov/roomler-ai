@@ -1,6 +1,6 @@
 # FR-72 — One MagicDNS resolver per daemon
 
-**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + P6 shipped and field-verified — **MagicDNS now resolves on the enforced-DNS host too**; P5 parked, P3 (#1363) open · **Opened:** 2026-09-05
+**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + P6 shipped and field-verified — **MagicDNS now resolves on the enforced-DNS host too**; P3 (#1363) shipped, its lab cells pending; P5 parked · **Opened:** 2026-09-05
 
 > ⚠️ **Re-aimed 2026-09-05, same day, after the verification overturned the
 > original premise.** This FR opened as *"MagicDNS without an OS port"* — the
@@ -21,7 +21,7 @@ something else briefly holds the port.
 |---|---|---|---|
 | P1 | Keep the resolver's `JoinHandle` and abort it in the runtime teardown | **shipped 0.4.71** (#1397) | — (a task that was already meant to stop) |
 | P2 | Retry a failed bind; steer the OS when the bind lands late; await the aborted task | **shipped 0.4.73** (#1414), field-verified | — (retry is unconditional; the pre-P2 behaviour is "give up", not a safer state) |
-| P3 | Reporting: make `magicdns active` mean *answering* | open (#1363) | — |
+| P3 | Reporting: make `magicdns active` mean *answering* | **shipped** (#4096), lab cells on #1363: the status measures the OS path (60 s at first, backed off to 15 min while nothing changes, again at once on a change it sees; switch `ROOMLERD_MAGICDNS_PROBE=0`) and names each state ([`docs/magicdns.md`](../magicdns.md#what-roomler-status-says)) | — (a report: no rung, steer or route follows it) |
 | P4 | Docs: [`docs/magicdns.md`](../magicdns.md) in house style with diagrams, linked from `docs/README.md` | **shipped** | — |
 | P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | **PARKED** — necessary but not sufficient; the host that motivated it is blocked one layer higher | detect-and-fall-back; a host whose local rule works must keep using it |
 | P6 | **A resolution ladder, with the hosts file as its last rung** | **shipped 0.4.76** (#1437), **field-verified** — the goal is met on the enforced-DNS host | `ROOMLERD_MAGICDNS_HOSTS`, default OFF |
@@ -328,11 +328,14 @@ separate times.
 
 ## Open
 
-- **#1363** — `roomler status` said `active` over a resolver that had lost its
-  own bind race. ⚠️ Verifying the NRPT effective table would **not** have caught
-  this; the check has to be *does our resolver answer*. Still open, and P2 adds a
-  state it must now express: *retrying* is neither `active` nor a permanent
-  `DOWN`.
+- **#1363** — shipped in #4096, its lab cells pending on the issue.
+  `roomler status` said `active` over a resolver that had lost its own bind
+  race. It now says `active` only when the OS resolves the probe name to this
+  node's own address, and names every other state, P2's *retrying* included
+  (`resolver binding (retrying)`, neither `active` nor a permanent `DOWN`).
+  ⚠️ Verifying the NRPT effective table would **not** have caught this, and
+  the status still does not take the NRPT as an answer: on Windows the NRPT
+  stores only choose the words of an unanswered probe.
 - Whether the same spawn-and-forget shape exists elsewhere in `run()`. The
   teardown aborts four tasks explicitly, which is exactly the pattern that hides
   a fifth — and P2 showed the abort itself was not awaited, so "listed in the

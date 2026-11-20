@@ -480,6 +480,10 @@ pub struct DeviceView {
     /// Peers with their current connection type (empty when the overlay is off
     /// or the daemon is disconnected from the server).
     pub peers: Vec<PeerInfo>,
+    /// #1363 — MagicDNS's state in words, from `DnsStatus::health`: the same
+    /// words `roomler status` prints, so the two can never disagree. `None`
+    /// when the daemon publishes no DNS status.
+    pub dns_health: Option<String>,
 }
 
 impl DeviceView {
@@ -489,8 +493,18 @@ impl DeviceView {
             reason: Some(reason.to_string()),
             status: None,
             peers: Vec::new(),
+            dns_health: None,
         }
     }
+}
+
+/// #1363 — the DNS section's line for `status`, read at this moment.
+fn dns_health_line(status: &NodeStatus) -> Option<String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    status.dns.as_ref().map(|d| d.health(now_ms).one_line())
 }
 
 /// Read the live device view from the daemon over the LocalAPI. NEVER errors
@@ -543,6 +557,7 @@ async fn device_view(connected: std::io::Result<localapi::Client>) -> DeviceView
     DeviceView {
         available: true,
         reason: None,
+        dns_health: dns_health_line(&status),
         status: Some(status),
         peers,
     }
@@ -6121,6 +6136,64 @@ mod tests {
                 && reason.ends_with("[PermissionDenied]"),
             "{reason}"
         );
+    }
+
+    /// #1363 — the Overview's DNS line is `DnsStatus::health`'s words, the
+    /// ones `roomler status` prints. The app sends them and the page paints
+    /// them; it used to work the state out of the raw fields itself, and said
+    /// `active` from three attempts.
+    #[test]
+    fn the_dns_line_is_the_words_roomler_status_prints() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let with_dns = |dns: &str| -> NodeStatus {
+            serde_json::from_str(&format!(
+                r#"{{"node_id":"n","name":"w11","version":"0.4.228","mode":"service",
+                    "connected":true,"dns":{dns}}}"#
+            ))
+            .expect("a NodeStatus the daemon could send")
+        };
+        let policy_managed = with_dns(&format!(
+            r#"{{"magic_domain":"myorg.roomler.net","resolver_bound":true,
+                 "os_steer_active":true,"upstream":"1.1.1.1:53","answer_aaaa":true,
+                 "probe":{{"outcome":"unanswered","at_ms":{},
+                           "reason":"nrpt_policy_managed"}}}}"#,
+            now_ms - 5_000
+        ));
+        let line = dns_health_line(&policy_managed);
+        assert_eq!(
+            line.as_deref(),
+            Some(
+                "the OS does not reach the resolver: the NRPT rule is written but not in \
+                 effect, because the NRPT is policy-managed on this host"
+            )
+        );
+        assert_eq!(
+            line,
+            policy_managed
+                .dns
+                .as_ref()
+                .map(|d| d.health(now_ms).one_line()),
+            "the same words as `roomler status`"
+        );
+        // An older daemon measures nothing: never `active`.
+        let older = with_dns(
+            r#"{"magic_domain":"myorg.roomler.net","resolver_bound":true,
+                "os_steer_active":true,"upstream":"1.1.1.1:53","answer_aaaa":true}"#,
+        );
+        assert_eq!(
+            dns_health_line(&older).as_deref(),
+            Some("steered, not measured (older daemon)")
+        );
+        assert_eq!(dns_health_line(&daemon_status("n", None)), None);
+        // The page paints the app's words and has none of its own left.
+        let js = include_str!("front/overview.js");
+        assert!(js.contains("paintDns(st.dns, dv.dns_health);"), "{js}");
+        for own in ["resolver DOWN", "OS steer failed", "steered but bypassed"] {
+            assert!(!js.contains(own), "{own}");
+        }
     }
 
     /// #4020 — every connect of this app whose error is read goes through

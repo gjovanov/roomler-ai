@@ -34,6 +34,9 @@ pub mod dialer;
 pub mod direct;
 pub mod disco;
 pub mod dns;
+/// #1363 — the OS path, measured: one lookup a minute of a name only an
+/// overlay resolver answers, shared by FR-72 P6's ladder and the status.
+pub mod dns_probe;
 /// FR-97 P0b-2b — host state the daemon changes that must not outlive it
 /// (IPv4 forwarding a Windows router turned on), refcounted in process and
 /// persisted for the boot purge.
