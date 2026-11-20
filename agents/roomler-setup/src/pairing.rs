@@ -326,8 +326,10 @@ impl PairStore {
                     root,
                 })
             }
-            // Today's `halves: 1` mapping: the screen half's token.
-            Layout::OneRow => Ok(InstallTokens::Device(first)),
+            // FR-141 P2, rule 1: the one token is ROOT's. Never the screen
+            // half's, which `halves: 1` means for the screen alone: that would
+            // make a per-user row and no root row.
+            Layout::OneRow => Ok(InstallTokens::OneRow { root: first }),
         }
     }
 

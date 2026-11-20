@@ -841,8 +841,10 @@ fn resolve_install_tokens(
     }
     let tokens = match layout {
         Layout::Device => InstallTokens::Device(pasted),
-        // Today's one-token paste: the screen half's.
-        Layout::OneRow => InstallTokens::Device(pasted),
+        // FR-141 P2, rule 3: the one pasted token is root's, as a paired one
+        // is, so the paste makes the same one-row Mac; a second paste goes
+        // nowhere (the one-row form shows no second field).
+        Layout::OneRow => InstallTokens::OneRow { root: pasted },
         Layout::TwoRows => {
             let root = pasted_root
             .map(|t| t.trim().to_string())
