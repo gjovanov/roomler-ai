@@ -1424,7 +1424,7 @@ bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehea
 node scripts/rc-shadow-report.cjs rows.ndjson                        # a read's --rows output, offline: the same verdict
 ```
 
-FR-148's path report reads the same `agent_logs` per session: what it opened at beside what its pair had carried, the plan beside the encoder, what the path carried while bytes waited, a change of path, and whether the picture left the slow-link profile (`bash scripts/rc-path-report.sh --mars --yes`, [production-mongo-reads.md](production-mongo-reads.md) §8). One device's window reads line by line with `--timeline` (§8a there).
+FR-148's path report reads the same `agent_logs` per session: what it opened at beside what its pair had carried, the plan beside the encoder, what the path carried while bytes waited, a change of path, and whether the picture left the slow-link profile (`bash scripts/rc-path-report.sh --mars --yes`, [production-mongo-reads.md](production-mongo-reads.md) §8). One device's window reads line by line with `--timeline`, each target move with its `why` (§8a there).
 
 ⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
 release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a window
@@ -2560,6 +2560,10 @@ VP9-444 DC pump heartbeat (≈1s window) session_id=… target_fps=30 … target
 - Causes that netted to nothing leave nothing: a decrease and a floor that puts the
   number back hand out no move.
 - The RTP pump has no governor and writes none of this.
+
+The path report's `--timeline` reads both fields: each move prints with its `why`, a line from
+an older agent as "(reason: not logged)", and each session counts its moves by `why` on the
+target lines beside the heartbeats' `target_moves` ([production-mongo-reads.md](production-mongo-reads.md) §8a).
 
 | Where | Anchor |
 |---|---|
