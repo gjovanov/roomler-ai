@@ -178,7 +178,7 @@ socket in each wave. That accounts for the 6–8 hosts per roll that log two clo
 
 For whoever puts the next frame on this socket: agents back to 0.4.48, the oldest version in these
 logs, ignore a Text frame (the `Some(Ok(_))` arm, `agents/roomlerd/src/derp.rs:545`) and drop a Binary frame
-under 32 bytes (`crates/tunnel-core/src/transport/derp.rs:515-518`). A Binary frame of 32 bytes or
+under 32 bytes (`crates/tunnel-core/src/transport/derp.rs:520-523`). A Binary frame of 32 bytes or
 more reads as a peer's frame and raises `Unrouted`. So a server-to-agent signal needs no capability
 gate as long as it is Text. This was read at the tags `agent-v0.4.48` and `agent-v0.4.154`, not run.
 
@@ -414,7 +414,7 @@ it in advance, so the sequence is: pod dies → agent keeps handing frames to a 
 socket → a send hard-errors → `DeathReason::HardDead`
 (`crates/tunnel-core/src/overlay/runtime/establish.rs:734-754`) → carrier rebuild →
 `MuxEvent::Recovered` opens the fast-walk window
-(`crates/tunnel-core/src/overlay/runtime.rs:2661-2664`).
+(`crates/tunnel-core/src/overlay/runtime.rs:2663-2666`).
 
 That recovery path has already been optimised once (#28: `DERP_RECOVERY_WALK_WINDOW`
 + `DERP_RECOVERY_RECHECK`, after a field case where "the WS returned in 1.5 s and the
