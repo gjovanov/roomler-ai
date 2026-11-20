@@ -2725,6 +2725,44 @@ pub fn mark_rollback_attempted(cfg: &mut AgentConfig) {
     cfg.rollback_attempted = true;
 }
 
+/// #4097 — the top-level keys of a config that the agent's own run
+/// bookkeeping writes: [`AgentConfig::last_known_good_version`],
+/// [`AgentConfig::crash_count`], [`AgentConfig::last_crash_unix`],
+/// [`AgentConfig::rollback_attempted`], [`AgentConfig::last_run_unhealthy`]
+/// and [`AgentConfig::last_run_boot`]. [`mark_run_starting`],
+/// [`record_clean_run_at`], [`mark_clean_shutdown`], [`record_crash_at`] and
+/// [`mark_rollback_attempted`] move no other key, and a field that joins them
+/// joins this list. `sudo roomlerd one-row` converts a person's config from
+/// what their agent saved as it stopped when that save moved only these
+/// ([`run_state_moved`]).
+pub const RUN_STATE_KEYS: [&str; 6] = [
+    "last_known_good_version",
+    "crash_count",
+    "last_crash_unix",
+    "rollback_attempted",
+    "last_run_unhealthy",
+    "last_run_boot",
+];
+
+/// #4097 — `Some` when the config texts `before` and `after` differ in
+/// nothing but [`RUN_STATE_KEYS`]: those of them whose values differ, in that
+/// list's order, and none when only the way the file is written differs.
+/// Each text is read as a raw TOML table, so a key this build does not know
+/// counts as any other key, and the six are taken off the top level of both
+/// before the rest is compared. `None` when anything else differs, or when
+/// either text does not parse.
+pub fn run_state_moved(before: &str, after: &str) -> Option<Vec<&'static str>> {
+    let mut before: toml::Table = toml::from_str(before).ok()?;
+    let mut after: toml::Table = toml::from_str(after).ok()?;
+    let mut moved = Vec::new();
+    for key in RUN_STATE_KEYS {
+        if before.remove(key) != after.remove(key) {
+            moved.push(key);
+        }
+    }
+    (before == after).then_some(moved)
+}
+
 /// TOML-friendly mirror of `encode::EncoderPreference`. Kept separate so
 /// the `encode` module stays CLI-independent and the config file survives
 /// feature gating without needing the `mf-encoder` feature enabled to
@@ -6974,6 +7012,150 @@ tenant_id = "tid2"
             .join("\n");
         let back: AgentConfig = toml::from_str(&old).unwrap();
         assert_eq!(back.last_run_boot, None);
+    }
+
+    /// #4097 — a config with a value in each of [`RUN_STATE_KEYS`], so a save
+    /// writes every one of them (a `None` is left out of the file).
+    fn with_run_state() -> AgentConfig {
+        let mut cfg = just_updated();
+        cfg.crash_count = 2;
+        cfg.last_crash_unix = 1_000_000;
+        cfg.rollback_attempted = true;
+        cfg.last_run_unhealthy = true;
+        cfg.last_run_boot = Some("7".into());
+        cfg
+    }
+
+    /// #4097 — a config's text as `save` writes it.
+    fn saved_text(cfg: &AgentConfig) -> String {
+        toml::to_string_pretty(cfg).unwrap()
+    }
+
+    /// #4097 — the top-level keys whose values differ between two configs as
+    /// `save` writes them, sorted.
+    fn top_level_keys_moved(before: &AgentConfig, after: &AgentConfig) -> Vec<String> {
+        let table =
+            |cfg: &AgentConfig| -> toml::Table { toml::from_str(&saved_text(cfg)).unwrap() };
+        let (before, after) = (table(before), table(after));
+        let mut keys: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|k| before.get(*k) != after.get(*k))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    #[test]
+    fn each_run_state_key_is_a_top_level_key_of_a_saved_config() {
+        let text = saved_text(&with_run_state());
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        for key in RUN_STATE_KEYS {
+            assert!(
+                table.contains_key(key),
+                "{key} is not a top-level key of:\n{text}"
+            );
+        }
+    }
+
+    /// #4097 — each step of the run bookkeeping moves something, and nothing
+    /// outside [`RUN_STATE_KEYS`]; [`run_state_moved`] names what it moved.
+    #[test]
+    fn the_run_bookkeeping_moves_only_run_state_keys() {
+        type Step = fn(&mut AgentConfig);
+        let steps: [(&str, AgentConfig, Step); 5] = [
+            ("mark_run_starting", fixture(), mark_run_starting),
+            ("record_clean_run_at", with_run_state(), |c| {
+                record_clean_run_at(c, "0.4.197")
+            }),
+            ("mark_clean_shutdown", with_run_state(), mark_clean_shutdown),
+            ("record_crash_at", fixture(), |c| {
+                record_crash_at(c, 1_000_000)
+            }),
+            (
+                "mark_rollback_attempted",
+                fixture(),
+                mark_rollback_attempted,
+            ),
+        ];
+        for (name, before, step) in steps {
+            let mut after = before.clone();
+            step(&mut after);
+            let moved = top_level_keys_moved(&before, &after);
+            assert!(!moved.is_empty(), "{name} moved nothing");
+            for key in &moved {
+                assert!(
+                    RUN_STATE_KEYS.contains(&key.as_str()),
+                    "{name} moved {key}, which is not in RUN_STATE_KEYS"
+                );
+            }
+            let mut said: Vec<String> = run_state_moved(&saved_text(&before), &saved_text(&after))
+                .unwrap_or_else(|| panic!("{name}: run_state_moved said no"))
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            said.sort();
+            assert_eq!(said, moved, "{name}");
+        }
+    }
+
+    /// #4097 — yes for a change of run state alone, however the file is
+    /// written; no for any other key, for a key this build does not know, for
+    /// a run-state name below the top level, and for a text that does not
+    /// parse.
+    #[test]
+    fn run_state_moved_is_some_only_when_nothing_else_moved() {
+        let before = saved_text(&with_run_state());
+        let mut stopped = with_run_state();
+        mark_clean_shutdown(&mut stopped);
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&stopped)),
+            Some(vec!["last_run_unhealthy"])
+        );
+        assert_eq!(
+            run_state_moved(&before, &format!("# kept by hand\n{before}")),
+            Some(vec![]),
+            "the same values, written another way"
+        );
+        let mut renamed = with_run_state();
+        renamed.machine_name = "Renamed".into();
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&renamed)),
+            None,
+            "another key"
+        );
+        let mut moved_org = with_run_state();
+        moved_org.orgs.push(org_fixture("second", "t2"));
+        assert_eq!(
+            run_state_moved(&before, &saved_text(&moved_org)),
+            None,
+            "an [[orgs]] entry"
+        );
+        let unknown = format!("future_key = 1\n{before}");
+        assert_eq!(
+            run_state_moved(&before, &unknown),
+            None,
+            "a key this build does not know"
+        );
+        assert_eq!(run_state_moved(&unknown, &before), None, "that key gone");
+        let nested = format!("{before}\n[extra]\ncrash_count = 1\n");
+        assert_eq!(
+            run_state_moved(&before, &nested),
+            None,
+            "below the top level"
+        );
+        assert_eq!(
+            run_state_moved(&before, "crash_count = ["),
+            None,
+            "after does not parse"
+        );
+        assert_eq!(
+            run_state_moved("crash_count = [", &before),
+            None,
+            "before does not parse"
+        );
     }
 
     // ---- Migration tests (rc.18 P4) ---------------------------------

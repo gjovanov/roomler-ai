@@ -3294,7 +3294,7 @@ build (B1's runs: 24 to 39).
 | the sampler and the line | `agents/roomlerd/src/media_delivery.rs:403` (the field), `:667` (`on_frame`), `:676` (`on_pair_check`), `:684` (`note_gate`), `:711` (`on_handed`), `:719` (`pump_count`), `:603` (`report`), `:762` (`emit`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4293` (the send task's count), `:4307` and `:4336` (each frame taken, each chunk released), `:4390` (the pair), `:4506` (the gate's count), `:4524` (the step), `:5210` (the watermark), `:5245` (`on_handed`), `:5262` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7304` (the send task's count), `:7326` and `:7382` (each frame taken, each chunk released), `:7720` (the pair), `:8122` (the gate's count, the ledger beside the channel), `:8199` (the step), `:9925` (`on_handed`), `:9951` (a full channel) |
-| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3463` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2758` (its check) |
+| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3501` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2758` (its check) |
 | the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:2327` (`Outages`), `:2525` (`out_direction`), `:3865` (`outaged`), `:4893` (`print_releases`), `:4953` (`recoveries`), `:5090` (`stalls_against_today`), `:5210` (`outages_against_today`) |
 
 ### The tests
