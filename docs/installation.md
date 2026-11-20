@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4023`, `crates/agent-core/src/config.rs:4463`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4023`, `crates/agent-core/src/config.rs:4477`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -569,15 +569,15 @@ Enrollment successful. Agent id: …
 ### "The host must be re-enrolled" — when to believe it
 
 Re-enrolling is **destructive**: removal is final, and a re-enrolled device
-never gets its old overlay address back. So the one log line that prescribes it
-has to be true whenever it appears. Since FR-66 it is: `roomlerd` reads its
+never gets its old overlay address back. So the log lines that prescribe it
+have to be true whenever they appear. Since FR-66 they are: `roomlerd` reads its
 `config.toml` two ways, and which one a caller uses states whether a missing
 file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, worded for what happened to the live file (below), and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3608`) |
-| `config::read_if_present` (`:3638`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3613`, `:3621`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`:3652`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -590,7 +590,9 @@ flowchart TD
     V -->|"yes"| W{"was the live file there?<br/>(the read's own error)"}
     W -->|"no — NotFound"| RM["promoted to live<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
     W -->|"yes"| R["promoted to live<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
-    V -->|"no"| E["ERROR 'the host must be re-enrolled'<br/>— believe it"]
+    V -->|"no"| X{"was the live file there?<br/>(the read's own error)"}
+    X -->|"no — NotFound"| EM["the load fails<br/>ERROR 'config missing … must be enrolled (again)'<br/>— believe it"]
+    X -->|"yes"| E["the load fails<br/>ERROR 'config unreadable … must be re-enrolled'<br/>— believe it"]
 ```
 
 The recovery's line says what happened to the live file (#4058). Both are ERROR: either way the
@@ -601,16 +603,29 @@ host now runs on an older config, and that must never look like a normal boot.
 | **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3581` |
 | **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3589` |
 
-"Not there" is read off the read's own error (`not_found`, `:3807`), never off an `exists()`
+"Not there" is read off the read's own error (`not_found`, `:3821`), never off an `exists()`
 that could race the read, and a parse error is never read as missing. Before #4058 a live file
 that a person or a test had removed took the second line, which named a truncation that never
-happened. With no usable previous copy, a missing file takes the re-enrollment line above,
-unchanged.
+happened.
+
+With no usable previous copy the load fails with the live file's own error, and its line tells
+the same two cases apart (#4102). Both stay ERROR and keep their advice, because this is the
+config the process runs on (FR-66). The missing line's words also fit a device that was never
+enrolled. Both lines carry `path`, `error` (the live file's), `prev` and `prev_error` (why the
+copy could not be used).
+
+| The live file | ERROR line | Where |
+|---|---|---|
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3613` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3621` |
+
+Before #4102 both took the second line, so a device with no config at all, such as one never
+enrolled where `roomlerd org ls` ran, was told its config was unreadable.
 
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1143`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1270`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -630,7 +645,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
 (`record_clean_run_at`, `:2570`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4415`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4429`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -642,7 +657,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4235`):
+ignores (`serialise_for`, `:4249`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -668,14 +683,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:4041`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4055`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:4109`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:4093`), never one read off the entry on disk. A newer build's
+`:4123`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4107`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -696,11 +711,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4187`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4201`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4381`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4395`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -878,7 +893,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4750`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4764`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived

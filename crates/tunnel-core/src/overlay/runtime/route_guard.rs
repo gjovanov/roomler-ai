@@ -78,7 +78,8 @@ pub(super) enum Defend {
     /// traffic leaked to the CORP GATEWAY — field 2026-08-08, winhost-a), or
     /// actively retract them when the host's own uplink sits inside the block
     /// (the ISP-CGNAT self-wedge gate — decided per wave, inside the detached
-    /// task, off the select loop).
+    /// task, off the select loop). macOS has no floors: there the same gate
+    /// decides the utun's own block route on every wave (#4117).
     BlockFloor,
 }
 

@@ -1288,11 +1288,12 @@ pub struct OverlayRuntime {
     /// [`with_netstack_socks`](Self::with_netstack_socks).
     netstack_socks: Option<u16>,
     /// Phase D (DERP) — a factory that OPENS this node's `/derp` WS + returns
-    /// its demux, called LAZILY by [`run`](Self::run) only when the node is
-    /// itself UDP-blocked (its srflx gather found nothing). A UDP-capable node
-    /// can never be in a both-UDP-blocked pair, so it never needs DERP — this
-    /// way it doesn't hold an idle `/derp` WS. `None` (no factory / not called)
-    /// ⇒ no DERP; the coordinator falls through to both-allocate. Set via
+    /// its demux. [`run`](Self::run) hands it to the relay coordinator, which
+    /// calls it at start only when the node is itself UDP-blocked (its srflx
+    /// gather found nothing) or its DERP floor is on, and otherwise on the
+    /// first DERP verdict that finds no mux (P7, #2992), so a UDP-capable
+    /// node holds no idle `/derp` WS. `None` (no factory) ⇒ no DERP; a DERP
+    /// verdict then reports `derp_mux_failed`. Set via
     /// [`with_derp_mux_factory`](Self::with_derp_mux_factory).
     derp_mux_factory: Option<DerpMuxFactory>,
     /// Multi-region DERP — per-URL regional mux opener (agent-provided, like
@@ -1347,8 +1348,10 @@ pub struct OverlayRuntime {
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
 /// `tokio_tungstenite`) and returns the connected [`DerpMux`]. Boxed +
-/// agent-provided so `tunnel-core` stays WebSocket-free; [`OverlayRuntime::run`]
-/// calls it AT MOST ONCE, and only for a UDP-blocked node (lazy `/derp`).
+/// agent-provided so `tunnel-core` stays WebSocket-free. Called AT MOST ONCE:
+/// [`OverlayRuntime::run`] hands it to the relay coordinator, which opens it at
+/// start for a UDP-blocked or floor-on node, and otherwise on the first DERP
+/// verdict that finds no mux (#2992).
 ///
 /// `Send + Sync`: the `run` future keeps `&self` alive across awaits and is
 /// spawned onto the multi-thread runtime, so `OverlayRuntime` (and thus this
@@ -2617,21 +2620,16 @@ impl OverlayRuntime {
         // (the rc.393 deadlock class). One idle WSS per org; the server's
         // 30 s keepalive (#509) carries it.
         //
-        // P7 — the factory is RETAINED (moved into a local, not consumed at
-        // startup unless needed): a UDP-capable node can now be force-pinned
-        // onto DERP mid-run by the server's `OverlayForceDerp` push, and the
-        // handler invokes the factory at-most-once THEN — see the ForceDerp
-        // arm.
-        let mut derp_factory = self.derp_mux_factory.take();
+        // P7 — the factory is RETAINED, not consumed at startup unless needed:
+        // a UDP-capable node can be pinned onto DERP mid-run by the server.
+        // #2992 — the RELAY COORDINATOR holds it (`set_derp_opener` below), so
+        // every DERP verdict that finds no mux opens it there, once: the P7
+        // push, and the server's stamp on a live TURN pair or at
+        // establishment. Before, only the ForceDerp arm could reach it.
+        let derp_factory = self.derp_mux_factory.take();
         // Multi-region DERP — reusable per-URL opener for regional relays.
         let regional_derp_factory = self.regional_derp_factory.take();
-        let derp_mux = if matches!(self.mode, CarrierMode::Relay)
-            && (srflx_advertised.is_empty() || super::direct::derp_floor_enabled())
-        {
-            derp_factory.take().map(|f| f())
-        } else {
-            None
-        };
+        let open_derp_at_start = srflx_advertised.is_empty() || super::direct::derp_floor_enabled();
         let mut relay = match self.mode {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
@@ -2650,8 +2648,12 @@ impl OverlayRuntime {
                         .as_ref()
                         .map(|c| c.endpoints.clone())
                         .unwrap_or_default(),
-                    derp_mux,
+                    None,
                 );
+                r.set_derp_opener(derp_factory);
+                if open_derp_at_start {
+                    r.open_derp_mux_at_start();
+                }
                 // W6 phase-2 — the full coturn worker IP set (uncapped
                 // A-record resolve of the STUN hosts): the single-relay
                 // dialer positively identifies the anchor's relayed address
@@ -4357,13 +4359,10 @@ impl OverlayRuntime {
                         self.shadow(|s| s.mon.on_forced_derp(&peer_node_id, Duration::from_millis(ttl_ms), Instant::now()));
                         if let Some(r) = relay.as_mut() {
                             // P7 — a UDP-capable node skipped the startup
-                            // `/derp` open; lazily invoke the retained factory
-                            // (at-most-once) before pinning.
-                            if !r.has_derp_mux()
-                                && let Some(f) = derp_factory.take()
-                            {
-                                r.set_derp_mux(f());
-                            }
+                            // `/derp` open; open it now, through the
+                            // coordinator's opener (at-most-once, #2992),
+                            // before pinning.
+                            r.open_derp_mux_for_verdict(&peer_node_id, "the server's force-DERP pin (P7)");
                             // Multi-region DERP — a push carrying a regional
                             // url: open (once per URL) via the reusable
                             // factory. An unopenable region (no ticket yet /
