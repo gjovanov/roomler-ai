@@ -616,8 +616,8 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3613` |
-| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3621` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3651` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3659` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
 enrolled where `roomlerd org ls` ran, was told its config was unreadable.
