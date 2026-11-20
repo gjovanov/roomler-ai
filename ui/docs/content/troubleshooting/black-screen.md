@@ -14,7 +14,7 @@ unhelpful here: a missing capture grant almost never produces an error.
 | You see | Almost always |
 |---|---|
 | Wallpaper, no windows or menu bar | macOS **Screen Recording** grant missing |
-| Screen fine, clicks and keys do nothing | macOS **Accessibility** grant, or a Linux keyboard-layout problem |
+| Screen fine, clicks and keys do nothing | macOS **Accessibility** grant (**Device Control and Data Access** on macOS 27), or a Linux keyboard-layout problem |
 | Frozen at a lock screen or UAC prompt | Windows agent not in system service mode |
 | Completely black, a reconnect fixes it | A capture handle that came up empty |
 | Black on a headless Linux box | No session to capture |
@@ -26,7 +26,11 @@ Open **System Settings → Privacy & Security** and enable **roomlerd**
 under both:
 
 - **Screen & System Audio Recording** — without it you get the desktop picture and nothing on it.
-- **Accessibility** — without it, keys and clicks are silently dropped.
+- **Accessibility**, which macOS 27 calls **Device Control and Data Access** — without it, keys and clicks are silently dropped.
+
+A **Roomler** entry, if a list shows one, is the menu-bar app, and its toggle
+changes nothing. On macOS 27, Privacy & Security has no Accessibility row; the
+sidebar's **Accessibility** page is a different one, for assistive settings.
 
 Then restart the user half:
 
