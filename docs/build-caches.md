@@ -235,20 +235,20 @@ until its job ceiling.
 
 ```mermaid
 flowchart TD
-    A["probe the names apt's sources use<br/>getent, in parallel (:266)"] -->|all resolve| R
-    A -->|a required name fails| B{"does 1.1.1.1 or 8.8.8.8<br/>answer every name? (dig, :299)"}
-    B -->|yes| C["resolvectl dns on the default link,<br/>flush, probe again (:329)<br/>::warning apt mirror DNS"]
+    A["probe the names apt's sources use<br/>getent, in parallel (:275)"] -->|all resolve| R
+    A -->|a required name fails| B{"does 1.1.1.1 or 8.8.8.8<br/>answer every name? (dig, :308)"}
+    B -->|yes| C["resolvectl dns on the default link,<br/>flush, probe again (:338)<br/>::warning apt mirror DNS"]
     C -->|resolves now| R
     C -->|still fails| X["put the link back"]
     B -->|no| X
     X --> N{"subcommand"}
     N -->|prepare| W["::warning apt mirrors unreachable<br/>refresh skipped, step passes"]
-    N -->|install| O["offline install from the local archive (:446)<br/>else ONE ::error Ubuntu mirrors unreachable"]
+    N -->|install| O["offline install from the local archive (:460)<br/>else ONE ::error Ubuntu mirrors unreachable"]
     N -->|reach| E["ONE ::error apt mirrors unreachable"]
-    R["dpkg --configure -a, bounded refresh (:403)"] --> I["download phase, bounded<br/>then install phase, bounded (:422)<br/>the caller's apt options on both"]
+    R["dpkg --configure -a, bounded refresh (:417)"] --> I["download phase, bounded<br/>then install phase, bounded (:436)<br/>the caller's apt options on both"]
 ```
 
-**The names.** They come from apt's own sources (`derive_hosts`, `ci-apt.sh:230`): one-line
+**The names.** They come from apt's own sources (`derive_hosts`, `ci-apt.sh:239`): one-line
 `.list` files, deb822 `.sources` and the list a `mirror+file:` URI names. The Ubuntu archive
 hosts are **required** (`ci-apt.sh:136`). Any other repository, such as
 `packages.microsoft.com`, is probed with a shorter wait and only reported, so a dead
@@ -261,19 +261,36 @@ container images' mirrors (`ci-apt.sh:133-134`).
 **The failover never weakens apt's verification.** No `--allow-unauthenticated`, no
 `[trusted=yes]`. Every index is checked against Ubuntu's signing keys and every package
 against the index, so a DNS answer can make a download fail but never install a wrong
-package. A container started after the switch inherits it: Docker copies
-`/run/systemd/resolve/resolv.conf`, which the switch rewrites. The self-test measured this
-on all three images (D2 of #3710).
+package.
+
+**Containers get the switch passed in; they do not always inherit it.** Docker gives a
+container the host's resolv.conf without its loopback entries. Where `/etc/resolv.conf`
+links to the stub, Docker reads `/run/systemd/resolve/resolv.conf` instead, which the
+switch rewrites, so the container inherits the switch. The 11-20 self-test measured that on
+ubuntu-latest and ubuntu-22.04 (D2 of #3710). ubuntu-22.04-arm image 20261116.196.1 ships a
+static `/etc/resolv.conf` instead: an egress proxy on `127.0.0.100`, the stub, then the
+Azure upstream. A container's copy then holds only the upstream the switch went around,
+and its `apt-get update` timed out after the failover. So a switch that helped also writes
+its resolvers to `/tmp/ci-apt.docker-dns` as `docker run` arguments (`--dns`, then an
+address, one per line; `ci-apt.sh:171`). Every container step passes them:
+`deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns`, and the two bundle checks read the
+file into an array on the line after `reach`. With no failover there is no file, and a
+container starts exactly as before.
+
+| Runner image | `/etc/resolv.conf` | A container after the switch, by itself | With the helper's arguments |
+|---|---|---|---|
+| ubuntu-latest (26.04), ubuntu-22.04 | link to the stub | reaches its mirror | reaches its mirror |
+| ubuntu-22.04-arm 20261116.196.1 | static file, written by `repoint-resolv-conf` | `apt-get update` times out | reaches its mirror in about 3 s |
 
 ### The subcommands and where each runs
 
 | Subcommand | Does | Callers |
 |---|---|---|
-| `prepare [BOUND...]` (`:530`) | probe and failover, a bounded refresh, the apt-fast stand-in. It never fails the step | the composite (`ci-linux-system-deps/action.yml:63`); `ffmpeg-encoder-check` (`ci.yml:2340`); `recording-ffmpeg` (`ci.yml:2517`); release-agent's `build-linux` and `build-linux-companion`, before their cached steps (`release-agent.yml:313`, `:793`) |
-| `fallback PKG...` (`:600`) | bounded install, `--no-install-recommends`; with no resolver, one `::error` | the composite's verify steps (`action.yml:130`, `:186`); `ci.yml:2364`, `:2525` |
-| `install [BOUND...] [OPT...] -- PKG...` (`:620`) | `dpkg --configure -a`, probe and failover, bounded refresh, bounded two-phase install with exactly the caller's options. It adds no option, so recommends stay wherever the step had them | the recorder-audio lane's xvfb and xclip (`ci.yml:1301`, `:1337`, `:1445`); release-agent's fallbacks (`:364`, `:826`), `rpm` (`:884`), and the arm64 installs (`:972`, `:1107`); `apt-seed-install` (`action.yml:69`); release-tunnel (`:166`) |
-| `reach [--containers] [HOST...]` (`:658`) | probe and failover alone, for apt that runs elsewhere; one `::error` when the names do not resolve | `ui-phone-smoke.yml:78` (Playwright's `--with-deps` runs apt itself); the bundle checks' containers (`release-agent.yml:665`, `:1240`); every `deb-bare-check.sh` run (`release-agent.yml:1358`, `release-tunnel.yml:334`, `deb-bare-image.yml:78`) |
-| the stand-in (`:561`) | what cache-apt-pkgs-action's cold path runs as `apt-fast`: the bounded two-phase install. On failure it removes `~/cache-apt-pkgs`, so the action saves no empty set | every cached-apt step after a `prepare` |
+| `prepare [BOUND...]` (`:544`) | probe and failover, a bounded refresh, the apt-fast stand-in. It never fails the step | the composite (`ci-linux-system-deps/action.yml:63`); `ffmpeg-encoder-check` (`ci.yml:2340`); `recording-ffmpeg` (`ci.yml:2517`); release-agent's `build-linux` and `build-linux-companion`, before their cached steps (`release-agent.yml:313`, `:793`) |
+| `fallback PKG...` (`:614`) | bounded install, `--no-install-recommends`; with no resolver, one `::error` | the composite's verify steps (`action.yml:130`, `:186`); `ci.yml:2364`, `:2525` |
+| `install [BOUND...] [OPT...] -- PKG...` (`:634`) | `dpkg --configure -a`, probe and failover, bounded refresh, bounded two-phase install with exactly the caller's options. It adds no option, so recommends stay wherever the step had them | the recorder-audio lane's xvfb and xclip (`ci.yml:1301`, `:1337`, `:1445`); release-agent's fallbacks (`:364`, `:826`), `rpm` (`:884`), and the arm64 installs (`:972`, `:1107`); `apt-seed-install` (`action.yml:69`); release-tunnel (`:166`) |
+| `reach [--containers] [HOST...]` (`:672`) | probe and failover alone, for apt that runs elsewhere; one `::error` when the names do not resolve | `ui-phone-smoke.yml:78` (Playwright's `--with-deps` runs apt itself); the bundle checks' containers (`release-agent.yml:665`, `:1240`); every `deb-bare-check.sh` run (`release-agent.yml:1358`, `release-tunnel.yml:334`, `deb-bare-image.yml:78`) |
+| the stand-in (`:575`) | what cache-apt-pkgs-action's cold path runs as `apt-fast`: the bounded two-phase install. On failure it removes `~/cache-apt-pkgs`, so the action saves no empty set | every cached-apt step after a `prepare` |
 
 **Left, and why.**
 
@@ -300,7 +317,7 @@ and a composite step cannot carry one at all.
 
 The stand-in's bounds come from `prepare --download-bound 120 --install-bound 180`. `prepare`
 records them in `/usr/local/etc/ci-apt.bounds`, and the stand-in reads that file without
-sourcing it (`:494`). This keeps a failover (~85 s), the download, the install and the
+sourcing it (`:508`). This keeps a failover (~85 s), the download, the install and the
 action's own work inside release-agent's 8-minute cached step, so that step's timeout can
 never land inside dpkg. The defaults (300 + 600 s) would not fit there.
 
@@ -357,7 +374,12 @@ release workflows or itself. It has two jobs:
   and checks at the end that the DROP rules matched packets.
 - **The runner-dead cells** also run a negative control (today's bare `apt-get` must fail
   or hang), a container before and after the failover (D2), and `deb-bare-check.sh` on an
-  empty package (exit 3 under the fault, a pass after it).
+  empty package (exit 3 under the fault, a pass after it). After the failover the cell
+  measures a container started bare, then requires one started with the helper's
+  `/tmp/ci-apt.docker-dns` arguments to reach its mirror. Every cell logs the runner image
+  and whether `/etc/resolv.conf` is a link, because the images change between pushes.
+- **The healthy cells** require that no `/tmp/ci-apt.docker-dns` exists, so a healthy job
+  starts its containers as before.
 - **The all-dead cells** read the cached action in front of a failing stand-in, and
   `apt-seed-install`'s offline path.
 
