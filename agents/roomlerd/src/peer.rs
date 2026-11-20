@@ -2038,7 +2038,7 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
-            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move.
+            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move; never under `route`.
             let (pair, opening) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             let local = pair.local();
             let remote = pair.remote();
@@ -2050,7 +2050,7 @@ async fn detect_constrained_transport(
                 && !crate::encode::relay_addr_is_fast_local(&local.address))
                 || (remote.typ == RTCIceCandidateType::Relay
                     && !crate::encode::relay_addr_is_fast_local(&remote.address));
-            crate::carrier_rank::path_detected(session_id, relay, local, remote, opening);
+            crate::carrier_rank::log_path(session_id, relay, local, remote, opening).await;
             return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

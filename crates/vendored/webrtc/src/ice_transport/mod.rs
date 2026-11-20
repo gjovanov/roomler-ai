@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use ice::agent::agent_config::RouteRead;
 use ice::candidate::Candidate;
 use ice::state::ConnectionState;
 use ice_candidate::RTCIceCandidate;
@@ -95,6 +96,22 @@ impl RTCIceTransport {
             }
         }
         None
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): `pair` as the ICE agent's route rank
+    /// reads it (`Agent::route_read`, a patch of the vendored webrtc-ice):
+    /// whether it rides the mesh, and how the agent's hold went so far. `None`
+    /// when the agent is gone or runs no route rank. Like
+    /// [`Self::local_candidates`], it never creates an agent.
+    pub async fn route_read(&self, pair: &RTCIceCandidatePair) -> Option<RouteRead> {
+        let agent = self.gatherer.get_agent().await?;
+        let (local, remote) = (pair.local(), pair.remote());
+        agent.route_read(
+            local.priority,
+            local.component,
+            &local.address,
+            &remote.address,
+        )
     }
 
     /// Roomler patch (FR-148 P4): the local candidates gathered so far, empty

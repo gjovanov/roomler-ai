@@ -94,11 +94,67 @@ pub struct AgentInternal {
     // made and by the controlled agent's checks after its first selection.
     pub(crate) carrier_rank: Arc<Option<CarrierRank>>,
     // Roomler patch (FR-148 P4 step 2): the route rank's hold
-    // (`holds_mesh_route`). Whether a TURN server off the mesh is configured,
-    // whether the relay gather has ended, and when the checks started.
-    pub(crate) real_turn: bool,
-    pub(crate) relays_settled: AtomicBool,
-    pub(crate) checks_started: SyncMutex<Option<Instant>>,
+    // (`holds_mesh_route`): when the checks started and when and why the hold
+    // stopped, and how many allocations on a TURN server off the mesh are
+    // still running. Zero without the route rank where it acts.
+    pub(crate) route_hold: SyncMutex<RouteHoldState>,
+    pub(crate) real_turns_pending: AtomicUsize,
+    // Roomler patch (FR-148 P4 step 2): rule 2's sibling (R1), as
+    // `SIBLING_TURN` and `SIBLING_HOST` bits (`refuses_pair`). Zero without the
+    // route rank where it acts.
+    pub(crate) mesh_sibling: AtomicU8,
+}
+
+/// Roomler patch (FR-148 P4 step 2): rule 2's sibling, from the config: a TURN
+/// URL on the mesh, with relay gathering on. Its relay is served from the mesh
+/// and the srflx its server answers is mapped onto it: both are ranked last.
+/// Dropped when the whole gather ends without a srflx or relay candidate on
+/// the mesh (`settle_sibling`).
+pub(crate) const SIBLING_TURN: u8 = 1;
+
+/// Roomler patch (FR-148 P4 step 2): rule 2's sibling, from the interfaces: the
+/// host gather will make a candidate on a mesh address (`Agent::new` reads the
+/// gather's own interface list, with its filters). Dropped when the host
+/// gather ends without one (`settle_sibling`).
+pub(crate) const SIBLING_HOST: u8 = 2;
+
+/// Roomler patch (FR-148 P4 step 2): the route rank's hold, as it went.
+#[derive(Default)]
+pub(crate) struct RouteHoldState {
+    /// When the checks started.
+    pub(crate) started: Option<Instant>,
+    /// When and why the hold last stopped holding. Cleared if it holds again:
+    /// a pair off the mesh formed before any selection (a late remote relay).
+    pub(crate) stopped: Option<(Instant, RouteHoldExit)>,
+    /// Over for good: a pair is selected, or the bound passed. It never holds
+    /// again, so a pair that carries the session is always answered.
+    pub(crate) over: bool,
+}
+
+/// Roomler patch (FR-148 P4 step 2): under the route rank where it acts, with
+/// relay gathering on, how many of the config's TURN URLs are off the mesh
+/// (`off_the_mesh`) or on it; zero otherwise. A URL host that is a name is off
+/// the mesh: only an address can be the mesh's.
+fn route_turns(config: &AgentConfig, off_the_mesh: bool) -> usize {
+    let Some(rank) = (*config.carrier_rank)
+        .as_ref()
+        .filter(|rank| rank.route_engaged().is_some())
+    else {
+        return 0;
+    };
+    if !(config.candidate_types.is_empty()
+        || config.candidate_types.contains(&CandidateType::Relay))
+    {
+        return 0;
+    }
+    config
+        .urls
+        .iter()
+        .filter(|url| {
+            matches!(url.scheme, SchemeType::Turn | SchemeType::Turns)
+                && rank.turn_off_the_mesh(&url.host) == off_the_mesh
+        })
+        .count()
 }
 
 impl AgentInternal {
@@ -178,17 +234,13 @@ impl AgentInternal {
             agent_conn: Arc::new(AgentConn::new()),
 
             carrier_rank: Arc::clone(&config.carrier_rank),
-            real_turn: (*config.carrier_rank).as_ref().is_some_and(|rank| {
-                rank.route.is_some()
-                    && (config.candidate_types.is_empty()
-                        || config.candidate_types.contains(&CandidateType::Relay))
-                    && config.urls.iter().any(|url| {
-                        matches!(url.scheme, SchemeType::Turn | SchemeType::Turns)
-                            && rank.turn_off_the_mesh(&url.host)
-                    })
+            route_hold: SyncMutex::new(RouteHoldState::default()),
+            real_turns_pending: AtomicUsize::new(route_turns(config, true)),
+            mesh_sibling: AtomicU8::new(if route_turns(config, false) > 0 {
+                SIBLING_TURN
+            } else {
+                0
             }),
-            relays_settled: AtomicBool::new(false),
-            checks_started: SyncMutex::new(None),
         };
 
         let chan_receivers = ChanReceivers {
@@ -230,7 +282,7 @@ impl AgentInternal {
             .await;
 
         // Roomler patch (FR-148 P4 step 2): the route rank's hold counts from here.
-        *self.checks_started.lock() = Some(Instant::now());
+        self.route_hold.lock().started = Some(Instant::now());
         self.request_connectivity_check();
 
         self.connectivity_checks().await;
@@ -391,6 +443,8 @@ impl AgentInternal {
                 );
             }
             p.nominated.store(true, Ordering::SeqCst);
+            // Roomler patch (FR-148 P4 step 2): a selection ends the hold.
+            self.hold_ends_at_selection(&p);
             self.agent_conn.selected_pair.store(Some(p));
 
             self.update_connection_state(ConnectionState::Connected)
@@ -475,12 +529,9 @@ impl AgentInternal {
         local: Arc<dyn Candidate + Send + Sync>,
         remote: Arc<dyn Candidate + Send + Sync>,
     ) {
-        // Roomler patch (FR-148 P4 step 2): the route rank never pairs a local
-        // candidate off the mesh with a remote on it ([`CarrierRank::route`]).
-        if (*self.carrier_rank)
-            .as_ref()
-            .is_some_and(|rank| rank.crosses_into_the_mesh(&*local, &*remote))
-        {
+        // Roomler patch (FR-148 P4 step 2): rule 2, a pair into the mesh is not
+        // formed while a sibling carries its route ([`CarrierRank::route`]).
+        if self.refuses_pair(&*local, &*remote) {
             log::debug!(
                 "[{}]: no pair {} -> {}: it crosses into the mesh",
                 self.get_name(),
@@ -489,13 +540,99 @@ impl AgentInternal {
             );
             return;
         }
+        // Roomler patch (FR-148 P4 step 2): where the route rank acts, a pair
+        // is formed once, though the pairs a dropped sibling had refused are
+        // formed by `settle_sibling` while the candidates still trickle.
+        let once = (*self.carrier_rank)
+            .as_ref()
+            .is_some_and(|rank| rank.route_engaged().is_some());
         let p = Arc::new(CandidatePair::new(
             local,
             remote,
             self.is_controlling.load(Ordering::SeqCst),
         ));
         let mut checklist = self.agent_conn.checklist.lock().await;
+        if once
+            && checklist
+                .iter()
+                .any(|q| q.local.equal(&*p.local) && q.remote.equal(&*p.remote))
+        {
+            return;
+        }
         checklist.push(p);
+    }
+
+    /// Roomler patch (FR-148 P4 step 2, D49 rule 2 with R1): does the agent
+    /// refuse the pair of `local` and `remote`? Only a pair into the mesh
+    /// ([`CarrierRank::crosses_into_the_mesh`]), and only while the session has
+    /// a sibling that carries the same route ranked: a TURN URL on the mesh, or
+    /// a host candidate on it (`mesh_sibling`). The sibling is fixed before any
+    /// candidate is gathered or any remote arrives, so the answer never depends
+    /// on the order they come in; it is dropped only when the gather that was
+    /// to make it has ended without it (`settle_sibling`). Without one the pair
+    /// is the route's only pair: it is formed, and the hold treats it as any
+    /// pair the mesh carries.
+    pub(crate) fn refuses_pair(&self, local: &dyn Candidate, remote: &dyn Candidate) -> bool {
+        self.mesh_sibling.load(Ordering::SeqCst) != 0
+            && (*self.carrier_rank)
+                .as_ref()
+                .is_some_and(|rank| rank.crosses_into_the_mesh(local, remote))
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): the gather that was to make the
+    /// sibling `bit` has ended: the host gather for `SIBLING_HOST`, the whole
+    /// gather for `SIBLING_TURN`. When it made no candidate on the mesh of its
+    /// kind (a host for the one; a srflx or relay for the other: a bind on the
+    /// mesh address failed, the TURN server on the mesh never answered), that
+    /// sibling is dropped; if none is left, the pairs into the mesh refused so
+    /// far are formed now, as R1 forms them for a session that never had one.
+    pub(crate) async fn settle_sibling(&self, bit: u8) {
+        if self.mesh_sibling.load(Ordering::SeqCst) & bit == 0 {
+            return;
+        }
+        let Some(rank) = (*self.carrier_rank).as_ref() else {
+            return;
+        };
+        let made_it = {
+            let local_candidates = self.local_candidates.lock().await;
+            local_candidates.values().flatten().any(|c| {
+                (c.candidate_type() == CandidateType::Host) == (bit == SIBLING_HOST)
+                    && rank.local_on_mesh(&**c)
+            })
+        };
+        if made_it {
+            return;
+        }
+        let left = self.mesh_sibling.fetch_and(!bit, Ordering::SeqCst) & !bit;
+        log::debug!(
+            "[{}]: the gather made no candidate on the mesh for sibling {}; sibling left: {}",
+            self.get_name(),
+            bit,
+            left != 0
+        );
+        if left != 0 {
+            return;
+        }
+        // Read after the sibling is dropped: a candidate added from here on
+        // reads it dropped and forms its own pairs; one added before is here.
+        let locals: Vec<_> = {
+            let local_candidates = self.local_candidates.lock().await;
+            local_candidates.values().flatten().cloned().collect()
+        };
+        let remotes: Vec<_> = {
+            let remote_candidates = self.remote_candidates.lock().await;
+            remote_candidates.values().flatten().cloned().collect()
+        };
+        for local in &locals {
+            for remote in &remotes {
+                if local.network_type() == remote.network_type()
+                    && rank.crosses_into_the_mesh(&**local, &**remote)
+                {
+                    self.add_pair(Arc::clone(local), Arc::clone(remote)).await;
+                }
+            }
+        }
+        self.request_connectivity_check();
     }
 
     pub(crate) async fn find_pair(
@@ -512,44 +649,117 @@ impl AgentInternal {
         None
     }
 
-    /// Roomler patch (FR-148 P4 step 2): does the controlled agent hold its
-    /// mesh-route pairs now, neither checking nor answering them? Only under
-    /// the route rank, and only while all of these hold:
+    /// Roomler patch (FR-148 P4 step 2, D49 rule 3): does the controlled agent
+    /// hold its mesh-route pairs now, neither checking nor answering them? Only
+    /// under the route rank where it acts, and only while all of these hold:
     ///
     /// - the bound has not passed since the checks started ([`RouteRank::hold`]);
-    /// - no pair off the mesh carries the session;
-    /// - a relay off the mesh can still come: its gather has not ended, or a
-    ///   pair off the mesh has not failed.
+    /// - no pair is selected (a pair off the mesh ends it: `real-selected`; one
+    ///   on the mesh can only be selected once the hold has stopped);
+    /// - a relay off the mesh can still come: an allocation on a TURN server
+    ///   off the mesh is still running, or a pair off the mesh has not failed.
     ///
-    /// Read again at every check and every inbound check, so the hold ends on
-    /// the evidence that nothing off the mesh can come, or on the bound.
+    /// Read again at every check and every inbound check, so it stops on the
+    /// evidence that nothing off the mesh can come, or on the bound. Until a
+    /// pair is selected a pair off the mesh that forms later (a remote relay
+    /// trickled late) holds it again; once a pair is selected, or the bound has
+    /// passed, it never holds again. When and why it stopped is kept for the
+    /// session's opening (`route_hold_so_far`).
     pub(crate) async fn holds_mesh_route(&self) -> bool {
         let Some(rank) = (*self.carrier_rank).as_ref() else {
             return false;
         };
-        let Some(route) = rank.route else {
+        let Some(route) = rank.route_engaged() else {
             return false;
         };
-        if rank.mesh_last.is_none() || self.is_controlling.load(Ordering::SeqCst) {
+        if self.is_controlling.load(Ordering::SeqCst) {
             return false;
         }
-        let started = *self.checks_started.lock();
-        if started.is_some_and(|started| started.elapsed() >= route.hold) {
+        let started = {
+            let hold = self.route_hold.lock();
+            if hold.over {
+                return false;
+            }
+            // Nothing is checked or answered before the checks start.
+            let Some(started) = hold.started else {
+                return true;
+            };
+            started
+        };
+        let bound = started + route.hold;
+        if Instant::now() >= bound {
+            let mut hold = self.route_hold.lock();
+            if hold.stopped.is_none() {
+                hold.stopped = Some((bound, RouteHoldExit::Bound));
+            }
+            hold.over = true;
             return false;
         }
         if let Some(selected) = self.agent_conn.get_selected_pair() {
-            if !rank.mesh_route(&*selected.local, &*selected.remote) {
-                return false;
-            }
+            // Its selection has ended the hold already; this only repeats it.
+            self.hold_ends_at_selection(&selected);
+            return false;
         }
-        if self.real_turn && !self.relays_settled.load(Ordering::SeqCst) {
-            return true;
+        let real_can_come = self.real_turns_pending.load(Ordering::SeqCst) > 0 || {
+            let checklist = self.agent_conn.checklist.lock().await;
+            checklist.iter().any(|p| {
+                p.state.load(Ordering::SeqCst) != CandidatePairState::Failed as u8
+                    && !rank.mesh_route(&*p.local, &*p.remote)
+            })
+        };
+        let mut hold = self.route_hold.lock();
+        if hold.over {
+            return false;
         }
-        let checklist = self.agent_conn.checklist.lock().await;
-        checklist.iter().any(|p| {
-            p.state.load(Ordering::SeqCst) != CandidatePairState::Failed as u8
-                && !rank.mesh_route(&*p.local, &*p.remote)
-        })
+        if real_can_come {
+            hold.stopped = None;
+        } else if hold.stopped.is_none() {
+            hold.stopped = Some((Instant::now(), RouteHoldExit::NothingReal));
+        }
+        real_can_come
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): the selection of `p` ends the hold for
+    /// good. While the hold holds, only a pair off the mesh can be selected:
+    /// a mesh-route pair is neither checked nor answered, so it cannot be valid.
+    fn hold_ends_at_selection(&self, p: &CandidatePair) {
+        let Some(rank) = (*self.carrier_rank).as_ref() else {
+            return;
+        };
+        let Some(route) = rank.route_engaged() else {
+            return;
+        };
+        if self.is_controlling.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut hold = self.route_hold.lock();
+        let Some(started) = hold.started else {
+            return;
+        };
+        if hold.over {
+            return;
+        }
+        hold.over = true;
+        if hold.stopped.is_some() {
+            return;
+        }
+        let (now, bound) = (Instant::now(), started + route.hold);
+        if now >= bound {
+            hold.stopped = Some((bound, RouteHoldExit::Bound));
+        } else if !rank.mesh_route(&*p.local, &*p.remote) {
+            hold.stopped = Some((now, RouteHoldExit::RealSelected));
+        }
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): how long the hold held, from the
+    /// checks' start to when it stopped, and why it stopped. Zero and `None`
+    /// when it never applied or has not stopped.
+    pub(crate) fn route_hold_so_far(&self) -> (Duration, Option<RouteHoldExit>) {
+        let hold = self.route_hold.lock();
+        match (hold.started, hold.stopped) {
+            (Some(started), Some((at, exit))) => (at.saturating_duration_since(started), Some(exit)),
+            _ => (Duration::ZERO, None),
+        }
     }
 
     /// Checks if the selected pair is (still) valid.
