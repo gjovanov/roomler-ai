@@ -942,8 +942,8 @@ skip and run nothing. Send plain text: an encoded payload is the shape endpoint 
 
 | Stop on | Linux | Windows | macOS (first run 2026-11-20) |
 |---|---|---|---|
-| A live session | `roomlerd rc` | `roomlerd rc` | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions. The 2026-11-20 run read the server's record instead: no open session on either of the Mac's rows |
-| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session | `CGEventSourceSecondsSinceLastEventType`. ⚠️ With keep busy on, its posted input resets that clock and `HIDIdleTime` alike: read keep busy's own `user_active` line in the per-user log instead |
+| A live session | `roomlerd rc` | `roomlerd rc`. The 2026-11-20 runs read the server's record instead: no open session on the PC's row | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions. The 2026-11-20 run read the server's record instead: no open session on either of the Mac's rows |
+| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session. The 2026-11-20 runs read `quser`'s IDLE TIME instead, at 15 minutes for every interactive session, which needs no compiler on the PC. ⚠️ A running keep busy's moves reset both clocks, so read the row's `keep_busy` first: those runs went ahead only with it off | `CGEventSourceSecondsSinceLastEventType`. ⚠️ With keep busy on, its posted input resets that clock and `HIDIdleTime` alike: read keep busy's own `user_active` line in the per-user log instead |
 | A busy host | `/proc/loadavg` at 3/4 of the CPUs | `LoadPercentage` at 50 | `vm.loadavg` below `hw.ncpu` |
 | Another job's VMs | Any guest in `virsh list` but the host's own; count memory as allocated (`virsh dominfo`), never from `free` | | A running `tart` |
 

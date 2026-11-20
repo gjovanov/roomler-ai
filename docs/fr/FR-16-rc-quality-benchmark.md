@@ -9,6 +9,8 @@ whose verdict reads `fallback` when hardware was asked for and software answered
 began on 2026-10-31 on 0.4.191: [4 of the 11 online hosts](#l1-fleet-run-2026-10-31), and it
 caught a real fallback on two of them. MacBook-1 followed on 2026-11-20, its VideoToolbox cells
 opening in hardware as its hello says ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)).
+zeus and two Windows desktops were tried that evening, and the checks inside each command stopped
+all three before the bench.
 Tracking issue: `FR-16` (#798). Sibling of FR-17 (#799, the architectural fix); the
 measurement half of the FR-1 program, and the instrument of the
 [StarDesk teardown program](../plans/stardesk-teardown-program.md).
@@ -229,8 +231,10 @@ competitors". Engineering may use the numbers; the public pages never print them
       ([§ L1 fleet run](#l1-fleet-run-2026-10-31)). **Coverage is partial, so the box stays
       `[~]`:** 4 of the 11 online hosts ran it on 2026-10-31, of the 20 rows the server
       listed, and MacBook-1 ran it on 2026-11-20 with its VideoToolbox cells in hardware
-      ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)). **Owed:** zeus, skipped twice
-      for other jobs' load; two Windows PCs that came online after 2026-10-31; and the
+      ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)). **Owed:** zeus, skipped three
+      times for other jobs' load; two Windows desktops that came online after 2026-10-31,
+      each tried twice on the evening of 2026-11-20 and stopped by the checks (an open remote
+      session on one, a session in use on the other); and the
       console rows of CORPLAP-1, CORPLAP-2, CORPLAP-3, NEO16 and NEO16-WSL, which
       `roomler exec` does not target, so the operator runs those at each console (the
       2026-11-02 decision on #798).
@@ -294,6 +298,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-30 | **L1, a release build of the branch** (#3155) with the Linux release lane's features (`release-agent.yml:552`), in an Ubuntu 24.04 container on the Windows dev box, no GPU, no config | **RED:** the released 0.4.188 `.deb` (sha256 checked) answers `encoder-smoke --bench` with `error: unexpected argument '--bench' found`, exit 2, and no `L1` line. Its plain smoke still passes (`openh264`, 4 keyframes, 13 238 bytes). **GREEN:** the quick profile printed six rows in 2.0 s, 18.5 KB with its log lines against exec's 256 KiB. `rtp:h264` is OpenH264 `sw-only` (p50 6.6 ms, p95 12.9 ms, 3383 kbps for a 5529 kbps target). `rtp:h265` and the three FFmpeg DataChannel cells read `none`, as no GPU means they should. **`dc:vp9:444` reads `fallback`**: the build carries FFmpeg's VP9 hardware path, the container has no device for it, and libvpx answered (p50 5.2 ms). The release lane's own line on this binary gave 0.4.188's result exactly. The thread's clock reads `refused:95`: this kernel has no util clamp. **Twice:** `rtp:h264` over static, drag and pan, back to back, repeated its sizes and rates to the byte. Its p50s were 3.7/4.7, 8.1/7.5 and 7.6/6.4 ms, and its p95s up to 60 % apart (27.8/17.2 ms on pan) on a busy host. A paced run read about the same as back to back on this x86 host. **Wrong turn, fixed:** the first GREEN read `rtp:h264` `idr_n=6` with an IDR p50 of 30 bytes. OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and the bench counted packets. A frame is now one `encode()`'s output, and against the old count the seam test fails `6` against `3` |
 | 2026-10-31 | **L1, the fleet.** Agent 0.4.191 on every host read, the quick profile through `roomler exec` | **The check fails where it should.** Both Windows hosts read `fallback` on `rtp:h264`, on a hello that lists `mf-h264-hw`; jupiter and mars matched their hellos. 4 of 11 online hosts reached, with a live-use check inside each command. The table, the join and who was skipped are in [§ L1 fleet run](#l1-fleet-run-2026-10-31). |
 | 2026-11-20 | **L1, MacBook-1.** Agent 0.4.227, the quick profile with hardware asked for, through `roomler ssh` into the Mac's root row | **The join passes on macOS:** `rtp:h265`, `dc:h264` and `dc:h265` opened VideoToolbox in hardware, as the hello says, in a 1.3 s run. `rtp:h264` read `sw-only` and `dc:vp9:444` `fallback`, with the same bytes as every 2026-10-31 host. zeus was skipped again: three lab guests of another job were running, and the check in the command stopped the run. The rows are in [§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1). |
+| 2026-11-20 | **L1, zeus and two Windows desktops, that evening.** Agent 0.4.229 on all three, after that release reached the fleet. The desktops came online after 2026-10-31, and each was tried through `roomler exec`, which runs as SYSTEM in the console session | **None ran: the checks stopped all three before the bench.** Desktop 2, at 19:16Z and 20:18Z: the server's record held an open remote session on its row, the same one both times, so no command reached the PC. Desktop 3, at 19:16Z and 20:19Z (21:16 and 22:19 on its clock): `quser` read its one session idle under a minute. Keep busy was off, so the check read the session's own idle time. zeus, at 19:18Z: five guests of other jobs were running, the release lab's bases among them. Who ran it is in [§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1). |
 
 ### L1 fleet run, 2026-10-31
 
@@ -348,7 +353,7 @@ Who ran it, against the server's 20 rows, 11 of them online:
 | Hosts | State | Why |
 |---|---|---|
 | jupiter, mars, a Windows laptop, a Windows desktop | reached | mars on the second try: the first stopped at the check, at load 18 on 16 CPUs |
-| zeus | skipped | Host under memory pressure after an incident the same evening. Its hello matches jupiter's. **Skipped again on 2026-11-20**: three lab guests of another job were running, and the check in the command stopped the run ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)) |
+| zeus | skipped | Host under memory pressure after an incident the same evening. Its hello matches jupiter's. **Skipped twice more on 2026-11-20**: other jobs' lab guests were running each time, and the check in the command stopped the run ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)) |
 | MacBook-1 | skipped, **reached on 2026-11-20** | Two VM guests of another job were running. FR-112's rows on [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) ran `--encoder software`, which cannot read `fallback`. Its VideoToolbox rows ran in hardware on 2026-11-20 ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)) |
 | CORPLAP-1, CORPLAP-2, CORPLAP-3 | not run | `roomler exec` is not used on a corporate laptop |
 | NEO16, NEO16-WSL | not run | Never a target |
@@ -397,8 +402,17 @@ since 2026-11-10 the Mac has a second row, for its root daemon.
 | Hosts | State | Why |
 |---|---|---|
 | MacBook-1 | reached | Above |
-| zeus | skipped | Three lab guests of another job were running, and the check in the command stopped the run before the bench. The release lab takes the host from its next cut until that release is out, so it runs after that |
-| Two Windows PCs that came online after 2026-10-31 | not run | People's work PCs, in their working hours. `roomler exec` reaches both |
+| zeus | skipped twice | 14:21Z, on 0.4.228: three lab guests of another job were running. 19:18Z, on 0.4.229, after that release's push: five guests of other jobs were running, the release lab's bases for its next round among them. Both times the check in the command stopped the run before the bench |
+| Windows desktop 2 (Core i5-12400, UHD 730) | skipped twice | It came online after 2026-10-31. At 19:16Z and 20:18Z the server's record held an open remote session on its row, the same one both times, so no command reached the PC |
+| Windows desktop 3 (Core i5-12400, UHD 730) | skipped twice | It came online after 2026-10-31. At 19:16Z and 20:19Z, at 21:16 and 22:19 on its clock, `quser` read its one session idle under a minute, and the check in the command stopped the run before the bench |
 | jupiter, mars, a Windows laptop, a Windows desktop | not re-run | Reached on 2026-10-31 |
 | CORPLAP-1, CORPLAP-2, CORPLAP-3, NEO16, NEO16-WSL | not run | The operator runs these at each console (the 2026-11-02 decision on #798) |
 | 9 other rows | offline | |
+
+The two desktops are people's work PCs. They were tried with the operator's go, after their
+working day, on 0.4.229, with every check inside the one command that would have run the bench:
+the PC's own clock at 19:00 or later, every interactive session idle for at least 15 minutes by
+`quser`, the CPU under 50 % over three reads, and no open remote session on the row in the
+server's record. A running keep busy resets the idle clock with its moves, so each row's
+`keep_busy` was read first. It was off on both. Both desktops have the 2026-10-31 desktop's
+hardware, so their rows will compare with its column directly.
