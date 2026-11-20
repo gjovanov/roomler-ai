@@ -924,18 +924,18 @@ impl RoomManager {
         connection_id: &str,
         user_id: &ObjectId,
     ) -> bool {
-        let mut removed = false;
-        if let Some(room) = self.rooms.get(room_id) {
-            let owned = room
-                .participants
-                .get(connection_id)
-                .map(|p| &p.user_id == user_id)
-                .unwrap_or(false);
-            if owned {
-                room.participants.remove(connection_id);
-                removed = true;
-            }
-        }
+        // One `remove_if` checks the owner and removes the entry under one
+        // shard lock. A read, then a removal, let a hang-up between the two
+        // pass for a close made here: the seat check then ended, told and
+        // settled a seat the person had left themselves (found by reading: no
+        // test can place a hang-up between two lines). Now only an entry this
+        // call removed counts, and a connection that is gone or someone else's
+        // reports false and changes nothing.
+        let removed = self.rooms.get(room_id).is_some_and(|room| {
+            room.participants
+                .remove_if(connection_id, |_, p| &p.user_id == user_id)
+                .is_some()
+        });
         if removed {
             self.connection_rooms.remove(connection_id);
             debug!(?room_id, %connection_id, "participant media closed (ownership-checked)");
