@@ -1701,4 +1701,62 @@ mod tests {
             Ok(())
         });
     }
+
+    /// `close_participant_of_user` reports a close only when it made one. A
+    /// connection that is gone, one in a room that is not there and one that
+    /// is someone else's report false and leave every seat as it was; the
+    /// person's own connection reports true, once.
+    #[test]
+    fn a_close_of_a_gone_or_a_foreign_connection_reports_false_and_changes_nothing() {
+        on_two_threads(|| async {
+            let rm = manager().await?;
+            let rid = ObjectId::new();
+            rm.create_room(rid).await.map_err(|e| e.to_string())?;
+            let (owner, other) = (ObjectId::new(), ObjectId::new());
+            for (i, user) in [(0, owner), (1, other)] {
+                rm.create_transports(rid, user, conn(i), true)
+                    .await
+                    .map_err(|e| format!("join: {e}"))?;
+            }
+            // Whether each of the two still holds its seat, in the room's
+            // participants and in the connections' rooms.
+            let seated = || {
+                [(0, owner), (1, other)]
+                    .iter()
+                    .map(|(i, user)| {
+                        rm.holds_seat(&rid, &conn(*i), user)
+                            && rm.get_connection_room(&conn(*i)) == Some(rid)
+                    })
+                    .collect::<Vec<bool>>()
+            };
+            for (what, room, connection) in [
+                ("a gone connection", rid, conn(2)),
+                (
+                    "a connection in a room that is not there",
+                    ObjectId::new(),
+                    conn(0),
+                ),
+                ("someone else's connection", rid, conn(1)),
+            ] {
+                if rm.close_participant_of_user(&room, &connection, &owner) {
+                    return Err(format!("{what} reported a close"));
+                }
+                if seated() != [true, true] {
+                    return Err(format!("{what} changed the seats: {:?}", seated()));
+                }
+            }
+            if !rm.close_participant_of_user(&rid, &conn(0), &owner) {
+                return Err("the person's own connection reported no close".into());
+            }
+            if rm.close_participant_of_user(&rid, &conn(0), &owner) {
+                return Err("a second close of the same connection reported a close".into());
+            }
+            match seated().as_slice() {
+                [false, true] => Ok(()),
+                seats => Err(format!(
+                    "the person's own close left the seats {seats:?}, expected the other's alone"
+                )),
+            }
+        });
+    }
 }
