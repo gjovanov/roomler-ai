@@ -27,8 +27,8 @@ use bson::{Bson, Document, doc};
 use roomler_ai_mod_conference::ConferenceState;
 use roomler_ai_mod_conference::guards::require_room_in_tenant;
 use roomler_ai_mod_conference::seat_check::{
-    Gone, READ_TIMEOUT, Reading, SeatCheckMemory, SeatKey, SeatRead, Verdict, check_seats_once,
-    end_seats, read_readings, read_seats,
+    Gone, ODD_DOCUMENT, READ_TIMEOUT, Reading, SeatCheckMemory, SeatKey, SeatRead, Verdict,
+    check_seats_once, end_seats, read_readings, read_seats,
 };
 use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
 use roomler_core::ApiError;
@@ -1019,4 +1019,107 @@ async fn a_reached_withdrawal_during_a_pass_leaves_it_nothing_to_end() {
     for ws in [&mut host, &mut first, &mut second] {
         ws.close(None).await.ok();
     }
+}
+
+/// T1b (with the fix). The warning for a document that does not decode
+/// fires, and once while the document stays odd: three passes over a room
+/// whose visibility the model does not know warn once, naming the
+/// collection and the room, and end nothing.
+#[tokio::test]
+async fn a_document_that_stays_odd_warns_once() {
+    let app = TestApp::spawn().await;
+    let state = conf(&app);
+    let tenant = app.seed_tenant("seatoddwarn").await;
+    let r = start_call_in_new_room(&app, &tenant, "R").await;
+    let (mut ws, conn) =
+        seat_in_call(&app, &tenant.tenant_id, &r, &tenant.member.access_token).await;
+    set_visibility(&app, &r, "unheard-of").await;
+
+    let log = Captured::default();
+    let mut memory = SeatCheckMemory::default();
+    for pass in 1..=3 {
+        let read = read_seats(state, &mut memory)
+            .with_subscriber(log.dispatch())
+            .await;
+        assert!(
+            read.failed.is_none() && read.verdicts.is_empty(),
+            "pass {pass}: {read:?}"
+        );
+    }
+    let text = log.text();
+    let warned: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains(ODD_DOCUMENT))
+        .collect();
+    eprintln!("T1b the warning: {warned:?}");
+    assert_eq!(warned.len(), 1, "one warning while it stays odd: {text}");
+    assert!(
+        warned[0].contains("seat_check_odd_document")
+            && warned[0].contains("rooms")
+            && warned[0].contains(&r),
+        "the warning names its alert, the collection and the room: {}",
+        warned[0]
+    );
+    assert_seated(&app, &conn, &r, "the seat in the room that does not decode");
+    ws.close(None).await.ok();
+}
+
+/// T4b (with the fix). A room row of no org that names the seat is not read,
+/// so it hides the seat from no reading. The person's own row in a
+/// members-only room goes and a row with the same room and person and no org
+/// is written raw: the room guard, which reads the rows of the room's org,
+/// refuses the person, and the seat ends on its second reading. Were the row
+/// read, it would not decode, and the seat would get no verdict.
+#[tokio::test]
+async fn a_room_row_of_no_org_does_not_hide_the_seat_it_names() {
+    let app = TestApp::spawn().await;
+    let state = conf(&app);
+    let tenant = app.seed_tenant("seatnoorgrow").await;
+    let tid = oid_of(&tenant.tenant_id);
+    let x = &tenant.member;
+    let r = start_call_in_new_room(&app, &tenant, "R").await;
+    let (mut host, _) = seat_in_call(&app, &tenant.tenant_id, &r, &tenant.admin.access_token).await;
+    let (mut in_x, conn_x) = seat_in_call(&app, &tenant.tenant_id, &r, &x.access_token).await;
+    set_visibility(&app, &r, "private").await;
+
+    delete_room_row(&app, &r, &x.id).await;
+    put_row(
+        &app,
+        "room_members",
+        doc! {
+            "room_id": oid_of(&r),
+            "user_id": oid_of(&x.id),
+            "joined_at": bson::DateTime::now(),
+        },
+    )
+    .await;
+    let since = Instant::now();
+    let guard = require_room_in_tenant(state, tid, oid_of(&r), oid_of(&x.id)).await;
+    eprintln!("T4b the room guard on X: {}", answer(&guard));
+    assert!(
+        matches!(
+            guard,
+            Err(ApiError::NotAMember | ApiError::Forbidden(_) | ApiError::NotFound(_))
+        ),
+        "the room guard refuses X: {}",
+        answer(&guard)
+    );
+    let seat = key(&r, &x.id);
+    let read = read_readings(state, &[seat]).await;
+    eprintln!("T4b the read: {read:?}");
+    assert_eq!(
+        read.as_ref().ok().and_then(|readings| readings.get(&seat)),
+        Some(&Reading::Gone(Gone::NotInRoom)),
+        "the row of no org is not read: {read:?}"
+    );
+
+    let mut memory = SeatCheckMemory::default();
+    passes_end_nothing(&app, &mut memory, 1, "X's first reading").await;
+    let ended = check_seats_once(state, &mut memory).await;
+    assert_eq!(ended, vec![seat], "X's second reading ends the seat");
+    heard_seat_end_once(&mut in_x, &r, "X").await;
+    assert_unseated(&app, &conn_x, "X");
+    within_the_loops_window(since);
+    host.close(None).await.ok();
+    in_x.close(None).await.ok();
 }

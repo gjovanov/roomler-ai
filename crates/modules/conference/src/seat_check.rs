@@ -30,11 +30,15 @@
 //!   open call sessions close, and a call they were the last one in ends. Each
 //!   step finds nothing to do where the pod that took the membership's end did
 //!   it already, so nothing counts twice.
-//! - A read that fails, breaks off, cannot be decoded or is late changes
-//!   nothing; from the [`FAILED_READS_TO_WARN`]th in a row each one warns. A
+//! - A read that fails, breaks off or is late changes nothing; from the
+//!   [`FAILED_READS_TO_WARN`]th in a row each one warns. A document that does
+//!   not decode fails no read: the seats it bears on get no verdict
+//!   ([`Reading::Unreadable`]), every other seat is read as before, and it
+//!   warns ([`ODD_DOCUMENT`]), once an hour at most while it stays odd. A
 //!   person found admitted starts again from zero, and so does one in a room
-//!   the read found no document for: ending a deleted room's call is the
-//!   reconcile's (`media_cluster::end_calls_of_rooms_gone`).
+//!   the read found no document for, or one a document that did not decode
+//!   bears on: ending a deleted room's call is the reconcile's
+//!   (`media_cluster::end_calls_of_rooms_gone`).
 //!
 //! **The bound.** On a pod whose reads succeed, a seat whose admission is gone
 //! ends within two passes and their reads of the membership's end:
@@ -59,7 +63,7 @@
 //! skipped here, or the check ends it.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bson::{Bson, Document, doc, oid::ObjectId};
 use mongodb::options::{ReadPreference, SelectionCriteria};
@@ -90,6 +94,14 @@ pub const SWITCH: &str = "ROOMLER__CONFERENCE__SEAT_CHECK";
 
 /// The one wording of the warning for every seat the check ends.
 pub const ENDED: &str = "seat check: ended a call seat whose admission is gone";
+
+/// The one wording of the warning for a document a read could not decode.
+pub const ODD_DOCUMENT: &str =
+    "seat check: a document did not decode; the seats it bears on get no verdict";
+
+/// How long the check keeps quiet about a document that stays odd, once it
+/// warned about it: the document's next warning comes no sooner.
+pub const ODD_DOCUMENT_WARN_EVERY: Duration = Duration::from_secs(3600);
 
 /// A person seated in a room's media on this pod: `(room, user)`. The check
 /// counts by the person in the room, because the admission is the person's:
@@ -125,6 +137,9 @@ pub enum Reading {
     Gone(Gone),
     /// The room has no document: no verdict on its seats.
     NoRoom,
+    /// A document the admission may rest on did not decode: the room's, or a
+    /// membership row whose ids could name this seat. No verdict on it.
+    Unreadable,
 }
 
 /// What the check keeps between its passes on one pod.
@@ -134,6 +149,9 @@ pub struct SeatCheckMemory {
     misses: HashMap<SeatKey, (u8, Gone)>,
     /// How many reads failed in a row.
     failed_reads: u32,
+    /// The documents that did not decode, by collection and `_id`, with when
+    /// the check last warned about each.
+    odd_warned: HashMap<(&'static str, String), Instant>,
 }
 
 /// A seat key the verdict ends, with what its first and its last read found.
@@ -148,8 +166,9 @@ pub struct Verdict {
 /// for each of `seated`, or is `None` when the read failed: a failed read
 /// changes nothing, not even what is forgotten. A seat key read as gone
 /// counts one more miss and ends (is returned) on its [`MISSES_TO_END`]th in
-/// a row. Anything else read for it (admitted, no room document, no reading
-/// at all) starts it again from zero. A key no longer seated is forgotten.
+/// a row. Anything else read for it (admitted, no room document, a document
+/// that did not decode, no reading at all) starts it again from zero. A key
+/// no longer seated is forgotten.
 pub fn seats_to_end(
     misses: &mut HashMap<SeatKey, (u8, Gone)>,
     seated: &[SeatKey],
@@ -267,7 +286,10 @@ pub async fn read_seats(state: &ConferenceState, memory: &mut SeatCheckMemory) -
         read_admissions(state, &seated).await
     };
     match &read {
-        Ok(_) => memory.failed_reads = 0,
+        Ok(admissions) => {
+            memory.failed_reads = 0;
+            warn_odd_documents(&mut memory.odd_warned, &admissions.odd, Instant::now());
+        }
         Err(e) => {
             memory.failed_reads = memory.failed_reads.saturating_add(1);
             if memory.failed_reads >= FAILED_READS_TO_WARN {
@@ -341,12 +363,69 @@ pub async fn end_seats(
     ended
 }
 
+/// Warn about each document of `odd` the check has not warned about within
+/// [`ODD_DOCUMENT_WARN_EVERY`], and remember when; one it warned about lately
+/// goes to debug. Returns how many it warned about.
+fn warn_odd_documents(
+    warned: &mut HashMap<(&'static str, String), Instant>,
+    odd: &[OddDocument],
+    now: Instant,
+) -> usize {
+    warned.retain(|_, at| now.saturating_duration_since(*at) < ODD_DOCUMENT_WARN_EVERY);
+    let mut warnings = 0;
+    for doc in odd {
+        let seen = (doc.collection, doc.id.clone());
+        if warned.contains_key(&seen) {
+            debug!(
+                collection = doc.collection, id = %doc.id, why = %doc.why,
+                "seat check: a document still does not decode"
+            );
+            continue;
+        }
+        warned.insert(seen, now);
+        warnings += 1;
+        warn!(
+            collection = doc.collection, id = %doc.id, fields = %doc.fields, why = %doc.why,
+            alert = "seat_check_odd_document", "{ODD_DOCUMENT}"
+        );
+    }
+    warnings
+}
+
 /// What one complete read found: a reading for every seat key it was asked
-/// about, and the org of every room it found.
+/// about, the org of every room it decoded, and every document it could not
+/// decode.
 #[derive(Debug, Default)]
 struct Admissions {
     readings: HashMap<SeatKey, Reading>,
     tenants: HashMap<ObjectId, ObjectId>,
+    odd: Vec<OddDocument>,
+}
+
+/// A document a read returned and could not decode, for the warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OddDocument {
+    /// The collection it is in.
+    collection: &'static str,
+    /// Its `_id`, as stored.
+    id: String,
+    /// The fields the read projected, as stored, cut at 300 characters.
+    fields: String,
+    /// Why it did not decode.
+    why: String,
+}
+
+impl OddDocument {
+    fn of(collection: &'static str, doc: &Document, why: String) -> Self {
+        Self {
+            collection,
+            id: doc
+                .get("_id")
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            fields: doc.to_string().chars().take(300).collect(),
+            why,
+        }
+    }
 }
 
 /// The part of a room's document an admission rests on, decoded with the
@@ -360,10 +439,232 @@ struct RoomAdmission {
     visibility: RoomVisibility,
 }
 
+/// The rooms one read found: each room whose document decoded, and the ids
+/// of those whose document did not.
+#[derive(Debug, Default)]
+struct RoomsRead {
+    found: HashMap<ObjectId, RoomAdmission>,
+    odd: HashSet<ObjectId>,
+    odd_docs: Vec<OddDocument>,
+}
+
+impl RoomsRead {
+    /// Decode each room document on its own. One that does not decode is
+    /// kept by its `_id`, which always decodes, because the read matched it
+    /// by `_id`; a document without one fails the read.
+    fn decode(docs: &[Document]) -> Result<Self, String> {
+        let mut rooms = Self::default();
+        for doc in docs {
+            match bson::from_document::<RoomAdmission>(doc.clone()) {
+                Ok(room) => {
+                    rooms.found.insert(room.id, room);
+                }
+                Err(e) => {
+                    let id = oid(doc, "_id").map_err(|e| format!("a room without its id: {e}"))?;
+                    rooms.odd.insert(id);
+                    rooms
+                        .odd_docs
+                        .push(OddDocument::of("rooms", doc, e.to_string()));
+                }
+            }
+        }
+        Ok(rooms)
+    }
+}
+
+/// A membership row that did not decode, by the ids it could name. Each id
+/// field holds its ObjectIds (the value itself, or an array's elements), or
+/// `None` when it holds none, and then it could name any id.
+#[derive(Debug, Clone, Default)]
+struct OddRow {
+    tenants: Option<HashSet<ObjectId>>,
+    rooms: Option<HashSet<ObjectId>>,
+    users: Option<HashSet<ObjectId>>,
+}
+
+impl OddRow {
+    fn of(row: &Document) -> Self {
+        Self {
+            tenants: ids_in(row, "tenant_id"),
+            rooms: ids_in(row, "room_id"),
+            users: ids_in(row, "user_id"),
+        }
+    }
+
+    /// As an org row: whether it could admit `user` to the org `tenant`. The
+    /// room guard counts org rows without decoding them
+    /// (`TenantDao::is_member`), so a row whose `tenant_id` is an array
+    /// admits each org it holds.
+    fn could_name_org(&self, tenant: ObjectId, user: ObjectId) -> bool {
+        could_name(self.tenants.as_ref(), tenant) && could_name(self.users.as_ref(), user)
+    }
+
+    /// As a room row: whether it could admit `user` to `room`, of any org.
+    fn could_name_room(&self, room: ObjectId, user: ObjectId) -> bool {
+        could_name(self.rooms.as_ref(), room) && could_name(self.users.as_ref(), user)
+    }
+}
+
+fn could_name(ids: Option<&HashSet<ObjectId>>, id: ObjectId) -> bool {
+    ids.is_none_or(|ids| ids.contains(&id))
+}
+
+/// The ObjectIds `key` holds in `row`: the value itself, or an array's
+/// elements. `None` when it holds none.
+fn ids_in(row: &Document, key: &str) -> Option<HashSet<ObjectId>> {
+    let ids: HashSet<ObjectId> = match row.get(key) {
+        Some(Bson::ObjectId(id)) => HashSet::from([*id]),
+        Some(Bson::Array(items)) => items.iter().filter_map(Bson::as_object_id).collect(),
+        _ => HashSet::new(),
+    };
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Decode each membership row of `collection` on its own: the ids of each
+/// row whose `keys` each hold one ObjectId, and each other row by the ids it
+/// could name, with the document for the warning in `odd`.
+fn decode_rows<const N: usize>(
+    rows: &[Document],
+    collection: &'static str,
+    keys: [&str; N],
+    odd: &mut Vec<OddDocument>,
+) -> (HashSet<[ObjectId; N]>, Vec<OddRow>) {
+    let mut found = HashSet::new();
+    let mut odd_rows = Vec::new();
+    for row in rows {
+        match ids_of(row, keys) {
+            Ok(ids) => {
+                found.insert(ids);
+            }
+            Err(why) => {
+                odd_rows.push(OddRow::of(row));
+                odd.push(OddDocument::of(collection, row, why));
+            }
+        }
+    }
+    (found, odd_rows)
+}
+
+/// The values of `keys` in `row`, each one ObjectId, or why one is not.
+fn ids_of<const N: usize>(row: &Document, keys: [&str; N]) -> Result<[ObjectId; N], String> {
+    let mut ids = [ObjectId::from_bytes([0; 12]); N];
+    for (slot, key) in ids.iter_mut().zip(keys) {
+        *slot = oid(row, key)?;
+    }
+    Ok(ids)
+}
+
+/// The org rows' filter: the orgs of the rooms the read decoded, and the
+/// people seated in them. `None` when nobody is.
+fn org_rows_filter(seated: &[SeatKey], rooms: &RoomsRead) -> Option<Document> {
+    let users: HashSet<ObjectId> = seated
+        .iter()
+        .filter(|(rid, _)| rooms.found.contains_key(rid))
+        .map(|(_, uid)| *uid)
+        .collect();
+    if users.is_empty() {
+        return None;
+    }
+    let tenants: HashSet<ObjectId> = rooms.found.values().map(|room| room.tenant_id).collect();
+    Some(doc! { "tenant_id": { "$in": as_bson(tenants) }, "user_id": { "$in": as_bson(users) } })
+}
+
+/// The room rows' filter, for the rooms only their members may enter: their
+/// orgs, the rooms and the people seated in them. These are the fields
+/// `RoomDao::is_member` names, so a row of no org, or of another org, which
+/// the room guard never reads, is not read here either. `None` when nobody
+/// is seated in such a room.
+fn room_rows_filter(seated: &[SeatKey], rooms: &RoomsRead) -> Option<Document> {
+    let (mut tids, mut rids, mut uids) = (HashSet::new(), HashSet::new(), HashSet::new());
+    for (rid, uid) in seated {
+        if let Some(room) = rooms
+            .found
+            .get(rid)
+            .filter(|room| room.visibility.requires_membership())
+        {
+            tids.insert(room.tenant_id);
+            rids.insert(*rid);
+            uids.insert(*uid);
+        }
+    }
+    if rids.is_empty() {
+        return None;
+    }
+    Some(doc! {
+        "tenant_id": { "$in": as_bson(tids) },
+        "room_id": { "$in": as_bson(rids) },
+        "user_id": { "$in": as_bson(uids) },
+    })
+}
+
+/// The readings of `seated` from the documents one complete read returned:
+/// the rooms, and the org and room rows its queries matched. A seat that a
+/// document which did not decode bears on gets no verdict
+/// ([`Reading::Unreadable`]): its room's document, an org row that could name
+/// the room's org and the person, or a room row that could name the room and
+/// the person. Every other seat reads as it would with those documents gone.
+fn readings_of(
+    seated: &[SeatKey],
+    rooms: RoomsRead,
+    org_rows: &[Document],
+    room_rows: &[Document],
+) -> Admissions {
+    let mut odd = rooms.odd_docs;
+    let (in_org, odd_org) = decode_rows(
+        org_rows,
+        "tenant_members",
+        ["tenant_id", "user_id"],
+        &mut odd,
+    );
+    let (in_room, odd_room) = decode_rows(
+        room_rows,
+        "room_members",
+        ["tenant_id", "room_id", "user_id"],
+        &mut odd,
+    );
+    let readings = seated
+        .iter()
+        .map(|&(rid, uid)| {
+            let reading = if rooms.odd.contains(&rid) {
+                Reading::Unreadable
+            } else if let Some(room) = rooms.found.get(&rid) {
+                let tid = room.tenant_id;
+                let doubt = odd_org.iter().any(|row| row.could_name_org(tid, uid))
+                    || odd_room.iter().any(|row| row.could_name_room(rid, uid));
+                if doubt {
+                    Reading::Unreadable
+                } else if !in_org.contains(&[tid, uid]) {
+                    Reading::Gone(Gone::NotInOrg)
+                } else if room.visibility.requires_membership()
+                    && !in_room.contains(&[tid, rid, uid])
+                {
+                    Reading::Gone(Gone::NotInRoom)
+                } else {
+                    Reading::Admitted
+                }
+            } else {
+                Reading::NoRoom
+            };
+            ((rid, uid), reading)
+        })
+        .collect();
+    let tenants = rooms
+        .found
+        .values()
+        .map(|room| (room.id, room.tenant_id))
+        .collect();
+    Admissions {
+        readings,
+        tenants,
+        odd,
+    }
+}
+
 /// Read what admits each of `seated`, within [`READ_TIMEOUT`]. Only a read
-/// that completes counts: a query error, a cursor that breaks off, a
-/// document that does not decode and a late answer are each an error, never
-/// "not a member".
+/// that completes counts: a query error, a cursor that breaks off and a late
+/// answer are each an error, never "not a member". A document that does not
+/// decode fails no read: it costs only the seats it bears on their verdict
+/// ([`readings_of`]).
 async fn read_admissions(
     state: &ConferenceState,
     seated: &[SeatKey],
@@ -377,96 +678,38 @@ async fn read_admissions(
 /// read from the primary: the rooms (`_id`), the org memberships
 /// (`tenant_members` `{tenant_id, user_id}`) and, for the rooms only their
 /// members may enter, the room memberships (`room_members`
-/// `{room_id, user_id}`). A membership counts exactly as `is_member` counts
-/// it: `{tenant_id, user_id}` for the org, `{tenant_id, room_id, user_id}`
-/// for the room.
+/// `{tenant_id, room_id, user_id}`, the fields `RoomDao::is_member` names).
+/// A membership counts exactly as `is_member` counts it: `{tenant_id,
+/// user_id}` for the org, `{tenant_id, room_id, user_id}` for the room. A
+/// room whose document does not decode stays out of the membership reads.
 async fn read_admissions_unbounded(
     state: &ConferenceState,
     seated: &[SeatKey],
 ) -> Result<Admissions, String> {
     let room_ids: HashSet<ObjectId> = seated.iter().map(|(rid, _)| *rid).collect();
-    let rooms: HashMap<ObjectId, RoomAdmission> = read_all(
+    let room_docs = read_all(
         state,
         "rooms",
         doc! { "_id": { "$in": as_bson(room_ids) } },
         doc! { "_id": 1, "tenant_id": 1, "visibility": 1 },
     )
-    .await?
-    .into_iter()
-    .map(|d| {
-        bson::from_document::<RoomAdmission>(d)
-            .map(|room| (room.id, room))
-            .map_err(|e| format!("a room did not decode: {e}"))
-    })
-    .collect::<Result<_, _>>()?;
-
-    let seated_in_rooms: Vec<&SeatKey> = seated
-        .iter()
-        .filter(|(rid, _)| rooms.contains_key(rid))
-        .collect();
-    let tenants: HashSet<ObjectId> = rooms.values().map(|room| room.tenant_id).collect();
-    let users: HashSet<ObjectId> = seated_in_rooms.iter().map(|(_, uid)| *uid).collect();
-    let in_org: HashSet<(ObjectId, ObjectId)> = if users.is_empty() {
-        HashSet::new()
-    } else {
-        read_all(
-            state,
-            "tenant_members",
-            doc! { "tenant_id": { "$in": as_bson(tenants) }, "user_id": { "$in": as_bson(users) } },
-            doc! { "_id": 0, "tenant_id": 1, "user_id": 1 },
-        )
-        .await?
-        .iter()
-        .map(|d| Ok((oid(d, "tenant_id")?, oid(d, "user_id")?)))
-        .collect::<Result<_, String>>()?
+    .await?;
+    let rooms = RoomsRead::decode(&room_docs)?;
+    let org_rows = match org_rows_filter(seated, &rooms) {
+        Some(filter) => {
+            let projection = doc! { "_id": 1, "tenant_id": 1, "user_id": 1 };
+            read_all(state, "tenant_members", filter, projection).await?
+        }
+        None => Vec::new(),
     };
-
-    let members_only: Vec<&SeatKey> = seated_in_rooms
-        .iter()
-        .copied()
-        .filter(|(rid, _)| rooms[rid].visibility.requires_membership())
-        .collect();
-    let in_room: HashSet<(ObjectId, ObjectId, ObjectId)> = if members_only.is_empty() {
-        HashSet::new()
-    } else {
-        let rids: HashSet<ObjectId> = members_only.iter().map(|(rid, _)| *rid).collect();
-        let uids: HashSet<ObjectId> = members_only.iter().map(|(_, uid)| *uid).collect();
-        read_all(
-            state,
-            "room_members",
-            doc! { "room_id": { "$in": as_bson(rids) }, "user_id": { "$in": as_bson(uids) } },
-            doc! { "_id": 0, "tenant_id": 1, "room_id": 1, "user_id": 1 },
-        )
-        .await?
-        .iter()
-        .map(|d| Ok((oid(d, "tenant_id")?, oid(d, "room_id")?, oid(d, "user_id")?)))
-        .collect::<Result<_, String>>()?
+    let room_rows = match room_rows_filter(seated, &rooms) {
+        Some(filter) => {
+            let projection = doc! { "_id": 1, "tenant_id": 1, "room_id": 1, "user_id": 1 };
+            read_all(state, "room_members", filter, projection).await?
+        }
+        None => Vec::new(),
     };
-
-    let readings = seated
-        .iter()
-        .map(|&(rid, uid)| {
-            let reading = match rooms.get(&rid) {
-                None => Reading::NoRoom,
-                Some(room) if !in_org.contains(&(room.tenant_id, uid)) => {
-                    Reading::Gone(Gone::NotInOrg)
-                }
-                Some(room)
-                    if room.visibility.requires_membership()
-                        && !in_room.contains(&(room.tenant_id, rid, uid)) =>
-                {
-                    Reading::Gone(Gone::NotInRoom)
-                }
-                Some(_) => Reading::Admitted,
-            };
-            ((rid, uid), reading)
-        })
-        .collect();
-    let tenants = rooms
-        .values()
-        .map(|room| (room.id, room.tenant_id))
-        .collect();
-    Ok(Admissions { readings, tenants })
+    Ok(readings_of(seated, rooms, &org_rows, &room_rows))
 }
 
 /// Every document `filter` matches in `collection`, projected, from the
@@ -681,7 +924,347 @@ mod tests {
                 doc! { "_id": id, "tenant_id": tenant, "visibility": "unheard-of" }
             )
             .is_err(),
-            "a visibility the model does not know fails the read, never reads as public"
+            "a visibility the model does not know does not decode: that room's seats get no \
+             verdict, and it never reads as public"
+        );
+    }
+
+    /// U1's world: one org with two public rooms and two members-only ones,
+    /// another org's members-only room, and four people, each seat with a
+    /// reading of its own, among them both kinds of gone.
+    struct World {
+        org: ObjectId,
+        other_org: ObjectId,
+        p1: ObjectId,
+        q1: ObjectId,
+        q2: ObjectId,
+        z1: ObjectId,
+        a: ObjectId,
+        b: ObjectId,
+        c: ObjectId,
+        d: ObjectId,
+        seated: Vec<SeatKey>,
+        rooms: Vec<Document>,
+        org_rows: Vec<Document>,
+        room_rows: Vec<Document>,
+    }
+
+    fn room_doc(id: ObjectId, tenant: ObjectId, visibility: &str) -> Document {
+        doc! { "_id": id, "tenant_id": tenant, "visibility": visibility }
+    }
+
+    fn org_row(tenant: impl Into<Bson>, user: impl Into<Bson>) -> Document {
+        doc! { "_id": ObjectId::new(), "tenant_id": tenant.into(), "user_id": user.into() }
+    }
+
+    fn room_row(tenant: impl Into<Bson>, room: impl Into<Bson>, user: impl Into<Bson>) -> Document {
+        doc! {
+            "_id": ObjectId::new(),
+            "tenant_id": tenant.into(),
+            "room_id": room.into(),
+            "user_id": user.into(),
+        }
+    }
+
+    impl World {
+        fn new() -> Self {
+            let (org, other_org) = (ObjectId::new(), ObjectId::new());
+            let [p1, p2, q1, q2, z1] = [(); 5].map(|()| ObjectId::new());
+            let [a, b, c, d] = [(); 4].map(|()| ObjectId::new());
+            Self {
+                org,
+                other_org,
+                p1,
+                q1,
+                q2,
+                z1,
+                a,
+                b,
+                c,
+                d,
+                seated: vec![
+                    (p1, a),
+                    (p1, b),
+                    (p2, c),
+                    (q1, a),
+                    (q1, b),
+                    (q2, c),
+                    (q2, d),
+                    (z1, a),
+                ],
+                rooms: vec![
+                    room_doc(p1, org, "public"),
+                    room_doc(p2, org, "public"),
+                    room_doc(q1, org, "private"),
+                    room_doc(q2, org, "secret"),
+                    room_doc(z1, other_org, "private"),
+                ],
+                // d is in neither org.
+                org_rows: vec![
+                    org_row(org, a),
+                    org_row(org, b),
+                    org_row(org, c),
+                    org_row(other_org, a),
+                ],
+                // b has no row in q1; a row of another org for b there counts
+                // for nothing, as `RoomDao::is_member` reads it.
+                room_rows: vec![
+                    room_row(org, q1, a),
+                    room_row(other_org, q1, b),
+                    room_row(org, q2, c),
+                    room_row(other_org, z1, a),
+                ],
+            }
+        }
+
+        fn readings(&self) -> Admissions {
+            let rooms = RoomsRead::decode(&self.rooms).expect("every room has its id");
+            readings_of(&self.seated, rooms, &self.org_rows, &self.room_rows)
+        }
+    }
+
+    /// `with_odd` gives exactly the seats of `bears_on` no verdict, and every
+    /// other seat the reading `base` gives it.
+    fn assert_costs_only(
+        base: &HashMap<SeatKey, Reading>,
+        with_odd: &HashMap<SeatKey, Reading>,
+        bears_on: &[SeatKey],
+        what: &str,
+    ) {
+        assert_eq!(
+            base.len(),
+            with_odd.len(),
+            "{what}: a reading for every seat"
+        );
+        for (key, reading) in with_odd {
+            if bears_on.contains(key) {
+                assert_eq!(*reading, Reading::Unreadable, "{what}: {key:?}");
+            } else {
+                assert_eq!(Some(reading), base.get(key), "{what}: {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_worlds_readings_are_the_ones_master_gives() {
+        let w = World::new();
+        let read = w.readings();
+        assert!(read.odd.is_empty());
+        assert_eq!(read.readings.len(), w.seated.len());
+        let gone_room = Reading::Gone(Gone::NotInRoom);
+        let gone_org = Reading::Gone(Gone::NotInOrg);
+        for (key, want) in [
+            ((w.p1, w.a), Reading::Admitted),
+            ((w.p1, w.b), Reading::Admitted),
+            (w.seated[2], Reading::Admitted),
+            ((w.q1, w.a), Reading::Admitted),
+            ((w.q1, w.b), gone_room),
+            ((w.q2, w.c), Reading::Admitted),
+            ((w.q2, w.d), gone_org),
+            ((w.z1, w.a), Reading::Admitted),
+        ] {
+            assert_eq!(read.readings.get(&key), Some(&want), "{key:?}");
+        }
+        assert_eq!(read.tenants.get(&w.z1), Some(&w.other_org));
+    }
+
+    #[test]
+    fn a_room_document_that_does_not_decode_costs_only_its_own_seats_their_verdict() {
+        let mut w = World::new();
+        let base = w.readings().readings;
+        let (o, tenant) = (ObjectId::new(), w.org);
+        w.seated.extend([(o, w.a), (o, w.d)]);
+        let mut with_room = base.clone();
+        with_room.extend([((o, w.a), Reading::NoRoom), ((o, w.d), Reading::NoRoom)]);
+        for (odd, what) in [
+            (room_doc(o, tenant, "unheard-of"), "an unknown visibility"),
+            (doc! { "_id": o, "visibility": "private" }, "no org"),
+            (doc! { "_id": o, "tenant_id": "x" }, "an org that is no id"),
+        ] {
+            let mut rooms = w.rooms.clone();
+            rooms.push(odd);
+            let read = readings_of(
+                &w.seated,
+                RoomsRead::decode(&rooms).unwrap(),
+                &w.org_rows,
+                &w.room_rows,
+            );
+            assert_costs_only(&with_room, &read.readings, &[(o, w.a), (o, w.d)], what);
+            assert_eq!(read.odd.len(), 1, "{what}");
+            assert_eq!(read.odd[0].collection, "rooms", "{what}");
+            assert_eq!(read.odd[0].id, Bson::ObjectId(o).to_string(), "{what}");
+            assert!(!read.tenants.contains_key(&o), "{what}: no org is read");
+        }
+        // A room document without an id cannot be put to a seat: the read
+        // fails, which changes nothing.
+        let mut rooms = w.rooms.clone();
+        rooms.push(doc! { "tenant_id": tenant, "visibility": "private" });
+        assert!(RoomsRead::decode(&rooms).is_err());
+    }
+
+    #[test]
+    fn an_org_row_that_does_not_decode_costs_only_the_seats_it_could_admit() {
+        let w = World::new();
+        let base = w.readings().readings;
+        let org_rooms = |user: ObjectId| -> Vec<SeatKey> {
+            w.seated
+                .iter()
+                .copied()
+                .filter(|&(rid, uid)| uid == user && rid != w.z1)
+                .collect()
+        };
+        for (odd, bears_on, what) in [
+            // d's org row, its `tenant_id` an array that holds the org: the
+            // guard counts it and admits d.
+            (
+                org_row(Bson::Array(vec![Bson::ObjectId(w.org)]), w.d),
+                org_rooms(w.d),
+                "an array of orgs",
+            ),
+            (
+                org_row(w.org, Bson::Array(vec![w.b.into(), w.d.into()])),
+                [org_rooms(w.b), org_rooms(w.d)].concat(),
+                "an array of people",
+            ),
+            // Another org's array names no seat in this org's rooms.
+            (
+                org_row(Bson::Array(vec![w.other_org.into()]), w.d),
+                vec![],
+                "an array of another org",
+            ),
+            // A `user_id` that holds no id could be anyone's.
+            (
+                org_row(w.other_org, "someone"),
+                vec![(w.z1, w.a)],
+                "a person that is no id",
+            ),
+        ] {
+            let mut org_rows = w.org_rows.clone();
+            org_rows.push(odd);
+            let read = readings_of(
+                &w.seated,
+                RoomsRead::decode(&w.rooms).unwrap(),
+                &org_rows,
+                &w.room_rows,
+            );
+            assert_costs_only(&base, &read.readings, &bears_on, what);
+            assert_eq!(read.odd.len(), 1, "{what}");
+            assert_eq!(read.odd[0].collection, "tenant_members", "{what}");
+        }
+    }
+
+    #[test]
+    fn a_room_row_that_does_not_decode_costs_only_the_seats_it_could_admit() {
+        let w = World::new();
+        let base = w.readings().readings;
+        for (odd, bears_on, what) in [
+            // b's row in q1, its `room_id` an array that holds q1.
+            (
+                room_row(w.org, Bson::Array(vec![w.q1.into()]), w.b),
+                vec![(w.q1, w.b)],
+                "an array of rooms",
+            ),
+            // A person that is no id could be anyone in q2.
+            (
+                room_row(w.org, w.q2, "someone"),
+                vec![(w.q2, w.c), (w.q2, w.d)],
+                "a person that is no id",
+            ),
+            // A row with no org, which the filter keeps out (below), would
+            // cost only the seat it names, whatever org it is of.
+            (
+                doc! { "_id": ObjectId::new(), "room_id": w.q1, "user_id": w.b },
+                vec![(w.q1, w.b)],
+                "no org",
+            ),
+        ] {
+            let mut room_rows = w.room_rows.clone();
+            room_rows.push(odd);
+            let read = readings_of(
+                &w.seated,
+                RoomsRead::decode(&w.rooms).unwrap(),
+                &w.org_rows,
+                &room_rows,
+            );
+            assert_costs_only(&base, &read.readings, &bears_on, what);
+            assert_eq!(read.odd.len(), 1, "{what}");
+            assert_eq!(read.odd[0].collection, "room_members", "{what}");
+        }
+    }
+
+    #[test]
+    fn the_room_rows_are_read_by_the_rooms_orgs_as_the_room_guard_reads_them() {
+        let w = World::new();
+        let rooms = RoomsRead::decode(&w.rooms).unwrap();
+        let ids = |filter: &Document, key: &str| -> HashSet<ObjectId> {
+            filter
+                .get_document(key)
+                .and_then(|clause| clause.get_array("$in"))
+                .unwrap_or_else(|e| panic!("{key}: {e}"))
+                .iter()
+                .filter_map(Bson::as_object_id)
+                .collect()
+        };
+        let filter = room_rows_filter(&w.seated, &rooms).expect("members-only rooms are seated");
+        assert_eq!(
+            ids(&filter, "tenant_id"),
+            HashSet::from([w.org, w.other_org])
+        );
+        assert_eq!(ids(&filter, "room_id"), HashSet::from([w.q1, w.q2, w.z1]));
+        assert_eq!(ids(&filter, "user_id"), HashSet::from([w.a, w.b, w.c, w.d]));
+        let filter = org_rows_filter(&w.seated, &rooms).expect("people are seated");
+        assert_eq!(
+            ids(&filter, "tenant_id"),
+            HashSet::from([w.org, w.other_org])
+        );
+        // Seats in public rooms only: no room rows are read.
+        let public = [(w.p1, w.a)];
+        assert!(room_rows_filter(&public, &rooms).is_none());
+    }
+
+    #[test]
+    fn a_document_that_stays_odd_warns_once_an_hour_at_most() {
+        let odd = |collection: &'static str, id: &str| OddDocument {
+            collection,
+            id: id.to_string(),
+            fields: String::new(),
+            why: "does not decode".to_string(),
+        };
+        let mut warned = HashMap::new();
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        assert_eq!(
+            warn_odd_documents(&mut warned, &[odd("rooms", "1")], at(0)),
+            1
+        );
+        for pass in 1..=6 {
+            assert_eq!(
+                warn_odd_documents(&mut warned, &[odd("rooms", "1")], at(10 * pass)),
+                0,
+                "pass {pass}"
+            );
+        }
+        assert_eq!(
+            warn_odd_documents(
+                &mut warned,
+                &[
+                    odd("rooms", "1"),
+                    odd("room_members", "1"),
+                    odd("rooms", "2")
+                ],
+                at(70),
+            ),
+            2,
+            "each other document warns on its own"
+        );
+        assert_eq!(
+            warn_odd_documents(&mut warned, &[odd("rooms", "1")], at(3599)),
+            0
+        );
+        assert_eq!(
+            warn_odd_documents(&mut warned, &[odd("rooms", "1")], at(3600)),
+            1,
+            "an hour after it warned, it warns again"
         );
     }
 }
