@@ -297,6 +297,9 @@ for t in curl sudo systemctl installer launchctl uname hostname stat mktemp slee
     ln -sf "$S/standin" "$BIN/$t"
 done
 for t in dpkg apt-get; do ln -sf "$S/standin" "$DPKG/$t"; done
+# FR-141 P2 — `install`, which places a one-row Mac's root config: recorded and
+# never run, so the record holds the mode and the owner it places it with.
+ln -sf "$S/standin" "$BIN/install"
 # The daemon where the script runs it: the .deb's path, and the macOS bundle's.
 ln -sf "$S/standin" /usr/bin/roomlerd
 mkdir -p /Library/Roomler/roomlerd.app/Contents/MacOS
