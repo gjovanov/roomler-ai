@@ -294,8 +294,8 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   group or others can write, and the package sets 644 (`postinstall:335-336`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:4015-4031`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4419-4423`), and no `.prev` repair, which belongs to the person's own agent
+  (`crates/agent-core/src/config.rs:4029-4045`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4433-4437`), and no `.prev` repair, which belongs to the person's own agent
   (`:3611-3639`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1413`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another

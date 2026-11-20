@@ -4521,7 +4521,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
         // software encoder cannot hold the target, take frames on an even grid
@@ -5391,7 +5391,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, None); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -8196,7 +8196,7 @@ async fn media_pump_ffmpeg_dc(
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
         PassWatch::stop(gate_start, &mut gate_us);
-        delivery.on_frame(&pc, governor.applied_bps(), governor.open_at_bps()); // FR-148 D46
+        delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -10357,7 +10357,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
-            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
+            delivery.heartbeat(&pc, session_id, &mut governor, seed_age); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block

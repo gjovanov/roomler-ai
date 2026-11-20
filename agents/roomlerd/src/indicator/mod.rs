@@ -474,6 +474,16 @@ pub(crate) mod panel_gate;
 #[cfg(all(target_os = "macos", any(test, feature = "viewer-indicator-macos")))]
 pub(crate) mod console_watch;
 
+/// #4119 — the net under the macOS panel: an exit that AppKit begins inside
+/// one of the panel's window calls, on the thread making it, and that the
+/// daemon did not choose, leaves with `watchdog::APPKIT_ENDED_EXIT_CODE`.
+/// [`mac`] arms it in a root process; its cells run on every Unix lane.
+#[cfg(any(
+    all(test, unix),
+    all(target_os = "macos", feature = "viewer-indicator-macos")
+))]
+pub(crate) mod exit_net;
+
 /// FR-93 P6f — the desktop's notifications as the last consent surface, where
 /// neither the native panel nor the companion can show a question. `pub`
 /// because `app.rs` runs its session helper (`portal-helper --notify`).

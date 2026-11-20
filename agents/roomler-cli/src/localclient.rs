@@ -2636,35 +2636,24 @@ fn print_status(s: &NodeStatus) {
         println!("  host fw     {line}");
     }
     // S2 — MagicDNS status (only when the tenant has a magic domain and the
-    // overlay published it). "resolver down" / "OS steer failed" are the two
-    // states worth an operator's eye.
+    // overlay published it). #1363: the words are `DnsStatus::health`'s, the
+    // same the companion prints, and `active` means the OS was MEASURED to
+    // reach this node's resolver. The reason goes on the line below.
     if let Some(dns) = &s.dns {
-        // FR-97 P3h — a steer the host's own resolver never asks is not
-        // "active", so it is named, and why on the line below.
-        let bypassed = dns
-            .os_steer_bypassed
-            .as_deref()
-            .filter(|_| dns.resolver_bound && dns.os_steer_active);
-        let health = if !dns.resolver_bound {
-            "resolver DOWN"
-        } else if !dns.os_steer_active {
-            "resolver up, OS steer FAILED"
-        } else if bypassed.is_some() {
-            "steered but BYPASSED"
-        } else {
-            "active"
-        };
+        let health = dns.health(now_ms());
         let aaaa = if dns.answer_aaaa {
             "AAAA on"
         } else {
             "AAAA off"
         };
         println!(
-            "  magicdns    {} ({health}, {aaaa}, upstream {})",
-            dns.magic_domain, dns.upstream
+            "  magicdns    {} ({}, {aaaa}, upstream {})",
+            dns.magic_domain,
+            health.headline(),
+            dns.upstream
         );
-        if let Some(why) = bypassed {
-            println!("              ⚠️ {why}: this host's own lookups never reach the steer");
+        if let Some(why) = health.detail() {
+            println!("              ⚠️ {why}");
         }
     }
 

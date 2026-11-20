@@ -15,9 +15,9 @@
 //! there is no explicit route-table call here. Per-peer reachability is
 //! still exact-match `/32` in [`super::router::Router`]; a packet to an
 //! overlay address with no installed peer is dropped by
-//! [`super::wg::WgDevice::send_ip_packet`]. (macOS utun is point-to-point
-//! and may need an explicit `route add` for the CIDR — refined when 3b/3c
-//! field-test there.)
+//! [`super::wg::WgDevice::send_ip_packet`]. (macOS utun is point-to-point:
+//! the bring-up makes the address its own peer and adds the CIDR's route
+//! itself, #4117 — see `shape_utun_v4`.)
 //!
 //! Dual-stack: the device also carries the node's *derived* overlay IPv6
 //! ([`super::router::derive_overlay_v6`]) on the ULA `/96`, assigned
@@ -122,6 +122,11 @@ pub trait TunIo: Send + Sync {
     /// The gate fails toward WITHHOLD (an unreadable interface table installs
     /// nothing). Default no-op (mock, netstack, platforms without the
     /// route-war doctrine).
+    ///
+    /// macOS (#4117) has no floors. The same gate decides its utun's own
+    /// block route on every wave instead: added while the gate allows it and
+    /// nothing holds the block, our route deleted while the gate withholds,
+    /// and nothing written when the table already matches the decision.
     async fn defend_block_floor(&self) {}
 
     /// Multi-org twin of [`defend_block_floor`](Self::defend_block_floor) —
@@ -216,8 +221,9 @@ pub(crate) fn floor_cidrs(net: std::net::Ipv4Addr, plen: u8) -> Option<[String; 
 /// non-overlay interface address OR the original default gateway sits inside
 /// the block — the ISP-CGNAT-uplink case where claiming the block would
 /// blackhole the host's own internet. Pure; the caller supplies the gathered
-/// addresses and fails toward withhold when it cannot gather.
-#[cfg(any(windows, test))]
+/// addresses and fails toward withhold when it cannot gather. macOS asks the
+/// same question before it routes a utun's block (#4117, [`utun_block_gate`]).
+#[cfg(any(windows, all(target_os = "macos", feature = "overlay-l3"), test))]
 pub(crate) fn floor_safe(
     non_overlay_v4: &[std::net::Ipv4Addr],
     orig_gateway_v4: Option<std::net::Ipv4Addr>,
@@ -544,6 +550,958 @@ fn mask_plen(mask: std::net::IpAddr) -> Option<u8> {
         }
     };
     (ones == total).then_some(ones as u8)
+}
+
+/// #4117 — what an `inet` line of `ifconfig <utun>` says about one address:
+/// its peer (the `-->` address a point-to-point interface prints) and its
+/// netmask (printed in hex, `netmask 0xffc00000`).
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BsdInet {
+    pub(crate) peer: Option<std::net::Ipv4Addr>,
+    pub(crate) mask: Option<std::net::Ipv4Addr>,
+}
+
+/// #4117 — the `inet` line of an `ifconfig <utun>` listing that carries `ip`,
+/// or `None` when no line does. Read by token, never by label, and the
+/// address is compared whole: `100.64.0.2` never matches `100.64.0.28`.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn parse_bsd_inet_line(listing: &str, ip: std::net::Ipv4Addr) -> Option<BsdInet> {
+    listing.lines().find_map(|line| {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let carries_ip = toks.first() == Some(&"inet")
+            && toks
+                .get(1)
+                .and_then(|t| t.parse::<std::net::Ipv4Addr>().ok())
+                == Some(ip);
+        if !carries_ip {
+            return None;
+        }
+        let after = |key: &str| {
+            toks.iter()
+                .position(|t| *t == key)
+                .and_then(|i| toks.get(i + 1).copied())
+        };
+        Some(BsdInet {
+            peer: after("-->").and_then(|t| t.parse().ok()),
+            mask: after("netmask").and_then(bsd_netmask),
+        })
+    })
+}
+
+/// A netmask as ifconfig prints one: hex (`0xfffffc00`), or dotted.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+fn bsd_netmask(s: &str) -> Option<std::net::Ipv4Addr> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16)
+            .ok()
+            .map(std::net::Ipv4Addr::from),
+        None => s.parse().ok(),
+    }
+}
+
+/// #4117 — the overlay block `ip` sits in under `mask`: its network and its
+/// prefix length. `None` for a mask that is not a prefix, and for `/0`.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn v4_block(
+    ip: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> Option<(std::net::Ipv4Addr, u8)> {
+    let plen = mask_plen(std::net::IpAddr::V4(mask)).filter(|p| *p > 0)?;
+    Some((
+        std::net::Ipv4Addr::from(u32::from(ip) & u32::from(mask)),
+        plen,
+    ))
+}
+
+/// #4117 — `ifconfig <utun> inet <ip> <ip> netmask <mask> alias`: the address
+/// as its own peer, with the block's mask. `alias` changes the address the
+/// utun already holds in place (SIOCAIFADDR), so it is never absent between
+/// two writes.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_self_peer_args(
+    if_name: &str,
+    ip: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> Vec<String> {
+    vec![
+        if_name.to_string(),
+        "inet".into(),
+        ip.to_string(),
+        ip.to_string(),
+        "netmask".into(),
+        mask.to_string(),
+        "alias".into(),
+    ]
+}
+
+/// #4117 — `route -n get -inet -net <net> -prefixlen <plen>`: the block's own
+/// lookup, read with [`bsd_route_is_ours`] as `add_cidr_route` reads a prefix.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_block_get_args(net: std::net::Ipv4Addr, plen: u8) -> Vec<String> {
+    vec![
+        "-n".into(),
+        "get".into(),
+        "-inet".into(),
+        "-net".into(),
+        net.to_string(),
+        "-prefixlen".into(),
+        plen.to_string(),
+    ]
+}
+
+/// #4117 — `route -n add -inet -net <net> -prefixlen <plen> -interface <utun>`:
+/// the block routed on the utun. Never a delete first: a route for the block
+/// that is not ours belongs to another product, and it is left alone.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_block_add_args(net: std::net::Ipv4Addr, plen: u8, if_name: &str) -> Vec<String> {
+    vec![
+        "-n".into(),
+        "add".into(),
+        "-inet".into(),
+        "-net".into(),
+        net.to_string(),
+        "-prefixlen".into(),
+        plen.to_string(),
+        "-interface".into(),
+        if_name.to_string(),
+    ]
+}
+
+/// #4117 — one way a utun's IPv4 shape is not the one the overlay needs. Its
+/// `Display` is what the bring-up's WARN says.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UtunV4Problem {
+    /// No `inet` line carries the address.
+    NoAddress,
+    /// The address's peer is another address, or it has none.
+    Peer(Option<std::net::Ipv4Addr>),
+    /// The address's netmask is another mask, or none is shown.
+    Mask(Option<std::net::Ipv4Addr>),
+    /// The block's own lookup answered a route that is not ours (its
+    /// destination, mask and interface as route(8) printed them), or nothing.
+    Block(Option<String>),
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+impl std::fmt::Display for UtunV4Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAddress => write!(f, "no inet line carries the overlay address"),
+            Self::Peer(Some(peer)) => write!(f, "the address's peer is {peer}, not itself"),
+            Self::Peer(None) => write!(f, "the address has no peer"),
+            Self::Mask(Some(mask)) => write!(f, "the netmask is {mask}, not the block's"),
+            Self::Mask(None) => write!(f, "no netmask is shown"),
+            Self::Block(Some(route)) => write!(f, "the block's lookup answers {route}"),
+            Self::Block(None) => write!(f, "the block has no route"),
+        }
+    }
+}
+
+/// #4117 — everything wrong with a utun's IPv4 shape after the bring-up. The
+/// address's `inet` line ([`parse_bsd_inet_line`]) must name the address as its
+/// own peer with the block's mask, and the block's own lookup
+/// ([`bsd_block_get_args`], parsed) must answer the utun. Empty when both hold.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_v4_problems(
+    inet: Option<&BsdInet>,
+    block: Option<&BsdRouteGet>,
+    ip: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+    if_name: &str,
+) -> Vec<UtunV4Problem> {
+    let mut problems = Vec::new();
+    match inet {
+        None => problems.push(UtunV4Problem::NoAddress),
+        Some(inet) => {
+            if inet.peer != Some(ip) {
+                problems.push(UtunV4Problem::Peer(inet.peer));
+            }
+            if inet.mask != Some(mask) {
+                problems.push(UtunV4Problem::Mask(inet.mask));
+            }
+        }
+    }
+    if let Some((net, plen)) = v4_block(ip, mask)
+        && !bsd_route_is_ours(block, std::net::IpAddr::V4(net), plen, if_name)
+    {
+        problems.push(UtunV4Problem::Block(block.map(|b| {
+            format!(
+                "{} mask {} on {}",
+                b.destination,
+                b.mask.as_deref().unwrap_or("(host)"),
+                b.interface.as_deref().unwrap_or("(no interface)")
+            )
+        })));
+    }
+    problems
+}
+
+/// #4117 — `route -n delete -inet -net <net> -prefixlen <plen>`: our block
+/// route taken back. It names the block's key and mask, not an interface, so
+/// it is written only after the block's own lookup has shown the route on
+/// our utun ([`utun_block_step`]).
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_block_delete_args(net: std::net::Ipv4Addr, plen: u8) -> Vec<String> {
+    vec![
+        "-n".into(),
+        "delete".into(),
+        "-inet".into(),
+        "-net".into(),
+        net.to_string(),
+        "-prefixlen".into(),
+        plen.to_string(),
+    ]
+}
+
+/// #4117 — why a utun's block is not routed on it. Its `Display` is the
+/// `why` of the WARN that says so.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UtunBlockWithheld {
+    /// An address of another interface sits inside the block.
+    Address {
+        ip: std::net::Ipv4Addr,
+        interface: String,
+    },
+    /// The default route's gateway sits inside the block.
+    Gateway(std::net::Ipv4Addr),
+    /// The interface addresses could not be read, or the list did not show
+    /// the utun itself.
+    AddressesUnread,
+    /// `route -n get -inet default` could not run.
+    DefaultRouteUnread,
+    /// A `/0` block holds every address ([`v4_block`] never yields one).
+    EveryAddress,
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+impl std::fmt::Display for UtunBlockWithheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Address { ip, interface } => {
+                write!(f, "{ip} on {interface} sits inside the block")
+            }
+            Self::Gateway(gw) => write!(f, "the default gateway {gw} sits inside the block"),
+            Self::AddressesUnread => write!(f, "the interface addresses could not be read"),
+            Self::DefaultRouteUnread => write!(f, "the default route could not be read"),
+            Self::EveryAddress => write!(f, "the block holds every address"),
+        }
+    }
+}
+
+/// #4117 — Change B's gate ([`floor_safe`], Windows' block-floor gate) for a
+/// utun's block route: `Ok` when the block may be routed on the utun, else
+/// why not, naming the address or the gateway `floor_safe` refused on.
+///
+/// `addrs` is every IPv4 address of every other interface, with its
+/// interface ([`bsd_non_overlay_v4`]), `None` when the list could not be
+/// read. `gateway` is the default gateway ([`utun_gate_gateway`]),
+/// `Some(None)` when there is none and `None` when the default route could not
+/// be read. Either read failing withholds.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_block_gate(
+    addrs: Option<&[(String, std::net::Ipv4Addr)]>,
+    gateway: Option<Option<std::net::Ipv4Addr>>,
+    block: (std::net::Ipv4Addr, u8),
+) -> Result<(), UtunBlockWithheld> {
+    let addrs = addrs.ok_or(UtunBlockWithheld::AddressesUnread)?;
+    let gateway = gateway.ok_or(UtunBlockWithheld::DefaultRouteUnread)?;
+    let v4: Vec<std::net::Ipv4Addr> = addrs.iter().map(|(_, ip)| *ip).collect();
+    if floor_safe(&v4, gateway, block) {
+        return Ok(());
+    }
+    // Name what `floor_safe` refused on, judged by `floor_safe` itself.
+    let inside = |ip: std::net::Ipv4Addr| !floor_safe(&[ip], None, block);
+    if let Some((interface, ip)) = addrs.iter().find(|(_, ip)| inside(*ip)) {
+        return Err(UtunBlockWithheld::Address {
+            ip: *ip,
+            interface: interface.clone(),
+        });
+    }
+    Err(match gateway {
+        Some(gw) if inside(gw) => UtunBlockWithheld::Gateway(gw),
+        _ => UtunBlockWithheld::EveryAddress,
+    })
+}
+
+/// #4117 — the gateway [`utun_block_gate`] asks about: the default route's
+/// next hop as read now (`now`; `None` when the read failed, `Some(None)` when
+/// the default route has no next hop), or the uplink the overlay holds for its
+/// exit pins (`held`) when the default route has none. A full-tunnel VPN can
+/// make the default an interface route with no next hop, and the physical
+/// gateway its own tunnel runs through is still the one the gate must see:
+/// Windows' gate likewise asks the default gateway the overlay holds.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_gate_gateway(
+    now: Option<Option<std::net::Ipv4Addr>>,
+    held: Option<std::net::Ipv4Addr>,
+) -> Option<Option<std::net::Ipv4Addr>> {
+    now.map(|gw| gw.or(held))
+}
+
+/// #4117 — who holds the route for exactly a utun's block, by the block's own
+/// lookup ([`bsd_block_get_args`]).
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UtunBlockHeld {
+    /// Nothing holds exactly the block: the lookup answered `not in table`,
+    /// or a route that only covers the block.
+    Absent,
+    /// Our route: the block, on this utun.
+    Ours,
+    /// A route for exactly the block on another interface (empty when
+    /// route(8) named none): another product's, or a sibling org's utun
+    /// holding the block the two share.
+    Elsewhere(String),
+    /// `route` could not run.
+    Unread,
+}
+
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+impl std::fmt::Display for UtunBlockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => write!(f, "no route for exactly the block"),
+            Self::Ours => write!(f, "the block on this utun"),
+            Self::Elsewhere(on) if on.is_empty() => write!(f, "the block on an unnamed interface"),
+            Self::Elsewhere(on) => write!(f, "the block on {on}"),
+            Self::Unread => write!(f, "the block's lookup could not run"),
+        }
+    }
+}
+
+/// #4117 — the block's own lookup (`got`, parsed; `None` for `not in table`)
+/// read as [`UtunBlockHeld`]. The lookup carries the block's mask, and a route
+/// for exactly the block is what it answers whenever one exists. When none
+/// does it answers `not in table` or a route that only covers the block, both
+/// measured on macOS 26 CI runners: `not in table` before the block had been
+/// routed, the default route right after the block's own route was deleted.
+/// So an answer that is not exactly the block is [`UtunBlockHeld::Absent`].
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_block_held(
+    got: Option<&BsdRouteGet>,
+    block: (std::net::Ipv4Addr, u8),
+    if_name: &str,
+) -> UtunBlockHeld {
+    let Some(got) = got else {
+        return UtunBlockHeld::Absent;
+    };
+    let (net, plen) = block;
+    let net = std::net::IpAddr::V4(net);
+    if bsd_route_is_ours(Some(got), net, plen, if_name) {
+        return UtunBlockHeld::Ours;
+    }
+    // Exactly the block, on whichever interface the answer names, if any.
+    let on = got.interface.clone().unwrap_or_default();
+    let named = BsdRouteGet {
+        interface: Some(on.clone()),
+        ..got.clone()
+    };
+    if bsd_route_is_ours(Some(&named), net, plen, &on) {
+        UtunBlockHeld::Elsewhere(on)
+    } else {
+        UtunBlockHeld::Absent
+    }
+}
+
+/// #4117 — the one write a decision on a utun's block route makes, if any.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UtunBlockStep {
+    /// `route -n add` ([`bsd_block_add_args`]).
+    Add,
+    /// `route -n delete` ([`bsd_block_delete_args`]).
+    Delete,
+    /// Nothing is written.
+    Nothing,
+}
+
+/// #4117 — the bring-up's and every wave's step for a utun's block route:
+/// add only when the gate allows it and nothing holds the block; delete only
+/// our own route, and only when the gate withholds; otherwise write nothing.
+/// So a route another product holds is never touched, a block that anything
+/// holds is never added over (the add would be refused on every wave), and a
+/// wave that finds the route as decided writes nothing.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn utun_block_step(
+    gate: &Result<(), UtunBlockWithheld>,
+    held: &UtunBlockHeld,
+) -> UtunBlockStep {
+    match (gate, held) {
+        (Ok(()), UtunBlockHeld::Absent) => UtunBlockStep::Add,
+        (Err(_), UtunBlockHeld::Ours) => UtunBlockStep::Delete,
+        _ => UtunBlockStep::Nothing,
+    }
+}
+
+/// #4117 — the gate's address input on a Mac: every IPv4 address in
+/// `listing` (interface, address) but loopback's and those of this daemon's
+/// own utuns. Ours are `overlay_if` and every name `is_ours` knows: the utuns
+/// this daemon created, by the name the kernel gave each one. Never a name
+/// prefix: another product's utun is named the same way. A sibling org's utun
+/// carries an address inside this one's block whenever the two blocks nest or
+/// are the same (the legacy `/10`), and counting it would withhold the block
+/// (#1237 was this trap on Windows). `None` when `overlay_if` is not in the
+/// listing: a list that misses our own utun is not read as complete, and the
+/// gate withholds.
+#[cfg(any(all(target_os = "macos", feature = "overlay-l3"), test))]
+pub(crate) fn bsd_non_overlay_v4(
+    listing: &[(String, std::net::IpAddr)],
+    overlay_if: &str,
+    is_ours: impl Fn(&str) -> bool,
+) -> Option<Vec<(String, std::net::Ipv4Addr)>> {
+    if !listing.iter().any(|(name, _)| name == overlay_if) {
+        return None;
+    }
+    Some(
+        listing
+            .iter()
+            .filter(|(name, _)| name != overlay_if && !is_ours(name))
+            .filter_map(|(name, ip)| match ip {
+                std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some((name.clone(), *v4)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod utun_shape_tests {
+    use super::{
+        BsdInet, UtunV4Problem, bsd_block_add_args, bsd_block_get_args, parse_bsd_inet_line,
+        parse_bsd_route_get, utun_self_peer_args, utun_v4_problems, v4_block,
+    };
+    use std::net::Ipv4Addr;
+
+    const SELF: Ipv4Addr = Ipv4Addr::new(100, 65, 128, 1);
+    const MASK_18: Ipv4Addr = Ipv4Addr::new(255, 255, 192, 0);
+
+    /// The lab Mac on 0.4.228, a utun the `tun` crate set up with an address
+    /// and a netmask and no peer: its inet line verbatim, in a listing of
+    /// ifconfig's shape.
+    const BROKEN: &str = "utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                          \tinet 100.65.128.1 --> 28.30.0.0 netmask 0xff000000\n\
+                          \tinet6 fe80::1c4d:2b3a:9e10:7f21%utun0 prefixlen 64 scopeid 0x10\n\
+                          \tinet6 fd72:6f6f:6d6c::6441:8001 prefixlen 96\n";
+    const SHAPED: &str = "utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                          \tinet 100.65.128.1 --> 100.65.128.1 netmask 0xffffc000\n\
+                          \tinet6 fd72:6f6f:6d6c::6441:8001 prefixlen 96\n";
+    /// Its own peer, with another mask: the whole `/10` instead of the block.
+    const OTHER_MASK: &str = "utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                              \tinet 100.65.128.1 --> 100.65.128.1 netmask 0xffc00000\n";
+    /// The address is not on this utun; `100.65.128.10` is the substring trap.
+    const WITHOUT: &str = "utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                           \tinet 100.65.128.10 --> 100.65.128.10 netmask 0xffffc000\n\
+                           \tinet6 fd72:6f6f:6d6c::6441:8001 prefixlen 96\n";
+
+    /// `route -n get -inet -net 100.65.128.0 -prefixlen 18`, in the shape a
+    /// macOS 26 runner printed for a block routed on its utun: the block on
+    /// our utun, and on another.
+    const BLOCK_OURS: &str = "   route to: 100.65.128.0
+destination: 100.65.128.0
+       mask: 255.255.192.0
+  interface: utun0
+      flags: <UP,DONE,STATIC,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0
+";
+    const BLOCK_ELSEWHERE: &str = "   route to: 100.65.128.0
+destination: 100.65.128.0
+       mask: 255.255.192.0
+  interface: utun3
+      flags: <UP,DONE,STATIC,PRCLONING>
+";
+    const FELL_TO_DEFAULT: &str = "   route to: 100.65.128.0
+destination: default
+       mask: default
+    gateway: 192.168.8.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+";
+
+    fn inet(peer: &str, mask: &str) -> BsdInet {
+        BsdInet {
+            peer: Some(peer.parse().unwrap()),
+            mask: Some(mask.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_inet_line_is_read_for_its_peer_and_its_mask() {
+        assert_eq!(
+            parse_bsd_inet_line(BROKEN, SELF),
+            Some(inet("28.30.0.0", "255.0.0.0"))
+        );
+        assert_eq!(
+            parse_bsd_inet_line(SHAPED, SELF),
+            Some(inet("100.65.128.1", "255.255.192.0"))
+        );
+        assert_eq!(
+            parse_bsd_inet_line(OTHER_MASK, SELF),
+            Some(inet("100.65.128.1", "255.192.0.0"))
+        );
+        assert_eq!(parse_bsd_inet_line(WITHOUT, SELF), None);
+        assert_eq!(parse_bsd_inet_line("", SELF), None);
+        // A broadcast interface's line has no peer; a dotted mask still reads.
+        assert_eq!(
+            parse_bsd_inet_line(
+                "\tinet 192.168.8.106 netmask 0xffffff00 broadcast 192.168.8.255\n",
+                Ipv4Addr::new(192, 168, 8, 106)
+            ),
+            Some(BsdInet {
+                peer: None,
+                mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            })
+        );
+        assert_eq!(
+            parse_bsd_inet_line(
+                "\tinet 10.0.0.1 --> 10.0.0.1 netmask 255.255.255.0\n",
+                Ipv4Addr::new(10, 0, 0, 1)
+            )
+            .and_then(|i| i.mask),
+            Some(Ipv4Addr::new(255, 255, 255, 0))
+        );
+    }
+
+    #[test]
+    fn the_block_is_the_address_under_its_mask() {
+        assert_eq!(
+            v4_block(SELF, MASK_18),
+            Some((Ipv4Addr::new(100, 65, 128, 0), 18))
+        );
+        assert_eq!(
+            v4_block(
+                Ipv4Addr::new(100, 65, 0, 5),
+                Ipv4Addr::new(255, 255, 252, 0)
+            ),
+            Some((Ipv4Addr::new(100, 65, 0, 0), 22))
+        );
+        assert_eq!(
+            v4_block(Ipv4Addr::new(100, 64, 0, 28), Ipv4Addr::new(255, 192, 0, 0)),
+            Some((Ipv4Addr::new(100, 64, 0, 0), 10))
+        );
+        // Not a prefix, and no prefix at all.
+        assert_eq!(v4_block(SELF, Ipv4Addr::new(255, 0, 255, 0)), None);
+        assert_eq!(v4_block(SELF, Ipv4Addr::UNSPECIFIED), None);
+    }
+
+    #[test]
+    fn the_commands_are_the_ones_the_kernel_needs() {
+        assert_eq!(
+            utun_self_peer_args("utun4", SELF, MASK_18),
+            [
+                "utun4",
+                "inet",
+                "100.65.128.1",
+                "100.65.128.1",
+                "netmask",
+                "255.255.192.0",
+                "alias"
+            ]
+        );
+        let net = Ipv4Addr::new(100, 65, 128, 0);
+        assert_eq!(
+            bsd_block_get_args(net, 18),
+            [
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "100.65.128.0",
+                "-prefixlen",
+                "18"
+            ]
+        );
+        assert_eq!(
+            bsd_block_add_args(net, 18, "utun4"),
+            [
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "100.65.128.0",
+                "-prefixlen",
+                "18",
+                "-interface",
+                "utun4"
+            ]
+        );
+    }
+
+    /// Every way the read-back can be wrong is named, and the shape the
+    /// overlay needs has nothing to name.
+    #[test]
+    fn the_read_back_names_what_is_wrong() {
+        let read = |listing: &str, block: &str| {
+            utun_v4_problems(
+                parse_bsd_inet_line(listing, SELF).as_ref(),
+                parse_bsd_route_get(block).as_ref(),
+                SELF,
+                MASK_18,
+                "utun0",
+            )
+        };
+        assert_eq!(read(SHAPED, BLOCK_OURS), Vec::<UtunV4Problem>::new());
+        // 0.4.228, as the lab read it: no peer of its own, a classful mask,
+        // and the block's lookup falling through to the default route.
+        assert_eq!(
+            read(BROKEN, FELL_TO_DEFAULT),
+            [
+                UtunV4Problem::Peer(Some(Ipv4Addr::new(28, 30, 0, 0))),
+                UtunV4Problem::Mask(Some(Ipv4Addr::new(255, 0, 0, 0))),
+                UtunV4Problem::Block(Some("default mask default on en0".into())),
+            ]
+        );
+        assert_eq!(
+            read(OTHER_MASK, BLOCK_OURS),
+            [UtunV4Problem::Mask(Some(Ipv4Addr::new(255, 192, 0, 0)))]
+        );
+        assert_eq!(read(WITHOUT, BLOCK_OURS), [UtunV4Problem::NoAddress]);
+        // Another product holds exactly this block: named, never ours.
+        assert_eq!(
+            read(SHAPED, BLOCK_ELSEWHERE),
+            [UtunV4Problem::Block(Some(
+                "100.65.128.0 mask 255.255.192.0 on utun3".into()
+            ))]
+        );
+        // The lookup found nothing at all (`not in table` on stderr).
+        assert_eq!(read(SHAPED, ""), [UtunV4Problem::Block(None)]);
+        assert_eq!(
+            UtunV4Problem::Peer(Some(Ipv4Addr::new(28, 30, 0, 0))).to_string(),
+            "the address's peer is 28.30.0.0, not itself"
+        );
+    }
+}
+
+/// #4117 — the macOS block route's gate and per-wave step, pure: they run on
+/// every platform. The kernel tests stage the same cases on a real utun.
+#[cfg(test)]
+mod utun_block_gate_tests {
+    use super::{
+        BsdRouteGet, UtunBlockHeld, UtunBlockStep, UtunBlockWithheld, bsd_block_delete_args,
+        bsd_non_overlay_v4, floor_safe, utun_block_gate, utun_block_held, utun_block_step,
+        utun_gate_gateway,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const BLOCK: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 65, 0, 0), 22);
+
+    fn addrs(list: &[(&str, [u8; 4])]) -> Vec<(String, Ipv4Addr)> {
+        list.iter()
+            .map(|(name, octets)| (name.to_string(), Ipv4Addr::from(*octets)))
+            .collect()
+    }
+
+    fn address(ip: [u8; 4], interface: &str) -> UtunBlockWithheld {
+        UtunBlockWithheld::Address {
+            ip: Ipv4Addr::from(ip),
+            interface: interface.into(),
+        }
+    }
+
+    #[test]
+    fn the_gate_withholds_for_an_address_or_the_gateway_inside_the_block_and_names_it() {
+        let home = addrs(&[("en0", [192, 168, 1, 20])]);
+        let home_gw = Some(Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(utun_block_gate(Some(&home), home_gw, BLOCK), Ok(()));
+        // No default route through a gateway (offline, or between networks):
+        // the addresses decide.
+        assert_eq!(utun_block_gate(Some(&home), Some(None), BLOCK), Ok(()));
+
+        // A LAN that numbers from 100.64.0.0/10 more coarsely than the block.
+        let lan = addrs(&[("en0", [100, 65, 1, 20])]);
+        assert_eq!(
+            utun_block_gate(Some(&lan), Some(Some(Ipv4Addr::new(100, 64, 0, 1))), BLOCK),
+            Err(address([100, 65, 1, 20], "en0"))
+        );
+        // Only the gateway inside: the Mac's own address is outside the block.
+        let wide = addrs(&[("en0", [100, 64, 5, 7])]);
+        assert_eq!(
+            utun_block_gate(Some(&wide), Some(Some(Ipv4Addr::new(100, 65, 0, 1))), BLOCK),
+            Err(UtunBlockWithheld::Gateway(Ipv4Addr::new(100, 65, 0, 1)))
+        );
+        // The legacy /10, equal to the CGNAT range: an ISP's CGNAT address
+        // withholds it.
+        let legacy = (Ipv4Addr::new(100, 64, 0, 0), 10);
+        let wan = addrs(&[("en0", [100, 72, 3, 4])]);
+        assert_eq!(
+            utun_block_gate(Some(&wan), Some(None), legacy),
+            Err(address([100, 72, 3, 4], "en0"))
+        );
+        // The block's own edges are inside; one past either edge is not.
+        for edge in [[100, 65, 0, 0], [100, 65, 3, 255]] {
+            assert_eq!(
+                utun_block_gate(Some(&addrs(&[("en5", edge)])), Some(None), BLOCK),
+                Err(address(edge, "en5"))
+            );
+        }
+        for outside in [[100, 64, 255, 255], [100, 65, 4, 0]] {
+            assert_eq!(
+                utun_block_gate(Some(&addrs(&[("en5", outside)])), Some(None), BLOCK),
+                Ok(()),
+                "{outside:?} is outside the block"
+            );
+        }
+        // The first address inside is the one named, whatever comes after.
+        let several = addrs(&[
+            ("en0", [192, 168, 1, 20]),
+            ("lo0", [100, 65, 2, 77]),
+            ("en5", [100, 65, 0, 9]),
+        ]);
+        assert_eq!(
+            utun_block_gate(Some(&several), home_gw, BLOCK),
+            Err(address([100, 65, 2, 77], "lo0"))
+        );
+    }
+
+    #[test]
+    fn a_read_that_fails_withholds() {
+        let home = addrs(&[("en0", [192, 168, 1, 20])]);
+        assert_eq!(
+            utun_block_gate(None, Some(None), BLOCK),
+            Err(UtunBlockWithheld::AddressesUnread)
+        );
+        assert_eq!(
+            utun_block_gate(Some(&home), None, BLOCK),
+            Err(UtunBlockWithheld::DefaultRouteUnread)
+        );
+        assert_eq!(
+            utun_block_gate(None, None, BLOCK),
+            Err(UtunBlockWithheld::AddressesUnread)
+        );
+    }
+
+    /// The gateway asked about is the default route's next hop, or, while
+    /// the default route has none (a full-tunnel VPN's interface default),
+    /// the uplink the overlay holds: a LAN wider than the block whose gateway
+    /// sits inside it still withholds then.
+    #[test]
+    fn the_gate_asks_the_default_routes_gateway_or_the_one_held() {
+        let now = Ipv4Addr::new(192, 168, 1, 1);
+        let held = Ipv4Addr::new(100, 65, 0, 1);
+        assert_eq!(
+            utun_gate_gateway(Some(Some(now)), Some(held)),
+            Some(Some(now))
+        );
+        assert_eq!(utun_gate_gateway(Some(None), Some(held)), Some(Some(held)));
+        assert_eq!(utun_gate_gateway(Some(None), None), Some(None));
+        assert_eq!(
+            utun_gate_gateway(None, Some(held)),
+            None,
+            "a failed read stays unread"
+        );
+        let lan = addrs(&[("en0", [100, 64, 5, 7])]);
+        assert_eq!(
+            utun_block_gate(Some(&lan), utun_gate_gateway(Some(None), Some(held)), BLOCK),
+            Err(UtunBlockWithheld::Gateway(held))
+        );
+    }
+
+    /// The gate is Windows' `floor_safe`: wherever both reads succeed, the
+    /// two agree.
+    #[test]
+    fn the_gate_is_floor_safe() {
+        /// The addresses, the gateway and the block of one case.
+        type Case<'a> = (&'a [(&'a str, [u8; 4])], Option<[u8; 4]>, (Ipv4Addr, u8));
+        let legacy = (Ipv4Addr::new(100, 64, 0, 0), 10);
+        let narrow = (Ipv4Addr::new(100, 65, 20, 0), 22);
+        let cases: [Case; 8] = [
+            (&[("en0", [192, 168, 1, 20])], Some([192, 168, 1, 1]), BLOCK),
+            (&[("en0", [100, 65, 1, 20])], None, BLOCK),
+            (&[("en0", [100, 64, 5, 7])], Some([100, 65, 0, 1]), BLOCK),
+            (&[("en0", [100, 72, 3, 4])], Some([100, 72, 0, 1]), legacy),
+            (
+                &[("en0", [10, 0, 0, 5])],
+                Some([100, 127, 255, 254]),
+                legacy,
+            ),
+            (&[("en0", [10, 0, 0, 5])], Some([10, 0, 0, 1]), legacy),
+            (&[("en0", [100, 65, 19, 255])], None, narrow),
+            (&[], None, (Ipv4Addr::UNSPECIFIED, 0)),
+        ];
+        for (list, gw, block) in cases {
+            let list = addrs(list);
+            let v4: Vec<Ipv4Addr> = list.iter().map(|(_, ip)| *ip).collect();
+            let gw = gw.map(Ipv4Addr::from);
+            assert_eq!(
+                utun_block_gate(Some(&list), Some(gw), block).is_ok(),
+                floor_safe(&v4, gw, block),
+                "{list:?} gateway {gw:?} block {block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_withhold_names_what_sat_inside() {
+        assert_eq!(
+            address([100, 65, 2, 77], "lo0").to_string(),
+            "100.65.2.77 on lo0 sits inside the block"
+        );
+        assert_eq!(
+            UtunBlockWithheld::Gateway(Ipv4Addr::new(100, 65, 0, 1)).to_string(),
+            "the default gateway 100.65.0.1 sits inside the block"
+        );
+        assert_eq!(
+            UtunBlockWithheld::AddressesUnread.to_string(),
+            "the interface addresses could not be read"
+        );
+        assert_eq!(
+            UtunBlockWithheld::DefaultRouteUnread.to_string(),
+            "the default route could not be read"
+        );
+        assert_eq!(
+            utun_block_gate(Some(&[]), Some(None), (Ipv4Addr::UNSPECIFIED, 0)),
+            Err(UtunBlockWithheld::EveryAddress)
+        );
+    }
+
+    fn got(destination: &str, mask: Option<&str>, interface: &str) -> BsdRouteGet {
+        BsdRouteGet {
+            destination: destination.into(),
+            mask: mask.map(Into::into),
+            gateway: None,
+            interface: Some(interface.into()),
+        }
+    }
+
+    #[test]
+    fn the_blocks_own_lookup_says_who_holds_it() {
+        const MASK: Option<&str> = Some("255.255.252.0");
+        assert_eq!(utun_block_held(None, BLOCK, "utun4"), UtunBlockHeld::Absent);
+        assert_eq!(
+            utun_block_held(Some(&got("100.65.0.0", MASK, "utun4")), BLOCK, "utun4"),
+            UtunBlockHeld::Ours
+        );
+        // Another product, and a sibling org's utun on the block both share.
+        for other in ["lo0", "utun5"] {
+            let held = utun_block_held(Some(&got("100.65.0.0", MASK, other)), BLOCK, "utun4");
+            assert_eq!(held, UtunBlockHeld::Elsewhere(other.into()));
+            assert_eq!(held.to_string(), format!("the block on {other}"));
+        }
+        // Exactly the block with no interface shown is still held.
+        let unnamed = BsdRouteGet {
+            interface: None,
+            ..got("100.65.0.0", MASK, "")
+        };
+        assert_eq!(
+            utun_block_held(Some(&unnamed), BLOCK, "utun4"),
+            UtunBlockHeld::Elsewhere(String::new())
+        );
+        // An answer that is not exactly the block means nothing holds it: with
+        // no such route the lookup answered the default route on a macOS 26
+        // runner, right after the block's own route was deleted.
+        for not_the_block in [
+            got("default", Some("default"), "en0"),
+            got("100.65.0.0", None, "utun4"),
+            got("100.65.0.0", Some("255.255.248.0"), "utun4"),
+            got("100.64.0.0", Some("255.192.0.0"), "utun9"),
+        ] {
+            assert_eq!(
+                utun_block_held(Some(&not_the_block), BLOCK, "utun4"),
+                UtunBlockHeld::Absent,
+                "{not_the_block:?}"
+            );
+        }
+    }
+
+    /// The gate's inputs to the step: assert, retract or nothing.
+    #[test]
+    fn a_step_adds_only_when_allowed_and_absent_and_deletes_only_our_own_route() {
+        use UtunBlockHeld::{Absent, Elsewhere, Ours, Unread};
+        let allowed: Result<(), UtunBlockWithheld> = Ok(());
+        assert_eq!(utun_block_step(&allowed, &Absent), UtunBlockStep::Add);
+        for held in [Ours, Elsewhere("lo0".into()), Unread] {
+            assert_eq!(
+                utun_block_step(&allowed, &held),
+                UtunBlockStep::Nothing,
+                "{held:?}"
+            );
+        }
+        for why in [
+            address([100, 65, 2, 77], "lo0"),
+            UtunBlockWithheld::Gateway(Ipv4Addr::new(100, 65, 0, 1)),
+            UtunBlockWithheld::AddressesUnread,
+            UtunBlockWithheld::DefaultRouteUnread,
+            UtunBlockWithheld::EveryAddress,
+        ] {
+            let withheld = Err(why);
+            assert_eq!(
+                utun_block_step(&withheld, &Ours),
+                UtunBlockStep::Delete,
+                "{withheld:?}"
+            );
+            for held in [Absent, Elsewhere("lo0".into()), Unread] {
+                assert_eq!(
+                    utun_block_step(&withheld, &held),
+                    UtunBlockStep::Nothing,
+                    "{withheld:?} {held:?}"
+                );
+            }
+        }
+    }
+
+    /// Every utun this daemon created is ours by the name the kernel gave it,
+    /// and nothing else is: a sibling org's address inside the block never
+    /// withholds it, another product's utun does, named the same way.
+    #[test]
+    fn every_utun_of_ours_and_nothing_else_is_left_out_of_the_gate() {
+        let v4 = |octets: [u8; 4]| IpAddr::V4(Ipv4Addr::from(octets));
+        let listing: Vec<(String, IpAddr)> = vec![
+            ("lo0".into(), v4([127, 0, 0, 1])),
+            ("lo0".into(), "::1".parse().unwrap()),
+            ("lo0".into(), v4([100, 65, 2, 77])),
+            ("en0".into(), v4([192, 168, 1, 20])),
+            ("en0".into(), "fe80::1".parse().unwrap()),
+            // This utun, a sibling org's utun of ours, another product's.
+            ("utun4".into(), v4([100, 65, 0, 5])),
+            ("utun5".into(), v4([100, 65, 0, 9])),
+            ("utun6".into(), v4([100, 65, 1, 1])),
+        ];
+        let ours = |name: &str| name == "utun5";
+        let seen = bsd_non_overlay_v4(&listing, "utun4", ours).expect("utun4 is listed");
+        assert_eq!(
+            seen,
+            addrs(&[
+                ("lo0", [100, 65, 2, 77]),
+                ("en0", [192, 168, 1, 20]),
+                ("utun6", [100, 65, 1, 1]),
+            ])
+        );
+        // A sibling alone never withholds; another product's utun does.
+        let with_sibling = bsd_non_overlay_v4(&listing[3..7], "utun4", ours).unwrap();
+        assert_eq!(
+            utun_block_gate(Some(&with_sibling), Some(None), BLOCK),
+            Ok(())
+        );
+        let with_other = bsd_non_overlay_v4(&listing[3..], "utun4", ours).unwrap();
+        assert_eq!(
+            utun_block_gate(Some(&with_other), Some(None), BLOCK),
+            Err(address([100, 65, 1, 1], "utun6"))
+        );
+        // With no sibling registered, its address counts like any other.
+        let alone = bsd_non_overlay_v4(&listing, "utun4", |_| false).unwrap();
+        assert!(alone.contains(&("utun5".to_string(), Ipv4Addr::new(100, 65, 0, 9))));
+        // A list that does not show our own utun is not read as complete.
+        assert_eq!(bsd_non_overlay_v4(&listing[..5], "utun4", ours), None);
+    }
+
+    #[test]
+    fn the_delete_names_the_block_and_no_interface() {
+        assert_eq!(
+            bsd_block_delete_args(Ipv4Addr::new(100, 65, 0, 0), 22),
+            [
+                "-n",
+                "delete",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2604,6 +3562,16 @@ mod system {
         /// one it had: a network in transit is no reason to touch the pins.
         #[cfg(target_os = "macos")]
         uplinks: std::sync::Mutex<BsdUplinks>,
+        /// #4117 — the block this utun's first address sits in, whose route
+        /// the bring-up decided and every route-guard wave decides again.
+        /// `None` with the kill switch off or a mask that is not a prefix.
+        #[cfg(target_os = "macos")]
+        utun_block: Option<(Ipv4Addr, u8)>,
+        /// #4117 — the last decision per block (`true` = routed, `false` =
+        /// withheld), so a wave logs only a flip, as `floor_state` does on
+        /// Windows. Seeded with the bring-up's decision, which logged its own.
+        #[cfg(target_os = "macos")]
+        utun_block_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), bool)>>,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -4059,11 +5027,12 @@ mod system {
             #[cfg(target_os = "macos")]
             {
                 // A utun is a POINT-TO-POINT interface: `ifconfig utunN inet
-                // A B netmask M alias` needs BOTH a local and a peer address.
-                // Using the address as its own peer is what makes the block's
-                // prefix land on this interface, which is what the connected
-                // route needs — the same shape `up` uses for the first
-                // address.
+                // A B netmask M alias` takes a local and a peer address. With
+                // the address as its own peer the kernel gives it a host route
+                // on this interface and nothing for the block's prefix (#4117,
+                // measured on a macOS 26 CI runner). `up` routes its own block
+                // (`shape_utun_v4`); nothing does that for an address added
+                // here.
                 let mask = Ipv4Addr::from(if prefix == 0 {
                     0
                 } else {
@@ -4148,9 +5117,9 @@ mod system {
 
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
-        /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here
-        /// via the OS-installed connected route. Must be called inside a
-        /// Tokio runtime (the async device registers with the reactor).
+        /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here (the
+        /// connected route; on macOS `shape_utun_v4` adds it). Must be called
+        /// inside a Tokio runtime (the async device registers with the reactor).
         ///
         /// Dual-stack: the device also gets this node's *derived* overlay
         /// IPv6 ([`derive_overlay_v6`](crate::overlay::router::derive_overlay_v6))
@@ -4262,6 +5231,16 @@ mod system {
             if if_name != opts.name {
                 tracing::info!(%if_name, "overlay: OS-assigned TUN interface name");
             }
+
+            // #4117 — a utun is point-to-point: its first address needs a peer,
+            // and the block a route of its own (`shape_utun_v4`). The utun is
+            // registered as ours first, by the name the kernel gave it, so
+            // neither this decision nor a sibling org's wave reads its address
+            // as another interface's (the registration at the end stays).
+            #[cfg(target_os = "macos")]
+            own_adapters::register(&if_name, 0, None);
+            #[cfg(target_os = "macos")]
+            let utun_block = shape_utun_v4(&if_name, opts.ip, opts.netmask);
 
             // Pin the overlay NIC's interface metric so its routes (the
             // connected block + the per-peer `/32`s) are preferred over a
@@ -4471,8 +5450,9 @@ mod system {
             // is `0` off-Windows, where the registry is unconsumed.)
             // FR-68 C2(b) — computed BEFORE registering so the registry can
             // compare this adapter's block against its siblings' and warn on
-            // an overlap. Off-Windows there is no mask helper and no route
-            // guard, so it is honestly `None`.
+            // an overlap. Off-Windows there is no mask helper, so it is
+            // honestly `None`; the macOS block route (#4117) is decided from
+            // the interfaces, never from this registry's blocks.
             #[cfg(windows)]
             let connected_v4_block = prefix_len_of_mask(opts.netmask).map(|plen| {
                 let net = u32::from_be_bytes(opts.ip.octets())
@@ -4496,6 +5476,10 @@ mod system {
                 orig_default_v6: std::sync::Mutex::new(orig_default_v6),
                 #[cfg(target_os = "macos")]
                 uplinks,
+                #[cfg(target_os = "macos")]
+                utun_block: utun_block.map(|(block, _)| block),
+                #[cfg(target_os = "macos")]
+                utun_block_state: std::sync::Mutex::new(utun_block.into_iter().collect()),
                 #[cfg(windows)]
                 _wfp,
                 #[cfg(windows)]
@@ -4579,8 +5563,9 @@ mod system {
 
         /// Add an on-link `/32` for `peer` via the overlay NIC. Windows uses
         /// `netsh` (by adapter name, so no LUID/index lookup); Linux uses
-        /// `ip route replace` (idempotent). macOS utun is left to the
-        /// connected route for now (refined when 3b/3c field-test there). The
+        /// `ip route replace` (idempotent). macOS uses `route -n add
+        /// -interface <utun>`, deleting first because BSD `route` has no
+        /// replace, and leaves a `/32` that is already ours alone (#1856). The
         /// agent runs privileged (service), so the route call has rights.
         async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
             #[cfg(target_os = "windows")]
@@ -4903,6 +5888,14 @@ mod system {
                 };
                 self.defend_block_floor_of(net, plen).await;
             }
+            // #4117 — a Mac has no floors: its utun's own block route is
+            // decided again instead, by the bring-up's gate.
+            #[cfg(target_os = "macos")]
+            {
+                if let Some((net, plen)) = self.utun_block {
+                    self.defend_block_floor_of(net, plen).await;
+                }
+            }
         }
 
         async fn defend_block_floor_of(&self, net: Ipv4Addr, plen: u8) {
@@ -5003,7 +5996,75 @@ mod system {
                     }
                 }
             }
-            #[cfg(not(windows))]
+            // #4117 — the block routed on this utun while the gate allows it
+            // and nothing holds it, our route deleted while the gate
+            // withholds, nothing written when the table already matches the
+            // decision ([`decide_utun_block`], on the blocking pool). The
+            // decision is logged only when it flips, as Windows' is.
+            #[cfg(target_os = "macos")]
+            {
+                if !utun_block_route_enabled() {
+                    return;
+                }
+                let if_name = self.if_name.clone();
+                let held_gateway = self
+                    .uplinks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .v4
+                    .as_ref()
+                    .and_then(|u| match u.gateway {
+                        std::net::IpAddr::V4(gw) => Some(gw),
+                        std::net::IpAddr::V6(_) => None,
+                    });
+                let Ok(decision) = tokio::task::spawn_blocking(move || {
+                    decide_utun_block(&if_name, (net, plen), held_gateway)
+                })
+                .await
+                else {
+                    return;
+                };
+                let routed = decision.gate.is_ok();
+                let flipped = {
+                    let mut st = self
+                        .utun_block_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match st.iter_mut().find(|(b, _)| *b == (net, plen)) {
+                        Some((_, s)) if *s == routed => false,
+                        Some((_, s)) => {
+                            *s = routed;
+                            true
+                        }
+                        None => {
+                            st.push(((net, plen), routed));
+                            true
+                        }
+                    }
+                };
+                let block = format!("{net}/{plen}");
+                match &decision.gate {
+                    Err(why) if flipped => tracing::warn!(
+                        utun = %self.if_name, %block,
+                        "overlay: the utun's block route is withheld: {why}; the address keeps \
+                         its own host route and each peer its /32"
+                    ),
+                    Ok(()) if flipped => tracing::info!(
+                        utun = %self.if_name, %block,
+                        "overlay: the utun's block route is no longer withheld: no other \
+                         interface address and no default gateway sits inside the block"
+                    ),
+                    _ => {}
+                }
+                if decision.step != super::UtunBlockStep::Nothing {
+                    tracing::debug!(
+                        utun = %self.if_name, %block, step = ?decision.step,
+                        found = %decision.held, complaint = ?decision.complaint,
+                        "overlay: the utun's block route written by the route guard"
+                    );
+                }
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             {
                 let _ = (net, plen);
             }
@@ -6309,6 +7370,235 @@ mod system {
         crate::env::flag("EXIT_CLIENT_MACOS", true)
     }
 
+    /// #4117 — `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` leaves a utun as the
+    /// `tun` crate configures it: the first address with no peer and no route
+    /// of its own, the shape every Mac came up with through 0.4.228, and no
+    /// route-guard step for the block either. Default ON.
+    #[cfg(target_os = "macos")]
+    fn utun_block_route_enabled() -> bool {
+        crate::env::flag("OVERLAY_UTUN_BLOCK_ROUTE", true)
+    }
+
+    /// #4117 — the gate's address input ([`super::bsd_non_overlay_v4`]) as
+    /// the interfaces show it right now. Ours are `overlay_if` and the names
+    /// in `own_adapters`, where `up_with` registers each utun by the name the
+    /// kernel gave it before that utun's bring-up decides anything. `None`
+    /// when the list cannot be read or does not show `overlay_if`.
+    #[cfg(target_os = "macos")]
+    fn bsd_non_overlay_v4_now(overlay_if: &str) -> Option<Vec<(String, Ipv4Addr)>> {
+        let listing: Vec<(String, std::net::IpAddr)> = if_addrs::get_if_addrs()
+            .ok()?
+            .into_iter()
+            .map(|a| {
+                let ip = a.ip();
+                (a.name, ip)
+            })
+            .collect();
+        super::bsd_non_overlay_v4(&listing, overlay_if, own_adapters::is_own_name)
+    }
+
+    /// #4117 — the default route's gateway right now, read afresh for every
+    /// decision: a Mac changes networks under a running daemon, and the uplink
+    /// held for the exit's pins is re-read only when those pin, so it is only
+    /// the fallback ([`super::utun_gate_gateway`]). `Some(None)` when there is
+    /// no default route through a gateway, `None` when `route` could not run.
+    #[cfg(target_os = "macos")]
+    fn bsd_default_gateway_v4_now(overlay_if: &str) -> Option<Option<Ipv4Addr>> {
+        let out = std::process::Command::new("route")
+            .args(["-n", "get", "-inet", "default"])
+            .output()
+            .ok()?;
+        let got = super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout));
+        Some(
+            super::bsd_default_uplink(got.as_ref(), false, overlay_if).and_then(|u| {
+                match u.gateway {
+                    std::net::IpAddr::V4(gw) => Some(gw),
+                    std::net::IpAddr::V6(_) => None,
+                }
+            }),
+        )
+    }
+
+    /// #4117 — one decision on a utun's block route, and what it wrote.
+    #[cfg(target_os = "macos")]
+    struct UtunBlockDecision {
+        gate: Result<(), super::UtunBlockWithheld>,
+        held: super::UtunBlockHeld,
+        step: super::UtunBlockStep,
+        /// What `route` complained about when it made the step's write.
+        complaint: Option<String>,
+    }
+
+    /// #4117 — decide a utun's block route once: the gate
+    /// ([`super::utun_block_gate`]), then the block's own lookup, then at
+    /// most one write ([`super::utun_block_step`]). The bring-up and every
+    /// route-guard wave run this one function, so a Mac that starts on a
+    /// network that withholds the block never routes it, and a wave that
+    /// finds the route as decided writes nothing. `held_gateway` is the v4
+    /// uplink [`SystemTun`] holds for its exit pins (none yet at the
+    /// bring-up). Each read and the write are separate `route` runs, so it
+    /// blocks: the wave runs it on the blocking pool.
+    #[cfg(target_os = "macos")]
+    fn decide_utun_block(
+        if_name: &str,
+        block: (Ipv4Addr, u8),
+        held_gateway: Option<Ipv4Addr>,
+    ) -> UtunBlockDecision {
+        let (net, plen) = block;
+        let gate = super::utun_block_gate(
+            bsd_non_overlay_v4_now(if_name).as_deref(),
+            super::utun_gate_gateway(bsd_default_gateway_v4_now(if_name), held_gateway),
+            block,
+        );
+        let held = match std::process::Command::new("route")
+            .args(super::bsd_block_get_args(net, plen))
+            .output()
+        {
+            Ok(out) => super::utun_block_held(
+                super::parse_bsd_route_get(&String::from_utf8_lossy(&out.stdout)).as_ref(),
+                block,
+                if_name,
+            ),
+            Err(_) => super::UtunBlockHeld::Unread,
+        };
+        let step = super::utun_block_step(&gate, &held);
+        let complaint = match step {
+            super::UtunBlockStep::Add => {
+                run_bringup("route", &super::bsd_block_add_args(net, plen, if_name)).1
+            }
+            super::UtunBlockStep::Delete => {
+                run_bringup("route", &super::bsd_block_delete_args(net, plen)).1
+            }
+            super::UtunBlockStep::Nothing => None,
+        };
+        UtunBlockDecision {
+            gate,
+            held,
+            step,
+            complaint,
+        }
+    }
+
+    /// One command of the macOS bring-up or of a block decision: what it
+    /// printed, and its complaint if it made one. macOS `route` exits 0 when
+    /// the kernel refuses a write (measured on a macOS 26 CI runner: a second
+    /// `route -n add` of the same block printed `route: writing to routing
+    /// socket: File exists` and exited 0), so a complaint is the first line on
+    /// stderr whatever the exit status, or the status of a run that failed
+    /// without a word.
+    #[cfg(target_os = "macos")]
+    fn run_bringup(prog: &str, args: &[String]) -> (String, Option<String>) {
+        let out = match std::process::Command::new(prog).args(args).output() {
+            Ok(out) => out,
+            Err(e) => return (String::new(), Some(format!("{prog} could not run: {e}"))),
+        };
+        let complaint = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!out.status.success()).then(|| format!("{prog} exited {}", out.status)));
+        (String::from_utf8_lossy(&out.stdout).into_owned(), complaint)
+    }
+
+    /// #4117 — give a utun's first IPv4 address the shape a point-to-point
+    /// interface needs, route the overlay block on it when the gate allows,
+    /// and read both back. Returns the block and the gate's decision on it
+    /// (`true` = routed), the first decision the route guard's waves compare
+    /// with, or `None` when the kill switch is off or the mask is not a
+    /// prefix: then no wave decides anything for this utun either.
+    ///
+    /// The `tun` crate sets the address and the netmask with no peer
+    /// (SIOCSIFADDR, then SIOCSIFNETMASK). A utun brought up that way reads
+    /// `inet <self> --> 28.30.0.0 netmask 0xff000000` and has no IPv4 route at
+    /// all: the lab Mac on 0.4.228 and a macOS 26 CI runner both. With itself
+    /// as its peer the address gets a host route on the utun (`UH`), and the
+    /// kernel still routes nothing for the block (measured on the runner), so
+    /// the block gets a route of its own, as wg-quick adds one per range on
+    /// macOS. Both go with the utun when it closes.
+    ///
+    /// The block's route is decided by [`decide_utun_block`], the function
+    /// every wave runs: withheld while an address of another interface or the
+    /// default gateway sits inside the block (one WARN names which). The
+    /// address's own shape is given either way, and its host route cannot
+    /// claim anything but the address. Each step looks before it writes, so
+    /// a utun already in this shape is written nothing. Nothing here can fail
+    /// the bring-up: a step that fails, or a read-back that is not this shape,
+    /// is one WARN naming what is wrong, and every peer still gets its own
+    /// `/32` as before. A route for exactly this block that anything else
+    /// holds is left where it is: never added over, never deleted.
+    #[cfg(target_os = "macos")]
+    fn shape_utun_v4(
+        if_name: &str,
+        ip: Ipv4Addr,
+        mask: Ipv4Addr,
+    ) -> Option<((Ipv4Addr, u8), bool)> {
+        if !utun_block_route_enabled() {
+            tracing::info!(
+                utun = %if_name,
+                "overlay: utun left as created (ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0): \
+                 its address has no peer and the block no route"
+            );
+            return None;
+        }
+        let Some((net, plen)) = super::v4_block(ip, mask) else {
+            tracing::warn!(
+                utun = %if_name, %mask,
+                "overlay: the overlay netmask is not a prefix; the utun keeps the shape it was created with"
+            );
+            return None;
+        };
+        let read_inet =
+            || super::parse_bsd_inet_line(&run_bringup("ifconfig", &[if_name.to_string()]).0, ip);
+        let read_block = || bsd_route_get_blocking(&super::bsd_block_get_args(net, plen));
+        let shaped = super::BsdInet {
+            peer: Some(ip),
+            mask: Some(mask),
+        };
+
+        let mut complaints: Vec<String> = Vec::new();
+        if read_inet() != Some(shaped) {
+            let args = super::utun_self_peer_args(if_name, ip, mask);
+            complaints.extend(run_bringup("ifconfig", &args).1);
+        }
+        let decision = decide_utun_block(if_name, (net, plen), None);
+        complaints.extend(decision.complaint);
+
+        let mut problems = super::utun_v4_problems(
+            read_inet().as_ref(),
+            read_block().as_ref(),
+            ip,
+            mask,
+            if_name,
+        );
+        if let Err(why) = &decision.gate {
+            // Withheld on purpose: the block's own lookup is not a problem.
+            problems.retain(|p| !matches!(p, super::UtunV4Problem::Block(_)));
+            tracing::warn!(
+                utun = %if_name, addr = %ip, block = format_args!("{net}/{plen}"),
+                "overlay: the utun's block route is withheld: {why}; the address keeps its \
+                 own host route and each peer its /32"
+            );
+        }
+        if problems.is_empty() {
+            if decision.gate.is_ok() {
+                tracing::info!(
+                    utun = %if_name, addr = %ip, %mask, block = format_args!("{net}/{plen}"),
+                    "overlay: utun shaped: its address is its own peer and the block routes on it"
+                );
+            }
+        } else {
+            let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+            tracing::warn!(
+                utun = %if_name, addr = %ip, %mask, block = format_args!("{net}/{plen}"),
+                problems = %problems.join("; "), complaints = %complaints.join("; "),
+                "overlay: the utun's IPv4 shape is not the one the overlay needs; \
+                 each peer still gets its own /32"
+            );
+        }
+        Some(((net, plen), decision.gate.is_ok()))
+    }
+
     #[cfg(target_os = "macos")]
     impl SystemTun {
         /// FR-97 P1a — the uplink `v6`'s exemptions pin through right now:
@@ -7109,6 +8399,186 @@ mod macos_kernel_tests {
             .any(|t| t == needle)
     }
 
+    /// Whole-word match for an interface name, so `utun4` never matches
+    /// `utun40`.
+    fn names(haystack: &str, iface: &str) -> bool {
+        haystack
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == iface)
+    }
+
+    /// The block's own lookup, `route -n get -inet -net <net> -prefixlen
+    /// <plen>`, parsed: `None` when it matched nothing (`not in table`).
+    fn block_route(net: &str, plen: u8) -> Option<super::BsdRouteGet> {
+        super::parse_bsd_route_get(&sh(
+            "route",
+            &[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                net,
+                "-prefixlen",
+                &plen.to_string(),
+            ],
+        ))
+    }
+
+    /// Is the route for exactly `net/plen` ours on `iface`?
+    fn block_is_ours(net: &str, plen: u8, iface: &str) -> bool {
+        super::bsd_route_is_ours(
+            block_route(net, plen).as_ref(),
+            net.parse().unwrap(),
+            plen,
+            iface,
+        )
+    }
+
+    /// The interface a route for exactly `net/plen` is on, if one exists.
+    /// With none, the block's own lookup answers `not in table` or, as this
+    /// runner did right after the block's route was deleted, the default
+    /// route: both read `None` here.
+    fn held_exactly(net: &str, plen: u8) -> Option<String> {
+        let got = block_route(net, plen)?;
+        let on = got.interface.clone()?;
+        super::bsd_route_is_ours(Some(&got), net.parse().unwrap(), plen, &on).then_some(on)
+    }
+
+    /// One block of `route -n monitor` output is a table write.
+    fn is_write(block: &str) -> bool {
+        let kind = block.lines().find(|l| l.starts_with("RTM_")).unwrap_or("");
+        kind.starts_with("RTM_ADD")
+            || kind.starts_with("RTM_DELETE")
+            || kind.starts_with("RTM_CHANGE")
+    }
+
+    /// An address on `lo0` while this lives: another interface whose address
+    /// sits inside the block. The lab cell's own commands: `ifconfig lo0 alias
+    /// <addr> netmask 255.255.255.255`, and `ifconfig lo0 -alias <addr>` on
+    /// drop, whatever happened in between.
+    struct LoAlias(&'static str);
+
+    impl LoAlias {
+        fn add(addr: &'static str) -> Self {
+            let alias = Self(addr);
+            sh(
+                "ifconfig",
+                &["lo0", "alias", addr, "netmask", "255.255.255.255"],
+            );
+            assert!(
+                mentions(&sh("ifconfig", &["lo0"]), addr),
+                "staging the lo0 alias {addr} failed:\n{}",
+                sh("ifconfig", &["lo0"])
+            );
+            alias
+        }
+    }
+
+    impl Drop for LoAlias {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("ifconfig")
+                .args(["lo0", "-alias", self.0])
+                .output();
+        }
+    }
+
+    /// The words of the WARN that says the block's route is withheld, at the
+    /// bring-up and on a wave alike.
+    const WITHHELD: &str = "the utun's block route is withheld";
+    /// The words of the INFO a wave logs when the withhold ends.
+    const NO_LONGER_WITHHELD: &str = "the utun's block route is no longer withheld";
+
+    /// Every event at INFO and above that THIS thread emits while the guard
+    /// lives. The bring-up runs on the test's thread, and so does a wave's
+    /// logging (its commands run on the blocking pool, its lines do not).
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        /// The lines that carry `words`.
+        fn lines_with(&self, words: &str) -> Vec<String> {
+            self.text()
+                .lines()
+                .filter(|l| l.contains(words))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// Three waves under `route -n monitor`, then a control write on `lo0`
+    /// for `control` that the monitor must see. Returns every write that
+    /// names the block (`100.65.0.0`, or `100.65` as route(8) may shorten it)
+    /// or the utun. Our own child, killed by its own handle: the daemon's
+    /// netstate backend is a `route -n monitor` too.
+    async fn block_writes_during_three_waves(
+        tun: &SystemTun,
+        iface: &str,
+        control: &str,
+    ) -> Vec<String> {
+        let mut mon = std::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("route monitor");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            tun.defend_block_floor().await;
+        }
+        sh(
+            "route",
+            &["-n", "add", "-inet", control, "-interface", "lo0"],
+        );
+        sh("route", &["-n", "delete", "-inet", control]);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = mon.kill();
+        let out = mon.wait_with_output().expect("route monitor output");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let blocks: Vec<&str> = text.split("got message of size").collect();
+        assert!(
+            blocks.iter().any(|b| is_write(b) && mentions(b, control)),
+            "the monitor did not even see the control write — this run proves nothing:\n{text}"
+        );
+        blocks
+            .iter()
+            .filter(|b| {
+                is_write(b)
+                    && (mentions(b, "100.65.0.0") || mentions(b, "100.65") || names(b, iface))
+            })
+            .map(|b| b.to_string())
+            .collect()
+    }
+
     /// The utun's descriptor is close-on-exec, so a program started after the
     /// bring-up, with no sweep of its own, does not hold it.
     #[cfg(target_os = "macos")]
@@ -7217,6 +8687,642 @@ mod macos_kernel_tests {
         assert!(
             !mentions(&routes, "100.65.0.9"),
             "a deleted peer route must be gone:\n{routes}"
+        );
+    }
+
+    /// #4117 — the utun's first IPv4 address is its own peer, with the
+    /// overlay block's mask, and the block is routed on the utun. The lab Mac
+    /// on 0.4.228, and this runner before the fix, read `inet <self> -->
+    /// 28.30.0.0 netmask 0xff000000`, no IPv4 route on the utun, and `route -n
+    /// get <self>` answering the default route.
+    #[tokio::test]
+    async fn the_first_address_is_its_own_peer_and_the_block_routes_on_the_utun() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let state = || {
+            format!(
+                "ifconfig {iface}:\n{}\nnetstat -rn -f inet:\n{}",
+                sh("ifconfig", &[&iface]),
+                sh("netstat", &["-rn", "-f", "inet"])
+            )
+        };
+
+        let cfg = sh("ifconfig", &[&iface]);
+        let shaped = [
+            "inet",
+            "100.65.0.5",
+            "-->",
+            "100.65.0.5",
+            "netmask",
+            "0xfffffc00",
+        ];
+        assert!(
+            cfg.lines().any(|l| l
+                .split_whitespace()
+                .take(shaped.len())
+                .eq(shaped.iter().copied())),
+            "the first address must be its own peer, with the block's mask:\n{}",
+            state()
+        );
+        let block = super::parse_bsd_route_get(&sh(
+            "route",
+            &[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+            ],
+        ));
+        assert!(
+            super::bsd_route_is_ours(block.as_ref(), "100.65.0.0".parse().unwrap(), 22, &iface),
+            "the overlay block must be routed on {iface}: {block:?}\n{}",
+            state()
+        );
+        // The node's own address, and one of the block's that no peer holds.
+        for dest in ["100.65.0.5", "100.65.1.77"] {
+            let got = route_get("-inet", dest);
+            assert_eq!(
+                got.as_ref().and_then(|g| g.interface.as_deref()),
+                Some(iface.as_str()),
+                "`route -n get {dest}` must answer {iface}, not the default route: {got:?}\n{}",
+                state()
+            );
+        }
+    }
+
+    /// #4117 — another product already holds a route for exactly this block
+    /// (another mesh on 100.64.0.0/10 can). The bring-up still succeeds, the
+    /// address still gets its shape, and the other product's route stays
+    /// where it is: nothing is added over it, and the WARN names the
+    /// interface the block answers on.
+    #[tokio::test]
+    async fn a_block_another_product_holds_is_left_alone_and_the_bring_up_stands() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        /// Whatever happens, the stand-in's route is removed.
+        struct Foreign;
+        impl Drop for Foreign {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("route")
+                    .args([
+                        "-n",
+                        "delete",
+                        "-inet",
+                        "-net",
+                        "100.65.0.0",
+                        "-prefixlen",
+                        "22",
+                    ])
+                    .output();
+            }
+        }
+        let block = [
+            "-n",
+            "get",
+            "-inet",
+            "-net",
+            "100.65.0.0",
+            "-prefixlen",
+            "22",
+        ];
+        let _foreign = Foreign;
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+                "-interface",
+                "lo0",
+            ],
+        );
+        let held = sh("route", &block);
+        assert!(
+            held.lines().any(|l| l.trim() == "interface: lo0"),
+            "the stand-in for another product must hold the block first:\n{held}"
+        );
+
+        let ip = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = SystemTun::up(ip, MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let cfg = sh("ifconfig", &[&iface]);
+        assert_eq!(
+            super::parse_bsd_inet_line(&cfg, ip),
+            Some(super::BsdInet {
+                peer: Some(ip),
+                mask: Some(MASK_22),
+            }),
+            "the address gets its shape whoever holds the block:\n{cfg}"
+        );
+        let held = sh("route", &block);
+        assert!(
+            held.lines().any(|l| l.trim() == "interface: lo0"),
+            "another product's route for the block is never taken over:\n{held}"
+        );
+        let own = route_get("-inet", "100.65.0.5");
+        assert_eq!(
+            own.as_ref().and_then(|g| g.interface.as_deref()),
+            Some(iface.as_str()),
+            "the node's own address still routes on {iface}: {own:?}"
+        );
+    }
+
+    /// #4117 — `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` puts the bring-up back to
+    /// 0.4.228's shape: the address is not its own peer, and the block has no
+    /// route on the utun. It is also the control for the shape test: these
+    /// reads tell the two shapes apart on this kernel.
+    #[tokio::test]
+    async fn the_kill_switch_leaves_the_utun_as_the_tun_crate_made_it() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _restore = crate::env::test_env::Saved::cleared("OVERLAY_UTUN_BLOCK_ROUTE");
+        // SAFETY: the kernel tests run on one thread; nothing else reads it.
+        unsafe { crate::env::test_env::set("OVERLAY_UTUN_BLOCK_ROUTE", "0") };
+
+        let ip = Ipv4Addr::new(100, 65, 0, 5);
+        let tun = SystemTun::up(ip, MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let cfg = sh("ifconfig", &[&iface]);
+        assert_ne!(
+            super::parse_bsd_inet_line(&cfg, ip).and_then(|i| i.peer),
+            Some(ip),
+            "switched off, the address is not made its own peer:\n{cfg}"
+        );
+        let block = super::parse_bsd_route_get(&sh(
+            "route",
+            &[
+                "-n",
+                "get",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+            ],
+        ));
+        assert!(
+            !super::bsd_route_is_ours(block.as_ref(), "100.65.0.0".parse().unwrap(), 22, &iface),
+            "switched off, the block is not routed on {iface}: {block:?}"
+        );
+        // The switch takes the route guard's arm with it: no wave routes it.
+        tun.defend_block_floor().await;
+        assert!(
+            !block_is_ours("100.65.0.0", 22, &iface),
+            "switched off, no wave routes the block on {iface} either: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+    }
+
+    /// #4117 — with the block routed on the utun, a peer's `/32` still comes
+    /// and goes as before. The block's route covers the peer's address, and it
+    /// is never read as the peer's own, so the `/32` is still written; a delete
+    /// of the `/32`, or of a `/32` that is not there, leaves the block's route.
+    #[tokio::test]
+    async fn a_peer_route_comes_and_goes_beside_the_block_route() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        let block_is_ours = || {
+            let got = super::parse_bsd_route_get(&sh(
+                "route",
+                &[
+                    "-n",
+                    "get",
+                    "-inet",
+                    "-net",
+                    "100.65.0.0",
+                    "-prefixlen",
+                    "22",
+                ],
+            ));
+            super::bsd_route_is_ours(got.as_ref(), "100.65.0.0".parse().unwrap(), 22, &iface)
+        };
+        let peer = Ipv4Addr::new(100, 65, 1, 77);
+        let peer_is_ours = || {
+            let got = route_get("-inet", "100.65.1.77");
+            super::bsd_route_is_ours(got.as_ref(), std::net::IpAddr::V4(peer), 32, &iface)
+        };
+        assert!(block_is_ours(), "the bring-up routes the block on {iface}");
+        assert!(!peer_is_ours(), "the block's route is not the peer's own");
+
+        tun.add_peer_route(peer).await.expect("peer route");
+        assert!(
+            peer_is_ours(),
+            "the peer's /32 is written beside the block: {:?}",
+            route_get("-inet", "100.65.1.77")
+        );
+
+        tun.del_peer_route(peer).await;
+        assert!(!peer_is_ours(), "the peer's /32 is deleted");
+        assert!(
+            block_is_ours(),
+            "deleting a peer's /32 leaves the block's route"
+        );
+        tun.del_peer_route(peer).await;
+        assert!(
+            block_is_ours(),
+            "deleting a /32 that is not there leaves the block's route"
+        );
+    }
+
+    /// #4117 — an address of another interface inside the block (a LAN that
+    /// numbers from 100.64.0.0/10 more coarsely than the block) withholds the
+    /// block's route at the bring-up. One WARN names the address and its
+    /// interface. The utun keeps its own-peer shape, and its address keeps
+    /// its host route.
+    #[tokio::test]
+    async fn an_address_inside_the_block_withholds_the_block_route_at_bring_up() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let _alias = LoAlias::add("100.65.2.77");
+        let ip = Ipv4Addr::new(100, 65, 0, 5);
+        let (logs, guard) = Logs::start();
+        let tun = SystemTun::up(ip, MASK_22, 1280).expect("utun bring-up");
+        drop(guard);
+        let iface = tun.if_name().to_string();
+
+        assert!(
+            !block_is_ours("100.65.0.0", 22, &iface),
+            "an address inside the block withholds its route on {iface}: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+        assert_eq!(
+            super::parse_bsd_inet_line(&sh("ifconfig", &[&iface]), ip),
+            Some(super::BsdInet {
+                peer: Some(ip),
+                mask: Some(MASK_22),
+            }),
+            "withheld or not, the address is its own peer with the block's mask"
+        );
+        assert_eq!(
+            route_get("-inet", "100.65.0.5").and_then(|g| g.interface),
+            Some(iface.clone()),
+            "and the address keeps its own host route on {iface}"
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("WARN")
+                && lines[0].contains("100.65.2.77 on lo0"),
+            "ONE WARN says the route is withheld and names the address and its interface:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — the route guard decides again on every wave. An address that
+    /// comes inside the block after the bring-up (a laptop joining such a
+    /// LAN) makes the next wave delete our block route, and one WARN says so
+    /// however many waves follow. Once the address is gone the next wave
+    /// routes the block again, and one INFO says so.
+    #[tokio::test]
+    async fn a_wave_takes_our_block_route_back_while_an_address_sits_inside_and_restores_it() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+
+        let alias = LoAlias::add("100.65.2.77");
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert_eq!(
+            held_exactly("100.65.0.0", 22),
+            None,
+            "the next wave deletes our block route: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1
+                && lines[0].contains("WARN")
+                && lines[0].contains("100.65.2.77 on lo0"),
+            "ONE WARN for two waves, naming the address and its interface:\n{}",
+            logs.text()
+        );
+
+        drop(alias);
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "with the address gone, the next wave routes the block on {iface} again: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        let lines = logs.lines_with(NO_LONGER_WITHHELD);
+        assert!(
+            lines.len() == 1 && lines[0].contains("INFO"),
+            "ONE INFO for two waves says the withhold ended:\n{}",
+            logs.text()
+        );
+        assert!(
+            logs.lines_with(WITHHELD).is_empty(),
+            "and nothing is withheld any more:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — a block route that something else deleted (a full-tunnel VPN
+    /// that reaps routes it did not add) is put back by the next wave.
+    #[tokio::test]
+    async fn a_reaped_block_route_is_restored_by_the_next_wave() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+        sh(
+            "route",
+            &[
+                "-n",
+                "delete",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+            ],
+        );
+        assert_eq!(
+            held_exactly("100.65.0.0", 22),
+            None,
+            "staging the reap failed: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        tun.defend_block_floor().await;
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the next wave restores the block's route on {iface}: {:?}\n{}",
+            block_route("100.65.0.0", 22),
+            sh("netstat", &["-rn", "-f", "inet"])
+        );
+    }
+
+    /// #4117 — a wave deletes only OUR route. While another product holds a
+    /// route for exactly the block, an address inside the block withholds
+    /// (one WARN), and the other product's route stays where it is.
+    #[tokio::test]
+    async fn a_withhold_never_deletes_another_products_route_for_the_block() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        /// Whatever happens, the stand-in's route is removed.
+        struct Foreign;
+        impl Drop for Foreign {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("route")
+                    .args([
+                        "-n",
+                        "delete",
+                        "-inet",
+                        "-net",
+                        "100.65.0.0",
+                        "-prefixlen",
+                        "22",
+                    ])
+                    .output();
+            }
+        }
+        let held_on_lo0 = || {
+            block_route("100.65.0.0", 22).is_some_and(|g| {
+                g.destination == "100.65.0.0" && g.interface.as_deref() == Some("lo0")
+            })
+        };
+        let _foreign = Foreign;
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "100.65.0.0",
+                "-prefixlen",
+                "22",
+                "-interface",
+                "lo0",
+            ],
+        );
+        assert!(
+            held_on_lo0(),
+            "the stand-in for another product must hold the block first: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        // Printed, not asserted: does an add the kernel refuses reach the
+        // routing socket's listeners? netstate's monitor counts an `RTM_ADD`
+        // header whatever its errno, so a wave that tried to add over a held
+        // block would arm the next wave. The wave never adds then.
+        {
+            let mut mon = std::process::Command::new("route")
+                .args(["-n", "monitor"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("route monitor");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            sh(
+                "route",
+                &[
+                    "-n",
+                    "add",
+                    "-inet",
+                    "-net",
+                    "100.65.0.0",
+                    "-prefixlen",
+                    "22",
+                    "-interface",
+                    "lo0",
+                ],
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = mon.kill();
+            let out = mon.wait_with_output().expect("route monitor output");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let refused: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("RTM_ADD") && !l.contains("errno 0,"))
+                .collect();
+            eprintln!(
+                "measure: a refused add of the held block, as route -n monitor saw it: {refused:?}"
+            );
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        assert!(
+            held_on_lo0(),
+            "the bring-up leaves the other product's route"
+        );
+
+        let _alias = LoAlias::add("100.65.2.77");
+        let (logs, guard) = Logs::start();
+        tun.defend_block_floor().await;
+        drop(guard);
+        assert!(
+            held_on_lo0(),
+            "a withhold never deletes a route that is not ours: {:?}",
+            block_route("100.65.0.0", 22)
+        );
+        let lines = logs.lines_with(WITHHELD);
+        assert!(
+            lines.len() == 1 && lines[0].contains("100.65.2.77 on lo0"),
+            "the wave did decide to withhold, so the route was spared by design:\n{}",
+            logs.text()
+        );
+    }
+
+    /// #4117 — every utun of this daemon is ours, whatever number the kernel
+    /// gave it, so no org's utun withholds another org's block. Three utuns:
+    /// A on a `/21`; B on a `/22` nested inside A's block; C on A's very
+    /// block (the legacy case, where two orgs share one), which A already
+    /// routes. Each one's address sits inside a sibling's block.
+    #[tokio::test]
+    async fn no_utun_of_ours_withholds_a_siblings_block() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        const MASK_21: Ipv4Addr = Ipv4Addr::new(255, 255, 248, 0);
+        let (logs, guard) = Logs::start();
+        let a = SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_21, 1280).expect("utun A");
+        let b = SystemTun::up(Ipv4Addr::new(100, 65, 4, 9), MASK_22, 1280).expect("utun B");
+        let c = SystemTun::up(Ipv4Addr::new(100, 65, 0, 6), MASK_21, 1280).expect("utun C");
+        for tun in [&a, &b, &c] {
+            tun.defend_block_floor().await;
+        }
+        drop(guard);
+        let (ia, ib) = (a.if_name().to_string(), b.if_name().to_string());
+        assert!(
+            block_is_ours("100.65.0.0", 21, &ia),
+            "A's block stays on {ia}: {:?}",
+            block_route("100.65.0.0", 21)
+        );
+        assert!(
+            block_is_ours("100.65.4.0", 22, &ib),
+            "B's block, nested inside A's, stays on {ib}: {:?}",
+            block_route("100.65.4.0", 22)
+        );
+        assert!(
+            logs.lines_with(WITHHELD).is_empty(),
+            "no utun of ours withholds another's block:\n{}",
+            logs.text()
+        );
+        drop(c);
+        drop(b);
+        drop(a);
+    }
+
+    /// #4117 — a wave that finds the block's route as it should be writes
+    /// nothing, routed or withheld, so it cannot arm the next wave through
+    /// the route monitor (#1856). Watches the routing socket while waves run.
+    #[tokio::test]
+    async fn a_wave_that_finds_the_block_route_as_decided_writes_nothing() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            block_is_ours("100.65.0.0", 22, &iface),
+            "the bring-up routes the block on {iface}"
+        );
+        let writes = block_writes_during_three_waves(&tun, &iface, "100.65.0.253").await;
+        assert!(
+            writes.is_empty(),
+            "waves that find the block routed must not write the table:\n{}",
+            writes.join("\n---\n")
+        );
+
+        let _alias = LoAlias::add("100.65.2.77");
+        // The withhold itself is one write; the waves after it must be none.
+        tun.defend_block_floor().await;
+        let writes = block_writes_during_three_waves(&tun, &iface, "100.65.0.254").await;
+        assert!(
+            writes.is_empty(),
+            "waves that find the block withheld must not write the table:\n{}",
+            writes.join("\n---\n")
         );
     }
 

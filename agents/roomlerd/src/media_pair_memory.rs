@@ -424,6 +424,11 @@ impl Drop for ModelGuard {
             samples_under_plan = c.map_or(0, |c| c.under_plan),
             record_ended = c.is_some_and(|c| c.ended),
             frozen = self.frozen,
+            // FR-148 D46 B2 — of `samples_counted`, the delivery samples'
+            // push-backs: P1 (a standing queue) and P3 (backlogged under the
+            // in-flight budget, no still span in it).
+            samples_counted_p1 = c.map_or(0, |c| c.counted_p1.0),
+            samples_counted_p3 = c.map_or(0, |c| c.counted_p3.0),
             "{CLOSE_LINE}"
         );
     }
@@ -797,6 +802,8 @@ mod tests {
             counted: 0,
             counted_overproduced: 0,
             counted_clear: 0,
+            counted_p1: (0, 0),
+            counted_p3: (0, 0),
             ended: false,
             measured: true,
             at_unix: 1_795_000_000,
@@ -1409,7 +1416,7 @@ mod tests {
         "taken_why",
     ];
 
-    const CLOSE_FIELDS: [&str; 23] = [
+    const CLOSE_FIELDS: [&str; 25] = [
         "session_id",
         "key_id",
         "key_carrier",
@@ -1433,6 +1440,8 @@ mod tests {
         "samples_under_plan",
         "record_ended",
         "frozen",
+        "samples_counted_p1",
+        "samples_counted_p3",
     ];
 
     /// Both lines name their fields in this order, carry no address and no
@@ -1442,7 +1451,7 @@ mod tests {
     /// next session's open.
     #[test]
     fn the_two_lines_name_their_fields() {
-        use crate::encode::pipe::Basis;
+        use crate::encode::pipe::{Basis, PushedBy};
         let _env = crate::encode::RELAY_ENV_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -1554,6 +1563,39 @@ mod tests {
         );
         drop(p);
         lines.push(("the session after it", open, String::new()));
+
+        // 4. FR-148 D46 B2 — the delivery samples' push-backs under a 2 M
+        // delivery: two queued (P1), one from an `Overproduced` window, and
+        // one backlogged under the in-flight budget (P3), all counted and in
+        // the split; a window's push-back beside them is today's.
+        let mut p = pump(guard(EntryState::None, None), None);
+        let open = open_line(&mut p, t0);
+        let mut mem = pm::SessionMemory::default();
+        mem.open(None, now_unix, t0);
+        mem.delivered(2_000_000, Basis::AppLimited, at(4));
+        let (over, clear) = (
+            pm::Take::Sample(pm::Read::Overproduced),
+            pm::Take::Sample(pm::Read::Clear),
+        );
+        mem.sample_pushed_back_in(1_800_000, PushedBy::P1, over, at(8));
+        mem.sample_pushed_back_in(1_700_000, PushedBy::P1, clear, at(12));
+        mem.sample_pushed_back_in(1_750_000, PushedBy::P3, clear, at(16));
+        mem.pushed_back(1_600_000, Basis::Backlogged, pm::Read::Clear, at(20));
+        let c = mem.closing(at(24), now_unix);
+        assert_eq!((c.counted_p1, c.counted_p3), ((2, 1), (1, 1)));
+        p.model.as_mut().unwrap().take(c, true);
+        let close = logged(|| drop(p));
+        assert!(
+            close.contains(
+                " samples_counted=4 samples_counted_overproduced=1 samples_counted_clear=3 "
+            ),
+            "{close}"
+        );
+        assert!(
+            close.contains(" frozen=false samples_counted_p1=2 samples_counted_p3=1"),
+            "{close}"
+        );
+        lines.push(("the delivery samples' push-backs", open, close));
 
         for (what, open, close) in &lines {
             assert_in_order(open, &OPEN_FIELDS);
