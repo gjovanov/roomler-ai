@@ -47,6 +47,35 @@
 //! inside one of these window calls, on this thread, that our code did not
 //! choose, leaves with a code of its own, which launchd relaunches.
 //!
+//! ## The root daemon's questions, on a screen worker's panel (FR-149 P1)
+//!
+//! On a one-row Mac the screen worker (`run --supervised --unenrolled`) runs
+//! as the person, in the person's GUI session, where the window server serves
+//! it after a boot and after a log-out, when the root daemon's own panel
+//! cannot. The root daemon asks it over the delegation channel (`PanelAsk`,
+//! `indicator::session_panel`), and [`show_root_question`] answers: the
+//! worker's gate (its own account owns `/dev/console`, the panel shows no
+//! other question, a 24-hex id, time left), then ONE main-thread job that
+//! puts the panel up and reads its window number. Above 0 is `shown`; 0 or
+//! less takes the panel down again and is `not_up`. The question then sits in
+//! the one slot every question shares, so there is never a second panel, and
+//! a click on it goes out on the same `ConsentSender`: the signalling loop
+//! sends it on the person's app's road to the root half
+//! (`consent_relay::panel_clicked`), never to this process's own broker,
+//! which is not asking it. The root daemon takes it down (`PanelHide`,
+//! [`dismiss_root_question`]); so does the pump at its time's end, and the
+//! worker when its channel ends.
+//!
+//! ## The main loop's promise (FR-149 P1, C2)
+//!
+//! `main` starts the daemon's thread and then hands its own to AppKit, so the
+//! daemon could build its panel before [`run_main_loop`] pumped, and a panel
+//! refused then stayed refused for the process's life (P0's read on
+//! 0.4.228). `main` now promises the loop first ([`promise_main_loop`]): the
+//! promise builds the panel, and the loop's first pass opens it to questions
+//! (`panel_gate::MainLoop`). A question before that pass goes to the
+//! person's app; none after it does for that reason.
+//!
 //! ## The application delegate (#3164)
 //!
 //! Because this process is an `NSApplication`, macOS can ask it to quit with a
@@ -67,7 +96,7 @@
 
 #![cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -91,7 +120,8 @@ use objc2_foundation::{
 
 use super::console_watch::ConsoleWatch;
 use super::exit_net;
-use super::panel_gate::{Connection, PanelGate, Screen, Seat, reads_console_session};
+use super::panel_gate::{Connection, MainLoop, PanelGate, Screen, Seat, reads_console_session};
+use super::session_panel::{PanelQuestion, PanelState};
 use super::{ConsentSender, PromptView};
 use crate::macos_quit::{self, QuitReply};
 
@@ -113,6 +143,18 @@ struct Shared {
     dirty: bool,
     /// Where a click goes back. Set once, at construction.
     tx: Option<ConsentSender>,
+    /// FR-149 P1 — `prompt` is the root daemon's question, put up by
+    /// [`show_root_question`]: the pump takes it down at its time's end.
+    root: bool,
+}
+
+impl Shared {
+    /// The slot is empty again, whoever's question it held.
+    fn clear(&mut self) {
+        self.prompt = None;
+        self.root = false;
+        self.dirty = true;
+    }
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -120,10 +162,19 @@ fn shared() -> &'static Mutex<Shared> {
     SHARED.get_or_init(|| Mutex::new(Shared::default()))
 }
 
-/// Whether [`run_main_loop`] is actually pumping. Until it is, a prompt would
-/// be parked and never drawn — so `prompt` must report `false` and let the
-/// caller fall back to the companion.
-static PUMPING: AtomicBool = AtomicBool::new(false);
+/// Where [`run_main_loop`] stands: promised by `main`, then pumping. Until it
+/// pumps, a prompt would be parked and never drawn — so `prompt` must report
+/// `false` and let the caller fall back to the companion. FR-149 P1 (C2) —
+/// but a panel built after the promise is kept, and takes questions from the
+/// loop's first pass.
+static MAIN_LOOP: MainLoop = MainLoop::new();
+
+/// FR-149 P1 (C2) — `main` will hand the main thread to AppKit
+/// ([`run_main_loop`]). Called before it starts the daemon's thread, so a
+/// panel the daemon builds first is built for the loop to come.
+pub fn promise_main_loop() {
+    MAIN_LOOP.promise();
+}
 
 /// FR-97 P2d-2a — work that must run on the MAIN thread, handed to [`pump`]
 /// the way a prompt is: queued here, run on its next pass, its answer sent
@@ -139,7 +190,7 @@ fn main_jobs() -> &'static Mutex<Vec<MainJob>> {
 /// Whether [`on_main`] has a main thread to run on: [`run_main_loop`] is
 /// pumping in this process (not in a CLI call, nor in a test).
 pub fn main_loop_running() -> bool {
-    PUMPING.load(Ordering::SeqCst)
+    MAIN_LOOP.takes_a_question()
 }
 
 /// Run `f` on the main thread and wait up to `timeout` for its answer, which
@@ -171,8 +222,10 @@ impl Inner {
         // Only useful if `main` handed the main thread to AppKit. It does that
         // under this same feature, so a mismatch means someone changed one
         // half without the other — worth failing loudly rather than parking
-        // prompts nothing will draw.
-        if !PUMPING.load(Ordering::SeqCst) {
+        // prompts nothing will draw. FR-149 P1 (C2) — `main` promises the
+        // loop before it starts the daemon's thread, so a panel built before
+        // the loop pumps is kept, and takes questions from its first pass.
+        if !MAIN_LOOP.builds_a_panel() {
             return Err(anyhow!(
                 "the AppKit main loop is not running — `main` must call \
                  indicator::mac::run_main_loop() (FR-27 phase 3.4)"
@@ -181,6 +234,7 @@ impl Inner {
         shared().lock().unwrap().tx = Some(consent_tx);
         // #4053 — "available", or in its place one WARN: a panel the window
         // server refused when the pump started shows no question at all.
+        // Built before the pump started, the pump says it instead.
         if let Some(screen) = PANEL_SCREEN.get() {
             screen.gate.announce();
         }
@@ -188,7 +242,7 @@ impl Inner {
     }
 
     pub(super) fn prompt(&self, view: PromptView) -> bool {
-        if !PUMPING.load(Ordering::SeqCst) {
+        if !MAIN_LOOP.takes_a_question() {
             return false;
         }
         // #4053 — not where this process cannot reach the screen now: the
@@ -218,9 +272,164 @@ impl Inner {
         if s.prompt.as_ref().map(|p| p.session_hex.as_str()) != Some(session_hex) {
             return;
         }
-        s.prompt = None;
-        s.dirty = true;
+        s.clear();
     }
+}
+
+/// FR-149 P1 — how long the screen worker waits for the main thread to put a
+/// root daemon's question up: inside the root daemon's own wait
+/// (`session_panel::PANEL_WITHIN`, 500 ms), with the channel's two crossings
+/// to spare. The pump comes round every 120 ms at most.
+const SHOW_WITHIN: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// FR-149 P1 — the root daemon's question `id` on this screen worker's
+/// panel: the worker's gate ([`super::session_panel::worker_gate`]), then
+/// ONE main-thread job that puts the panel up and reads its window number.
+/// Above 0 is `shown`; 0 or less takes the panel down at once and is
+/// `not_up`. Answered within [`SHOW_WITHIN`] ([`put_up_within`]): a later
+/// panel would be a second surface beside the app's, since the answer said
+/// `not_up` (`main_thread_late`). Blocking: the caller runs it on the
+/// blocking pool.
+pub(crate) fn show_root_question(id: &str, question: &PanelQuestion) -> PanelState {
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let own = unsafe { libc::geteuid() };
+    let free = shared().lock().unwrap().prompt.is_none();
+    if let Err(state) = super::session_panel::worker_gate(
+        own,
+        super::session_panel::console_owner(),
+        free,
+        id,
+        std::time::Duration::from_millis(question.left_ms),
+    ) {
+        return state;
+    }
+    if !MAIN_LOOP.takes_a_question() {
+        return PanelState::NotUp {
+            why: "no_main_loop".into(),
+        };
+    }
+    let view = question.view(id, Instant::now());
+    put_up_within(SHOW_WITHIN, view).unwrap_or_else(|| PanelState::NotUp {
+        why: "main_thread_late".into(),
+    })
+}
+
+/// FR-149 P1 — on the main thread: the root daemon's question into the one
+/// slot, and its panel up, when the slot is still free.
+fn put_up(mtm: MainThreadMarker, view: PromptView) -> PanelState {
+    let mut s = shared().lock().unwrap();
+    if s.prompt.is_some() {
+        return PanelState::Busy;
+    }
+    let _inside = exit_net::inside("the panel's window");
+    let panel = match Panel::new(mtm, &view) {
+        Ok(panel) => panel,
+        Err(e) => {
+            return PanelState::NotUp {
+                why: format!("no_panel: {e:#}"),
+            };
+        }
+    };
+    let number = panel.window.windowNumber();
+    if number <= 0 {
+        // Dropping it closes the window.
+        drop(panel);
+        return PanelState::NotUp {
+            why: format!("no_window_device: window number {number}"),
+        };
+    }
+    PANEL.with_borrow_mut(|p| *p = Some(panel));
+    s.prompt = Some(view);
+    s.root = true;
+    s.dirty = false;
+    PanelState::Shown
+}
+
+/// FR-149 P1 — whether this process's panel holds a question now. On a
+/// one-row Mac's root daemon the session panel is then not asked: at most
+/// one panel on the screen (`session_panel::chain`).
+pub(crate) fn shows_a_question() -> bool {
+    shared().lock().unwrap().prompt.is_some()
+}
+
+/// FR-149 P1 — take the root daemon's question down: `id`'s (`PanelHide`),
+/// or whichever is up (`None`, when the channel ends). This process's own
+/// questions stay.
+pub(crate) fn dismiss_root_question(id: Option<&str>) {
+    let mut s = shared().lock().unwrap();
+    let held = s.prompt.as_ref().map(|p| p.session_hex.as_str());
+    if s.root && (id.is_none() || held == id) {
+        s.clear();
+    }
+}
+
+/// [`put_up`] on the main thread ([`on_main`]'s queue), answered within
+/// `timeout` at most, and always what the screen holds. A job the main thread
+/// has not begun when the caller stops waiting never runs; one it is running
+/// then takes its panel down again at its end, since the caller's answer is
+/// `not_up`. `None` when no answer came in time, or with no pumping main loop.
+fn put_up_within(timeout: std::time::Duration, view: PromptView) -> Option<PanelState> {
+    use std::sync::atomic::AtomicU8;
+    const WAITING: u8 = 0;
+    const BEGUN: u8 = 1;
+    const DONE: u8 = 2;
+    const GIVEN_UP: u8 = 3;
+    if !main_loop_running() || MainThreadMarker::new().is_some() {
+        return None;
+    }
+    let claim = std::sync::Arc::new(AtomicU8::new(WAITING));
+    let theirs = claim.clone();
+    let id = view.session_hex.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    main_jobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Box::new(move |mtm| {
+            if theirs
+                .compare_exchange(WAITING, BEGUN, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+            let state = put_up(mtm, view);
+            if theirs
+                .compare_exchange(BEGUN, DONE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let _ = tx.send(state);
+            } else if state == PanelState::Shown {
+                // The caller stopped waiting while the panel went up, and
+                // answered `not_up`: a panel the root daemon did not count
+                // never stays.
+                dismiss_root_question(Some(&id));
+                PANEL.with_borrow_mut(|panel| *panel = None);
+            }
+        }));
+    match rx.recv_timeout(timeout) {
+        Ok(state) => Some(state),
+        Err(_) => {
+            let given_up = claim
+                .compare_exchange(WAITING, GIVEN_UP, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+                || claim
+                    .compare_exchange(BEGUN, GIVEN_UP, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+            if given_up {
+                None
+            } else {
+                // Done just as the wait ran out: the job sends its answer in
+                // its next step, with nothing between that could wait.
+                rx.recv().ok()
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The panel on screen. The main thread's alone: [`pump`] and the jobs
+    /// it runs ([`put_up`], [`put_up_within`]'s) are the only ones that touch
+    /// it.
+    static PANEL: std::cell::RefCell<Option<Panel>> = const { std::cell::RefCell::new(None) };
 }
 
 define_class!(
@@ -433,14 +642,18 @@ pub fn run_main_loop() -> ! {
 
     // #4053 — the panel's first reads, after `finishLaunching` and never
     // before it: whether the window server serves this process, and the
-    // console session it serves. Made before PUMPING is set, so a panel that
+    // console session it serves. Made before the loop pumps, so a panel that
     // finds the loop pumping finds them.
-    let _ = PANEL_SCREEN.set(PanelScreen::at_start(mtm));
-    PUMPING.store(true, Ordering::SeqCst);
+    let screen = PANEL_SCREEN.get_or_init(|| PanelScreen::at_start(mtm));
+    MAIN_LOOP.pumps();
+    // FR-149 P1 (C2) — a panel built on `main`'s promise, before these reads,
+    // could not say what they found: it is said now, once.
+    if shared().lock().unwrap().tx.is_some() {
+        screen.gate.announce();
+    }
 
-    let mut panel: Option<Panel> = None;
     loop {
-        pump(mtm, &mut panel);
+        pump(mtm);
         // #4119 — the event fetch and its dispatch, where AppKit runs what it
         // queued (the delegate's answer to a quit included): the net's.
         let _inside = exit_net::inside("the event fetch and dispatch");
@@ -459,7 +672,7 @@ pub fn run_main_loop() -> ! {
 }
 
 /// One AppKit-side step. MAIN THREAD ONLY (the `MainThreadMarker` proves it).
-fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
+fn pump(mtm: MainThreadMarker) {
     // FR-97 P2d-2a — queued main-thread work ([`on_main`]) first. A job that
     // panics is contained: this thread is AppKit's for the daemon's whole life.
     let jobs = std::mem::take(&mut *main_jobs().lock().unwrap_or_else(|e| e.into_inner()));
@@ -468,12 +681,26 @@ fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
             tracing::warn!("indicator: a main-thread job panicked");
         }
     }
+    PANEL.with_borrow_mut(|panel| step_the_panel(mtm, panel));
+}
 
+/// The panel's part of [`pump`]: made, refreshed, read for a click, and
+/// closed. MAIN THREAD ONLY.
+fn step_the_panel(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
     // #4119 — from here on, the panel's own window: made, refreshed, read for
     // a click, and closed. The net's (`exit_net`).
     let _inside = exit_net::inside("the panel's window");
     let (view, dirty) = {
         let mut s = shared().lock().unwrap();
+        // FR-149 P1 — the root daemon's question comes down at its time's
+        // end, whatever became of its `PanelHide`.
+        if s.root
+            && s.prompt
+                .as_ref()
+                .is_some_and(|v| Instant::now() >= v.expires_at)
+        {
+            s.clear();
+        }
         let d = std::mem::take(&mut s.dirty);
         (s.prompt.clone(), d)
     };
@@ -485,8 +712,9 @@ fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
     {
         let session = {
             let mut s = shared().lock().unwrap();
-            s.dirty = true;
-            s.prompt.take().map(|v| v.session_hex)
+            let session = s.prompt.take().map(|v| v.session_hex);
+            s.clear();
+            session
         };
         if let Some(session) = session {
             // Report, never resolve: the broker is the single decision point.
@@ -497,6 +725,14 @@ fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
         }
     }
 
+    // FR-149 P1 — a panel left from another question (taken down, and the
+    // slot filled again, between two passes) is never reused for this one:
+    // its text is the other question's.
+    if let (Some(v), Some(p)) = (&view, panel.as_ref())
+        && p.shows != v.session_hex
+    {
+        panel.take();
+    }
     match (&view, panel.is_some()) {
         (Some(v), false) => match Panel::new(mtm, v) {
             Ok(p) => *panel = Some(p),
@@ -524,6 +760,9 @@ struct Panel {
     approve: Retained<NSButton>,
     deny: Retained<NSButton>,
     secs_shown: std::cell::Cell<u64>,
+    /// FR-149 P1 — the question it shows, by id: a panel is never refreshed
+    /// for another one.
+    shows: String,
 }
 
 impl Panel {
@@ -690,6 +929,7 @@ impl Panel {
                 approve,
                 deny,
                 secs_shown: std::cell::Cell::new(u64::MAX),
+                shows: v.session_hex.clone(),
             };
             p.tick_countdown(v);
             Ok(p)
@@ -829,8 +1069,8 @@ struct PanelScreen {
     console: Option<ConsoleWatch>,
 }
 
-/// Made on the main thread after `finishLaunching`, before [`PUMPING`] is
-/// set ([`run_main_loop`]).
+/// Made on the main thread after `finishLaunching`, before the loop pumps
+/// ([`run_main_loop`]).
 static PANEL_SCREEN: OnceLock<PanelScreen> = OnceLock::new();
 
 impl PanelScreen {

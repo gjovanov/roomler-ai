@@ -659,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:4996`](../agents/roomlerd/src/companion.rs#L4996)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2196`](../agents/roomlerd/src/companion.rs#L2196)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:5012`](../agents/roomlerd/src/companion.rs#L5012)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2200`](../agents/roomlerd/src/companion.rs#L2200)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -1215,7 +1215,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3084`](../agents/roomlerd/src/ssh.rs#L3084)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3116-3125`), so a skewed clock stays visible |
+| the device | `record_grant` ([`ssh.rs:3093`](../agents/roomlerd/src/ssh.rs#L3093)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3125-3134`), so a skewed clock stays visible |
 | the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
@@ -1248,7 +1248,7 @@ server's. These bounds hold whatever the device's clock says:
    `agents/roomlerd/src/signaling.rs:66`, checked at `:2393`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:3031`), and no window longer than 60 s from
+   (`agents/roomlerd/src/ssh.rs:3040`), and no window longer than 60 s from
    arrival.
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
@@ -1320,7 +1320,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4298`](../agents/roomlerd/src/signaling.rs#L4298), [`:5849`](../agents/roomlerd/src/signaling.rs#L5849)), as the recording question does
+first the same way ([`signaling.rs:4326`](../agents/roomlerd/src/signaling.rs#L4326), [`:5881`](../agents/roomlerd/src/signaling.rs#L5881)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -1333,7 +1333,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2338`](../agents/roomlerd/src/ssh.rs#L2338)), and the answer's line carries the grant ([`:2537`](../agents/roomlerd/src/ssh.rs#L2537)), so a
+question's id ([`ssh.rs:2338`](../agents/roomlerd/src/ssh.rs#L2338)), and the answer's line carries the grant ([`:2546`](../agents/roomlerd/src/ssh.rs#L2546)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same

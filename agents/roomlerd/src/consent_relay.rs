@@ -25,6 +25,8 @@
 //! | the root daemon | counts the app as a question's surface only while that road is open ([`reach`]): an attached worker that said [`RELAY_CONSENT`], and the person socket of that worker's account answering within [`RELAY_WITHIN`] |
 //! | #3967 — a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) | lists and decides as the worker does; says `consent_relaying` over the root half's person socket for its person and holds that connection (`keep_telling`) |
 //! | #3967 — a two-row Mac's root half | takes that announcement from the socket's own person, for as long as its connection stays open ([`Announcements`]), and counts the app only while one is live and that person's socket answers within [`RELAY_WITHIN`] ([`reach_two_rows`]) |
+//! | FR-149 P1 — a one-row Mac's worker, its panel | shows the root daemon's questions on the person's own panel when the root daemon asks it (`indicator::session_panel`); a click on one its own broker is not asking takes the app's road ([`panel_clicked`], registered by [`register_panel_road`]): `consent_decide_view`, to the root half, within [`DECIDE_WITHIN`]. Its word on the panel (`shown`) routes a question and never decides one |
+//! | FR-149 P1 — a one-row Mac's root daemon, asking | asks its worker's panel first ([`one_row_host`]), and the app gets a question that panel did not show, as before |
 //!
 //! Nothing is written anywhere: the question crosses the root's person socket
 //! (`/var/run/roomler-person/<uid>.sock`), which serves only the person at the
@@ -462,6 +464,71 @@ pub fn register(host: &crate::delegate::DelegateHost) {
 /// Whether this process is a one-row Mac's root daemon ([`register`]).
 pub fn one_row() -> bool {
     ONE_ROW_HOST.get().is_some()
+}
+
+/// FR-149 P1 — that host, on a one-row Mac's root daemon: its worker shows
+/// the daemon's questions on the person's own panel
+/// (`indicator::session_panel::TheRoad`).
+pub fn one_row_host() -> Option<&'static crate::delegate::DelegateHost> {
+    ONE_ROW_HOST.get()
+}
+
+/// FR-149 P1 — the road an answer on this process's panel takes to a
+/// question its own broker is not asking: the LocalAPI state the person's
+/// app reaches (`localapi_state::DaemonState`), whose `consent_decide_view`
+/// sends it to the root half ([`decided`]). Registered by a one-row Mac's
+/// screen worker (`run --supervised --unenrolled`) only, so every other
+/// daemon's panel answers as before.
+static PANEL_ROAD: OnceLock<std::sync::Arc<dyn tunnel_core::localapi::LocalApiState>> =
+    OnceLock::new();
+
+/// Register `state` as [`PANEL_ROAD`]: this process is a one-row Mac's screen
+/// worker, whose panel shows the root daemon's questions. Once.
+pub fn register_panel_road(state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState>) {
+    let _ = PANEL_ROAD.set(state);
+}
+
+/// FR-149 P1 — the road for an answer to question `session_id` on this
+/// process's panel: `None` when `own` asks it (or on a daemon that registered
+/// no road), which decides it as before FR-149.
+pub fn panel_road(
+    own: &crate::consent::ConsentBroker,
+    session_id: &str,
+) -> Option<std::sync::Arc<dyn tunnel_core::localapi::LocalApiState>> {
+    if own.is_asking(session_id) {
+        return None;
+    }
+    PANEL_ROAD.get().cloned()
+}
+
+/// FR-149 P1 (D3) — an answer given on this process's panel. A question its
+/// own broker asks is decided there, as before. Any other goes by `road`, the
+/// way the person's app answers it (`consent_decide_view`): on a one-row Mac's
+/// worker, to the root half, whose person socket asks the seat again before
+/// its broker takes it, within [`DECIDE_WITHIN`]. No new verb decides
+/// anything: the panel's click is the app's answer, and passes the same
+/// gates. Whether it was taken; a refusal is logged here.
+pub async fn panel_clicked(
+    own: &crate::consent::ConsentBroker,
+    road: Option<&dyn tunnel_core::localapi::LocalApiState>,
+    session_id: &str,
+    allow: bool,
+) -> bool {
+    let Some(road) = road.filter(|_| !own.is_asking(session_id)) else {
+        return own.record_decision(session_id, allow);
+    };
+    match road.consent_decide_view(session_id, allow).await {
+        Response::ConsentDecided { ok: true } => true,
+        refused => {
+            tracing::warn!(
+                session = %session_id,
+                allow,
+                ?refused,
+                "consent panel: the answer on this panel was not taken (FR-149)"
+            );
+            false
+        }
+    }
 }
 
 /// The road a question this daemon asks takes to the menu-bar app: a one-row

@@ -2470,7 +2470,11 @@ mod sshd {
             org: String::new(),
             expires_at: std::time::Instant::now() + timeout,
         };
-        let native = indicator.show_prompt(view.clone());
+        // FR-149 P1 — on a one-row Mac's root daemon the screen worker's
+        // panel first, `PANEL_WITHIN` at most (`companion::COMPANION_START_BUDGET`'s
+        // assertion counts it).
+        let on_screen = indicator.show_prompt(view.clone()).await;
+        let native = on_screen.native;
         let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Ssh,
             asked_by: caller,
@@ -2524,7 +2528,12 @@ mod sshd {
             have_surface = (companion_up && marker) || notified;
             why_not = tray.why_not_shown(marker);
         }
-        info!(?caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
+        info!(
+            ?caller, %sentinel, native, panel = on_screen.panel(),
+            session_panel = on_screen.session_panel(), why = on_screen.why(), notified,
+            have_surface,
+            "consent prompt surface (ssh)"
+        );
 
         let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from

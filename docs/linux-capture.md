@@ -531,7 +531,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7063`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:7099`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2687`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -559,7 +559,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3589`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3593`,
 `virtual_desktop.rs:1971`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -736,7 +736,7 @@ takes anything down (§2.4). A `SIGTERM` listener made when the desktop starts
 would answer at once, but tokio installs the process's handler for good at
 the first listener, and one made then would come before the run loop's own:
 a `SIGTERM` landing between the two would be swallowed, and the daemon would
-run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3672`) is the daemon's
+run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3676`) is the daemon's
 only one (`STOP_GRACE`'s comment, `agents/roomlerd/src/virtual_desktop.rs:1010-1016`).
 
 **Xorg's directory is made, never adopted** (`private_dir` `:2695`). It
@@ -844,7 +844,7 @@ manager or an app that exited by itself stayed a zombie under the daemon, which
 waits for one pid at a time.
 
 So the daemon starts its own binary once per desktop as `roomlerd vd-keeper`.
-`main` answers that argument before anything else (`app.rs:1379`,
+`main` answers that argument before anything else (`app.rs:1383`,
 `answer_keeper` `virtual_desktop.rs:59`), so the desktop's keeper builds no
 runtime, reads no config, opens no log and takes no lock. It runs in the
 desktop's process group as a child subreaper, and it is the parent of the
@@ -2137,7 +2137,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7060`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7074`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2384,10 +2384,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:4874`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:4890`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:8993`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4927-4930`),
+most (`graphical_session_within`, `companion.rs:9009`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4943-4946`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2952,7 +2952,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4578-4596`, `watchdog.rs:628`) and it forced
+watchdog's 90 s window (`app.rs:4582-4600`, `watchdog.rs:628`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

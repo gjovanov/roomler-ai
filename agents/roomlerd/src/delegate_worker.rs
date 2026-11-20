@@ -410,6 +410,8 @@ async fn attach_once(
     // change re-sends them (the arm below). Subscribed BEFORE the first
     // announcement, so a change in between is never missed.
     let mut gates = watch_gates();
+    let hosts_panel = crate::indicator::session_panel::hosts_the_panel(person.is_some());
+    let panel_says = crate::indicator::session_panel::WorkerSays::default();
     {
         let caps = own_caps();
         tracing::info!(
@@ -424,12 +426,16 @@ async fn attach_once(
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
                 // #3864 — a worker with no enrollment relays the root half's
-                // consent questions to its person's app.
-                features: crate::delegate::worker_features(person.is_some()),
+                // consent questions to its person's app. FR-149 P1 — and,
+                // with the macOS panel and the switch on, shows them.
+                features: crate::delegate::worker_features(person.is_some(), hosts_panel),
             },
         )
         .await?;
     }
+    // FR-149 P1 — the root daemon's questions on this panel come down with
+    // the channel, however it ends.
+    let _panel = TakeDownAtTheEnd(hosts_panel);
     // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
     // their row and its broker are gone, so the daemon's `Request` arm is the
     // only consent there is. Subscribed BEFORE the first frame, so a change in
@@ -539,12 +545,32 @@ async fn attach_once(
                             )
                             .await?;
                         }
+                        // FR-149 P1 — the root daemon asks this panel to show
+                        // its question. Answered inline: the panel's one
+                        // main-thread job is a pump tick or two, inside the
+                        // root daemon's `PANEL_WITHIN`. A worker that does not
+                        // host the panel was never asked, and says `not_up`.
+                        Ok(WorkerLane::Here(DelegateFrame::PanelAsk { id, question })) => {
+                            let state = if hosts_panel {
+                                crate::indicator::session_panel::answer(id.clone(), question).await
+                            } else {
+                                crate::indicator::session_panel::PanelState::NotUp {
+                                    why: "not_hosting".into(),
+                                }
+                            };
+                            panel_says.told(&state);
+                            write_frame(&mut wr, &DelegateFrame::PanelTold { id, state }).await?;
+                        }
+                        Ok(WorkerLane::Here(DelegateFrame::PanelHide { id })) => {
+                            crate::indicator::session_panel::take_down(Some(&id));
+                        }
                         Ok(WorkerLane::Here(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
                             | DelegateFrame::KeepBusyTold { .. }
                             | DelegateFrame::WorkerLogs { .. }
-                            | DelegateFrame::PersonFloor(..),
+                            | DelegateFrame::PersonFloor(..)
+                            | DelegateFrame::PanelTold { .. },
                         )) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -608,7 +634,7 @@ async fn attach_once(
                         caps: Box::new(caps),
                         // #3864 — the same words as the first frame: the
                         // daemon keeps the words of the newest frame only.
-                        features: crate::delegate::worker_features(person.is_some()),
+                        features: crate::delegate::worker_features(person.is_some(), hosts_panel),
                     },
                 )
                 .await?;
@@ -627,6 +653,18 @@ async fn attach_once(
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// FR-149 P1 — the root daemon's question on this worker's panel comes down
+/// when the attach ends, however it ends (a closed channel, an error, a stop).
+struct TakeDownAtTheEnd(bool);
+
+impl Drop for TakeDownAtTheEnd {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::indicator::session_panel::take_down(None);
         }
     }
 }

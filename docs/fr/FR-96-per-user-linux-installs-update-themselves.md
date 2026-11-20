@@ -82,7 +82,7 @@ sequenceDiagram
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3527-3534` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3028`, `LINUX_UPDATE_TRIGGER` `:3033`, `queue_update_check` / `queue_update_check_at` `:3248-3267` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1995-2010`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1999-2014`) |
 | `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:1058-1060`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2115-2125`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
@@ -149,7 +149,7 @@ A host without the helper (an install from before this FR) keeps today's path un
 ### 3.3 Onto the new binary (P2b, as built)
 
 The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
-(`app.rs:5637-5644`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`app.rs:5651-5658`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
 (`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
 hand install alike, and the helper never speaks to a daemon.
 
@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:2937-2947`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:2946-2956`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon
@@ -216,7 +216,7 @@ at `:452` and `:461-469`):
   served by the server and ships with a promote, while the daemon ships with an agent release, and the two need not
   arrive in order. A word is never renamed or removed: `the_capabilities_are_the_words_install_sh_matches` pins
   the pair.
-- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1490-1500`, `updater.rs:4165-4193`),
+- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1494-1504`, `updater.rs:4165-4193`),
   and only its exact form (`only_the_exact_capabilities_query_is_answered_before_parsing`). It was a clap flag at
   first, a `--capabilities` field on `Command::UpdateHelper`, and CI's Windows recorder lane (FR-85) went red: the
   debug binary died before printing a line, twice on the same commit, while the parent PR passed on the same base.
@@ -243,7 +243,7 @@ at `:452` and `:461-469`):
   as a real install leaves it). It failed that row and restarted onto a binary that cannot run on the first cut,
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
-  of failing (`app.rs:6346-6362`). It asks the daemon's own decision, `helper_owns_updates`
+  of failing (`app.rs:6360-6376`). It asks the daemon's own decision, `helper_owns_updates`
   (`updater.rs:4207-4215`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off
