@@ -5774,6 +5774,755 @@ mod supervise_tests {
     }
 
     // -----------------------------------------------------------------------
+    // #4099: a window manager that exits while its X server runs is started
+    // again by the keeper, through the function that started it, with the X
+    // server's backoff; never in a teardown, and never onto a server that is
+    // gone. Stand-ins only: no X server, displays `:490`-`:498`, never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// One start of a window manager stand-in, as its first line wrote it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WmStart {
+        pid: i32,
+        /// Who started it: the keeper, on the keeper's path.
+        parent: i32,
+        /// When it ran, in nanoseconds since the epoch (`date +%s%N`).
+        at_ns: i128,
+    }
+
+    /// A window manager stand-in's first line: each start appends
+    /// `$$ $PPID <now>` to `<dir>/wm.pids`, in one short write.
+    fn wm_started(dir: &Path) -> String {
+        format!(
+            "echo \"$$ $PPID $(date +%s%N)\" >> \"{}/wm.pids\"",
+            dir.display()
+        )
+    }
+
+    /// The whole lines of `<dir>/<name>` so far, each split at its blanks: a
+    /// line still being written is not read in half.
+    fn whole_lines(dir: &Path, name: &str) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let whole = text.rfind('\n').map_or("", |end| &text[..end]);
+        whole
+            .lines()
+            .map(|l| l.split_whitespace().map(String::from).collect())
+            .collect()
+    }
+
+    /// The window manager's starts so far, in order.
+    fn wm_starts(dir: &Path) -> Vec<WmStart> {
+        whole_lines(dir, "wm.pids")
+            .iter()
+            .filter_map(|f| {
+                Some(WmStart {
+                    pid: f.first()?.parse().ok()?,
+                    parent: f.get(1)?.parse().ok()?,
+                    at_ns: f.get(2)?.parse().ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The window manager's first start, once it has run its first line.
+    fn first_start(dir: &Path) -> WmStart {
+        let mut first = None;
+        wait_for("the window manager's first start", || {
+            first = wm_starts(dir).first().copied();
+            first.is_some()
+        });
+        first.unwrap()
+    }
+
+    /// Now, on the clock `date +%s%N` reads.
+    fn wall_ns() -> i128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos() as i128
+    }
+
+    /// From `from` to `to`, both in nanoseconds since the epoch; zero when
+    /// `to` came first.
+    fn gap(from: i128, to: i128) -> Duration {
+        Duration::from_nanos(u64::try_from(to - from).unwrap_or(0))
+    }
+
+    /// `look` every 10 ms until it finds something, for at most `within`:
+    /// a RED ends here in its own words, never in [`wait_for`]'s 20 s panic.
+    fn poll_for<T>(within: Duration, mut look: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(found) = look() {
+                return Some(found);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// [`desktop_keeping_lines`] on `base`, with the window manager's restart
+    /// numbers set (its delays' floor and ceiling, and how long it must run
+    /// for its exit to start them over), and `wm_body` after the window
+    /// manager's first line ([`wm_started`]).
+    fn desktop_restarting_wm(
+        dir: &Path,
+        display: &str,
+        wm_body: &str,
+        [floor, ceil, stable]: [Duration; 3],
+        base: Plan,
+    ) -> (Arc<Desktop>, i32, KeeperLines) {
+        let lines = KeeperLines::default();
+        let wm = script(dir, "wm", &format!("{}\n{wm_body}", wm_started(dir)));
+        let (desk, x_pid) = desktop_planned(
+            display,
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm,
+                    startup: vec![],
+                },
+                wm_delay_floor: floor,
+                wm_delay_ceil: ceil,
+                wm_stable_after: stable,
+                keeper_lines: Some(lines.clone()),
+                ..base
+            },
+        );
+        (desk, x_pid, lines)
+    }
+
+    /// The supervisor of `desk` on a thread of its own, handed the server and
+    /// the keeper as `bring_up` hands them.
+    fn supervised(desk: &Arc<Desktop>, x_pid: i32, keeper: i32) -> std::thread::JoinHandle<()> {
+        let desk = desk.clone();
+        std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+    }
+
+    /// The daemon's stop, and its supervisor gone.
+    fn stopped(desk: &Desktop, supervisor: std::thread::JoinHandle<()>) {
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+    }
+
+    /// The process of start `s` once its script has exec'd its `sleep`, as
+    /// `/proc` describes it: what every later look and signal checks against.
+    fn wm_proc(s: &WmStart) -> ProcInfo {
+        let mut info = None;
+        wait_for("the window manager to exec its sleep", || {
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", s.pid)).unwrap_or_default();
+            info = read_proc_stat(s.pid).filter(|_| comm.trim() == "sleep");
+            info.is_some()
+        });
+        info.unwrap()
+    }
+
+    /// Signal the process this test recorded, while `/proc` still shows it.
+    fn signal_recorded(info: &ProcInfo, sig: i32) {
+        if RealProcs.same_process_now(info) {
+            RealProcs.signal(info.pid, sig);
+        }
+    }
+
+    /// The keeper's warnings about the window manager so far.
+    fn wm_warnings(lines: &KeeperLines) -> Vec<String> {
+        keeper_warnings(lines, "")
+            .0
+            .into_iter()
+            .filter(|l| l.contains("the window manager"))
+            .collect()
+    }
+
+    /// #4099, box 1 — a window manager that exits while its X server runs is
+    /// started again by the keeper, no sooner than its delay's floor after
+    /// the exit and within a second of it, with what the first one got from
+    /// the keeper: its parent, display, environment, descriptors and signals.
+    /// Nothing else moves: the server and the keeper run on, the desktop
+    /// stays up and is not started again, and the new one is the only one.
+    #[test]
+    fn a_window_manager_that_exits_while_its_server_runs_is_started_again() {
+        let dir = scratch("wm-again");
+        let floor = Duration::from_millis(200);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":490",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first = first_start(&dir);
+        let first_wm = wm_proc(&first);
+        let first_seen = seen_of(&first_wm, x_pid);
+        // Taken before the signal, so that the exit cannot come before it.
+        let signalled = wall_ns();
+        signal_recorded(&first_wm, libc::SIGTERM);
+        let again = poll_for(Duration::from_secs(5), || wm_starts(&dir).get(1).copied());
+        let again_seen = again.map(|s| seen_of(&wm_proc(&s), x_pid));
+        // Two floors more: a start the keeper wrongly kept due comes by then.
+        std::thread::sleep(2 * floor);
+        let starts = wm_starts(&dir);
+        let server_ran = is_running(x_pid);
+        let keeper_ran = is_running(keeper);
+        let up = desk.state().up;
+        let desktop_starts = runs(&dir).len();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let again =
+            again.expect("the window manager was started once in 5 s after its exit (#4099)");
+        let after = gap(signalled, again.at_ns);
+        assert!(
+            after >= floor,
+            "started again {after:?} after the signal, sooner than its floor of {floor:?}"
+        );
+        assert!(
+            after <= floor + Duration::from_secs(1),
+            "started again only {after:?} after the signal"
+        );
+        assert_eq!(
+            first.parent, keeper,
+            "the first window manager is not the keeper's"
+        );
+        assert_eq!(
+            again.parent, keeper,
+            "the window manager was started again by another: {again:?}"
+        );
+        assert!(
+            first_seen.environ.iter().any(|v| v == "DISPLAY=:490"),
+            "{first_seen:#?}"
+        );
+        assert_eq!(
+            again_seen.as_ref(),
+            Some(&first_seen),
+            "the window manager started again did not get what the first one got"
+        );
+        assert_eq!(starts.len(), 2, "the window manager's starts: {starts:?}");
+        assert!(server_ran, "the X server stopped with its window manager");
+        assert!(keeper_ran, "the keeper left with the window manager");
+        assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
+        assert_eq!(desktop_starts, 0, "the desktop was started again");
+    }
+
+    /// #4099, box 2 — a window manager that exits at once, every time, is
+    /// started again after each exit, each delay twice the one before, from
+    /// the floor up to the ceiling, where it stays: never sooner than its
+    /// delay, never much later than the ceiling, and each exit said in one
+    /// line, with the window manager's pid and the delay it was given.
+    #[test]
+    fn repeated_window_manager_exits_back_off_to_the_ceiling() {
+        let dir = scratch("wm-backoff");
+        let (floor, ceil) = (Duration::from_millis(100), Duration::from_millis(400));
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":491",
+            "exit 0",
+            [floor, ceil, Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        std::thread::sleep(Duration::from_secs(3));
+        let starts = wm_starts(&dir);
+        let said = wm_warnings(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            starts.len() >= 2,
+            "the window manager was started {} time(s) in 3 s, and it exits at once (#4099)",
+            starts.len()
+        );
+        assert!(
+            starts.iter().all(|s| s.parent == keeper),
+            "a start that is not the keeper's ({keeper}): {starts:?}"
+        );
+        // 0.1 + 0.2 + 0.4 s: the fourth start, the first at the ceiling, is
+        // due 0.7 s after the first.
+        assert!(
+            (4..=12).contains(&starts.len()),
+            "{} starts in 3 s, with delays from {floor:?} doubling to {ceil:?}: {starts:?}",
+            starts.len()
+        );
+        let mut delay = floor;
+        for pair in starts.windows(2) {
+            let took = gap(pair[0].at_ns, pair[1].at_ns);
+            assert!(
+                took + Duration::from_millis(20) >= delay,
+                "started again {took:?} after the start before, sooner than its delay of {delay:?}: {starts:?}"
+            );
+            assert!(
+                took <= ceil + Duration::from_secs(1),
+                "started again only {took:?} after the start before: {starts:?}"
+            );
+            delay = (delay * 2).min(ceil);
+        }
+        assert!(
+            said.len() <= starts.len(),
+            "more lines than attempts: {said:?}"
+        );
+        let mut delay = floor;
+        for (line, start) in said.iter().zip(&starts) {
+            assert!(
+                line.contains(&format!("the window manager ({}) exited: ", start.pid)),
+                "the line does not name the window manager's pid {}: {line}",
+                start.pid
+            );
+            assert!(
+                line.contains(&format!(" — it is started again {delay:?} after its exit")),
+                "the line does not name its delay of {delay:?}: {line}"
+            );
+            delay = (delay * 2).min(ceil);
+        }
+    }
+
+    /// #4099, box 2 — a window manager that ran as long as the X server must
+    /// for its exit to start the delays over gets the floor again: after
+    /// three exits at once (0.1, 0.2, 0.4 s), a run of 1.5 s, past a stable
+    /// time of 1 s, is started again after 0.1 s, not 0.8 s.
+    #[test]
+    fn a_window_manager_that_stays_up_resets_the_backoff() {
+        let dir = scratch("wm-reset");
+        let d = dir.display();
+        let floor = Duration::from_millis(100);
+        // Its own run's number (the first line counted it); the fourth run
+        // lives 1.5 s, the fifth stays up, and each exit is stamped.
+        let wm_body = format!(
+            "n=$(wc -l < \"{d}/wm.pids\")\n\
+             if [ \"$n\" -ge 5 ]; then exec sleep 300; fi\n\
+             if [ \"$n\" -eq 4 ]; then sleep 1.5; fi\n\
+             echo \"$$ $(date +%s%N)\" >> \"{d}/wm.exits\""
+        );
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":492",
+            &wm_body,
+            [floor, Duration::from_millis(1600), Duration::from_secs(1)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let fifth = poll_for(Duration::from_secs(6), || wm_starts(&dir).get(4).copied());
+        let starts = wm_starts(&dir);
+        let exits: Vec<(i32, i128)> = whole_lines(&dir, "wm.exits")
+            .iter()
+            .filter_map(|f| Some((f.first()?.parse().ok()?, f.get(1)?.parse().ok()?)))
+            .collect();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            starts.len() >= 2,
+            "the window manager was not started again after its first exit: no second start in 6 s (#4099)"
+        );
+        let fifth = fifth.unwrap_or_else(|| panic!("{} starts in 6 s: {starts:?}", starts.len()));
+        assert!(exits.len() >= 4, "the exits: {exits:?}");
+        for ((pid, _), start) in exits.iter().zip(&starts) {
+            assert_eq!(
+                *pid, start.pid,
+                "the exits {exits:?}, the starts {starts:?}"
+            );
+        }
+        let mut delay = floor;
+        for ((_, exited), start) in exits.iter().zip(starts.iter().skip(1)).take(3) {
+            let took = gap(*exited, start.at_ns);
+            assert!(
+                took + Duration::from_millis(20) >= delay,
+                "started again {took:?} after an exit, sooner than its delay of {delay:?}"
+            );
+            delay *= 2;
+        }
+        let ran = gap(starts[3].at_ns, exits[3].1);
+        assert!(
+            ran >= Duration::from_secs(1),
+            "the fourth run lasted {ran:?}, short of its stable time"
+        );
+        let took = gap(exits[3].1, fifth.at_ns);
+        assert!(
+            took + Duration::from_millis(20) >= floor,
+            "started again {took:?} after its exit, sooner than its floor"
+        );
+        assert!(
+            took < Duration::from_millis(400),
+            "started again {took:?} after a run of {ran:?}, past its stable time of 1 s: the delays did not start over (they would be 0.8 s)"
+        );
+    }
+
+    /// #4099, box 2 — a window manager that cannot be started (its file is
+    /// gone) is tried once at each delay, the delays doubling as for an exit,
+    /// and each failed attempt said in one line, with the window manager, its
+    /// error and the next delay. Put back, it is started by the next attempt.
+    #[test]
+    fn a_window_manager_that_cannot_be_started_is_tried_with_the_backoff() {
+        let dir = scratch("wm-gone");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":493",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(800),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let path = dir.join("wm").display().to_string();
+        let failures = |lines: &KeeperLines| -> Vec<String> {
+            wm_warnings(lines)
+                .into_iter()
+                .filter(|l| l.contains("failed to start"))
+                .collect()
+        };
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        std::fs::remove_file(dir.join("wm")).unwrap();
+        // Taken before the signal, so that the exit cannot come before it.
+        let signalled = Instant::now();
+        signal_recorded(&first_wm, libc::SIGTERM);
+        let tried =
+            poll_for(Duration::from_secs(2), || failures(&lines).first().cloned()).is_some();
+        // When each of the first three failures was first seen, then the
+        // file put back whole: a new file renamed over the name.
+        let mut seen = Vec::new();
+        let mut back = None;
+        if tried {
+            while seen.len() < 3 && signalled.elapsed() < Duration::from_secs(4) {
+                let n = failures(&lines).len().min(3);
+                while seen.len() < n {
+                    seen.push(signalled.elapsed());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            script(
+                &dir,
+                "wm.new",
+                &format!("{}\nexec sleep 300", wm_started(&dir)),
+            );
+            std::fs::rename(dir.join("wm.new"), dir.join("wm")).unwrap();
+            back = poll_for(Duration::from_millis(1800), || {
+                wm_starts(&dir).get(1).copied()
+            });
+        }
+        let said = failures(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            tried,
+            "no attempt in 2 s after the window manager's exit, with its file gone (#4099)"
+        );
+        assert_eq!(seen.len(), 3, "the failed attempts: {said:?}");
+        for (k, (at, least)) in seen.iter().zip([100, 300, 700]).enumerate() {
+            assert!(
+                *at >= Duration::from_millis(least),
+                "attempt {} seen {at:?} after the exit, sooner than its delays allow: {said:?}",
+                k + 1
+            );
+        }
+        for line in &said {
+            assert!(
+                line.contains(&format!("the window manager {path} failed to start: ")),
+                "the line does not name the window manager: {line}"
+            );
+        }
+        let stated: Vec<&str> = said
+            .iter()
+            .map(|l| {
+                l.rsplit("tried again in ")
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+            })
+            .collect();
+        assert_eq!(
+            stated.get(..3),
+            Some(&["200ms", "400ms", "800ms"][..]),
+            "the delays the failures named: {said:?}"
+        );
+        assert!(
+            stated[3..].iter().all(|d| *d == "800ms"),
+            "past the ceiling: {said:?}"
+        );
+        let back = back.expect("put back, the window manager was not started within 1.8 s");
+        assert_eq!(back.parent, keeper, "started by another: {back:?}");
+    }
+
+    /// #4099 — in production the window manager's restart takes the X
+    /// server's numbers: a second at first, doubling to five minutes, and a
+    /// second again once it ran a minute. From the daemon's plan, and from a
+    /// job line without them, as a daemon from before #4099 writes it.
+    #[test]
+    fn the_window_managers_restart_takes_the_servers_numbers() {
+        let p = Plan::of(&Config {
+            resolution: "640x480".into(),
+            wm: "openbox".into(),
+            startup: vec![],
+        });
+        assert_eq!(
+            (p.wm_delay_floor, p.wm_delay_ceil, p.wm_stable_after),
+            (
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                Duration::from_secs(60)
+            )
+        );
+        assert_eq!(
+            (p.wm_delay_floor, p.wm_delay_ceil, p.wm_stable_after),
+            (p.delay_floor, p.delay_ceil, p.stable_after),
+            "the window manager's numbers are not the X server's"
+        );
+        let job: keeper::Job =
+            serde_json::from_str(r#"{"display":":7","group":9,"wm":"openbox","grace_ms":1500}"#)
+                .expect("a job line from before #4099");
+        assert_eq!(
+            (
+                job.wm_delay_floor_ms,
+                job.wm_delay_ceil_ms,
+                job.wm_stable_after_ms
+            ),
+            (1_000, 300_000, 60_000)
+        );
+    }
+
+    /// #4099, control — a window manager that stays up is started once.
+    #[test]
+    fn a_window_manager_that_stays_up_is_not_started_again() {
+        let dir = scratch("wm-stays");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":494",
+            "exec sleep 300",
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(400),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first = first_start(&dir);
+        std::thread::sleep(Duration::from_secs(2));
+        let starts = wm_starts(&dir);
+        let first_ran = is_running(first.pid);
+        let said = wm_warnings(&lines);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            starts,
+            [first],
+            "a window manager that stayed up was started again"
+        );
+        assert_eq!(
+            first.parent, keeper,
+            "the window manager is not the keeper's"
+        );
+        assert!(first_ran, "the window manager did not stay up");
+        assert!(said.is_empty(), "the keeper warned: {said:?}");
+    }
+
+    /// #4099, control (the stop) — a window manager that exits in a stop is
+    /// not started again. A service manager's stop signals every process of
+    /// the unit at once; here the keeper's SIGTERM comes alone, once it has
+    /// collected the window manager's exit, so the server runs on, and only
+    /// the stop itself keeps the keeper, lingering for its input's end, from
+    /// the start it scheduled.
+    #[test]
+    fn a_window_manager_that_exits_in_a_stop_is_not_started_again() {
+        let dir = scratch("wm-stop");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":495",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        signal_recorded(&first_wm, libc::SIGTERM);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        // The keeper, our child, unreaped while the tree lists it.
+        RealProcs.signal(keeper, libc::SIGTERM);
+        // Past the start's due time, by a second.
+        std::thread::sleep(floor + Duration::from_secs(1));
+        let starts = wm_starts(&dir);
+        let keeper_stayed = is_running(keeper);
+        let server_ran = is_running(x_pid);
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (warned, read) = keeper_warnings(&lines, "asked to stop");
+
+        assert!(read, "the keeper's lines were not read: {lines:?}");
+        assert!(
+            keeper_stayed,
+            "the keeper left on SIGTERM alone, before the start was due"
+        );
+        assert!(
+            server_ran,
+            "the X server stopped, so its check may have kept the start out"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again in a stop: {starts:?}"
+        );
+        assert!(warned.is_empty(), "the keeper warned in a stop: {warned:?}");
+    }
+
+    /// #4099, control (the end of input) — a window manager that exits in the
+    /// daemon's teardown is not started again: the teardown ends the keeper's
+    /// input before the start is due, and the keeper takes the desktop down.
+    #[test]
+    fn a_window_manager_that_exits_in_the_daemons_teardown_is_not_started_again() {
+        let dir = scratch("wm-teardown");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":496",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        signal_recorded(&first_wm, libc::SIGTERM);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        stopped(&desk, supervisor);
+        // Past the start's due time.
+        std::thread::sleep(floor);
+        let starts = wm_starts(&dir);
+        let keeper_gone = collected(keeper);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again in the daemon's teardown: {starts:?}"
+        );
+        assert!(keeper_gone, "the stop left the keeper {keeper}");
+    }
+
+    /// #4099, control (the server) — a window manager whose X server is gone
+    /// is not started again. No supervisor here: nothing takes the desktop
+    /// down, so the keeper runs on past the start's due time with its input
+    /// open, and only its look at the server, a zombie now, keeps the start
+    /// out.
+    #[test]
+    fn a_window_manager_whose_server_is_gone_is_not_started_again() {
+        let dir = scratch("wm-no-server");
+        let (desk, x_pid, lines) = desktop_restarting_wm(
+            &dir,
+            ":497",
+            "exec sleep 300",
+            [
+                Duration::from_millis(200),
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+            ],
+            plan(stand_in(&dir, "exit 1")),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let first_wm = wm_proc(&first_start(&dir));
+        // The server's stand-in, our child, unreaped: a zombie from now on.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the X server to die", || !is_running(x_pid));
+        signal_recorded(&first_wm, libc::SIGKILL);
+        wait_for("the keeper to collect the window manager", || {
+            reaped(&first_wm)
+        });
+        // Ten floors past the window manager's exit.
+        std::thread::sleep(Duration::from_secs(2));
+        let starts = wm_starts(&dir);
+        let keeper_ran = is_running(keeper);
+        let said = wm_warnings(&lines);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            keeper_ran,
+            "the keeper left, so its look at the server was not what kept the start out"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again onto a server that is gone: {starts:?}"
+        );
+        assert!(
+            said.is_empty(),
+            "the keeper warned of a desktop that did not run on: {said:?}"
+        );
+    }
+
+    /// #4099, control (the order) — an X server's death ends its clients, the
+    /// window manager among the first, so its exit reaches the keeper before
+    /// the server's (50 ms here, as in [`an_x_server_death_adds_no_keeper_warning`]).
+    /// The supervisor's teardown comes only after its stop grace (1 s, as the
+    /// daemon's), past the start's due time, so only the keeper's look at the
+    /// server keeps the start out.
+    #[test]
+    fn a_window_manager_that_exits_just_before_its_server_is_not_started_again() {
+        let dir = scratch("wm-then-server");
+        let floor = Duration::from_millis(500);
+        let (desk, x_pid, _lines) = desktop_restarting_wm(
+            &dir,
+            ":498",
+            "exec sleep 300",
+            [floor, Duration::from_secs(2), Duration::from_secs(60)],
+            plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = supervised(&desk, x_pid, keeper);
+        let first_wm = wm_proc(&first_start(&dir));
+        let killed = Instant::now();
+        signal_recorded(&first_wm, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(50));
+        // The server's stand-in, our child, unreaped while the tree lists it.
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the supervisor's teardown to collect the keeper", || {
+            collected(keeper)
+        });
+        let keeper_lived = killed.elapsed();
+        let starts: Vec<WmStart> = wm_starts(&dir)
+            .into_iter()
+            .filter(|s| s.parent == keeper)
+            .collect();
+        stopped(&desk, supervisor);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            keeper_lived > floor + Duration::from_millis(200),
+            "the keeper was gone {keeper_lived:?} after the window manager's exit, before its start was due: this proves nothing"
+        );
+        assert_eq!(
+            starts.len(),
+            1,
+            "the window manager was started again onto a dying server: {starts:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // #3671: what an X server's exit tells the open sessions, and the exit a
     // stop of the daemon asked for. Stand-ins only: no X server, never `:99`.
     // -----------------------------------------------------------------------
@@ -7245,6 +7994,14 @@ mod supervise_tests {
         let _stop = StopAtTheEnd(desk.clone());
         let keeper = desk.start_clients();
         let wm = recorded(dir, "wm.pid");
+        let seen = seen_of(&wm, x_pid);
+        desk.stop();
+        (seen, keeper, wm.ppid)
+    }
+
+    /// What `wm`, a client of the desktop whose X server is `x_pid`, got
+    /// from whoever started it.
+    fn seen_of(wm: &ProcInfo, x_pid: i32) -> Seen {
         let mut environ: Vec<String> = std::fs::read(format!("/proc/{}/environ", wm.pid))
             .unwrap_or_default()
             .split(|b| *b == 0)
@@ -7254,7 +8011,7 @@ mod supervise_tests {
         environ.sort();
         // SAFETY: `getsid(2)` on a live pid.
         let session = unsafe { libc::getsid(wm.pid) };
-        let seen = Seen {
+        Seen {
             environ,
             cwd: std::fs::read_link(format!("/proc/{}/cwd", wm.pid)).ok(),
             umask: status_line(wm.pid, "Umask:"),
@@ -7263,9 +8020,7 @@ mod supervise_tests {
             group_is_the_servers: wm.pgid == x_pid,
             session,
             fds: fds_of(wm.pid),
-        };
-        desk.stop();
-        (seen, keeper, wm.ppid)
+        }
     }
 
     /// Is SIGHUP in a `/proc/<pid>/status` signal mask?
