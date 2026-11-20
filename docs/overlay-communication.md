@@ -1379,7 +1379,11 @@ flowchart TD
 * **IPv6.** macOS routes the derived IPv6 as a local address, and still, on
   #4117's code, a datagram the Mac sent to it was read from the utun and never
   delivered (measured on a macOS 26 CI runner). The same comparison covers it,
-  so it is handed back like the IPv4 address.
+  so it is handed back like the IPv4 address and never reaches the outbound
+  path. macOS does not deliver a UDP datagram handed back to that address,
+  though (measured on the same runner), so such a datagram still gets no
+  answer. The IPv4 address, where MagicDNS listens and where macOS sends the
+  overlay zone, is not affected.
 * **The count.** `SystemTun::self_delivered` (`tun.rs:7535`) counts the packets
   a utun has handed back. The first one logs ONE INFO, `overlay: a packet to
   this node's own overlay address was handed back to the OS; the next ones are
@@ -1399,12 +1403,13 @@ utun in #4117's shape, in the CI step `macOS overlay against a real utun`:
 
 | Test | Asserts |
 |---|---|
-| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10252`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
-| `a_ping_to_its_own_address_is_answered` (`tun.rs:10291`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
-| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10332`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
-| `the_kill_switch_hands_nothing_back` (`tun.rs:10404`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
-| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:10458`) | the same exchange with the derived IPv6: delivered, answered, one hand-back each way |
-| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:10524`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+| `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10391`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
+| `a_ping_to_its_own_address_is_answered` (`tun.rs:10430`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
+| `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10471`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
+| `the_kill_switch_hands_nothing_back` (`tun.rs:10543`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
+| `a_datagram_to_its_own_derived_v6_is_handed_back_once_and_never_read` (`tun.rs:10599`) | the same datagram to the derived IPv6: one hand-back, it never comes out of the read, and nothing more comes into the utun in the 2 s after. Whether macOS delivers it, and what `ping6 -c 3` to the address gets, are printed |
+| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:10686`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
+| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:10766`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
 
 The rule is pure and tested on every platform (`utun_self_delivery_tests`,
 `tun.rs:8541`).
