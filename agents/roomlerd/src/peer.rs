@@ -17890,9 +17890,12 @@ mod wire_text_log_tests {
 mod dir_listing_tests {
     use super::files_channel_tests::Pair;
     use super::*;
+    use crate::files::dir_pages::{DIR_PAGE_BUDGET, FILES_FRAME_MAX};
     use crate::files::drawer_edges::seams;
     use roomler_ai_remote_control::permissions::Permissions;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
     /// Messages of other kinds, sent behind a listing whose folder's entries
     /// do not come, are acted on at once: a cancel naming an id that is not
@@ -18005,5 +18008,329 @@ mod dir_listing_tests {
             panic!("the listing outlived its session, parked in its answer's send");
         };
         ended.expect("the listing's task");
+    }
+
+    /// The folder `name` in `temp`, of `n` empty files whose names are `len`
+    /// characters long, and those names in the order a listing gives them.
+    fn folder_of(
+        temp: &std::path::Path,
+        name: &str,
+        n: usize,
+        len: usize,
+    ) -> (std::path::PathBuf, Vec<String>) {
+        let at = temp.join(name);
+        std::fs::create_dir(&at).expect("a folder");
+        let names: Vec<String> = (0..n)
+            .map(|i| {
+                let head = format!("{i:05}-");
+                format!("{head}{}", "x".repeat(len.saturating_sub(head.len())))
+            })
+            .collect();
+        for file in &names {
+            std::fs::write(at.join(file), b"").expect("an empty file");
+        }
+        (at, names)
+    }
+
+    fn json_of(text: &str) -> Value {
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    /// The start of a frame, for a message about it.
+    fn head_of(text: &str) -> &str {
+        let end = text
+            .char_indices()
+            .nth(200)
+            .map_or(text.len(), |(at, _)| at);
+        &text[..end]
+    }
+
+    /// A viewer's `files` channel whose device end nothing serves: the test
+    /// sends on that end itself, once it is open.
+    async fn bare_pair() -> (Pair, Arc<RTCDataChannel>) {
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let put = stash.clone();
+        let pair = Pair::open_with("files", move |device, _| {
+            *put.lock().unwrap() = Some(device);
+        })
+        .await;
+        let device = stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the channel's device end");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while device.ready_state() != RTCDataChannelState::Open
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (pair, device)
+    }
+
+    /// #4121 — a folder whose listing is over 64 KiB of JSON (1 500 names of
+    /// 120 characters, about 270 KB) reaches a viewer that joins pages, over
+    /// a real SCTP association: every entry, in order, each frame within the
+    /// budget and within the viewer's wait of the one before.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_reaches_a_paging_viewer() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "big", "path": folder, "paged": true}))
+            .await;
+        let mut heard: Vec<String> = Vec::new();
+        let mut wait = Duration::from_secs(8);
+        while let Some(text) = pair.next_within(wait).await {
+            heard.push(text);
+            let pages = json_of(&heard[0])["pages"].as_u64().unwrap_or(1);
+            if heard.len() as u64 >= pages {
+                break;
+            }
+            wait = Duration::from_secs(5);
+        }
+        pair.close().await;
+        assert!(
+            !heard.is_empty(),
+            "no frame within 8 s: a ~270 KB listing never reached the viewer (#4121)"
+        );
+        let pages: Vec<Value> = heard.iter().map(|text| json_of(text)).collect();
+        for (i, (text, page)) in heard.iter().zip(&pages).enumerate() {
+            assert!(
+                text.len() <= DIR_PAGE_BUDGET,
+                "frame {i} is {} bytes: {}",
+                text.len(),
+                head_of(text)
+            );
+            assert_eq!(page["t"], "files:dir-list", "frame {i}: {}", head_of(text));
+            assert_eq!(page["req_id"], "big", "frame {i}");
+            assert_eq!(page["page"], i, "frame {i}");
+            assert_eq!(page["pages"], heard.len(), "frame {i}");
+            assert_eq!(page["total"], names.len(), "frame {i}");
+        }
+        let joined: Vec<&str> = pages
+            .iter()
+            .filter_map(|page| page["entries"].as_array())
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(joined, names, "the pages joined in order are the folder");
+    }
+
+    /// #4121 (D1-A) — the same folder, asked by a viewer that does not join
+    /// pages (every viewer before it): within that viewer's 5 s wait, one
+    /// `files:dir-error` naming the folder and its count, and nothing after.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_tells_an_old_viewer_why() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, _) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let asked = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:dir", "req_id": "old", "path": folder}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let took = asked.elapsed();
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let Some(first) = first else {
+            panic!("an old viewer heard nothing in 8 s (#4121)");
+        };
+        let refusal = json_of(&first);
+        assert_eq!(refusal["t"], "files:dir-error", "{}", head_of(&first));
+        assert_eq!(refusal["req_id"], "old");
+        assert!(
+            took <= Duration::from_secs(5),
+            "the refusal came {took:?} after the ask"
+        );
+        let message = refusal["message"].as_str().unwrap_or("");
+        for named in ["w23-1500", "1500"] {
+            assert!(message.contains(named), "{named:?} is not in {message:?}");
+        }
+        assert!(
+            more.is_none(),
+            "something followed the refusal: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — a files answer the channel refuses (a frame over the SCTP
+    /// stack's message limit) is a WARN naming its kind, size, id and the
+    /// error, and never its text: a listing names a person's files.
+    #[tokio::test]
+    async fn a_files_answer_that_cannot_be_sent_is_a_warning() {
+        let (pair, device) = bare_pair().await;
+        let entries: Vec<crate::files::DirEntryView> = (0..400)
+            .map(|i| crate::files::DirEntryView {
+                name: format!("w23-private-name-{i:04}-{}", "y".repeat(100)),
+                is_dir: false,
+                size: Some(0),
+                mtime_unix: None,
+            })
+            .collect();
+        let msg = crate::files::FilesOutgoing::DirList {
+            req_id: "g1",
+            path: "/home/person/w23-g1",
+            parent: None,
+            entries: &entries,
+            page: None,
+            pages: None,
+            total: None,
+            capped: false,
+        };
+        let bytes = serde_json::to_string(&msg)
+            .expect("the answer as JSON")
+            .len();
+        let log = files_log_tests::Logged::start(tracing::Level::WARN);
+        send_files_json(&device, &msg).await;
+        let text = log.text();
+        drop(log);
+        pair.close().await;
+        assert!(
+            bytes > 65_536,
+            "the answer is {bytes} bytes, small enough to go"
+        );
+        let warned: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("files: answer not sent"))
+            .collect();
+        assert!(
+            !warned.is_empty(),
+            "the failed send left no WARN (#4121): {text:?}"
+        );
+        assert_eq!(warned.len(), 1, "{text:?}");
+        for part in [
+            "WARN",
+            "files:dir-list",
+            bytes.to_string().as_str(),
+            "\"g1\"",
+            "outbound packet larger than maximum message size",
+        ] {
+            assert!(
+                warned[0].contains(part),
+                "{part:?} is not in {:?}",
+                warned[0]
+            );
+        }
+        assert!(
+            !text.contains("w23-private-name"),
+            "an entry's name was logged: {text:?}"
+        );
+    }
+
+    /// A small folder is answered in one frame with today's keys, to a viewer
+    /// that joins pages and to one that does not.
+    #[tokio::test]
+    async fn a_small_listing_is_one_frame_as_today() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-4", 4, 12);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let mut heard = Vec::new();
+        for (req_id, paged) in [("c1-old", None), ("c1-new", Some(true))] {
+            let mut ask = json!({"t": "files:dir", "req_id": req_id, "path": folder});
+            if let Some(paged) = paged {
+                ask["paged"] = json!(paged);
+            }
+            pair.ask(&ask).await;
+            heard.push((req_id, pair.next_within(Duration::from_secs(8)).await));
+        }
+        let more = pair.next_within(Duration::from_millis(500)).await;
+        pair.close().await;
+        let today: BTreeSet<&str> = ["t", "req_id", "path", "parent", "entries"].into();
+        for (req_id, frame) in &heard {
+            let listing = json_of(frame.as_deref().unwrap_or(""));
+            let keys: BTreeSet<&str> = listing
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(keys, today, "{req_id}: {frame:?}");
+            assert_eq!(listing["req_id"], *req_id);
+            let listed: Vec<&str> = listing["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| entry["name"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(listed, names, "{req_id}");
+        }
+        assert!(more.is_none(), "a third frame: {more:?}");
+    }
+
+    /// A listing over the page budget but under the frame limit (about 320
+    /// names of 120 characters, about 57 KB) goes whole, in one frame, to a
+    /// viewer that joins pages.
+    #[tokio::test]
+    async fn a_listing_under_the_limit_is_one_frame() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-320", 320, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "c2", "path": folder, "paged": true}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let first = first.unwrap_or_default();
+        assert!(
+            (DIR_PAGE_BUDGET + 1..=FILES_FRAME_MAX).contains(&first.len()),
+            "the listing is {} bytes; this test needs one between the budget and the limit",
+            first.len()
+        );
+        let listing = json_of(&first);
+        assert_eq!(listing["t"], "files:dir-list", "{}", head_of(&first));
+        assert!(listing.get("pages").is_none(), "{}", head_of(&first));
+        let listed: Vec<&str> = listing["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(listed, names);
+        assert!(
+            more.is_none(),
+            "a second frame: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — what the constants assume of the stack, over a real
+    /// association: a frame of 65 535 bytes arrives whole at a webrtc-rs
+    /// viewer, and one of 65 537 is refused at the send with the error a
+    /// failed answer logs.
+    #[tokio::test]
+    async fn the_stacks_limits_are_what_the_constants_assume() {
+        let (mut pair, device) = bare_pair().await;
+        let fits = device.send_text("x".repeat(FILES_FRAME_MAX)).await;
+        let heard = pair.next_within(Duration::from_secs(8)).await;
+        let over = device.send_text("x".repeat(FILES_FRAME_MAX + 2)).await;
+        pair.close().await;
+        assert!(fits.is_ok(), "65 535 bytes: {fits:?}");
+        assert_eq!(
+            heard.map(|text| text.len()),
+            Some(FILES_FRAME_MAX),
+            "65 535 bytes arrive whole"
+        );
+        let refused = over.expect_err("65 537 bytes are refused at the send");
+        assert!(
+            refused
+                .to_string()
+                .contains("outbound packet larger than maximum message size"),
+            "{refused}"
+        );
+        const { assert!(DIR_PAGE_BUDGET < FILES_FRAME_MAX) };
     }
 }

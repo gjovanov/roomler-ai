@@ -7082,6 +7082,142 @@ mod tests {
         }
     }
 
+    /// #4121 — a viewer that joins a listing's pages says so; one that leaves
+    /// `paged` out (every viewer before it) parses as before.
+    #[test]
+    fn parse_files_dir_paged() {
+        for (text, paged) in [
+            (r#"{"t":"files:dir","req_id":"r1","path":"/p"}"#, false),
+            (
+                r#"{"t":"files:dir","req_id":"r1","path":"/p","paged":false}"#,
+                false,
+            ),
+            (
+                r#"{"t":"files:dir","req_id":"r1","path":"/p","paged":true}"#,
+                true,
+            ),
+        ] {
+            let m: FilesIncoming = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                m,
+                FilesIncoming::Dir {
+                    req_id: "r1".into(),
+                    path: "/p".into(),
+                    paged,
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// #4121 — a listing sent whole is today's bytes: none of the page
+    /// fields, and no `capped` while the folder held no more.
+    #[test]
+    fn dir_list_serializes_as_today() {
+        let entries = [
+            DirEntryView {
+                name: "a.txt".into(),
+                is_dir: false,
+                size: Some(5),
+                mtime_unix: Some(1_763_683_200),
+            },
+            DirEntryView {
+                name: "sub".into(),
+                is_dir: true,
+                size: None,
+                mtime_unix: None,
+            },
+        ];
+        let text = serde_json::to_string(&FilesOutgoing::DirList {
+            req_id: "r1",
+            path: "/home/p",
+            parent: Some("/home"),
+            entries: &entries,
+            page: None,
+            pages: None,
+            total: None,
+            capped: false,
+        })
+        .unwrap();
+        assert_eq!(
+            text,
+            r#"{"t":"files:dir-list","req_id":"r1","path":"/home/p","parent":"/home","entries":[{"name":"a.txt","is_dir":false,"size":5,"mtime_unix":1763683200},{"name":"sub","is_dir":true,"size":null,"mtime_unix":null}]}"#
+        );
+    }
+
+    /// #4121 — a frame's kind is the `t` its message serializes with, and its
+    /// id the one its waiter settles on, for every message: a send that fails
+    /// is logged by them.
+    #[test]
+    fn a_frames_kind_is_its_messages_t() {
+        let entries: [DirEntryView; 0] = [];
+        for msg in [
+            FilesOutgoing::Accepted {
+                id: "a",
+                path: "/p",
+            },
+            FilesOutgoing::Progress { id: "a", bytes: 1 },
+            FilesOutgoing::Complete {
+                id: "a",
+                path: "/p",
+                bytes: 1,
+            },
+            FilesOutgoing::Error {
+                id: "a",
+                message: "m",
+            },
+            FilesOutgoing::Offer {
+                id: "a",
+                name: "n",
+                size: None,
+                mime: None,
+            },
+            FilesOutgoing::Eof { id: "a", bytes: 1 },
+            FilesOutgoing::DirList {
+                req_id: "a",
+                path: "/p",
+                parent: None,
+                entries: &entries,
+                page: None,
+                pages: None,
+                total: None,
+                capped: false,
+            },
+            FilesOutgoing::DirError {
+                req_id: "a",
+                message: "m",
+            },
+            FilesOutgoing::Resumed {
+                id: "a",
+                accepted_offset: 0,
+            },
+        ] {
+            let frame = msg.frame().unwrap();
+            let sent: serde_json::Value = serde_json::from_str(&frame.text).unwrap();
+            assert_eq!(sent["t"], frame.kind, "{msg:?}");
+            assert_eq!(frame.id, "a", "{msg:?}");
+        }
+    }
+
+    /// #4121 (D3-A) — a folder holding more entries than a listing takes is
+    /// listed to the limit and says it was cut; one that fits says nothing.
+    #[test]
+    fn a_folder_over_the_cap_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            std::fs::write(temp.path().join(format!("f{i}.txt")), b"").unwrap();
+        }
+        let (entries, capped) = collect_dir_entries(std::fs::read_dir(temp.path()).unwrap(), 5);
+        assert_eq!(entries.len(), 5, "the listing takes its limit");
+        assert!(capped, "a folder of 6 listed to 5 was cut silently (#4121)");
+        let (entries, capped) = collect_dir_entries(std::fs::read_dir(temp.path()).unwrap(), 6);
+        assert_eq!(
+            (entries.len(), capped),
+            (6, false),
+            "a folder of 6 fits a limit of 6"
+        );
+    }
+
     // ---- rc.19 file-DC v3 resume wire-format locks ----
 
     #[test]
