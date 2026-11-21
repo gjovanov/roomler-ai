@@ -199,6 +199,34 @@ impl Agent {
             Arc::new(Net::new(None))
         };
 
+        // Roomler patch (FR-148 P4 step 2, D49 R1): will the host gather make a
+        // candidate on the mesh? Read here, before any candidate is gathered or
+        // any remote arrives (the offer's own candidates come before the
+        // gather starts, and trickled ones race it), from the interfaces the
+        // host gather lists with the same filters, so whether a pair into the
+        // mesh is refused never depends on the order candidates come in.
+        if contains_candidate_type(CandidateType::Host, &candidate_types) {
+            if let Some(rank) = (*config.carrier_rank)
+                .as_ref()
+                .filter(|rank| rank.route_engaged().is_some())
+            {
+                let ips = crate::util::local_interfaces(
+                    &net,
+                    &config.interface_filter,
+                    &config.ip_filter,
+                    &config.network_types,
+                    config.include_loopback,
+                )
+                .await;
+                if ips
+                    .iter()
+                    .any(|ip| rank.ranks_last(*ip) || rank.names(&ip.to_string()))
+                {
+                    ai.mesh_sibling.fetch_or(SIBLING_HOST, Ordering::SeqCst);
+                }
+            }
+        }
+
         let agent = Self {
             udp_network: config.udp_network,
             internal: Arc::new(ai),
@@ -371,6 +399,33 @@ impl Agent {
     /// Returns the selected pair or nil if there is none
     pub fn get_selected_candidate_pair(&self) -> Option<Arc<CandidatePair>> {
         self.internal.agent_conn.get_selected_pair()
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): a pair, given by its local candidate's
+    /// priority, component and address and its remote's address, as this
+    /// agent's route rank reads it ([`rides_the_mesh`] with the rank's own
+    /// addresses), with the hold so far. `None` when the agent runs no route
+    /// rank: under every `rc_carrier_rank` value but `route`.
+    pub fn route_read(
+        &self,
+        local_priority: u32,
+        local_component: u16,
+        local_address: &str,
+        remote_address: &str,
+    ) -> Option<RouteRead> {
+        let route = (*self.internal.carrier_rank).as_ref()?.route.as_ref()?;
+        let (held, hold_exit) = self.internal.route_hold_so_far();
+        Some(RouteRead {
+            rides_the_mesh: rides_the_mesh(
+                &*route.mesh,
+                local_priority,
+                local_component,
+                local_address,
+                remote_address,
+            ),
+            held,
+            hold_exit,
+        })
     }
 
     /// Sets the credentials of the remote agent.

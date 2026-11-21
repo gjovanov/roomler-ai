@@ -951,6 +951,11 @@ skip and run nothing. Send plain text: an encoded payload is the shape endpoint 
 Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
 the run too. Take the denominator from the server's device list, not from who answered exec.
 
+A check can print its reading instead of stopping the run, for one run, on the word of whoever owns
+the machine. On 2026-11-20 two Windows desktops in use ran the bench that way: the session and
+idle checks printed what they read, and the load check still stopped at 50 %
+([§ two Windows desktops](fr/FR-16-rc-quality-benchmark.md#l1-fleet-run-2026-11-20-two-windows-desktops)).
+
 ### The plain smoke and the sweep judge by the same verdict
 
 `roomlerd encoder-smoke` without `--bench` is the bench's judgement on ONE cell (#3652). Its flags map

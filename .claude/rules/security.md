@@ -41,7 +41,12 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   `MANAGE_AGENTS`, the reads too: the list is the org's whole ACL. `GET …/magic-dns`
   stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
   must not: the policy IS the grant, made for people who hold none
-  (security-baseline.md §3).
+  (security-baseline.md §3). ⚠️ `Json<T>` as an extractor answers a body that does
+  not parse (400/415/422) before the handler runs. A gated write takes
+  `Result<Json<T>, JsonRejection>` instead and reads it straight after the gate
+  (`let Json(body) = body?;`); `ApiError::JsonBody` answers it as the extractor did
+  (#4187). The tunnel-policy and overlay-acl writes do; the route and exit-node
+  approvals and `PUT …/magic-dns` still read their body first (#4218).
 - **A member's roles are the org's own, read where a rule is evaluated.** Only the
   ids of a membership row that are `roles` rows of THAT org count: read them through
   `TenantDao::get_member_permissions` (the bits), `member_live_role_ids` (one member)

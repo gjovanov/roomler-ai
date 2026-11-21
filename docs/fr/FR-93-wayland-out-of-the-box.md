@@ -307,7 +307,7 @@ between worktrees or inside one. Every capture/input knob flip forces a fresh ca
 ### 4.1 One desktop-session resolver
 
 `desktop::session()` replaces the five ad-hoc lookups (`companion.rs:1157`, `recording/launch.rs:1758-1786`,
-`apps/linux.rs:503-513`, `keep_busy/logind.rs:91-110`, and the scrap arm's reliance on the daemon's own
+`apps/linux.rs:585-595`, `keep_busy/logind.rs:91-110`, and the scrap arm's reliance on the daemon's own
 `DISPLAY`):
 
 - logind over **D-Bus** (`org.freedesktop.login1`, zbus — already a dependency and pure Rust) instead of
