@@ -188,8 +188,9 @@ describe('FR-135 R2: the bursts', () => {
   // A report runs inside the rAF callback, and nothing there caught a throw. In a
   // test, a burst that outlived its spec reported into jsdom's window
   // `postMessage`, which takes two arguments, and failed a run whose tests had all
-  // passed (#4193). The reading is lost; the bursts are not.
-  it('catches a report that throws, so nothing escapes the rAF callback, and the bursts go on', () => {
+  // passed (#4193). A report that throws costs that one reading: it does not count
+  // as told, so the next burst on the same screen reports it again.
+  it('catches a report that throws, so nothing escapes the rAF callback, and the next burst on the same screen reports again', () => {
     const f = fakeEnv()
     const told: number[] = []
     const late = (hz: number) => {
@@ -202,10 +203,11 @@ describe('FR-135 R2: the bursts', () => {
     expect(f.waiting).toBe(false)
     expect(f.timers).toHaveLength(1)
     expect(f.timers[0]!.ms).toBe(VIEWER_HZ_EVERY_MS)
-    // The next burst measures again, and a screen that moved is reported.
+    // The next burst reads the same screen. The reading that threw was never told,
+    // so this one is reported again.
     f.timers.shift()!.run()
-    expect(() => f.ticks(1000 / 144)).not.toThrow()
-    expect(told).toEqual([60, 144])
+    expect(() => f.ticks(1000 / 60)).not.toThrow()
+    expect(told).toEqual([60, 60])
     expect(f.timers).toHaveLength(1)
   })
 })
