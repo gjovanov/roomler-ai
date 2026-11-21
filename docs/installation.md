@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4023`, `crates/agent-core/src/config.rs:4515`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4024`, `crates/agent-core/src/config.rs:4519`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,17 +576,17 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3585`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3651`, `:3659`), and the load fails. Each line is worded for what happened to the live file (below) |
-| `config::read_if_present` (`:3690`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3585`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3655`, `:3663`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`:3694`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
-A start never restores a missing file, because `run` checks for the file before it loads it. With
-no `config.toml`, an enrolled device's start stops with *"no config found"*
-(`agents/roomlerd/src/app.rs:3949-3954`) before the load (`:4017`); its service manager starts it
-again, and it stops again. An unenrolled one-row Mac's screen worker passes that check and writes
-the person a new file with no enrollment instead (`:3969-3981`). Only a process that loads the
-configuration once the file is gone restores it: a command such as `roomlerd org ls`, or a daemon
-or worker that was already running, the next time it loads the file. Whether a start should
-restore one is the open #4157.
+A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
+loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
+line and without its run marks, so the next start counts no crash (`agents/roomlerd/src/app/config_at_start.rs:39`,
+`agents/roomlerd/src/app.rs:3949-3955`). With no copy, or one that does not load or holds no enrollment, it stops with
+*"no config found"* before the lock, as before. An unenrolled one-row Mac's screen worker never restores at its start: it writes the
+person a new file with no enrollment (`agents/roomlerd/src/app.rs:4005-4017`). Nor does the macOS supervisor's enrolled worker
+(`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because a converted one-row Mac's person `config.toml.prev` can still hold the enrollment that moved to root (#4184).
+So removing `config.toml` alone does not make a device forget its enrollment: remove `config.toml.prev` too. A Windows SystemContext install with its machine config missing still waits (#4176).
 
 ```mermaid
 flowchart TD
@@ -597,8 +597,8 @@ flowchart TD
     T -->|"yes"| OK["the config"]
     T -->|"no"| V{"config.toml.prev parses?"}
     V -->|"yes"| W{"was the live file there?<br/>(the read's own error)"}
-    W -->|"no — NotFound"| RM["promoted to live<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
-    W -->|"yes"| R["promoted to live<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
+    W -->|"no — NotFound"| RM["promoted to live, run marks cleared<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
+    W -->|"yes"| R["promoted to live, run marks cleared<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
     V -->|"no"| X{"was the live file there?<br/>(the read's own error)"}
     X -->|"no — NotFound"| EM["the load fails<br/>ERROR 'config missing … must be enrolled (again)'<br/>— believe it"]
     X -->|"yes"| E["the load fails<br/>ERROR 'config unreadable … must be re-enrolled'<br/>— believe it"]
@@ -612,7 +612,7 @@ host now runs on an older config, and that must never look like a normal boot.
 | **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3619` |
 | **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3627` |
 
-"Not there" is read off the read's own error (`not_found`, `:3859`), never off an `exists()`
+"Not there" is read off the read's own error (`not_found`, `:3863`), never off an `exists()`
 that could race the read, and a parse error is never read as missing. Before #4058 a live file
 that a person or a test had removed took the second line, which named a truncation that never
 happened.
@@ -625,8 +625,8 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3651` |
-| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3659` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3655` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3663` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
 enrolled where `roomlerd org ls` ran, was told its config was unreadable.
@@ -654,7 +654,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
 (`record_clean_run_at`, `:2570`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4467`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4471`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -666,7 +666,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4287`):
+ignores (`serialise_for`, `:4291`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -692,14 +692,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:4093`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4097`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2882`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:4161`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:4145`), never one read off the entry on disk. A newer build's
+`:4165`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4149`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -720,11 +720,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4239`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4243`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4433`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4437`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -902,7 +902,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4802`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4806`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -3225,7 +3225,7 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4011`). The
+  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4012`). The
   macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
   (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std
