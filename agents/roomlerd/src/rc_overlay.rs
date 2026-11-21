@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tunnel_core::localapi::{ConnectionType, PeerInfo};
 use tunnel_core::overlay_footprint as footprint;
 use webrtc::api::setting_engine::SettingEngine;
-use webrtc::ice::agent::agent_config::{CarrierRank, MeshAddrFn};
+use webrtc::ice::agent::agent_config::{CarrierRank, MeshAddrFn, ROUTE_HOLD, RouteRank};
 
 /// The overlay decision for ONE session, resolved when it is requested.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -110,6 +110,12 @@ pub enum RankMode {
     /// ` network-cost 999`, Chrome's own lever.
     #[serde(rename = "1")]
     Cost,
+    /// `route` (FR-148 P4 step 2): `1`, and the pair's route is the rank's
+    /// unit (`CarrierRank::route`): no pair from a local candidate off the mesh
+    /// to a remote on it, and the agent holds its mesh-route pairs while a
+    /// relay off the mesh can still come, [`ROUTE_HOLD`] at most.
+    #[serde(rename = "route")]
+    Route,
 }
 
 impl RankMode {
@@ -119,13 +125,19 @@ impl RankMode {
         Self::parse(tunnel_core::env::node_env("RC_CARRIER_RANK").as_deref())
     }
 
-    /// `0`, `prio` or `1`; anything else, unset included, reads `0`.
+    /// `0`, `prio`, `1` or `route`; anything else, unset included, reads `0`.
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some(v) if v.eq_ignore_ascii_case("prio") => Self::Prio,
             Some("1") => Self::Cost,
+            Some(v) if v.eq_ignore_ascii_case("route") => Self::Route,
             _ => Self::Off,
         }
+    }
+
+    /// Does a ranked-last candidate's line carry ` network-cost 999`?
+    pub fn signals_cost(self) -> bool {
+        matches!(self, Self::Cost | Self::Route)
     }
 
     pub fn is_off(&self) -> bool {
@@ -138,6 +150,7 @@ impl RankMode {
             Self::Off => "0",
             Self::Prio => "prio",
             Self::Cost => "1",
+            Self::Route => "route",
         }
     }
 }
@@ -296,15 +309,26 @@ impl RcOverlay {
     /// follow; with `mesh_last`, every local candidate on the mesh's own
     /// blocks or the derived-v6 ULA ([`footprint::is_overlay_addr`], never the
     /// whole CGNAT `/10`) ranks last.
+    ///
+    /// FR-148 P4 step 2 (D49): under `route` alone, the route rank too, with
+    /// the same addresses whatever the link ([`RouteRank::mesh`]): its one
+    /// predicate is what the follow gate, the checks above the selection, the
+    /// opening and the carrier record read. It refuses and holds pairs only
+    /// with `mesh_last` set as well.
     pub fn ice_rank(&self) -> Option<CarrierRank> {
         if self.carrier_rank.is_off() {
             return None;
         }
-        let mesh_last = self.mesh_last.then(|| {
+        let mesh = || {
             let nets = self.v4_nets.clone();
             Box::new(move |ip: IpAddr| footprint::is_overlay_addr(&nets, ip)) as MeshAddrFn
+        };
+        let mesh_last = self.mesh_last.then(mesh);
+        let route = (self.carrier_rank == RankMode::Route).then(|| RouteRank {
+            hold: ROUTE_HOLD,
+            mesh: mesh(),
         });
-        Some(CarrierRank { mesh_last })
+        Some(CarrierRank { mesh_last, route })
     }
 
     /// [`Self::ice_rank`], set on the session's `SettingEngine`.
@@ -1252,8 +1276,92 @@ mod tests {
         assert_eq!(RankMode::parse(Some("prio")), RankMode::Prio);
         assert_eq!(RankMode::parse(Some(" PRIO ")), RankMode::Prio);
         assert_eq!(RankMode::parse(Some("1")), RankMode::Cost);
-        for m in [RankMode::Off, RankMode::Prio, RankMode::Cost] {
+        assert_eq!(RankMode::parse(Some(" Route ")), RankMode::Route);
+        for m in [
+            RankMode::Off,
+            RankMode::Prio,
+            RankMode::Cost,
+            RankMode::Route,
+        ] {
             assert_eq!(RankMode::parse(Some(m.as_str())), m);
+        }
+    }
+
+    /// FR-148 P4 step 2: the route rank reaches ICE under `route` alone, with
+    /// the mesh's blocks ranked last as under `1`, and with its cost lever.
+    #[test]
+    fn only_route_hands_ice_the_route_rank() {
+        for mode in [RankMode::Prio, RankMode::Cost, RankMode::Route] {
+            let mut d = RcOverlay::resolve_ranked(true, None, mode, blocks());
+            d.mesh_last = true;
+            let rank = d.ice_rank().expect("rank mode");
+            assert!(rank.mesh_last.is_some(), "{mode}");
+            assert_eq!(rank.route.is_some(), mode == RankMode::Route, "{mode}");
+            if let Some(route) = rank.route {
+                assert_eq!(route.hold, ROUTE_HOLD);
+                assert!((route.mesh)(ip("100.65.4.34")), "the mesh's own block");
+            }
+            assert_eq!(mode.signals_cost(), mode != RankMode::Prio, "{mode}");
+        }
+        assert!(
+            RcOverlay::resolve_ranked(true, None, RankMode::Off, blocks())
+                .ice_rank()
+                .is_none()
+        );
+    }
+
+    /// FR-148 P4 step 2, A2: the route rank's addresses are the mesh's own
+    /// blocks and the ULA, on a direct link too, so its one predicate (which
+    /// the follow gate, the checks above the selection, the opening and the
+    /// carrier record read) takes an address of 100.64.0.0/10 outside them, a
+    /// carrier's CGNAT or a corporate VPN's, for a real path. Under `prio` and
+    /// `1` there is no route rank: the follow gate reads the whole range, as
+    /// built.
+    #[test]
+    fn a2_the_route_ranks_predicate_reads_the_mesh_blocks_not_the_whole_range() {
+        use webrtc::ice::agent::agent_config::rides_the_mesh;
+        // A relay allocated over UDP, off the mesh.
+        const UDP_RELAY: u32 = (1 << 8) * 65535 + 255;
+        let relay = |address| (UDP_RELAY, address);
+        for mesh_last in [true, false] {
+            let mut d = RcOverlay::resolve_ranked(true, None, RankMode::Route, blocks());
+            d.mesh_last = mesh_last;
+            let rank = d.ice_rank().expect("rank mode");
+            assert_eq!(rank.mesh_last.is_some(), mesh_last);
+            let route = rank.route.expect("route");
+            let rides = |(priority, local): (u32, &str), remote: &str| {
+                rides_the_mesh(&*route.mesh, priority, 1, local, remote)
+            };
+            let link = if mesh_last { "relayed" } else { "direct" };
+            assert!(
+                !rides(relay("203.0.113.7"), "100.80.1.2"),
+                "{link}: a carrier's CGNAT is a real path"
+            );
+            assert!(
+                rides(relay("203.0.113.7"), "100.65.4.33"),
+                "{link}: a mesh remote"
+            );
+            assert!(
+                rides(relay("203.0.113.7"), "fd72:6f6f:6d6c::6441:421"),
+                "{link}: the ULA"
+            );
+            assert!(
+                rides((255, "203.0.113.7"), "198.51.100.4"),
+                "{link}: ranked last"
+            );
+            assert!(
+                rides((0, "100.65.4.34"), "198.51.100.4"),
+                "{link}: a mesh local"
+            );
+            assert!(
+                !rides(relay("203.0.113.7"), "4a5b6c7d.local"),
+                "{link}: a name is no mesh address"
+            );
+        }
+        for mode in [RankMode::Prio, RankMode::Cost] {
+            let mut d = RcOverlay::resolve_ranked(true, None, mode, blocks());
+            d.mesh_last = true;
+            assert!(d.ice_rank().expect("rank mode").route.is_none(), "{mode}");
         }
     }
 

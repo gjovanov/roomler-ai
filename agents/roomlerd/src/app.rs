@@ -1320,7 +1320,7 @@ pub fn main() -> Result<()> {
             purge_after_daemon();
             if let Err(e) = res {
                 roomlerd::daemon_error::say(&e);
-                std::process::exit(1);
+                std::process::exit(roomlerd::daemon_error::exit_code(&e).unwrap_or(1));
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
             // relaunches only a non-zero exit). Diverges when it applies.
@@ -1780,7 +1780,9 @@ async fn daemon_main() -> Result<()> {
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
-        Command::AdoptEnrollment { from, take } => adopt_enrollment_cmd(&config_path, &from, &take),
+        Command::AdoptEnrollment { from, take } => {
+            adopt_enrollment_cmd(&config_path, &from, &take).map(|line| println!("{line}"))
+        }
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
             let action = match action {
@@ -3114,12 +3116,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 ///
 /// A `FILE` that does not parse is a refusal before anything is written, and
 /// so is a `--take` key outside the config surface. A `TARGET` that exists but
-/// does not load is not a refusal either — nothing can read it anyway — but it
-/// is never silently "absent": its last good copy (`.prev`) is folded into
-/// when that one loads, as the daemon itself would recover at its next start,
-/// the damaged file is kept as `.unreadable`, and both are said on stderr,
-/// which the setup wizard streams to the person
-/// ([`config::read_merge_base`]).
+/// does not load is not a refusal — nothing can read it anyway — but it is
+/// never silently "absent": its last good copy (`.prev`) is folded into when
+/// that one loads, as the daemon would at its next start, and the damaged file
+/// is kept as `.unreadable`; both are said on stderr, which the wizard streams
+/// ([`config::read_merge_base`]). The last line, returned, says what was there.
 ///
 /// The person's process enrolled with a machine id derived from the host
 /// name, since it could not read this file. When the server answered that
@@ -3128,7 +3129,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 /// and the overlay join refuses to share — is retired, so the daemon mints a
 /// fresh one, and the previous row is named for the operator
 /// ([`enrollment::retire_key_of_previous_row`]).
-fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
+fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<String> {
     let from_path = from.to_path_buf();
     let Some(fresh) = config::read_if_present(&from_path) else {
         bail!(
@@ -3152,15 +3153,15 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         taken.push((key.to_string(), entry.value));
     }
     let target = config_path.to_path_buf();
-    let existing = match config::read_merge_base(&target) {
-        config::MergeBase::Absent => None,
-        config::MergeBase::Loaded(cfg) => Some(cfg),
+    let (found, existing) = match config::read_merge_base(&target) {
+        config::MergeBase::Absent => (adopt_line::Found::Absent, None),
+        config::MergeBase::Loaded(cfg) => (adopt_line::Found::Loaded, Some(cfg)),
         config::MergeBase::Unreadable { reason, recovered } => {
             let kept = config::keep_unreadable(&target).map_err(|e| e.to_string());
             let said = config::describe_unreadable(&target, &reason, recovered.is_some(), &kept);
             tracing::warn!(path = %target.display(), %reason, recovered = recovered.is_some(), "adopt-enrollment: {said}");
             eprintln!("WARNING: {said}");
-            recovered
+            (adopt_line::Found::unreadable(&recovered, &kept), recovered)
         }
         // #3116 — closed to this process, not damaged: folding into nothing
         // would write a fresh config over the device's settings.
@@ -3175,7 +3176,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             let said = config::describe_not_private(&target, &reason);
             tracing::warn!(path = %target.display(), %reason, "adopt-enrollment: {said}");
             eprintln!("WARNING: {said}");
-            None
+            (adopt_line::Found::NotPrivate, None)
         }
     };
     let previous = existing.clone();
@@ -3223,7 +3224,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
     }
     .context("saving the adopted config")?;
     let what = match &outcome {
-        EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
+        EnrollOutcome::FreshPrimary => adopt_line::fresh_primary(&found),
         EnrollOutcome::RefreshedPrimary => {
             "folded into the existing config (same server + org; operator settings kept)"
                 .to_string()
@@ -3235,7 +3236,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         }
     };
     tracing::info!(path = %target.display(), ?outcome, taken = taken.len(), "enrollment adopted");
-    println!(
+    Ok(format!(
         "Enrollment adopted: {what}{}. Config written to: {}",
         if taken.is_empty() {
             String::new()
@@ -3251,8 +3252,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             )
         },
         target.display()
-    );
-    Ok(())
+    ))
 }
 
 /// rc.53 Phase 7 predicate: should the `--machine-global` enroll
@@ -3912,10 +3912,10 @@ async fn run_cmd(
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
     if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault, told apart by type and never by
-        // its words: a Windows worker records no crash for it, and (#4028) the
-        // service host's worker exits with its own code, so the host records none.
-        return Err(roomlerd::daemon_error::NoConfig::of_run(config_path, supervisor_flag).into());
+        // #4023 — the device's state, not a fault, told apart by type and never by its words:
+        // no crash is recorded for it, and a supervisor that reads 78 gets 78 (#4028, #4071).
+        let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+        return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
     }
     // Take the single-instance lock before doing anything else. If
     // another agent is already attached to this config (typically the
@@ -9046,9 +9046,13 @@ mod smoke_ffmpeg_tests {
 mod no_enrollment_exit_tests {
     use super::*;
 
-    /// `run_cmd` on a missing config, started as `run --supervisor <supervisor>`.
-    /// Its future is the whole daemon's, so it runs on a thread with room for it.
-    fn run_with_no_config(supervisor: Option<&'static str>) -> (PathBuf, Result<()>) {
+    /// `run_cmd` on a missing config, started as `run --supervisor <supervisor>`,
+    /// and with FR-43's `--supervised` when `supervised` (#4071). Its future is the
+    /// whole daemon's, so it runs on a thread with room for it.
+    fn run_with_no_config(
+        supervisor: Option<&'static str>,
+        supervised: bool,
+    ) -> (PathBuf, Result<()>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("config.toml");
         let path = missing.clone();
@@ -9060,7 +9064,7 @@ mod no_enrollment_exit_tests {
                     .build()
                     .expect("runtime")
                     .block_on(Box::pin(run_cmd(
-                        &path, None, false, false, supervisor, None, None,
+                        &path, None, supervised, false, supervisor, None, None,
                     )))
                     .map(|_| ())
             })
@@ -9086,7 +9090,7 @@ mod no_enrollment_exit_tests {
             (Some("task"), EXIT_CODE_OF_AN_ERR),
             (None, EXIT_CODE_OF_AN_ERR),
         ] {
-            let (missing, res) = run_with_no_config(supervisor);
+            let (missing, res) = run_with_no_config(supervisor, false);
             let (words, code) = step_outcome(&res);
             assert_eq!(code, want, "{supervisor:?}");
             assert_eq!(
@@ -9108,4 +9112,31 @@ mod no_enrollment_exit_tests {
             Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock"));
         assert_eq!(step_outcome(&fault).1, EXIT_CODE_OF_AN_ERR);
     }
+
+    /// #4071 — the GUI worker FR-43's macOS supervisor starts on a two-row Mac
+    /// (`run --supervised`, no `--unenrolled`) ends with the same code there, the
+    /// one platform where that flag proves the supervisor; anywhere else it
+    /// proves nothing, and the worker ends with 1, as it always has. The same
+    /// words either way.
+    #[test]
+    fn the_macos_supervisors_worker_with_no_config_ends_with_its_own_code_on_a_mac() {
+        let want = if cfg!(target_os = "macos") {
+            roomlerd::daemon_error::NO_ENROLLMENT_EXIT_CODE
+        } else {
+            EXIT_CODE_OF_AN_ERR
+        };
+        let (missing, res) = run_with_no_config(None, true);
+        let (words, code) = step_outcome(&res);
+        assert_eq!(code, want);
+        assert_eq!(
+            words,
+            Some(format!(
+                "no config found at {}. Run `roomlerd enroll` first.",
+                missing.display()
+            ))
+        );
+    }
 }
+
+/// #3589 — what the last line of `adopt-enrollment` says was at the target.
+mod adopt_line;

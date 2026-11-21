@@ -290,7 +290,7 @@ and the consent chain's fallbacks.
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:282-334`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
 | D5 | The setup wizard installs the daemon | ✅ | ✅ since 0.4.184 (FR-129 B1) | ✅ since 0.4.184 (FR-129 B1); the root half since 0.4.187 (B2) | Was: the tunnel client only on Linux and macOS (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offered it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`). *Since FR-129 B1:* the wizard has daemon roles on every OS (`agents/roomler-setup/src/role.rs:101-108`): on Linux the system daemon and the per-user one, on macOS the person's daemon, with the root half beside it when the private-network box is ticked (`role.rs:130`). Windows asks no server (`commands.rs:193`). On Linux and macOS a card shows only when the chosen server's switch for that OS is on (`commands.rs:285`, `features.rs:93`), and an install refuses without it (`orchestrator_unix.rs:349-361`). The server answers per OS on `GET /api/setup/features` from `[setup] wizard_linux_daemon` and `wizard_macos_daemon`, each default off (`crates/modules/fleet/src/setup_release.rs:218-231`, `crates/config/src/settings.rs:90`, `:94`). The enroll dialog and the homepages offer the wizard for an agent on that answer (`ui/src/utils/enrollCommands.ts:198-203`, `:290`). Field-verified on Ubuntu, Fedora KDE and macOS in [FR-129](FR-129-guided-cross-platform-installer.md) AC11, on 0.4.189 to 0.4.191 | P0c, D5, FR-129 B1, B2 |
-| D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4373`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
+| D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4411`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
 
 ### 2.5 SSH and Fleet RPC
 
@@ -310,7 +310,7 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1512`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1534-1541`) | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:275-301`, `:1793-1800`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1013-1022` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3738`, `session_end.rs:220`) | P4d |
@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2288-2303`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2316-2331`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -1032,7 +1032,7 @@ test of the SIGKILL property itself.
   off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
   carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
   `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
-  retired config keys (`crates/agent-core/src/config.rs:4373`), and the hidden `roomler hive hook`
+  retired config keys (`crates/agent-core/src/config.rs:4411`), and the hidden `roomler hive hook`
   (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
   It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
   that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,
@@ -1230,11 +1230,11 @@ model on Windows, so the three agree on what the mode means.
     - *Measured first, on a tart Mac (§8).* The child the supervisor reaps is `sudo`: `launchctl asuser` execs into
       it. `sudo` passes the worker's end through as its own, so the supervisor's wait status is the worker's.
     - *What counts.* Any signal but SIGTERM, SIGHUP and SIGINT (a logout, a closed terminal, a person), and any
-      exit code but 0 and the four the agent exits with on purpose: the Windows supervisor's list, less its
-      session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:271-295`). Exit code 9 is a restart someone
+      exit code but 0 and the five the agent exits with on purpose (78 since #4071): the Windows supervisor's list, less its
+      session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:275-301`). Exit code 9 is a restart someone
       asked for, and signal 9 is a kill. Only the wait status tells them apart, and a test holds that.
     - *Where it goes.* `WriterContext::Supervisor`, which off Windows is the writing process's own dir: the root
-      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:656-662`).
+      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:1793-1800`).
     - *Its tail* is the daemon's own log, as on Windows. The worker's stderr is the daemon's `StandardErrorPath`,
       which a signal death writes nothing to. Its rolling log is in the person's home, which a root daemon does not
       read, and nothing ties the two halves to one org.

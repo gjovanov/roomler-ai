@@ -73,15 +73,26 @@ jobs:
           mv target/debian/roomlerd_*.deb target/debian/roomler-desktop_*.deb built/
 
       - name: Install them on bare images and start them
-        run: bash scripts/deb-bare-check.sh --install-sh scripts/install.sh built/*.deb
+        # `reach` first: the containers' mirrors must resolve, through a public
+        # resolver if the runner's own cannot (#3710).
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh reach --containers && bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns --install-sh scripts/install.sh built/*.deb
 
       - name: Control — the check refuses a package known not to start
         # agent-v0.4.190 is #3204 itself: on Ubuntu 24.04 apt gives it a stub ALSA
         # and the daemon dies at load. A check that passed it would prove nothing.
+        # It must fail for THAT reason: a container that could not resolve its
+        # mirror fails too, and would pass this control vacuously (#3710).
         run: |
           gh release download agent-v0.4.190 -R "$GITHUB_REPOSITORY" -D control \
             -p "roomlerd-0.4.190-${{ matrix.triple }}.deb"
-          if bash scripts/deb-bare-check.sh --image ubuntu:24.04 control/*.deb; then
+          rc=0
+          bash scripts/deb-bare-check.sh --dns-file /tmp/ci-apt.docker-dns --image ubuntu:24.04 control/*.deb >control.log 2>&1 || rc=$?
+          cat control.log
+          if [ "$rc" -eq 0 ]; then
             echo "::error::the check passed a package that cannot start, so its passes mean nothing"
+            exit 1
+          fi
+          if [ "$rc" -eq 3 ] || ! grep -q '^DOES NOT START: roomlerd' control.log; then
+            echo "::error::the check failed (rc=$rc) for another reason than the package not starting, so this control proves nothing"
             exit 1
           fi

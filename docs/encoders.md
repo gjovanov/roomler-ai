@@ -405,20 +405,32 @@ Two stores hold the choice:
 | per device | `roomler-rc-codec.v1:<agent id>` = the value | at connect, for a pick made on this page (`codecConnectAction`, `:2458`; `persistCodecChoice`, `:2442`) | at connect, through the persist-free apply path (`readStoredCodecChoice`, `:2430`; `applyCodecChoiceSettings`, `:8269`); a value not in the list reads as no override |
 | per browser, the default of a device with no override of its own | the settings, in four keys: `roomler-rc-video-transport.v2`, `roomler-rc-vp9-chroma`, `roomler-rc-preferred-codec`, `roomler-rc-render-path` | by the picker's setter (`codecChoice`, `:8251`) | at page load: the dropdowns show `settingsToCodecChoice(transport, chroma)` (`:3962`), which reads an explicit chroma back on every transport that can carry it |
 
-⚠️ **The transport key's reader drops `data-channel-h264`** (`readStoredVideoTransport`,
-`:3063`). Every H.264 per-browser default (`h264`, `h264-444`, `h264-420`) therefore
-reads back as transport `auto` on a device with no override of its own. The chroma is a
-key of its own and survives, so an H.264 4:2:0 default runs the auto rank pinned to
-4:2:0; the codec does not survive. The device where the pick was made restores it from
-its own override. #3651 leaves the reader as it is: accepting the value would change
-what such a device opens with on upgrade, which waits for a decision.
+The transport key's reader, `readStoredVideoTransport`
+(`ui/src/composables/useRemoteControl.ts:3066`), checks the stored value against the one
+list of transports, `RC_VIDEO_TRANSPORTS` (`ui/src/composables/useRemoteControl.ts:3023`).
+The type `RcVideoTransport` derives from that list, as `RcCodecChoice` derives from
+`RC_CODEC_CHOICES`, so a transport added to the list is read back after a reload with
+no second edit. A value not in the list, or a page whose storage the browser refuses,
+reads as `auto`. The unit test round-trips every transport, and every choice with and
+without the H.264 RTP mapping, through a reload
+(`ui/src/__tests__/composables/useRemoteControl.videoTransport.spec.ts`).
+
+⚠️ **Until #4101 the reader dropped `data-channel-h264`.** It kept a hand-kept copy of
+the list, and every H.264 per-browser default (`h264`, `h264-444`, `h264-420`) read back
+as transport `auto` on a device with no override of its own: the chroma, a key of its
+own, survived, and the codec did not. #4101 stores nothing new. A stored
+`data-channel-h264` is the value every H.264 pick has written, and it now reads as
+itself, so after the upgrade such a device opens on H.264 instead of the auto rank. The
+key stays `roomler-rc-video-transport.v2` (`ui/src/composables/useRemoteControl.ts:3037`),
+because a new key would reset every stored pick.
 
 A page from before #3651 that reads what a newer page stored (a tab in a session does
 not reload, and a roll can go back) stays safe. The per-device `hevc-420` / `h264-420`
 read as no override there and stay stored. The per-browser keys hold only values that
 page knows: `hevc-420` shows as HEVC × Auto and still asks for 4:2:0, because connect
 reads the chroma key directly (`resolveChroma`, `:11663` for HEVC, `:11559` for H.264),
-and `h264-420` shows as Auto × Standard (4:2:0) and runs the auto rank at 4:2:0.
+and `h264-420` shows as Auto × Standard (4:2:0) and runs the auto rank at 4:2:0. A page
+from before #4101 still reads a stored `data-channel-h264` as `auto`, as it always did.
 
 ## The probe lifecycle
 
@@ -1679,7 +1691,7 @@ heuristics exist only to ration that cost
 ([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
 AIMD target to `FfmpegEncoder::set_bitrate`
 (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3018`), which snaps it to the
-ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
+ladder first (`encode/aimd.rs:503` — 100 k … 25 M, `coarsen_bitrate` at `:523`)
 and returns when the rung is the one already running. Only a rung crossing reaches
 the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
 

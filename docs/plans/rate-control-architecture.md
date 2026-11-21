@@ -45,7 +45,7 @@ indexed by `session_id`) — the only structured per-session record and the shad
    (`queue_max_age` 100 ms, `crates/tunnel-core/src/transport/derp.rs:64–77`). The rc.319
    interface filter (`peer.rs:345`, `is_overlay_iface` :9289) is a **no-op on Windows** — webrtc-util
    reports every adapter with name `""` (`webrtc-util-0.10.0/src/ifaces/ffi/windows/mod.rs:331–348`)
-   — and misses macOS `utunN`; srflx (`agent_gather.rs:797–831`) and remote candidates
+   — and misses macOS `utunN`; srflx (`agent_gather.rs:828–862`) and remote candidates
    (`peer.rs:1293–1342`) are never filtered; host↔host type-preference wins whenever it connects.
    #1237 is the same class: "any interface other than ours" (`tun.rs:2427–2472`).
 
@@ -112,8 +112,8 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | PR | delete | anchors | precondition |
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5106, 5088–5095, 6475–6522, 6533–6569, 6639–6644`; `encode/mod.rs:423–480` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7271–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `encode/mod.rs:509–520` | VT measured or kept on the settle rule |
-| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1259–1263`; `peer.rs:4826` | — (#3472 measured the divergence as a defect) |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7271–7285, 7706–7799`; `encoder.rs:2560–2770`; `aimd.rs:491–544`; `encode/mod.rs:509–520` | VT measured or kept on the settle rule |
+| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence): **done in #4061** (2026-11-19), the mirror-only hook deleted | `governor.rs:1386–1390`; `peer.rs:4826` | — (#3472 measured the divergence as a defect) |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
@@ -232,7 +232,7 @@ before B2: done in #4061).
    `status().overlay_ip/ip6` (`localapi/src/lib.rs:190–194`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:341–344`.
-2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:797–831`) — a 3-line
+2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:828–862`) — a 3-line
    addition to the already-forked webrtc-ice (`webrtc-ice.patch`, `--regen`) applying `ip_filter`
    to `xoraddr.ip` at :744, plus a belt at the signaling hop `peer.rs:737–753`.
 3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1293–1342`), after mDNS resolution:
@@ -240,7 +240,7 @@ before B2: done in #4061).
    query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
    `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:1004–1013`).
 
-Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:247`)
+Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:282`)
 and in the FR-35 memory key (`peer.rs:4785` → `"{ip}|{class}"`, which fixes "a fast day carried
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost

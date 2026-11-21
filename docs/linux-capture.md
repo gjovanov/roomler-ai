@@ -560,7 +560,7 @@ On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
 `ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3589`,
-`virtual_desktop.rs:1957`) starts an X server at
+`virtual_desktop.rs:1971`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
 (FR-108 P2, `docs/display-match.md`), else Xvfb — with the window manager named by
@@ -686,11 +686,11 @@ FR-122 §8). `agents/roomlerd/src/virtual_desktop.rs` now holds five rules:
 
 | Rule | What it means | Where |
 |---|---|---|
-| **No hardware vendor's EGL inside the server** | The server is a software framebuffer. The crashed one had NVIDIA's EGL mapped beside Mesa's DRI shim and had aborted with `double free or corruption (out)`. The likely path, read from those mappings: its GLX goes through the shim, the shim lists its configurations through EGL, and glvnd hands that call to the first vendor file it finds, which is NVIDIA's `10_nvidia.json`, ahead of `50_mesa.json`. Installing Mesa's EGL beside NVIDIA's changed nothing, and neither did `__GLX_VENDOR_LIBRARY_NAME`. So Xvfb and Xorg are both started with `__EGL_VENDOR_LIBRARY_FILENAMES` naming Mesa's vendor file and nothing else. On a host that has vendor files and none of Mesa's (the g5g's image as shipped) that is Mesa's usual path, which is not there: with no vendor at all the server starts and still lists GLX. A host with no vendor file where glvnd looks by default is left as it was. The window manager and the apps are clients and are not pinned | `egl_vendor_pin` `:2108` |
-| **"Up" means it answers, and it is ours** | The start waits until the server answers an X11 connection setup, for 15 s at most, and fails at once when the server exits. A socket is not enough: the server makes it before it initialises its extensions, which is where the g5g's died. An answer is not enough either: the display keeps its number, so another server can be on it between two of ours, and the display's lock has to name this server before its answer counts. Xvfb now runs with `-noreset`, as Xorg already did, so that this first client leaving does not reset the server | `wait_display_ready` `:2555`, `x_answers` `:2303`, `xvfb_args` `:2436` |
-| **Its exit is noticed, and it comes back** | A thread waits for the server's exit, takes the rest of the tree down, clears the lock a killed server leaves behind, and starts the desktop again on the **same display**, since `DISPLAY` is exported once. The delay is 1 s after an exit, and doubles with every start that fails or lasts under a minute, up to 5 min. The desktop's keeper (§2.3) is waited for with the server, and its exit takes the desktop down and brings it back the same way | `supervise` `:1705`, `Backoff` `:1795`, `remove_stale_lock` `:2049`, `wait_desktop_exit` `:1888` |
-| **Its last words are kept** | The server's stderr used to go to `/dev/null`. Its last 4 KiB now reach the daemon log when it exits or does not come up (`said=…`), beside how it ended (`signal 6 (aborted), core dumped`). They stay in the log: the reason a controller is shown never carries them | `StderrTail` `:2169`, `wait_exit` `:1945` |
-| **A broken desktop never stops the daemon** | Missing binaries, or a server that will not come up, used to end the daemon's start, and with it the machine's overlay and SSH. The daemon now runs without a desktop, says why, and keeps trying: installing the missing package is enough, with no restart. What a broken desktop can still cost is time, once: the first start is waited for, 15 s a server at most | `start` `:1672` |
+| **No hardware vendor's EGL inside the server** | The server is a software framebuffer. The crashed one had NVIDIA's EGL mapped beside Mesa's DRI shim and had aborted with `double free or corruption (out)`. The likely path, read from those mappings: its GLX goes through the shim, the shim lists its configurations through EGL, and glvnd hands that call to the first vendor file it finds, which is NVIDIA's `10_nvidia.json`, ahead of `50_mesa.json`. Installing Mesa's EGL beside NVIDIA's changed nothing, and neither did `__GLX_VENDOR_LIBRARY_NAME`. So Xvfb and Xorg are both started with `__EGL_VENDOR_LIBRARY_FILENAMES` naming Mesa's vendor file and nothing else. On a host that has vendor files and none of Mesa's (the g5g's image as shipped) that is Mesa's usual path, which is not there: with no vendor at all the server starts and still lists GLX. A host with no vendor file where glvnd looks by default is left as it was. The window manager and the apps are clients and are not pinned | `egl_vendor_pin` `:2460` |
+| **"Up" means it answers, and it is ours** | The start waits until the server answers an X11 connection setup, for 15 s at most, and fails at once when the server exits. A socket is not enough: the server makes it before it initialises its extensions, which is where the g5g's died. An answer is not enough either: the display keeps its number, so another server can be on it between two of ours, and the display's lock has to name this server before its answer counts. Xvfb now runs with `-noreset`, as Xorg already did, so that this first client leaving does not reset the server | `wait_display_ready` `:2907`, `x_answers` `:2655`, `xvfb_args` `:2788` |
+| **Its exit is noticed, and it comes back** | A thread waits for the server's exit, takes the rest of the tree down, clears the lock a killed server leaves behind, and starts the desktop again on the **same display**, since `DISPLAY` is exported once. The delay is 1 s after an exit, and doubles with every start that fails or lasts under a minute, up to 5 min. The desktop's keeper (§2.3) is waited for with the server, and its exit takes the desktop down and brings it back the same way | `supervise` `:2017`, `Backoff` `:2147`, `remove_stale_lock` `:2401`, `wait_desktop_exit` `:2240` |
+| **Its last words are kept** | The server's stderr used to go to `/dev/null`. Its last 4 KiB now reach the daemon log when it exits or does not come up (`said=…`), beside how it ended (`signal 6 (aborted), core dumped`). They stay in the log: the reason a controller is shown never carries them | `StderrTail` `:2521`, `wait_exit` `:2297` |
+| **A broken desktop never stops the daemon** | Missing binaries, or a server that will not come up, used to end the daemon's start, and with it the machine's overlay and SSH. The daemon now runs without a desktop, says why, and keeps trying: installing the missing package is enough, with no restart. What a broken desktop can still cost is time, once: the first start is waited for, 15 s a server at most | `start` `:1971` |
 
 ```mermaid
 stateDiagram-v2
@@ -721,11 +721,11 @@ person coming back to the screen.
 for the server and the desktop's keeper together, `wait_desktop_exit`, never
 `P_ALL`: the daemon's other children keep their statuses for their own
 waiters). The dead server keeps its pid, and the
-desktop's process group id with it, until `kill_tree_with` (`:664`) has sent
+desktop's process group id with it, until `kill_tree_with` (`:839`) has sent
 its last signal: rule 1 of the teardown below. `Child::wait` would free both
 numbers while the window manager is still to be signalled through them. And
 every child is spawned and recorded under the one lock that a graceful exit
-sets `stopping` under (`spawn_server` `:1102`), so `teardown` either kills a
+sets `stopping` under (`spawn_server` `:1365`), so `teardown` either kills a
 child or the child is never started.
 
 ⚠️ **A stop is told from an exit by time, never by a signal listener**
@@ -739,7 +739,7 @@ a `SIGTERM` landing between the two would be swallowed, and the daemon would
 run on. `terminate_signal` (`agents/roomlerd/src/app.rs:3672`) is the daemon's
 only one (`STOP_GRACE`'s comment, `agents/roomlerd/src/virtual_desktop.rs:1010-1016`).
 
-**Xorg's directory is made, never adopted** (`private_dir` `:2343`). It
+**Xorg's directory is made, never adopted** (`private_dir` `:2695`). It
 sits under the temp directory, so it is created with mode 0700 in one step and
 reused only when it already is this user's own and closed to everyone else;
 anything else found at its path is removed first, and no step follows a link.
@@ -760,8 +760,13 @@ environment as it is.
   died are as they were before [#3665](https://github.com/gjovanov/roomler-ai/issues/3665):
   one that exits stays uncollected until the server next exits or the daemon
   stops, and such a descendant is out of the teardown's reach, the #1684 class.
-  The window manager is started once per server: one that exits is collected
-  and logged, not started again.
+  There the window manager is also started once per server: one that exits is
+  not started again ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099),
+  decision D1).
+- Where the keeper runs, a window manager that exits while its server runs is
+  started again ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099),
+  §2.3), and what it had set up is not all brought back: §2.3, *What a start
+  of the window manager again does not bring back*.
 - Display match's mode after a restart: the new server starts at the
   configured size.
 - A session that was open when the server exited is told and keeps no input
@@ -783,7 +788,7 @@ environment as it is.
   desktop and type into the other:
   [#3945](https://github.com/gjovanov/roomler-ai/issues/3945).
 
-**Proven** by `virtual_desktop::supervise_tests` (`:3510`): stand-in servers
+**Proven** by `virtual_desktop::supervise_tests` (`:3977`): stand-in servers
 that die or hang, a display that someone else's server answers on, a lock and
 a directory that are not ours, all in every Linux unit run; and on the CI Xvfb
 lane a real Xvfb that is SIGKILLed and is back on the same display, on a new
@@ -859,15 +864,59 @@ flowchart TD
 
 | Rule | What it means | Where |
 |---|---|---|
-| **Ready before the job** | The keeper checks that it is in a process group of the desktop's own (not the daemon's), makes itself a child subreaper, arms its signals and says `ready` on stderr. Only then does the daemon write the job, one JSON line: display, group, window manager, apps, grace. A keeper the daemon gives up on never had a job and started nothing; it is SIGKILLed and collected before its input ends, and leaves the tree in the same step. So a keeper whose input ends before its job, whose parent changed, or that has had no job for 15 s is one whose daemon left between `ready` and the job, or was stopped for that long (SIGSTOP, a debugger, a freezer): it takes the whole desktop down, with the job's grace of 1.5 s, as it does once it has its job. A daemon that was only stopped loses the desktop it was starting, and its supervisor starts it again | `run` `virtual_desktop/keeper.rs:643`, `JOB_WAIT` `virtual_desktop/keeper.rs:133`, `start_keeper` `virtual_desktop.rs:1749`, `discard_keeper` `virtual_desktop.rs:1419` |
-| **Its clients get what the daemon's got** | Environment, working directory, umask, ignored and blocked signals (a SIGHUP the daemon ignores under `nohup` stays ignored), process group, session and descriptors; stdin, stdout and stderr are `/dev/null` on both paths. Their parent is the one difference | `arm_signals` `virtual_desktop/keeper.rs:298`, `Book::start` `virtual_desktop/keeper.rs:429` |
-| **Nothing that exits stays a zombie** | It waits for every child it has, its own and adopted. `waitpid(-1)` is right there, because all its children are the desktop's. The daemon still waits for one pid at a time | `Book::reap` `virtual_desktop/keeper.rs:447` |
-| **Its input is the lifeline** | Only the daemon holds the write end, write-only and close-on-exec. The daemon's teardown drops it just before it signals the tree, and a daemon that dies closes it. The keeper then ends everything under it and every other member of the desktop's group, the X server included, and leaves. A parent that changed means the same: the daemon died while something else held the write end | `serve` `virtual_desktop/keeper.rs:730`, `kill_recorded_tree` `virtual_desktop.rs:1450` |
-| **SIGTERM alone ends what it started, then it waits** | A service manager's stop signals every process of the unit at once. On SIGTERM alone the keeper ends its own children and waits up to 10 s for its input to end, so the supervisor sees no exit to report and the daemon's teardown finds it | `serve`, `LINGER` `virtual_desktop/keeper.rs:98` |
-| **Its teardown loops** | SIGTERM, a grace of 1.5 s, SIGKILL, collect; then again with no grace while a child is left, such as an orphan adopted during a pass. At most about 4.5 s | `teardown_with` `virtual_desktop/keeper.rs:617` |
-| **It signals only the desktop's** | Never pid 0, 1 or -1, itself or the daemon, and never a group, since it is a member of the desktop's. A pid that is not its own child is signalled only after its `/proc` start time matches the snapshot that selected it | `may_signal` `virtual_desktop/keeper.rs:192`, `KeeperProcs` `virtual_desktop/keeper.rs:560` |
-| **Quiet about what a stop or a death caused** | An exit of the window manager or an app is held for 2 s and said only while the X server still runs. A service manager's stop and an X server's death end those clients first, and neither is news. One false notice is left: an X server that closes its clients' connections and then takes over 2 s to exit. A server that has exited reads as not running, a zombie or reaped, and its pid cannot come back as another process while the keeper lives, because the keeper's membership holds the group's number | `Book::say_notices` `virtual_desktop/keeper.rs:496` |
-| **Its exit is the desktop's failure** | Once it has its job, the keeper's exit takes the desktop down and brings it back with the supervisor's backoff, as the server's exit does, never with a start on top. The reason reads `its keeper process (vd-keeper) exited: …`. A job it refuses (one it cannot read, or one for another group) is logged first, as a warning with its reason, `virtual-desktop vd-keeper: refused: …`, because the supervisor's warning names only the exit code | `supervise` `virtual_desktop.rs:2003`, `Gone` `virtual_desktop.rs:2205`, `keeper_line` `virtual_desktop.rs:1933` |
+| **Ready before the job** | The keeper checks that it is in a process group of the desktop's own (not the daemon's), makes itself a child subreaper, arms its signals and says `ready` on stderr. Only then does the daemon write the job, one JSON line: display, group, window manager, apps, grace, and the window manager's restart delays (#4099; a job without them gets the X server's). A keeper the daemon gives up on never had a job and started nothing; it is SIGKILLed and collected before its input ends, and leaves the tree in the same step. So a keeper whose input ends before its job, whose parent changed, or that has had no job for 15 s is one whose daemon left between `ready` and the job, or was stopped for that long (SIGSTOP, a debugger, a freezer): it takes the whole desktop down, with the job's grace of 1.5 s, as it does once it has its job. A daemon that was only stopped loses the desktop it was starting, and its supervisor starts it again | `run` `virtual_desktop/keeper.rs:806`, `JOB_WAIT` `virtual_desktop/keeper.rs:149`, `start_keeper` `virtual_desktop.rs:1760`, `discard_keeper` `virtual_desktop.rs:1430` |
+| **Its clients get what the daemon's got** | Environment, working directory, umask, ignored and blocked signals (a SIGHUP the daemon ignores under `nohup` stays ignored), process group, session and descriptors; stdin, stdout and stderr are `/dev/null` on both paths. Their parent is the one difference | `arm_signals` `virtual_desktop/keeper.rs:343`, `Book::start` `virtual_desktop/keeper.rs:532` |
+| **Nothing that exits stays a zombie** | It waits for every child it has, its own and adopted. `waitpid(-1)` is right there, because all its children are the desktop's. The daemon still waits for one pid at a time | `Book::reap` `virtual_desktop/keeper.rs:602` |
+| **Its input is the lifeline** | Only the daemon holds the write end, write-only and close-on-exec. The daemon's teardown drops it just before it signals the tree, and a daemon that dies closes it. The keeper then ends everything under it and every other member of the desktop's group, the X server included, and leaves. A parent that changed means the same: the daemon died while something else held the write end | `serve` `virtual_desktop/keeper.rs:893`, `kill_recorded_tree` `virtual_desktop.rs:1461` |
+| **SIGTERM alone ends what it started, then it waits** | A service manager's stop signals every process of the unit at once. On SIGTERM alone the keeper ends its own children and waits up to 10 s for its input to end, so the supervisor sees no exit to report and the daemon's teardown finds it | `serve`, `LINGER` `virtual_desktop/keeper.rs:105` |
+| **Its teardown loops** | SIGTERM, a grace of 1.5 s, SIGKILL, collect; then again with no grace while a child is left, such as an orphan adopted during a pass. At most about 4.5 s | `teardown_with` `virtual_desktop/keeper.rs:780` |
+| **It signals only the desktop's** | Never pid 0, 1 or -1, itself or the daemon, and never a group, since it is a member of the desktop's. A pid that is not its own child is signalled only after its `/proc` start time matches the snapshot that selected it | `may_signal` `virtual_desktop/keeper.rs:237`, `KeeperProcs` `virtual_desktop/keeper.rs:723` |
+| **A window manager that exits is started again** ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099)) | While the X server runs, the keeper starts it again through the same `spawn_client` as its first start, so it gets what the first got, after the X server's own backoff: 1 s after the exit at first, doubling with each exit to 5 min, and 1 s again after one that ran a minute (a job's floor is never under 100 ms). One that cannot be started, its file gone or not executable, is tried at the same delays, and a failed start never starts them over. An exit only schedules the start. The start runs at the loop's tail and looks then, not at the exit, at the keeper's teardown and at the X server, the group's leader: an exit in a teardown starts nothing, and a start that comes due in one, or while the server is not running, is dropped, never left due, so no `poll` turns into a loop of 0 ms ones. Each attempt writes at most one line, a WARN: the exit's, held as the next row says, `virtual-desktop vd-keeper: the window manager (<pid>) exited: <how> — it is started again <delay> after its exit`, or a failed start's, at once, `virtual-desktop vd-keeper: the window manager <path> failed to start: <error> — it is tried again in <delay>`. A start that works says nothing of its own | `Book::start_wm` `virtual_desktop/keeper.rs:547`, `Book::start_wm_when_due` `virtual_desktop/keeper.rs:576`, `WmDelays` `virtual_desktop/keeper.rs:469`, `Book::wait_ms` `virtual_desktop/keeper.rs:593` |
+| **Quiet about what a stop or a death caused** | An exit of the window manager or an app is held for 2 s and said only while the X server still runs. A service manager's stop and an X server's death end those clients first, and neither is news. One false notice is left: an X server that closes its clients' connections and then takes over 2 s to exit. The window manager's start does not wait for this hold, so such a server also gets one start of the window manager, which fails on the dying display at once; the next delay, twice as long, finds the server gone. A server that has exited reads as not running, a zombie or reaped, and its pid cannot come back as another process while the keeper lives, because the keeper's membership holds the group's number | `Book::say_notices` `virtual_desktop/keeper.rs:659` |
+| **Its exit is the desktop's failure** | Once it has its job, the keeper's exit takes the desktop down and brings it back with the supervisor's backoff, as the server's exit does, never with a start on top. The reason reads `its keeper process (vd-keeper) exited: …`. A job it refuses (one it cannot read, or one for another group) is logged first, as a warning with its reason, `virtual-desktop vd-keeper: refused: …`, because the supervisor's warning names only the exit code | `supervise` `virtual_desktop.rs:2017`, `Gone` `virtual_desktop.rs:2219`, `keeper_line` `virtual_desktop.rs:1947` |
+
+**A window manager's exit, and its start again**
+([#4099](https://github.com/gjovanov/roomler-ai/issues/4099)). The keeper is
+the only process that can start it again: the window manager is its child, so
+only the keeper can wait for it, and one the daemon started would sit outside
+the keeper, its orphans out of reach again. The delays are per keeper, so a
+new X server starts them over.
+
+```mermaid
+flowchart TD
+    E["the window manager exits, and the keeper collects it"] --> T{"tearing down?"}
+    T -->|yes| N["nothing: no start, no line"]
+    T -->|no| S["the next delay: 1 s, doubling to 5 min, 1 s again after a run of a minute; the exit's line held 2 s"]
+    S --> P["poll until the start is due, 1 s at most a wake"]
+    P --> D{"due: tearing down, or the X server not running?"}
+    D -->|yes| R["dropped, never left due"]
+    D -->|no| SP["spawn_client, as the first start"]
+    SP -->|started| OK["no line of its own"]
+    SP -->|failed| F["one WARN with the error, then the next delay"]
+    F --> P
+```
+
+| What happened | What becomes of the window manager's exit |
+|---|---|
+| The X server died first (a crash, the OOM killer, SIGKILL) | The server is a zombie before its clients see their I/O error, so a start that comes due finds it not running and is dropped. The supervisor ends the keeper after its stop grace, at most 1 s, its input first |
+| A stop (`systemctl stop`, a restart, a self-update) | The service manager's SIGTERM reaches the keeper before a 1 s delay ends, and the daemon's teardown then ends its input: nothing starts |
+| The window manager first, its server later, with no stop | A server that closes its clients' connections and outlives the delay gets one start, which fails on its dying display at once; the next delay, doubled, finds the server gone |
+| The window manager alone: a crash, a `kill`, the OOM killer | Started again after its delay |
+
+**What a start of the window manager again does not bring back:**
+
+- A window that maps while the new window manager starts can stay without a
+  frame, the map race of §2: the nudge runs only after the desktop's first
+  start of its clients (`nudge_wm_after_startup`, `virtual_desktop.rs:1748`).
+  Windows already mapped are taken over and framed again.
+- A window manager setting that names a session (`xfce4-session`,
+  `openbox-session`) runs that session's autostart again.
+- A person's own *Exit* from the window manager's menu is undone: it is
+  started again after its delay.
+- A window manager a person starts with `--replace` takes over, and each start
+  of the configured one then exits at once, at the backoff, up to 12 an hour,
+  for the desktop's life (decision D2: kept trying, as the X server is).
+- The startup apps are never started again.
 
 **When the daemon starts the clients itself**, as before #3665, what the apps
 leave behind is out of the teardown's reach again. The log says so at every
@@ -875,16 +924,24 @@ start:
 
 | Case | The daemon's log |
 |---|---|
-| The kill switch `ROOMLERD_VIRTUAL_DESKTOP_KEEPER=0` (`virtual_desktop.rs:1062`) | nothing: the start of 0.4.221, except that the clients get `/dev/null` on stdin |
+| The kill switch `ROOMLERD_VIRTUAL_DESKTOP_KEEPER=0` (`virtual_desktop.rs:1073`) | nothing: the start of 0.4.221, except that the clients get `/dev/null` on stdin |
 | The keeper refuses: not in a group of the desktop's own, no subreaper (a seccomp filter or an old kernel refuses `PR_SET_CHILD_SUBREAPER`), or its signals cannot be armed | WARN `virtual-desktop: no vd-keeper — …`, with `why=it refused: …` |
 | Not ready within 5 s | the same WARN, `why=it did not say it was ready within 5s` |
-| Two keepers in a row that exited by themselves within a minute of their desktop's start, or two that were not ready in time with none ready between them | WARN `no vd-keeper for the rest of this daemon's life, after two keepers in a row exited by themselves within a minute of their desktop's start, or two were not ready in time with none ready between them`. These are two counts, and one of each turns nothing off. Early exits (`KeeperStrikes` `virtual_desktop.rs:2175`) start again after a keeper or a desktop that ran longer. Readiness timeouts (`keeper_slow` `virtual_desktop.rs:1249`) start again only at a `ready`, so a refusal between two timeouts does not reset them. The next daemon tries again |
+| Two keepers in a row that exited by themselves within a minute of their desktop's start, or two that were not ready in time with none ready between them | WARN `no vd-keeper for the rest of this daemon's life, after two keepers in a row exited by themselves within a minute of their desktop's start, or two were not ready in time with none ready between them`. These are two counts, and one of each turns nothing off. Early exits (`KeeperStrikes` `virtual_desktop.rs:2189`) start again after a keeper or a desktop that ran longer. Readiness timeouts (`keeper_slow` `virtual_desktop.rs:1260`) start again only at a `ready`, so a refusal between two timeouts does not reset them. The next daemon tries again |
+
+On this path a window manager that exits is not started again
+([#4099](https://github.com/gjovanov/roomler-ai/issues/4099), decision D1): the
+daemon starts the clients once per server and waits on the server alone, so the
+window manager's exit stays a zombie, unlogged, until the server next exits or
+the daemon stops. Starting it again there would take a reap in the daemon
+outside the teardown, against the teardown's first rule, no reap before the
+last signal (§2.2).
 
 A stop that lands while a keeper starts leaves nothing behind. Before the keeper
 has its job, nothing is started, neither the keeper's clients nor the daemon's,
 and a keeper the stop ended then is logged at INFO, never as a warning:
 `virtual-desktop: the desktop is stopping, and its vd-keeper with it`
-(`start_clients` `virtual_desktop.rs:1702`). Once the job is sent, the keeper
+(`start_clients` `virtual_desktop.rs:1713`). Once the job is sent, the keeper
 may already have started the window manager and the apps; the stop then ends
 them with the rest of the desktop, within its usual bound, and logs nothing more.
 
@@ -938,6 +995,11 @@ app that exit are collected; a killed daemon leaves nothing of its desktop,
 also while something else holds the keeper's input, and one that left before
 the job takes the desktop with it; a stop and an X server's death add no
 warning, and a window manager that exits while its server runs is reported;
+such a window manager is started again after its delay, by the keeper and with
+what the first one got, its delays double to their ceiling and start over after
+a run past the stable time, one that cannot be started is tried at the same
+delays, and none is started in a stop, in the daemon's teardown, or onto a
+server that is gone or dying (#4099, the production numbers pinned);
 nothing reaches a keeper's input before its `ready`; a keeper that is slow,
 refuses or exits early falls back as the tables say; and a client sees the
 same on both paths. The issue's three
@@ -1056,15 +1118,15 @@ two issues.
 and on master the supervisor warned about that exit at every stop. The
 supervisor now waits a stop grace after any exit before it tells or takes
 anything down (`STOP_GRACE`, `virtual_desktop.rs:1018`;
-`wait_unless_stopping`, `:1529`, is the wait that `stop` wakes). A stop inside
+`wait_unless_stopping`, `:1540`, is the wait that `stop` wakes). A stop inside
 it logs one `INFO` line, "exited as the daemon stops", with the server's kind
-and its exit, and tells nobody (`:2031-2043`). Nothing of the desktop's tree is
+and its exit, and tells nobody (`:2045-2057`). Nothing of the desktop's tree is
 touched while it waits, so the stop finds every child recorded. The grace is
 carved out of the restart delay, so the desktop is back no later than before.
 It covers a keeper's exit the same way (§2.3), while the X server is still up:
 a session keeps a live picture for that second, and is told after it. An exit
 nobody asked for is still warned once, after the grace and the teardown
-(`:2060-2088`).
+(`:2074-2102`).
 
 **The clipboard worker follows.** It is one worker per daemon life
 (`Clipboard::shared`, `agents/roomlerd/src/clipboard.rs:459`), and arboard keeps
@@ -1610,7 +1672,7 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3817`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1513`; `set_output_cap`, `drm_backend.rs:1742` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3999`, `:6752`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1513`; `set_output_cap`, `drm_backend.rs:1742` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
 | **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:713`; `band_threads`, `drm_backend.rs:741` | `ROOMLERD_DRM_THREADS=1` |
 | **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1618` | — (a timing fix) |
 | **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:152` | `ROOMLERD_DRM_GPU=0` |
@@ -2839,7 +2901,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1170-1257`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3218-3228`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3256-3266`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -2924,7 +2986,7 @@ is still in its file (`scripts/code-map-audit.sh`).
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener; #3671: a capture whose X server went away answers no frame and says so once (`connection_lost`), and a damage watcher on a dead connection stays blind (`blind`) |
 | `agents/roomlerd/src/capture/x11_cursor.rs` | FR-97 P3a: the X11 pointer for the cursor channel (`X11Cursor::open`, `publish`), its shape (`shape_of`) and its CSS keyword (`css_for`) |
 | `agents/roomlerd/src/virtual_desktop.rs` | the X server + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` (`start`); #3643: the server's EGL vendor (`egl_vendor_pin`), "it answers" (`wait_display_ready`), the supervisor (`supervise`) and why the desktop is down (`down`); the teardown (`teardown`, `kill_tree_with`); #3665: the daemon's side of the desktop's keeper (`start_keeper`, `discard_keeper`, `wait_desktop_exit`, `KeeperStrikes`, the kill switch in `Plan`); #3671: the desktop's X server generation (`generation`, `x_server_now`), the stop grace (`STOP_GRACE`, `wait_unless_stopping`), the sessions marked and told (`sessions_told`, `sessions_to_tell`) and the retires of the shared pipelines (`retire_if`) |
-| `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, collects what exits and takes the desktop down when its input ends (`run`, `serve`, `teardown_with`, `may_signal`) |
+| `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, starts a window manager that exits again with the X server's backoff (#4099), collects what exits and takes the desktop down when its input ends (`run`, `serve`, `Book::start_wm`, `teardown_with`, `may_signal`) |
 | `agents/roomlerd/src/media_share.rs` | #3671: the shared pipelines retired with the desktop's X server (`retire_all`); #3918: a joiner under a marked owner (`try_join`), from what the owner published (`names_a_capture_off_x`) |
 | `agents/roomlerd/src/input/x_follow.rs` | #3918: the X11 injector's follow (`gate`, `let_go`, `opened_under`) and its kill switch (`enabled`); the marks (`no_picture`) and who is left behind (`Sessions`) |
 | `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`); FR-93 P4c's warm-up (`warm`) and its kill switch (`warm_on`); #4069: the wait for a planned automatic capture (`awaits_automatic_capture`), the one prediction it and the caps' word share (`automatic_uinput_planned`), and the capture's live edge (`live_edge`, `CaptureLive`) |

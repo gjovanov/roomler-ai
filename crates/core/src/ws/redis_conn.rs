@@ -522,6 +522,7 @@ mod tests {
                 url: "redis://r:6379".to_string(),
                 response_timeout_ms,
                 connection_timeout_ms,
+                subscriber_probe_ms: 15_000,
             })
         };
         assert_eq!(

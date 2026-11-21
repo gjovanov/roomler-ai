@@ -73,6 +73,14 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "rc_relay_total": RC_RELAY_TOTAL.load(Ordering::Relaxed),
             "rc_slot_claim_failed_total": RC_SLOT_CLAIM_FAILED_TOTAL.load(Ordering::Relaxed),
             "rc_slot_full_total": RC_SLOT_FULL_TOTAL.load(Ordering::Relaxed),
+            // #3952 — each Redis subscriber's probe of its own connection,
+            // since boot: on a Redis that answers, `heard` keeps up with
+            // `sent` and `missed` and `deaf` stay 0.
+            "subscriber_probes": {
+                "fanout": SUB_PROBE_FANOUT.totals(),
+                "bus": SUB_PROBE_BUS.totals(),
+                "turn": SUB_PROBE_TURN.totals(),
+            },
         },
         "local": {
             // FR-69 P7b — fleet's and network's gauges; zero when a module

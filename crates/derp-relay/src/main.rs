@@ -389,11 +389,39 @@ async fn collect_turn_usage(url: String, usage: Arc<TurnUsage>) {
     }
 }
 
+/// #3952 — the most the statistics subscription waits for this PoP's Redis
+/// to answer its connect (TCP and the handshake) or one PSUBSCRIBE: the
+/// server's own defaults for #3840's two bounds. The relay has no Redis
+/// settings. A Redis that takes the connection and never answers then costs
+/// this and a retry, never a subscriber parked for as long as the socket
+/// lives. Unlike the server's subscribers, this one does not probe its own
+/// connection: its Redis runs on the same host, so a connection gone deaf
+/// there is a frozen Redis, which coturn cannot publish to either.
+const STATS_REDIS_BOUND: Duration = Duration::from_secs(3);
+
+/// `fut` within [`STATS_REDIS_BOUND`]; elapsed, an io `TimedOut` error that
+/// names the step, so the failed line says what got no answer.
+async fn within_stats_bound<T>(
+    step: &str,
+    fut: impl std::future::Future<Output = redis::RedisResult<T>>,
+) -> redis::RedisResult<T> {
+    match tokio::time::timeout(STATS_REDIS_BOUND, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "no answer within {} ms ({step})",
+                STATS_REDIS_BOUND.as_millis()
+            ),
+        ))),
+    }
+}
+
 async fn subscribe_turn_usage(url: &str, usage: &TurnUsage) -> Result<(), redis::RedisError> {
     let client = redis::Client::open(url)?;
-    let mut pubsub = client.get_async_pubsub().await?;
+    let mut pubsub = within_stats_bound("connect", client.get_async_pubsub()).await?;
     for channel in turn_stats::CHANNELS {
-        pubsub.psubscribe(channel).await?;
+        within_stats_bound(&format!("PSUBSCRIBE {channel}"), pubsub.psubscribe(channel)).await?;
     }
     info!("derp-relay: subscribed to coturn's statistics");
     let mut stream = pubsub.on_message();
@@ -1770,5 +1798,51 @@ mod tests {
             serde_json::from_str(&reqwest_lite(plain, "/stats").await).unwrap();
         assert!(v["turn_usage"].is_null(), "no totals kept, no marker: {v}");
         assert_eq!(get_lite(plain, "/stats/turn-usage", Some(&ok)).await.0, 404);
+    }
+
+    /// #3952 (T6) — a Redis that takes the connection and never answers fails
+    /// the statistics subscription within the bound, so the loop tries again,
+    /// instead of waiting in the handshake for as long as the socket lives.
+    #[tokio::test]
+    async fn a_statistics_subscribe_to_a_silent_listener_gives_up_within_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Taken, never read, never answered, never closed.
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let usage = TurnUsage::new();
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            subscribe_turn_usage(&format!("redis://{addr}"), &usage),
+        )
+        .await;
+        let took = started.elapsed();
+        eprintln!(
+            "W18-RESULT T6 relay statistics subscribe to a silent listener: {} after {took:?}",
+            match &res {
+                Ok(Ok(())) => "ended",
+                Ok(Err(_)) => "failed",
+                Err(_) => "still waiting",
+            }
+        );
+        accept.abort();
+        assert!(
+            res.is_ok(),
+            "W18-RED the relay's statistics subscribe to a listener that never answers was \
+             still waiting after {took:?}: nothing bounds its connect or its subscribe"
+        );
+        assert!(
+            res.unwrap().is_err(),
+            "a listener that never answers cannot have taken the subscription"
+        );
+        assert!(
+            took <= Duration::from_secs(5),
+            "it failed after {took:?}; the bound is 3 s"
+        );
     }
 }

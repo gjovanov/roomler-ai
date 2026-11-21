@@ -52,7 +52,16 @@
 //! CBR target; the FFmpeg HW encoders interpret it as a `maxrate` ceiling
 //! (they run constant-quality with maxrate as the burst cap). Same number,
 //! different meaning per pump — don't read the heartbeat value as wire rate.
+//!
+//! # Why `desired` moved (FR-148 P0)
+//!
+//! Every place that changes `desired` records a [`Cause`], and a ceiling or a
+//! floor pushed in carries its source: [`AimdController::take_move`] hands the
+//! causes out with the move, in the order they happened, so the pump's line can
+//! say why the target moved. Recording a cause moves nothing: each record sits
+//! beside an assignment that was already there.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 /// Multiplicative-decrease factor: ×0.85 on a full channel. Gentler than a
@@ -93,6 +102,169 @@ const OCC_ALPHA: f32 = 0.1;
 /// correctly held back from climbing).
 const AI_OCC_THRESHOLD: f32 = 0.25;
 
+/// FR-148 P0 — the congestion signal behind a ×0.85 decrease. The decrease is
+/// one code path, fed by six signals; the word names the signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Congestion {
+    /// The send channel was full: the gate's skip, or a tick with no capacity.
+    Full,
+    /// A frame overflowed the send channel, or the DC buffer passed its
+    /// watermark ([`AimdController::note_buffer_overflow`]).
+    Overflow,
+    /// A send blocked, under FR-35's `HARD_STALL`.
+    Stall,
+    /// FR-15 — the viewer's paint age was over-rate.
+    Age,
+    /// FR-59 P3 — the viewer's transit queue grew while the sender offered.
+    Link,
+    /// FR-79 V5 — a stalled window while the target sat over the measured pipe.
+    TransitStall,
+}
+
+impl Congestion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Congestion::Full => "full",
+            Congestion::Overflow => "overflow",
+            Congestion::Stall => "stall",
+            Congestion::Age => "age",
+            Congestion::Link => "link",
+            Congestion::TransitStall => "transit-stall",
+        }
+    }
+}
+
+/// FR-148 P0 — where a ceiling pushed into the controller comes from: the
+/// stage of the governor's chain whose number is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingSource {
+    /// The pump's own: the quality preference × the relay clamp, or the rate
+    /// plan's maxrate ceiling, ÷ viewers when the pipeline is shared.
+    Plan,
+    /// The measured clamp of 2026-08-27, from the blocked-send goodput (direct).
+    Pipe,
+    /// FR-35 — the learned ceiling (constrained).
+    Learned,
+    /// FR-59 P3 — the viewer's arrival rate while its queue grows (constrained).
+    Arrival,
+    /// FR-63 — the slow-start ramp's cap (constrained).
+    Opener,
+}
+
+impl CeilingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CeilingSource::Plan => "plan",
+            CeilingSource::Pipe => "pipe",
+            CeilingSource::Learned => "learned",
+            CeilingSource::Arrival => "arrival",
+            CeilingSource::Opener => "opener",
+        }
+    }
+}
+
+/// FR-148 P0 — where a floor pushed into the controller comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorSource {
+    /// The pump's area-scaled legibility minimum (`area_min_bitrate_bps`).
+    Area,
+    /// FR-59 P1 — the floor relieved toward a measured pipe.
+    Relief,
+    /// FR-63 — the slow-start ramp's floor.
+    Ramp,
+}
+
+impl FloorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloorSource::Area => "area",
+            FloorSource::Relief => "relief",
+            FloorSource::Ramp => "ramp",
+        }
+    }
+}
+
+/// FR-148 P0 — why `desired` moved: one word for each place it can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// The controller's first target ([`AimdController::new`]).
+    Open,
+    /// The additive increase.
+    Increase,
+    /// The ×0.85 decrease, and the signal that fired it.
+    Decrease(Congestion),
+    /// FR-35 — the ×0.5 on a hard stall ([`AimdController::apply_hard_md`]).
+    HardDecrease,
+    /// A lower ceiling pulled `desired` down.
+    Ceiling(CeilingSource),
+    /// A higher floor pulled `desired` up.
+    Floor(FloorSource),
+    /// The same target handed out again after an encoder rebuild
+    /// ([`AimdController::force_reapply`]).
+    Reapply,
+}
+
+impl fmt::Display for Cause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Cause::Open => f.write_str("open"),
+            Cause::Increase => f.write_str("increase"),
+            Cause::Decrease(c) => write!(f, "decrease({})", c.as_str()),
+            Cause::HardDecrease => f.write_str("hard-decrease"),
+            Cause::Ceiling(s) => write!(f, "ceiling({})", s.as_str()),
+            Cause::Floor(s) => write!(f, "floor({})", s.as_str()),
+            Cause::Reapply => f.write_str("reapply"),
+        }
+    }
+}
+
+/// How many distinct causes one move keeps: a tick adds at most three (its
+/// floor, its ceiling, its own sample), after what a window, a stall or a
+/// rebuild noted since the last tick. Past this, [`Causes::more`].
+const CAUSES_KEPT: usize = 8;
+
+/// FR-148 P0 — the causes of one move of the target, in the order they
+/// happened since the last [`AimdController::take_move`]. A cause that repeats
+/// is kept once, at its first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Causes {
+    kept: [Option<Cause>; CAUSES_KEPT],
+    more: bool,
+}
+
+impl Causes {
+    /// The record of one cause.
+    pub(crate) fn of(cause: Cause) -> Self {
+        let mut causes = Self::default();
+        causes.push(cause);
+        causes
+    }
+
+    fn push(&mut self, cause: Cause) {
+        if self.contains(cause) {
+            return;
+        }
+        match self.kept.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(cause),
+            None => self.more = true,
+        }
+    }
+
+    /// The causes, in the order they happened.
+    pub fn iter(&self) -> impl Iterator<Item = Cause> + '_ {
+        self.kept.iter().flatten().copied()
+    }
+
+    pub fn contains(&self, cause: Cause) -> bool {
+        self.kept.contains(&Some(cause))
+    }
+
+    /// More distinct causes landed than are kept: the line ends `+more`.
+    pub fn more(&self) -> bool {
+        self.more
+    }
+}
+
 /// AIMD bitrate controller. See the module docs for the signal model.
 ///
 /// Construct once per pump session with the initial target, the hard
@@ -124,6 +296,9 @@ pub struct AimdController {
     /// FR-35 — count of applied decreases, so the governor can tell the
     /// ceiling learner "the pipe pushed back" without reading the target.
     decreases: u32,
+    /// FR-148 P0 — why `desired` (or, for a rebuild, the last value handed
+    /// out) moved since the last take. Read by nothing but `take_move`.
+    moved: Causes,
 }
 
 impl AimdController {
@@ -149,6 +324,7 @@ impl AimdController {
             last_event_at: now,
             last_full_at: now,
             decreases: 0,
+            moved: Causes::of(Cause::Open),
         }
     }
 
@@ -163,7 +339,7 @@ impl AimdController {
 
         if full {
             self.last_full_at = now;
-            self.apply_md(now);
+            self.apply_md(Congestion::Full, now);
         } else if self.occ_avg < AI_OCC_THRESHOLD
             && now.duration_since(self.last_full_at) >= AI_SETTLE
             && now.duration_since(self.last_event_at) >= AI_SETTLE
@@ -178,17 +354,29 @@ impl AimdController {
     /// watermark, treat it as congestion (same rate-limited MD as a full
     /// channel). Harmless on the FFmpeg pump, which doesn't call it.
     pub fn note_buffer_overflow(&mut self, now: Instant) {
+        self.note_congestion(Congestion::Overflow, now);
+    }
+
+    /// FR-148 P0 — [`Self::note_buffer_overflow`] for any congestion sample,
+    /// named by its signal: the same rate-limited ×0.85.
+    pub fn note_congestion(&mut self, signal: Congestion, now: Instant) {
         self.last_full_at = now;
-        self.apply_md(now);
+        self.apply_md(signal, now);
     }
 
     /// Update the ceiling (quality preference × relay clamp), pushed each
     /// frame by the pump. Lowering it clamps `desired` down immediately;
     /// raising it just lets AI climb toward the new ceiling.
     pub fn set_ceiling(&mut self, ceiling_bps: u32) {
+        self.set_ceiling_from(ceiling_bps, CeilingSource::Plan);
+    }
+
+    /// FR-148 P0 — [`Self::set_ceiling`], with where the ceiling comes from.
+    pub fn set_ceiling_from(&mut self, ceiling_bps: u32, source: CeilingSource) {
         self.ceiling_bps = ceiling_bps.max(self.floor_bps);
         if self.desired_bps > self.ceiling_bps {
             self.desired_bps = self.ceiling_bps;
+            self.moved.push(Cause::Ceiling(source));
         }
     }
 
@@ -201,9 +389,15 @@ impl AimdController {
     /// (dims change / transport flip) that `take_pending` emitting a
     /// `set_bitrate` for it is fine.
     pub fn set_floor(&mut self, floor_bps: u32) {
+        self.set_floor_from(floor_bps, FloorSource::Area);
+    }
+
+    /// FR-148 P0 — [`Self::set_floor`], with where the floor comes from.
+    pub fn set_floor_from(&mut self, floor_bps: u32, source: FloorSource) {
         self.floor_bps = floor_bps.max(1).min(self.ceiling_bps);
         if self.desired_bps < self.floor_bps {
             self.desired_bps = self.floor_bps;
+            self.moved.push(Cause::Floor(source));
         }
     }
 
@@ -212,9 +406,17 @@ impl AimdController {
     /// only moves `desired` on rate-limited MD/AI/ceiling events, so this
     /// never thrashes — no extra hysteresis needed.
     pub fn take_pending(&mut self) -> Option<u32> {
+        self.take_move().map(|(bps, _)| bps)
+    }
+
+    /// FR-148 P0 — [`Self::take_pending`], with why the target moved since the
+    /// last take. The causes are cleared either way: a move that netted to
+    /// nothing leaves none behind for the next one.
+    pub fn take_move(&mut self) -> Option<(u32, Causes)> {
+        let causes = std::mem::take(&mut self.moved);
         if self.desired_bps != self.last_applied_bps {
             self.last_applied_bps = self.desired_bps;
-            Some(self.desired_bps)
+            Some((self.desired_bps, causes))
         } else {
             None
         }
@@ -225,6 +427,7 @@ impl AimdController {
     /// the encoder's rate control to its constructor value.
     pub fn force_reapply(&mut self) {
         self.last_applied_bps = 0;
+        self.moved.push(Cause::Reapply);
     }
 
     /// Current desired bitrate (for heartbeat logging).
@@ -232,7 +435,7 @@ impl AimdController {
         self.desired_bps
     }
 
-    fn apply_md(&mut self, now: Instant) {
+    fn apply_md(&mut self, signal: Congestion, now: Instant) {
         if now.duration_since(self.last_event_at) < MD_MIN_INTERVAL {
             return;
         }
@@ -243,6 +446,7 @@ impl AimdController {
             self.desired_bps = next;
             self.last_event_at = now;
             self.decreases += 1;
+            self.moved.push(Cause::Decrease(signal));
         }
     }
 
@@ -257,6 +461,7 @@ impl AimdController {
             self.desired_bps = next;
             self.last_event_at = now;
             self.decreases += 1;
+            self.moved.push(Cause::HardDecrease);
         }
     }
 
@@ -275,6 +480,7 @@ impl AimdController {
         let next = self.desired_bps.saturating_add(step).min(self.ceiling_bps);
         if next > self.desired_bps {
             self.desired_bps = next;
+            self.moved.push(Cause::Increase);
         }
         // Advance the event clock even if we were already at the ceiling,
         // so we don't re-evaluate AI every frame once settled.
@@ -753,5 +959,121 @@ mod tests {
         for bps in (floor..=26_000_000).step_by(1_000) {
             assert_eq!(coarsen_bitrate(bps), pre_p8_coarsen(bps), "at {bps} bps");
         }
+    }
+
+    /// FR-148 P0 — the causes of a move, as a line writes them.
+    fn words(causes: Causes) -> String {
+        causes
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    fn take(c: &mut AimdController) -> Option<(u32, String)> {
+        c.take_move().map(|(bps, causes)| (bps, words(causes)))
+    }
+
+    /// FR-148 P0 — every place that moves `desired` hands its cause out with
+    /// the move, and a ceiling or a floor its source.
+    #[test]
+    fn every_move_hands_out_its_cause() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = ctrl(6_000_000, 8, t0);
+        assert_eq!(take(&mut c), Some((6_000_000, "open".to_string())));
+        c.observe(8, true, ms(600));
+        assert_eq!(
+            take(&mut c),
+            Some((5_100_000, "decrease(full)".to_string()))
+        );
+        c.note_buffer_overflow(ms(1_200));
+        assert_eq!(
+            take(&mut c),
+            Some((4_335_000, "decrease(overflow)".to_string()))
+        );
+        c.note_congestion(Congestion::Age, ms(1_800));
+        assert_eq!(take(&mut c), Some((3_684_750, "decrease(age)".to_string())));
+        c.apply_hard_md(ms(1_810));
+        assert_eq!(take(&mut c), Some((1_842_375, "hard-decrease".to_string())));
+        c.set_floor_from(2_000_000, FloorSource::Relief);
+        assert_eq!(take(&mut c), Some((2_000_000, "floor(relief)".to_string())));
+        c.set_floor(FLOOR);
+        c.set_ceiling_from(1_800_000, CeilingSource::Pipe);
+        assert_eq!(take(&mut c), Some((1_800_000, "ceiling(pipe)".to_string())));
+        c.force_reapply();
+        assert_eq!(take(&mut c), Some((1_800_000, "reapply".to_string())));
+        c.set_ceiling(CEIL);
+        c.observe(0, false, ms(7_000));
+        assert_eq!(take(&mut c), Some((2_550_000, "increase".to_string())));
+    }
+
+    /// FR-148 P0 — only a move that lands is named: a decrease a higher floor
+    /// took back nets to nothing and leaves no cause behind, and a sample the
+    /// 500 ms spacing refused, or a bound that moved nothing, records none.
+    #[test]
+    fn only_a_move_that_lands_is_named() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = ctrl(3_000_000, 8, t0);
+        assert_eq!(take(&mut c), Some((3_000_000, "open".to_string())));
+        c.observe(8, true, ms(600));
+        c.set_floor_from(3_000_000, FloorSource::Area);
+        assert!(take(&mut c).is_none(), "back where it was handed out");
+        c.set_floor(FLOOR);
+        c.set_ceiling(CEIL);
+        c.note_congestion(Congestion::Link, ms(700));
+        assert_eq!(c.desired(), 3_000_000, "the spacing refused it");
+        c.note_congestion(Congestion::Stall, ms(1_200));
+        assert_eq!(
+            take(&mut c),
+            Some((2_550_000, "decrease(stall)".to_string()))
+        );
+    }
+
+    /// FR-148 P0 — the causes keep the order they happened in, a repeat is kept
+    /// once at its first place, and past eight distinct causes the record says
+    /// that more landed.
+    #[test]
+    fn causes_keep_their_order_and_say_when_more_landed() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = ctrl(12_000_000, 8, t0);
+        c.observe(8, true, ms(600));
+        c.observe(8, true, ms(1_200));
+        for (n, signal) in [
+            (1_800, Congestion::Overflow),
+            (2_400, Congestion::Stall),
+            (3_000, Congestion::Age),
+            (3_600, Congestion::Link),
+            (4_200, Congestion::TransitStall),
+        ] {
+            c.note_congestion(signal, ms(n));
+        }
+        c.apply_hard_md(ms(4_210));
+        let (_, eight) = c.take_move().expect("a move");
+        assert_eq!(
+            words(eight),
+            "open+decrease(full)+decrease(overflow)+decrease(stall)+decrease(age)+\
+             decrease(link)+decrease(transit-stall)+hard-decrease"
+        );
+        assert!(!eight.more(), "eight distinct causes fit");
+        let mut c = ctrl(12_000_000, 8, t0);
+        for (n, signal) in [
+            (600, Congestion::Full),
+            (1_200, Congestion::Overflow),
+            (1_800, Congestion::Stall),
+            (2_400, Congestion::Age),
+            (3_000, Congestion::Link),
+            (3_600, Congestion::TransitStall),
+        ] {
+            c.note_congestion(signal, ms(n));
+        }
+        c.apply_hard_md(ms(3_610));
+        c.set_ceiling_from(1_800_000, CeilingSource::Opener);
+        let (bps, nine) = c.take_move().expect("a move");
+        assert_eq!(bps, 1_800_000);
+        assert!(nine.more(), "the ninth is not kept, and the record says so");
+        assert!(!nine.contains(Cause::Ceiling(CeilingSource::Opener)));
     }
 }

@@ -3006,26 +3006,29 @@ export function isWebCodecsSupported(): boolean {
     && typeof g.VideoDecoder === 'function'
 }
 
-/** Which video transport the viewer prefers for inbound frames.
- *  - `webrtc`: classic WebRTC video track. The default. Works on
- *    every browser; pixels go through Chrome's chroma-subsampled
- *    (4:2:0) decode path for every codec.
- *  - `data-channel-vp9-444`: VP9 profile 1 (8-bit 4:4:4) frames over
- *    an RTCDataChannel named `video-bytes`, decoded with WebCodecs
- *    `VideoDecoder` and painted to a canvas. Bypasses the WebRTC
- *    pipeline's 4:2:0 enforcement so screen-content text stays
- *    crisp. Requires `VideoDecoder.isConfigSupported({codec:
- *    'vp09.01.10.08'})` and an agent that advertises
- *    `data-channel-vp9-444` in its `AgentCaps.transports`. Falls
- *    back to `webrtc` silently when either side lacks support.
- *    Takes effect on the next `connect()`. */
-export type RcVideoTransport =
-  | 'auto'
-  | 'webrtc'
-  | 'data-channel-vp9-444'
-  | 'data-channel-hevc'
-  | 'data-channel-av1'
-  | 'data-channel-h264'
+/** Which video transport the viewer prefers for inbound frames. `auto` (the
+ *  default since rc.190) ranks them at connect by what is hardware on both
+ *  ends. `webrtc` is the RTP video track, which every browser plays. Each
+ *  `data-channel-*` carries one codec's frames over an RTCDataChannel to a
+ *  WebCodecs decoder and a canvas (`-vp9-444` carries VP9 in both chroma
+ *  formats; the name is historical). The agent honours a transport only when
+ *  it offers it. Takes effect on the next `connect()`.
+ *
+ *  The ONE list (#4101): `RcVideoTransport` is `typeof` this array, and the
+ *  stored pick is checked against it, so a transport added here is also read
+ *  back after a reload. The check was a second, hand-kept list that missed
+ *  `data-channel-h264`, so an H.264 pick read back as Auto after every
+ *  reload. `useRemoteControl.videoTransport.spec.ts` round-trips each one
+ *  through the store and the read. */
+export const RC_VIDEO_TRANSPORTS = [
+  'auto',
+  'webrtc',
+  'data-channel-vp9-444',
+  'data-channel-hevc',
+  'data-channel-av1',
+  'data-channel-h264',
+] as const
+export type RcVideoTransport = (typeof RC_VIDEO_TRANSPORTS)[number]
 
 /** rc.190.1 Ã¢ÂÂ key bumped as a ONE-TIME migration to the new Auto
  *  default (same rationale as the resolution-prefix bump: transports
@@ -3063,14 +3066,11 @@ function persistVp9Chroma(c: Vp9ChromaPref) {
 function readStoredVideoTransport(): RcVideoTransport {
   try {
     const raw = globalThis.localStorage?.getItem(VIDEO_TRANSPORT_STORAGE_KEY)
-    if (
-      raw === 'data-channel-vp9-444'
-      || raw === 'data-channel-hevc'
-      || raw === 'data-channel-av1'
-      || raw === 'webrtc'
-      || raw === 'auto'
-    )
-      return raw
+    // #4101 — checked against the one list, never a copy of it: a transport a
+    // copy missed (`data-channel-h264`) read back as Auto after every reload.
+    if (raw && (RC_VIDEO_TRANSPORTS as readonly string[]).includes(raw)) {
+      return raw as RcVideoTransport
+    }
   } catch {
     /* privacy mode Ã¢ÂÂ default */
   }

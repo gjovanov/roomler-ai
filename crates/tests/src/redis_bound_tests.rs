@@ -304,6 +304,7 @@ async fn with_both_bounds_at_0_a_command_waits_as_before() {
         url: fwd.url_for(&test_redis_url()),
         response_timeout_ms: 0,
         connection_timeout_ms: 0,
+        subscriber_probe_ms: 15_000,
     };
     let ps = RedisPubSub::from_settings(&settings, unique("w14-test/"))
         .await
@@ -860,6 +861,7 @@ async fn a_bound_under_1_s_is_used_as_1_s_and_the_boot_line_says_what_is_used() 
         url: test_redis_url(),
         response_timeout_ms: 3,
         connection_timeout_ms: 0,
+        subscriber_probe_ms: 15_000,
     };
     let ps = RedisPubSub::from_settings(&settings, unique("w14-test/"))
         .await

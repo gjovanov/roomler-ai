@@ -36,6 +36,15 @@
 # daemon's answer, and under every shell those calls must equal the mode's
 # record in install-sh-output-check.calls, beside this script: a command the
 # script adds or drops shows there.
+# #3931 — the script is one function, main, which its last line alone calls,
+# and whose first statement gives the shell /dev/null as stdin: a check reads
+# that shape from the text. In every mode one case makes every call of every
+# stand-in read its stdin first, and under dash a second one does so with the
+# script padded so that one of dash's 8 KiB reads of the pipe ends inside the
+# main block: the script runs to its last line, with the mode's calls. And a
+# script cut off after each line of the main block, after sampled lines above
+# it and after each byte of its last line runs nothing: no stand-in records a
+# call. Each cut's exit code is printed.
 #
 # What it cannot show: a real package install, systemd, launchd, a real feed,
 # Apple's /bin/sh, and BSD grep, sed and tr (the Mac cases run Debian's GNU
@@ -205,6 +214,8 @@ case "$me" in
     uname | hostname | mktemp | stat | sleep) ;; # answers, not actions
     *) printf '%s\n' "$line" >>"$C/calls.log" ;;
 esac
+# #3931 — a case can make every call of every stand-in read its stdin first.
+if [ -f "$C/stdin.all" ]; then cat >/dev/null; fi
 # #3925 — a case can make one call read its stdin first, as a binary could: the
 # call of this name whose line holds the words in stdin.<name>.
 if [ -f "$C/stdin.$me" ]; then
@@ -387,7 +398,9 @@ SH=""
 # form, makes it exit 1 in that call. HAS_CONFIG=1 puts an
 # earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
 # half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
-# as root, as a privileged half runs. The records land in $RUNS/$SH/CASE.
+# as root, as a privileged half runs. READS_ALL=1 makes every call of every
+# stand-in read its stdin first, and SCRIPT=<file> pipes that file in place of
+# the script (#3931). The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
@@ -417,6 +430,7 @@ run() {
     [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
     [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
     [ -z "${FAILS:-}" ] || printf '%s' "${FAILS#* }" >"$C/fails.${FAILS%% *}"
+    [ "${READS_ALL:-0}" = 0 ] || : >"$C/stdin.all"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -432,7 +446,7 @@ run() {
     who=tester uid=1000 home=/home/tester
     [ "${AS_ROOT:-0}" = 0 ] || who=root uid=0 home=/root
     set +e
-    cat /src/install.sh 2>/dev/null | setpriv --reuid=$uid --regid=$uid --clear-groups \
+    cat "${SCRIPT:-/src/install.sh}" 2>/dev/null | setpriv --reuid=$uid --regid=$uid --clear-groups \
         env -i HOME=$home USER=$who LOGNAME=$who LANG=C.UTF-8 PATH="$path" \
         "${shell[@]}" -s -- --server https://roomler.example "$@" >"$C/out.txt" 2>&1
     echo "${PIPESTATUS[1]}" >"$C/rc"
@@ -471,6 +485,125 @@ same() { want "==> the running daemon (pid $PID) already runs $1: nothing to res
 self() { want "==> the running daemon (pid $PID) restarts onto $1 by itself, once nothing it serves would be cut"; }
 restart() {
     want "==> restarting the running daemon (pid $PID): it runs $1, which cannot restart onto a new binary by itself (a remote or SSH session to this device drops for a few seconds)"
+}
+
+# #3931 — the script's shape, read from its text: one function, main, opened
+# below nothing but comments and blank lines, whose first statement gives the
+# shell /dev/null as stdin and whose last statement is exit; the line before
+# the last closes it, and the last line, the only call, is `main "$@"` with
+# nothing after its newline. So the shell has read all of the script before
+# the first command runs, and no line after the call is ever run.
+WHY=""
+open=$(grep -n -m1 '^main() {' /src/install.sh | cut -d: -f1 || true)
+if [ -z "$open" ]; then
+    WHY="$WHY"$'\n'"    no line opens the function: main() {"
+else
+    [ "$(grep -c '^main() {' /src/install.sh)" = 1 ] || WHY="$WHY"$'\n'"    main() { opens more than once"
+    above=$(head -n $((open - 1)) /src/install.sh | grep -cv '^#\|^[[:space:]]*$' || true)
+    [ "$above" = 0 ] || WHY="$WHY"$'\n'"    $above line(s) above main() { are neither comment nor blank: they run before the script is read"
+    # The first statement, on the opening line after the brace or on the first
+    # line after it that is neither comment nor blank.
+    first=$(sed -n "${open}p" /src/install.sh | sed 's/^main() {[[:space:]]*//; s/^#.*//')
+    [ -n "$first" ] || first=$(tail -n +$((open + 1)) /src/install.sh | grep -v '^#\|^[[:space:]]*$' | head -n 1 || true)
+    case "$first" in
+        'exec </dev/null'*) ;;
+        *) WHY="$WHY"$'\n'"    main's first statement is not exec </dev/null: $first" ;;
+    esac
+fi
+[ "$(tail -c 1 /src/install.sh | od -An -tx1 | tr -d ' ')" = 0a ] ||
+    WHY="$WHY"$'\n'"    the script does not end with the newline of its last line"
+[ "$(tail -n 1 /src/install.sh)" = 'main "$@"' ] ||
+    WHY="$WHY"$'\n'"    the last line is not main \"\$@\": $(tail -n 1 /src/install.sh)"
+[ "$(tail -n 2 /src/install.sh | head -n 1)" = '}' ] ||
+    WHY="$WHY"$'\n'"    the line before the last does not close main: $(tail -n 2 /src/install.sh | head -n 1)"
+calls=$(grep -cE '^[[:space:]]*main([[:space:]]|;|$)' /src/install.sh || true)
+[ "$calls" = 1 ] || WHY="$WHY"$'\n'"    $calls line(s) call main, want 1, the last"
+last_statement=$(head -n -2 /src/install.sh | grep -v '^[[:space:]]*#\|^[[:space:]]*$' | tail -n 1 || true)
+[ "$last_statement" = exit ] ||
+    WHY="$WHY"$'\n'"    main's last statement is not exit: $last_statement"
+TOTAL=$((TOTAL + 1))
+if [ -z "$WHY" ]; then
+    echo "PASS the script is one function, opened at line $open below comments alone, stdin /dev/null first, exit last, and its last line alone calls it"
+else
+    FAILED=$((FAILED + 1))
+    echo "FAIL the script is not one function that its last line alone calls:$WHY"
+fi
+
+# #3931 — the script padded so that one of dash's reads of the pipe ends inside
+# its main block. Dash reads a pipe 8192 bytes at a time, so a command there
+# that reads its stdin would eat what lies past that read. The padding is
+# comment lines after the first line, and it puts a multiple of 8192 bytes
+# halfway between the main block's heading and the end.
+pad_lines() { # N >= 2: comment lines of N bytes in all, none over 80
+    local n=$1 l
+    while [ "$n" -gt 0 ]; do
+        l=$n
+        [ "$l" -le 80 ] || l=80
+        [ $((n - l)) != 1 ] || l=$((l - 1))
+        printf '#%*s\n' $((l - 2)) '' | tr ' ' p
+        n=$((n - l))
+    done
+}
+main_at=$(LC_ALL=C grep -b -m1 '^# ─── main ─' /src/install.sh | cut -d: -f1)
+size=$(wc -c </src/install.sh)
+mid=$(((main_at + size) / 2))
+pad=$(((8192 - mid % 8192) % 8192))
+[ "$pad" -ge 2 ] || pad=$((pad + 8192))
+PADDED=$S/install-padded.sh
+{ head -n 1 /src/install.sh; pad_lines "$pad"; tail -n +2 /src/install.sh; } >"$PADDED"
+echo "padded for dash: $pad bytes, the main block at bytes $((main_at + pad))-$((size + pad)), a read ending at $((mid + pad))"
+
+# #3931 — the script cut off: after every 97th line above its main block, after
+# each line of the main block, and after each byte of its last line but the
+# newline. `cut_off` (in the loop below) pipes each one in.
+CUTS=$S/cuts
+mkdir -p "$CUTS"
+nlines=$(wc -l </src/install.sh)
+main_line=$(grep -n -m1 '^# ─── main ─' /src/install.sh | cut -d: -f1)
+for k in $(seq 1 97 $((main_line - 1))) $(seq "$main_line" $((nlines - 1))); do
+    head -n "$k" /src/install.sh >"$CUTS/$(printf 'line-%05d' "$k")"
+done
+last_line=$(tail -n 1 /src/install.sh)
+for b in $(seq 1 $((${#last_line} - 1))); do
+    { head -n $((nlines - 1)) /src/install.sh; printf '%s' "${last_line:0:b}"; } >"$CUTS/$(printf 'last-%03d' "$b")"
+done
+# cut_off MODE ARGS...: as run, each cut script in turn; none may record a call.
+cut_off() {
+    local m=$1 f k what n0 n1 n2 n127 nother
+    shift
+    n0=0 n1=0 n2=0 n127=0 nother=0
+    for f in "$CUTS"/*; do
+        SCRIPT=$f run "cut/$m" "$@"
+        rc=$(cat "$C/rc")
+        case "${f##*/}" in
+            line-*) k=$((10#${f##*/line-})); what="after line $k of $nlines ($(sed -n "${k}p" /src/install.sh | cut -c1-40))" ;;
+            last-*) what="inside the last line, after '$(cat "$f" | tail -n 1)'" ;;
+        esac
+        case "$rc" in 0) n0=$((n0 + 1)) ;; 1) n1=$((n1 + 1)) ;; 2) n2=$((n2 + 1)) ;; 127) n127=$((n127 + 1)) ;; *) nother=$((nother + 1)) ;; esac
+        TOTAL=$((TOTAL + 1))
+        ran=$(cat "$C/calls.log" "$C/curl.log" "$C/roomlerd.log" "$C/roomler.log")
+        if [ -z "$ran" ]; then
+            echo "PASS $SH cut $m $what: exit $rc, nothing ran"
+        else
+            FAILED=$((FAILED + 1))
+            echo "FAIL $SH cut $m $what: exit $rc, and it ran:"
+            printf '%s\n' "$ran" | sed 's/^/    | /'
+        fi
+    done
+    echo "cut $m under $SH: $(ls "$CUTS" | wc -l) cuts; exit 0 x$n0, 1 x$n1, 2 x$n2, 127 x$n127, other x$nother"
+}
+# every MODE ARGS...: as run, the case MODE/stdin-all, every call of every
+# stand-in reading its stdin first; under dash MODE/stdin-all-padded as well.
+every() {
+    local m=$1
+    shift
+    READS_ALL=1 run "$m/stdin-all" "$@"
+    want "==> done."
+    done_case
+    [ "$SH" = dash ] || return 0
+    READS_ALL=1 SCRIPT=$PADDED run "$m/stdin-all-padded" "$@"
+    want "==> done."
+    done_case
 }
 
 for SH in $SHELLS; do
@@ -695,6 +828,28 @@ for SH in $SHELLS; do
     READS='roomler [enroll]' run tunnel-enroll/reads-stdin Linux x86_64 1 normal '' 0 --role tunnel --token check-token
     lines "$R" 0; lines "$V" 0; want "$tun"; want "==> done."; done_case
 
+    # #3931 — in every mode, every call of every stand-in reads its stdin first
+    # (under dash a second time, padded): the script runs to its last line, and
+    # the check below holds the calls to the mode's.
+    every deb-dl Linux x86_64 1 normal '' 0 "${dl[@]}"
+    every deb-fallback Linux x86_64 1 nodeb '' 0 "${dl[@]}"
+    every tgz-dl Linux x86_64 0 normal '' 0 "${dl[@]}"
+    every pkg-dl Darwin arm64 0 normal '' 0 "${dl[@]}"
+    every deb-system Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    FAILS='sudo [dpkg]' every deb-system-apt Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    every deb-user Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    every pkg Darwin arm64 0 normal "$new" 0 "${usr[@]}"
+    RUNNING=$new every deb-user-same Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    RUNNING=$old RUNNING_CAPS=$cap every deb-user-self Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    RUNNING=$old every deb-user-restart Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    AS_ROOT=1 HAS_CONFIG=1 every deb-privileged Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    HAS_PLIST=1 every pkg-two-row Darwin arm64 0 normal "$new" 0 "${two[@]}"
+    every pkg-one-row Darwin arm64 0 normal "$new" 0 "${one[@]}"
+    every tunnel-dl Linux x86_64 1 normal '' 0 --role tunnel --download-only
+    every tunnel Linux x86_64 1 normal '' 0 --role tunnel
+    FAILS='sudo [dpkg]' every tunnel-apt Linux x86_64 1 normal '' 0 --role tunnel
+    every tunnel-enroll Linux x86_64 1 normal '' 0 --role tunnel --token check-token
+
     # The same calls, byte for byte, in every case of a mode: neither the
     # feed's tag nor the daemon's answer changes what the script runs or how
     # it exits.
@@ -720,6 +875,11 @@ for SH in $SHELLS; do
             echo "FAIL $SH ${mode##*/}: the calls differ between cases:$WHY"
         fi
     done
+
+    # #3931 — a script cut off in transit runs nothing, in a Linux system
+    # install and in a Mac's per-user install: no stand-in records a call.
+    cut_off deb-system Linux x86_64 1 normal "$new" 0 "${sys[@]}"
+    cut_off pkg Darwin arm64 0 normal "$new" 0 "${usr[@]}"
 done
 
 # Every mode's calls as one record: its first case's (the check above holds

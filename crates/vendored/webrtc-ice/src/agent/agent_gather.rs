@@ -20,6 +20,30 @@ use crate::util::*;
 
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Roomler patch (FR-148 P4 step 2): the relay gather has ended, whatever its
+/// URLs did: no relay off the mesh is still coming from it
+/// (`AgentInternal::holds_mesh_route`).
+struct RelaysSettled(Arc<AgentInternal>);
+
+impl Drop for RelaysSettled {
+    fn drop(&mut self) {
+        self.0.real_turns_pending.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Roomler patch (FR-148 P4 step 2): one allocation on a TURN server off the
+/// mesh has ended, with a relay or without.
+struct RealTurnSettled(Arc<AgentInternal>);
+
+impl Drop for RealTurnSettled {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .real_turns_pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+}
+
 /// Roomler patch (media dodges the overlay): type-preference slot for host
 /// candidates whose interface IP sits inside the Roomler overlay ranges.
 /// Chosen BELOW server-reflexive (100) and ABOVE relay (0), so ICE prefers a
@@ -205,8 +229,12 @@ impl Agent {
                     let w = wg.worker();
                     tokio::spawn(async move {
                         let _d = w;
+                        let agent_internal = Arc::clone(&local_params.agent_internal);
 
                         Self::gather_candidates_local(local_params).await;
+                        // Roomler patch (FR-148 P4 step 2): the host gather
+                        // made the session's mesh sibling, or did not.
+                        agent_internal.settle_sibling(SIBLING_HOST).await;
                     });
                 }
                 CandidateType::ServerReflexive => {
@@ -266,6 +294,9 @@ impl Agent {
 
         // Block until all STUN and TURN URLs have been gathered (or timed out)
         wg.wait().await;
+        // Roomler patch (FR-148 P4 step 2): the TURN server on the mesh made
+        // the session's mesh sibling, or did not.
+        params.agent_internal.settle_sibling(SIBLING_TURN).await;
 
         Self::set_gathering_state(
             &params.chan_candidate_tx,
@@ -876,6 +907,9 @@ impl Agent {
         net: Arc<Net>,
         agent_internal: Arc<AgentInternal>,
     ) {
+        // Roomler patch (FR-148 P4 step 2): however this gather ends, the
+        // route rank's hold learns that no relay is still coming from it.
+        let _settled = RelaysSettled(Arc::clone(&agent_internal));
         let wg = WaitGroup::new();
 
         for url in urls {
@@ -902,10 +936,19 @@ impl Agent {
             let network = NetworkType::Udp4.to_string();
             let net2 = Arc::clone(&net);
             let agent_internal2 = Arc::clone(&agent_internal);
+            // Roomler patch (FR-148 P4 step 2): an allocation the route rank's
+            // hold waits for (`AgentInternal::real_turns_pending`).
+            let real_turn = (*agent_internal.carrier_rank)
+                .as_ref()
+                .is_some_and(|rank| {
+                    rank.route_engaged().is_some() && rank.turn_off_the_mesh(&url.host)
+                })
+                .then(|| RealTurnSettled(Arc::clone(&agent_internal)));
 
             let w = wg.worker();
             tokio::spawn(async move {
                 let _d = w;
+                let _real_turn = real_turn;
 
                 let turn_server_addr = format!("{}:{}", url.host, url.port);
 

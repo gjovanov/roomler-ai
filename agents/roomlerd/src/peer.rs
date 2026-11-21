@@ -454,33 +454,33 @@ impl AgentPeer {
             webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut engine)
                 .context("register default interceptors")?;
 
-        // Keep the OVERLAY interface out of ICE. The STUN query that rides
-        // that interface comes back reflected as the node's own overlay
-        // address, and webrtc-rs offers it as a perfectly ordinary
-        // `typ=srflx` candidate.
+        // The interface filter keeps the overlay's TUN out of ICE by NAME
+        // (`is_overlay_iface`), and it does so on Linux only, where the TUN
+        // is `roomler0`. webrtc-util 0.10.0 names every Windows interface
+        // `""`, so on Windows the `roomler` adapter passes like any other,
+        // and macOS names the TUN `utunN`, which no name rule can claim. Nor
+        // does the filter touch a server-reflexive or relay candidate: their
+        // sockets bind to the unspecified address, whatever the interfaces
+        // are called.
         //
-        // (This used to say the controller's browser is never on the mesh,
-        // so an overlay candidate could never pair. #1882 measured the
-        // opposite: an operator's browser runs on an overlay node, its
-        // wintun address is a host candidate, and a Mac — whose `utunN` this
-        // name rule cannot see — paired host↔host over the overlay. Whether
-        // a session may do that is now the device's call; see the IP filter
-        // below and `crate::rc_overlay`.)
+        // So on Windows and macOS a host candidate on the mesh is gathered.
+        // The vendored ICE ranks it by its type-preference slot (90, below
+        // server-reflexive: `OVERLAY_HOST_TYPE_PREFERENCE`) and, under the
+        // carrier rank with the mesh link not direct (FR-148 P4,
+        // `crate::rc_overlay`), last of all, as it does a server-reflexive
+        // candidate mapped onto the mesh. Whether a session may use the mesh
+        // at all is the device's call: the address filters below.
         //
-        // Field 2026-08-07 (winhost-a, Check Point profile blocking STUN on the
-        // physical NIC): the ONLY srflx it gathered was
-        // `typ=srflx address=100.64.0.28` — its own overlay IP. That masked
-        // the fact it had no public reflexive candidate at all, so every
-        // session negotiated, "started", and then died at a constant ~10.9 s
-        // when media never flowed (388 sessions in 24 h). winhost-b, same LAN
-        // and same Check Point build, offered a real `37.63.112.129` and
-        // worked. The filter does not FIX a host that cannot reach STUN — it
-        // stops that failure from disguising itself as a usable candidate.
+        // What the name rule cannot stop: #1882 measured a browser on an
+        // overlay node pairing host↔host with a Mac over the overlay, and on
+        // 2026-08-07 a Windows host whose physical NIC could not reach STUN
+        // offered one srflx, its own overlay address, which hid that it had
+        // no public one (each session died at ~10.9 s, media never flowing).
         //
-        // Filter by interface NAME, deliberately not by CIDR: the overlay
-        // lives in 100.64.0.0/10, which is real CGNAT space that some ISPs
-        // hand out to customers, so a CIDR rule would strip a legitimate host
-        // candidate from anyone behind carrier-grade NAT.
+        // NAME, deliberately not CIDR: the overlay lives in 100.64.0.0/10,
+        // which is real CGNAT space that some ISPs hand out to customers, so a
+        // CIDR rule would strip a legitimate host candidate from anyone behind
+        // carrier-grade NAT.
         let mut setting = webrtc::api::setting_engine::SettingEngine::default();
         setting.set_interface_filter(Box::new(|name: &str| !is_overlay_iface(name)));
         // #1882 — unless the device lets remote desktop use the overlay, keep
@@ -2038,7 +2038,7 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
-            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move.
+            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move; never under `route`.
             let (pair, opening) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             let local = pair.local();
             let remote = pair.remote();
@@ -2050,7 +2050,7 @@ async fn detect_constrained_transport(
                 && !crate::encode::relay_addr_is_fast_local(&local.address))
                 || (remote.typ == RTCIceCandidateType::Relay
                     && !crate::encode::relay_addr_is_fast_local(&remote.address));
-            crate::carrier_rank::path_detected(session_id, relay, local, remote, opening);
+            crate::carrier_rank::log_path(session_id, relay, local, remote, opening).await;
             return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5020,7 +5020,7 @@ async fn media_pump_vp9_444_dc(
                         quality = quality::label(q_now),
                         base_bps = base,
                         ceiling_bps = ceiling,
-                        target_bps = applied.bps,
+                        target_bps = applied.bps, why = %applied.why,
                         "VP9-444 set_bitrate (AIMD)"
                     );
                 }
@@ -5202,7 +5202,7 @@ async fn media_pump_vp9_444_dc(
                 info!(
                     %session_id,
                     buffered,
-                    new_target = applied.bps,
+                    new_target = applied.bps, why = %applied.why,
                     "VP9-444 AIMD decrease (DC buffer over high watermark)"
                 );
             }
@@ -5336,7 +5336,7 @@ async fn media_pump_vp9_444_dc(
                 avg_scale_ms,
                 avg_encode_ms,
                 paced_fps = ?governor.paced_software_fps(),
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
                 // FR-15 — the viewer's own paint age + the learned path
@@ -7248,7 +7248,7 @@ async fn media_pump_ffmpeg_dc(
     // STATIC image — invisible). The governor's mirror advances at emit
     // time, so heartbeat `target_bps` shows the target while the encoder
     // briefly runs the old maxrate — an accepted, bounded skew.
-    let mut deferred_bps: Option<u32> = None;
+    let mut deferred_bps: Option<crate::encode::governor::AppliedBitrate> = None;
     // Seeded "a minute ago" so the first apply lands at once — through the
     // boot-safe helper: `Instant::now() - 60 s` panics on a host up for less
     // than a minute, and a session that starts that early is exactly what a
@@ -8187,7 +8187,7 @@ async fn media_pump_ffmpeg_dc(
                     deferred_bps = None;
                     swap_wanted = Some(applied.bps);
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -9509,7 +9509,7 @@ async fn media_pump_ffmpeg_dc(
                 && enc.reconfig_forces_idr()
                 && applied.bps > enc.current_maxrate_bps();
             if held_increase {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             } else if enc.supports_dynamic_bitrate() {
                 deferred_bps = None;
                 if constrained && relay_idr_thrift {
@@ -9563,22 +9563,22 @@ async fn media_pump_ffmpeg_dc(
                         timed_apply!(enc.set_bitrate(applied.bps).await);
                     }
                 } else {
-                    deferred_bps = Some(applied.bps);
+                    deferred_bps = Some(applied);
                 }
             } else {
-                deferred_bps = Some(applied.bps);
+                deferred_bps = Some(applied);
             }
             if applied.changed {
                 info!(
                     %session_id,
                     codec_label,
                     ceiling_bps = ceiling,
-                    target_bps = applied.bps,
+                    target_bps = applied.bps, why = %applied.why,
                     deferred = deferred_bps.is_some(),
                     "FFmpeg DC pump set_bitrate (AIMD)"
                 );
             }
-        } else if let Some(bps) = deferred_bps
+        } else if let Some(held) = deferred_bps
             && last_motion_at.elapsed() >= DEFER_QUIET
         {
             // FR-10 — relay IDR thrift: each flush is a re-open whose first
@@ -9592,7 +9592,7 @@ async fn media_pump_ffmpeg_dc(
                 relay_idr_thrift,
                 last_deferred_apply_at.map(|t| t.elapsed()),
                 enc.current_maxrate_bps(),
-                bps,
+                held.bps,
             );
             if allow {
                 // Quiet flush: the held QSV/AMF target applies now, while the
@@ -9610,11 +9610,11 @@ async fn media_pump_ffmpeg_dc(
                     // inside the window is dead air. The quiet-gated adoption
                     // still bumps `send_epoch` and still ships the IDR on a
                     // static scene; only the freeze goes away.
-                    swap_wanted = Some(bps);
+                    swap_wanted = Some(held.bps);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate scheduled (background rebuild)"
                     );
                 } else {
@@ -9623,11 +9623,11 @@ async fn media_pump_ffmpeg_dc(
                     if !enc.supports_dynamic_bitrate() {
                         send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    timed_apply!(enc.set_bitrate(bps).await);
+                    timed_apply!(enc.set_bitrate(held.bps).await);
                     info!(
                         %session_id,
                         codec_label,
-                        target_bps = bps,
+                        target_bps = held.bps, why = %held.why,
                         "FFmpeg DC pump: deferred bitrate applied at quiet"
                     );
                 }
@@ -9968,7 +9968,7 @@ async fn media_pump_ffmpeg_dc(
                             deferred_bps = None;
                             swap_wanted = Some(applied.bps);
                         } else {
-                            deferred_bps = Some(applied.bps);
+                            deferred_bps = Some(applied);
                         }
                     }
                 }
@@ -10166,7 +10166,7 @@ async fn media_pump_ffmpeg_dc(
                 codec_label,
                 target_fps,
                 constrained,
-                target_bps = governor.applied_bps(),
+                target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 width = w,
                 height = h,
                 encoder = enc.name(),

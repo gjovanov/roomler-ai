@@ -153,6 +153,9 @@ impl AppState {
         // cluster layer ⇒ every consumer fails soft to pod-local
         // behavior (the standing degradation rule). Constructed HERE
         // (not main.rs) so two-pod TestApps exercise them.
+        // #3952 — how often each subscriber probes its own connection, read
+        // once for the fan-out and the bus (TURN usage reads its own).
+        let sub_probe = roomler_core::ws::sub_probe::ProbeSettings::from_settings(&settings.redis);
         let (cluster_directory, cluster_bus) = match &redis_pubsub {
             Some(ps) => (
                 Some(crate::cluster::directory::OwnershipDirectory::new(
@@ -163,6 +166,7 @@ impl AppState {
                     pod.clone(),
                     ps.connection(),
                     settings.redis.url.clone(),
+                    sub_probe,
                 )),
             ),
             None => (None, None),
@@ -353,6 +357,8 @@ impl AppState {
                 settings.redis.url.clone(),
                 redis_tx,
                 redis_sub_alive.clone(),
+                pubsub.connection(),
+                sub_probe,
             );
             tokio::spawn(async move {
                 loop {

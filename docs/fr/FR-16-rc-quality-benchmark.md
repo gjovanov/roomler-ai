@@ -7,7 +7,12 @@ built 2026-10-30**: `roomlerd encoder-smoke --bench` prints a per-host encoder c
 whose verdict reads `fallback` when hardware was asked for and software answered
 ([testing.md](../testing.md#the-l1-encoder-bench-fr-16)). Its fleet run through `roomler exec`
 began on 2026-10-31 on 0.4.191: [4 of the 11 online hosts](#l1-fleet-run-2026-10-31), and it
-caught a real fallback on two of them.
+caught a real fallback on two of them. MacBook-1 followed on 2026-11-20, its VideoToolbox cells
+opening in hardware as its hello says ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)).
+zeus and two Windows desktops were tried that evening, and the checks inside each command stopped
+all three before the bench. Later that night both desktops ran it on the operator's word, while
+they were in use, and both read `fallback` where the 2026-10-31 desktop did
+([§ two Windows desktops](#l1-fleet-run-2026-11-20-two-windows-desktops)).
 Tracking issue: `FR-16` (#798). Sibling of FR-17 (#799, the architectural fix); the
 measurement half of the FR-1 program, and the instrument of the
 [StarDesk teardown program](../plans/stardesk-teardown-program.md).
@@ -226,10 +231,16 @@ competitors". Engineering may use the numbers; the public pages never print them
       both the bench opened Microsoft's software MFT and `rtp:h264` read `fallback`, beside
       rows that opened `hevc_qsv` and `h264_qsv` in hardware
       ([§ L1 fleet run](#l1-fleet-run-2026-10-31)). **Coverage is partial, so the box stays
-      `[~]`:** 4 of the 11 online hosts ran it, of the 20 rows the server lists. zeus and
-      MacBook-1 can run it on a quieter night. **Owed:** those two, and a way to read
-      CORPLAP-1, CORPLAP-2, CORPLAP-3, NEO16 and NEO16-WSL, which `roomler exec` does not
-      target.
+      `[~]`:** 4 of the 11 online hosts ran it on 2026-10-31, of the 20 rows the server
+      listed. On 2026-11-20 MacBook-1 ran it with its VideoToolbox cells in hardware
+      ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)), and so did two Windows desktops
+      that came online after 2026-10-31, on the operator's word while they were in use. Both
+      read `fallback` on `rtp:h264`, as the 2026-10-31 desktop did
+      ([§ two Windows desktops](#l1-fleet-run-2026-11-20-two-windows-desktops)). **Owed:**
+      zeus, skipped three times for other jobs' load, and the
+      console rows of CORPLAP-1, CORPLAP-2, CORPLAP-3, NEO16 and NEO16-WSL, which
+      `roomler exec` does not target, so the operator runs those at each console (the
+      2026-11-02 decision on #798).
 - [ ] L2 produces an N×N pair matrix with carrier + RTT + goodput.
 - [ ] L3 reproduces a known-bad cell (MacBook → CORPLAP-1 H.265) and a known-good cell
       (a direct pair) with scores on opposite ends of the ladder — the harness must
@@ -289,6 +300,9 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-16 | **Release build, field: L4 as FR-98 P5's instrument.** Agent **0.4.138** (MSI, service) on a throwaway vmtest Win11 guest, the production viewer in headless Chromium on a LAN neighbour, `roomlerd probe-target` in the signed-in session; the viewer forced onto the RTP track or left to its own DataChannel pick | **L4 told three paths apart on one guest.** The DataChannel (`data-channel-vp9-444`): batch p50s 44–52 ms, 0 of 480 lost, as on 10-13. The RTP track on OpenH264: 35–40 ms with FR-98's `playout-delay` on, 78–362 ms with it off. The RTP track on Auto: **~850 ms with a quarter of the probes unanswered in 2 s**, because Auto had picked Microsoft's software MFT, which no other instrument here could see (#2283). FR-98 §9 has the full rows |
 | 2026-10-30 | **L1, a release build of the branch** (#3155) with the Linux release lane's features (`release-agent.yml:552`), in an Ubuntu 24.04 container on the Windows dev box, no GPU, no config | **RED:** the released 0.4.188 `.deb` (sha256 checked) answers `encoder-smoke --bench` with `error: unexpected argument '--bench' found`, exit 2, and no `L1` line. Its plain smoke still passes (`openh264`, 4 keyframes, 13 238 bytes). **GREEN:** the quick profile printed six rows in 2.0 s, 18.5 KB with its log lines against exec's 256 KiB. `rtp:h264` is OpenH264 `sw-only` (p50 6.6 ms, p95 12.9 ms, 3383 kbps for a 5529 kbps target). `rtp:h265` and the three FFmpeg DataChannel cells read `none`, as no GPU means they should. **`dc:vp9:444` reads `fallback`**: the build carries FFmpeg's VP9 hardware path, the container has no device for it, and libvpx answered (p50 5.2 ms). The release lane's own line on this binary gave 0.4.188's result exactly. The thread's clock reads `refused:95`: this kernel has no util clamp. **Twice:** `rtp:h264` over static, drag and pan, back to back, repeated its sizes and rates to the byte. Its p50s were 3.7/4.7, 8.1/7.5 and 7.6/6.4 ms, and its p95s up to 60 % apart (27.8/17.2 ms on pan) on a busy host. A paced run read about the same as back to back on this x86 host. **Wrong turn, fixed:** the first GREEN read `rtp:h264` `idr_n=6` with an IDR p50 of 30 bytes. OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and the bench counted packets. A frame is now one `encode()`'s output, and against the old count the seam test fails `6` against `3` |
 | 2026-10-31 | **L1, the fleet.** Agent 0.4.191 on every host read, the quick profile through `roomler exec` | **The check fails where it should.** Both Windows hosts read `fallback` on `rtp:h264`, on a hello that lists `mf-h264-hw`; jupiter and mars matched their hellos. 4 of 11 online hosts reached, with a live-use check inside each command. The table, the join and who was skipped are in [§ L1 fleet run](#l1-fleet-run-2026-10-31). |
+| 2026-11-20 | **L1, MacBook-1.** Agent 0.4.227, the quick profile with hardware asked for, through `roomler ssh` into the Mac's root row | **The join passes on macOS:** `rtp:h265`, `dc:h264` and `dc:h265` opened VideoToolbox in hardware, as the hello says, in a 1.3 s run. `rtp:h264` read `sw-only` and `dc:vp9:444` `fallback`, with the same bytes as every 2026-10-31 host. zeus was skipped again: three lab guests of another job were running, and the check in the command stopped the run. The rows are in [§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1). |
+| 2026-11-20 | **L1, zeus and two Windows desktops, that evening.** Agent 0.4.229 on all three, after that release reached the fleet. The desktops came online after 2026-10-31, and each was tried through `roomler exec`, which runs as SYSTEM in the console session | **None ran: the checks stopped all three before the bench.** Desktop 2, at 19:16Z and 20:18Z: the server's record held an open remote session on its row, the same one both times, so no command reached the PC. Desktop 3, at 19:16Z and 20:19Z (21:16 and 22:19 on its clock): `quser` read its one session idle under a minute. Keep busy was off, so the check read the session's own idle time. zeus, at 19:18Z: five guests of other jobs were running, the release lab's bases among them. Who ran it is in [§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1). |
+| 2026-11-20 | **L1, the two Windows desktops, later that night.** Agent 0.4.229, the quick profile through `roomler exec`, at 21:50Z and 21:52Z, about six seconds each, on the operator's word while each PC was in use | **Both ran, and both read `fallback` on `rtp:h264`**, on a hello that lists `mf-h264-hw` and whose FR-77 cell marks `h264/mf` as software, as on the 2026-10-31 desktop. `rtp:h265`, `dc:h264` and `dc:h265` opened Quick Sync in hardware, as the hellos' cells say. The two desktops printed the same seven verdicts and the same output bytes. The open remote session on desktop 2 and each PC's `quser` idle time were printed but no longer stopped the run. The CPU check still could, and read 23 % and 8 %. zeus was not tried: the next release's lab holds it until that release reaches the fleet. The rows are in [§ two Windows desktops](#l1-fleet-run-2026-11-20-two-windows-desktops). |
 
 ### L1 fleet run, 2026-10-31
 
@@ -343,8 +357,110 @@ Who ran it, against the server's 20 rows, 11 of them online:
 | Hosts | State | Why |
 |---|---|---|
 | jupiter, mars, a Windows laptop, a Windows desktop | reached | mars on the second try: the first stopped at the check, at load 18 on 16 CPUs |
-| zeus | skipped | Host under memory pressure after an incident the same evening. Its hello matches jupiter's |
-| MacBook-1 | skipped | Two VM guests of another job were running. FR-112's rows on [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) ran `--encoder software`, which cannot read `fallback`, so its VideoToolbox rows are owed |
+| zeus | skipped | Host under memory pressure after an incident the same evening. Its hello matches jupiter's. **Skipped twice more on 2026-11-20**: other jobs' lab guests were running each time, and the check in the command stopped the run ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)) |
+| MacBook-1 | skipped, **reached on 2026-11-20** | Two VM guests of another job were running. FR-112's rows on [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) ran `--encoder software`, which cannot read `fallback`. Its VideoToolbox rows ran in hardware on 2026-11-20 ([§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1)) |
 | CORPLAP-1, CORPLAP-2, CORPLAP-3 | not run | `roomler exec` is not used on a corporate laptop |
 | NEO16, NEO16-WSL | not run | Never a target |
 | 9 other rows | offline | |
+
+### L1 fleet run, 2026-11-20: MacBook-1
+
+Agent 0.4.227, which this Mac is held on, and the same quick profile as on 2026-10-31
+(`roomlerd encoder-smoke --bench`: 1280×720, `drag:1000`, 90 frames back to back at a 30 fps
+target, hardware asked for), at `nice -n 10`, as the signed-in user, through `roomler ssh` into
+the Mac's root row. The checks ran in the same command, and none stopped it: no open session on
+either of the Mac's two rows in the server's record, no VM guest running, load 2.2 on 15 CPUs,
+and keep busy's last `user_active` seven hours old. `clock=off`, as on macOS by default. The
+whole run took 1.3 s.
+
+| Cell | Opened | Verdict | Encode p50 / p95, ms | Produced (rate) |
+|---|---|---|---|---|
+| `rtp:h264` | `openh264`, sw | `sw-only` | 1.73 / 3.43 | 3383 kbps (0.61) |
+| `rtp:h265` | `hevc_videotoolbox`, hw | `ok` | 0.61 / 0.68 | 1365 kbps (0.25) |
+| `rtp:av1` | not in this build | | | |
+| `dc:h264` | `h264_videotoolbox`, hw | `ok` | 0.58 / 0.71 | 693 kbps (0.13) |
+| `dc:h265` | `hevc_videotoolbox`, hw | `ok` | 0.61 / 0.64 | 1279 kbps (0.23) |
+| `dc:av1` | nothing | `none` | | |
+| `dc:vp9:444` | `libvpx-vp9-444`, sw | `fallback` | 2.14 / 3.48 | 3594 kbps (0.65) |
+
+- **The join passes on macOS.** The hello in the server's record (both of the Mac's rows, on
+  0.4.227) lists two hardware encoders, `ffmpeg-hevc_videotoolbox` and
+  `ffmpeg-h264_videotoolbox`, and its FR-77 cells mark `hevc/videotoolbox` and
+  `h264/videotoolbox` as hardware at 4:2:0. All three rows that ask for them opened them in
+  hardware. No cell this Mac advertises fell back.
+- **`rtp:h264` is `sw-only`, not a fallback.** The RTP track's H.264 has hardware only through
+  Media Foundation, on Windows. A session that wants hardware H.264 on a Mac gets it on the
+  DataChannel.
+- **`dc:vp9:444`'s `fallback` is the one 2026-10-31 read on every host:** the build carries
+  FFmpeg's VP9 hardware path, nothing here answers it, and libvpx did. No hello claims 4:4:4 VP9
+  in hardware.
+- **The bytes match the other hosts'.** `rtp:h264` produced 3383 kbps and `dc:vp9:444` 3594
+  kbps, as on jupiter, mars, both Windows hosts and the 2026-10-30 container. The VideoToolbox
+  rows sit far under their target (rate 0.13 to 0.25), which is headroom: a quality-driven
+  encoder under a cap does that on easy content.
+- `dc:av1` opened nothing. Apple's encoders offer no AV1, and the hello lists none.
+
+Who ran it on 2026-11-20, against the server's 23 rows, 14 of them online. That is 13 machines:
+since 2026-11-10 the Mac has a second row, for its root daemon.
+
+| Hosts | State | Why |
+|---|---|---|
+| MacBook-1 | reached | Above |
+| zeus | skipped twice | 14:21Z, on 0.4.228: three lab guests of another job were running. 19:18Z, on 0.4.229, after that release's push: five guests of other jobs were running, the release lab's bases for its next round among them. Both times the check in the command stopped the run before the bench. Not tried again that night: the next release's lab holds zeus until that release reaches the fleet |
+| Windows desktop 2 (Core i5-12400, UHD 730) | skipped twice, **reached at 21:50Z** | It came online after 2026-10-31. At 19:16Z and 20:18Z the server's record held an open remote session on its row, the same one both times, so no command reached the PC. At 21:50Z it ran on the operator's word, beside that session ([§ two Windows desktops](#l1-fleet-run-2026-11-20-two-windows-desktops)) |
+| Windows desktop 3 (Core i5-12400, UHD 730) | skipped twice, **reached at 21:52Z** | It came online after 2026-10-31. At 19:16Z and 20:19Z, at 21:16 and 22:19 on its clock, `quser` read its one session idle under a minute, and the check in the command stopped the run before the bench. At 21:52Z it ran on the operator's word, its session still in use ([§ two Windows desktops](#l1-fleet-run-2026-11-20-two-windows-desktops)) |
+| jupiter, mars, a Windows laptop, a Windows desktop | not re-run | Reached on 2026-10-31 |
+| CORPLAP-1, CORPLAP-2, CORPLAP-3, NEO16, NEO16-WSL | not run | The operator runs these at each console (the 2026-11-02 decision on #798) |
+| 9 other rows | offline | |
+
+The two desktops are people's work PCs. They were tried with the operator's go, after their
+working day, on 0.4.229, with every check inside the one command that would have run the bench:
+the PC's own clock at 19:00 or later, every interactive session idle for at least 15 minutes by
+`quser`, the CPU under 50 % over three reads, and no open remote session on the row in the
+server's record. A running keep busy resets the idle clock with its moves, so each row's
+`keep_busy` was read first. It was off on both. Both desktops have the 2026-10-31 desktop's
+hardware, so their rows compare with its column directly.
+
+### L1 fleet run, 2026-11-20: two Windows desktops
+
+Both evening tries stopped on people at work: a remote session open on desktop 2 since 19:04Z,
+and a session on desktop 3 that `quser` never read as idle. The operator then said to run the
+bench while they were in use. A run is about six seconds of encoder load. The session check and
+the idle check were read and printed in the command's output, and no longer stopped it. The CPU
+check still could: at 50 % or more over three reads it would read again five minutes later, and
+skip if the load was still that high. It read 23 % on desktop 2 and 8 % on desktop 3. Agent
+0.4.229, the quick profile of 2026-10-31, through `roomler exec` as SYSTEM in the console
+session. The remote session on desktop 2 was left alone, and at 22:06Z the server's record still
+held it open, the same session. Both runs read `clock=unthrottled`: since FR-112 the bench takes
+its encoding thread out of Windows power throttling, and the 2026-10-31 runs read `n/a`.
+
+An entry is what opened, its verdict, encode p50 / p95 in ms and the Mbps produced, as in
+[the 2026-10-31 table](#l1-fleet-run-2026-10-31), whose desktop column is repeated here.
+
+| | Windows desktop 2 | Windows desktop 3 | A Windows desktop, 2026-10-31 |
+|---|---|---|---|
+| Run | 21:50:46Z, 6.2 s | 21:52:02Z, 6.1 s | 5.3 s |
+| `rtp:h264` | **`mf-h264` sw, `fallback`**: 2.56 / 3.30, 2.6 | **`mf-h264` sw, `fallback`**: 2.48 / 3.17, 2.6 | **`mf-h264` sw, `fallback`**: 2.59 / 3.36, 2.6 |
+| `rtp:h265` | `hevc_qsv` hw, `ok`: 2.53 / 3.64, 6.3 | `hevc_qsv` hw, `ok`: 2.62 / 3.16, 6.3 | `hevc_qsv` hw, `ok`: 2.66 / 3.36, 6.3 |
+| `rtp:av1` | `noop`, `none` | `noop`, `none` | `noop`, `none` |
+| `dc:h264` | `h264_qsv` hw, `ok`: 2.53 / 3.47, 5.1 | `h264_qsv` hw, `ok`: 2.61 / 3.33, 5.1 | `h264_qsv` hw, `ok`: 2.78 / 3.50, 5.1 |
+| `dc:h265` | `hevc_qsv` hw, `ok`: 2.52 / 3.73, 5.1 | `hevc_qsv` hw, `ok`: 2.68 / 3.18, 5.1 | `hevc_qsv` hw, `ok`: 2.74 / 3.58, 5.1 |
+| `dc:av1` | nothing, `none` | nothing, `none` | nothing, `none` |
+| `dc:vp9:444` | `libvpx-vp9-444` sw, `fallback`: 4.63 / 7.42, 3.6 | `libvpx-vp9-444` sw, `fallback`: 4.47 / 7.08, 3.6 | `libvpx-vp9-444` sw, `fallback`: 4.80 / 8.74, 3.6 |
+| Hello's `hw_encoders`, hardware entries | `mf-h264-hw`, `vp9_qsv`, `hevc_qsv`, `h264_qsv` | the same | the same |
+| Hello's `h264/mf` cell | software | software | software |
+
+- **The fallback reads on both.** Each hello (the server's record at 21:53Z, on 0.4.229) lists
+  `mf-h264-hw`, and `rtp:h264` opened Microsoft's software MFT. The log gives the 2026-10-31
+  reason: the cascade enumerated four H.264 MFTs, deferred the asynchronous ones, the last
+  produced zero bytes, and it wrote `no HW candidate succeeded — falling back to SW MFT`. The
+  FR-77 cell `h264/mf` is software on both, so only the legacy label overclaims.
+- **The join passes on every other row.** The hellos' cells mark `hevc/qsv` and `h264/qsv` as
+  hardware at 4:2:0, and `rtp:h265`, `dc:h264` and `dc:h265` opened them in hardware. Neither
+  hello lists AV1 in `codecs`, and both AV1 rows opened nothing. `dc:vp9:444` is the
+  `fallback` every host reads: the `vp9/qsv` cell is 4:2:0 only.
+- **The two desktops agree to the byte.** Every row produced the same rate and the same IDR and
+  delta sizes on both, and `dc:vp9:444` produced 3594 kbps, as on every host since 2026-10-30.
+  Every encode p50 is within 0.35 ms of the 2026-10-31 desktop's.
+
+Who ran it on 2026-11-20 is in [§ 2026-11-20](#l1-fleet-run-2026-11-20-macbook-1).

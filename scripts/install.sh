@@ -91,7 +91,7 @@
 # Conventions: POSIX sh (no bashisms), curl -fsSL, /tmp staging, sudo only
 # where the target dir demands it. The enrollment token is single-use and is
 # never echoed.
-
+main() { exec </dev/null # #3931: the whole script is this one function, and its end says why
 set -eu
 
 # ⚠️ FR-50 — this line is REWRITTEN at serve time by the server that hands you
@@ -2240,3 +2240,28 @@ fi
 
 report_installed_version
 say "done."
+# ⚠️ #3931 — the WHOLE script is this one function, main, from `main() {`
+# below the header's comments to the brace below, and the last line is its
+# only call. So the shell has read every byte of the script before the first
+# command runs, however the script reaches it:
+#   - piped from curl, the script is the shell's stdin, which bash reads one
+#     byte at a time and dash 8 KiB at a time. A command that read its stdin
+#     ate the lines the shell had not read yet, and the shell went on without
+#     them, often to exit 0 (#3917, #3924, #3930, #3926 guarded their calls).
+#   - a download cut short either does not parse (the brace never closes) or
+#     never reaches the call, so it runs nothing at all.
+# main's first statement gives the shell /dev/null as its stdin, so whatever
+# it starts reads an end of file in every mode: piped, from a file (where
+# stdin is the person's terminal) and from the wizard. Never script text, and
+# never keystrokes. What the script asks a person goes to the terminal device
+# (/dev/tty), as sudo's password prompt and the pairing's "Join …?" do. The
+# </dev/null on single calls stays: each still says so where it is.
+# Keep it so:
+#   - nothing after the last line. Dash runs bytes that arrive in the same
+#     read as the call, and so does any shell that runs the script from a
+#     file. The exit below keeps them from running, whatever path main takes.
+#   - call main as a plain command, never `main || …`, `if main` or `! main`:
+#     each turns set -e off for the whole script.
+exit
+}
+main "$@"
