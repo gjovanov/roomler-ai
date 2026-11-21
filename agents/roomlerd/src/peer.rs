@@ -11117,7 +11117,7 @@ fn attach_control_handler(
                     // agent's current rolling log file so the
                     // operator can see what's actually happening on
                     // the host without RDPing in. Single round-trip
-                    // for sub-32-KB payloads (rc.23-compatible);
+                    // for a reply that fits one frame (rc.23-compatible);
                     // chunked stream for larger ones because a
                     // single SCTP message can't exceed the
                     // negotiated `max_message_size` (65536 default)
@@ -11164,7 +11164,7 @@ fn attach_control_handler(
                         let text = match serde_json::to_string(&env) {
                             Ok(s) => s,
                             Err(e) => {
-                                debug!(%session_id, %e, "control: rc:logs-fetch.reply serialise failed");
+                                warn!(%session_id, %e, "control: rc:logs-fetch.reply serialise failed");
                                 continue;
                             }
                         };
@@ -11172,7 +11172,7 @@ fn attach_control_handler(
                             break;
                         };
                         if let Err(e) = dc.send_text(text).await {
-                            debug!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
+                            warn!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
                             // Stop sending the rest of the stream —
                             // browser will get a partial response and
                             // can retry. Better than spamming dead
