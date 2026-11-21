@@ -483,7 +483,7 @@ AC23's case, TURN blackholed: the hold ran to its bound, and the session opened 
 INFO per-session ICE path detected (adaptive bitrate) session_id=<id> relay=false local_typ=Host local_proto=Udp local_addr=100.64.0.12:50123 remote_typ=Relay remote_proto=Udp remote_addr=100.64.0.9:50200 waited_ms=0 opening=route route=mesh-relayed hold_ms=2500 hold_exit=bound
 ```
 
-`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:139`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
+`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:287`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
 
 **The kill switch.** `rc_carrier_rank` back to `1`, `prio` or `0` (or `ROOMLERD_RC_CARRIER_RANK`), then a restart; it is read once per session. Under every value but `route` the agent gets no route rank, and every branch above is a no-op: the vnet cells `kill_switch_under_prio_and_1_every_pair_is_formed_and_nothing_is_held` and `kill_switch_under_prio_shapes_a_and_b_still_open_on_the_mesh` hold that.
 
@@ -3025,7 +3025,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    nothing or did not answer (#3967; `docs/desktop-companion.md` §10.8). An exec question reads it
    from `ensure_running_verdict` ([`:1181`](../agents/roomlerd/src/companion.rs#L1181)), an SSH
    question from `Companion::verdict` ([`:1462`](../agents/roomlerd/src/companion.rs#L1462)), in
-   `ask_here` ([`ssh.rs:2581`](../agents/roomlerd/src/ssh.rs#L2581)). `TrayVerdict::why_not_shown`
+   `ask_here` ([`ssh.rs:2694`](../agents/roomlerd/src/ssh.rs#L2694)). `TrayVerdict::why_not_shown`
    ([`companion.rs:1227`](../agents/roomlerd/src/companion.rs#L1227)) picks the closed road's
    sentence only where the tray was up with the question's marker to read, and FR-27's sentence
    otherwise. Until #4140 both causes were one `false` (`tray_up() && reaches_the_tray()`), so on a

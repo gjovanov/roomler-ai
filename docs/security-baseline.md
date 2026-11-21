@@ -792,12 +792,12 @@ escaping, on every line that holds it:
 |---|---|---|
 | `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
 | `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
-| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2257`) |
-| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2120`) | the four `ssh: forward …` lines |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2370`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2233`) | the four `ssh: forward …` lines |
 | `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:903`, `:926`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
 | `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
 | `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
-| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2205`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2318`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
 
 Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
 question's id), which the SYSTEM service checks with `valid_object_id` before it
