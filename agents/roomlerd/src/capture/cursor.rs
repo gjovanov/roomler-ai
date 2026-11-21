@@ -781,3 +781,143 @@ mod windows_impl {
         }
     }
 }
+
+/// #4207 — the `cursor:shape` message for one shape, as the pump in
+/// `peer.rs` sends it on the `cursor` channel when the tracker reports a new
+/// shape.
+pub fn shape_message(shape_id: u64, shape: &CursorInfo) -> String {
+    shape_message_as_is(shape_id, shape)
+}
+
+/// The message with the bitmap as the host drew it.
+fn shape_message_as_is(shape_id: u64, shape: &CursorInfo) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    serde_json::json!({
+        "t": "cursor:shape",
+        "id": shape_id,
+        "w": shape.width,
+        "h": shape.height,
+        "hx": shape.hotspot_x,
+        "hy": shape.hotspot_y,
+        "bgra": BASE64.encode(&shape.bgra),
+        // Optional CSS `cursor` keyword for stock system cursors ("text",
+        // "default", …); null for app-custom cursors. Lets the browser
+        // render the viewer's native OS cursor instead of this bitmap.
+        // Additive — old browsers ignore it.
+        "css": shape.css,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod shape_message_tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    /// What one data-channel message carries to every peer (#4121): a
+    /// webrtc-rs reader reads each message into a 65 535-byte buffer, and
+    /// the agent's SCTP stack refuses to send one over 65 536 bytes. The
+    /// tests keep their own copy rather than trust the code's.
+    const ONE_MESSAGE: usize = 65_535;
+
+    /// Every pixel opaque, the colours varied across the image.
+    fn opaque(w: u32, h: u32) -> CursorInfo {
+        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                bgra.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 255]);
+            }
+        }
+        CursorInfo {
+            width: w,
+            height: h,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
+            css: None,
+        }
+    }
+
+    /// An opaque white disc on fully transparent black: the edge a resample
+    /// must not darken.
+    fn transparent_edged(w: u32, h: u32) -> CursorInfo {
+        let (cx, cy) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+        let r = f64::from(w.min(h)) / 2.0 - 2.0;
+        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (f64::from(x) + 0.5 - cx, f64::from(y) + 0.5 - cy);
+                let inside = dx * dx + dy * dy <= r * r;
+                bgra.extend_from_slice(&if inside { [255; 4] } else { [0; 4] });
+            }
+        }
+        CursorInfo {
+            width: w,
+            height: h,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
+            css: None,
+        }
+    }
+
+    /// The message for `shape`, checked to be one `cursor:shape` that a peer
+    /// takes in one message and whose bitmap is `w`×`h`×4 bytes, as the
+    /// viewer reads it (`applyCursorShape` drops a shorter one).
+    fn sent(shape: &CursorInfo, what: &str) -> (serde_json::Value, Vec<u8>) {
+        let msg = shape_message(7, shape);
+        assert!(
+            msg.len() <= ONE_MESSAGE,
+            "{what}: the message is {} bytes, over the {ONE_MESSAGE} a peer takes in one",
+            msg.len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&msg).expect("the message is JSON");
+        assert_eq!(v["t"], "cursor:shape", "{what}");
+        assert_eq!(v["id"], 7, "{what}");
+        let (w, h) = (v["w"].as_u64().unwrap(), v["h"].as_u64().unwrap());
+        assert!(w >= 1 && h >= 1, "{what}: {w}x{h}");
+        let bgra = BASE64.decode(v["bgra"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            bgra.len() as u64,
+            w * h * 4,
+            "{what}: bgra is not w*h*4 bytes"
+        );
+        (v, bgra)
+    }
+
+    #[test]
+    fn a_128_px_pointer_fits_one_message() {
+        sent(&opaque(128, 128), "opaque 128x128");
+        sent(&transparent_edged(128, 128), "transparent-edged 128x128");
+    }
+
+    #[test]
+    fn a_256_px_pointer_fits_one_message() {
+        sent(&opaque(256, 256), "opaque 256x256");
+        sent(&transparent_edged(256, 256), "transparent-edged 256x256");
+    }
+
+    #[test]
+    fn a_64_px_pointer_is_sent_byte_for_byte_as_before() {
+        for css in [None, Some("text")] {
+            let mut shape = transparent_edged(64, 64);
+            (shape.hotspot_x, shape.hotspot_y, shape.css) = (3, 5, css);
+            // The pump's own build before #4207 (`peer.rs`, `6168d66fa`).
+            let before = serde_json::to_string(&serde_json::json!({
+                "t": "cursor:shape",
+                "id": 42u64,
+                "w": shape.width,
+                "h": shape.height,
+                "hx": shape.hotspot_x,
+                "hy": shape.hotspot_y,
+                "bgra": BASE64.encode(&shape.bgra),
+                "css": shape.css,
+            }))
+            .unwrap();
+            assert_eq!(shape_message(42, &shape), before, "css {css:?}");
+            sent(&shape, "64x64");
+        }
+    }
+}
