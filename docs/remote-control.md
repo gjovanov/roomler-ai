@@ -6011,7 +6011,8 @@ to-activate, so the browser never sees a bait-and-switch.
   drawer and `files:error` on a transfer, and the session goes on (§9.6 there).
   Gated by `AgentCaps.files` — `upload · download ·
   download-folder · resume` always, `browse` only while
-  `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in
+  `enable_remote_browse` is on, and `dir-pages` with it (#4121: a large
+  folder's listing comes in pages, below). ⚠️ The list is assigned by the daemon in
   `encode::caps::detect()` (`with_config_lists` → `files_caps`), never by the
   caps-probe child:
   the child loads no config, so a `browse` computed there rode the flag's
@@ -6043,6 +6044,57 @@ to-activate, so the browser never sees a bait-and-switch.
   still running an upload's end, which it awaits inline (#4082). A
   channel runs one folder listing step at a time, and the Drives view has
   a lane of its own ([desktop-companion.md](desktop-companion.md) §9.3).
+  **A listing too large for one message comes in pages** (#4121). A
+  webrtc-rs receiver reads each message into a 65 535-byte buffer, and the
+  SCTP stack refuses to send one over 65 536 bytes, so a folder whose
+  listing ran past that never listed (about 360 names of 120 characters
+  are enough): the drawer showed its 5 s timeout. The agent measures the
+  listing as one frame and answers by what the request asked
+  (`answer_measured`,
+  [`files/dir_pages.rs:42`](../agents/roomlerd/src/files/dir_pages.rs#L42)):
+
+  | The listing as one frame | A viewer that asks for pages (`paged: true`) | An older viewer |
+  |---|---|---|
+  | at most 65 535 bytes (`FILES_FRAME_MAX`) | one `files:dir-list`, today's bytes, no page fields | the same |
+  | larger | `files:dir-list` pages of at most 40 KiB each (`DIR_PAGE_BUDGET`), measured as serialized: every entry in order, each page numbered `page` (from 0) of `pages`, with the listing's `total`, and the last one `capped` when the folder held more | one `files:dir-error` naming the folder, its count and the listing's size ("too large for this viewer to receive at once") |
+
+  | A large folder | An older viewer | A viewer with #4121 |
+  |---|---|---|
+  | **An agent before #4121** | never arrives: the 5 s timeout | the timeout names the folder and says the host's agent needs an update (its hello has no `dir-pages`) |
+  | **An agent with #4121** | the refusal, at once | the pages, joined |
+
+  The limit is one byte under the stack's own: a frame of 65 536 bytes is
+  sent, and closes a native receiver's stream for good. A page is filled
+  entry by entry against each entry as serialized, then measured whole
+  (`paginate`, `dir_pages.rs:108`), so a name that escapes long (a control
+  character is six bytes as `\u0001`) cannot carry a page past the budget.
+  A folder whose path alone leaves a page no room is refused, named by its
+  last part, shortened to fit if need be (`refusal`, `dir_pages.rs:146`).
+  The listing's task sends the frames in order (`send_listing_frames`,
+  [`peer.rs:13450`](../agents/roomlerd/src/peer.rs#L13450)), each waiting
+  while the channel holds more than the download pumps' 4 MiB high-water
+  mark, and stops at the channel's end, the session's, or the first send
+  that fails. A send that fails is a WARN, `files: answer not sent`, with
+  the frame's kind, size, id and error, never an entry's name
+  (`send_files_frame`, `peer.rs:13897`); `files: dir listed` gains
+  `capped`, `bytes` and `pages`. The viewer
+  ([`remoteDirListing.ts`](../ui/src/composables/remoteDirListing.ts),
+  moved out of `useRemoteControl.ts` by #4121) asks with `paged: true`,
+  joins one `req_id`'s pages in order and checks the join against `total`
+  (`takePage`, `remoteDirListing.ts:171`): a page out of order, or a join
+  short of `total`, rejects naming the folder. Its 5 s wait starts again at
+  each page (`armWait`, `remoteDirListing.ts:121`), so a large folder is
+  not cut off 5 s after the request. A wait that runs out names the folder
+  and, when the agent's hello has no `dir-pages`, says that an update lists
+  a large folder (`timeoutWords`, `remoteDirListing.ts:132`), never that the
+  host "may not support remote browse": the drawer asks only an agent that advertises `browse`.
+  A folder over 10 000 entries (`DIR_ENTRIES_MAX`) is listed to that limit
+  and says so, `capped` on its last page or its one frame, and the drawer
+  shows a line under the list. The drawer applies only its latest
+  navigation's answer (`createLatest`, `remoteDirListing.ts:250`, from `navigateTo` in
+  [`RemoteControl.vue:3338`](../ui/src/views/remote/RemoteControl.vue#L3338)):
+  pages widen the window in which an earlier folder's answer lands after a
+  later one's.
   **One upload on the wire at a time** (#2929). The agent keeps ONE active
   transfer per files channel: a `files:begin` while another is open
   replaces it, and every chunk lands in the open one. Two uploads started

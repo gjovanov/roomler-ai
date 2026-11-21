@@ -142,7 +142,13 @@ flowchart TB
   file's path names the folder once, #3725), folder download (streamed zip),
   resumable uploads, cancellable either way; the Remote files drawer browses the
   host — its roots view is the empty path (the drives on Windows, a single `/` on
-  Unix), and `/` itself is a directory (`isRootsRequest`, #2870). A Transfers
+  Unix), and `/` itself is a directory (`isRootsRequest`, #2870). It waits 5 s
+  for a folder's answer, and 5 s again after each page of a folder too large for
+  one message (#4121, `remoteDirListing.ts`). A wait that runs out names the
+  folder, and adds that the host's agent needs an update when its hello lacks
+  `dir-pages`; a folder over 10 000 entries shows a line under the list saying
+  it holds more; and only the latest navigation's answer fills the drawer
+  ([remote-control.md §18.2](remote-control.md#182-data-channel-handlers-0131--0133)). A Transfers
   row moves only through `moveTransfer`: a finished or cancelled row is final,
   and its bar never moves back (#3726,
   [remote-control.md §18.2](remote-control.md#182-data-channel-handlers-0131--0133)).

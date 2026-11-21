@@ -10569,7 +10569,7 @@ CAN_GRAPHICAL=0
 
     /// #3688 — a listing answers inside the viewer's own timer for it: the
     /// drawer gives up on `files:dir` after 5 s (`listDir`,
-    /// `ui/src/composables/useRemoteControl.ts`). The seat0 lookup and the
+    /// `ui/src/composables/remoteDirListing.ts`). The seat0 lookup and the
     /// listing's own timeout run one after the other, so together they stay
     /// inside it; a lookup that took the whole 5 s could never be answered.
     #[cfg(target_os = "linux")]

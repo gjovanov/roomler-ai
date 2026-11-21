@@ -935,7 +935,17 @@ sequenceDiagram
     T->>K: take the lane, within 4.5 s of the task's start
     K->>B: one step, 3 s from now: resolve, open, read the entries
     B-->>T: the listing
-    T-->>V: files:dir-list {req_id: a}, or files:dir-error with the reason,<br/>unless the channel closes or the session ends first
+    alt it fits one message, at most 65 535 bytes
+        T-->>V: files:dir-list {req_id: a}, as every agent sends it
+    else larger, and the request said paged
+        loop each page, at most 40 KiB, in order
+            T-->>V: files:dir-list {req_id: a, page, pages, total}
+            V->>V: join the page, wait 5 s again
+        end
+    else larger, from a viewer that does not join pages
+        T-->>V: files:dir-error {req_id: a}: the folder, its count, its size
+    end
+    Note over T,V: a failed read answers files:dir-error with the reason,<br/>and nothing goes once the channel closes or the session ends
 ```
 
 - **The read loop never awaits a listing.** The files channel's message handler hands `files:dir`
@@ -944,7 +954,7 @@ sequenceDiagram
   chunks never wait behind a share: the channel's worst-case hold for a listing is none. It used to
   be awaited inline, and webrtc-rs reads a channel's next message only once the handler of the last
   one returns. A later listing's answer can now come before an earlier one's; the viewer matches
-  each by its `req_id` (`ui/src/composables/useRemoteControl.ts:10628`), so no wire changed. Once the
+  each by its `req_id` (`onFilesMessage`, `ui/src/composables/remoteDirListing.ts:215`), so no wire changed. Once the
   channel closes or its session ends, a listing still running drops its answer and sends nothing
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:320`, from the channel's
   `on_close`, `agents/roomlerd/src/peer.rs:13082`; `end_session`). An answer already being sent
@@ -974,7 +984,8 @@ sequenceDiagram
   drives.
 - **A listing is answered within 4.5 s of reaching its task** (`LISTING_ANSWERED_WITHIN`): its
   person lookup (1.5 s at most), its wait for the lane and its step all in. The viewer gives up
-  5 s after its send (`useRemoteControl.ts:14153`, a timer set just before the send at `:14156`),
+  5 s after its send (`listDir`, `ui/src/composables/remoteDirListing.ts:156`, a timer set just
+  before the send at `:159`), and 5 s after each page of a listing that comes in pages (#4121),
   which leaves 0.5 s for the way there and back, however long the listing waited, when the read
   loop hands it on at once. ⚠️ The read loop still runs an upload's end itself
   (`agents/roomlerd/src/peer.rs:13218`), and that end moves the file into place with no bound: on
@@ -984,6 +995,17 @@ sequenceDiagram
   answers "Could not tell who is signed in to this computer. Try again." (`CANNOT_TELL`,
   `agents/roomlerd/src/files/reads.rs:35`), a read and a received file alike, never the service's own
   identity. A retry asks again, and joins a lookup still running rather than starting another.
+- **A listing too large for one message comes in pages** (#4121). The answer is measured as one
+  frame first (`answer_measured`, `agents/roomlerd/src/files/dir_pages.rs:42`): up to 65 535
+  bytes it goes whole, as before. Larger, it goes in pages of at most 40 KiB to a viewer whose
+  request said `paged`, and as one `files:dir-error` naming the folder, its count and the
+  listing's size to a viewer that did not, which every viewer shows. The task sends the pages in
+  order behind the same end as a whole answer (`send_listing_frames`,
+  `agents/roomlerd/src/peer.rs:13450`, through `or_stopped`), so a channel that closes mid-listing
+  stops them, and the viewer waits 5 s again at each page. A send that fails is a WARN,
+  `files: answer not sent`, with its error. A folder over 10 000 entries is listed to that limit
+  and says so (`capped`). The answers by viewer and agent, the limit and the budget:
+  [remote-control.md §18.2](remote-control.md#182-data-channel-handlers-0131--0133).
 - **The Drives view lists the person's own letters.** A letter they mapped in their own sign-in is
   listed, and a typed path on it lists and downloads with their logon. A letter mapped from an
   elevated prompt lives in that elevated sign-in's device map, not their everyday one's, so it is
