@@ -750,7 +750,7 @@ impl StripeService {
                     "Everything in Pro",
                     "5,000 devices",
                     "Unlimited remote sessions",
-                    "Meetings with 100 people, and recordings",
+                    "Meetings with 100 people",
                     "100 GB of relay traffic per user each month",
                     "50 GB storage per user",
                     "Priority support",
