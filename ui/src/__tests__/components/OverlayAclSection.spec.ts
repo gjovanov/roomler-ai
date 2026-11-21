@@ -11,6 +11,11 @@
 // teleported v-dialog, so the spec mounts attached to the document and reads
 // the dialog from there: a stub that hid the dialog's body would pass on the
 // broken shape too.
+//
+// #4190 — an id no list here holds (a node or a role since removed, a member
+// who left) reads as its kind and its first 6 characters, `Node 6a70a3…`, as
+// on the Tunnel ACL tab. It read as the bare kind, so two removed nodes looked
+// the same.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
@@ -213,6 +218,44 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     expect(chips(rows[1]!, 'Sources')).toEqual(['All nodes'])
     expect(chips(rows[1]!, 'Via')).toEqual(['All nodes'])
     expect(document.body.textContent).not.toContain('[object Object]')
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('names one no list holds by its kind and its first 6 characters (#4190)', async () => {
+    // A node and a role since removed, and a member who left. The first 6
+    // characters are the top of an ObjectId's timestamp: these two nodes were
+    // minted eight days apart (two minted within the same 256 s share them).
+    const gone = {
+      node: '6a70a3f15e2d4c1b0a9f8e01',
+      otherNode: '6a7b52e05e2d4c1b0a9f8e02',
+      user: '6a61f4a2c3d4e5f60718293a',
+      role: '6a5c9e7b1a2b3c4d5e6f7081',
+    }
+    const rule: OverlayPolicy = {
+      ...namedRule(),
+      sources: [
+        { kind: 'node_id', id: wireId(gone.node) },
+        { kind: 'user_id', id: wireId(gone.user) },
+        { kind: 'role_id', id: wireId(gone.role) },
+      ],
+      via: [
+        { kind: 'node_id', id: wireId(gone.node) },
+        { kind: 'node_id', id: wireId(ids.node) },
+        { kind: 'node_id', id: wireId(gone.otherNode) },
+      ],
+    }
+    mockApi.get.mockResolvedValue(listOf([rule]))
+    const w = mountSection()
+    await flushPromises()
+    const rows = [...document.querySelectorAll('tbody tr')]
+    expect(rows).toHaveLength(1)
+    expect(chips(rows[0]!, 'Sources')).toEqual(['Node 6a70a3…', 'User 6a61f4…', 'Role 6a5c9e…'])
+    // The node it can resolve keeps its name alone, between the two it cannot.
+    const via = chips(rows[0]!, 'Via')
+    expect(via).toEqual(['Node 6a70a3…', NODE, 'Node 6a7b52…'])
+    // The issue's own complaint: two removed nodes no longer read the same.
+    expect(via[0]).not.toBe(via[2])
     expectNothingRaised()
     w.unmount()
   })
