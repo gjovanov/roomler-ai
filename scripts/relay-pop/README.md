@@ -183,6 +183,34 @@ old workers until they close. A new `derp-relay` binary takes effect with
 `docker compose -f docker-compose.pop.yml restart derp-relay`, which drops the
 PoP's DERP sockets; the nodes reconnect at once.
 
+## The drop lines (FR-148 D52)
+
+`derp-relay` drops a frame it cannot pass on, as the central relay does, and
+since FR-148 D52 it counts every drop past the frame-size check and logs it,
+paced, so a T3 on the mesh relay that no node's own count explains can be
+looked for here ([every drop on the relay path](../../docs/overlay-communication.md#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)).
+
+| Drop | Level | Message | Fields | Paced |
+|---|---|---|---|---|
+| a bulk frame of an org past its plan's monthly relay (FR-115) | INFO | `derp-relay: bulk frame dropped by the relay allowance (the org is past its plan's monthly relay)` | `network`, `rate_bytes_per_sec`, `derp_allowance_shaped_total` | once per network per 10 s |
+| a frame for a destination with no registration here: the peer is offline, or registered on another relay | INFO | `derp-relay: dropped a frame for an unregistered dst (peer offline, or registered on another relay)` | `network`, `src`, `dst`, `derp_miss_total` | once per network and destination per 30 s |
+| a frame the destination's send queue refused: full (a slow or half-open consumer), or closed by a socket on its way out | WARN | `derp-relay: dropped a frame on a full destination queue (slow or half-open consumer)` | `network`, `src`, `dst`, `derp_full_total` | once per network and destination per 30 s |
+
+`src` and `dst` are the first 8 hex characters of each key, never a whole key,
+so a line here matches the nodes' lines and the central relay's. A total counts
+every drop of its cause since the process started, logged or not; a line
+between two others says how many fell between. The two forward drops are
+counted and paced in `ForwardDrops` (`crates/derp-relay/src/main.rs:995`,
+pacing `drop_log_due`, `:1042`); each cause keeps the last line's time for at
+most 4,096 network and destination pairs, and a pair past that waits for a
+sweep, at most one a window. A frame shorter than 32 bytes or longer than
+2,048 is still dropped without a count.
+
+⚠️ **There is no census line.** `derp-relay` writes no periodic line, and
+`GET /stats` does not carry these totals, so the drop lines are the only place
+they show. Read them in the relay's log:
+`docker compose -f docker-compose.pop.yml logs derp-relay | grep 'dropped a frame'`.
+
 ## Rollback
 
 A misbehaving region: set its spec `"enabled": false` (or drop it) and
