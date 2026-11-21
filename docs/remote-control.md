@@ -7453,8 +7453,10 @@ backs it off exactly as an exit 1. It ends before this bookkeeping, with no
 config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
 GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
-its reports. Only those two workers exit 78: every other `run` with no config
-still exits 1.
+its reports. That worker does so even beside an enrolled copy, because it never
+restores at its start (#4157): on a converted one-row Mac the person's
+`config.toml.prev` can still hold the enrollment that moved to root (#4184).
+Only those two workers exit 78: every other `run` with no config still exits 1.
 
 **A restored config counts nowhere either** (#4157). When `config::load`
 restores a config from its last good copy (`config.toml.prev`), the live

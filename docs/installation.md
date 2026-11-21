@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4023`, `crates/agent-core/src/config.rs:4519`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4024`, `crates/agent-core/src/config.rs:4519`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -579,14 +579,14 @@ file is a *normal* answer for that caller.
 | `config::load` (`crates/agent-core/src/config.rs:3585`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3655`, `:3663`), and the load fails. Each line is worded for what happened to the live file (below) |
 | `config::read_if_present` (`:3694`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
-A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but
-whose `config.toml.prev` loads and holds an enrollment takes the single-instance lock, then `load` restores
-the copy with the *"config missing — RESTORED"* line and without its run marks, so the next start counts no
-crash (`agents/roomlerd/src/app/config_at_start.rs:35`, `agents/roomlerd/src/app.rs:3949-3954`). With no copy,
-or one that does not load or holds no enrollment, it stops with *"no config found"* before the lock, as before.
-An unenrolled one-row Mac's screen worker never restores at its start: it writes the person a new file with
-no enrollment (`:4004-4016`). So removing `config.toml` alone does not make a device forget its enrollment:
-remove `config.toml.prev` too. A Windows SystemContext install with its machine config missing still waits (#4176).
+A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
+loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
+line and without its run marks, so the next start counts no crash (`agents/roomlerd/src/app/config_at_start.rs:39`,
+`agents/roomlerd/src/app.rs:3949-3955`). With no copy, or one that does not load or holds no enrollment, it stops with
+*"no config found"* before the lock, as before. An unenrolled one-row Mac's screen worker never restores at its start: it writes the
+person a new file with no enrollment (`agents/roomlerd/src/app.rs:4005-4017`). Nor does the macOS supervisor's enrolled worker
+(`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because a converted one-row Mac's person `config.toml.prev` can still hold the enrollment that moved to root (#4184).
+So removing `config.toml` alone does not make a device forget its enrollment: remove `config.toml.prev` too. A Windows SystemContext install with its machine config missing still waits (#4176).
 
 ```mermaid
 flowchart TD
@@ -3016,7 +3016,7 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4011`). The
+  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4012`). The
   macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
   (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std

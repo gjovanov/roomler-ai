@@ -235,11 +235,11 @@ flowchart TD
 | Welcome, This device | "Not enrolled yet … Enroll this device…" | "Enrollment not known yet", with no enroll offer (`src/front/welcome.js:168-171`) |
 | Onboarding | the form | the form waits, with a note (`src/front/onboarding.js:131-140`) |
 
-- ⚠️ **A registered service that is not running is no sign of an enrollment.** A daemon with no
-  config, and no last good copy of one that holds an enrollment (#4157), exits ("no config found …
-  Run 'roomlerd enroll' first"), so a fresh system install's service is registered and stopped. Only
-  the config being there decides: a host with none still reads "Not enrolled" and is offered set-up.
-  A per-user install is never asked about the service's config, not even a machine-wide copy left behind.
+- ⚠️ **A registered service that is not running is no sign of an enrollment.** A daemon with no config, and no last good
+  copy of one that holds an enrollment (#4157), exits ("no config found … Run 'roomlerd enroll' first"), so a fresh system
+  install's service is registered and stopped. The macOS supervisor's enrolled worker exits even beside such a copy (78, as before), because a converted one-row Mac's person copy can hold the enrollment that moved to root (#4184).
+  Only the config being there decides: a host with none still reads "Not enrolled" and is offered set-up. A per-user
+  install is never asked about the service's config, not even a machine-wide copy left behind.
 - **Nothing is remembered.** A one-row Mac is told by its person's file with no enrollment
   beside the root half's config, both read afresh on every poll. The next answer that names the
   device ends "not known", and an un-enrollment that takes the root config away (an uninstall)
