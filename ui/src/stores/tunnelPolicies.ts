@@ -4,6 +4,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useTenantStore } from '@/stores/tenant'
+import { fetchAllPages } from '@/utils/allPages'
 import { canManageTunnelPolicies } from '@/utils/permissions'
 
 /**
@@ -148,11 +149,15 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
    *  `MANAGE_AGENTS` (and nothing was sent), or the server answered 403. The
    *  page explains that instead of drawing an editor whose every save fails. */
   const refused = ref(false)
+  /** The list stopped at the page cap (`MAX_PAGES` in utils/allPages.ts)
+   *  while the server holds more policies: the tab says how many it shows. */
+  const truncated = ref(false)
 
   async function fetchPolicies(tenantId: string) {
     loading.value = true
     error.value = null
     refused.value = false
+    truncated.value = false
     try {
       if (!(await mayManageTunnelPolicies(tenantId))) {
         refused.value = true
@@ -160,11 +165,14 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
         total.value = 0
         return
       }
-      const resp = await api.get<TunnelPolicyListResponse>(
+      // Every page, not the route's first 25 (#4188). A failed page lands in
+      // the catch below like the one request did, refusal included.
+      const all = await fetchAllPages<TunnelPolicy, TunnelPolicyListResponse>(
         `/tenant/${tenantId}/tunnel-policy`,
       )
-      policies.value = resp.items
-      total.value = resp.total
+      policies.value = all.items
+      total.value = all.last.total
+      truncated.value = all.truncated
     } catch (e) {
       if (isRefusal(e)) refused.value = true
       else error.value = (e as Error).message
@@ -214,6 +222,7 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
     loading,
     error,
     refused,
+    truncated,
     fetchPolicies,
     createPolicy,
     updatePolicy,

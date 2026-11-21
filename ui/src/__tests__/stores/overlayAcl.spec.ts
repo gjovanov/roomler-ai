@@ -48,7 +48,9 @@ describe('overlayAcl store', () => {
     const store = useOverlayAclStore()
     await store.fetchPolicies(TENANT_ID)
 
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/overlay-acl`)
+    expect(mockApi.get).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/overlay-acl?page=1&per_page=100`,
+    )
     expect(store.policies).toHaveLength(1)
     expect(store.total).toBe(1)
     // The posture rides the list response so the UI can render the banner
@@ -175,5 +177,48 @@ describe('overlayAcl store: an org with more rules than one page holds', () => {
     )
     expect(store.total).toBe(101)
     expect(store.mode).toBe('enforce')
+  })
+
+  it('stops at the page cap, keeps what it read, and says the cap cut the list', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 5001, row: named, extra: { mode: 'warn' } }),
+    )
+    const store = useOverlayAclStore()
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(mockApi.get).toHaveBeenCalledTimes(50)
+    expect(store.policies).toHaveLength(5000)
+    expect(store.total).toBe(5001)
+    expect(store.truncated).toBe(true)
+    expect(store.mode).toBe('warn')
+    expect(store.error).toBeNull()
+
+    // A later read that gets the whole list clears it.
+    mockApi.get.mockImplementation(pagedRoute({ total: 3, row: named, extra: { mode: 'warn' } }))
+    await store.fetchPolicies(TENANT_ID)
+    expect(store.policies).toHaveLength(3)
+    expect(store.truncated).toBe(false)
+  })
+
+  it('stops at a failed page: the error shows, no part of the list is kept, the posture stays', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({
+        total: 250,
+        row: named,
+        extra: { mode: 'enforce' },
+        fail: { page: 2, error: new Error('API error 500') },
+      }),
+    )
+    const store = useOverlayAclStore()
+    store.mode = 'warn'
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(mockApi.get).toHaveBeenCalledTimes(2)
+    expect(store.error).toBe('API error 500')
+    expect(store.policies).toEqual([])
+    expect(store.total).toBe(0)
+    expect(store.truncated).toBe(false)
+    expect(store.mode).toBe('warn')
+    expect(store.loading).toBe(false)
   })
 })

@@ -86,6 +86,20 @@
         port-narrowed rule currently grants the whole peer at L3.
       </v-alert>
 
+      <!-- #4188: the store reads every page of the list up to its page cap;
+           past it, the tab says how much of the list it shows. -->
+      <v-alert
+        v-if="store.truncated"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        data-testid="overlay-acl-truncated"
+      >
+        Showing the first {{ store.policies.length }} of this organization's
+        {{ store.total }} rules.
+      </v-alert>
+
       <p v-if="!store.loading && store.policies.length === 0" class="text-medium-emphasis">
         No overlay rules yet. While enforcement is <code>off</code> every node
         sees every peer and all of its approved routes — the pre-ACL behaviour.
