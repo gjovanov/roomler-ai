@@ -961,6 +961,37 @@ impl DeliverySampler {
             b.on_frame(pc, governor.applied_bps(), governor.open_at_bps());
             b.take_mark()
         });
+        self.framed(governor, marked);
+    }
+
+    /// [`Self::on_frame`] on the association's own handles, as the tcp_shape
+    /// harness's closed-loop writer holds them (FR-148 D51 B4c).
+    #[cfg(test)]
+    pub(crate) fn on_frame_with(
+        &mut self,
+        governor: &mut RateGovernor,
+        clock: &DeliveryClock,
+        gauges: &GaugeReader,
+    ) {
+        if self.pass.acts() {
+            return;
+        }
+        let open = crate::media_inflight::opening(governor.applied_bps(), governor.open_at_bps());
+        let marked = self.budget.as_mut().is_some_and(|b| {
+            b.on_frame_with(
+                Instant::now(),
+                open,
+                || Some(clock.clone()),
+                || Some(gauges.clone()),
+            );
+            b.take_mark()
+        });
+        self.framed(governor, marked);
+    }
+
+    /// The step's end: a stall it marked goes to the governor's shadow model
+    /// and drops the push-backs inside their settle, and its rate follows.
+    fn framed(&mut self, governor: &mut RateGovernor, marked: bool) {
         if marked {
             governor.note_path_stall();
             self.on_mark(Instant::now());
@@ -1028,6 +1059,38 @@ impl DeliverySampler {
             ),
             None => Pass::today(byte_gate),
         };
+        self.gate_pass(governor, session_id, pass);
+    }
+
+    /// [`Self::gate`] on the association's own handles, as the tcp_shape
+    /// harness's closed-loop writer holds them (FR-148 D51 B4c).
+    #[cfg(test)]
+    pub(crate) fn gate_with(
+        &mut self,
+        governor: &mut RateGovernor,
+        clock: &DeliveryClock,
+        gauges: &GaugeReader,
+        constrained: bool,
+        byte_gate: bool,
+    ) {
+        let open = crate::media_inflight::opening(governor.applied_bps(), governor.open_at_bps());
+        let pass = match self.budget.as_mut() {
+            Some(b) => b.gate_with(
+                Instant::now(),
+                open,
+                || Some(clock.clone()),
+                || Some(gauges.clone()),
+                constrained,
+                byte_gate,
+            ),
+            None => Pass::today(byte_gate),
+        };
+        self.gate_pass(governor, ObjectId::from_bytes([0; 12]), pass);
+    }
+
+    /// The gate's end: the pass is kept for the gate's terms, a stall the
+    /// acting budget marked goes to the governor, and an acting step's rate.
+    fn gate_pass(&mut self, governor: &mut RateGovernor, session_id: ObjectId, pass: Pass) {
         if self.gated(Instant::now(), session_id, pass) {
             governor.note_path_stall();
         }
@@ -8538,6 +8601,796 @@ pub(crate) mod shaped_link {
                 s[3].1,
                 s[2].1
             );
+        }
+
+        /// FR-148 D51 B4c — the closed-loop writer: the VP9-444 pump's own loop
+        /// on a relay session (`peer.rs`, `media_pump_vp9_444_dc`), run on the
+        /// shaped link against a viewer that reports as the browser does. The
+        /// fixed writer above offers a constant, so it cannot show a sender
+        /// that swings its own offer when the budget's queue appears, which is
+        /// what slice B3T measured. This one runs the pump's gate and its 2 ms
+        /// retry, a 30 fps capture, the real governor (its AIMD, fps cap, age
+        /// loop, link loop and drain) and an encoder that cannot make a frame
+        /// smaller than its floor (W-67's design, §4.5).
+        mod closed_loop {
+            use std::collections::BTreeMap;
+
+            use super::*;
+            use crate::encode::governor::{AppliedBitrate, GovernorFlags, RateGovernor};
+            use crate::encode::viewer_rate::{self, ViewerFeedback};
+
+            /// The lab path B3T ran on: 2 Mbit/s on the wire, of which SCTP's
+            /// payload got E_sat = 0.8137 at saturation (the loaded `off` runs'
+            /// mean E_measured), so the link carries C_sat of payload.
+            const WIRE_BPS: u64 = 2_000_000;
+            const E_SAT: (u64, u64) = (8_137, 10_000);
+            /// cap.awk's modeled E for T: AC32's C, the lab's reported fill.
+            const E_MODEL: (u64, u64) = (8_869, 10_000);
+            /// T's base round trip: `on`'s median, 23-43 ms, is an empty queue.
+            const BASE_RTT: Duration = Duration::from_millis(30);
+            /// The encoder's least frame over a frame interval Δt, a + b·Δt
+            /// bits, fitted through B3T's arm means (libvpx at its maximum
+            /// quantizer on the motion content). Past `FLOOR_SPAN` a delta is
+            /// as big as it gets; a keyframe is `KEY_FLOORS` floors of a 30 fps
+            /// frame.
+            const FLOOR_A_BITS: u64 = 50_000;
+            const FLOOR_B_BPS: u64 = 450_000;
+            const FLOOR_SPAN: Duration = Duration::from_millis(100);
+            const KEY_FLOORS: u64 = 5;
+            /// One encode, and one decode in the viewer's worker.
+            const ENCODE: Duration = Duration::from_millis(10);
+            const DECODE: Duration = Duration::from_millis(6);
+            /// The capture's frame interval: 30 fps, the pump's target.
+            const CAPTURE: Duration = Duration::from_nanos(1_000_000_000 / 30);
+            const TARGET_FPS: u32 = 30;
+            /// The relay's ceiling: `encode::relay_max_bps`'s default.
+            const RELAY_CEILING: u32 = 3_000_000;
+            /// The pump's send channel on a relay, its gate's retry, and its
+            /// poll while a drain pauses production (`peer.rs`).
+            const SEND_DEPTH: usize = 2;
+            const GATE_RETRY: Duration = Duration::from_millis(2);
+            const DRAIN_POLL: Duration = Duration::from_millis(10);
+            /// The browser's decode-backlog rule (`rc-hop-stats.ts`): a window
+            /// whose mean backlog is over this is bad, and this many bad windows
+            /// in a row report the struggling bit.
+            const STRUGGLE_MS: u64 = 33;
+            const STRUGGLE_WINDOWS: u32 = 2;
+            /// The viewer keeps its clock probe's least round trip of the last
+            /// eight (`useRemoteControl.ts`, `CLOCK_RING`).
+            const PROBE_RING: usize = 8;
+            /// The run, and the opening its figures leave out.
+            const RUN: Duration = Duration::from_secs(60);
+            const OPENING: Duration = Duration::from_secs(5);
+            /// A still screen's delta, bytes: what a desktop sends before
+            /// anything on it moves.
+            const STILL_DELTA: usize = 1_000;
+            /// The `off` control's standing queue: each second's least.
+            const STANDING_MS: u64 = 500;
+
+            /// Which law the pump runs: today's (`off`: the VP9-444 watermark arm
+            /// sheds a frame over 256 KiB buffered) or the budget acting (`on`).
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            enum Arm {
+                Off,
+                On,
+            }
+
+            impl Arm {
+                fn word(self) -> &'static str {
+                    match self {
+                        Arm::Off => "off",
+                        Arm::On => "on",
+                    }
+                }
+            }
+
+            /// The shaped link's packet rate, which carries C_sat of payload.
+            fn packet_bps() -> u64 {
+                WIRE_BPS * E_SAT.0 / E_SAT.1 * PACKET / PAYLOAD
+            }
+
+            /// The link's payload capacity (C_sat), and AC32's C.
+            fn payload_bps() -> u64 {
+                packet_bps() * PAYLOAD / PACKET
+            }
+
+            fn c_bps() -> u64 {
+                WIRE_BPS * E_MODEL.0 / E_MODEL.1
+            }
+
+            /// How long a byte written now waits for the far end: the link's
+            /// queue and SCTP's own pending bytes ahead of it.
+            fn queued(link: &ShapedConn, gauges: &GaugeReader) -> u64 {
+                us(queue_now(link)) + gauges.peek().pending_bytes * 8_000_000 / packet_bps()
+            }
+
+            /// The frame the encoder makes at `target_bps` over `dt`, bytes:
+            /// never under its floor, a keyframe at `KEY_FLOORS` floors.
+            fn frame_len(target_bps: u32, dt: Duration, key: bool) -> usize {
+                let floor = |dt: Duration| FLOOR_A_BITS + FLOOR_B_BPS * us(dt) / 1_000_000;
+                let bits = if key {
+                    KEY_FLOORS * floor(CAPTURE)
+                } else {
+                    let dt = dt.min(FLOOR_SPAN);
+                    (u64::from(target_bps) * us(dt) / 1_000_000).max(floor(dt))
+                };
+                usize::try_from(bits / 8).unwrap_or(usize::MAX).max(16)
+            }
+
+            /// One governor window, as the pump's `viewer-rate fps cap` line
+            /// carries it (µs from `t0`).
+            #[derive(Debug, Clone, Copy)]
+            struct Win {
+                t_us: u64,
+                divisor: u32,
+                cap_fps: u32,
+                reported_fps: u32,
+                struggling: bool,
+                age: Option<(u16, u16)>,
+                floor: Option<u16>,
+                age_over: bool,
+                link_congested: bool,
+                drain_ms: Option<u32>,
+                target_bps: u32,
+            }
+
+            /// What the pump did, pass by pass.
+            #[derive(Debug, Default)]
+            struct Pumped {
+                passes: u64,
+                /// Passes the budget's hold shut by itself, and the send
+                /// channel's full ones.
+                holds: u64,
+                full: u64,
+                drained: u64,
+                /// Captured frames the divisor discarded.
+                divided: u64,
+                keys: u64,
+                /// Encoded frames the watermark arm shed, and the frames a full
+                /// send channel refused.
+                shed: u64,
+                refused: u64,
+                /// When each frame was captured, encoded and handed to the
+                /// send channel (µs from `t0`).
+                captured_at: Vec<u64>,
+                encoded_at: Vec<u64>,
+                sent_at: Vec<u64>,
+                /// The applied moves by their why, and the target over time.
+                moves: BTreeMap<String, u32>,
+                targets: Vec<(u64, u32)>,
+                windows: Vec<Win>,
+            }
+
+            /// A frame in the viewer's worker: its write stamp, when its last
+            /// byte arrived and when it painted, µs from `t0`.
+            #[derive(Debug, Clone, Copy)]
+            struct Painted {
+                stamp: u64,
+                arrival: u64,
+                paint: u64,
+            }
+
+            /// One window as the browser reported it.
+            #[derive(Debug, Clone, Copy)]
+            struct Seen {
+                t_us: u64,
+                fps: u32,
+                backlog_ms: u64,
+                struggling: bool,
+                age: Option<(u16, u16)>,
+                arrival_ms: u16,
+                probe_rtt_ms: u16,
+                rx_bps: u32,
+                queue_ms: Option<i64>,
+            }
+
+            fn note(p: &mut Pumped, t0: Instant, target: &mut u32, a: Option<AppliedBitrate>) {
+                if let Some(a) = a {
+                    *p.moves.entry(a.why.to_string()).or_default() += 1;
+                    *target = a.bps;
+                    p.targets.push((us(t0.elapsed()), a.bps));
+                }
+            }
+
+            /// The pump: `peer.rs`'s VP9-444 loop on a relay, pass by pass. The
+            /// budget's gate and the capacity gate, the 2 ms retry with the
+            /// skip's decrease through the pass, the budget's step, the newest
+            /// capture, the viewer window, the drain, the divisor, the governor's
+            /// tick, the encode, the watermark arm and the send channel; and the
+            /// send task behind it, one frame at a time into SCTP. Until `moves`
+            /// the screen is still: a delta is `STILL_DELTA` whatever the target.
+            #[allow(clippy::too_many_arguments)] // one pump's handles; a struct would only rename them
+            async fn pump(
+                arm: Arm,
+                t0: Instant,
+                start: Instant,
+                moves: Instant,
+                stop: Instant,
+                stream: Arc<webrtc::sctp::stream::Stream>,
+                clock: DeliveryClock,
+                gauges: GaugeReader,
+                feedback: Arc<ViewerFeedback>,
+                written: Arc<AtomicU64>,
+            ) -> Pumped {
+                let mut governor = RateGovernor::new(
+                    TARGET_FPS,
+                    SEND_DEPTH,
+                    GovernorFlags::default(),
+                    0,
+                    None,
+                    Instant::now(),
+                );
+                let mut delivery = match arm {
+                    Arm::Off => DeliverySampler::new(true),
+                    Arm::On => DeliverySampler::new(true).with_budget_on(),
+                };
+                let (send_tx, mut send_rx) = mpsc::channel::<Bytes>(SEND_DEPTH);
+                let sender = {
+                    let stream = Arc::clone(&stream);
+                    let count = delivery.pump_count();
+                    let written = Arc::clone(&written);
+                    let sink = governor.goodput_sink();
+                    tokio::spawn(async move {
+                        while let Some(frame) = send_rx.recv().await {
+                            let mut unsent = count.unsent(frame.len());
+                            let began = Instant::now();
+                            if stream.write(&frame).await.is_err() {
+                                break;
+                            }
+                            unsent.sent(frame.len());
+                            written.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                            sink.record_frame(frame.len() as u64, began.elapsed(), frame[8] == 1);
+                        }
+                    })
+                };
+                let floor_bps = crate::encode::area_min_bitrate_bps(1920, 1080, true);
+                let mut p = Pumped::default();
+                let mut target = 0_u32;
+                // libvpx's pending keyframe, and the pump's `keyframe_requested`:
+                // a stream opens on a keyframe.
+                let (mut force_key, mut key_asked) = (false, true);
+                let mut taken: Option<u32> = None;
+                let mut last_encoded: Option<Instant> = None;
+                while Instant::now() < stop {
+                    p.passes += 1;
+                    delivery.gate_with(&mut governor, &clock, &gauges, true, false);
+                    let full = send_tx.capacity() == 0;
+                    if full || delivery.shuts() {
+                        if full {
+                            p.full += 1;
+                        } else {
+                            p.holds += 1;
+                        }
+                        delivery.note_gate(full, false);
+                        let a = delivery.on_skip(false, |t| governor.on_backpressure_skip(t));
+                        note(&mut p, t0, &mut target, a);
+                        tokio::time::sleep(GATE_RETRY).await;
+                        continue;
+                    }
+                    delivery.on_frame_with(&mut governor, &clock, &gauges);
+                    // The capture: the newest frame not taken yet, or the next.
+                    let newest = u32::try_from(
+                        Instant::now().saturating_duration_since(start).as_nanos()
+                            / CAPTURE.as_nanos(),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let k = match taken {
+                        Some(t) if t >= newest => {
+                            let due = start + CAPTURE * (t + 1);
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                            t + 1
+                        }
+                        _ => newest,
+                    };
+                    taken = Some(k);
+                    let captured = start + CAPTURE * k;
+                    p.captured_at.push(us(t0.elapsed()));
+                    let forced = std::mem::take(&mut key_asked);
+                    force_key |= forced;
+                    if let Some(vw) = governor.tick_viewer_window(
+                        Instant::now(),
+                        TARGET_FPS,
+                        || feedback.take_report(),
+                        || feedback.take_age(),
+                        || feedback.take_link(),
+                        true,
+                        |own| own,
+                        written.load(Ordering::Relaxed),
+                    ) {
+                        p.windows.push(Win {
+                            t_us: us(t0.elapsed()),
+                            divisor: vw.skip_divisor,
+                            cap_fps: vw.cap_fps,
+                            reported_fps: vw.reported_fps,
+                            struggling: vw.struggling,
+                            age: vw.age_ms,
+                            floor: governor.viewer_age().map(|(_, f)| f),
+                            age_over: vw.age_over,
+                            link_congested: vw.link_congested,
+                            drain_ms: vw.drain_for_ms,
+                            target_bps: governor.applied_bps(),
+                        });
+                    }
+                    if governor.draining(Instant::now()) {
+                        p.drained += 1;
+                        tokio::time::sleep(DRAIN_POLL).await;
+                        continue;
+                    }
+                    if governor.should_skip_delta_frame(forced) {
+                        p.divided += 1;
+                        continue;
+                    }
+                    let a = governor.pre_encode_tick(
+                        RELAY_CEILING,
+                        floor_bps,
+                        true,
+                        send_tx.capacity(),
+                        Instant::now(),
+                    );
+                    note(&mut p, t0, &mut target, a);
+                    tokio::time::sleep(ENCODE).await;
+                    let key = std::mem::take(&mut force_key);
+                    let dt =
+                        last_encoded.map_or(CAPTURE, |l| captured.saturating_duration_since(l));
+                    last_encoded = Some(captured);
+                    let len = if captured < moves && !key {
+                        STILL_DELTA
+                    } else {
+                        frame_len(target, dt, key)
+                    };
+                    p.encoded_at.push(us(t0.elapsed()));
+                    p.keys += u64::from(key);
+                    if delivery.sheds(stream.buffered_amount() as u64 > OVERFLOW) {
+                        let a = governor.on_send_overflow(Instant::now());
+                        note(&mut p, t0, &mut target, a);
+                        p.shed += 1;
+                        delivery.note_watermark();
+                        key_asked = true;
+                        continue;
+                    }
+                    let mut frame = vec![0x6b_u8; len];
+                    frame[..8].copy_from_slice(&us(t0.elapsed()).to_le_bytes());
+                    frame[8] = u8::from(key);
+                    match send_tx.try_send(Bytes::from(frame)) {
+                        Ok(()) => {
+                            delivery.on_handed(len as u64);
+                            p.sent_at.push(us(t0.elapsed()));
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            p.refused += 1;
+                            delivery.note_full();
+                            key_asked = true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+                drop(send_tx);
+                let _ = tokio::time::timeout(Duration::from_secs(5), sender).await;
+                p
+            }
+
+            /// The browser: decodes each frame as it arrives, paints it when
+            /// decoded, sends a clock probe on every stats tick and keeps the
+            /// least round trip of the last eight, whose echo waited behind
+            /// the queue (so the age it maps is low by half that queue), and at
+            /// each tick (a second, at its own phase) reports what
+            /// `rc-dc-worker.ts` and `decodeStatWireMessage` report, a one-way
+            /// trip later.
+            async fn browser(
+                t0: Instant,
+                start: Instant,
+                stop: Instant,
+                arrivals: Arc<StdMutex<Vec<Arrival>>>,
+                link: Arc<ShapedConn>,
+                gauges: GaugeReader,
+                feedback: Arc<ViewerFeedback>,
+            ) -> Vec<Seen> {
+                let mut seen = Vec::new();
+                let mut next = 0;
+                let mut decoder_free = 0_u64;
+                let mut decoding: VecDeque<Painted> = VecDeque::new();
+                let mut probes: VecDeque<(u64, u64)> = VecDeque::new();
+                let mut last_painted: Option<(u64, u64)> = None;
+                let mut bad = 0;
+                let mut tick = start + Duration::from_millis(500);
+                let mut prev = us(start.saturating_duration_since(t0));
+                while tick < stop {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(tick)).await;
+                    let now = us(t0.elapsed());
+                    let queue = queued(&link, &gauges);
+                    probes.push_back((us(BASE_RTT) + queue, queue));
+                    if probes.len() > PROBE_RING {
+                        probes.pop_front();
+                    }
+                    let best = probes
+                        .iter()
+                        .copied()
+                        .min_by_key(|p| p.0)
+                        .unwrap_or_default();
+                    let mut rx = 0;
+                    {
+                        let log = arrivals.lock().unwrap();
+                        for x in &log[next..] {
+                            decoder_free = x.at_us.max(decoder_free) + us(DECODE);
+                            decoding.push_back(Painted {
+                                stamp: x.sent_us,
+                                arrival: x.at_us,
+                                paint: decoder_free,
+                            });
+                            rx += x.len;
+                        }
+                        next = log.len();
+                    }
+                    let mut painted = Vec::new();
+                    while decoding.front().is_some_and(|f| f.paint <= now) {
+                        painted.extend(decoding.pop_front());
+                    }
+                    let span = now.saturating_sub(prev).max(1);
+                    prev = now;
+                    let n = painted.len() as u64;
+                    let fps = u32::try_from((n * 1_000_000 + span / 2) / span).unwrap_or(u32::MAX);
+                    let backlog_ms =
+                        painted.iter().map(|f| f.paint - f.arrival).sum::<u64>() / n.max(1) / 1_000;
+                    bad = if n > 0 && backlog_ms > STRUGGLE_MS {
+                        bad + 1
+                    } else {
+                        0
+                    };
+                    let struggling = bad >= STRUGGLE_WINDOWS;
+                    // The probe's offset is low by half the queue its echo met.
+                    let skew = best.1 / 2;
+                    let age =
+                        |at: u64, stamp: u64| at.saturating_sub(stamp).saturating_sub(skew) / 1_000;
+                    let ms16 = |v: u64| u16::try_from(v).unwrap_or(u16::MAX);
+                    let ages: Vec<u64> = painted.iter().map(|f| age(f.paint, f.stamp)).collect();
+                    let age_pair = (n > 0).then(|| {
+                        (
+                            ms16(ages.iter().sum::<u64>() / n),
+                            ms16(ages.iter().copied().min().unwrap_or(0)),
+                        )
+                    });
+                    let arrival_ms = ms16(
+                        painted.iter().map(|f| age(f.arrival, f.stamp)).sum::<u64>() / n.max(1),
+                    )
+                    .max(1);
+                    // `QueueDrift` at paint: each frame against the one before,
+                    // the last window's last frame included.
+                    let mut drift: Option<i64> = None;
+                    for f in &painted {
+                        if let Some((stamp, paint)) = last_painted {
+                            let wire = f.stamp as i64 - stamp as i64;
+                            let arrived = f.paint as i64 - paint as i64;
+                            if wire > 0 && wire <= 5_000_000 && (0..=5_000_000).contains(&arrived) {
+                                *drift.get_or_insert(0) +=
+                                    (arrived - wire).clamp(-1_000_000, 1_000_000);
+                            }
+                        }
+                        last_painted = Some((f.stamp, f.paint));
+                    }
+                    let queue_ms = drift.map(|d| d / 1_000);
+                    let rx_bps = u32::try_from(rx * 8_000_000 / span).unwrap_or(u32::MAX);
+                    let probe_rtt_ms = ms16(best.0 / 1_000);
+                    seen.push(Seen {
+                        t_us: now,
+                        fps,
+                        backlog_ms,
+                        struggling,
+                        age: age_pair,
+                        arrival_ms,
+                        probe_rtt_ms,
+                        rx_bps,
+                        queue_ms,
+                    });
+                    tokio::time::sleep(BASE_RTT / 2).await;
+                    feedback.store_report(viewer_rate::pack_report(fps, struggling));
+                    if let Some((avg, min)) = age_pair {
+                        feedback.store_age(viewer_rate::pack_age_with_arrival(
+                            avg,
+                            min,
+                            probe_rtt_ms,
+                            arrival_ms,
+                        ));
+                    }
+                    if let Some(q) = queue_ms {
+                        let q = i16::try_from(q.clamp(i16::MIN.into(), i16::MAX.into())).unwrap();
+                        feedback.store_link(viewer_rate::pack_link(rx_bps, q));
+                    }
+                    tick += SAMPLE;
+                }
+                seen
+            }
+
+            #[derive(Debug)]
+            struct LoopRun {
+                arm: Arm,
+                /// Where the figures start (the opening's end) and the run's
+                /// stop, µs from `t0`.
+                from_us: u64,
+                stop_us: u64,
+                pumped: Pumped,
+                seen: Vec<Seen>,
+                arrivals: Vec<Arrival>,
+                /// The queue a byte written then would wait behind, every poll.
+                queue_at: Vec<(u64, u64)>,
+            }
+
+            /// One arm on B3T's path: `still` of a still screen, then `RUN` of
+            /// motion, whose first `OPENING` the figures leave out.
+            async fn run_loop(arm: Arm, still: Duration) -> LoopRun {
+                let _turn = TURN.lock().await;
+                #[cfg(target_os = "windows")]
+                let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
+                let t0 = Instant::now();
+                let (a, b) = shaped(packet_bps(), BASE_RTT / 2, DEEP);
+                let a = Arc::new(a);
+                let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
+                let (agent, viewer) = pair_timed(
+                    a.clone(),
+                    Arc::new(b),
+                    OpenPath::InitAck,
+                    t0,
+                    Arc::clone(&arrivals),
+                    None,
+                )
+                .await;
+                let stream = agent
+                    .open_stream(1, PayloadProtocolIdentifier::Binary)
+                    .await
+                    .unwrap();
+                let (clock, gauges) = (agent.delivery_clock(), agent.gauges());
+                let feedback = Arc::new(ViewerFeedback::new());
+                let written = Arc::new(AtomicU64::new(0));
+                let start = Instant::now();
+                let moves = start + still;
+                let stop = moves + RUN;
+                let pumping = tokio::spawn(pump(
+                    arm,
+                    t0,
+                    start,
+                    moves,
+                    stop,
+                    Arc::clone(&stream),
+                    clock,
+                    gauges.clone(),
+                    Arc::clone(&feedback),
+                    Arc::clone(&written),
+                ));
+                let viewing = tokio::spawn(browser(
+                    t0,
+                    start,
+                    stop,
+                    Arc::clone(&arrivals),
+                    Arc::clone(&a),
+                    gauges.clone(),
+                    Arc::clone(&feedback),
+                ));
+                let mut queue_at = Vec::new();
+                while Instant::now() < stop {
+                    queue_at.push((us(t0.elapsed()), queued(&a, &gauges)));
+                    tokio::time::sleep(POLL).await;
+                }
+                let pumped = pumping.await.unwrap();
+                let seen = viewing.await.unwrap();
+                let arrivals = arrivals.lock().unwrap().clone();
+                let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
+                LoopRun {
+                    arm,
+                    from_us: us((moves + OPENING).saturating_duration_since(t0)),
+                    stop_us: us(stop.saturating_duration_since(t0)),
+                    pumped,
+                    seen,
+                    arrivals,
+                    queue_at,
+                }
+            }
+
+            /// The `q`-th percentile of `v`, sorted in place; 0 for none.
+            fn quantile(v: &mut [u64], q: usize) -> u64 {
+                if v.is_empty() {
+                    return 0;
+                }
+                v.sort_unstable();
+                v[(v.len() - 1) * q / 100]
+            }
+
+            /// What a run reads from its opening's end to its stop.
+            #[derive(Debug, Clone, Copy)]
+            struct Read {
+                /// Delivered payload, bit/s, and its share of the payload
+                /// capacity (C_sat) and of AC32's C, thousandths.
+                rx_bps: u64,
+                of_payload: u64,
+                of_c: u64,
+                /// Frames captured, encoded and sent a second, tenths.
+                cap_fps: u64,
+                enc_fps: u64,
+                sent_fps: u64,
+                /// Windows whose divisor was 2 or more, of the windows.
+                divided: (usize, usize),
+                /// Frame transit, write to read, and a probe's round trip,
+                /// base and queue: median and p95, ms.
+                transit: (u64, u64),
+                rtt: (u64, u64),
+                /// Seconds whose queue never fell under `STANDING_MS`, of the
+                /// seconds; the median second's least queue, ms.
+                standing: (usize, usize),
+                least_ms: u64,
+            }
+
+            fn read(r: &LoopRun) -> Read {
+                let (from, to) = (r.from_us, r.stop_us);
+                let span = to - from;
+                let inside = |t: u64| t >= from && t < to;
+                let got: Vec<&Arrival> = r.arrivals.iter().filter(|x| inside(x.at_us)).collect();
+                let rx_bps = got.iter().map(|x| x.len).sum::<u64>() * 8_000_000 / span;
+                let per_s =
+                    |v: &[u64]| v.iter().filter(|&&t| inside(t)).count() as u64 * 10_000_000 / span;
+                let windows: Vec<&Win> =
+                    r.pumped.windows.iter().filter(|w| inside(w.t_us)).collect();
+                let mut transit: Vec<u64> = got
+                    .iter()
+                    .map(|x| x.at_us.saturating_sub(x.sent_us) / 1_000)
+                    .collect();
+                let mut rtt: Vec<u64> = r
+                    .queue_at
+                    .iter()
+                    .filter(|q| inside(q.0))
+                    .map(|q| (us(BASE_RTT) + q.1) / 1_000)
+                    .collect();
+                let mut least: BTreeMap<u64, u64> = BTreeMap::new();
+                for &(t, q) in r.queue_at.iter().filter(|q| inside(q.0)) {
+                    let s = least.entry((t - from) / 1_000_000).or_insert(u64::MAX);
+                    *s = (*s).min(q / 1_000);
+                }
+                let mut leasts: Vec<u64> = least.values().copied().collect();
+                Read {
+                    rx_bps,
+                    of_payload: rx_bps * 1_000 / payload_bps(),
+                    of_c: rx_bps * 1_000 / c_bps(),
+                    cap_fps: per_s(&r.pumped.captured_at),
+                    enc_fps: per_s(&r.pumped.encoded_at),
+                    sent_fps: per_s(&r.pumped.sent_at),
+                    divided: (
+                        windows.iter().filter(|w| w.divisor >= 2).count(),
+                        windows.len(),
+                    ),
+                    transit: (quantile(&mut transit, 50), quantile(&mut transit, 95)),
+                    rtt: (quantile(&mut rtt, 50), quantile(&mut rtt, 95)),
+                    standing: (
+                        leasts.iter().filter(|&&q| q > STANDING_MS).count(),
+                        leasts.len(),
+                    ),
+                    least_ms: quantile(&mut leasts, 50),
+                }
+            }
+
+            fn print_loop(r: &LoopRun, x: &Read) {
+                let p = &r.pumped;
+                let thousandths = |v: u64| format!("{}.{:03}", v / 1_000, v % 1_000);
+                let tenths = |v: u64| format!("{}.{}", v / 10, v % 10);
+                println!(
+                    "B4c | {} | payload {} kbit/s, C {} kbit/s | delivered {} kbit/s = {} of payload, \
+                     {} of C | captured {} fps, encoded {} fps, sent {} fps, discarded {} /s | divisor >= 2 in {} of \
+                     {} windows | transit p50 {} / p95 {} ms | rtt p50 {} / p95 {} ms | standing {} of {} \
+                     s, least queue median {} ms",
+                    r.arm.word(),
+                    kbps(payload_bps()),
+                    kbps(c_bps()),
+                    kbps(x.rx_bps),
+                    thousandths(x.of_payload),
+                    thousandths(x.of_c),
+                    tenths(x.cap_fps),
+                    tenths(x.enc_fps),
+                    tenths(x.sent_fps),
+                    tenths(x.cap_fps.saturating_sub(x.enc_fps)),
+                    x.divided.0,
+                    x.divided.1,
+                    x.transit.0,
+                    x.transit.1,
+                    x.rtt.0,
+                    x.rtt.1,
+                    x.standing.0,
+                    x.standing.1,
+                    x.least_ms,
+                );
+                let windows = || p.windows.iter().filter(|w| w.t_us >= r.from_us);
+                println!(
+                    "B4c | {} | passes {}, holds {}, channel full {}, drained {}, divided {}, keys {}, \
+                     shed {}, refused {} | age_over {} windows, link congested {}, drains {}, struggling \
+                     {} | moves {:?}",
+                    r.arm.word(),
+                    p.passes,
+                    p.holds,
+                    p.full,
+                    p.drained,
+                    p.divided,
+                    p.keys,
+                    p.shed,
+                    p.refused,
+                    windows().filter(|w| w.age_over).count(),
+                    windows().filter(|w| w.link_congested).count(),
+                    windows().filter(|w| w.drain_ms.is_some()).count(),
+                    windows().filter(|w| w.struggling).count(),
+                    p.moves,
+                );
+                for w in &p.windows {
+                    let s = r.seen.iter().rev().find(|s| s.t_us <= w.t_us);
+                    println!(
+                        "B4c | {} | t {:>5} ms | divisor {} cap {:>2} reported {:>2}{} | age {:?} floor {:?}{}{}{} | \
+                         target {:>7} | viewer: fps {}{}, age {:?}, arrival {} ms, rtt {} ms, rx {} kbit/s, \
+                         growth {:?} ms, backlog {} ms",
+                        r.arm.word(),
+                        w.t_us / 1_000,
+                        w.divisor,
+                        w.cap_fps,
+                        w.reported_fps,
+                        if w.struggling { " struggling" } else { "" },
+                        w.age,
+                        w.floor,
+                        if w.age_over { " AGE_OVER" } else { "" },
+                        if w.link_congested { " LINK" } else { "" },
+                        w.drain_ms
+                            .map(|d| format!(" DRAIN {d}"))
+                            .unwrap_or_default(),
+                        w.target_bps,
+                        s.map_or(0, |s| s.fps),
+                        if s.is_some_and(|s| s.struggling) {
+                            " struggling"
+                        } else {
+                            ""
+                        },
+                        s.and_then(|s| s.age),
+                        s.map_or(0, |s| s.arrival_ms),
+                        s.map_or(0, |s| s.probe_rtt_ms),
+                        s.map_or(0, |s| u64::from(s.rx_bps) / 1_000),
+                        s.and_then(|s| s.queue_ms),
+                        s.map_or(0, |s| s.backlog_ms),
+                    );
+                }
+            }
+
+            /// FR-148 D51 C6 — the budget `on` with the pump's own loop, against
+            /// today's law (`off`), each 60 s on B3T's path with the closed-loop
+            /// writer. `on`: the fill is at least 0.95 of the payload capacity,
+            /// the divisor stays at 1 in at least 0.9 of the windows, and the
+            /// transit's p95 is under 300 ms. `off`, the control: the fill is
+            /// at least 0.95 too, over a standing queue of more than 500 ms.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, off and on"]
+            async fn budget_on_with_the_pump_loop() {
+                let off = run_loop(Arm::Off, Duration::ZERO).await;
+                let x = read(&off);
+                print_loop(&off, &x);
+                let on = run_loop(Arm::On, Duration::ZERO).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                assert!(x.of_payload >= 950, "off: fill {x:?}");
+                assert!(x.least_ms > STANDING_MS, "off: no standing queue {x:?}");
+                assert!(y.of_payload >= 950, "on: fill {y:?}");
+                assert!(y.divided.0 * 10 <= y.divided.1, "on: the divisor {y:?}");
+                assert!(y.transit.1 < 300, "on: transit {y:?}");
+            }
+
+            /// FR-148 D51 — the same two arms after 10 s of a still screen, so
+            /// the age loop's floor and the viewer's clock probe learn an empty
+            /// queue before anything moves. A probe of the swing's start: it
+            /// prints, and asserts only that the run read.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path after a still opening"]
+            async fn budget_on_after_a_still_opening() {
+                const STILL: Duration = Duration::from_secs(10);
+                let off = run_loop(Arm::Off, STILL).await;
+                let x = read(&off);
+                print_loop(&off, &x);
+                let on = run_loop(Arm::On, STILL).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                assert!(
+                    x.divided.1 > 0 && y.divided.1 > 0,
+                    "no windows: {x:?} {y:?}"
+                );
+            }
         }
     }
 }

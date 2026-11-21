@@ -1407,7 +1407,7 @@ impl Pass {
 
 /// The opening rate a pump's step reads: the governor's applied rate, or
 /// before one is applied the rate the pump opened at; 0 when neither is known.
-fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
+pub(crate) fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
     let open = if applied_bps > 0 {
         applied_bps
     } else {
