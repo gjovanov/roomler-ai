@@ -3456,9 +3456,16 @@ pub async fn run_periodic(
         consecutive_defers = arm.defers_after(consecutive_defers);
         match arm {
             CycleArm::Cooldown => {
-                tracing::info!(
-                    "forced update suppressed by recent-install cooldown; try again shortly"
-                );
+                if matches!(ask, Some(UpdateAsk::OutageRecheck)) {
+                    tracing::info!(
+                        %cycle,
+                        "auto-updater: recheck suppressed by recent-install cooldown; the timer checks next"
+                    );
+                } else {
+                    tracing::info!(
+                        "forced update suppressed by recent-install cooldown; try again shortly"
+                    );
+                }
                 continue;
             }
             // S1a — operator-forced cycle (rc:agent.update). Bypasses the
@@ -3493,7 +3500,8 @@ pub async fn run_periodic(
             // (`busy`). Skip the cycle while any is live, or the network just
             // moved (R5b), unless we've deferred MAX_CONSECUTIVE_DEFERS times
             // in a row (security-vs-uptime trade-off documented in the rc.19
-            // plan M3 fix).
+            // plan M3 fix). The timer's cycle, and since #4245 the recheck
+            // after a long control-socket outage (`cycle`).
             CycleArm::Gated {
                 decision: DeferDecision::DeferOnce,
                 recheck,
@@ -3633,8 +3641,11 @@ impl CycleArm {
 /// #4245 — which arm a cycle of [`run_periodic`] takes. `ask` is what woke
 /// it, `None` for the loop's own timer; `in_cooldown`, an install attempt
 /// younger than [`STARTUP_UPDATE_COOLDOWN`], suppresses an ask of either
-/// kind (the timer has its own carve-out, the skipped first check). Pure: the
-/// cells' entry, and the loop's.
+/// kind (the timer has its own carve-out, the skipped first check). Only an
+/// operator's push takes the forced arm. The recheck after a long
+/// control-socket outage is the timer's cycle run early: before #4245 it
+/// took the push's arm and installed over live work. Pure: the cells' entry,
+/// and the loop's.
 pub(crate) fn cycle_arm(
     ask: Option<&UpdateAsk>,
     busy: &crate::busy::Busy,
@@ -3643,16 +3654,14 @@ pub(crate) fn cycle_arm(
 ) -> CycleArm {
     match ask {
         Some(_) if in_cooldown => CycleArm::Cooldown,
+        // S1a — the operator asked NOW: the one ask the gate never holds.
         Some(UpdateAsk::Operator(pin)) => CycleArm::Forced {
             pin: pin.clone(),
             warning: forced_update_warning(busy),
         },
-        // The seam: the recheck still takes the forced arm, as every ask did.
-        Some(UpdateAsk::OutageRecheck) => CycleArm::Forced {
-            pin: None,
-            warning: forced_update_warning(busy),
-        },
-        None => {
+        // The gate, on the one defer budget: a recheck that defers counts,
+        // and one at the cap forces, as the timer's cycle does.
+        Some(UpdateAsk::OutageRecheck) | None => {
             let (decision, recheck) = periodic_gate(busy, consecutive_defers);
             CycleArm::Gated { decision, recheck }
         }
