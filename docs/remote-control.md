@@ -376,7 +376,7 @@ flowchart TD
 | the link | one LocalAPI `peers` call within 400 ms, the one FR-128's lookup makes (`mesh_links_of`, `:591`). The best device's link decides |
 | the rule | only a `Direct` link that is neither `upgrading` nor `stalled` keeps today's order (`MeshLink::is_direct`, `:623`). Relayed, a tunnel, blocked, offline, not in the answer, no answer in time, and no viewer device known all rank the mesh last |
 
-**The carrier order.** With `mesh_last`, the agent's own candidates get these priorities, where a priority is 2^24 × type + 2^8 × local + (256 − component). Ranked last is 255 for component 1 (`ranked_last_priority`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:252`), which no other candidate of the agent's can have:
+**The carrier order.** With `mesh_last`, the agent's own candidates get these priorities, where a priority is 2^24 × type + 2^8 × local + (256 − component). Ranked last is 255 for component 1 (`ranked_last_priority`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:265`), which no other candidate of the agent's can have:
 
 | The agent's candidate | Switch `0` | Rank, link direct | Rank, link not direct |
 |---|---|---|---|
@@ -389,7 +389,7 @@ flowchart TD
 
 "Mesh" is exact here too: the carried v4 blocks and the derived-v6 ULA (`overlay_footprint::is_overlay_addr`), never the whole `100.64.0.0/10`. The priorities are set where the candidates are made (`host_priority`, `srflx_priority`, `relay_priority`, `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:81`, `:92`, `:104`), so the pairs, the follow gate and the signalled line all read the same 255. A pair's priority is 2^32 × min(G, D) + 2 × max(G, D) + (G > D), so every pair with a ranked-last candidate on the agent's side ranks below every pair whose two candidates both rank above it: below every relay pair the browser can make, its TLS relay at local preference 1 (priority 511) included.
 
-**The agent keeps checking.** Upstream's controlled agent sends no check after its first selection. A TURN client creates its permission for a peer only when it first sends to it, and the TURN server drops whatever arrives from a peer no permission covers. So a relay the agent gathered after its first selection never validated, and the browser could not move onto it (the vnet cell `without_the_rank_a_turn_pair_after_the_first_selection_never_validates`, `crates/vendored/webrtc-ice/src/agent/agent_carrier_rank_test.rs`). In rank mode the agent keeps checking every pair the follow gate would follow, on every tick of its loop and bounded as any check is (`check_pairs_above_selection`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:220`, called at `:729`). The two use one predicate, `outranks_on_a_real_path` (`:88`): the pair's remote is off the overlay range, and the pair ranks strictly above the selection. The agent therefore never validates a pair the follow gate (`should_follow_renomination`, `:57`) would refuse. Under `route` both read the route rank's predicate instead, with the mesh's own blocks (`AgentInternal::outranks`, `:152`; [below](#the-route-rank-fr-148-p4-step-2)).
+**The agent keeps checking.** Upstream's controlled agent sends no check after its first selection. A TURN client creates its permission for a peer only when it first sends to it, and the TURN server drops whatever arrives from a peer no permission covers. So a relay the agent gathered after its first selection never validated, and the browser could not move onto it (the vnet cell `without_the_rank_a_turn_pair_after_the_first_selection_never_validates`, `crates/vendored/webrtc-ice/src/agent/agent_carrier_rank_test.rs`). In rank mode the agent keeps checking every pair the follow gate would follow, on every tick of its loop and bounded as any check is (`check_pairs_above_selection`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:249`, called at `:769`). A tick is 200 ms once connected too, and under `route`, while the selection rides the mesh, the bound is a budget of the pair's own ([phase B](#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)). The two use one predicate, `outranks_on_a_real_path` (`:88`): the pair's remote is off the overlay range, and the pair ranks strictly above the selection. The agent therefore never validates a pair the follow gate (`should_follow_renomination`, `:57`) would refuse. Under `route` both read the route rank's predicate instead, with the mesh's own blocks (`AgentInternal::outranks`, `:152`; [below](#the-route-rank-fr-148-p4-step-2)).
 
 **The opening's wait.** A data-channel pump starts from the pair it reads at its opening: its first constrained flag, which it re-reads every 5 s, and its rate memory's key and opening ceiling, which it keeps (`detect_constrained_transport` and `nominated_remote_ip`, `agents/roomlerd/src/peer.rs:2042`, `:2078`). The browser's move off a ranked-last pair comes a moment after its first selection, so a ranked-last pair waits for it, up to 1.5 s a connection (`opening_pair`, `agents/roomlerd/src/carrier_rank.rs:183`). The wait stops as soon as the selection moves, and at once when gathering has ended with no relay off the mesh, since nothing better can then come. The pump's two reads share one deadline (`opening_deadline`, `:167`). A pair that is not ranked last is read at once, so under `0`, and on a direct link, nothing waits. Under `route` nothing waits either: the ICE agent has held already (`opening=route`, [below](#the-route-rank-fr-148-p4-step-2)).
 
@@ -436,15 +436,15 @@ How to read them:
 
 | D49 | Under `route` | Where |
 |---|---|---|
-| **1. One predicate** | A pair rides the mesh when its local candidate is ranked last or sits on a mesh address, or its remote sits on one. "Mesh" is the carried v4 blocks and the derived-v6 ULA, the addresses the carrier order reads, never the whole `100.64.0.0/10`. A name (an mDNS `.local`) is not the mesh's | `rides_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:170`, with the addresses `RcOverlay::ice_rank` hands it (`agents/roomlerd/src/rc_overlay.rs:318`) |
-| **A2. Every reader reads it** | the follow gate, the checks above the selection, the opening and the carrier record. An address of the `/10` outside the blocks (a carrier's CGNAT, a corporate VPN) is a real path, and a pair whose local socket the mesh carries is not. Under `0`, `prio` and `1` each reads as built | `outranks_off_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:106`, through `AgentInternal::outranks` and `follows_renomination` (`:152`, `:162`); `RTCIceTransport::route_read`, `crates/vendored/webrtc/src/ice_transport/mod.rs:106`, read by the opening (`agents/roomlerd/src/carrier_rank.rs:188`) and the carrier record (`agents/roomlerd/src/session_carrier.rs:313`) |
+| **1. One predicate** | A pair rides the mesh when its local candidate is ranked last or sits on a mesh address, or its remote sits on one. "Mesh" is the carried v4 blocks and the derived-v6 ULA, the addresses the carrier order reads, never the whole `100.64.0.0/10`. A name (an mDNS `.local`) is not the mesh's | `rides_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:183`, with the addresses `RcOverlay::ice_rank` hands it (`agents/roomlerd/src/rc_overlay.rs:318`) |
+| **A2. Every reader reads it** | the follow gate, the checks above the selection, the opening and the carrier record. An address of the `/10` outside the blocks (a carrier's CGNAT, a corporate VPN) is a real path, and a pair whose local socket the mesh carries is not. Under `0`, `prio` and `1` each reads as built | `outranks_off_the_mesh`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:106`, through `AgentInternal::outranks` and `follows_renomination` (`:152`, `:162`); `RTCIceTransport::route_read`, `crates/vendored/webrtc/src/ice_transport/mod.rs:106`, read by the opening (`agents/roomlerd/src/carrier_rank.rs:188`) and the carrier record (`agents/roomlerd/src/session_carrier.rs:367`) |
 | **2. No cross pair beside a sibling** | no pair from a local candidate off the mesh to a remote on it while the session has a local candidate on the mesh or a TURN URL on the mesh. That route is then also a pair of the agent's own mesh candidates, which the rank ranks | `add_pair`, `crates/vendored/webrtc-ice/src/agent/agent_internal.rs:534`; `refuses_pair`, `:575` |
 | **R1. No sibling** | a session with neither forms the cross pair: it is the route's only pair, and rule 3 holds it like any pair on the mesh. Such a session is a Linux agent (the name rule keeps `roomler0` out of its host candidates) given no relay of the viewer's | `settle_sibling`, `agent_internal.rs:589` |
-| **3. The silent hold** | the controlled agent neither checks nor answers its pairs on the mesh while all three hold: less than 2.5 s since its checks started, no pair off the mesh selected, and a relay off the mesh can still come (an allocation on a TURN server off the mesh is still running, or a pair off the mesh has not failed). Every candidate is still signalled, and nothing restarts ICE | `holds_mesh_route`, `agent_internal.rs:668`; its checks skipped, `:494`; an inbound check dropped unanswered, `agent_selector.rs:825` |
+| **3. The silent hold** | the controlled agent neither checks nor answers its pairs on the mesh while all three hold: less than 2.5 s since its checks started, no pair off the mesh selected, and a relay off the mesh can still come (an allocation on a TURN server off the mesh is still running, or a pair off the mesh has not failed). Every candidate is still signalled, and nothing restarts ICE | `holds_mesh_route`, `agent_internal.rs:668`; its checks skipped, `:494`; an inbound check dropped unanswered, `agent_selector.rs:876` |
 | **4. The opening reads at once** | `opening=route`, `waited_ms=0`: ICE has held already, and a wait would only add to AC23 | `opening_pair`, `agents/roomlerd/src/carrier_rank.rs:183` |
 | **5. The path line names the route** | `route`, `hold_ms` and `hold_exit`, read from the agent once, at the opening (`Agent::route_read`, `crates/vendored/webrtc-ice/src/agent/mod.rs:409`) | `log_path`, `carrier_rank.rs:388` |
 
-**Where it acts.** The refusal and the hold need a mesh link that is not direct, the case in which the carrier order ranks the mesh last (`CarrierRank::route_engaged`, `agent_config.rs:202`). On a direct link `route` only keeps the follow gate and the checks above the selection off the mesh, and a session the mesh carries direct stays on it, as under `prio`.
+**Where it acts.** The refusal and the hold need a mesh link that is not direct, the case in which the carrier order ranks the mesh last (`CarrierRank::route_engaged`, `agent_config.rs:215`). On a direct link `route` only keeps the follow gate and the checks above the selection off the mesh, and a session the mesh carries direct stays on it, as under `prio`.
 
 **The sibling is fixed before any candidate exists.** D49 assumed that the host candidates are gathered before any remote arrives. They are not: webrtc-rs adds the offer's own candidates when it sets the remote description, before its gather starts; a trickled remote races the host gather; and the host gather lists its interfaces in no fixed order. So both halves of the sibling are read before the gather starts (`Agent::new`, `crates/vendored/webrtc-ice/src/agent/mod.rs:202`; `AgentInternal::new`, `agent_internal.rs:239`): "a TURN URL on the mesh" from the config, and "a local candidate on the mesh" from the interface list the host gather itself reads, through the same filters. A half is dropped only when the gather that was to make it ends without it (`settle_sibling`, called at `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:237` and `:299`): no host on the mesh (its bind failed), or, when the whole gather ends, no server-reflexive or relay candidate on the mesh (the viewer's TURN server never answered). With no half left, the pairs refused so far are formed then, as R1 forms them. Whether a pair is refused never depends on the order the candidates come in.
 
@@ -506,7 +506,85 @@ The roomlerd cells beside them pin the opening (`carrier_rank::tests::the_openin
 **What phase A leaves to later** (D49's phases):
 
 - **A5.** The viewer does not yet say when its own gathering has ended. When the agent's relay gather has ended and no pair off the mesh exists yet, the hold stops at `nothing-real` though the browser's far relay may still come. When it comes, its pair holds the mesh again until it fails or the bound passes.
-- **B.** A TURN that allocates after the bound, and the move off a mesh selection inside one ICE generation.
+- **B.** A TURN that allocates after the bound, and the move off a mesh selection inside one ICE generation: built, [below](#the-move-off-the-mesh-fr-148-p4-step-2-phase-b).
+
+#### The move off the mesh (FR-148 P4 step 2, phase B)
+
+Phase A opens a session on the mesh when no TURN pair connects inside the hold: at its bound (`hold_exit=bound`), or once nothing off the mesh can come (`nothing-real`). A TURN relay that allocates later, such as the agent's own allocation held up by a middlebox, forms its pairs after that selection. As built, the agent followed the browser onto one only at the browser's next nomination after the agent's own check had validated the pair: on Chrome's round robin, a check every 2.4 s, that was 2.8 s after the relay. Phase B moves the session onto such a pair inside the same ICE generation, on the browser's first nomination. It acts under `route` alone, and only while the agent's selection rides the mesh by rule 1's predicate. With the selection off the mesh, and under `0`, `prio` and `1`, every branch below is a no-op.
+
+| D49 phase B | While the selection rides the mesh | Where |
+|---|---|---|
+| **B1. A budget of its own** | every pair the follow gate would follow is checked on each tick of the agent's loop, 200 ms, up to 13 checks counted on the pair, then it fails. 13 checks span 2.4 s, inside the hold's 2.5 s bound: a pair that forms after the selection gets the hold's own time again for its far side to answer (the candidate's trip through signalling, the far TURN's permission for the agent's relayed address). A dead pair costs 13 checks, once. The browser's checks still reopen a failed pair: each is answered or nominates (B2), and triggers a check of the agent's | `check_pairs_above_selection`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:249`, the budget at `:273`; `ROUTE_MOVE_CHECKS`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:130`; `CandidatePair::move_checks`, `crates/vendored/webrtc-ice/src/candidate/mod.rs:249` |
+| **B2. Answer the nomination, move on the agent's own check** | a check of the browser's with USE-CANDIDATE on a pair the agent has not validated is answered with a success, and triggers the agent's own check (RFC 8445 §7.3.1.4), when the pair is off the mesh, its remote is an address, and the follow gate would follow it: one decision for the answer and for the move. The agent takes the nomination only when its own check of the pair succeeds (§7.3.1.5), so it never sends media on a pair it has not validated. Following nominations it had not validated is how Chrome steered the agent onto a half-blackholed pair on 2026-07-27, and SCTP died in every session. A later check of the browser's on the pair without USE-CANDIDATE withdraws the nomination. A pair on the mesh is never answered this way: during the hold, silence stays its only answer (rule 3) | `answers_before_validating`, `agent_selector.rs:221`; the answer, `:963`; the move, `:848`; the withdrawal, `:980`; `CandidatePair::nomination_pending`, `candidate/mod.rs:254` |
+| **B3. The move is named** | one `session carrier moved` line at each change of the agent's selection after the opening | `follow_moves`, `agents/roomlerd/src/session_carrier.rs:523`; the line, `emit_moved`, `:583` |
+
+**The checks already ran at 200 ms.** A connected agent does not wait for its 2 s keepalive to check: its loop starts each round at the check interval, 200 ms, and the keepalive interval can only shorten it (`crates/vendored/webrtc-ice/src/agent/agent_internal.rs:350`, `:352`). roomlerd sets no ICE interval of its own. So phase A's checks above the selection already ran every 200 ms. What they lacked was a budget: they spent the opening's, 8 checks (`max_binding_requests` is 7), and a pair whose far side had not answered by then failed until a check of the browser's reopened it. B1 adds the budget and no cadence code. As built, the cell `b1_a_dead_pair_above_a_selection_on_the_mesh_is_checked_at_the_check_cadence_within_the_budget` counted 8 checks about 215 ms apart; with B1 it counts 13, the last 2.6 s after the candidate arrived.
+
+A late TURN, as the cells play it:
+
+```mermaid
+sequenceDiagram
+    participant B as Browser, controlling
+    participant T as The far TURN
+    participant A as Agent, controlled
+    Note over A: route, the mesh link relayed, the agent's TURN allocation held up
+    Note over B,A: the hold ends at its bound, 2.5 s: the session opens on the mesh, hold_exit=bound
+    T-->>A: the allocation, after the bound
+    A-->>B: rc:ice, the agent's relay, through signalling
+    loop each 200 ms tick, up to 13 checks (B1)
+        A->>T: a check of the relays' pair, dropped until the browser's permission exists
+    end
+    B->>A: Chrome's first check of the pair, USE-CANDIDATE, through T
+    A->>B: success, at once (B2)
+    A->>B: the triggered check
+    B->>A: success: the agent's own check has validated the pair
+    Note over A: the selection moves, one line: session carrier moved, from derp to turn, route=turn
+    Note over A: within 5 s the pumps re-read the pair (relay-escape)
+```
+
+**The moved line.** Under `route` the observation that records the carrier also follows the session from its first pair (`observe`, `session_carrier.rs:427`, which starts `follow` at `:436`). It reads the selection every second (`MOVE_TICK`, `:84`), holding the peer weakly, until the peer is gone, closed or failed, and at each change of pair writes one line at `info`. The line's latency is never the media's: nothing waits on it, and no wire carries it. The recorded carrier, sent on `rc:session.stats`, stays the one read after the settle ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
+
+```text
+INFO session carrier moved session_id=<id> from="derp" to="turn" route=turn relay_transport="udp" local_typ=Relay local_addr=203.0.113.7:61002 remote_typ=Srflx remote_addr=198.51.100.4:50000 overlay=None
+```
+
+| Field | What it says |
+|---|---|
+| `from`, `to` | the carrier the session left and the one it moved to, in the carrier record's words (D21): each by `carrier_on` with the agent's read of its pair and, for a pair on the mesh, the overlay's carrier for the remote's peer, asked at the move |
+| `route` | the new pair's route, in the path line's words (`path_route`, `agents/roomlerd/src/carrier_rank.rs:324`) |
+| `relay_transport`, `local_typ`, `local_addr`, `remote_typ`, `remote_addr`, `overlay` | the carrier line's fields, for the new pair, with its ports |
+
+A pair the agent reads no route for ends the follow without a line, and under `0`, `prio` and `1` no follow starts.
+
+**The constrained flag follows on its own.** Phase B builds the line only. A data-channel pump reads its constrained flag at its opening (`detect_constrained_transport`, `agents/roomlerd/src/peer.rs:2028`) and again every 5 s (`TRANSPORT_RECHECK_INTERVAL`, `:2093`; `current_pair_is_relay`, `:2154`), by one predicate: a relay at either end that is not the device's own fast TURN, or a remote on the mesh whose overlay carrier is not direct. A change writes `transport path changed mid-session — updating bitrate clamp (relay-escape)` with `was_relay` and `now_relay`. So within 5 s of a move, the flag is what the opening would have read on the new pair:
+
+| The move | The flag before | After | What changes |
+|---|---|---|---|
+| mesh-relayed to TURN | on: the overlay carries the peer through TURN or DERP | on: a relay off the device | nothing, and no relay-escape line |
+| mesh-relayed to native | on | off | the clamps lift |
+| mesh-direct to native | off | off | nothing |
+| TURN to native | on | off | the clamps lift |
+
+The clamps: in the VP9 pump, the bitrate cap (`relay_max_bps`, 3 Mbps, against none), the buffered-amount watermark (256 KiB against `DC_BUFFERED_HIGH_BYTES`) and the worst-quality cap (`peer.rs:4388`); in the FFmpeg pump, everything it reads from the flag each frame (its rate ceiling and pipe estimate, its relay resolution cap, its queue budget and byte gate, its opener grace and IDR thrift) and, once a flip has held for two re-reads, its capture and encoder rebuilt at 30 or 60 fps, at most once a minute, under `rate_profile_rebuild` (`peer.rs:7720`). Its send depth and its rate memory's key stay the opening's. A relayed mesh and the far TURN read alike, so the move phase B exists for, mesh-relayed to TURN, keeps the clamp and changes the carrier under it. The cell `session_carrier::tests::the_constrained_flag_per_move_class` pins the table from the predicate's parts.
+
+**The cells** (`crates/vendored/webrtc-ice/src/agent/agent_carrier_rank_test.rs`, on a vnet like phase A's; a stand-in for Chrome nominates with checks that carry USE-CANDIDATE):
+
+| Cell | What it shows |
+|---|---|
+| `b1_the_budget_spans_the_holds_bound_at_the_check_cadence`, `b1_a_pair_above_a_selection_on_the_mesh_has_a_budget_of_its_own` | B1's numbers, and whose budget a pair spends: its own above a selection on the mesh under `route`; the opening's with the selection off the mesh and under `prio` and `1`; none under `0` |
+| `b1_a_dead_pair_above_a_selection_on_the_mesh_is_checked_at_the_check_cadence_within_the_budget` | a live agent: 13 checks about 215 ms apart, then the pair fails |
+| `b2_a_nomination_the_agent_has_not_validated_is_answered_and_taken_on_its_own_check` | one nomination moves the session: the answer, the triggered check, its success, then the agent's media |
+| `b2_the_half_blackholed_pair_is_answered_never_taken_and_never_sent_on` | the agent's checks lost on the way: answered, never selected, nothing sent on it |
+| `b2_with_the_selection_off_the_mesh_a_nomination_is_handled_as_built` | no move away from a real pair |
+| `b2_one_decision_answers_only_a_pair_off_the_mesh_the_follow_gate_would_take` | the decision, row by row: a pair into or from the mesh, a selection off it, nothing selected, a name, a stale selection, a direct link |
+| `b_a_turn_that_allocates_after_the_bound_opens_on_the_mesh_then_moves_once`, `b2_a_late_turn_moves_on_chromes_first_check_of_the_pair` | the late TURN: it opens on the mesh at the bound, read `hold_exit=bound`, and moves once: within 1.5 s of the agent's relay with Chrome checking every 480 ms, and within 1 s on Chrome's round robin, where as built it moved 2.8 s after the relay |
+| `b2_kill_switch_under_prio_and_0_a_nomination_the_agent_has_not_validated_is_handled_as_built` | under `prio`, `1` and `0`: no answer, the triggered check, no move |
+
+The roomlerd cells pin the line (`session_carrier::tests::the_moved_line_names_its_fields`, `under_route_each_selection_change_after_the_opening_writes_one_moved_line`, `a_move_to_another_port_at_the_same_address_is_a_move`), its absence without `route` (`without_route_nothing_follows_the_selection`) and the flag table.
+
+**The kill switch** is phase A's: `rc_carrier_rank` back to `1`, `prio` or `0`, then a restart. Without the route rank a pair spends the opening's budget, a nomination the agent has not validated goes unanswered, `nomination_pending` is never set, and no follow starts.
+
+**What phase B leaves.** B moves a session only onto a pair that ranks above its selection: phase A's follow gate. A pair's priority follows its lower candidate, so a selection on R1's cross pair, from the agent's LAN host, ranks above every pair through the agent's own TURN relay (16,777,215 at most, [the carrier order](#the-carrier-rank-fr-148-p4)). B does not move such a session onto the agent's relay, though D15 orders TURN above a relayed mesh. A5 stands as above.
 
 ### 4.5 How the viewer finds its own device's relay (FR-121)
 
@@ -741,10 +819,10 @@ and every session registered at that moment gets, one stop grace (1 s) after
 the exit, the reason a session opened while the desktop is down gets:
 `backend_error`, with *this device's virtual desktop is down: its X server
 (Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
-(`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:361`). The
+(`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:438`). The
 supervisor reads who to tell on its own thread and sends one
 `spawn_capture_unavailable_notice` per session on the daemon's runtime
-(`sessions_told_via`, `virtual_desktop.rs:436`), so it never waits on a
+(`sessions_told_via`, `virtual_desktop.rs:513`), so it never waits on a
 channel. Only where the device's plan is the virtual desktop
 (`capture::sessions_capture_the_virtual_desktop`,
 `agents/roomlerd/src/capture/mod.rs:1535`); under an explicit `drm_capture` or
@@ -764,7 +842,7 @@ desktop, the supervisor retires every registered pipeline
 (`media_share::retire_all`, `agents/roomlerd/src/media_share.rs:1006`) after
 the stop grace, before the sessions are told, and again once the restarted
 desktop is up, which catches what registered while it was down (`retire_if`,
-`virtual_desktop.rs:468`). A retired pipeline takes no joiner and its key is
+`virtual_desktop.rs:545`). A retired pipeline takes no joiner and its key is
 free, so the next viewer of the profile runs a capture and an encoder of its
 own on the new server. Its owner and its followers keep what they share and
 are told with the rest; detaching a follower would send it back into an open
@@ -2011,7 +2089,7 @@ server.
 - **Who is marked.** At an X server exit the supervisor marks every session
   registered at that moment, on its own thread, before it reads the device's
   plan or the tell's switch and before the restart can publish the desktop up
-  (`sessions_told_via`, `agents/roomlerd/src/virtual_desktop.rs:436`). FR-80's
+  (`sessions_told_via`, `agents/roomlerd/src/virtual_desktop.rs:513`). FR-80's
   notice also marks the session it tells, when its reason is this daemon's
   virtual desktop being down (`input::told_no_picture`,
   `agents/roomlerd/src/input/mod.rs:93`): a session whose open was refused
@@ -3743,11 +3821,14 @@ so `mark_ended`'s whole-`stats` write cannot reset it, only when the value is a 
 device is the only writer). Absent is unknown, never direct. The P9a freeze splits the day's
 Active sessions by carrier, and the Quality tab and weekly roll-up show it. Rules, storage and
 the field plan: [growth-observability.md](growth-observability.md#remote-desktop-quality-from-what-is-recorded-p9a).
-Whether the pair rides the overlay is its remote's range (`carrier_of`, `agents/roomlerd/src/session_carrier.rs:164`),
+Whether the pair rides the overlay is its remote's range (`carrier_of`, `agents/roomlerd/src/session_carrier.rs:187`),
 except under `rc_carrier_rank=route` (FR-148 P4 step 2). There it is the ICE agent's own read of the pair, the route
-rank's predicate with the mesh's own blocks (`carrier_on`, `:178`, fed at `:313`): a remote in the `/10` outside
+rank's predicate with the mesh's own blocks (`carrier_on`, `:201`, fed at `:367`): a remote in the `/10` outside
 them is recorded as the TURN or direct path it is, and a pair whose local socket the mesh carries asks the overlay,
 whatever its remote ([§4.4](#the-route-rank-fr-148-p4-step-2)). The vocabulary is the same under every value.
+Under `route` a later change of pair is still not recorded, but it is named: one `session carrier moved` line, from
+the last pair's carrier to the new pair's, in the same words (`follow_moves`, `:523`;
+[§4.4](#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)).
 Since FR-148 P0 the agent's carrier line also names what carries its own TURN allocation,
 `relay_transport` (`udp`, `tcp`, `tls`, `none` or `unknown`). It is a log field only, never sent
 on `rc:session.stats`
@@ -5941,6 +6022,23 @@ to-activate, so the browser never sees a bait-and-switch.
   (`ROOMLER_AGENT_WGC_CURSOR=1` re-enables) so the low-latency overlay /
   CSS cursor is the single source with no double cursor. Additive +
   back-compat: old browsers ignore `css` and draw the bitmap.
+  **A shape always fits one message (#4207):** a webrtc-rs reader takes
+  at most 65 535 bytes a message and the agent's SCTP stack refuses one
+  over 65 536, so a `cursor:shape` whose message would pass 64 000 bytes
+  (a bitmap of about 110×110 px or more: an enlarged accessibility
+  pointer, a large application cursor, a high DPI) goes out with its
+  bitmap scaled down, aspect kept, until the message fits
+  (`shape_message`, `agents/roomlerd/src/capture/cursor.rs:813`). `w`,
+  `h`, `hx`, `hy` and `bgra` describe the scaled bitmap, the hotspot
+  scaled with it and kept inside it, and `css` is kept, so the wire and
+  the viewer are unchanged: the viewer draws such a pointer smaller than
+  the host does, and a stock one as its own native cursor. The scale
+  averages premultiplied colour, so a transparent ground leaves no dark
+  fringe at the pointer's edge. A shape send that fails is logged at WARN
+  with its error, one line per send (a shape is sent when the pointer
+  changes to it), and the pump goes on. Before the fix such a shape never
+  arrived, silently: the viewer kept the previous pointer, even for a
+  stock cursor, whose `css` only counts once its shape is cached.
 - **Clipboard DC** (0.1.32): thread-pinned `arboard::Clipboard` worker;
   JSON protocol `clipboard:read` / `clipboard:write` /
   `clipboard:content` / `clipboard:error` with `req_id` round-trip

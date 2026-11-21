@@ -243,6 +243,15 @@ pub struct CandidatePair {
     pub(crate) binding_request_count: AtomicU16,
     pub(crate) state: AtomicU8, // convert it to CandidatePairState,
     pub(crate) nominated: AtomicBool,
+    /// Roomler patch (FR-148 P4 step 2, phase B of D49, B1): the checks this
+    /// pair has sent above a selection that rides the mesh, on that budget of
+    /// its own (`agent_config::ROUTE_MOVE_CHECKS`).
+    pub(crate) move_checks: AtomicU16,
+    /// Roomler patch (FR-148 P4 step 2, phase B of D49, B2): the controlling
+    /// agent's latest check on this pair nominated it before this agent had
+    /// validated it, and this agent answered. Taken when this agent's own check
+    /// on the pair succeeds (`AgentInternal::answers_before_validating`).
+    pub(crate) nomination_pending: AtomicBool,
 }
 
 impl Default for CandidatePair {
@@ -254,6 +263,8 @@ impl Default for CandidatePair {
             state: AtomicU8::new(CandidatePairState::Waiting as u8),
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
+            move_checks: AtomicU16::new(0),
+            nomination_pending: AtomicBool::new(false),
         }
     }
 }
@@ -306,6 +317,8 @@ impl CandidatePair {
             state: AtomicU8::new(CandidatePairState::Waiting as u8),
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
+            move_checks: AtomicU16::new(0),
+            nomination_pending: AtomicBool::new(false),
         }
     }
 

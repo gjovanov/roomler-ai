@@ -239,12 +239,23 @@ address rides the mesh too, because the destination picks the route. Under the s
 `route` value (step 2) the unit is the pair: a pair rides the mesh when either end sits on
 the mesh's own blocks or its local candidate is ranked last, never on the whole
 `100.64.0.0/10` (`rides_the_mesh`,
-`crates/vendored/webrtc-ice/src/agent/agent_config.rs:170`). While a sibling on the mesh
+`crates/vendored/webrtc-ice/src/agent/agent_config.rs:183`). While a sibling on the mesh
 carries that route, the agent forms no pair from a socket off the mesh into it, and it
 holds the pairs the mesh carries, unanswered, for at most 2.5 s while a TURN relay can
 still come. A TURN pair that connects inside the hold wins; the mesh carries the video
 when none does, and the session's path line names the route and the hold
 ([remote-control.md](remote-control.md#the-route-rank-fr-148-p4-step-2)).
+
+A TURN relay that allocates after the hold still takes the session off the mesh (phase
+B). While the selection rides the mesh, the agent checks each pair off it that ranks
+above, on every 200 ms tick of its ICE loop, up to 13 checks of the pair's own
+(`ROUTE_MOVE_CHECKS`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:130`). It
+answers the browser's nomination of such a pair before its own check has validated the
+pair, and moves onto it only once that check succeeds, so it never sends on a pair it
+has not validated (`answers_before_validating`,
+`crates/vendored/webrtc-ice/src/agent/agent_selector.rs:221`). Each move writes one
+`session carrier moved` line, from the carrier the session left to the one it took
+([remote-control.md](remote-control.md#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)).
 
 ### The direct carrier's socket buffers (FR-110)
 
@@ -972,7 +983,7 @@ has deleted, or one of another org, never matches.
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
 re-fanned about 750 ms later, one re-fan for a burst of changes, while the org's ACL
 is `warn` or `enforce` (`refan_for_role_change`,
-`crates/modules/network/src/routes/overlay_policy.rs:334`). Under `off` a role shapes
+`crates/modules/network/src/routes/overlay_policy.rs:346`). Under `off` a role shapes
 nothing, so nothing is re-fanned. A node whose owner's roles cannot be read matches
 no role rule, with a WARN (`overlay acl: roles unreadable; role-scoped rules will not
 match this node`), and an org-relay grant that needs them is refused.

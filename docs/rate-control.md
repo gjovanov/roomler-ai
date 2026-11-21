@@ -1773,7 +1773,7 @@ time, so that line of cells grows by about 20 s. Since D44 the line runs eight c
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
 names, right after `carrier`, what carries the agent's own TURN allocation for the
 nominated pair: `relay_transport` (`relay_transport_of`,
-`agents/roomlerd/src/session_carrier.rs:274`; the line, `:374`). A relay candidate names
+`agents/roomlerd/src/session_carrier.rs:297`; the line, `:458`). A relay candidate names
 its relayed address, which is UDP whatever carries the allocation to the TURN server, so
 the pair alone cannot tell TURN over UDP from TURN over TCP or TLS. The vendored
 webrtc-ice stamps each relay candidate it gathers with its TURN URL's transport and

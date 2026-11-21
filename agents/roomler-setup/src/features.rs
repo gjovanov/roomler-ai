@@ -28,6 +28,11 @@
 //! switch exists to prevent. The answer is never cached across runs, and it is
 //! fetched again for the chosen server right before an install
 //! ([`crate::orchestrator_unix`]): the role is picked before the server.
+//!
+//! FR-141 adds two keys about a Mac: `wizard_reinstall_guard` (P3), the one
+//! switch that is on unless the server says a JSON `false`, and
+//! `wizard_macos_one_row` (P2), the one-row form ([`crate::one_row_form`]),
+//! a claim like the rest.
 
 use std::time::Duration;
 
@@ -70,6 +75,10 @@ pub struct SetupFeatures {
     /// off: an older server, a timeout, an error page or a string `"false"`
     /// leave it on, because a Mac it fails to guard ends up with three rows.
     pub reinstall_guard_off: bool,
+    /// FR-141 P2 — the released wizard makes a new Mac ONE device row
+    /// ([`crate::one_row_form`]). A claim like the daemon switches: only a
+    /// JSON `true` turns it on, so an older server keeps FR-129 B2's two rows.
+    pub wizard_macos_one_row: bool,
 }
 
 impl SetupFeatures {
@@ -95,6 +104,13 @@ impl SetupFeatures {
         !self.reinstall_guard_off
     }
 
+    /// FR-141 P2 — does this server offer the one-row form on `os`? A Mac's
+    /// alone, and only on the server's JSON `true`. Whether it is OPEN on this
+    /// Mac is [`crate::one_row_form`]'s, which reads this first.
+    pub fn one_row_offered(self, os: HostOs) -> bool {
+        os == HostOs::Macos && self.wizard_macos_one_row
+    }
+
     /// The answer as the page binds it, for `os`: the per-OS rule applied
     /// here, so the page holds one boolean and no rule of its own.
     pub fn view(self, os: HostOs) -> FeaturesView {
@@ -103,13 +119,15 @@ impl SetupFeatures {
             pairing_off: self.pairing_off,
             daemon_offered: self.daemon_offered(os),
             answered: false,
+            one_row_open: false,
+            one_row_note: None,
         }
     }
 }
 
 /// What `cmd_setup_features` hands the page: the server's answer for THIS
 /// OS. camelCase, as the SPA binds it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeaturesView {
     /// `/api/pair/*` is mounted.
@@ -120,6 +138,12 @@ pub struct FeaturesView {
     pub daemon_offered: bool,
     /// [`Asked::answered`]: `false` means nobody could say, not "off".
     pub answered: bool,
+    /// FR-141 P2 — the one-row form is open on this Mac for this server
+    /// ([`crate::one_row_form::read_here`]); `false` until that is read.
+    pub one_row_open: bool,
+    /// FR-141 P2 — why it is closed, as the page shows it
+    /// ([`crate::one_row_form::Closed::note`]).
+    pub one_row_note: Option<String>,
 }
 
 /// FR-129 C — what asking a server came to. "Could not ask" is not "switched
@@ -182,6 +206,7 @@ pub fn parse(status: u16, body: &[u8]) -> SetupFeatures {
             .get("wizard_reinstall_guard")
             .and_then(serde_json::Value::as_bool)
             == Some(false),
+        wizard_macos_one_row: flag("wizard_macos_one_row"),
     }
 }
 
@@ -338,7 +363,32 @@ mod tests {
         wizard_macos_daemon: true,
         wizard_unix_daemon: true,
         reinstall_guard_off: false,
+        wizard_macos_one_row: false,
     };
+
+    /// FR-141 P2 — the one-row form is offered only on a JSON `true`, and on a
+    /// Mac alone: absent (every server before the key), a string, a number,
+    /// an older server's 404 or an error page leave B2's two rows.
+    #[test]
+    fn only_a_json_true_offers_the_one_row_form_and_only_on_a_mac() {
+        let on = parse(200, br#"{"wizard_macos_one_row": true}"#);
+        assert!(on.one_row_offered(HostOs::Macos));
+        for os in [HostOs::Linux, HostOs::Windows, HostOs::Other] {
+            assert!(!on.one_row_offered(os), "{os:?}");
+        }
+        for body in [
+            &br#"{"wizard_macos_one_row": "true"}"#[..],
+            br#"{"wizard_macos_one_row": 1}"#,
+            br#"{"wizard_macos_one_row": false}"#,
+            ALL_ON,
+            b"<html>blocked</html>",
+        ] {
+            assert!(!parse(200, body).one_row_offered(HostOs::Macos));
+        }
+        assert!(!parse(404, br#"{"wizard_macos_one_row": true}"#).one_row_offered(HostOs::Macos));
+        assert!(!SetupFeatures::default().one_row_offered(HostOs::Macos));
+        assert!(on.reinstall_guard_on(), "the guard is not this switch");
+    }
 
     /// FR-141 P3 — the one-row guard is on unless the server says a JSON
     /// `false`: absent (every server before the key), a string, an error
@@ -495,7 +545,8 @@ mod tests {
                 pairing: true,
                 pairing_off: false,
                 daemon_offered: true,
-                answered: false
+                answered: false,
+                ..FeaturesView::default()
             }
         );
         assert_eq!(
@@ -504,7 +555,8 @@ mod tests {
                 pairing: true,
                 pairing_off: false,
                 daemon_offered: false,
-                answered: false
+                answered: false,
+                ..FeaturesView::default()
             }
         );
         assert_eq!(
@@ -631,7 +683,7 @@ mod tests {
         let json = serde_json::to_string(&ON.view(HostOs::Linux)).unwrap();
         assert_eq!(
             json,
-            r#"{"pairing":true,"pairingOff":false,"daemonOffered":true,"answered":false}"#
+            r#"{"pairing":true,"pairingOff":false,"daemonOffered":true,"answered":false,"oneRowOpen":false,"oneRowNote":null}"#
         );
     }
 }

@@ -181,6 +181,8 @@ usage() {
     echo "                  (Linux --system; on macOS it also requests the root half). A config"
     echo "                  already there keeps its operator settings (the daemon folds the new"
     echo "                  enrollment in); --config-take KEYS copies those keys from FILE anyway."
+    echo "                  On macOS --privileged-steps --one-row --config-from FILE places a"
+    echo "                  one-row Mac's root config before the package, and has no user half."
     echo
     echo "  --uninstall     Remove every Roomler part on this machine — the daemon, the"
     echo "                  companion, the tunnel CLI — however it was installed (this"
@@ -293,8 +295,21 @@ if [ "$ONE_ROW" = 1 ]; then
         echo "error: --one-row enrolls ONE row from one token, and --daemon-token is the second token of a two-row install: pass one of them" >&2
         exit 1
     fi
-    if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
-        echo "error: --one-row is this script's terminal install: the halves a GUI runs (--privileged-steps, --user-steps) have no one-row form yet" >&2
+    # FR-141 P2 — the setup wizard's one-row form is the privileged half alone
+    # (install_macos_one_row_half): it places the root config the wizard
+    # enrolled, and there is no user half to run after it.
+    if [ "$USER_STEPS" = 1 ]; then
+        echo "error: a one-row Mac has no user half: its root service starts the screen worker, so run only --privileged-steps --one-row --config-from FILE" >&2
+        exit 1
+    fi
+    if [ "$PRIV_STEPS" = 1 ] && [ -z "$CONFIG_FROM" ]; then
+        echo "error: --privileged-steps --one-row places the root config its caller enrolled: pass --config-from FILE" >&2
+        exit 1
+    fi
+    # Only the half places a config: on the terminal route --config-take meets
+    # the refusals every install gets (--config-from belongs to the half).
+    if [ "$PRIV_STEPS" = 1 ] && [ -n "$CONFIG_TAKE" ]; then
+        echo "error: --one-row places the root config whole and folds nothing into it: run it without --config-take" >&2
         exit 1
     fi
     if [ "$NO_ENROLL" = 1 ]; then
@@ -872,7 +887,11 @@ install_daemon_macos() {
 
     # FR-43 P3d — one token, one row: a sequence of its own.
     if [ "$ONE_ROW" = 1 ]; then
-        install_macos_one_row "$pkg" "$daemon_bin"
+        if [ "$PRIV_STEPS" = 1 ]; then
+            install_macos_one_row_half "$pkg" "$daemon_bin"
+        else
+            install_macos_one_row "$pkg" "$daemon_bin"
+        fi
         return 0
     fi
 
@@ -1084,6 +1103,69 @@ install_macos_one_row() {
         say "NOTE: '$CONSOLE_USER' also has an enrollment of their own here, from an earlier"
         say "      install. A one-row Mac ignores it and nothing runs it any more, so its row"
         say "      stays offline: delete that row in the dashboard (Devices)."
+    fi
+    macos_permissions_notice
+}
+
+# The agent_id a config names, or nothing: its first such line, which is the
+# top-level key (an org's tables come after it).
+config_agent_id() {
+    as_root sed -n 's/^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# FR-141 P2 — the one-row form of the privileged half, `--privileged-steps
+# --one-row --config-from FILE`, which the setup wizard runs for a Mac that is
+# not enrolled yet. The wizard enrolled the root config in its own process (the
+# one token, both switches, as `enroll --one-row` writes them), so this places
+# it BEFORE the one package run, and the package's guard reads the switch,
+# removes the per-user LaunchAgent and starts the root half. Nothing here
+# enrolls, folds, kickstarts or touches a home (FR-147), and no user half
+# follows. The marker goes first: the guard honours the switch only beside it
+# (postinstall's daemon_supervises_gui_worker), and without it the package
+# removes the root half and starts the LaunchAgent, which holds no enrollment.
+install_macos_one_row_half() {
+    pkg="$1"; daemon_bin="$2"
+    # A root config here already is this wizard's own from an earlier attempt
+    # (a Retry: the same agent_id), or another row's, which is never written
+    # over. The wizard reads the Mac's layout before it pairs; this is the belt.
+    keep_placed=0
+    if as_root test -f "$MACOS_DAEMON_CONFIG"; then
+        own="$(config_agent_id "$CONFIG_FROM")"
+        if [ -n "$own" ] && [ "$own" = "$(config_agent_id "$MACOS_DAEMON_CONFIG")" ]; then
+            keep_placed=1
+        elif root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
+            echo "error: this Mac is one row already ($MACOS_DAEMON_CONFIG), under another enrollment, so this install changes nothing: run Roomler Setup again and it installs nothing over it. Nothing was changed." >&2
+            exit 1
+        else
+            echo "error: this Mac's root half is enrolled already ($MACOS_DAEMON_CONFIG), as a row of its own, so it keeps its layout. To make it one row, run: sudo roomlerd one-row (it says its plan and asks first, and --revert puts the Mac back). Nothing was changed." >&2
+            exit 1
+        fi
+    fi
+
+    say "requesting the root half (root LaunchDaemon: it holds this Mac's one row and runs the overlay)"
+    as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+    as_root touch "$MACOS_DAEMON_MARKER"
+    if [ "$keep_placed" = 1 ]; then
+        say "the root config an earlier attempt placed is this one ($MACOS_DAEMON_CONFIG): it stays"
+    else
+        say "placing the root config the wizard enrolled at $MACOS_DAEMON_CONFIG (root-owned, 0600): this Mac's one row"
+        # gid 0 is wheel on a Mac.
+        as_root install -m 600 -o root -g 0 "$CONFIG_FROM" "$MACOS_DAEMON_CONFIG"
+    fi
+
+    say "installing roomlerd (.pkg — its guard reads the switch, removes the per-user LaunchAgent and starts the root half)"
+    # Stdin from /dev/null: in a piped run, stdin is the rest of this script,
+    # and bash, macOS's /bin/sh, reads it a line at a time.
+    as_root installer -pkg "$pkg" -target / </dev/null
+    [ -x "$daemon_bin" ] || {
+        echo "error: the package did not install $daemon_bin" >&2
+        exit 1
+    }
+    # The wizard compared the release with the first one-row release before it
+    # spent the token. This is the belt, as on the terminal route.
+    if ! "$daemon_bin" enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'; then
+        echo "error: this release's roomlerd has no one-row form, so it does not read the root config as one row. Remove $MACOS_DAEMON_CONFIG and $MACOS_DAEMON_MARKER, then run Roomler Setup again once a newer release is out." >&2
+        exit 1
     fi
     macos_permissions_notice
 }
@@ -2149,6 +2231,8 @@ esac
 if [ "$PRIV_STEPS" = 1 ]; then
     if [ "$SYSTEM" = 1 ]; then
         say "privileged steps done — a --system install has no user half"
+    elif [ "$ONE_ROW" = 1 ]; then
+        say "privileged steps done — a one-row Mac has no user half: its root service starts the screen worker"
     else
         say "privileged steps done. Next, as the person: enroll in your own process, then install.sh --user-steps --role daemon"
     fi
