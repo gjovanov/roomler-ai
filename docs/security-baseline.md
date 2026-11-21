@@ -372,9 +372,10 @@ roles do not.
   update and mode, take the body as `Result<Json<T>, JsonRejection>` and read it
   with `let Json(body) = body?;` straight after the gate. `ApiError::JsonBody`
   (`crates/core/src/error.rs:55`) answers it exactly as the extractor did, the
-  status and the plain-text words, so a holder sees no change. The overlay ACL's
-  half is pinned in `crates/tests/src/overlay_tests.rs`
-  (`overlay_acl_decides_the_bit_before_the_body`).
+  status and the plain-text words, so a holder sees no change. The extractor
+  still buffers and parses the bytes before the handler runs, as `Bytes` would;
+  what waits for the gate is its answer. The overlay ACL's half is pinned in
+  `crates/tests/src/overlay_tests.rs` (`overlay_acl_decides_the_bit_before_the_body`).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
   `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
