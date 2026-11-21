@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { fetchAllPages } from '@/utils/allPages'
 
 // Matches `crates/remote_control/src/models.rs` (OverlaySelector / OverlayTarget
 // / OverlayRule / OverlayAclMode) and the answers of
@@ -66,19 +67,27 @@ export const useOverlayAclStore = defineStore('overlayAcl', () => {
   const mode = ref<OverlayAclMode>('off')
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** The list stopped at the page cap (`MAX_PAGES` in utils/allPages.ts)
+   *  while the server holds more rules: the tab says how many it shows. */
+  const truncated = ref(false)
 
   // Fetches swallow into `error`; mutations THROW for the component to catch —
   // the split documented in stores/role.ts.
   async function fetchPolicies(tenantId: string) {
     loading.value = true
     error.value = null
+    truncated.value = false
     try {
-      const res = await api.get<OverlayPolicyListResponse>(
+      // Every page, not the route's first 25 (#4188). The posture rides every
+      // answer; like the total, the last one's is kept. A failed page lands in
+      // the catch below like the one request did, and the posture stays.
+      const all = await fetchAllPages<OverlayPolicy, OverlayPolicyListResponse>(
         `/tenant/${tenantId}/overlay-acl`,
       )
-      policies.value = res.items
-      total.value = res.total
-      mode.value = res.mode
+      policies.value = all.items
+      total.value = all.last.total
+      mode.value = all.last.mode
+      truncated.value = all.truncated
     } catch (e) {
       error.value = (e as Error).message
       policies.value = []
@@ -133,6 +142,7 @@ export const useOverlayAclStore = defineStore('overlayAcl', () => {
     mode,
     loading,
     error,
+    truncated,
     fetchPolicies,
     createPolicy,
     updatePolicy,

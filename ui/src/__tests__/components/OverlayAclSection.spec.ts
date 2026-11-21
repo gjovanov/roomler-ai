@@ -66,6 +66,7 @@ vi.mock('@/stores/members', () => ({
 import OverlayAclSection from '@/components/admin/OverlayAclSection.vue'
 import type { OverlayPolicy } from '@/stores/overlayAcl'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from '../stores/pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -210,7 +211,9 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     mockApi.get.mockResolvedValue(listOf([namedRule(), catchAllRule()]))
     const w = mountSection()
     await flushPromises()
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/overlay-acl`)
+    expect(mockApi.get).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/overlay-acl?page=1&per_page=100`,
+    )
     const rows = [...document.querySelectorAll('tbody tr')]
     expect(rows).toHaveLength(2)
     expect(chips(rows[0]!, 'Sources')).toEqual([NODE, 'Ops lead', 'Mesh operators'])
@@ -301,6 +304,44 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     expect(body.via).toEqual(rule.via)
     expect(body.destinations).toEqual(rule.destinations)
     expect(document.querySelector('.v-overlay--active .v-alert')).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+})
+
+// #4188 — the tab lists every page the route answers, up to the store's cap of
+// 50 pages. A route that serves one row a page reaches that cap at 50 rows.
+describe('OverlayAclSection — a list longer than one page', () => {
+  const row = (i: number): OverlayPolicy => ({
+    ...catchAllRule(),
+    id: rowId(i),
+    name: `rule-${i}`,
+  })
+  const note = () => document.querySelector('[data-testid="overlay-acl-truncated"]')
+
+  it('lists the rows of every page, with no note that the list was cut', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 3, row, extra: { mode: 'warn' }, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(mockApi.get).toHaveBeenCalledTimes(3)
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(3)
+    expect(note()).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('says how much of the list it shows when the page cap cut it', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 51, row, extra: { mode: 'warn' }, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(50)
+    expect(note()?.textContent?.replace(/\s+/g, ' ').trim()).toBe(
+      "Showing the first 50 of this organization's 51 rules.",
+    )
     expectNothingRaised()
     w.unmount()
   })
