@@ -47,7 +47,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   that many single-use tokens (`:985-1004`). Each half counts against the device cap
   (`docs/fr/FR-129-guided-cross-platform-installer.md:580-584`).
 - One run: the root half enrolls in the wizard's process as `<name>-daemon` (`role.rs:142-147`) under a machine id
-  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:876-925`); one administrator prompt runs the
+  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:877-926`); one administrator prompt runs the
   privileged half (marker, package, config placed, daemon started: `scripts/install.sh:886-893`, `:951-985`); the
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:940-949`). Two rows.
@@ -152,7 +152,7 @@ person's half on it and says why.
     stop can still show). It promises no layout: with P2's switch on, Setup gives a new Mac one device and no two-row
     choice, so "two devices" would be true only while the switch is off. A Mac that `sudo roomlerd
     one-row` made one row is also offered `sudo roomlerd one-row --revert`, but only while root's copy from before,
-    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:64-82`): only that command
+    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:66-84`): only that command
     writes it, a finished revert removes it (`:2695-2700`), and with no copy the revert says only "nothing to revert"
     (`:2730-2735`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
