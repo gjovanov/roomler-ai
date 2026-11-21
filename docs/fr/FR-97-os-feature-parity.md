@@ -310,7 +310,7 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1430`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1534-1541`) | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:275-301`, `:1793-1800`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1013-1022` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3773`, `session_end.rs:220`) | P4d |
@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2379-2394`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2432-2447`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -1230,11 +1230,11 @@ model on Windows, so the three agree on what the mode means.
     - *Measured first, on a tart Mac (§8).* The child the supervisor reaps is `sudo`: `launchctl asuser` execs into
       it. `sudo` passes the worker's end through as its own, so the supervisor's wait status is the worker's.
     - *What counts.* Any signal but SIGTERM, SIGHUP and SIGINT (a logout, a closed terminal, a person), and any
-      exit code but 0 and the four the agent exits with on purpose: the Windows supervisor's list, less its
-      session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:271-295`). Exit code 9 is a restart someone
+      exit code but 0 and the five the agent exits with on purpose (78 since #4071): the Windows supervisor's list, less its
+      session-teardown code (`agents/roomlerd/src/macos_supervisor.rs:275-301`). Exit code 9 is a restart someone
       asked for, and signal 9 is a kill. Only the wait status tells them apart, and a test holds that.
     - *Where it goes.* `WriterContext::Supervisor`, which off Windows is the writing process's own dir: the root
-      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:656-662`).
+      daemon's. Its own uploader drains it, so the record reaches the server on the daemon's row (`:1793-1800`).
     - *Its tail* is the daemon's own log, as on Windows. The worker's stderr is the daemon's `StandardErrorPath`,
       which a signal death writes nothing to. Its rolling log is in the person's home, which a root daemon does not
       read, and nothing ties the two halves to one org.

@@ -220,3 +220,12 @@ simplifying: unversioned, a stub that lacks the daemon's symbols satisfies it, a
 dependency it removes the package and exits 0: over a working install that deletes a
 running daemon. `deb_install` in `scripts/install.sh` names the package, so apt
 refuses instead.
+
+⚠️ **`scripts/install.sh` is one function, `main`, and its last line is the only call** (#3931,
+`docs/installation.md`, "Nothing the script starts reads the piped script"). Piped from curl, the
+script is the shell's stdin, and a command it starts that reads stdin eats the lines not yet read.
+The function makes the shell read every byte first, its first statement `exec </dev/null` covers
+every command, present and future, and a download cut short never reaches the call. So: no code
+outside `main`, nothing after `main "$@"`, `exit` stays main's last statement, and never call it as
+`main || …`, `if main` or `! main` (each turns `set -e` off). A question for the person goes to
+`/dev/tty`. The harness pins the shape.
