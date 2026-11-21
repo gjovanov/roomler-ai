@@ -3946,10 +3946,11 @@ async fn run_cmd(
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault, told apart by type and never by its words:
-        // no crash is recorded for it, and a supervisor that reads 78 gets 78 (#4028, #4071).
-        let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    let at_start = config_at_start::of(config_path, unenrolled, supervision);
+    if at_start == config_at_start::AtStart::NoConfig {
+        // #4023 — a state, not a fault: no crash is recorded, and a supervisor that reads 78 gets
+        // 78 (#4028, #4071). #4157 — an enrolled copy is restored instead, if the run may restore.
         return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
     }
     // Take the single-instance lock before doing anything else. If
@@ -4037,12 +4038,11 @@ async fn run_cmd(
         );
     }
 
-    // FR-84 D3 — who will relaunch this process if it exits, decided once,
-    // from evidence the supervisor left (argv, environment, cgroup) — never
-    // from the config file. `none` is the answer for a hand-run `roomlerd
-    // run`, and it is the one that makes "Apply now" refuse instead of
-    // taking the device offline.
-    let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+    // FR-84 D3 — who will relaunch this process if it exits, decided once, at
+    // the top (#4157's check reads it), from evidence the supervisor left
+    // (argv, environment, cgroup) — never from the config file. `none` is the
+    // answer for a hand-run `roomlerd run`, and it is the one that makes
+    // "Apply now" refuse instead of taking the device offline.
     roomlerd::supervision::set_current(supervision);
     tracing::info!(
         supervisor = supervision.wire(),
@@ -9232,3 +9232,6 @@ mod no_enrollment_exit_tests {
 
 /// #3589 — what the last line of `adopt-enrollment` says was at the target.
 mod adopt_line;
+
+/// #4157 — what a `run` does with its config before it takes the lock.
+mod config_at_start;
