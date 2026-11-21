@@ -54,8 +54,8 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
   and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2729-2778`). `install.sh --one-row` is
   the one-token path (`install.sh:1012-1108`); it is refused with the halves the wizard runs: "have no one-row
-  form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
-  (`docs/installation.md:2146-2150`).
+  form yet" (`install.sh:296-299` at master `b08b6f383`). The docs say the wizard has no one-row control
+  (`docs/installation.md:2697-2700` at master `b08b6f383`).
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
   (`agents/roomler-setup/src/root_identity.rs:67-79`), so on a Mac that is already one row or supervised the
   wizard would enroll a new person's half and start a LaunchAgent that the package's guard removes

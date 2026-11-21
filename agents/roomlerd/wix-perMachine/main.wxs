@@ -581,6 +581,56 @@
             HideTarget='yes'
             Return='ignore' />
 
+        <!--
+          #4196: a file this install puts in place is still there after the next
+          boot. Something that holds roomlerd.exe open without FILE_SHARE_DELETE
+          while the old product's removal deletes it (MajorUpgrade is
+          afterInstallInitialize, so that removal runs first) leaves Windows
+          Installer one way out: a delete at the next boot, in
+          PendingFileRenameOperations, and exit 3010. This product's InstallFiles
+          then copies its roomlerd.exe to the same path, or keeps the one there
+          when it is of an equal version, and neither cancels the delete: the
+          session manager deleted the NEW file at boot, and the service did not
+          start (SCM 7000). Measured both ways in the #4196 lab. Whatever held
+          the file (a running image, such as the old service's, a worker's or a
+          `roomler` call's, is renamed aside instead; a handle that does not
+          share delete, such as a scanner's, makes the entry), that one entry is
+          what loses it, so the fix acts on the entry, in the same DLL as the
+          carry above (agents/roomler-msi-ca/src/lib.rs has the reasoning):
+
+          - ListInstalledFiles (immediate, after InstallValidate, when component
+            states are final) lists every file whose component stays installed
+            and hands the list to the next action as its CustomActionData.
+          - SpareInstalledFiles (deferred, LocalSystem, after InstallFiles, so
+            after the old product's removal and after anything the copy had to
+            schedule) takes every pending delete of a listed file out of
+            PendingFileRenameOperations and PendingFileRenameOperations2, unless
+            a later entry puts a file at that path (a replacement, which is what
+            this install wants). Every other entry stays as it was.
+
+          Not on an uninstall, whose deletes are wanted. No rollback partner:
+          completed or rolled back, the file at a listed path is one that must
+          stay, so a delete of it is wrong either way. Both are
+          Return="ignore" and return success after logging a miss, like the
+          carry's: an action failing here would stop updates.
+          SpareInstalledFiles sorts after RegisterService, so WiX numbers it
+          after every action scheduled after InstallFiles and theirs stay as
+          docs/installation.md records them.
+        -->
+        <CustomAction
+            Id='ListInstalledFiles'
+            BinaryKey='RoomlerMsiCa'
+            DllEntry='ListInstalledFiles'
+            Execute='immediate'
+            Return='ignore' />
+        <CustomAction
+            Id='SpareInstalledFiles'
+            BinaryKey='RoomlerMsiCa'
+            DllEntry='SpareInstalledFiles'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
         <InstallExecuteSequence>
             <!--
               #3375: before InstallInitialize, so before the old product's
@@ -589,6 +639,13 @@
             -->
             <Custom Action='CaptureServiceEnvironment' Before='InstallInitialize'>
                 WIX_UPGRADE_DETECTED AND NOT (REMOVE="ALL")
+            </Custom>
+            <!-- #4196: the files that stay, then their boot-time deletes out. -->
+            <Custom Action='ListInstalledFiles' After='InstallValidate'>
+                NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='SpareInstalledFiles' After='InstallFiles'>
+                NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='RegisterService' After='InstallFiles'>
                 NOT (REMOVE="ALL")
