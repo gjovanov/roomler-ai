@@ -976,14 +976,15 @@ diagnostics answer on the terminal they were run from. Task Scheduler gives a co
 program started with an interactive token a new console, so until #3292 a per-user
 daemon kept a terminal of raw logs on the person's desktop, and closing it stopped the
 device. Now the task runs `roomlerdw.exe` (`agents/roomlerdw/src/main.rs`), which has no
-console, passes its arguments on, and leaves with the daemon's exit code.
+console, passes its arguments on, and leaves with the daemon's exit code. Since FR-150 P2 it
+also starts a daemon that crashed again (below).
 
 | What | Behaviour | Why |
 |---|---|---|
-| The task's `Running`, `IgnoreNew`, `LastTaskResult` | Unchanged: the launcher stays until the daemon exits, with its code | Task Scheduler watches the process it started |
-| `schtasks /End` | Ends the launcher, whose kill-on-close job takes the daemon | Measured without the job: `/End` says success, the task reads `Ready`, the daemon runs on |
+| The task's `Running`, `IgnoreNew`, `LastTaskResult` | Unchanged: the launcher stays while it runs the daemon, across a restart after a crash too, and leaves with the code of the daemon's last end | Task Scheduler watches the process it started |
+| `schtasks /End` | Ends the launcher, whose kill-on-close job takes the daemon. Nothing restarts it: the launcher has gone | Measured without the job: `/End` says success, the task reads `Ready`, the daemon runs on |
 | What the daemon spawns | Outside that job (`SILENT_BREAKAWAY_OK`, `BREAKAWAY_OK`) | `msiexec` and its watcher have to outlive the daemon on an update |
-| Sign-out | The launcher is shut down last (`SetProcessShutdownParameters`) | Otherwise it could take the daemon down through the job before its `WM_ENDSESSION` |
+| Sign-out | The launcher is shut down last (`SetProcessShutdownParameters`), and starts nothing into the ending session | Otherwise it could take the daemon down through the job before its `WM_ENDSESSION` |
 | stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
 | stdout | `NUL` | Tracing only, and the rolling log has the same events |
 | The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
@@ -1096,17 +1097,68 @@ resume, and no terminal appeared. The task's second trigger is `Kernel-General` 
 an OS start, which does not fire on a resume. S3 and Modern Standby are unread: the test
 guest offers only S4.
 
-⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
-or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
-per-user daemon that crashes stays down until the next sign-in or `roomlerd service
-start` (#3295). It does retry a start that could not begin at all: with a task naming a
-missing launcher it fired each minute, answering `0x80070002`.
+**The launcher starts a daemon that crashed again (FR-150 P2, #3295).** Task Scheduler does
+not: `<RestartOnFailure>` restarted nothing after exit 1 or after `0xC000013A`, five minutes
+on, with `Count` 10 and `PT1M` registered. It retries only a start that could not begin at
+all: with a task naming a missing launcher it fired each minute, answering `0x80070002`. So
+before P2 a per-user daemon that crashed stayed down until the next sign-in or `roomlerd
+service start`. Now the launcher runs the daemon in a loop (`supervise`,
+`agents/roomlerdw/src/ends.rs:149-180`) and reads each end from one table (`end_of`,
+`ends.rs:65-79`), one more row of `Install`'s (`agents/roomlerd/src/service.rs:29-43`):
+
+```mermaid
+flowchart TD
+    T["the task: roomlerdw.exe run --supervisor task"] --> S["start roomlerd.exe"]
+    S -->|started| E{"the daemon's end"}
+    S -->|"could not start"| B["wait: 2 s, doubling to 60 s"]
+    E -->|"0 · 7 · 8 · 9 · 75 · 78,<br/>or the session is ending"| L["leave with the daemon's code"]
+    E -->|"anything else: a crash"| B
+    B --> S
+```
+
+| The daemon's end | The launcher | Why |
+|---|---|---|
+| 0 | leaves | a clean stop: `service stop`, the MSI's `StopOldDaemon`, an update's exit |
+| 7 | leaves | the server removed the device, which stays down, as on Linux ([device-credentials.md](device-credentials.md)) |
+| 8 | leaves | another daemon holds the instance lock |
+| 9 | leaves | a requested restart, whose caller starts the task again |
+| 78 | leaves | no enrollment yet: since P2 the task's `run` exits 78 for it, as the service host's worker does (#4028) |
+| 75 | leaves | an install in flight at the daemon's start (below) |
+| any code, while the session ends (`SM_SHUTTINGDOWN`) | leaves | a daemon is never started into a closing session |
+| anything else: 1, a stall's 2, a panic's 101, an exception code | starts it again after the service supervisor's backoff, 2 s doubling to 60 s, from 2 s again after a run of 5 minutes | a crash. The watchdog's stall exit counts on that restart |
+| a start that fails, e.g. an EDR holding the replaced file at logon | tries again with the same backoff | that only delays the start. Before P2 it left the device offline until the next sign-in, with `LastTaskResult` 127 its only trace |
+
+- **Only the daemon's own run is supervised.** The launcher also runs `--version` for the
+  AppLocker check, `service start` for the start task and the Start menu entry, and each of
+  the MSI's custom actions. It supervises only the exact command `run --supervisor task`,
+  compared by equality and never as a prefix (`is_the_daemons_run`, `ends.rs:98-101`), and
+  waits once for every other, as before. A task from before 0.4.198 names `roomlerd.exe`
+  itself, with no launcher, so nothing restarts its daemon until an update registers the
+  task again.
+- **A restart is still a crash.** The daemon counts a run that ended unhealthily at its
+  next start, so three inside ten minutes on a version not yet promoted trip the rollback
+  check. On Windows that raises `rollback_failed`, and the daemon stays up, with no
+  download (#3289).
+- **An install in flight.** A `run --supervisor task` that starts while an update of ours
+  was attempted within ten minutes (the `update-attempt` marker) and Windows Installer runs
+  an install (its mutex, `Global\_MSIExecute`) leaves with 75 before it takes the instance
+  lock, so it holds no file the install replaces. The person's log says why: `an install of
+  Roomler is running …` (`leave_if_an_install_runs`,
+  `agents/roomlerd/src/daemon_error.rs:237-252`). Either sign alone starts the daemon as
+  before. The new task's one-shots start it after the install, and the last, ten minutes
+  after the registration, finds the marker stale whatever install still runs: the per-user
+  MSI touches the marker in `StopOldDaemon`, before `RegisterAutostart` writes the task.
+- **`schtasks /End` and sign-out stay final.** `/End` ends the launcher, and the job the
+  daemon with it, so nothing is left to restart it. After an exit, the launcher reads
+  `SM_SHUTTINGDOWN` and starts nothing into an ending session.
+- **The kill switch.** `ROOMLERDW_SUPERVISE=0` in the person's environment, which the
+  task's process inherits, makes the launcher wait once and leave with the daemon's code,
+  as before P2.
 
 **Known gaps of the launcher**, each small enough to name and not to build yet:
 
 | Gap | What a person sees | Why it stands |
 |---|---|---|
-| The launcher cannot start the daemon: an EDR holds the replaced file at logon | Offline until the next sign-in; `LastTaskResult` 127 is the only trace | `<RestartOnFailure>` sees the launcher's start, and the launcher did start. A short retry belongs with #3295 |
 | A hand upgrade while the daemon is still starting | The stop event does not exist yet, so nothing stops it: the daemon runs on renamed files, and the one-shots exit 8, until the next sign-in | The window is the seconds before `run_cmd`'s last `select!`. `installer-smoke` waits 45 s for it |
 | A disk that is full at the day's log roll | The file log stays silent until the next start | `tracing-appender` prints that failure on stderr, which is now a file on the same disk, and its thread dies of it |
 | WDAC, or an EDR that quarantines the launcher | The AppLocker check answers nothing for them, so the launcher stays, and the row is offline | The check reads AppLocker's rules; a second kind of probe is not worth its code before one is seen in the field |
