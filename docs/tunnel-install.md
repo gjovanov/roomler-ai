@@ -139,13 +139,11 @@ Invoke-WebRequest `
   -OutFile "$env:USERPROFILE\Downloads\roomler-cli.zip"
 Expand-Archive "$env:USERPROFILE\Downloads\roomler-cli.zip" `
   -DestinationPath "$env:LOCALAPPDATA\roomler-cli"
-# RETIRED-NAME-ANCHOR(4): the ARCHIVE directory keeps the roomler-tunnel
-# prefix by contract (release-tunnel.yml). Only the binary inside it was
-# renamed to `roomler`.
+# The zip has no directory inside: roomler.exe lands in roomler-cli itself.
 # Optional — add to PATH:
 [Environment]::SetEnvironmentVariable(
   "Path",
-  "$env:Path;$env:LOCALAPPDATA\roomler-cli\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc",
+  "$env:Path;$env:LOCALAPPDATA\roomler-cli",
   "User"
 )
 ```
@@ -186,7 +184,8 @@ sudo dpkg -i /tmp/roomler-cli.deb
 ```bash
 curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/linux-x86_64?version=latest"
-# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+# RETIRED-NAME-ANCHOR(2): the tarball's directory, as release-tunnel.yml
+# names it until FR-46 P1c step 2.
 mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
 ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler ~/.local/bin/
 ```
@@ -196,7 +195,8 @@ ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler ~/.local/b
 ```bash
 curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/macos?version=latest"
-# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+# RETIRED-NAME-ANCHOR(2): the tarball's directory, as release-tunnel.yml
+# names it until FR-46 P1c step 2.
 mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
 ln -sf ~/.local/opt/roomler-tunnel-*-universal-apple-darwin/roomler ~/.local/bin/
 ```
@@ -483,7 +483,7 @@ Then it installs by host:
 
 dpkg asks nothing during that install, not even in your terminal: a configuration file you
 edited stays as it is, with the package's version beside it as `<file>.dpkg-dist`
-(`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`, #3932). The CLI's package ships
+(`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`, #3932). The CLI's package ships
 no such file today. The option is there because every package install of ours takes it
 ([linux-self-update.md](linux-self-update.md#every-package-install-keeps-an-edited-configuration-file-and-asks-nothing-3932)).
 

@@ -768,8 +768,8 @@ mod tests {
     }
 
     // RETIRED-NAME-ANCHOR-BEGIN
-    // Fixtures of PUBLISHED tunnel artifacts: their names, and the dir inside a
-    // tarball, are `roomler-tunnel-<version>-<triple>`, frozen by FR-21 D6.
+    // Fixtures of PUBLISHED tunnel artifacts, `roomler-tunnel-<version>-<triple>`: every
+    // release before FR-46 P1c step 2 carries it, so the reader's retired arm stays till then.
     fn asset(name: &str) -> ReleaseAsset {
         ReleaseAsset {
             name: name.into(),
