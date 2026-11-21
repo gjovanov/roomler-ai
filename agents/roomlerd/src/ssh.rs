@@ -993,6 +993,28 @@ mod sshd {
         }
     }
 
+    /// One channel's own state: the terminal its `pty_request` asked for, the
+    /// input of the process it started, and that process's terminal.
+    ///
+    /// One connection carries several channels at once (commands, a terminal,
+    /// `sftp`, `direct-tcpip` forwards), and russh names the channel on every
+    /// callback. Each of these belongs to the channel that asked for it, so a
+    /// channel's data, EOF, window change and pty request act on that
+    /// channel's entry alone, never on another channel's process.
+    #[derive(Default)]
+    struct ChannelState {
+        /// Terminal type and geometry from this channel's `pty_request`, held
+        /// until its shell starts. `Some` is also what distinguishes an
+        /// interactive request from a one-shot command.
+        pty_req: Option<(String, crate::pty::WinSize)>,
+        /// The client's bytes for this channel's process: keystrokes for a
+        /// terminal, stdin for a command, the protocol for `sftp-server`.
+        /// Dropped at this channel's EOF, which ends that input alone.
+        input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        /// Resize half of this channel's terminal.
+        terminal: Option<crate::pty::PtyHandle>,
+    }
+
     /// Per-connection state.
     pub struct Handler {
         ctx: Arc<Ctx>,
@@ -1008,15 +1030,9 @@ mod sshd {
         /// Whether the session-deadline watchdog is running; armed on the
         /// first channel open so multiplexed channels share one timer.
         deadline_armed: bool,
-        /// Terminal type and geometry from `pty_request`, held until the shell
-        /// starts. `Some` is also what distinguishes an interactive session
-        /// from a one-shot command.
-        pty_req: Option<(String, crate::pty::WinSize)>,
-        /// Sink for client keystrokes, live only while a terminal is. Cleared
-        /// on EOF so the shell sees end-of-input.
-        channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-        /// Resize half of the live terminal.
-        pty_handle: Option<crate::pty::PtyHandle>,
+        /// Each channel's pty request, process input and terminal, by the
+        /// channel that asked for them ([`ChannelState`]).
+        channels: std::collections::HashMap<ChannelId, ChannelState>,
         /// FR-89 — one abort per exec channel (FR-97 P4b: and per Windows console-user
         /// sftp channel), fired when the client closes that channel
         /// ([`channel_close`](russh::server::Handler::channel_close)) or when the session
@@ -1052,9 +1068,7 @@ mod sshd {
                 peer,
                 policy: None,
                 deadline_armed: false,
-                pty_req: None,
-                channel_input: None,
-                pty_handle: None,
+                channels: std::collections::HashMap::new(),
                 exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
                 asker,
@@ -1124,6 +1138,22 @@ mod sshd {
                     )
                     .await;
             });
+        }
+
+        /// A channel opens: the state of every channel russh no longer holds
+        /// goes. A channel the server closed (its process ended, or it was
+        /// refused) is one of them: russh forgets a channel it closed, so the
+        /// client's answering close never reaches `channel_close`, and its
+        /// state, a finished terminal included, would stay until the
+        /// connection ends. The channel opening now is not held until it is
+        /// accepted, so it starts with no state either.
+        ///
+        /// russh has no `is_open`. The packet size it reports is 0 for a
+        /// channel it does not hold, and this server's own (32 KiB, never 0)
+        /// for one it does.
+        fn channel_opens(&mut self, session: &Session) {
+            self.channels
+                .retain(|id, _| session.max_packet_size(id) > 0);
         }
 
         /// Serve the `sftp` subsystem — which is also how modern `scp` moves
@@ -1277,9 +1307,9 @@ mod sshd {
 
             // Bounded, for the same reason the pty's queue is: a client
             // streaming a large upload must not grow the daemon's memory
-            // faster than sftp-server drains it.
+            // faster than sftp-server drains it. This channel's own input.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
 
             let mut stdin = child.stdin.take().expect("stdin was piped");
             tokio::spawn(async move {
@@ -1396,7 +1426,7 @@ mod sshd {
             caller: String,
         ) {
             let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
             let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<crate::exec::Chunk>(4);
             let abort = tokio_util::sync::CancellationToken::new();
             self.exec_aborts.insert(channel, abort.clone());
@@ -1446,8 +1476,8 @@ mod sshd {
             });
         }
 
-        /// Start an interactive session on the terminal `pty_request` asked
-        /// for.
+        /// Start an interactive session on the terminal this channel's
+        /// `pty_request` asked for.
         ///
         /// Runs the SAME two gates a one-shot command does, in the same order:
         /// resolve the identity from the server (never from the client), then
@@ -1459,7 +1489,8 @@ mod sshd {
             command: Option<String>,
             session: &mut Session,
         ) -> Result<(), russh::Error> {
-            let Some((term, size)) = self.pty_req.clone() else {
+            let Some((term, size)) = self.channels.get(&channel).and_then(|c| c.pty_req.clone())
+            else {
                 return refuse(
                     session,
                     channel,
@@ -1544,9 +1575,11 @@ mod sshd {
 
             // A bounded queue: an operator holding a key down must not be able
             // to grow the daemon's memory faster than the shell drains it.
+            // This channel's own input and terminal.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
-            self.pty_handle = Some(pty.handle());
+            let state = self.channels.entry(channel).or_default();
+            state.input = Some(tx);
+            state.terminal = Some(pty.handle());
 
             let writer = pty.handle();
             tokio::spawn(async move {
@@ -1710,6 +1743,7 @@ mod sshd {
             reply: russh::server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            self.channel_opens(session);
             reply.accept().await;
             self.arm_session_deadline(session);
             Ok(())
@@ -1739,10 +1773,13 @@ mod sshd {
             _originator_address: &str,
             _originator_port: u32,
             reply: russh::server::ChannelOpenHandle,
-            _session: &mut Session,
+            session: &mut Session,
         ) -> Result<(), Self::Error> {
             use russh::ChannelOpenFailure;
 
+            // A forward keeps no state here (russh hands its bytes to its own
+            // stream, below), but it is a channel opening all the same.
+            self.channel_opens(session);
             let host = host_to_connect.to_string();
             // A u32 on the wire; anything above 65535 is a malformed request,
             // not a port we should try.
@@ -1900,8 +1937,9 @@ mod sshd {
             // streaming into a command that is not reading is held back by
             // SSH flow control rather than by the daemon's memory. Bytes that
             // arrive while consent is pending wait here; a refusal drops them.
+            // This channel's own stdin: another channel's bytes never reach it.
             let (tx, stdin) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.channel_input = Some(tx);
+            self.channels.entry(channel).or_default().input = Some(tx);
             // FR-89 — minted HERE, before the consent wait, so a channel that
             // closes while the operator is being asked leaves nothing to run.
             let abort = tokio_util::sync::CancellationToken::new();
@@ -1924,16 +1962,20 @@ mod sshd {
             Ok(())
         }
 
-        /// A shell request without a prior PTY request is a non-interactive
-        /// shell — rare, and not what this exists to serve. Refused with a
-        /// reason rather than silently handed a terminal the client never
-        /// asked for.
+        /// A shell request without a prior PTY request on its own channel is
+        /// a non-interactive shell — rare, and not what this exists to serve.
+        /// Refused with a reason rather than silently handed a terminal the
+        /// client never asked for, or one another channel asked for.
         async fn shell_request(
             &mut self,
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if self.pty_req.is_some() {
+            if self
+                .channels
+                .get(&channel)
+                .is_some_and(|c| c.pty_req.is_some())
+            {
                 // The shell's CONTENTS are never recorded; this row exists so
                 // a reader can see that an interactive session happened.
                 self.report(SshActivityKind::Shell, None, None, true);
@@ -1966,8 +2008,9 @@ mod sshd {
             // shell starts, because that is when the identity it runs as
             // is known and when consent has been settled. Allocating here
             // would leave a pty (and later a shell) alive for a session
-            // that is about to be refused.
-            self.pty_req = Some((
+            // that is about to be refused. Recorded for THIS channel: a
+            // shell on another channel never takes it.
+            self.channels.entry(channel).or_default().pty_req = Some((
                 term.to_string(),
                 crate::pty::WinSize {
                     cols: col_width as u16,
@@ -1979,36 +2022,42 @@ mod sshd {
             Ok(())
         }
 
-        /// Client bytes for the channel's process: keystrokes for a terminal,
+        /// Client bytes for this channel's process: keystrokes for a terminal,
         /// the client's stdin for an exec'd command, the protocol for
-        /// `sftp-server`. With nothing to deliver to (no process yet, or the
-        /// session has ended) the send fails and the data is dropped.
+        /// `sftp-server`. Never another channel's. With nothing to deliver
+        /// to (no process yet, a forward, whose bytes russh hands to its own
+        /// stream, or a process that has ended) the data is dropped.
         async fn data(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             data: &[u8],
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(tx) = &self.channel_input {
+            if let Some(tx) = self.channels.get(&channel).and_then(|c| c.input.as_ref()) {
                 let _ = tx.send(data.to_vec()).await;
             }
             Ok(())
         }
 
-        /// The client's window changed. Resizing the terminal is what makes
-        /// the far side reflow. On Unix the kernel also SIGWINCHes the
-        /// foreground group, which is how a full-screen application learns to
-        /// redraw; ConPTY delivers the equivalent through the console host.
+        /// The client's window changed. Resizing this channel's terminal is
+        /// what makes the far side reflow. On Unix the kernel also SIGWINCHes
+        /// the foreground group, which is how a full-screen application learns
+        /// to redraw; ConPTY delivers the equivalent through the console host.
+        /// A channel with no terminal of its own resizes nothing.
         async fn window_change_request(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             col_width: u32,
             row_height: u32,
             _pix_width: u32,
             _pix_height: u32,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(h) = &self.pty_handle {
+            if let Some(h) = self
+                .channels
+                .get(&channel)
+                .and_then(|c| c.terminal.as_ref())
+            {
                 let size = crate::pty::WinSize {
                     cols: col_width as u16,
                     rows: row_height as u16,
@@ -2020,15 +2069,18 @@ mod sshd {
             Ok(())
         }
 
-        /// The client stopped sending. Close the terminal's input side so the
-        /// shell sees end-of-input and exits on its own, rather than being
-        /// killed — a shell that exits normally runs its logout hooks.
+        /// The client stopped sending on this channel: its process's input
+        /// ends, and no other's. A command or `sftp-server` reads end-of-input
+        /// and finishes on its own; a terminal takes no more keystrokes, and
+        /// its shell runs until it exits or the channel closes.
         async fn channel_eof(
             &mut self,
-            _channel: ChannelId,
+            channel: ChannelId,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            self.channel_input = None;
+            if let Some(state) = self.channels.get_mut(&channel) {
+                state.input = None;
+            }
             Ok(())
         }
 
@@ -2037,7 +2089,8 @@ mod sshd {
         /// closed channel, so the pump cannot tell — and no wall clock would
         /// end it, so it is ended here: the abort kills the process tree.
         /// A channel whose command already finished has a token that fires
-        /// into nothing.
+        /// into nothing. The channel's input, terminal and pty request go
+        /// with it.
         async fn channel_close(
             &mut self,
             channel: ChannelId,
@@ -2046,6 +2099,7 @@ mod sshd {
             if let Some(abort) = self.exec_aborts.remove(&channel) {
                 abort.cancel();
             }
+            self.channels.remove(&channel);
             Ok(())
         }
 
@@ -5962,6 +6016,504 @@ mod tests {
                     lines[0]
                 );
             }
+        }
+    }
+
+    /// One connection carries several channels, and each channel's data, EOF,
+    /// window change and pty request act on that channel alone: never on a
+    /// process, a terminal or a pty request of another channel. At the end of
+    /// the file, so no line above moves.
+    mod channel_scope_tests {
+        use super::*;
+
+        /// How long a test waits for what a channel should say: long, because
+        /// a loaded runner starts PowerShell slowly. A channel that has not
+        /// said it by then fails the test.
+        const WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+        /// [`exec_slot`], for a test that runs `n` commands at once.
+        async fn exec_slots(n: u32) -> tokio::sync::SemaphorePermit<'static> {
+            EXEC_TEST_SLOTS
+                .acquire_many(n)
+                .await
+                .expect("the slot semaphore is never closed")
+        }
+
+        /// A key-list session that runs as the daemon's own account.
+        async fn a_connection(seed: u8) -> russh::client::Handle<TestClient> {
+            let (key, line) = client_key(seed);
+            let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+            connect(addr, key).await
+        }
+
+        /// A command that writes back its stdin once its stdin ends.
+        fn echo_stdin() -> &'static str {
+            if cfg!(windows) {
+                "[Console]::In.ReadToEnd()"
+            } else {
+                "cat"
+            }
+        }
+
+        /// `line` as typed at a terminal, Enter included.
+        fn typed(line: &str) -> Vec<u8> {
+            let enter = if cfg!(windows) { "\r\n" } else { "\n" };
+            format!("{line}{enter}").into_bytes()
+        }
+
+        /// A command the shell answers with `<tag>-42`. The terminal's echo
+        /// of the command itself never holds that, so a test that sees it
+        /// knows the shell ran the command.
+        fn computed(tag: &str) -> String {
+            if cfg!(windows) {
+                format!("echo {tag}-$(6*7)")
+            } else {
+                format!("echo {tag}-$((6*7))")
+            }
+        }
+
+        /// A command the shell answers with its terminal's size, as `tag`,
+        /// the size in [`size`]'s form, then `:END`.
+        fn size_query(tag: &str) -> String {
+            if cfg!(windows) {
+                format!(
+                    "echo (\"{tag}\" + [Console]::WindowWidth + \"x\" + \
+                     [Console]::WindowHeight + \":END\")"
+                )
+            } else {
+                format!("echo {tag}$(stty size):END")
+            }
+        }
+
+        /// A terminal's size as [`size_query`] reports it.
+        fn size(cols: u32, rows: u32) -> String {
+            if cfg!(windows) {
+                format!("{cols}x{rows}")
+            } else {
+                format!("{rows} {cols}")
+            }
+        }
+
+        /// A channel with a terminal of `cols` × `rows` and a shell on it.
+        async fn open_terminal(
+            session: &russh::client::Handle<TestClient>,
+            cols: u32,
+            rows: u32,
+        ) -> russh::Channel<russh::client::Msg> {
+            let channel = session.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", cols, rows, 0, 0, &[])
+                .await
+                .unwrap();
+            channel.request_shell(true).await.unwrap();
+            channel
+        }
+
+        /// What a channel has said so far.
+        #[derive(Default)]
+        struct Heard {
+            out: Vec<u8>,
+            err: Vec<u8>,
+            exit: Option<u32>,
+            /// A request on it was answered with a failure.
+            failed: bool,
+            /// The server closed it.
+            ended: bool,
+        }
+
+        impl Heard {
+            fn out(&self) -> String {
+                String::from_utf8_lossy(&self.out).into_owned()
+            }
+
+            fn err(&self) -> String {
+                String::from_utf8_lossy(&self.err).into_owned()
+            }
+        }
+
+        /// Read `channel` into `heard` until `enough` holds, the channel ends,
+        /// or [`WITHIN`] passes. True if `enough` held.
+        async fn hear(
+            channel: &mut russh::Channel<russh::client::Msg>,
+            heard: &mut Heard,
+            enough: impl Fn(&Heard) -> bool,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + WITHIN;
+            while !enough(heard) {
+                if heard.ended {
+                    return false;
+                }
+                match tokio::time::timeout_at(deadline, channel.wait()).await {
+                    Err(_) => return false,
+                    Ok(None) => heard.ended = true,
+                    Ok(Some(msg)) => match msg {
+                        russh::ChannelMsg::Data { ref data } => heard.out.extend_from_slice(data),
+                        russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                            heard.err.extend_from_slice(data)
+                        }
+                        russh::ChannelMsg::ExitStatus { exit_status } => {
+                            heard.exit = Some(exit_status)
+                        }
+                        russh::ChannelMsg::Failure => heard.failed = true,
+                        _ => {}
+                    },
+                }
+            }
+            true
+        }
+
+        /// What the shell printed after `tag`, up to `:END`. Only plain text
+        /// counts, so the terminal's echo of the typed command (`$(…)`,
+        /// quotes, colour codes) is never taken for the answer.
+        fn answer(text: &str, tag: &str) -> Option<String> {
+            text.match_indices(tag).find_map(|(at, _)| {
+                let rest = &text[at + tag.len()..];
+                let value = &rest[..rest.find(":END")?];
+                let plain = !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-'));
+                plain.then(|| value.to_string())
+            })
+        }
+
+        /// Ask the shell on `terminal` a [`size_query`] under `tag`, and read
+        /// its answer.
+        async fn size_of(
+            terminal: &mut russh::Channel<russh::client::Msg>,
+            heard: &mut Heard,
+            tag: &str,
+        ) -> Option<String> {
+            terminal.data(&typed(&size_query(tag))[..]).await.unwrap();
+            hear(terminal, heard, |h| answer(&h.out(), tag).is_some()).await;
+            answer(&heard.out(), tag)
+        }
+
+        /// End the shell on `terminal` and read the channel to its end.
+        async fn exit_shell(terminal: &mut russh::Channel<russh::client::Msg>, heard: &mut Heard) {
+            terminal.data(&typed("exit 0")[..]).await.unwrap();
+            hear(terminal, heard, |h| h.ended).await;
+        }
+
+        /// Two commands on one connection, each on a channel of its own: each
+        /// reads only its own channel's bytes, and only its own channel's EOF
+        /// ends its input.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_commands_on_one_connection_each_read_only_their_own_input() {
+            let _slots = exec_slots(2).await;
+            let session = a_connection(170).await;
+            let mut first = session.channel_open_session().await.unwrap();
+            let mut second = session.channel_open_session().await.unwrap();
+            first.exec(true, echo_stdin()).await.unwrap();
+            second.exec(true, echo_stdin()).await.unwrap();
+            first.data(&b"first-channel-bytes"[..]).await.unwrap();
+            second.data(&b"second-channel-bytes"[..]).await.unwrap();
+            first.eof().await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut first, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                out.contains("first-channel-bytes"),
+                "the first command never read its own channel's bytes: {out:?}"
+            );
+            assert!(
+                !out.contains("second-channel"),
+                "the first command read the second channel's bytes: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+
+            // The first channel's EOF was the first channel's: the second
+            // command still reads.
+            second.data(&b"-and-after"[..]).await.unwrap();
+            second.eof().await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut second, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                out.contains("second-channel-bytes-and-after"),
+                "the second command's input ended before its own channel's EOF: {out:?}"
+            );
+            assert!(
+                !out.contains("first-channel"),
+                "the second command read the first channel's bytes: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A forward beside a command on one connection: the forward's bytes
+        /// and its EOF reach the forward's destination and never the command,
+        /// which reads its own channel up to its own EOF.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_forwards_bytes_and_eof_reach_no_command_on_its_connection() {
+            use tokio::io::AsyncReadExt;
+
+            let _slot = exec_slot().await;
+            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = destination.local_addr().unwrap().port();
+            let arrived = tokio::spawn(async move {
+                let (mut stream, _) = destination.accept().await.unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                got
+            });
+            let (key, line) = client_key(171);
+            let mut cfg = cfg_with_mode(vec![line], Some("daemon"));
+            cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
+            let session = connect(serve_one(&cfg).await, key).await;
+
+            let mut command = session.channel_open_session().await.unwrap();
+            command.exec(true, echo_stdin()).await.unwrap();
+            command.data(&b"command-bytes"[..]).await.unwrap();
+            let forward = session
+                .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+                .await
+                .expect("the allowlist names the destination");
+            forward.data(&b"forward-bytes"[..]).await.unwrap();
+            forward.eof().await.unwrap();
+            let arrived = tokio::time::timeout(WITHIN, arrived)
+                .await
+                .expect("the forward's EOF reached its destination")
+                .unwrap();
+            assert_eq!(
+                arrived, b"forward-bytes",
+                "the forward carries its own bytes"
+            );
+
+            command.data(&b"-and-after"[..]).await.unwrap();
+            command.eof().await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut command, &mut heard, |h| h.ended).await;
+            let out = heard.out();
+            assert!(
+                !out.contains("forward-bytes"),
+                "the forward's bytes reached the command: {out:?}"
+            );
+            assert!(
+                out.contains("command-bytes-and-after"),
+                "the command's input ended before its own channel's EOF: {out:?}"
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A window change on another channel leaves a terminal its size, and
+        /// the terminal's own window change still resizes it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_window_change_on_another_channel_leaves_a_terminal_its_size() {
+            let session = a_connection(172).await;
+            let mut terminal = open_terminal(&session, 100, 30).await;
+            let other = session.channel_open_session().await.unwrap();
+            other.window_change(50, 10, 0, 0).await.unwrap();
+
+            let mut heard = Heard::default();
+            assert_eq!(
+                size_of(&mut terminal, &mut heard, "SIZE-A:").await,
+                Some(size(100, 30)),
+                "another channel's window change resized this terminal: {:?}",
+                heard.out()
+            );
+
+            // A console applies a resize on its own time, so this asks until
+            // the answer changes.
+            terminal.window_change(132, 43, 0, 0).await.unwrap();
+            let mut resized = None;
+            for attempt in 0..20 {
+                resized = size_of(&mut terminal, &mut heard, &format!("SIZE-B{attempt}:")).await;
+                if resized.is_none() || resized == Some(size(132, 43)) {
+                    break;
+                }
+            }
+            assert_eq!(
+                resized,
+                Some(size(132, 43)),
+                "the terminal's own window change did not resize it: {:?}",
+                heard.out()
+            );
+            exit_shell(&mut terminal, &mut heard).await;
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A pty request on another channel changes neither the request this
+        /// channel recorded nor the terminal its shell then starts on, and
+        /// that channel's own terminal is what it asked for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_pty_request_on_another_channel_leaves_a_terminals_own_alone() {
+            let session = a_connection(173).await;
+            let mut first = session.channel_open_session().await.unwrap();
+            first
+                .request_pty(true, "xterm", 100, 30, 0, 0, &[])
+                .await
+                .unwrap();
+            let mut second = session.channel_open_session().await.unwrap();
+            second
+                .request_pty(true, "vt100", 60, 20, 0, 0, &[])
+                .await
+                .unwrap();
+            first.request_shell(true).await.unwrap();
+
+            let mut heard_first = Heard::default();
+            assert_eq!(
+                size_of(&mut first, &mut heard_first, "SIZE-A:").await,
+                Some(size(100, 30)),
+                "the first terminal started on the second channel's pty request: {:?}",
+                heard_first.out()
+            );
+            // A Windows console has no terminal type.
+            #[cfg(unix)]
+            {
+                first
+                    .data(&typed("echo TERM-A:$TERM:END")[..])
+                    .await
+                    .unwrap();
+                hear(&mut first, &mut heard_first, |h| {
+                    answer(&h.out(), "TERM-A:").is_some()
+                })
+                .await;
+                assert_eq!(
+                    answer(&heard_first.out(), "TERM-A:").as_deref(),
+                    Some("xterm"),
+                    "the first terminal took the second channel's terminal type: {:?}",
+                    heard_first.out()
+                );
+            }
+
+            second.request_shell(true).await.unwrap();
+            let mut heard_second = Heard::default();
+            assert_eq!(
+                size_of(&mut second, &mut heard_second, "SIZE-B:").await,
+                Some(size(60, 20)),
+                "the second terminal is not the one its channel asked for: {:?}",
+                heard_second.out()
+            );
+            #[cfg(unix)]
+            {
+                second
+                    .data(&typed("echo TERM-B:$TERM:END")[..])
+                    .await
+                    .unwrap();
+                hear(&mut second, &mut heard_second, |h| {
+                    answer(&h.out(), "TERM-B:").is_some()
+                })
+                .await;
+                assert_eq!(
+                    answer(&heard_second.out(), "TERM-B:").as_deref(),
+                    Some("vt100"),
+                    "the second terminal is not the type its channel asked for: {:?}",
+                    heard_second.out()
+                );
+            }
+
+            assert_eq!(
+                size_of(&mut first, &mut heard_first, "SIZE-C:").await,
+                Some(size(100, 30)),
+                "the second terminal's start changed the first: {:?}",
+                heard_first.out()
+            );
+            exit_shell(&mut second, &mut heard_second).await;
+            exit_shell(&mut first, &mut heard_first).await;
+            assert_eq!(heard_first.exit, Some(0));
+            assert_eq!(heard_second.exit, Some(0));
+        }
+
+        /// A shell on a channel that asked for no terminal is refused even
+        /// while another channel's pty request stands, and that request is
+        /// still there for its own channel's shell. Read whether the refusal
+        /// is a failure or the reason, an exit status and a close.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_shell_never_takes_another_channels_pty_request() {
+            let session = a_connection(174).await;
+            let mut terminal = session.channel_open_session().await.unwrap();
+            terminal
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            let mut bare = session.channel_open_session().await.unwrap();
+            bare.request_shell(true).await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut bare, &mut heard, |h| h.failed || !h.out.is_empty()).await;
+            assert!(
+                heard.out.is_empty(),
+                "a channel that asked for no terminal got a shell: {:?}",
+                heard.out()
+            );
+            assert!(
+                heard.err().contains("terminal"),
+                "the refusal must say why, got {:?}",
+                heard.err()
+            );
+
+            terminal.request_shell(true).await.unwrap();
+            let line = format!("{}; exit 0", computed("terminal-shell"));
+            terminal.data(&typed(&line)[..]).await.unwrap();
+            let mut heard = Heard::default();
+            hear(&mut terminal, &mut heard, |h| h.ended).await;
+            assert!(
+                heard.out().contains("terminal-shell-42"),
+                "the channel's own pty request no longer stood: {:?}",
+                heard.out()
+            );
+            assert_eq!(heard.exit, Some(0));
+        }
+
+        /// A second terminal on one connection is a terminal of its own: each
+        /// shell reads only the keystrokes typed on its own channel.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_second_terminal_on_one_connection_gets_input_of_its_own() {
+            let session = a_connection(175).await;
+            let mut first = open_terminal(&session, 80, 24).await;
+            let mut second = open_terminal(&session, 80, 24).await;
+            let line = format!("{}; exit 0", computed("first-terminal"));
+            first.data(&typed(&line)[..]).await.unwrap();
+            let line = format!("{}; exit 0", computed("second-terminal"));
+            second.data(&typed(&line)[..]).await.unwrap();
+
+            let mut heard_second = Heard::default();
+            hear(&mut second, &mut heard_second, |h| h.ended).await;
+            let out = heard_second.out();
+            assert!(
+                !out.contains("first-terminal"),
+                "the second terminal read the first's keystrokes: {out:?}"
+            );
+            assert!(
+                out.contains("second-terminal-42"),
+                "the second terminal never ran what was typed on it: {out:?}"
+            );
+            assert_eq!(heard_second.exit, Some(0));
+
+            let mut heard_first = Heard::default();
+            hear(&mut first, &mut heard_first, |h| h.ended).await;
+            let out = heard_first.out();
+            assert!(
+                !out.contains("second-terminal"),
+                "the first terminal read the second's keystrokes: {out:?}"
+            );
+            assert!(
+                out.contains("first-terminal-42"),
+                "the first terminal never ran what was typed on it: {out:?}"
+            );
+            assert_eq!(heard_first.exit, Some(0));
+        }
+
+        /// A terminal's EOF ends its input and nothing more: what was typed
+        /// before it still reaches the shell, which finishes by itself with
+        /// its own status.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_terminals_eof_leaves_its_shell_to_finish_by_itself() {
+            let session = a_connection(176).await;
+            let mut terminal = open_terminal(&session, 80, 24).await;
+            let line = format!("{}; exit 3", computed("typed-before-eof"));
+            terminal.data(&typed(&line)[..]).await.unwrap();
+            terminal.eof().await.unwrap();
+
+            let mut heard = Heard::default();
+            hear(&mut terminal, &mut heard, |h| h.ended).await;
+            assert!(
+                heard.out().contains("typed-before-eof-42"),
+                "what was typed before the EOF never ran: {:?}",
+                heard.out()
+            );
+            assert_eq!(heard.exit, Some(3), "the shell's own exit status");
         }
     }
 }
