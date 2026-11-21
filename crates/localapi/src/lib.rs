@@ -12124,6 +12124,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #4202 — binds a socket in a folder of the test's own, connects to it,
+    /// closes that connection, and only then accepts it. The result is the
+    /// daemon's end of a caller that has gone, as the person socket's accept
+    /// loop meets one when `roomler status` closes its check
+    /// (`macos_root_half_serves_me`) before the loop reads it. Nothing here
+    /// depends on timing: the close has returned before the accept is called.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn accepted_after_its_caller_closed(tag: &str) -> (std::path::PathBuf, tokio::net::UnixStream) {
+        let dir = std::env::temp_dir().join(format!("roomler-4202-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let (gone, _) = listener.accept().unwrap();
+        gone.set_nonblocking(true).unwrap();
+        (dir, tokio::net::UnixStream::from_std(gone).unwrap())
+    }
+
+    /// #4202 — on a Mac the kernel names no peer for a caller that closed
+    /// before the accept. Tokio's `peer_cred` asks `LOCAL_PEEREPID` first, and
+    /// that answers `ENOTCONN` once the caller's end is gone, so the person
+    /// socket reads no uid for the caller and refuses it with the line #4202 is
+    /// about. The caller's uid is still there: `getpeereid` reads
+    /// `LOCAL_PEERCRED`, which the kernel saved when the caller connected.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_mac_reads_no_credentials_for_a_caller_that_closed_before_the_accept() {
+        use std::os::unix::io::AsRawFd;
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("mac");
+        let e = gone
+            .peer_cred()
+            .expect_err("a caller that closed has no process for the kernel to name");
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTCONN), "{e}");
+        let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+        // SAFETY: an open socket, and two out-params of the types it writes.
+        let rc = unsafe { libc::getpeereid(gone.as_raw_fd(), &mut uid, &mut gid) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(
+            uid, me,
+            "the credentials saved at connect still name the caller"
+        );
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — on Linux the kernel keeps the credentials it saved when the
+    /// caller connected (`SO_PEERCRED`), so a caller that closed before the
+    /// accept is still read as itself. The person socket accepts it, and its
+    /// connection ends with nothing to read. That is why the refusal with
+    /// `peer_uid=None` is seen on a Mac only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_still_reads_a_caller_that_closed_before_the_accept() {
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("linux");
+        let cred = gone
+            .peer_cred()
+            .expect("the credentials saved at connect are still read");
+        assert_eq!(cred.uid(), me);
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — the person socket's accept loop meets a caller that has gone,
+    /// queued just ahead of the person's live connection. Both are queued
+    /// before the loop runs. The gone caller is refused on a Mac and ends with
+    /// nothing to read on Linux. On both, the live one is answered, so a caller
+    /// that has gone costs a waiting caller nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_caller_gone_before_the_accept_costs_the_live_person_nothing() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-4202-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let live = tokio::net::UnixStream::connect(&path).await.unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let (tx, mut rx) = watch::channel(false);
+        let srv = tokio::spawn(async move {
+            serve_person_listener(&listener, me, state, &mut rx, std::future::pending())
+                .await
+                .map(|_| ())
+        });
+        let (rd, mut wr) = tokio::io::split(live);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the live person is answered")
+            .unwrap()
+            .expect("an answer, not a close");
+        let r: Response = serde_json::from_str(&line).unwrap();
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
     #[tokio::test]
     async fn an_unidentified_peer_cannot_start_stop_delete_or_move_recordings() {
