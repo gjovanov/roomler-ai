@@ -732,7 +732,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1453-1519`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:4505`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:4515`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
@@ -745,7 +745,7 @@ test of the SIGKILL property itself.
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
   on the main thread, which `viewer-indicator-macos` gives to AppKit for the daemon's life (P2b's release set has it),
-  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:200`), run by the
+  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:204`), run by the
   pump on its next pass. The list is the selectable keyboard sources (the input menu's); the token is the source ID's
   hash; the tag is BCP-47 for a layout the table knows, else the source's own name. Offered wherever the switch is
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says
