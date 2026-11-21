@@ -1786,6 +1786,8 @@ pub fn revert_digest(r: &Revert) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     r.root_kept.as_deref().map(sha256_hex).hash(&mut h);
     (r.supervised, &r.unfinished, &r.strays).hash(&mut h);
+    // #4122 — whose LaunchAgent it bootstraps for a keep that never finished.
+    r.unfinished_agent.as_ref().map(|a| a.uid).hash(&mut h);
     for p in &r.people {
         p.uid.hash(&mut h);
         match &p.back {
@@ -2536,6 +2538,13 @@ pub struct Revert {
     /// Uid folders with no `record.json` that parses: a Keep that never
     /// finished, removed first.
     pub unfinished: Vec<u32>,
+    /// #4122 — the person of one of those folders whose LaunchAgent the
+    /// revert bootstraps after the restart, as it does a person given back
+    /// with their plist: the console user, where root's file put back leaves
+    /// that half to its LaunchAgent ([`bootstrap_after_revert`]), their plist
+    /// in their home as their own process read it, and their job not loaded.
+    /// A keep again that stopped after the bootout (#4097) leaves just that.
+    pub unfinished_agent: Option<Account>,
     /// [`Host::record_strays`]: temporary files a power loss left, removed
     /// first.
     pub strays: Vec<String>,
@@ -2665,6 +2674,19 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
             "root's file, which an earlier revert already put back",
         ),
     };
+    // #4122 — a keep again that stopped after the bootout leaves its person's
+    // folder unfinished and their agent booted out, with no record of them.
+    // Decided here, so that the plan says it and its digest holds it.
+    let console_uid = host.console_uid();
+    let mut unfinished_agent = None;
+    if let Some(uid) = bootstrap_after_revert(supervised, console_uid)
+        && unfinished.contains(&uid)
+        && let Some(p) = found.people.iter().find(|p| p.account.uid == uid)
+        && p.has_plist
+        && !host.agent_loaded(uid)
+    {
+        unfinished_agent = Some(p.account.clone());
+    }
     Ok(Some(Revert {
         root_kept,
         root_record,
@@ -2672,9 +2694,10 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
         supervised_from,
         people,
         unfinished,
+        unfinished_agent,
         strays,
         unread,
-        console_uid: host.console_uid(),
+        console_uid,
     }))
 }
 
@@ -2686,13 +2709,25 @@ pub fn bootstrap_after_revert(supervised: bool, console_uid: Option<u32>) -> Opt
     console_uid.filter(|_| !supervised)
 }
 
+/// What the plan adds to the line of the person whose LaunchAgent `--revert`
+/// bootstraps: one given back (#4092), or one whose keep never finished
+/// ([`Revert::unfinished_agent`], #4122).
+const AGENT_AFTER_RESTART: &str = ", and their LaunchAgent is bootstrapped after the restart, \
+                                   once the one-row screen worker that runs as them has stopped";
+
 /// The revert's plan, in the words it says before it asks.
 pub fn describe_revert(r: &Revert) -> Vec<String> {
     let mut out = vec!["one row --revert: the plan. Nothing has changed yet.".to_string()];
     for uid in &r.unfinished {
-        out.push(format!(
-            "{RECORDS}/{uid} is removed: a keep that never finished"
-        ));
+        let line = match r.unfinished_agent.as_ref().filter(|a| a.uid == *uid) {
+            Some(a) => format!(
+                "{RECORDS}/{uid} is removed: a keep of {}'s files that never finished\
+                 {AGENT_AFTER_RESTART}",
+                a.name
+            ),
+            None => format!("{RECORDS}/{uid} is removed: a keep that never finished"),
+        };
+        out.push(line);
     }
     for name in &r.strays {
         out.push(format!(
@@ -2719,8 +2754,7 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             p.name,
             p.uid,
             if bootstrap_for == Some(p.uid) {
-                ", and their LaunchAgent is bootstrapped after the restart, once the one-row \
-                 screen worker that runs as them has stopped"
+                AGENT_AFTER_RESTART
             } else {
                 ""
             }
@@ -2860,9 +2894,9 @@ async fn give_back<H: Host>(host: &mut H, p: &RevertPerson) -> std::result::Resu
 /// file back first, as a copy of its kept bytes checked against `root.json`;
 /// each person in uid order, one who fails named and the others going on;
 /// the restart; then, only once it answered, the console person's LaunchAgent
-/// where root's file leaves it to launchd (#4092, [`start_agent`]), the
-/// records of those given back, and `root.json` and the kept copy if nobody
-/// failed.
+/// where root's file leaves it to launchd (#4092, [`start_agent`]), given back
+/// with their plist or their keep unfinished (#4122), the records of those
+/// given back, and `root.json` and the kept copy if nobody failed.
 pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     for &uid in &r.unfinished {
         host.remove_records_of(uid)
@@ -2929,6 +2963,11 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     failed.sort_unstable();
     failed.dedup();
     let failed: Vec<String> = failed.into_iter().map(|(_, name)| name).collect();
+    // #4122 — the person of an unfinished folder the plan named, at the same
+    // point and in the same way as one given back, and once, whichever path
+    // names them. Their job is read again first: a login since loads it.
+    let read_again = r.unfinished_agent.as_ref().map(|a| a.uid);
+    let agent = agent.or_else(|| r.unfinished_agent.as_ref().map(|a| (a.uid, a.home.clone())));
     host.say("restarting the daemon onto the files put back: live sessions end now");
     let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
     let back = match host.kickstart() {
@@ -2952,12 +2991,17 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     // the one-row file, whose moved enrollments the person's file holds again:
     // two processes on one enrollment, which root's file going first prevents.
     // Now it runs root's file put back, which leaves this person to launchd.
-    if let Some((uid, home)) = &agent
-        && let Err(e) = start_agent(host, *uid, home, true).await
-    {
-        host.say(&format!(
-            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next login"
-        ));
+    if let Some((uid, home)) = &agent {
+        if read_again == Some(*uid) && host.agent_loaded(*uid) {
+            host.say(&format!(
+                "gui/{uid}/com.roomler.agent: loaded since the plan was said, so it is left alone"
+            ));
+        } else if let Err(e) = start_agent(host, *uid, home, true).await {
+            host.say(&format!(
+                "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
+                 login"
+            ));
+        }
     }
     for uid in given_back {
         host.remove_records_of(uid)
@@ -6192,6 +6236,7 @@ mod tests {
             supervised_from: "root.json",
             people: Vec::new(),
             unfinished: Vec::new(),
+            unfinished_agent: None,
             strays: Vec::new(),
             unread: Vec::new(),
             console_uid: Some(501),
