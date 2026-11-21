@@ -1739,3 +1739,833 @@ async fn ac23_at_the_products_hold_a_blackholed_turn_opens_on_the_mesh_within_5_
     assert_eq!(o.read.and_then(|r| r.hold_exit), Some(RouteHoldExit::Bound), "{o}");
     Ok(())
 }
+
+// FR-148 P4 step 2, phase B of D49: the move after the selection, under the
+// route rank. B1: a pair above a selection on the mesh is checked on a budget
+// of its own. B2: a nomination of a pair the agent has not validated is
+// answered, with a triggered check, and taken once that check succeeds; the
+// agent never sends on a pair it has not validated. Under `prio`, `1` and `0`
+// none of it acts.
+
+/// B1's budget, as the cells read it: the product's.
+const MOVE_BUDGET: u16 = ROUTE_MOVE_CHECKS;
+
+/// B1's budget in the product: 13 checks at the loop's 200 ms span 2.4 s, the
+/// hold's own bound less one check interval.
+#[test]
+fn b1_the_budget_spans_the_holds_bound_at_the_check_cadence() {
+    assert_eq!(ROUTE_MOVE_CHECKS, 13);
+    let span = DEFAULT_CHECK_INTERVAL * u32::from(ROUTE_MOVE_CHECKS - 1);
+    assert_eq!(span, Duration::from_millis(2400));
+    assert!(span < ROUTE_HOLD && ROUTE_HOLD - span <= DEFAULT_CHECK_INTERVAL);
+}
+
+/// B1: while the selection rides the mesh, a pair off the mesh above it is
+/// checked on a budget of its own, then it fails and is never checked again.
+/// The opening's checks do not spend it: a pair whose opening budget is gone
+/// gets the whole of it. With the selection off the mesh, under `prio` and `1`,
+/// and under `0`, the checks are phase A's as built: `max_binding_requests + 1`
+/// of them, or none.
+#[tokio::test]
+async fn b1_a_pair_above_a_selection_on_the_mesh_has_a_budget_of_its_own() -> Result<()> {
+    let (waiting, in_progress, failed) = (
+        CandidatePairState::Waiting as u8,
+        CandidatePairState::InProgress as u8,
+        CandidatePairState::Failed as u8,
+    );
+    for (name, rank, on_the_mesh) in [
+        ("route, the selection on the mesh", Some(route_rank(ROUTE_HOLD)), true),
+        ("route, the selection off the mesh", Some(route_rank(ROUTE_HOLD)), false),
+        ("prio and 1", Some(mesh_last()), true),
+        ("0", None, true),
+    ] {
+        let moves = on_the_mesh && rank.as_ref().is_some_and(|r| r.route.is_some());
+        let checks = rank.is_some();
+        let a = Agent::new(AgentConfig {
+            candidate_types: vec![CandidateType::Relay],
+            carrier_rank: Arc::new(rank),
+            ..Default::default()
+        })
+        .await?;
+        a.internal.route_hold.lock().started = Some(Instant::now());
+        let lan = host(AGENT_LAN_IP, 5000, chrome(126, 65535));
+        let (local, remote) = if on_the_mesh {
+            (host(AGENT_MESH_IP, 5001, 255), host(VIEWER_TUN_IP, 7000, chrome(126, 65535)))
+        } else {
+            (Arc::clone(&lan), relay("198.51.100.9", 7001, chrome(2, 32542)))
+        };
+        // The selection is alive: no stale-pair failover decides here.
+        remote.seen(false);
+        a.internal
+            .set_selected_pair(Some(Arc::new(CandidatePair::new(local, remote, false))))
+            .await;
+        // Two native pairs above it: one formed after the selection, and one
+        // the opening checked until its budget was gone.
+        let fresh = srflx("198.51.100.4", 7002, chrome(100, 65535));
+        let spent = srflx("198.51.100.5", 7003, chrome(100, 65535));
+        a.internal.add_pair(Arc::clone(&lan), Arc::clone(&fresh)).await;
+        a.internal.add_pair(Arc::clone(&lan), Arc::clone(&spent)).await;
+        let opening_budget = a.internal.max_binding_requests + 1;
+        {
+            let p = a.internal.find_pair(&lan, &spent).await.unwrap();
+            p.state.store(in_progress, Ordering::SeqCst);
+            p.binding_request_count.store(opening_budget, Ordering::SeqCst);
+        }
+
+        for _ in 0..MOVE_BUDGET {
+            a.internal.contact_candidates().await;
+        }
+        let (fresh_now, spent_now) = if moves {
+            ((in_progress, MOVE_BUDGET), (in_progress, opening_budget + MOVE_BUDGET))
+        } else if checks {
+            ((failed, opening_budget), (failed, opening_budget))
+        } else {
+            ((waiting, 0), (in_progress, opening_budget))
+        };
+        assert_eq!(checks_of(&a, &lan, &fresh).await, fresh_now, "{name}: formed after the selection");
+        assert_eq!(checks_of(&a, &lan, &spent).await, spent_now, "{name}: spent by the opening");
+
+        // Past the budget: failed, and never checked again.
+        for _ in 0..3 {
+            a.internal.contact_candidates().await;
+        }
+        let end = |(state, count): (u8, u16)| if checks { (failed, count) } else { (state, count) };
+        assert_eq!(checks_of(&a, &lan, &fresh).await, end(fresh_now), "{name}: formed after the selection");
+        assert_eq!(checks_of(&a, &lan, &spent).await, end(spent_now), "{name}: spent by the opening");
+        a.close().await?;
+    }
+    Ok(())
+}
+
+/// The STUN message type of a datagram that is one (RFC 5389: the magic cookie
+/// at bytes 4 to 8).
+fn stun_type(data: &[u8]) -> Option<u16> {
+    (data.len() >= 20 && data[4..8] == [0x21, 0x12, 0xa4, 0x42]).then(|| u16::from_be_bytes([data[0], data[1]]))
+}
+
+/// What the agent's data channel writes every 20 ms once connected: a datagram
+/// no STUN parser takes for one of its own.
+const MEDIA: &[u8] = b"MEDIA";
+
+/// What phase B's router lets through between the agent's and the viewer's
+/// own LAN addresses, and what it saw there once that LAN opened; and whether
+/// the agent's TURN allocation gets through.
+#[derive(Default)]
+struct Gate {
+    /// The LAN passes, both ways.
+    lan_open: std::sync::atomic::AtomicBool,
+    /// The agent's own binding requests on the LAN are dropped; its answers
+    /// pass: the half-blackholed pair.
+    drops_agent_checks: std::sync::atomic::AtomicBool,
+    /// The agent's requests to the far TURN's port are dropped.
+    turn_dropped: std::sync::atomic::AtomicBool,
+    /// What crossed the LAN, or was dropped there, once it opened, in order.
+    seen: std::sync::Mutex<Vec<&'static str>>,
+}
+
+/// One flat net for phase B's cells, as [`opening`]'s: every hop 10 ms, every
+/// address reaches every other, the LAN between the two ends' own addresses
+/// behind the [`Gate`].
+struct MoveNet<'a> {
+    agent_ips: &'a [&'a str],
+    browser_ips: &'a [&'a str],
+    /// Both ends allocate on the far TURN.
+    turn: bool,
+    /// The agent's TURN allocation is dropped until this long after the
+    /// checks start: a TURN that answers after the hold's bound.
+    agent_turn_after: Option<Duration>,
+}
+
+/// A session [`phase_b_session`] opened, still running.
+struct Session {
+    router: Arc<Mutex<router::Router>>,
+    server: Option<turn::server::Server>,
+    gate: Arc<Gate>,
+    agent: Arc<Agent>,
+    browser: Arc<Agent>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    _cancels: Vec<mpsc::Sender<()>>,
+    started: Instant,
+    /// The agent's first selection: its local and remote addresses, how long
+    /// after the checks started, and the agent's route read of it.
+    opened: (String, String),
+    opened_after: Duration,
+    read: Option<RouteRead>,
+}
+
+impl Session {
+    async fn close(self) -> Result<()> {
+        for t in &self.tasks {
+            t.abort();
+        }
+        self.agent.close().await?;
+        self.browser.close().await?;
+        if let Some(server) = self.server {
+            server.close().await?;
+        }
+        self.router.lock().await.stop().await?;
+        Ok(())
+    }
+}
+
+/// The agent's selection: its local and remote addresses and ports.
+fn selection_of(agent: &Agent) -> Option<(String, u16, String, u16)> {
+    agent
+        .internal
+        .agent_conn
+        .get_selected_pair()
+        .map(|p| (p.local.address(), p.local.port(), p.remote.address(), p.remote.port()))
+}
+
+/// A session on a [`MoveNet`], opened as [`opening`] opens one (the browser
+/// selects and nominates as Chrome does), with the agent running `rank`. The
+/// agent's data channel writes [`MEDIA`] once connected. Returns once the
+/// agent has selected; the opening's Chrome stand-in stops there, so after it
+/// a cell's own nominations are the browser's only ones.
+async fn phase_b_session(net: MoveNet<'_>, rank: Option<CarrierRank>) -> Result<Session> {
+    let router = Arc::new(Mutex::new(router::Router::new(router::RouterConfig {
+        cidr: "0.0.0.0/0".to_owned(),
+        min_delay: Duration::from_millis(10),
+        ..Default::default()
+    })?));
+    let gate = Arc::new(Gate::default());
+    gate.turn_dropped.store(net.agent_turn_after.is_some(), Ordering::SeqCst);
+    {
+        let gate = Arc::clone(&gate);
+        let (agent_lan, viewer_lan, turn_ip) = (ip(AGENT_LAN_IP), ip(VIEWER_LAN_IP), ip(VNET_STUN_SERVER_IP));
+        let agent_ips: Vec<IpAddr> = net.agent_ips.iter().map(|s| ip(s)).collect();
+        router
+            .lock()
+            .await
+            .add_chunk_filter(Box::new(move |c: &(dyn chunk::Chunk + Send + Sync)| {
+                let (src, dst) = (c.get_source_ip(), c.get_destination_ip());
+                if dst == turn_ip && c.destination_addr().port() == VNET_STUN_SERVER_PORT && agent_ips.contains(&src) {
+                    return !gate.turn_dropped.load(Ordering::SeqCst);
+                }
+                let from_agent = src == agent_lan && dst == viewer_lan;
+                if !from_agent && !(src == viewer_lan && dst == agent_lan) {
+                    return true;
+                }
+                if !gate.lan_open.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let data = c.user_data();
+                let (seen, passes) = match (from_agent, stun_type(&data)) {
+                    (true, Some(0x0001)) if gate.drops_agent_checks.load(Ordering::SeqCst) => {
+                        ("agent check dropped", false)
+                    }
+                    (true, Some(0x0001)) => ("agent check", true),
+                    (true, Some(0x0101)) => ("agent answer", true),
+                    (true, None) if data.starts_with(MEDIA) => ("agent media", true),
+                    (false, Some(0x0001)) => ("browser check", true),
+                    (false, Some(0x0101)) => ("answer to the agent", true),
+                    _ => ("other", true),
+                };
+                gate.seen.lock().unwrap().push(seen);
+                passes
+            }))
+            .await;
+    }
+    let viewer = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: net.browser_ips.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    })));
+    let agent_net = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: net.agent_ips.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    })));
+    connect_net2router(&viewer, &router).await?;
+    connect_net2router(&agent_net, &router).await?;
+    let server = if net.turn {
+        let turn_net = Arc::new(net::Net::new(Some(net::NetConfig {
+            static_ip: VNET_STUN_SERVER_IP.to_owned(),
+            ..Default::default()
+        })));
+        connect_net2router(&turn_net, &router).await?;
+        start_router(&router).await?;
+        Some(add_vnet_stun(turn_net).await?)
+    } else {
+        start_router(&router).await?;
+        None
+    };
+    let urls = || {
+        if net.turn {
+            vec![turn_url(VNET_STUN_SERVER_IP)]
+        } else {
+            vec![]
+        }
+    };
+    let never = Some(Duration::from_secs(3600));
+    let browser = Arc::new(
+        Agent::new(AgentConfig {
+            urls: urls(),
+            network_types: vec![NetworkType::Udp4],
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            net: Some(Arc::clone(&viewer)),
+            host_acceptance_min_wait: never,
+            srflx_acceptance_min_wait: never,
+            prflx_acceptance_min_wait: never,
+            relay_acceptance_min_wait: never,
+            max_binding_requests: Some(100),
+            ..Default::default()
+        })
+        .await?,
+    );
+    let agent = Arc::new(
+        Agent::new(AgentConfig {
+            urls: urls(),
+            network_types: vec![NetworkType::Udp4],
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            net: Some(Arc::clone(&agent_net)),
+            carrier_rank: Arc::new(rank),
+            ..Default::default()
+        })
+        .await?,
+    );
+    for (from, to) in [(&agent, &browser), (&browser, &agent)] {
+        let to = Arc::clone(to);
+        from.on_candidate(Box::new(move |c: Option<Cand>| {
+            let to = Arc::clone(&to);
+            Box::pin(async move {
+                if let Some(c) = c {
+                    if let Ok(c) = unmarshal_candidate(&c.marshal()) {
+                        let _ = to.add_remote_candidate(&(Arc::new(c) as Cand));
+                    }
+                }
+            })
+        }));
+    }
+
+    let (agent_ufrag, agent_pwd) = agent.get_local_user_credentials().await;
+    let (browser_ufrag, browser_pwd) = browser.get_local_user_credentials().await;
+    agent.gather_candidates()?;
+    browser.gather_candidates()?;
+    let started = Instant::now();
+    let mut tasks = vec![];
+    if let Some(after) = net.agent_turn_after {
+        let gate = Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            gate.turn_dropped.store(false, Ordering::SeqCst);
+        }));
+    }
+    let (agent_cancel, agent_cancel_rx) = mpsc::channel(1);
+    let (browser_cancel, browser_cancel_rx) = mpsc::channel(1);
+    {
+        let agent = Arc::clone(&agent);
+        tasks.push(tokio::spawn(async move {
+            if let Ok(conn) = agent.accept(agent_cancel_rx, browser_ufrag, browser_pwd).await {
+                loop {
+                    let _ = util::Conn::send(&*conn, MEDIA).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }));
+    }
+    {
+        let browser = Arc::clone(&browser);
+        tasks.push(tokio::spawn(async move {
+            let _ = browser.dial(browser_cancel_rx, agent_ufrag, agent_pwd).await;
+        }));
+    }
+    // Chrome at the opening: the first pair its own check validates,
+    // nominated at once and again every 100 ms, until the agent selects.
+    let chrome = {
+        let browser = Arc::clone(&browser);
+        tokio::spawn(async move {
+            let mut chosen: Option<(Cand, Cand)> = None;
+            loop {
+                if chosen.is_none() {
+                    let checklist = browser.internal.agent_conn.checklist.lock().await;
+                    chosen = checklist
+                        .iter()
+                        .find(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8)
+                        .map(|p| (Arc::clone(&p.local), Arc::clone(&p.remote)));
+                }
+                if let Some((local, remote)) = &chosen {
+                    nominate(&browser, local, remote).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+    };
+
+    let mut opened = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        if let Some(p) = agent.internal.agent_conn.get_selected_pair() {
+            let read = agent.route_read(
+                p.local.priority(),
+                p.local.component(),
+                &p.local.address(),
+                &p.remote.address(),
+            );
+            opened = Some(((p.local.address(), p.remote.address()), started.elapsed(), read));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    chrome.abort();
+    let session = Session {
+        router,
+        server,
+        gate,
+        agent,
+        browser,
+        tasks,
+        _cancels: vec![agent_cancel, browser_cancel],
+        started,
+        opened: (String::new(), String::new()),
+        opened_after: Duration::ZERO,
+        read: None,
+    };
+    let Some((pair, after, read)) = opened else {
+        session.close().await?;
+        return Err(Error::Other("no selection within 8 s".to_owned()));
+    };
+    Ok(Session {
+        opened: pair,
+        opened_after: after,
+        read,
+        ..session
+    })
+}
+
+/// A local candidate of `agent` at `address`, waited for up to 5 s.
+async fn local_at(agent: &Agent, address: &str, typ: CandidateType) -> Result<Cand> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(c) = agent
+            .get_local_candidates()
+            .await?
+            .into_iter()
+            .find(|c| c.address() == address && c.candidate_type() == typ)
+        {
+            return Ok(c);
+        }
+        if Instant::now() >= until {
+            return Err(Error::Other(format!("no {typ} candidate at {address}")));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A remote candidate of `agent` at `address` and `port`, waited for up to 5 s
+/// (it comes by trickle).
+async fn remote_soon(agent: &Agent, address: &str, port: u16) -> Result<Cand> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(c) = remote_at(agent, address, port).await {
+            return Ok(c);
+        }
+        if Instant::now() >= until {
+            return Err(Error::Other(format!("no remote candidate at {address}:{port}")));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// How one nomination of a pair the agent had not validated went
+/// ([`one_nomination`]).
+#[derive(Debug)]
+struct Nominated {
+    /// The agent's first selection: local and remote addresses.
+    opened: (String, String),
+    /// The browser's check was answered: its own pair stands validated.
+    answered: bool,
+    /// The agent's own check of the pair succeeded.
+    validated: bool,
+    /// The agent's selection is the pair.
+    moved: bool,
+    /// What crossed the LAN once it opened, in order.
+    seen: Vec<&'static str>,
+}
+
+/// Phase B on the LAN: the session opens with the LAN between the two ends
+/// shut, so its pair there is not the opening's. Once nothing checks that pair
+/// any more (the agent failed it, or checks nothing after its selection), the
+/// LAN opens, as a path that comes up after the opening, and the browser sends
+/// ONE nomination of that pair (Chrome's USE-CANDIDATE) and nothing else on it.
+/// `drops_agent_checks`: the agent's own checks on the LAN are dropped and its
+/// answers pass, the half-blackholed pair. `turn`: both ends allocate on the far
+/// TURN, so the session opens on a pair off the mesh under `route`.
+async fn one_nomination(rank: Option<CarrierRank>, turn: bool, drops_agent_checks: bool) -> Result<Nominated> {
+    let s = phase_b_session(
+        MoveNet {
+            agent_ips: &[AGENT_LAN_IP, AGENT_MESH_IP],
+            browser_ips: &[VIEWER_LAN_IP, VIEWER_TUN_IP],
+            turn,
+            agent_turn_after: None,
+        },
+        rank,
+    )
+    .await?;
+    let agent_lan = local_at(&s.agent, AGENT_LAN_IP, CandidateType::Host).await?;
+    let viewer_lan = local_at(&s.browser, VIEWER_LAN_IP, CandidateType::Host).await?;
+    let viewer_lan_at_agent = remote_soon(&s.agent, VIEWER_LAN_IP, viewer_lan.port()).await?;
+    let agent_lan_at_browser = remote_soon(&s.browser, AGENT_LAN_IP, agent_lan.port()).await?;
+
+    // Nothing checks the agent's LAN pair any more: it failed, or its count
+    // held for three check intervals.
+    let until = Instant::now() + Duration::from_secs(8);
+    let (mut last, mut since) = (None, Instant::now());
+    loop {
+        let now = checks_of(&s.agent, &agent_lan, &viewer_lan_at_agent).await;
+        if now.0 == CandidatePairState::Failed as u8 {
+            break;
+        }
+        if last != Some(now) {
+            (last, since) = (Some(now), Instant::now());
+        } else if since.elapsed() >= Duration::from_millis(600) {
+            break;
+        }
+        if Instant::now() >= until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    s.gate.drops_agent_checks.store(drops_agent_checks, Ordering::SeqCst);
+    s.gate.lan_open.store(true, Ordering::SeqCst);
+    nominate(&s.browser, &viewer_lan, &agent_lan_at_browser).await;
+    let succeeded = Some(CandidatePairState::Succeeded as u8);
+    let _ = within(Duration::from_secs(1), || async {
+        pair_state(&s.agent, &agent_lan, &viewer_lan_at_agent).await == succeeded
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let n = Nominated {
+        opened: s.opened.clone(),
+        answered: pair_state(&s.browser, &viewer_lan, &agent_lan_at_browser).await == succeeded,
+        validated: pair_state(&s.agent, &agent_lan, &viewer_lan_at_agent).await == succeeded,
+        moved: selection_of(&s.agent).is_some_and(|(l, _, r, _)| l == AGENT_LAN_IP && r == VIEWER_LAN_IP),
+        seen: s.gate.seen.lock().unwrap().clone(),
+    };
+    s.close().await?;
+    Ok(n)
+}
+
+/// B2: the session rides the mesh, and the browser nominates a pair off it that
+/// the agent has not validated. The agent answers at once, sends its triggered
+/// check, and takes the nomination when that check succeeds: one nomination
+/// moves it. It sends nothing on the pair before its own check succeeded.
+#[tokio::test]
+async fn b2_a_nomination_the_agent_has_not_validated_is_answered_and_taken_on_its_own_check() -> Result<()> {
+    let n = one_nomination(Some(route_rank(ROUTE_HOLD)), false, false).await?;
+    println!("B2, one nomination: {n:?}");
+    assert_eq!(n.opened.0, AGENT_MESH_IP, "the opening rides the mesh: {n:?}");
+    assert!(n.answered, "answered at once: {n:?}");
+    assert!(n.validated, "its triggered check: {n:?}");
+    assert!(n.moved, "taken when its own check succeeded: {n:?}");
+    let first = |what: &str| n.seen.iter().position(|e| *e == what);
+    let (success, media) = (first("answer to the agent"), first("agent media"));
+    assert!(success.is_some() && media.is_some(), "{n:?}");
+    assert!(success < media, "nothing sent on the pair before its own check succeeded: {n:?}");
+    Ok(())
+}
+
+/// B2, the half-blackholed pair (2026-07-27): the browser's checks reach the
+/// agent on a pair off the mesh, but the agent's own checks are lost. The agent
+/// answers, its triggered check fails, the selection stays on the mesh, and
+/// nothing is sent on the pair it has not validated.
+#[tokio::test]
+async fn b2_the_half_blackholed_pair_is_answered_never_taken_and_never_sent_on() -> Result<()> {
+    let n = one_nomination(Some(route_rank(ROUTE_HOLD)), false, true).await?;
+    println!("B2, half-blackholed: {n:?}");
+    assert_eq!(n.opened.0, AGENT_MESH_IP, "the opening rides the mesh: {n:?}");
+    assert!(n.answered, "answered: {n:?}");
+    assert!(n.seen.contains(&"agent check dropped"), "its triggered check was sent: {n:?}");
+    assert!(!n.validated, "and never returned: {n:?}");
+    assert!(!n.moved, "the selection stays on the mesh: {n:?}");
+    assert!(!n.seen.contains(&"agent media"), "nothing sent on the pair: {n:?}");
+    Ok(())
+}
+
+/// The kill switch: under `prio` and `1`, and under `0`, a nomination of a pair
+/// the agent has not validated is handled as built: no answer, a triggered
+/// check, and no move on one nomination.
+#[tokio::test]
+async fn b2_kill_switch_under_prio_and_0_a_nomination_the_agent_has_not_validated_is_handled_as_built(
+) -> Result<()> {
+    for (name, rank) in [("prio and 1", Some(mesh_last())), ("0", None)] {
+        let n = one_nomination(rank, false, false).await?;
+        println!("B2 kill switch, {name}: {n:?}");
+        assert!(!n.answered, "{name}: no answer before its own check: {n:?}");
+        assert!(!n.seen.contains(&"agent answer"), "{name}: {n:?}");
+        assert!(n.validated, "{name}: the triggered check: {n:?}");
+        assert!(!n.moved, "{name}: {n:?}");
+    }
+    Ok(())
+}
+
+/// No move away from a real pair: under `route`, with the selection off the
+/// mesh (the far TURN carries the opening), B2 does not act. The nomination is
+/// handled as built: no answer, a triggered check, no move.
+#[tokio::test]
+async fn b2_with_the_selection_off_the_mesh_a_nomination_is_handled_as_built() -> Result<()> {
+    let n = one_nomination(Some(route_rank(ROUTE_HOLD)), true, false).await?;
+    println!("B2, a real selection: {n:?}");
+    assert!(
+        n.opened.0 != AGENT_MESH_IP && n.opened.1 != VIEWER_TUN_IP,
+        "the opening is off the mesh: {n:?}"
+    );
+    assert!(!n.answered, "no answer before its own check: {n:?}");
+    assert!(!n.seen.contains(&"agent answer"), "{n:?}");
+    assert!(n.validated, "the triggered check: {n:?}");
+    assert!(!n.moved, "{n:?}");
+    Ok(())
+}
+
+/// B1 on a live agent: once the session rides the mesh, a browser candidate
+/// that answers nothing arrives. The agent checks its pair at the check
+/// cadence, within the budget, then never again.
+#[tokio::test]
+async fn b1_a_dead_pair_above_a_selection_on_the_mesh_is_checked_at_the_check_cadence_within_the_budget(
+) -> Result<()> {
+    let s = phase_b_session(
+        MoveNet {
+            agent_ips: &[AGENT_LAN_IP, AGENT_MESH_IP],
+            browser_ips: &[VIEWER_LAN_IP, VIEWER_TUN_IP],
+            turn: false,
+            agent_turn_after: None,
+        },
+        Some(route_rank(ROUTE_HOLD)),
+    )
+    .await?;
+    assert_eq!(s.opened.0, AGENT_MESH_IP, "the opening rides the mesh");
+    let agent_lan = local_at(&s.agent, AGENT_LAN_IP, CandidateType::Host).await?;
+    s.agent
+        .add_remote_candidate(&srflx("198.51.100.77", 9, chrome(100, 65535)))?;
+    let dead = remote_soon(&s.agent, "198.51.100.77", 9).await?;
+    let mut at = vec![];
+    let mut last = 0;
+    let watch = Instant::now();
+    while watch.elapsed() < Duration::from_millis(4500) {
+        if let Some(p) = s.agent.internal.find_pair(&agent_lan, &dead).await {
+            let count = p.binding_request_count.load(Ordering::SeqCst);
+            for _ in last..count {
+                at.push(watch.elapsed());
+            }
+            last = count;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let state = checks_of(&s.agent, &agent_lan, &dead).await.0;
+    s.close().await?;
+    println!("B1 live: {} checks at {at:?}", at.len());
+    assert_eq!(at.len(), MOVE_BUDGET as usize, "the budget: {at:?}");
+    let gaps: Vec<_> = at.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        gaps.iter().all(|g| *g < Duration::from_millis(450)),
+        "the check cadence, not the 2 s keepalive: {gaps:?}"
+    );
+    assert!(
+        at.last().is_some_and(|last| *last < Duration::from_millis(3500)),
+        "then never again: {at:?}"
+    );
+    assert_eq!(state, CandidatePairState::Failed as u8);
+    Ok(())
+}
+
+/// When the agent's TURN allocation gets through in [`late_turn`]'s cells: 4 s
+/// after the checks start, past `ROUTE_HOLD`.
+const LATE: Duration = Duration::from_secs(4);
+
+/// How a session whose agent relay allocated after the bound went
+/// ([`late_turn`]).
+#[derive(Debug)]
+struct LateTurn {
+    /// The agent's first selection: local and remote addresses.
+    opened: (String, String),
+    opened_after: Duration,
+    read: Option<RouteRead>,
+    /// From the checks' start to the agent's relay.
+    relay_after: Duration,
+    /// From the agent's relay to its selection of the two relays' pair.
+    moved_after: Option<Duration>,
+    /// The agent's selection changes after the opening.
+    changes: usize,
+    /// The agent's selection at the end is the two relays' pair.
+    on_the_relays: bool,
+}
+
+impl LateTurn {
+    /// The opening: on the mesh, at the hold's bound, read as such; then the
+    /// relay, after the bound; then one move, to the relays' pair.
+    fn opened_on_the_mesh_then_moved_once(&self) {
+        assert_eq!(self.opened.0, AGENT_MESH_IP, "the opening rides the mesh: {self:?}");
+        assert!(
+            self.opened_after >= ROUTE_HOLD && self.opened_after < LATE,
+            "at the bound: {self:?}"
+        );
+        assert_eq!(
+            self.read.map(|r| (r.rides_the_mesh, r.hold_exit)),
+            Some((true, Some(RouteHoldExit::Bound))),
+            "hold_exit=bound: {self:?}"
+        );
+        assert!(self.relay_after > LATE, "the relay comes after the bound: {self:?}");
+        assert!(self.on_the_relays, "on the relays' pair: {self:?}");
+        assert_eq!(self.changes, 1, "the move is the only selection change: {self:?}");
+    }
+}
+
+/// A TURN that answers after the hold's bound: the agent's allocation gets
+/// through only at [`LATE`]. The session opens on the mesh at the bound; the
+/// agent's relay comes later. The browser learns it by trickle at once, and
+/// Chrome's stand-in checks the two relays' pair `first` after the agent's
+/// relay, then every `every`: the pair ranks above Chrome's selection, so each
+/// check nominates it (`SEMI_AGGRESSIVE`). The browser's TURN client asks for
+/// its permission toward the agent's relayed address on its first check, so
+/// the agent's own checks of the pair get through only after that. Watched for
+/// 3.5 s after the agent's relay.
+async fn late_turn(first: Duration, every: Duration) -> Result<LateTurn> {
+    let s = phase_b_session(
+        MoveNet {
+            agent_ips: &[AGENT_MESH_IP],
+            browser_ips: &[VIEWER_TUN_IP],
+            turn: true,
+            agent_turn_after: Some(LATE),
+        },
+        Some(route_rank(ROUTE_HOLD)),
+    )
+    .await?;
+    let opening = selection_of(&s.agent);
+    let relay = local_at(&s.agent, VNET_STUN_SERVER_IP, CandidateType::Relay).await;
+    let relay_after = s.started.elapsed();
+    let relayed = Instant::now();
+    let browser_relay = local_at(&s.browser, VNET_STUN_SERVER_IP, CandidateType::Relay).await;
+    let (relay, browser_relay) = match (relay, browser_relay) {
+        (Ok(r), Ok(b)) => (r, b),
+        (r, b) => {
+            s.close().await?;
+            return Err(Error::Other(format!("relays: agent {:?}, browser {:?}", r.err(), b.err())));
+        }
+    };
+    let agent_relay_at_browser = remote_soon(&s.browser, &relay.address(), relay.port()).await?;
+    let chrome = {
+        let (browser, local, remote) = (Arc::clone(&s.browser), Arc::clone(&browser_relay), agent_relay_at_browser);
+        tokio::spawn(async move {
+            tokio::time::sleep(first).await;
+            loop {
+                nominate(&browser, &local, &remote).await;
+                tokio::time::sleep(every).await;
+            }
+        })
+    };
+    let to = Some((relay.address(), relay.port(), browser_relay.address(), browser_relay.port()));
+    let (mut changes, mut current, mut moved_after) = (0, opening, None);
+    while relayed.elapsed() < Duration::from_millis(3500) {
+        let now = selection_of(&s.agent);
+        if now != current {
+            changes += 1;
+            current = now;
+            if current == to && moved_after.is_none() {
+                moved_after = Some(relayed.elapsed());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    chrome.abort();
+    let t = LateTurn {
+        opened: s.opened.clone(),
+        opened_after: s.opened_after,
+        read: s.read,
+        relay_after,
+        moved_after,
+        changes,
+        on_the_relays: current == to,
+    };
+    s.close().await?;
+    Ok(t)
+}
+
+/// A late TURN, with a Chrome that checks the relays' pair at once and every
+/// 480 ms (its strong ping interval, with no other connection to ping): the
+/// session opens on the mesh (`hold_exit=bound`) and moves within 1.5 s of the
+/// agent's relay, once.
+#[tokio::test]
+async fn b_a_turn_that_allocates_after_the_bound_opens_on_the_mesh_then_moves_once() -> Result<()> {
+    let t = late_turn(Duration::ZERO, Duration::from_millis(480)).await?;
+    println!("late TURN, Chrome every 480 ms: {t:?}");
+    t.opened_on_the_mesh_then_moved_once();
+    assert!(
+        t.moved_after.is_some_and(|m| m < Duration::from_millis(1500)),
+        "within 1.5 s of the relay: {t:?}"
+    );
+    Ok(())
+}
+
+/// A late TURN, with Chrome's round robin: its first check of the relays' pair
+/// 300 ms after the agent's relay (the candidate's trip through the server and
+/// Chrome's next ping slot), then every 2.4 s (one check per 480 ms over five
+/// connections). Chrome's first check makes its TURN permission, so it reaches
+/// the agent before any check of the agent's can be answered. Answered (B2), it
+/// moves the session within 1 s of the agent's relay; unanswered, the move
+/// waits for Chrome's second check, 2.7 s after the relay.
+#[tokio::test]
+async fn b2_a_late_turn_moves_on_chromes_first_check_of_the_pair() -> Result<()> {
+    let t = late_turn(Duration::from_millis(300), Duration::from_millis(2400)).await?;
+    println!("late TURN, Chrome's round robin: {t:?}");
+    t.opened_on_the_mesh_then_moved_once();
+    assert!(
+        t.moved_after.is_some_and(|m| m < Duration::from_secs(1)),
+        "on Chrome's first check, within 1 s of the relay: {t:?}"
+    );
+    Ok(())
+}
+
+/// B2's one decision (`AgentInternal::answers_before_validating`), which
+/// answers a nomination before validating and takes it after: the route rank,
+/// a selection that rides the mesh, a pair that does not, a remote that is an
+/// address, and the follow gate. On a direct mesh link the rank's order holds:
+/// a native pair is answered, a TURN pair below the direct mesh selection is
+/// not. Nothing else answers before validating.
+#[tokio::test]
+async fn b2_one_decision_answers_only_a_pair_off_the_mesh_the_follow_gate_would_take() -> Result<()> {
+    let direct = || CarrierRank {
+        mesh_last: None,
+        ..route_rank(ROUTE_HOLD)
+    };
+    let lan = || host(AGENT_LAN_IP, 5000, chrome(126, 65535));
+    let native = || srflx("198.51.100.4", 7002, chrome(100, 65535));
+    let viewer_tun = || host(VIEWER_TUN_IP, 7000, chrome(126, 65535));
+    let viewer_far_relay = || relay("198.51.100.9", 7001, chrome(2, 32542));
+    let on_relayed_mesh = || Some((host(AGENT_MESH_IP, 5001, 255), viewer_tun()));
+    let on_direct_mesh = || Some((host(AGENT_MESH_IP, 5001, TYPE_90), viewer_tun()));
+    let (fresh, stale) = (true, false);
+    for (name, rank, selection, live, (local, remote), answers) in [
+        ("route, on the mesh, a native pair", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), fresh, (lan(), native()), true),
+        ("route, on the mesh, a far TURN pair", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), fresh, (lan(), viewer_far_relay()), true),
+        ("route, a pair into the mesh", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), fresh, (lan(), host(VIEWER_TUN_IP, 7003, chrome(126, 65535))), false),
+        ("route, a pair from the mesh", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), fresh, (host(AGENT_MESH_IP, 5009, 255), native()), false),
+        ("route, the selection off the mesh", Some(route_rank(ROUTE_HOLD)), Some((lan(), viewer_far_relay())), fresh, (lan(), native()), false),
+        ("route, nothing selected", Some(route_rank(ROUTE_HOLD)), None, fresh, (lan(), native()), false),
+        ("route, a stale selection, a native pair", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), stale, (lan(), native()), true),
+        ("route, a stale selection, a name for the remote", Some(route_rank(ROUTE_HOLD)), on_relayed_mesh(), stale, (lan(), host("viewer.local", 7004, chrome(126, 65535))), false),
+        ("direct link, a native pair", Some(direct()), on_direct_mesh(), fresh, (lan(), native()), true),
+        ("direct link, a TURN pair below the direct mesh", Some(direct()), on_direct_mesh(), fresh, (lan(), viewer_far_relay()), false),
+        ("prio and 1", Some(mesh_last()), on_relayed_mesh(), fresh, (lan(), native()), false),
+        ("0", None, on_relayed_mesh(), fresh, (lan(), native()), false),
+    ] {
+        let a = Agent::new(AgentConfig {
+            candidate_types: vec![CandidateType::Relay],
+            carrier_rank: Arc::new(rank),
+            ..Default::default()
+        })
+        .await?;
+        a.internal.route_hold.lock().started = Some(Instant::now());
+        if let Some((selected_local, selected_remote)) = selection {
+            if live {
+                selected_remote.seen(false);
+            }
+            a.internal
+                .set_selected_pair(Some(Arc::new(CandidatePair::new(selected_local, selected_remote, false))))
+                .await;
+        }
+        let pair = CandidatePair::new(local, remote, false);
+        assert_eq!(a.internal.answers_before_validating(&pair), answers, "{name}");
+        a.close().await?;
+    }
+    Ok(())
+}

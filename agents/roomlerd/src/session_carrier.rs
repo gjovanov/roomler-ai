@@ -32,7 +32,8 @@
 //! very first pair would record `turn` for sessions that spend their life
 //! direct. The pair is read once more [`SETTLE`] after the first nomination,
 //! and that is what is recorded — once per session; a later path change is
-//! not recorded (the bitrate clamp follows it live, this does not).
+//! not recorded (the bitrate clamp follows it live, this does not; under
+//! `route` a line names it, below).
 //!
 //! The spellings are a wire and storage vocabulary: the server stores what
 //! it is sent, the growth freeze groups by it. Never rename one.
@@ -43,12 +44,30 @@
 //! local candidate is no relay, and `unknown` when the agent cannot say.
 //! It is a log field only: no wire carries it and the server stores
 //! nothing of it.
+//!
+//! FR-148 P4 step 2, phase B of D49: under `rc_carrier_rank = route` a
+//! selection change after the opening writes one line, `session carrier
+//! moved` ([`follow_moves`]): the carrier before and after, in this
+//! vocabulary, the new pair's `route` as the path line names it
+//! ([`crate::carrier_rank::path_route`]), and the new pair. The recorded value
+//! stays the one read after the settle, and no wire carries the line. The
+//! bitrate clamp is the pumps' own: they re-read the pair every 5 s
+//! (relay-escape), with the opening's predicate. Under every other value
+//! nothing follows the selection.
 
+use std::future::Future;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use bson::oid::ObjectId;
 use tracing::{debug, info};
 use webrtc::ice::url::{ProtoType, SchemeType};
+use webrtc::ice_transport::RTCIceTransport;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+
+use crate::carrier_rank::PathRoute;
 
 /// How long to wait for the first nomination after `Connected` (ICE has
 /// usually nominated by then; the DC pumps wait the same 3 s).
@@ -59,6 +78,10 @@ pub const SETTLE: Duration = Duration::from_secs(2);
 /// The LocalAPI budget for the overlay lookup — the same the bitrate probe
 /// affords it.
 pub const LOCALAPI_BUDGET: Duration = Duration::from_millis(400);
+/// FR-148 P4 step 2, phase B of D49: how often a session under `route` reads
+/// its selection again after the opening, for the moved line. A log line's
+/// latency, not the media's.
+pub const MOVE_TICK: Duration = Duration::from_secs(1);
 
 /// What a session rides. The wire spelling is [`SessionCarrier::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,30 +317,82 @@ pub fn relay_transport_of(
 /// reads it as riding the mesh (`None` under every other value).
 type Nominated = (PairView, RelayTransport, Option<bool>);
 
-/// The nominated pair, polled every 100 ms for up to `wait`.
-async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
+/// The selected pair as read once: its two candidates, ports included, what
+/// carries the agent's relay for it, and, under `route` alone, whether the
+/// ICE agent reads it as riding the mesh (`None` under every other value).
+#[derive(Debug, Clone, PartialEq)]
+struct Selection {
+    local: RTCIceCandidate,
+    remote: RTCIceCandidate,
+    relay: RelayTransport,
+    rides: Option<bool>,
+}
+
+impl Selection {
+    /// The four facts the carrier rule reads.
+    fn view(&self) -> PairView {
+        PairView {
+            local_kind: self.local.typ.into(),
+            remote_kind: self.remote.typ.into(),
+            local_addr: self.local.address.clone(),
+            remote_addr: self.remote.address.clone(),
+        }
+    }
+
+    /// As the carrier line reads it.
+    fn nominated(&self) -> Nominated {
+        (self.view(), self.relay, self.rides)
+    }
+
+    /// Is `other` the same pair: both ends at the same address and port? Two
+    /// sockets at one address are two pairs.
+    fn same_pair(&self, other: &Selection) -> bool {
+        let ends = |s: &Selection| {
+            (
+                s.local.address.clone(),
+                s.local.port,
+                s.remote.address.clone(),
+                s.remote.port,
+            )
+        };
+        ends(self) == ends(other)
+    }
+}
+
+/// The selected pair, read once: `None` while nothing is selected.
+async fn selection(ice: &RTCIceTransport) -> Option<Selection> {
+    let pair = ice.get_selected_candidate_pair().await?;
+    let (local, remote) = (pair.local().clone(), pair.remote().clone());
+    let relay = relay_transport_of(local.typ.into(), pair.local_relay_transport());
+    let rides = ice.route_read(&pair).await.map(|read| read.rides_the_mesh);
+    Some(Selection {
+        local,
+        remote,
+        relay,
+        rides,
+    })
+}
+
+/// The selected pair, polled every 100 ms for up to `wait`.
+async fn nominated(pc: &RTCPeerConnection, wait: Duration) -> Option<Selection> {
     let sctp = pc.sctp();
     let dtls = sctp.transport();
     let ice = dtls.ice_transport();
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if let Some(pair) = ice.get_selected_candidate_pair().await {
-            let (local, remote) = (pair.local(), pair.remote());
-            let view = PairView {
-                local_kind: local.typ.into(),
-                remote_kind: remote.typ.into(),
-                local_addr: local.address.clone(),
-                remote_addr: remote.address.clone(),
-            };
-            let relay = relay_transport_of(view.local_kind, pair.local_relay_transport());
-            let rides = ice.route_read(&pair).await.map(|read| read.rides_the_mesh);
-            return Some((view, relay, rides));
+        if let Some(selected) = selection(ice).await {
+            return Some(selected);
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// The nominated pair, polled every 100 ms for up to `wait`.
+async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
+    nominated(pc, wait).await.map(|s| s.nominated())
 }
 
 /// What the overlay says about `remote_addr`'s peer, within
@@ -346,15 +421,24 @@ pub(crate) async fn overlay_path(remote_addr: &str) -> Option<OverlayPath> {
 /// remote is one of its addresses, and record what the rule says. Logged at
 /// `info` with the pair, so a field read can check the recorded value
 /// against the addresses.
-pub async fn observe(pc: &RTCPeerConnection, session_id: bson::oid::ObjectId) -> SessionCarrier {
-    let Some(first) = nominated_pair(pc, NOMINATION_WAIT).await else {
+///
+/// FR-148 P4 step 2, phase B of D49: under `route` (the agent reads a route
+/// for the first pair) it also starts [`follow`] from that pair.
+pub async fn observe(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: bson::oid::ObjectId,
+) -> SessionCarrier {
+    let Some(first) = nominated(pc, NOMINATION_WAIT).await else {
         debug!(%session_id, "session carrier: no nominated pair within the wait — unknown");
         return SessionCarrier::Unknown;
     };
+    if first.rides.is_some() {
+        tokio::spawn(follow(Arc::downgrade(pc), session_id, first.clone()));
+    }
     tokio::time::sleep(SETTLE).await;
     let (pair, relay, rides) = nominated_pair(pc, Duration::from_millis(500))
         .await
-        .unwrap_or(first);
+        .unwrap_or_else(|| first.nominated());
     // FR-148 P4 step 2: under `route` the agent's read decides; otherwise the
     // remote's range, as built.
     let rides_the_overlay =
@@ -388,6 +472,134 @@ fn emit(
         remote_addr = %pair.remote_addr,
         overlay = ?overlay,
         "session carrier recorded (FR-102 P9c)"
+    );
+}
+
+/// What one of [`follow`]'s reads found.
+#[derive(Debug)]
+enum Seen {
+    /// The session is over: its peer is gone, closed or failed.
+    Ended,
+    /// Its selection, `None` while nothing is selected. Boxed: a pair is a
+    /// few hundred bytes next to the unit variant (clippy
+    /// `large_enum_variant`).
+    Pair(Option<Box<Selection>>),
+}
+
+/// FR-148 P4 step 2, phase B of D49: follow a session under `route` from its
+/// first pair, `opening`, reading its selection every [`MOVE_TICK`], until it
+/// ends ([`follow_moves`]). It holds the peer weakly, as the observation's
+/// spawn does: it never keeps a closed peer alive, and ends with it.
+async fn follow(pc: Weak<RTCPeerConnection>, session_id: ObjectId, opening: Selection) {
+    let read = || {
+        let pc = pc.clone();
+        async move {
+            let Some(pc) = pc.upgrade() else {
+                return Seen::Ended;
+            };
+            if matches!(
+                pc.connection_state(),
+                RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+            ) {
+                return Seen::Ended;
+            }
+            let sctp = pc.sctp();
+            let dtls = sctp.transport();
+            Seen::Pair(selection(dtls.ice_transport()).await.map(Box::new))
+        }
+    };
+    let overlay = |remote_addr: String| async move { overlay_path(&remote_addr).await };
+    follow_moves(session_id, opening, read, overlay, MOVE_TICK).await;
+}
+
+/// [`follow`]'s loop over its reads, which a cell scripts: every `tick`,
+/// `read` the selection. A pair that is not the last one is a move: the
+/// carrier it moves from is the last pair's, the one it moves to the new
+/// pair's, each by [`carrier_on`] with the agent's read and, for a pair on the
+/// mesh, what `overlay` says of its remote's peer at the move; then one
+/// `session carrier moved` line ([`emit_moved`]). It ends when the session
+/// does, or when the agent reads no route for a pair, and never starts
+/// without one for `opening`. Returns how many moves it named.
+async fn follow_moves<R, RF, O, OF>(
+    session_id: ObjectId,
+    opening: Selection,
+    mut read: R,
+    mut overlay: O,
+    tick: Duration,
+) -> usize
+where
+    R: FnMut() -> RF,
+    RF: Future<Output = Seen>,
+    O: FnMut(String) -> OF,
+    OF: Future<Output = Option<OverlayPath>>,
+{
+    if opening.rides.is_none() {
+        return 0;
+    }
+    // The last pair, and its carrier once a move has named it.
+    let (mut last, mut last_carrier) = (opening, None::<SessionCarrier>);
+    let mut moves = 0;
+    loop {
+        tokio::time::sleep(tick).await;
+        let next = match read().await {
+            Seen::Ended => return moves,
+            Seen::Pair(None) => continue,
+            Seen::Pair(Some(next)) => *next,
+        };
+        if next.same_pair(&last) {
+            continue;
+        }
+        let (Some(was_on_the_mesh), Some(on_the_mesh)) = (last.rides, next.rides) else {
+            return moves;
+        };
+        let from = match last_carrier {
+            Some(carrier) => carrier,
+            None => {
+                let said = if was_on_the_mesh {
+                    overlay(last.remote.address.clone()).await
+                } else {
+                    None
+                };
+                carrier_on(&last.view(), was_on_the_mesh, said.as_ref())
+            }
+        };
+        let said = if on_the_mesh {
+            overlay(next.remote.address.clone()).await
+        } else {
+            None
+        };
+        let to = carrier_on(&next.view(), on_the_mesh, said.as_ref());
+        let route =
+            crate::carrier_rank::path_route(on_the_mesh, &next.local, &next.remote, said.as_ref());
+        emit_moved(session_id, from, to, route, &next, said.as_ref());
+        moves += 1;
+        (last, last_carrier) = (next, Some(to));
+    }
+}
+
+/// The moved line: the carrier before and after, the new pair's route, what
+/// carries the agent's relay for it, and the pair. Its field names and their
+/// order are pinned by a test, since a field read greps for them.
+fn emit_moved(
+    session_id: ObjectId,
+    from: SessionCarrier,
+    to: SessionCarrier,
+    route: PathRoute,
+    pair: &Selection,
+    overlay: Option<&OverlayPath>,
+) {
+    info!(
+        %session_id,
+        from = from.as_str(),
+        to = to.as_str(),
+        route = %route,
+        relay_transport = pair.relay.as_str(),
+        local_typ = ?pair.local.typ,
+        local_addr = %format!("{}:{}", pair.local.address, pair.local.port),
+        remote_typ = ?pair.remote.typ,
+        remote_addr = %format!("{}:{}", pair.remote.address, pair.remote.port),
+        overlay = ?overlay,
+        "session carrier moved"
     );
 }
 
@@ -956,5 +1168,259 @@ mod tests {
             SessionCarrier::Direct,
             "as built"
         );
+    }
+
+    // FR-148 P4 step 2, phase B of D49: the moved line.
+
+    use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType as T;
+
+    /// A pair as the follower reads it.
+    fn selected(
+        (local_typ, local_addr, local_port): (T, &str, u16),
+        (remote_typ, remote_addr, remote_port): (T, &str, u16),
+        relay: RelayTransport,
+        rides: Option<bool>,
+    ) -> Selection {
+        let candidate = |typ, address: &str, port| RTCIceCandidate {
+            typ,
+            address: address.to_owned(),
+            port,
+            ..Default::default()
+        };
+        Selection {
+            local: candidate(local_typ, local_addr, local_port),
+            remote: candidate(remote_typ, remote_addr, remote_port),
+            relay,
+            rides,
+        }
+    }
+
+    /// The field's pairs, under `route`: the agent's host candidate on its
+    /// mesh address with the viewer's mesh address, learned from the viewer's
+    /// check; the far TURN; a native pair.
+    fn on_the_mesh() -> Selection {
+        let (mesh_host, viewer_mesh) = (
+            (T::Host, "100.65.4.34", 5001),
+            (T::Prflx, "100.65.4.33", 40000),
+        );
+        selected(mesh_host, viewer_mesh, RelayTransport::NoRelay, Some(true))
+    }
+    fn on_the_far_turn() -> Selection {
+        let (agent_relay, viewer_relay) = (
+            (T::Relay, "203.0.113.7", 50000),
+            (T::Relay, "198.51.100.9", 7001),
+        );
+        selected(agent_relay, viewer_relay, RelayTransport::Tls, Some(false))
+    }
+    fn native() -> Selection {
+        let (lan, viewer_lan) = (
+            (T::Host, "192.168.1.10", 5000),
+            (T::Host, "192.168.1.20", 6000),
+        );
+        selected(lan, viewer_lan, RelayTransport::NoRelay, Some(false))
+    }
+
+    /// A read that finds `s` selected.
+    fn seen(s: Selection) -> Seen {
+        Seen::Pair(Some(Box::new(s)))
+    }
+
+    /// The viewer device's carrier, as the overlay names it: relayed through
+    /// DERP. Nothing for an address that is no peer's.
+    fn overlay_says_derp(addr: String) -> std::future::Ready<Option<OverlayPath>> {
+        std::future::ready(
+            (addr == "100.65.4.33").then(|| OverlayPath::Relay(Some("derp".to_owned()))),
+        )
+    }
+
+    /// [`follow_moves`] over scripted reads, on a runtime of its own, with
+    /// what it logged. The script ends the session when it runs out.
+    fn followed(opening: Selection, script: Vec<Seen>) -> (usize, usize, String) {
+        let sid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        let reads = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            script,
+        )));
+        let made = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read = {
+            let (reads, made) = (reads.clone(), made.clone());
+            move || {
+                made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next = reads.lock().unwrap().pop_front().unwrap_or(Seen::Ended);
+                std::future::ready(next)
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut moves = 0;
+        let out = logged(|| {
+            moves = runtime.block_on(follow_moves(
+                sid,
+                opening,
+                read,
+                overlay_says_derp,
+                Duration::from_millis(1),
+            ));
+        });
+        (moves, made.load(std::sync::atomic::Ordering::SeqCst), out)
+    }
+
+    /// The moved line's field names and their order, which a field read
+    /// greps for: the carrier before and after, the new pair's route, then
+    /// the carrier line's own fields, with the pair's ports.
+    #[test]
+    fn the_moved_line_names_its_fields() {
+        let sid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        let out = logged(|| {
+            emit_moved(
+                sid,
+                SessionCarrier::Derp,
+                SessionCarrier::Turn,
+                PathRoute::Turn,
+                &on_the_far_turn(),
+                None,
+            )
+        });
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            "session carrier moved",
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "from=\"derp\"",
+            "to=\"turn\"",
+            "route=turn",
+            "relay_transport=\"tls\"",
+            "local_typ=Relay",
+            "local_addr=203.0.113.7:50000",
+            "remote_typ=Relay",
+            "remote_addr=198.51.100.9:7001",
+            "overlay=None",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    /// Under `route`, each selection change after the opening writes one
+    /// moved line, from the last pair's carrier to the new pair's, and a read
+    /// of the same pair, or of none, writes nothing. A move back onto the mesh
+    /// is named too.
+    #[test]
+    fn under_route_each_selection_change_after_the_opening_writes_one_moved_line() {
+        let script = vec![
+            seen(on_the_mesh()),
+            Seen::Pair(None),
+            seen(on_the_far_turn()),
+            seen(on_the_far_turn()),
+            seen(native()),
+            seen(on_the_mesh()),
+        ];
+        let (moves, reads, out) = followed(on_the_mesh(), script);
+        assert_eq!((moves, reads), (3, 7), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        for (line, (from, to, route, local)) in lines.iter().zip([
+            ("derp", "turn", "turn", "203.0.113.7:50000"),
+            ("turn", "direct", "native", "192.168.1.10:5000"),
+            ("direct", "derp", "mesh-relayed", "100.65.4.34:5001"),
+        ]) {
+            assert!(line.contains("session carrier moved"), "{line}");
+            for want in [
+                format!("from=\"{from}\""),
+                format!("to=\"{to}\""),
+                format!("route={route}"),
+                format!("local_addr={local}"),
+            ] {
+                assert!(line.contains(&want), "{want} in {line}");
+            }
+        }
+    }
+
+    /// Two sockets at one address are two pairs: a move between them is a move.
+    #[test]
+    fn a_move_to_another_port_at_the_same_address_is_a_move() {
+        let other_socket = selected(
+            (T::Host, "100.65.4.34", 5002),
+            (T::Prflx, "100.65.4.33", 40000),
+            RelayTransport::NoRelay,
+            Some(true),
+        );
+        let (moves, _, out) = followed(on_the_mesh(), vec![seen(other_socket)]);
+        assert_eq!(moves, 1, "{out}");
+        assert!(
+            out.contains("from=\"derp\" to=\"derp\" route=mesh-relayed"),
+            "{out}"
+        );
+    }
+
+    /// Under every value but `route` the agent reads no route: nothing
+    /// follows the selection, nothing is read, and no line is written,
+    /// whatever the selection does. Under `route`, a pair the agent reads no
+    /// route for ends the follow without a line.
+    #[test]
+    fn without_route_nothing_follows_the_selection() {
+        let unrouted = |s: Selection| Selection { rides: None, ..s };
+        let script = || vec![seen(unrouted(on_the_far_turn())), seen(unrouted(native()))];
+        let (moves, reads, out) = followed(unrouted(on_the_mesh()), script());
+        assert_eq!((moves, reads, out.as_str()), (0, 0, ""));
+        let (moves, reads, out) = followed(on_the_mesh(), script());
+        assert_eq!((moves, reads, out.as_str()), (0, 1, ""));
+    }
+
+    /// The pumps' constrained flag per move class (phase B builds the line
+    /// only). The flag is the pumps' own, unchanged: at the opening
+    /// (`detect_constrained_transport`) and every 5 s after it (the
+    /// relay-escape re-read, `current_pair_is_relay`), one predicate: a relay
+    /// at either end that is not the device's own fast TURN
+    /// ([`crate::encode::relay_addr_is_fast_local`]), or a remote in the
+    /// overlay's range whose carrier is not direct. A move between relay
+    /// tiers keeps it; a move to a native pair lifts it at the next re-read.
+    #[test]
+    fn the_constrained_flag_per_move_class() {
+        let flag = |s: &Selection, overlay_direct: bool| {
+            let relay = |c: &RTCIceCandidate| {
+                c.typ == T::Relay && !crate::encode::relay_addr_is_fast_local(&c.address)
+            };
+            relay(&s.local)
+                || relay(&s.remote)
+                || (crate::peer::addr_is_overlay_range(&s.remote.address) && !overlay_direct)
+        };
+        let (relayed, direct) = (false, true);
+        for (class, (before, before_direct), (after, after_direct), (was, now)) in [
+            (
+                "mesh-relayed to TURN",
+                (on_the_mesh(), relayed),
+                (on_the_far_turn(), relayed),
+                (true, true),
+            ),
+            (
+                "mesh-relayed to native",
+                (on_the_mesh(), relayed),
+                (native(), relayed),
+                (true, false),
+            ),
+            (
+                "mesh-direct to native",
+                (on_the_mesh(), direct),
+                (native(), direct),
+                (false, false),
+            ),
+            (
+                "TURN to native",
+                (on_the_far_turn(), relayed),
+                (native(), relayed),
+                (true, false),
+            ),
+        ] {
+            assert_eq!(
+                (flag(&before, before_direct), flag(&after, after_direct)),
+                (was, now),
+                "{class}"
+            );
+        }
     }
 }
