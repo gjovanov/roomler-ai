@@ -9,6 +9,7 @@ vi.mock('@/api/client', () => ({
 
 import { useOverlayAclStore, type OverlayPolicy } from '@/stores/overlayAcl'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from './pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -151,6 +152,28 @@ describe('overlayAcl store', () => {
       `/tenant/${TENANT_ID}/overlay-acl/mode`,
       { mode: 'enforce' },
     )
+    expect(store.mode).toBe('enforce')
+  })
+})
+
+// #4188 — the route answers one page at a time: 25 rows unless the request
+// asks for more, and never more than 100. It answers no `total_pages`.
+describe('overlayAcl store: an org with more rules than one page holds', () => {
+  const named = (i: number) => mkPolicy({ id: rowId(i), name: `rule-${i}` })
+
+  it('lists every rule, in the server order, each once, with the server total and posture', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 101, row: named, extra: { mode: 'enforce' } }),
+    )
+    const store = useOverlayAclStore()
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(store.error).toBeNull()
+    expect(store.policies).toHaveLength(101)
+    expect(store.policies.map((p) => p.name)).toEqual(
+      Array.from({ length: 101 }, (_, i) => `rule-${i}`),
+    )
+    expect(store.total).toBe(101)
     expect(store.mode).toBe('enforce')
   })
 })

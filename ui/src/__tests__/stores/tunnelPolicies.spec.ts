@@ -10,6 +10,7 @@ vi.mock('@/api/client', () => ({
 import { useTunnelPolicyStore, type TunnelPolicy } from '@/stores/tunnelPolicies'
 import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from './pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -135,5 +136,26 @@ describe('tunnelPolicies store: who may manage the org tunnel ACL', () => {
     await store.fetchPolicies(TENANT_ID)
     expect(store.refused).toBe(false)
     expect(store.policies).toHaveLength(1)
+  })
+})
+
+// #4188 — the route answers one page at a time: 25 rows unless the request
+// asks for more, and never more than 100.
+describe('tunnelPolicies store: an org with more policies than one page holds', () => {
+  const named = (i: number) => mkPolicy({ id: rowId(i), name: `policy-${i}` })
+
+  it('lists every policy, in the server order, each once, with the server total', async () => {
+    asCaller(MANAGE_AGENTS)
+    mockApi.get.mockImplementation(pagedRoute({ total: 101, row: named, totalPages: true }))
+    const store = useTunnelPolicyStore()
+    await store.fetchPolicies(TENANT_ID)
+
+    expect(store.error).toBeNull()
+    expect(store.refused).toBe(false)
+    expect(store.policies).toHaveLength(101)
+    expect(store.policies.map((p) => p.name)).toEqual(
+      Array.from({ length: 101 }, (_, i) => `policy-${i}`),
+    )
+    expect(store.total).toBe(101)
   })
 })
