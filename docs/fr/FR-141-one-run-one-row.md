@@ -47,12 +47,12 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   that many single-use tokens (`:985-1004`). Each half counts against the device cap
   (`docs/fr/FR-129-guided-cross-platform-installer.md:580-584`).
 - One run: the root half enrolls in the wizard's process as `<name>-daemon` (`role.rs:142-147`) under a machine id
-  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:876-925`); one administrator prompt runs the
+  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:877-926`); one administrator prompt runs the
   privileged half (marker, package, config placed, daemon started: `scripts/install.sh:886-893`, `:951-985`); the
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:940-949`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2016-2053`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2466-2515`). `install.sh --one-row` is
   the one-token path (`install.sh:993-1089`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
   (`docs/installation.md:2146-2150`).
@@ -152,7 +152,7 @@ person's half on it and says why.
     stop can still show). It promises no layout: with P2's switch on, Setup gives a new Mac one device and no two-row
     choice, so "two devices" would be true only while the switch is off. A Mac that `sudo roomlerd
     one-row` made one row is also offered `sudo roomlerd one-row --revert`, but only while root's copy from before,
-    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:64-82`): only that command
+    `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:66-84`): only that command
     writes it, a finished revert removes it (`:2695-2700`), and with no copy the revert says only "nothing to revert"
     (`:2730-2735`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
