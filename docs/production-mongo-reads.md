@@ -422,10 +422,15 @@ lines the seed put in the window and none of the others, the late-stored line in
 read, with no address and no 24-hex id in it. The seed was loaded with mongosh, not through
 `--seed`. The `--mars` branch has not run against production.
 
-**The kind-aware read has not run on a database yet (FR-148 AC4).** Its `$switch` has run only in
-the self-test, which evaluates the read's two `$project` stages as the server would
-(`serverRows`, `scripts/rc-path-timeline.cjs:1717`) on synthetic agent lines, the /derp lines
-among them with a relay host, a relay address and a failed connect's error, and renders what comes
-back through `--rows` and the report. The match, the sort, the index and the stage list are the
-ones rehearsed above. §8's seed (`rc-path-report.cjs --fixtures`) has no /derp line and no
-`loss`, so a rehearsal of this read needs them added to it.
+**The kind-aware read, rehearsed on a real server (FR-148 AC4, 2026-11-21).** The self-test
+evaluates the read's two `$project` stages as the server would (`serverRows`,
+`scripts/rc-path-timeline.cjs:1717`) on synthetic agent lines, the /derp lines among them with a
+relay host, an IPv4 and an IPv6 relay address and a failed connect's error, and renders what comes
+back through `--rows` and the report. The same lines, with two lines the read must not take, went
+as 8 batches through `--seed` into a throwaway local mongo:7 (7.0.40). The server's rows, read
+before any cut of the client's, equal the self-test's evaluation row for row and field for field
+(11 rows). No relay host, address or error text was in them, in `--rows` or in the report, and
+`--explain` printed `PROJECTION_SIMPLE <- FETCH <- IXSCAN(tenant_id_1_agent_id_1_created_at_-1)`
+with no blocking SORT stage. That seed was written for the rehearsal: §8's seed
+(`rc-path-report.cjs --fixtures`) still has no /derp line and no `loss`, so a re-run needs them
+added to it. This read has not run against production.
