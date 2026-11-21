@@ -130,3 +130,14 @@ export function createDirListing(deps: DirListingDeps) {
 
   return { listDir, onFilesMessage }
 }
+
+/** The drawer's navigations (#4121): `begin()` at each one, whose answer
+ *  changes the drawer while the check it returns says so. Every navigation's
+ *  answer applies, so a folder answered after a later one replaces it. */
+export function createLatest(): { begin(): () => boolean } {
+  return {
+    begin() {
+      return () => true
+    },
+  }
+}
