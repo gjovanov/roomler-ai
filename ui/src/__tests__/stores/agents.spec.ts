@@ -1088,3 +1088,92 @@ describe('useAgentStore', () => {
     expect(rc.state).toBe('needs_restart')
   })
 })
+
+// #4248 — the store holds one org's devices at a time, and knows which. A
+// page that only names or picks devices asks with `ensureAgents`, which
+// fetches only when the store does not hold that org's devices.
+describe('useAgentStore: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const listOf = (ids: string[]) => ({
+    items: ids.map((id) => mkAgent({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    total_pages: 1,
+  })
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it("asked for org B while holding org A's: one fetch, for org B", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.fetchAgents(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['b1']))
+    await s.ensureAgents(ORG_B)
+    expect(asked()).toEqual([
+      `/tenant/${ORG_A}/agent?per_page=100`,
+      `/tenant/${ORG_B}/agent?per_page=100`,
+    ])
+    expect(s.agents.map((a) => a.id)).toEqual(['b1'])
+    expect(s.agentsTenantId).toBe(ORG_B)
+  })
+
+  it("asked for org A while holding org A's, or loading them: no fetch", async () => {
+    const s = useAgentStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = s.fetchAgents(ORG_A)
+    await s.ensureAgents(ORG_A)
+    answer(listOf(['a1']))
+    await first
+    await s.ensureAgents(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/agent?per_page=100`])
+    expect(s.agents.map((a) => a.id)).toEqual(['a1'])
+  })
+
+  it('an org with no devices is held too; the empty-list check it replaces asked every time', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf([]))
+    await s.ensureAgents(ORG_A)
+    await s.ensureAgents(ORG_A)
+    expect(mockApi.get).toHaveBeenCalledTimes(1)
+  })
+
+  it('asked again after a failed fetch: fetches', async () => {
+    const s = useAgentStore()
+    mockApi.get.mockRejectedValueOnce(new Error('network'))
+    await s.fetchAgents(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.ensureAgents(ORG_A)
+    expect(mockApi.get).toHaveBeenCalledTimes(2)
+    expect(s.agents.map((a) => a.id)).toEqual(['a1'])
+    expect(s.error).toBeNull()
+  })
+
+  it("a fetch for org B drops org A's devices at once, and org A's late answer", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await s.fetchAgents(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = s.fetchAgents(ORG_A)
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = s.fetchAgents(ORG_B)
+    expect(s.agents).toEqual([])
+    expect(s.total).toBe(0)
+
+    answerB(listOf(['b1']))
+    await loadB
+    lateA(listOf(['a1', 'a2']))
+    await refreshA
+    expect(s.agents.map((a) => a.id)).toEqual(['b1'])
+    expect(s.total).toBe(1)
+    expect(s.loading).toBe(false)
+  })
+})

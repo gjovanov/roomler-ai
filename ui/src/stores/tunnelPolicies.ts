@@ -152,14 +152,34 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
   /** The list stopped at the page cap (`MAX_PAGES` in utils/allPages.ts)
    *  while the server holds more policies: the tab says how many it shows. */
   const truncated = ref(false)
+  /** #4248 — which org `policies` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's policies never show under another org's page, and a save or a
+   *  delete answered for another org leaves this org's list as it is. */
+  const policiesTenantId = ref<string | null>(null)
+  // Only the latest fetch writes, the refusal included: the answer for an org
+  // asked before it (the page moved on to another org) is dropped.
+  let seq = 0
+  /** A save or a delete answered for `tenantId` touches the list only when the
+   *  list is not another org's. */
+  const listIsOf = (tenantId: string) =>
+    policiesTenantId.value === null || policiesTenantId.value === tenantId
 
   async function fetchPolicies(tenantId: string) {
+    const mySeq = ++seq
+    if (policiesTenantId.value !== null && policiesTenantId.value !== tenantId) {
+      policies.value = []
+      total.value = 0
+    }
+    policiesTenantId.value = tenantId
     loading.value = true
     error.value = null
     refused.value = false
     truncated.value = false
     try {
-      if (!(await mayManageTunnelPolicies(tenantId))) {
+      const may = await mayManageTunnelPolicies(tenantId)
+      if (mySeq !== seq) return
+      if (!may) {
         refused.value = true
         policies.value = []
         total.value = 0
@@ -170,16 +190,18 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
       const all = await fetchAllPages<TunnelPolicy, TunnelPolicyListResponse>(
         `/tenant/${tenantId}/tunnel-policy`,
       )
+      if (mySeq !== seq) return
       policies.value = all.items
       total.value = all.last.total
       truncated.value = all.truncated
     } catch (e) {
+      if (mySeq !== seq) return
       if (isRefusal(e)) refused.value = true
       else error.value = (e as Error).message
       policies.value = []
       total.value = 0
     } finally {
-      loading.value = false
+      if (mySeq === seq) loading.value = false
     }
   }
 
@@ -191,8 +213,10 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
       `/tenant/${tenantId}/tunnel-policy`,
       body,
     )
-    policies.value = [created, ...policies.value]
-    total.value += 1
+    if (listIsOf(tenantId)) {
+      policies.value = [created, ...policies.value]
+      total.value += 1
+    }
     return created
   }
 
@@ -206,12 +230,13 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
       body,
     )
     const idx = policies.value.findIndex((p) => p.id === policyId)
-    if (idx >= 0) policies.value[idx] = updated
+    if (listIsOf(tenantId) && idx >= 0) policies.value[idx] = updated
     return updated
   }
 
   async function deletePolicy(tenantId: string, policyId: string): Promise<void> {
     await api.delete(`/tenant/${tenantId}/tunnel-policy/${policyId}`)
+    if (!listIsOf(tenantId)) return
     policies.value = policies.value.filter((p) => p.id !== policyId)
     total.value = Math.max(0, total.value - 1)
   }
@@ -223,6 +248,7 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
     error,
     refused,
     truncated,
+    policiesTenantId,
     fetchPolicies,
     createPolicy,
     updatePolicy,

@@ -43,15 +43,25 @@ export const useMembersStore = defineStore('members', () => {
   const totalPages = ref(1)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4248 — which org `items` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's people never show (or fill a picker) under another org's page. */
+  const membersTenantId = ref<string | null>(null)
 
   // Stale-response guard: a slow page-1 response must not clobber a fast
-  // page-2 one (same pattern as the devices grid store).
+  // page-2 one (same pattern as the devices grid store), nor a slow answer
+  // for the org asked before it the new org's (#4248).
   let seq = 0
 
   async function fetchMembers(tenantId: string, opts: MemberFetchOpts | number = {}) {
     // Back-compat: the pre-FR-11 signature was (tenantId, page).
     const o: MemberFetchOpts = typeof opts === 'number' ? { page: opts } : opts
     const mySeq = ++seq
+    if (membersTenantId.value !== null && membersTenantId.value !== tenantId) {
+      items.value = []
+      total.value = 0
+    }
+    membersTenantId.value = tenantId
     loading.value = true
     error.value = null
     try {
@@ -119,6 +129,7 @@ export const useMembersStore = defineStore('members', () => {
     totalPages,
     loading,
     error,
+    membersTenantId,
     fetchMembers,
     addByEmail,
     removeMember,

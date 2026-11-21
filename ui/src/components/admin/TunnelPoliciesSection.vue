@@ -463,7 +463,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
   type DestinationRule,
   type HostPattern,
@@ -807,16 +807,38 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
 }
 
-onMounted(async () => {
-  await store.fetchPolicies(props.tenantId)
+async function load(tenantId: string) {
+  await store.fetchPolicies(tenantId)
+  // The org changed while the list was loading: the load for the new org
+  // owns the tab, and this one must not go on to fill the pickers with the
+  // previous org's rows (#4248).
+  if (tenantId !== props.tenantId) return
   // The pickers' data serves the editor only: a caller who may not manage
   // the policies gets no editor, so nothing is fetched for it.
   if (store.refused) return
-  roleStore.fetchRoles(props.tenantId)
-  membersStore.fetchMembers(props.tenantId)
-  if (agentStore.agents.length === 0) agentStore.fetchAgents(props.tenantId)
-  if (tunnelClientStore.clients.length === 0) {
-    tunnelClientStore.fetchTunnelClients(props.tenantId)
-  }
-})
+  roleStore.fetchRoles(tenantId)
+  membersStore.fetchMembers(tenantId)
+  // The shell loads the devices for its nav and the Devices page the tunnel
+  // clients: each is fetched only when its store does not hold this org's.
+  void agentStore.ensureAgents(tenantId)
+  void tunnelClientStore.ensureTunnelClients(tenantId)
+}
+
+// #4248 — the tab follows its org. The route reuses this section when only
+// the tenant id in the URL changes, so a load in onMounted alone kept the
+// previous org's policies and pickers under the new org's URL. An editor or a
+// delete prompt open on the previous org's policy is closed: its save would go
+// to the new org.
+watch(
+  () => props.tenantId,
+  (tenantId, previous) => {
+    if (previous !== undefined) {
+      editDialog.value = false
+      deleteDialog.value = false
+      deleteTarget.value = null
+    }
+    void load(tenantId)
+  },
+  { immediate: true },
+)
 </script>
