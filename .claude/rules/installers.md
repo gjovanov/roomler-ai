@@ -170,6 +170,17 @@ log: the properties are hidden, the lines name entries.
 over any entry of the same name, so a new installer-written value would lose to the old one on every
 upgrade. And a carried entry the NEW release cannot start with now fails the upgrade where it used to be
 dropped: `EnableSystemContext` is `Return="check"` and waits 120 s for RUNNING (`docs/installation.md`).
+⚠️ **The per-Machine MSI takes the boot-time deletes of the files it leaves in place back out of
+`PendingFileRenameOperations` and `PendingFileRenameOperations2`** (#4196, `docs/installation.md`). A handle
+that does not share delete on `roomlerd.exe` during the old product's removal makes Windows Installer schedule
+a delete of the install path, and the new product's copy does not cancel it: the next boot deleted the daemon
+(SCM 7000). `ListInstalledFiles` (immediate, after `InstallValidate`) and `SpareInstalledFiles` (deferred,
+LocalSystem, after `InstallFiles`) stay `Return="ignore"` and never run on an uninstall. The spare takes out a
+DELETE only, and only of a listed path compared by EQUALITY (a prefix match would take `roomlerd.exe2`); it
+keeps a delete that a later rename onto the same path completes, never touches a rename, and writes every other
+operation back byte for byte. Read the values raw: their empty strings are the deletes, which `split_multi_sz`
+drops. Its name sorts after `RegisterService` on purpose (WiX numbers the actions after `InstallFiles` by
+name), and installer-smoke's held upgrade fails on any boot-time delete it leaves in the install folder.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
 ⚠️ **`AutostartBackOnRollback` and `DaemonBackOnRollback` stay ahead of `RemoveExistingProducts`.** A
