@@ -1778,7 +1778,10 @@ impl RateGovernor {
                     // FR-148 P0 — with the switch off it gets here unoffered, and
                     // is then application-limited (the jupiter chain's trickle).
                     let basis = Basis::of_window(offer_held);
-                    self.belief.observe_capacity_in(rx_bps, basis, take, now);
+                    // FR-148 D48 — the window's own delivery: near a loss the
+                    // shadow model's window rules read it (rules 2 and 3).
+                    self.belief
+                        .observe_link_capacity_in(rx_bps, basis, take, now);
                     self.link_rx_bps = Some((rx_bps, now));
                     self.path.link_rx = basis;
                 }
@@ -2266,6 +2269,8 @@ impl RateGovernor {
             model_stand_in: model.stand_in(prior, now).map(aged),
             model_floor_by: model.floor_by(),
             model_capacity_by: model.capacity_by(now),
+            model_ruled: self.belief.ruled(now),
+            model_fell: model.fell(now),
         }
     }
 
@@ -2288,6 +2293,27 @@ impl RateGovernor {
     /// ([`super::pipe::Pipe::note_stall`]). Nothing else moves.
     pub fn note_path_stall(&mut self) {
         self.belief.note_stall();
+    }
+
+    /// FR-148 D48 — a sample rule acted on a closed sample, at the pump's
+    /// heartbeat: rule 1 re-read its P3 push-back at the budget's rate, or
+    /// rule 4 kept it out. The `path model` line names it
+    /// ([`super::pipe::Pipe::note_ruled`]) when the push-back would have
+    /// reached the shadow model: after a window the gate rejected B2 files
+    /// none ([`Self::on_sample_push_back`]), so no rule acted on one.
+    pub fn on_sample_ruled(&mut self, rule: super::pipe::Ruled, now: Instant) {
+        if self.sample_take.is_some() {
+            self.belief.note_ruled(rule, now);
+        }
+    }
+
+    /// FR-148 D48 — the in-flight budget's last step, computing on or in
+    /// shadow, beside its stall mark ([`Self::note_path_stall`]): its rate,
+    /// whether this association's figures gave it, and SCTP's loss count. The
+    /// shadow model's window rules read it at the next window's close
+    /// ([`super::pipe::Pipe::note_path_rate`]). Nothing else moves.
+    pub fn note_path_rate(&mut self, rate: super::pipe::PathRate) {
+        self.belief.note_path_rate(rate);
     }
 
     /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged
@@ -6175,6 +6201,61 @@ mod tests {
         assert_eq!(s.g.belief_bps(s.t).1, Some(1_500_000), "Pipe's own floor");
         s.window(187_500, Some(28), more, false);
         assert_eq!(model(&s).0, Some(1_500_000));
+    }
+
+    /// FR-148 D50 — the `path model` line's last fall comes from the shadow
+    /// model through `path_view`. With no rate noted (the in-flight budget
+    /// off) two delivery samples' push-backs under the floor are damped and
+    /// read no fall; with the budget's measured rate noted under the floor,
+    /// the next one is a fall, and the view carries the floor before and
+    /// after, and its age as it grows. `Pipe`'s own numbers do not move, and
+    /// the heartbeat's are the view's at every window (`same_numbers`).
+    #[test]
+    fn the_path_view_carries_the_models_last_fall() {
+        use crate::encode::pipe::{Fall, PathRate, PushedBy};
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let link = viewer_rate::pack_link(2_000_000, 0);
+        for _ in 0..5 {
+            s.window(250_000, Some(28), link, false);
+        }
+        let v = s.g.path_view(s.t, None);
+        assert_eq!(
+            (v.model_floor.map(|f| f.bps), v.model_fell),
+            (Some(2_000_000), None)
+        );
+        let own = s.g.belief_bps(s.t);
+        for want in [1_500_000, 1_250_000] {
+            s.t += Duration::from_secs(2);
+            s.g.on_sample_push_back(1_000_000, PushedBy::P3, s.t);
+            let v = s.g.path_view(s.t, None);
+            assert_eq!(
+                (v.model_floor.map(|f| f.bps), v.model_fell),
+                (Some(want), None)
+            );
+        }
+        s.g.note_path_rate(PathRate {
+            bps: Some(1_020_000),
+            measured: true,
+            loss: 0,
+        });
+        s.t += Duration::from_secs(2);
+        s.g.on_sample_push_back(1_000_000, PushedBy::P3, s.t);
+        let v = s.g.path_view(s.t, None);
+        let floor = v.model_floor.expect("a floor");
+        assert_eq!((floor.bps, floor.word()), (1_020_000, "backlogged"));
+        assert_eq!(v.model_floor_by, Some(PushedBy::P3));
+        let fall = Fall {
+            from_bps: 1_250_000,
+            to_bps: 1_020_000,
+            age: Duration::ZERO,
+        };
+        assert_eq!(v.model_fell, Some(fall));
+        let later = s.t + Duration::from_millis(3_400);
+        let aged = s.g.path_view(later, None).model_fell.map(|f| f.age);
+        assert_eq!(aged, Some(Duration::from_millis(3_400)));
+        assert_eq!(s.g.belief_bps(s.t), own, "Pipe's own numbers");
+        same_numbers(&s.g, s.t);
     }
 
     /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:

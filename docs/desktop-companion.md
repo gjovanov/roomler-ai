@@ -40,7 +40,7 @@ flowchart LR
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
 and the daemon's own account** in full and **Interactive Users** reading and writing data
-only, at medium integrity (`crates/localapi/src/lib.rs:4475-4476`): any person logged in at
+only, at medium integrity (`crates/localapi/src/lib.rs:4514-4515`): any person logged in at
 the machine can call it, but only the first three add an instance of the pipe, and a
 sandboxed low-integrity process cannot call it. Everything
 below that lets the companion *change* something is therefore something any interactive user
@@ -118,11 +118,11 @@ sequenceDiagram
    flow id (`routeRows`, `:55`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4575`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4614`)
    binds the first instance (retrying while another process holds the name), then runs a
-   pool of accept tasks (`accept_pipe`, `:4689`), each owning one listening instance and
+   pool of accept tasks (`accept_pipe`, `:4728`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
-   (`DEFAULT_PIPE_POOL`, `:4428`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
+   (`DEFAULT_PIPE_POOL`, `:4467`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
    switch** and reproduces the old single-instance behaviour.
 3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:5762`) retries a
    busy pipe at 5, 10, 20, 40, 80, 160 ms (≤ 315 ms in total); any other error (the daemon
@@ -306,7 +306,7 @@ compile.
   (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
   configuration — the listing, with every key it will not set marked
   `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
-  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`;
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3536`;
   the device-owned gates are not among them) — and the page shows the Mac as one device:
   each row comes from, and a change goes to, the half that READS the key. The split is the
   key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`):
@@ -569,7 +569,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:5649`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:5688`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -580,7 +580,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1779`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1818`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -700,7 +700,7 @@ struck through, and how long the probe took.
   since #4020 (§3.1); so does the Incoming files card (§9).
 - **A Linux system install** (#3831). The companion runs as the person and reaches the root
   daemon over its person socket (§12), which serves `EncoderCaps` as well (`person_may`,
-  `crates/localapi/src/lib.rs:3743`): the answer is the cached summary
+  `crates/localapi/src/lib.rs:3782`): the answer is the cached summary
   (`caps::summarize_cached`, `agents/roomlerd/src/encode/caps.rs:298`), so the verb starts no
   probe and changes nothing on the host. Up to 0.4.222 the socket refused it, and the card read
   **Error**. On such a daemon a newer companion reads **Unavailable**: "The encoders are shown
@@ -1035,7 +1035,7 @@ flowchart TD
 | The lookup | `seat_within` (`:1074`), `SEAT_LOOKUP_WAIT` (`:1043`), `FsAs::CannotTell` (`:333`), `linux_fs_as_within` (`:1016`), one lookup in flight `SEAT0` (`:1052`, `OneInFlight`, `agents/roomlerd/src/one_in_flight.rs:72`) | logind and the account database are other processes: the lookup runs on a thread of its own, never a stalled async worker, and each caller waits for it 1.5 s. #3796 — one lookup at a time, on a thread named `seat0-lookup`: a caller who asks while one runs waits on it, within its own 1.5 s, and starts none of its own, so retries during a hang hold one thread, not one each. A caller takes only the answer of a lookup that began at or after it asked (the list below says why). A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:5117`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:5032`), or systemd did not boot the host (`loginctl_failed`, `:5048`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:865`): the read is refused with its own text either way, logged |
 | A received file's lookup (#3711) | `FsAs::for_write` (`:502`), from `FilesHandler::begin` (`:2440`), `FilesHandler::resume_incoming` (`:3209`) and `sweep_orphans` (`:1775`) | the same path as a read's, with the same wait. These three asked inline on the async worker, with no time limit, so a slow account database (SSSD or LDAP refreshing a large group list) stalled that worker for as long as the lookup took, and the startup sweep, which signalling waits for, held the daemon's start as long. What a received file takes with each answer is in the list below |
 | A files folder's set (#3769) | `FilesDirSet` (`files.rs:1386`): `check` (`:1400`), `saved` (`:1430`), `refresh_status` (`:1440`), from `config_set` (`agents/roomlerd/src/localapi_state.rs:1444`) | a `ConfigSet` of `files_dir` asks who a drop would be written as once, as a received file asks it, and runs §9's set-time check for and as that person before it takes the config write lock (`:1464`, the lock `:1471`). Under the lock are only the load, the change, the save and the live folder. The status answer is recomputed for the same person after the lock (`:1545`), and published only while what the set saved is still the configured value (`publish_effective`, `files.rs:1285`), so an earlier set's late answer never shows after a later set. Both checks used to ask under the lock with no time limit, so a slow logind or account database held every other config read and write behind it. What a set answers is in the list below |
-| The person socket's check (#3796) | `person_socket::at_the_seat_now` (`agents/roomlerd/src/person_socket.rs:499`), its own lookup in flight `PERSON_AT_SEAT0` (`:527`), from the dispatch (`crates/localapi/src/lib.rs:4177`) | before it applies a `ConfigSet`, the person-at-the-device socket asks again whether its caller is still the person at seat0 (#2871's review). That is logind's answer, so it is asked as a received file's is: one lookup in flight (`seat0-person`), 1.5 s at most. It used to wait as long as logind took, a blocking thread for each request. With no answer in time the set is refused with "Could not tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`, `crates/localapi/src/lib.rs:3873`), the text a read or a received file gets then, never "the seat changed". #3845 — the socket's 5 s poll, which moves it to whoever is at the seat, now asks through the same lookup in flight, 5 s at most. A look that cannot tell keeps the socket where it is, and a consent answer is checked as a set is (§12.3) |
+| The person socket's check (#3796) | `person_socket::at_the_seat_now` (`agents/roomlerd/src/person_socket.rs:499`), its own lookup in flight `PERSON_AT_SEAT0` (`:527`), from the dispatch (`crates/localapi/src/lib.rs:4216`) | before it applies a `ConfigSet`, the person-at-the-device socket asks again whether its caller is still the person at seat0 (#2871's review). That is logind's answer, so it is asked as a received file's is: one lookup in flight (`seat0-person`), 1.5 s at most. It used to wait as long as logind took, a blocking thread for each request. With no answer in time the set is refused with "Could not tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`, `crates/localapi/src/lib.rs:3912`), the text a read or a received file gets then, never "the seat changed". #3845 — the socket's 5 s poll, which moves it to whoever is at the seat, now asks through the same lookup in flight, 5 s at most. A look that cannot tell keeps the socket where it is, and a consent answer is checked as a set is (§12.3) |
 | The status answer (#3796) | `spawn_effective_refresh` (`files.rs:1326`), `refresh_effective_files_dir_as` (`:1267`), `FsAs::now` (`:449`), the read `effective_files_dir` (`:1236`) | the card's folder comes from one background refresh at a time, which asks who a drop would be written as. It asked seat0 inline, with no time limit: while a lookup hung the refresh never finished, and the card kept the folder it showed before, perhaps for a person who had left. It now asks through `SEAT0`, 1.5 s at most. With no answer in time it publishes the folder as pending (no folder, not fresh: #3769's shape), and the next status read starts another refresh, which waits on the same lookup. The status read itself answers from its cache and never waits for a lookup |
 | How | `FsIdentity::begin_reading` (`agents/roomlerd/src/fs_identity.rs:233`), from `run_here` (`files.rs:754`) | §9.1's fsuid, fsgid and groups, and the thread's effective capabilities emptied for the step. An fsuid that is not 0 takes away only the file-system capabilities, and the rest would still answer for root wherever a check asks for one. The drop gives the capabilities back first (the groups' restore needs `CAP_SETGID`), then the identity, then the capabilities again, and checks all of it: a thread it cannot restore aborts the daemon |
 | Exec and SSH as `console_user` (#3822) | `exec::console_account` (`agents/roomlerd/src/exec.rs:919`), `exec::console_person` (`agents/roomlerd/src/exec.rs:972`), through `ask_seat0` (`agents/roomlerd/src/files.rs:1061`) | Fleet RPC's exec, SSH's exec and shell, and SFTP find the person at the screen through the same lookup in flight, `SEAT0`, 1.5 s at most, awaited from their own task. They used to run `loginctl` inline on the async worker, with no time limit. Only `Seat::Person` is an account. No answer in time, or a lookup that failed, refuses with the try-again text; nobody and root at the screen refuse. Nothing else stands in for the person. Details: `docs/roomler-ssh.md` § `console_user` on Linux and macOS |
@@ -2083,7 +2083,7 @@ relay can work:
 | the screen worker's list | its own questions, then the root half's, asked over the root daemon's person socket for this person, 1 s at most (`RELAY_WITHIN`). A root half that is gone (no socket for this person, or nothing listening on it) or refuses the list leaves the worker's own list, at once. Since #4011 a list the root half misses (no answer within 1 s, or any other failure) keeps the root half's last list in its place, without a question past its deadline or, since #4027, one the root half took an answer for (next row), for 10 s from that list's answer at most (`ROOT_LIST_KEPT_FOR`, the companion's own `QUESTIONS_KEPT_FOR`, §10.9.2); until #4011 a miss listed the worker's own questions alone, so the app's prompt went down for a poll and came back placed anew | `consent_pending_view`, [`localapi_state.rs:2238`](../agents/roomlerd/src/localapi_state.rs#L2238); `Relay::listed`, [`consent_relay.rs:213`](../agents/roomlerd/src/consent_relay.rs#L213), and the kept list's rule, `through_a_miss`, [`:296`](../agents/roomlerd/src/consent_relay.rs#L296); the ask's three outcomes, `machine_reply`, [`person_socket.rs:398`](../agents/roomlerd/src/person_socket.rs#L398) |
 | the screen worker's answers | an answer to a question its own broker is not asking goes to the root half, 5 s at most (`DECIDE_WITHIN`). The root half's refusal comes back in its own words, and no answer is refused with a try-again. Since #4027 an answer the root half took (`ConsentDecided { ok: true }`) takes its question off the kept list at once, so the misses after it no longer list it. The root half's `ok: false`, its refusal and no answer leave that list as it was (below) | `consent_decide_view`, [`localapi_state.rs:2250`](../agents/roomlerd/src/localapi_state.rs#L2250); `Relay::decided`, [`consent_relay.rs:226`](../agents/roomlerd/src/consent_relay.rs#L226), which takes the question off (`answer_taken`, [`:338`](../agents/roomlerd/src/consent_relay.rs#L338)); `decided`, [`:359`](../agents/roomlerd/src/consent_relay.rs#L359) |
 | the worker's word | `relay-consent` in its caps frames, the first and the one it sends again when the person's recording gates change, said only by a worker with no enrollment. The daemon keeps it as a known word, and it goes with the channel | [`delegate_worker.rs:428`](../agents/roomlerd/src/delegate_worker.rs#L428), [`:611`](../agents/roomlerd/src/delegate_worker.rs#L611); `worker_features`, [`delegate.rs:233`](../agents/roomlerd/src/delegate.rs#L233); `relays_consent`, [`:2035`](../agents/roomlerd/src/delegate.rs#L2035) |
-| the LocalAPI | a list and an answer are the daemon's views, `consent_pending_view` and `consent_decide_view`, on its own endpoint and on the person socket alike, after the same gates. Their defaults are the daemon's own lists | [`crates/localapi/src/lib.rs:4088`](../crates/localapi/src/lib.rs#L4088), [`:4199`](../crates/localapi/src/lib.rs#L4199), [`:4218`](../crates/localapi/src/lib.rs#L4218); the defaults, [`:3075`](../crates/localapi/src/lib.rs#L3075) and [`:3083`](../crates/localapi/src/lib.rs#L3083) |
+| the LocalAPI | a list and an answer are the daemon's views, `consent_pending_view` and `consent_decide_view`, on its own endpoint and on the person socket alike, after the same gates. Their defaults are the daemon's own lists | [`crates/localapi/src/lib.rs:4127`](../crates/localapi/src/lib.rs#L4127), [`:4238`](../crates/localapi/src/lib.rs#L4238), [`:4257`](../crates/localapi/src/lib.rs#L4257); the defaults, [`:3114`](../crates/localapi/src/lib.rs#L3114) and [`:3122`](../crates/localapi/src/lib.rs#L3122) |
 | the root daemon's verdict | the app is a question's surface only while the road is open: a worker is attached that said `relay-consent`, its account is known, and the person socket for that account answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (#3983, below). Since #4140 a closed road is kept apart from a tray that is not up (`TrayVerdict::RoadClosed`), so an exec or SSH question that no surface showed names it (the floor, below) | `reaches_the_tray`, [`companion.rs:2460`](../agents/roomlerd/src/companion.rs#L2460), asked by `TrayVerdict::of_a_tray` ([`:1206`](../agents/roomlerd/src/companion.rs#L1206)) for `ensure_running_verdict` ([`:1181`](../agents/roomlerd/src/companion.rs#L1181)), which `ensure_running` reads, and for `verdict_for_a_question` ([`:1359`](../agents/roomlerd/src/companion.rs#L1359)), which `up_for_a_question` reads; `reach_from`, [`consent_relay.rs:418`](../agents/roomlerd/src/consent_relay.rs#L418); the host is registered by `set_one_row`, [`delegate.rs:1320`](../agents/roomlerd/src/delegate.rs#L1320) |
 
 ```mermaid
@@ -2113,8 +2113,8 @@ sequenceDiagram
   `/var/run/roomler-person/<uid>.sock` (FR-97 P2g). That socket is served for `/dev/console`'s owner alone
   ([`person_socket.rs:435`](../agents/roomlerd/src/person_socket.rs#L435)). It drops every connection whose kernel
   uid is neither that person's nor root's (`person_peer_ok`,
-  [`crates/localapi/src/lib.rs:5108`](../crates/localapi/src/lib.rs#L5108), applied at `:5290`). It is 0600 and the
-  person's, in a folder only root writes (`:5420`). An answer is taken only after the seat is asked again (#3845).
+  [`crates/localapi/src/lib.rs:5147`](../crates/localapi/src/lib.rs#L5147), applied at `:5329`). It is 0600 and the
+  person's, in a folder only root writes (`:5459`). An answer is taken only after the seat is asked again (#3845).
   The worker's own socket is 0600 in the person's private temporary folder. Nothing is written anywhere: the root's
   folder stays in root's home.
 - **The floor is every host's.** With the road closed, the app is not the question's surface: no
@@ -2247,7 +2247,7 @@ says so to the root half. The root half counts the app only while that announcem
 |---|---|---|
 | the per-user half's list and answers | as §10.8's worker: its own questions, then the root half's, over the root half's person socket for this person, 1 s at most. Since #4011 a list the root half misses keeps the root half's last list, 10 s from its answer at most, and one that proves it gone or refuses takes those questions off at once (§10.8). An answer to an id its own broker is not asking goes to the root half, 5 s at most, and since #4027 one the root half took takes its question off that kept list at once (§10.8). Every Mac daemon that runs as a person relays: a one-row Mac's worker and a two-row Mac's per-user half | `relays_the_root_half`, [`localapi_state.rs:711`](../agents/roomlerd/src/localapi_state.rs#L711); `consent_pending_view`, [`:2238`](../agents/roomlerd/src/localapi_state.rs#L2238); `consent_decide_view`, [`:2250`](../agents/roomlerd/src/localapi_state.rs#L2250) |
 | the announcement | a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) says `consent_relaying` over the root half's person socket for its person, then holds that connection. It dials again after the connection ends or a dial finds no socket: 1 s, doubling to 5 s while the root half is out of reach. A root half that refused, and whose connection then ended within 30 s (`HELD_STEADY`), is dialled on that backoff too: at an update the per-user half restarts about 3 s before the root half and meets the old one. Only a second such refusal in a row, with no take between them, waits a minute (`ANNOUNCE_AFTER_A_REFUSAL`, [`consent_relay.rs:639`](../agents/roomlerd/src/consent_relay.rs#L639); the dial's end, [`:685`](../agents/roomlerd/src/consent_relay.rs#L685)). Each change of state is logged once, never a retry | `keep_telling`, [`consent_relay.rs:663`](../agents/roomlerd/src/consent_relay.rs#L663); `tell_the_root_half`, [`:857`](../agents/roomlerd/src/consent_relay.rs#L857); started by `person_socket::run`, [`person_socket.rs:759`](../agents/roomlerd/src/person_socket.rs#L759), for `announces_consent_relay`, [`localapi_state.rs:2273`](../agents/roomlerd/src/localapi_state.rs#L2273) |
-| what the root half keeps | the announcement, in memory, for as long as that connection stays open. It is taken only on the person socket and only from that socket's own person, never root. The connection's loop holds it, and it ends when the per-user half closes the connection (it stopped or restarted), or when the listener stops serving the connection (the seat changed, or the daemon is stopping) | `Request::ConsentRelaying`, [`crates/localapi/src/lib.rs:1485`](../crates/localapi/src/lib.rs#L1485); the dispatcher's arm, [`:4095`](../crates/localapi/src/lib.rs#L4095); `HeldForTheConnection`, [`:2991`](../crates/localapi/src/lib.rs#L2991); `Announcements`, [`consent_relay.rs:544`](../agents/roomlerd/src/consent_relay.rs#L544); `consent_relaying`, [`localapi_state.rs:2266`](../agents/roomlerd/src/localapi_state.rs#L2266) |
+| what the root half keeps | the announcement, in memory, for as long as that connection stays open. It is taken only on the person socket and only from that socket's own person, never root. The connection's loop holds it, and it ends when the per-user half closes the connection (it stopped or restarted), or when the listener stops serving the connection (the seat changed, or the daemon is stopping) | `Request::ConsentRelaying`, [`crates/localapi/src/lib.rs:1524`](../crates/localapi/src/lib.rs#L1524); the dispatcher's arm, [`:4134`](../crates/localapi/src/lib.rs#L4134); `HeldForTheConnection`, [`:3030`](../crates/localapi/src/lib.rs#L3030); `Announcements`, [`consent_relay.rs:544`](../agents/roomlerd/src/consent_relay.rs#L544); `consent_relaying`, [`localapi_state.rs:2266`](../agents/roomlerd/src/localapi_state.rs#L2266) |
 | the root half's verdict | the app is a question's surface only while an announcement is live for the person at the screen and that person's socket answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (§10.8, #3983) | `reach`, [`consent_relay.rs:472`](../agents/roomlerd/src/consent_relay.rs#L472); `reach_two_rows`, [`:522`](../agents/roomlerd/src/consent_relay.rs#L522); `reaches_the_tray`, [`companion.rs:2460`](../agents/roomlerd/src/companion.rs#L2460) |
 
 ```mermaid
@@ -2281,7 +2281,7 @@ sequenceDiagram
   only when the kernel's uid for the connection is the socket's own person; root is refused. Nothing is
   written anywhere: the root half keeps the announcement in memory, for the connection's life. The
   person socket holds an idle connection with no deadline (`serve_person_listener`,
-  [`crates/localapi/src/lib.rs:5259`](../crates/localapi/src/lib.rs#L5259)), so a held one does not
+  [`crates/localapi/src/lib.rs:5298`](../crates/localapi/src/lib.rs#L5298)), so a held one does not
   flap and needs no keepalive. It still ends when the seat moves, since the listener aborts every
   connection it holds.
 - **The floor.** The app is not counted when no announcement is live, or when the person socket does
@@ -2508,7 +2508,7 @@ No step of a click said anything, and none had a bound:
 | the page's `decide()` | left early, without a word, while an earlier answer was "on its way" or after the page had let go of the question |
 | the page's words | "Approving…" and "Failed: …" went into the countdown, which repaints every second |
 | the app's `consent_decide` | no line on any outcome |
-| the LocalAPI reply | read with no deadline (`Client::request`, [`crates/localapi/src/lib.rs:6058`](../crates/localapi/src/lib.rs#L6058)) |
+| the LocalAPI reply | read with no deadline (`Client::request`, [`crates/localapi/src/lib.rs:6097`](../crates/localapi/src/lib.rs#L6097)) |
 | the page's read of the questions | a failure read as "no question": the page let go of the question while it stayed on screen |
 
 The answer never reached the daemon: 0.4.221 answers a `ConsentDecide` at once, and logs a
@@ -2731,8 +2731,8 @@ was for the tray (FR-85).
 
 `connect` returns its last endpoint's error, and a running daemon's system socket answers the
 person `PermissionDenied` as well. So the own endpoint decides, asked again when a connect fails
-(`own_endpoint_gone`, [`crates/localapi/src/lib.rs:6845`](../crates/localapi/src/lib.rs#L6845);
-`endpoint_gone`, [`:6868`](../crates/localapi/src/lib.rs#L6868)). Until #3998 a click on
+(`own_endpoint_gone`, [`crates/localapi/src/lib.rs:6884`](../crates/localapi/src/lib.rs#L6884);
+`endpoint_gone`, [`:6907`](../crates/localapi/src/lib.rs#L6907)). Until #3998 a click on
 Approve with the daemon stopped read "Could not reach the device service: Permission denied (os
 error 13)" (the 0.4.224 Linux lab), and on those hosts the tray's red never came down with a
 stopped daemon.
@@ -2946,7 +2946,7 @@ dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat 
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
 dialog is the wait (`agents/roomlerd/src/peer.rs:5816`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1395`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1434`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:535`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -3122,7 +3122,7 @@ flowchart TD
   to follow a slow logind that still answers.
 - **A consent answer comes from whoever is at the seat now.** A consent answer lets someone
   see and control this screen. So the socket asks the seat again before it takes one, an
-  approval or a denial, as it does before a change (`crates/localapi/src/lib.rs:4195`). It
+  approval or a denial, as it does before a change (`crates/localapi/src/lib.rs:4234`). It
   used to take the answer from whoever held the socket. A person who had switched away could
   answer for the next person's screen until the next look, up to 5 s, and while who was at the
   seat was not known, for as long as that lasted. Root, and the daemon's own socket, are not
@@ -3161,7 +3161,7 @@ and `RcDisconnect` only from these callers, as the OS read them when they connec
 | another signed-in account; LocalService or NetworkService; a peer whose session and account could not be read | — | refused in words, with a warn line; nothing reaches the daemon |
 
 On Windows the screen's session depends on what serves the pipe (`screen_session`,
-`crates/localapi/src/lib.rs:2652`):
+`crates/localapi/src/lib.rs:2691`):
 
 | The daemon serving the pipe | The screen's session |
 |---|---|
@@ -3185,10 +3185,10 @@ flowchart TD
 
 | Piece | Where | What |
 |---|---|---|
-| the decision | `peer_may_decide_for_the_screen`, `crates/localapi/src/lib.rs:2679` | pure: the peer, the console session, the daemon's own session and uid. SYSTEM is named by its SID, because `ClientPeer::is_root` reads a uid, which a pipe client never has |
-| the daemon's own session | `own_session_id`, `:2696` | `ProcessIdToSessionId` of this process; `None` off Windows |
-| the dispatch | `:4212` (consent), `:4221` (Disconnect) | after the person socket's seat check (`:4195`), on every scope but the person socket's, so a new scope starts refused |
-| the refusals | `not_the_screens_person`, `:3925` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
+| the decision | `peer_may_decide_for_the_screen`, `crates/localapi/src/lib.rs:2718` | pure: the peer, the console session, the daemon's own session and uid. SYSTEM is named by its SID, because `ClientPeer::is_root` reads a uid, which a pipe client never has |
+| the daemon's own session | `own_session_id`, `:2735` | `ProcessIdToSessionId` of this process; `None` off Windows |
+| the dispatch | `:4251` (consent), `:4260` (Disconnect) | after the person socket's seat check (`:4234`), on every scope but the person socket's, so a new scope starts refused |
+| the refusals | `not_the_screens_person`, `:3964` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
 
 Who calls them, and how each is read:
 
@@ -3217,10 +3217,10 @@ is. Each gate's other conditions are as they were:
 
 | Gate | Where | Taken on Windows | Also, as before |
 |---|---|---|---|
-| the external-access password's set and clear (`is_console_user`) | `peer_is_console_user`, `crates/localapi/src/lib.rs:2577`; the dispatch `:4226` | a peer in the screen's session | Unix: the daemon's own uid, or root |
-| a console person's key | `peer_may_set_console_key`, `:2620`; the dispatch `:4167` | the same | the person socket: its person, and the seat asked again (§12.3) |
-| the recording verbs: start, stop, delete | `peer_may_record`, `:2554`; the dispatch `:4269` | the same | the person socket: its person |
-| keep busy on | `peer_may_start_keep_busy`, `:2521`; the dispatch `:4265` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
+| the external-access password's set and clear (`is_console_user`) | `peer_is_console_user`, `crates/localapi/src/lib.rs:2616`; the dispatch `:4265` | a peer in the screen's session | Unix: the daemon's own uid, or root |
+| a console person's key | `peer_may_set_console_key`, `:2659`; the dispatch `:4206` | the same | the person socket: its person, and the seat asked again (§12.3) |
+| the recording verbs: start, stop, delete | `peer_may_record`, `:2593`; the dispatch `:4308` | the same | the person socket: its person |
+| keep busy on | `peer_may_start_keep_busy`, `:2560`; the dispatch `:4304` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
 
 | The daemon serving the pipe | Who passes these gates on Windows |
 |---|---|
@@ -3234,7 +3234,7 @@ session, as before, and Unix reads no session, so there each gate decides by the
 
 Each refusal names the person these gates take (#3907): "only the person at this device's screen
 can …", in its gate's own words (`not_the_console_user`, `not_the_console_user_for_external_access`
-and `not_the_person_for_keep_busy`, `crates/localapi/src/lib.rs:3369-3397`, and each
+and `not_the_person_for_keep_busy`, `crates/localapi/src/lib.rs:3408-3436`, and each
 `CONSOLE_PERSON_KEYS` entry's `refusal`). On a machine-wide install the screen is the console's,
 so they read as before. On a per-user install used over Remote Desktop the person at the console
 is the one refused, whom the words of 0.4.222 and earlier ("only the person at this device's
@@ -3278,12 +3278,12 @@ both were measured on 0.4.228 in the lab:
 
 **The listener lives only while its path names it.** A person socket records the socket file
 it bound as its filesystem's device and its inode (`BoundSocket`,
-`crates/localapi/src/lib.rs:5220`). Both are needed: a runtime directory made again is a new
+`crates/localapi/src/lib.rs:5259`). Both are needed: a runtime directory made again is a new
 filesystem, whose inode numbers start over, and whose device number can be one an earlier
 directory had (measured: 54, 53, 54, 53 across three re-logins, root inode 1 each time). Every
 second it looks at its path (`PATH_CHECK`, `agents/roomlerd/src/person_socket.rs:124`). Once
 the path is gone, or names anything else, it stops, and so does every connection it serves
-(`serve_person_socket`, `crates/localapi/src/lib.rs:5150`). The poll serves the person again
+(`serve_person_socket`, `crates/localapi/src/lib.rs:5189`). The poll serves the person again
 at once, at the same path, with no pause (`Ended`, `agents/roomlerd/src/person_socket.rs:654`;
 `follow_the_seat`, `agents/roomlerd/src/person_socket.rs:813`).
 
@@ -3306,7 +3306,7 @@ it is bound is served again at most once a second, never in a loop.
 sessions (`RcSessions`), every 750 ms. That read is now the evidence:
 
 - The person socket's own person reading `RcSessions` over it is noted as theirs
-  (`rc_sessions_for_person`, `crates/localapi/src/lib.rs:3115`, dispatched at `:4118`;
+  (`rc_sessions_for_person`, `crates/localapi/src/lib.rs:3154`, dispatched at `:4157`;
   `RcSessionRegistry::list_for_person`, `agents/roomlerd/src/rc_sessions.rs:246`). The time is
   taken before the list, so a read counts only for sessions it could list. Root over the same
   socket, and every client of the daemon's own endpoint, read as before, with nothing noted.
@@ -3365,8 +3365,8 @@ The tests:
 | `a_removed_socket_file_is_served_again_within_a_look` | `agents/roomlerd/src/person_socket.rs:1726` | the real poll and a real socket (Linux, as the runner): a removed file is served again within a look, with no pause |
 | `a_replaced_socket_file_ends_the_listener_and_a_live_one_is_left_alone` | `agents/roomlerd/src/person_socket.rs:1769` | a stale replacement is cleared and served; a live one ends the listener, is kept and waits out the pause |
 | `a_runtime_directory_not_there_yet_is_tried_again_at_the_next_look` | `agents/roomlerd/src/person_socket.rs:1835` | a missing runtime directory is tried again at each look, said once for each log-in |
-| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:11882` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
-| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:11974` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
+| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:11959` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
+| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:12051` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
 | `a_session_is_told_only_by_a_read_after_its_registration` | `agents/roomlerd/src/rc_sessions.rs:448` | the decision, with a stubbed clock and record (every OS) |
 | `a_companion_that_stops_reading_for_longer_than_the_bound_has_gone_quiet` | `agents/roomlerd/src/rc_sessions.rs:481` | a told session's companion gone quiet |
 | `a_persons_read_is_noted_for_them_and_a_reannounce_keeps_the_registration` | `agents/roomlerd/src/rc_sessions.rs:505` | the record: per person, after the registration, kept across a re-announce |
