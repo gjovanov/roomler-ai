@@ -175,7 +175,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8105`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8106`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -305,7 +305,7 @@ up: an element marked `data-unsaved` (the machine key `GrowthChannels.vue:222` a
 ephemeral enrollment key `EnrollKeysSection.vue:179`, each shown once), an upload in flight
 anywhere on the page (`uploadsInProgress`, `api/client.ts:251`), and a remote session that
 ended within 5 minutes, or whose rating prompt is still up (`RC_ENDED_HOLD_MS`,
-`useRemoteControl.ts:468`). The call page counts as a call whatever the store says
+`useRemoteControl.ts:469`). The call page counts as a call whatever the store says
 (`AppLayout.vue:772`): it leaves and rejoins on a pod roll and stays after the call ends, and a
 reload there asks "Reload site?".
 
@@ -328,7 +328,7 @@ inside a fullscreen viewer too).
 | the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:72` |
 
 **The resume.** A remote session that a cut put on its redial (`scheduleReconnect`) is handed
-over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9899`), the args its
+over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9900`), the args its
 redial would have used (with the held session it replaces, FR-138's `replaces`,
 [remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c))
 are written to sessionStorage with the time, the path and the
@@ -338,17 +338,17 @@ reload that has not happened 20 s later gives the redial back and deletes the re
 or an F5 inside the minute would open the session a second time beside the redial. The next
 load takes the record out of storage before any page renders (`installStaleBuildWatch`,
 `staleBuildWatch.ts:515`, called before the router at `main.ts:46`). The viewer claims it once
-it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5505`): once,
+it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5518`): once,
 under a minute old, on the first page that load rendered, for the same person, device,
 organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:318`). It resumes through the
-redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9924`), never as a first
+redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9925`), never as a first
 connect: a first connect starts the ladder at 0, and `rc:error` retries `agent_offline` only
 past it, so a tab that reloaded while its device restarted for an update would have stopped
 there, where the redial keeps trying. Its record is `after_drop`, out of FR-22's
 first-attempt numbers ([remote-control.md §11.15](remote-control.md#1115-a-new-build-takes-over-a-redial-3582)).
 
 - ⚠️ **Only on the redial path.** A request or a consent prompt in flight reads `live`
-  (`rcReloadState`, `useRemoteControl.ts:443`). A reload then would abandon a question the
+  (`rcReloadState`, `useRemoteControl.ts:444`). A reload then would abandon a question the
   host may be reading, and the resume would ask it again. On the redial path the device
   decides consent as it would have for the redial, so a resume asks the host nothing more.
 - ⚠️ **Never an external session.** Its login opened one session, and another costs the
