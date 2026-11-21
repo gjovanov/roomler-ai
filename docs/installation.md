@@ -163,7 +163,7 @@ panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
 in a person's words (`label_existing`, `orchestrator_agent.rs:1881`,
-`orchestrator_unix.rs:1236`; `orchestrator_tunnel.rs:410`), for example
+`orchestrator_unix.rs:1237`; `orchestrator_tunnel.rs:410`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
@@ -2377,6 +2377,20 @@ bounded to 3 s. A Mac whose root daemon does not answer reads as before: unknown
 is never one row. The tunnel client can still be installed. The server's
 `wizard_reinstall_guard` turns the guard off; it is on by default, and the wizard
 reads anything but a JSON `false` as on (`agents/roomler-setup/src/features.rs`).
+
+The stop also says how to go on, in Terminal, naming only what works on that Mac:
+
+| The Mac | The stop offers | Why |
+|---|---|---|
+| any one-row Mac | remove Roomler with `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --uninstall` ([Uninstall](#uninstall-every-platform)), then start Setup again | the road to a fresh enrollment, for example after the row was deleted (launchd starts the daemon again after its exit 7, so the stop can still show); it names no layout, since what Setup installs then is its own form's choice |
+| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:64-82`, `:2695-2700`); with no copy the revert says only "nothing to revert" (`:2730-2735`), so it is not offered there |
+
+A wizard started as root (`sudo` from Terminal, the only root road: it never
+elevates itself on a Mac, and the administrator prompt runs `install.sh`'s
+privileged half, not the wizard) has no person socket, so it asks the system
+socket, `/var/run/roomler/roomler.sock`, the root daemon's own, with the same
+root-only connect, the same bound and the same reading. A person with no person
+socket asks nothing; it never falls back to the system socket.
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:

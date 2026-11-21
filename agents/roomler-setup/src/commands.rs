@@ -245,7 +245,7 @@ fn detect_unix(
     let roles = crate::role::daemon_roles(os);
     let offered = asked.features.daemon_offered(os);
     let one_row_stop =
-        crate::reinstall_guard::stop(os, asked.features.reinstall_guard_on(), one_row);
+        crate::reinstall_guard::stop(os, asked.features.reinstall_guard_on(), one_row, server);
     let kind = match (d.per_user_config, d.system_config) {
         (true, true) => "ambiguous",
         (true, false) => "peruser",
@@ -1266,12 +1266,20 @@ mod tests {
         };
         let mac = OneRowMac {
             name: "Studio Mac".into(),
+            migrated: false,
         };
         let server = "https://a.invalid";
 
         let d = detect_unix(HostOs::Macos, server, said(on), false, Some(&mac));
         let stop = d.one_row_stop.as_deref().expect("the stop");
         assert!(stop.contains("«Studio Mac»"), "{stop}");
+        // The way forward names the server the page asked (#4133's first note).
+        assert!(
+            stop.contains(
+                "`curl -fsSL https://a.invalid/api/setup/install.sh | sh -s -- --uninstall`"
+            ),
+            "{stop}"
+        );
         assert!(d.supported, "the card stays, under the note");
         assert_eq!(d.default_role, None, "nothing preselected");
         let json = serde_json::to_string(&d).unwrap();
