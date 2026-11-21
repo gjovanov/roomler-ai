@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:3004-3014`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:3117-3127`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon
@@ -340,7 +340,8 @@ next depends on it.
     `tarball installed`, `SucceededVerified`), and systemd restarted it onto the release.
   - The helper logged nothing that boot, and both of its units read `disabled`.
 - [x] **AC5**: `/etc/roomler/disable-auto-update` stops the helper, and removing it resumes updates (a round
-  trip, like `installer-smoke.yml`'s macOS one at `:1203-1252`). Field-verified on `wlab-kde` (§8).
+  trip, like `installer-smoke.yml`'s macOS one: its opt-out half at `:2703-2783`, its opt-in half at
+  `:2839-2861`). Field-verified on `wlab-kde` (§8).
   - STOP: the journal line `auto-update opted out — exiting`, on 2026-10-13. On 2026-10-14 it showed again for a
     wake from a non-root `roomlerd self-update`.
   - RESUME, on 2026-10-14 in the P3 run: with the marker removed, the next wake (a real push) installed 0.4.135.
