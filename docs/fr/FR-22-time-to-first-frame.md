@@ -388,7 +388,7 @@ Only three marks have a server record, via `remote_audit` (`event.kind`, 90 d TT
 is **browser-only and unpersisted**:
 
 - ⚠️ **The `/api/log/browser` ingest route exists but is unwired** — no UI uploader ships to
-  it (`crates/modules/fleet/src/agent_log.rs:160` as of that read; part 4 rewrites the comment, and the route's own `// punted to rc.59`
+  it (`crates/modules/fleet/src/agent_log.rs:196` as of that read; part 4 rewrites the comment, and the route's own `// punted to rc.59`
   comment), and `agent_logs` holds **0** browser-source rows. So the TTFF number and the
   `stalled waiting for <mark>` verdict live only in the live browser (console + snackbar)
   and are gone the moment the tab closes.

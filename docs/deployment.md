@@ -280,7 +280,7 @@ flowchart LR
 | Bake + default | `Dockerfile:155` (`COPY`), `Dockerfile:161` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
 | Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
-| Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
+| Payload | `crates/api/src/routes/stats.rs:1298` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
 **The licence.** DB-IP licenses the Lite database under
