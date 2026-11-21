@@ -236,7 +236,7 @@ the next version.
 
 ```bash
 # Verify a lockstep roll — both must hold
-git ls-remote origin 'refs/tags/setup-v<V>^{}' 'refs/tags/agent-v<V>^{}'   # the SAME commit (the release's targetCommitish now reads `master`)
+git ls-remote origin 'refs/tags/setup-v<V>' 'refs/tags/agent-v<V>^{}'   # the SAME commit: setup-v<V> is a LIGHTWEIGHT tag (`git tag`, no -a), so it has no ^{} line and its own line is the commit; agent-v<V> is annotated (the release's targetCommitish now reads `master`)
 gh release view setup-v<V> --json assets   # 4 platform archives + the Windows .exe (FR-129 C2), each with .sha256 + .asc
 for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>; windows is the .exe
 curl -sI 'https://roomler.ai/api/setup/windows?format=zip' | grep -i content-disposition   # the zip, for a proxy that refuses an EXE

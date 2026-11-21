@@ -601,8 +601,8 @@ last tunnel release: rc.266, cut 07-28, has only `.sha256`); releases are
 published non-prerelease so `/releases/latest` stays resolvable for the fleet's
 auto-updaters. `/api/setup/{windows,linux,macos}` serve the newest `setup-v*`,
 so the wizard a new install downloads is only as current as the last lockstep
-roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>^{}'`
-(the agent-v<V> commit), and `gh release view setup-v<V> --json assets`. The
+roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>'`
+(the agent-v<V> commit; the tag is lightweight, so a `^{}` pattern lists nothing), and `gh release view setup-v<V> --json assets`. The
 recipe, the re-run after a failure, and why the release no longer records a
 `targetCommitish` (#2013) are in the `ship-it` skill §6.
 

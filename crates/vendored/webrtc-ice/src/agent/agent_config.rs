@@ -116,6 +116,19 @@ pub struct RouteRank {
 /// mesh round trip or two, under a second) and a margin.
 pub const ROUTE_HOLD: Duration = Duration::from_millis(2500);
 
+/// Roomler patch (FR-148 P4 step 2, phase B of D49, B1): the checks a pair off
+/// the mesh gets above a selection that rides the mesh, on a budget of its own
+/// (`CandidatePair::move_checks`), whatever the opening spent on it. They go at
+/// the check cadence: the agent's loop ticks every [`DEFAULT_CHECK_INTERVAL`]
+/// (200 ms) once connected too, since the keepalive interval only lowers it.
+/// 13 checks span 2.4 s, inside [`ROUTE_HOLD`]: a pair that forms after the
+/// selection gets the hold's own bound again for its far side to answer (the
+/// candidate's signalling, the far TURN's permission for this agent's relayed
+/// address). Then the pair fails and is not checked again: a dead pair costs 13
+/// checks once. The far side's checks still reopen it: each is answered or
+/// nominates (B2), and triggers one of this agent's.
+pub const ROUTE_MOVE_CHECKS: u16 = 13;
+
 /// Roomler patch (FR-148 P4 step 2): why the route rank's hold stopped holding,
 /// the path line's `hold_exit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
