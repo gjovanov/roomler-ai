@@ -93,10 +93,10 @@ the design:
 
 | # | Fact | Evidence | Consequence |
 |---|---|---|---|
-| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4369`) and `merge_unknown_keys` (`:4503`), locked by `:5065` | Removing the 23 keys strands nothing, and a rollback finds them again. |
+| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4328`) and `merge_unknown_keys` (`:4457`), locked by `:4994` | Removing the 23 keys strands nothing, and a rollback finds them again. |
 | 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1579`, deserialized at `:1700`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
 | 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:605`; no handler (`:612`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4411`) and `crates/modules/fleet/src/socket.rs:801` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
-| 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:2988`, `:2993`, "Deliberately not fatal" (`:2985`) | The agent needs no stub variant. |
+| 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:3100`, `:3105`, "Deliberately not fatal" (`:3097`) | The agent needs no stub variant. |
 | 5 | `ClientMsg` ignores unknown fields. | `crates/remote_control/src/signaling.rs:523-525` | If P2 dropped `ssh_ticket` or `net_grant`, an old agent's ticketed request would parse as **the owner's own**. Hence S-B3. |
 | 6 | Role reconcile only adds bits. | `let reconciled = stored \| def.permissions;` (`crates/services/src/dao/tenant.rs:459`) | Bits 32-34 stay in stored masks for good. A deleted name would let a future bit pass both bit tests (`crates/db/src/models/role.rs:529`, `:544`) and reach every member. Hence S-A5. |
 | 7 | `SshDenyReason` is a strict enum in stored audit rows. | `pub enum SshDenyReason` (`crates/remote_control/src/models.rs:5253`); a 90-day TTL (`:5546`); one unknown word fails a page (`crates/services/src/dao/base.rs:237`) | Its three FR-90 variants stay (S-A6, S-B5). |
@@ -184,8 +184,8 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | **S-B2**: a hidden `roomler hive hook` that exits 0 | `agents/roomler-cli/src/cli.rs` | Adopted terminals' Claude Code hooks call it on every session event (`agents/roomler-cli/src/hive_hooks.rs:34`). Their contract is "prints nothing and always exits 0" (`:17`). | Those accounts are unadopted (D6). |
 | **S-B3**: `SshRequest.ssh_ticket` and `TunnelOpen.net_grant` stay on the wire, parse-only and refused | `crates/remote_control/src/signaling.rs` | fact 5 | The last ≤0.4.199 agent is gone (D8). |
 | **S-B4**: `RETIRED_RPC_VERBS` (the 21 spellings) and a test that guards them, the tag families `rc:hive.`, `rc:vault.`, `rc:knowhow.`, the user socket's `hive:` and the module ids | `crates/remote_control/src/models.rs` | B-I5 | Never. |
-| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4369`, `:4503` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
-| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4631` | Every host carries them (§2.2). | — (D11) |
+| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4328`, `:4457` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
+| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4562` | Every host carries them (§2.2). | — (D11) |
 | **S-B8**: FR-90's refactors of shipped code: SOCKS5 `negotiate()`, `flow_listener::bind()`, `TempDir::named`, `within_ngroups_max`, the Windows Job Object code, shared `windows-sys` features and deps | `inventory-B.md` §B1 | Shipped paths now run on them. | Never. |
 
 Two decisions also keep lines that name Hive. They are not stubs, and AC1's read classes them here
