@@ -601,6 +601,90 @@ mod tests {
         );
     }
 
+    /// #4189 — a listed batch as the device logs dialog reads it
+    /// (`ui/src/components/admin/AgentLogsDialog.vue`): each line's `ts` is an
+    /// RFC 3339 string, never bson's `{"$date": …}`. With the object the
+    /// dialog's time column printed it raw and Copy wrote `[object Object]`.
+    /// The batch's own id and time were strings already; a line's level,
+    /// target, message and fields keep their shapes.
+    #[test]
+    fn a_listed_batch_carries_each_lines_time_as_an_rfc3339_string() {
+        let at = |s: &str| DateTime::parse_rfc3339_str(s).expect("a test time");
+        let times = [at("2026-11-21T06:43:29.123Z"), at("2026-11-21T06:43:30Z")];
+        let line = |ts: DateTime, fields: bson::Document| LogLine {
+            ts,
+            level: LogLevel::Warn,
+            target: "roomlerd::peer".to_string(),
+            msg: "input dispatch".to_string(),
+            fields,
+        };
+        let batch = AgentLogBatch {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            source: LogSource::Agent,
+            agent_id: Some(ObjectId::new()),
+            user_id: None,
+            session_id: None,
+            host_id_hash: None,
+            agent_version: Some("0.4.230".to_string()),
+            line_count: 2,
+            created_at: at("2026-11-21T06:43:31.500Z"),
+            lines: vec![
+                line(times[0], bson::doc! { "px": 1181 }),
+                line(times[1], bson::doc! {}),
+            ],
+        };
+        let answer = serde_json::to_value(AgentLogBatchView::from(batch)).expect("serialises");
+
+        let mut wrong = Vec::new();
+        let lines = answer["lines"].as_array().cloned().unwrap_or_default();
+        if lines.len() != times.len() {
+            wrong.push(format!(
+                "{} lines, want {}: {answer}",
+                lines.len(),
+                times.len()
+            ));
+        }
+        for (i, (got, stored)) in lines.iter().zip(times).enumerate() {
+            match got["ts"].as_str() {
+                None => wrong.push(format!("lines[{i}].ts is not a string: {}", got["ts"])),
+                Some(ts) => match DateTime::parse_rfc3339_str(ts) {
+                    Err(_) => wrong.push(format!("lines[{i}].ts is not RFC 3339: {ts}")),
+                    Ok(back) if back != stored => {
+                        wrong.push(format!("lines[{i}].ts {ts} is not the stored time"))
+                    }
+                    Ok(_) => {}
+                },
+            }
+            if got["level"] != "WARN" || got["target"] != "roomlerd::peer" {
+                wrong.push(format!("lines[{i}]: level or target changed: {got}"));
+            }
+            if got["msg"] != "input dispatch" {
+                wrong.push(format!("lines[{i}]: the message changed: {got}"));
+            }
+        }
+        if lines.first().map(|l| &l["ts"]) != Some(&serde_json::json!("2026-11-21T06:43:29.123Z")) {
+            wrong.push(format!(
+                "lines[0].ts is not 2026-11-21T06:43:29.123Z: {answer}"
+            ));
+        }
+        if lines.first().map(|l| &l["fields"]) != Some(&serde_json::json!({ "px": 1181 })) {
+            wrong.push(format!("lines[0].fields changed: {answer}"));
+        }
+        if lines.get(1).is_some_and(|l| l.get("fields").is_some()) {
+            wrong.push(format!(
+                "lines[1]: empty fields are left out, as before: {answer}"
+            ));
+        }
+        let text = answer.to_string();
+        for raw in ["$date", "$oid"] {
+            if text.contains(raw) {
+                wrong.push(format!("the answer carries `{raw}`: {text}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     // The scrub's own rules, and what each leaves alone, are tested where
     // they live: `crate::diagnostics::tests`.
 

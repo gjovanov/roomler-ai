@@ -666,3 +666,204 @@ pub async fn privacy_activity(
         total_pages: page.total_pages,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    //! #4189 — what the session audit answer (`GET
+    //! …/session/{sid}/audit`) carries on the wire: every id the 24-hex
+    //! string and every time RFC 3339, never bson's `{"$oid": …}` or
+    //! `{"$date": …}`, the ids and times inside an event's kind included.
+
+    use super::*;
+    use roomler_ai_remote_control::models::{AuditKind, EndReason};
+    use serde_json::{Value, json};
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn at(s: &str) -> DateTime {
+        DateTime::parse_rfc3339_str(s).expect("a test time")
+    }
+
+    /// What is wrong with `got` as an id: not a string, not 24 lowercase hex,
+    /// or not the stored one.
+    fn id_problem(what: &str, got: &Value, want: ObjectId) -> Option<String> {
+        match got.as_str() {
+            None => Some(format!("{what} is not a string: {got}")),
+            Some(s) if !is_hex24(s) => Some(format!("{what} is not 24 lowercase hex: {s}")),
+            Some(s) if s != want.to_hex() => Some(format!("{what} {s} is not the stored {want}")),
+            Some(_) => None,
+        }
+    }
+
+    /// What is wrong with `got` as a time: not a string, not RFC 3339, or
+    /// not the stored instant.
+    fn time_problem(what: &str, got: &Value, want: DateTime) -> Option<String> {
+        match got.as_str() {
+            None => Some(format!("{what} is not a string: {got}")),
+            Some(s) => match DateTime::parse_rfc3339_str(s) {
+                Err(_) => Some(format!("{what} is not RFC 3339: {s}")),
+                Ok(back) if back != want => Some(format!("{what} {s} is not the stored time")),
+                Ok(_) => None,
+            },
+        }
+    }
+
+    /// Every kind that carries an id or a time, and one that carries
+    /// neither: the answer names every id as hex and every time as RFC 3339,
+    /// and leaves the rest of each event as it was.
+    #[test]
+    fn a_session_audit_answer_carries_every_id_and_time_as_a_string() {
+        let (session, agent, tenant) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (controller, watcher) = (ObjectId::new(), ObjectId::new());
+        let resume_by = at("2026-11-21T07:01:00.250Z");
+        let ended_at = at("2026-11-21T07:02:00Z");
+        let kinds = vec![
+            AuditKind::SessionRequested {
+                controller_user_id: controller,
+                controller_name: "ops".into(),
+                permissions: Permissions::VIEW | Permissions::INPUT,
+                record_stripped: None,
+                privacy_stripped: None,
+                features_stripped: None,
+                idle_secs: Some(600),
+                idle_enforced: Some(true),
+                lock_on_end: None,
+                lock_enforced: None,
+                external: false,
+            },
+            AuditKind::WatcherJoined { user_id: watcher },
+            AuditKind::WatcherLeft { user_id: watcher },
+            AuditKind::SessionDetached {
+                attach_seq: 3,
+                resume_by,
+            },
+            AuditKind::SessionEnded {
+                reason: EndReason::AgentDisconnect,
+                limit: None,
+                attach_seq: Some(4),
+                ended_at: Some(ended_at),
+                end_source: None,
+            },
+            AuditKind::ConsentGranted,
+        ];
+        let times: Vec<DateTime> = (0..kinds.len())
+            .map(|i| DateTime::from_millis(1_763_708_400_000 + 1_000 * i as i64 + 7))
+            .collect();
+        let events: Vec<RemoteAuditEvent> = kinds
+            .iter()
+            .cloned()
+            .zip(&times)
+            .map(|(event, at)| RemoteAuditEvent {
+                id: Some(ObjectId::new()),
+                session_id: session,
+                agent_id: agent,
+                tenant_id: tenant,
+                at: *at,
+                event,
+            })
+            .collect();
+        let answer = AuditListResponse {
+            items: events.clone().into_iter().map(Into::into).collect(),
+            total: events.len() as u64,
+            page: 1,
+            per_page: 50,
+            total_pages: 1,
+        };
+        let answer = serde_json::to_value(&answer).expect("serialises");
+
+        let items = answer["items"].as_array().cloned().unwrap_or_default();
+        let mut wrong: Vec<String> = Vec::new();
+        if items.len() != events.len() {
+            wrong.push(format!(
+                "{} items, want {}: {answer}",
+                items.len(),
+                events.len()
+            ));
+        }
+        for (i, (item, stored)) in items.iter().zip(&events).enumerate() {
+            let p = |field: &str| format!("items[{i}].{field}");
+            wrong.extend(id_problem(&p("_id"), &item["_id"], stored.id.unwrap()));
+            wrong.extend(id_problem(&p("session_id"), &item["session_id"], session));
+            wrong.extend(id_problem(&p("agent_id"), &item["agent_id"], agent));
+            wrong.extend(id_problem(&p("tenant_id"), &item["tenant_id"], tenant));
+            wrong.extend(time_problem(&p("at"), &item["at"], stored.at));
+        }
+        let event = |i: usize| {
+            items
+                .get(i)
+                .map(|it| it["event"].clone())
+                .unwrap_or_default()
+        };
+        wrong.extend(id_problem(
+            "the request's controller_user_id",
+            &event(0)["controller_user_id"],
+            controller,
+        ));
+        wrong.extend(id_problem(
+            "watcher_joined.user_id",
+            &event(1)["user_id"],
+            watcher,
+        ));
+        wrong.extend(id_problem(
+            "watcher_left.user_id",
+            &event(2)["user_id"],
+            watcher,
+        ));
+        wrong.extend(time_problem(
+            "session_detached.resume_by",
+            &event(3)["resume_by"],
+            resume_by,
+        ));
+        wrong.extend(time_problem(
+            "session_ended.ended_at",
+            &event(4)["ended_at"],
+            ended_at,
+        ));
+
+        // What is not an id or a time is as it was: each kind's other keys,
+        // and a kind with neither, whole.
+        let request = event(0);
+        let want_request = json!({
+            "kind": "session_requested",
+            "controller_name": "ops",
+            "permissions": serde_json::to_value(Permissions::VIEW | Permissions::INPUT).unwrap(),
+            "idle_secs": 600,
+            "idle_enforced": true,
+        });
+        for (key, want) in want_request.as_object().unwrap() {
+            if request.get(key) != Some(want) {
+                wrong.push(format!("the request's {key} changed: {request}"));
+            }
+        }
+        if event(3)["kind"] != "session_detached" || event(3)["attach_seq"] != 3 {
+            wrong.push(format!(
+                "the detach's kind or attach_seq changed: {}",
+                event(3)
+            ));
+        }
+        if event(4)["reason"] != "agent_disconnect" || event(4)["attach_seq"] != 4 {
+            wrong.push(format!(
+                "the end's reason or attach_seq changed: {}",
+                event(4)
+            ));
+        }
+        if event(4).get("limit").is_some() || event(4).get("end_source").is_some() {
+            wrong.push(format!(
+                "the end's unset fields are left out, as before: {}",
+                event(4)
+            ));
+        }
+        if event(5) != json!({ "kind": "consent_granted" }) {
+            wrong.push(format!("a kind with no id or time changed: {}", event(5)));
+        }
+        let text = answer.to_string();
+        for raw in ["$oid", "$date"] {
+            if text.contains(raw) {
+                wrong.push(format!("the answer carries `{raw}`: {text}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
