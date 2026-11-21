@@ -2367,6 +2367,14 @@ impl RateGovernor {
             (None, None) => Origin::At(now),
         }
     }
+
+    /// FR-148 D51 — the prior's base and its net steps from it, for the
+    /// `tcp_shape` closed loop's trail: the walk the stand-in alone hides
+    /// while it sits above the band.
+    #[cfg(test)]
+    pub(crate) fn prior_walk(&self) -> (Option<u32>, i32) {
+        (self.prior.base_bps(), self.prior.steps())
+    }
 }
 
 /// FR-148 P0 — where the evidence behind a held number was taken: at an
