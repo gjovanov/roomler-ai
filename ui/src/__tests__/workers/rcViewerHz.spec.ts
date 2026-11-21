@@ -184,4 +184,28 @@ describe('FR-135 R2: the bursts', () => {
     expect(calls).toBe(2)
     expect(told).toEqual([])
   })
+
+  // A report runs inside the rAF callback, and nothing there caught a throw. In a
+  // test, a burst that outlived its spec reported into jsdom's window
+  // `postMessage`, which takes two arguments, and failed a run whose tests had all
+  // passed (#4193). The reading is lost; the bursts are not.
+  it('catches a report that throws, so nothing escapes the rAF callback, and the bursts go on', () => {
+    const f = fakeEnv()
+    const told: number[] = []
+    const late = (hz: number) => {
+      told.push(hz)
+      throw new TypeError("'postMessage' requires 2 arguments: 'message' and 'targetOrigin'")
+    }
+    startViewerHzBursts(late, f.env)
+    expect(() => f.ticks(1000 / 60)).not.toThrow()
+    expect(told).toEqual([60])
+    expect(f.waiting).toBe(false)
+    expect(f.timers).toHaveLength(1)
+    expect(f.timers[0]!.ms).toBe(VIEWER_HZ_EVERY_MS)
+    // The next burst measures again, and a screen that moved is reported.
+    f.timers.shift()!.run()
+    expect(() => f.ticks(1000 / 144)).not.toThrow()
+    expect(told).toEqual([60, 144])
+    expect(f.timers).toHaveLength(1)
+  })
 })
