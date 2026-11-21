@@ -8732,6 +8732,21 @@ pub(crate) mod shaped_link {
                 link_congested: bool,
                 drain_ms: Option<u32>,
                 target_bps: u32,
+                /// What the window's fold left behind, for FR-59's relief: the
+                /// bytes written over the window (the governor's `sent_bps`),
+                /// the plane verdict, the measured pipe and the stand-in, the
+                /// floor in force, and the link loop's running counts (windows
+                /// the validity gate rejected, congested, congested but not
+                /// offered) with its depth estimate.
+                sent_bps: u64,
+                state: &'static str,
+                measured_bps: Option<u32>,
+                prior_bps: Option<u32>,
+                relieved_bps: Option<u32>,
+                rejected: u32,
+                congested: u32,
+                unoffered: u32,
+                depth_ms: i32,
             }
 
             /// What the pump did, pass by pass.
@@ -8851,6 +8866,7 @@ pub(crate) mod shaped_link {
                 let (mut force_key, mut key_asked) = (false, true);
                 let mut taken: Option<u32> = None;
                 let mut last_encoded: Option<Instant> = None;
+                let mut window_from = (Instant::now(), 0_u64);
                 while Instant::now() < stop {
                     p.passes += 1;
                     delivery.gate_with(&mut governor, &clock, &gauges, true, false);
@@ -8897,6 +8913,12 @@ pub(crate) mod shaped_link {
                         |own| own,
                         written.load(Ordering::Relaxed),
                     ) {
+                        let now = Instant::now();
+                        let bytes = written.load(Ordering::Relaxed);
+                        let ms = now.duration_since(window_from.0).as_millis().max(1) as u64;
+                        let sent_bps = bytes.saturating_sub(window_from.1) * 8_000 / ms;
+                        window_from = (now, bytes);
+                        let (congested, _, depth_ms) = governor.link_stats();
                         p.windows.push(Win {
                             t_us: us(t0.elapsed()),
                             divisor: vw.skip_divisor,
@@ -8909,6 +8931,15 @@ pub(crate) mod shaped_link {
                             link_congested: vw.link_congested,
                             drain_ms: vw.drain_for_ms,
                             target_bps: governor.applied_bps(),
+                            sent_bps,
+                            state: governor.pipe_state().map_or("none", |s| s.as_str()),
+                            measured_bps: governor.measured_bps(now, true),
+                            prior_bps: governor.prior_bps(),
+                            relieved_bps: governor.relieved_floor_bps(),
+                            rejected: governor.evidence_rejected().iter().sum(),
+                            congested,
+                            unoffered: governor.link_unoffered(),
+                            depth_ms,
                         });
                     }
                     if governor.draining(Instant::now()) {
@@ -9314,12 +9345,44 @@ pub(crate) mod shaped_link {
                     windows().filter(|w| w.struggling).count(),
                     p.moves,
                 );
+                // FR-59's relief, read the way step 1 of B4's gate reads it: how
+                // many windows ran on a relieved floor and with a measured pipe,
+                // the target sitting on that floor, and the floor's median
+                // against the delivered rate.
+                let mut floors: Vec<u64> = windows()
+                    .filter_map(|w| w.relieved_bps.map(u64::from))
+                    .collect();
+                let mut states: BTreeMap<&str, usize> = BTreeMap::new();
+                for w in windows() {
+                    *states.entry(w.state).or_default() += 1;
+                }
+                let last = p.windows.last();
+                println!(
+                    "B4c | {} | relieved floor in {} of {} windows, measured pipe in {}, prior in {}, target \
+                     on the relieved floor in {} | floor median {} kbit/s = {} of delivered | states {:?} | \
+                     rejected {}, link congested {}, congested but not offered {}",
+                    r.arm.word(),
+                    floors.len(),
+                    windows().count(),
+                    windows().filter(|w| w.measured_bps.is_some()).count(),
+                    windows().filter(|w| w.prior_bps.is_some()).count(),
+                    windows()
+                        .filter(|w| w.relieved_bps == Some(w.target_bps))
+                        .count(),
+                    kbps(quantile(&mut floors, 50)),
+                    thousandths(quantile(&mut floors, 50) * 1_000 / x.rx_bps.max(1)),
+                    states,
+                    last.map_or(0, |w| w.rejected),
+                    last.map_or(0, |w| w.congested),
+                    last.map_or(0, |w| w.unoffered),
+                );
                 for w in &p.windows {
                     let s = r.seen.iter().rev().find(|s| s.t_us <= w.t_us);
                     println!(
                         "B4c | {} | t {:>5} ms | divisor {} cap {:>2} reported {:>2}{} | age {:?} floor {:?}{}{}{} | \
                          target {:>7} | viewer: fps {}{}, age {:?}, arrival {} ms, rtt {} ms, rx {} kbit/s, \
-                         growth {:?} ms, backlog {} ms",
+                         growth {:?} ms, backlog {} ms | sent {} kbit/s, {}, measured {:?}, prior {:?}, \
+                         relieved {:?}, rejected {}, congested {}, unoffered {}, depth {} ms",
                         r.arm.word(),
                         w.t_us / 1_000,
                         w.divisor,
@@ -9346,6 +9409,15 @@ pub(crate) mod shaped_link {
                         s.map_or(0, |s| u64::from(s.rx_bps) / 1_000),
                         s.and_then(|s| s.queue_ms),
                         s.map_or(0, |s| s.backlog_ms),
+                        w.sent_bps / 1_000,
+                        w.state,
+                        w.measured_bps,
+                        w.prior_bps,
+                        w.relieved_bps,
+                        w.rejected,
+                        w.congested,
+                        w.unoffered,
+                        w.depth_ms,
                     );
                 }
             }
