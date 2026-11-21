@@ -367,6 +367,21 @@ pub fn stop(config_path: &Path) -> Result<String> {
     }
 }
 
+/// FR-150 P1a — `service stop --for-upgrade`, the per-user MSI's
+/// `StopOldDaemon`: [`stop`], except that on Windows nothing left to stop is
+/// the step done rather than a failure (`windows::stop_for_upgrade`). Only the
+/// per-user MSI runs it.
+pub fn stop_for_upgrade(config_path: &Path) -> Result<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::stop_for_upgrade(config_path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        stop(config_path)
+    }
+}
+
 /// FR-93 P5 (#2144) — at start, a per-user Linux daemon whose unit file wants it
 /// by `graphical-session.target` as well, while only `default.target` links to
 /// it (it was enabled before that target joined the unit's `[Install]`), enables
@@ -415,6 +430,29 @@ pub fn status() -> Result<AutostartStatus> {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         Ok(AutostartStatus::Unknown)
+    }
+}
+
+/// FR-150 P1a (#3507) — on Windows, what to say when this account cannot
+/// replace its own auto-start task from a medium token, which is what every
+/// self-update registers it with: an elevated registration from before FR-150
+/// owns it. The daemon logs it once at its start and `service status` prints
+/// it. `None` everywhere else, and when the question cannot be asked.
+pub fn unreplaceable_task_note() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::autostart_unreplaceable().map(|task| {
+            format!(
+                "this account cannot replace its auto-start task {task}: an elevated \
+                 registration owns it, so a self-update cannot register it again (#3507). \
+                 Run `roomlerd service install` once from an elevated prompt, or the \
+                 installer as administrator, to repair it"
+            )
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
     }
 }
 
@@ -762,6 +800,96 @@ mod windows {
         fn end(&mut self, name: &str) -> Result<()> {
             end_named(name)
         }
+
+        fn may_replace(&self, name: &str) -> Option<bool> {
+            task_file_may_be_replaced(name)
+        }
+    }
+
+    /// FR-150 P1a — may this account, from a medium token, replace and delete
+    /// the task `name`? Read from the task's file under `System32\Tasks`, the
+    /// copy of its descriptor a medium process may read (the scheduler's in
+    /// the registry is not, #4128's C6), with a medium copy of this process's
+    /// token. `None` when the file's descriptor cannot be read.
+    fn task_file_may_be_replaced(name: &str) -> Option<bool> {
+        let file = crate::appdirs::system32_tool(&format!(r"Tasks\{name}"));
+        match crate::win_token::medium_may_write_and_delete(&file) {
+            Ok(answer) => Some(answer),
+            Err(e) => {
+                tracing::debug!(task = name, error = %e, "the task's descriptor could not be checked");
+                None
+            }
+        }
+    }
+
+    /// FR-150 P1a — the task of this process's account (`Roomler-<SID>`),
+    /// when that account cannot replace it from a medium token: what every
+    /// self-update's registration runs with (#3507). `None` when it can, when
+    /// no such task is registered, or when the question cannot be asked. It
+    /// reads the task's file and runs no `schtasks`, so the daemon's start
+    /// asks it at no cost.
+    pub fn autostart_unreplaceable() -> Option<String> {
+        let name = user_task::autostart(&own_account().ok()?);
+        (task_file_may_be_replaced(&name) == Some(false)).then_some(name)
+    }
+
+    /// FR-150 P1a — `ROOMLERD_TASK_SD`: each task definition names a security
+    /// descriptor of the account's own, on unless set to 0. Off, `service
+    /// install` registers the task as before FR-150: no descriptor, no repair
+    /// and no start task.
+    fn own_descriptor_wanted() -> bool {
+        tunnel_core::env::flag("TASK_SD", true)
+    }
+
+    /// FR-150 P1a — the descriptor each task of the account `sid` names: the
+    /// account as its owner, with full access, beside SYSTEM and
+    /// Administrators. The owner and the access a registration at medium gives
+    /// the account (#4128's C1), from any token. It gives nothing more: from a
+    /// medium token the scheduler refuses a higher run level and any other
+    /// principal, over a task the account has full access to too (C4, C4b).
+    fn task_descriptor(sid: &str) -> String {
+        format!("O:{sid}D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})")
+    }
+
+    /// FR-150 P1a — `xml` naming `descriptor` in its `<RegistrationInfo>`,
+    /// after its `<URI>`. Task Scheduler applies it when it creates the task,
+    /// and only then (#4128's C3, C1b, C5).
+    fn with_descriptor(xml: &str, descriptor: &str) -> String {
+        xml.replacen(
+            "</URI>\n",
+            &format!(
+                "</URI>\n    <SecurityDescriptor>{}</SecurityDescriptor>\n",
+                xml_escape(descriptor)
+            ),
+            1,
+        )
+    }
+
+    /// FR-150 P1a — the definitions `service install` registers: the
+    /// account's task, and `Roomler start-<SID>`'s when a daemon should start
+    /// (`start_soon` is not empty). With `own_descriptor` off, the task's
+    /// definition before FR-150 and no start task.
+    fn definitions(
+        name: &str,
+        command: &str,
+        user: &str,
+        account: &str,
+        start_soon: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        own_descriptor: bool,
+    ) -> (String, Option<String>) {
+        let xml = render_task_xml(name, command, user, start_soon);
+        if !own_descriptor {
+            return (xml, None);
+        }
+        let descriptor = task_descriptor(account);
+        let start = (!start_soon.is_empty()).then(|| {
+            with_descriptor(
+                &render_start_task_xml(&user_task::start_task(account), command, user, now),
+                &descriptor,
+            )
+        });
+        (with_descriptor(&xml, &descriptor), start)
     }
 
     /// `enrolled`: a config exists, so a started daemon has something to do. A
@@ -770,10 +898,11 @@ mod windows {
         let exe = std::env::current_exe().context("locating current exe")?;
         let user = current_user_qualified().context("resolving current user")?;
         let account = own_account()?;
+        let own_descriptor = own_descriptor_wanted();
         let mut command = task_command(&exe);
         if command != exe
             && applocker_exe_policy_in_force()
-            && launcher_is_blocked(&command, &user, &account)
+            && launcher_is_blocked(&command, &user, &account, own_descriptor)
         {
             eprintln!(
                 "This machine's AppLocker policy does not let {} start, so the task runs {} \
@@ -786,16 +915,35 @@ mod windows {
         }
         let exe_str = command.to_string_lossy().into_owned();
 
+        let now = chrono::Utc::now();
         let start_soon = if enrolled {
-            start_soon_triggers(chrono::Utc::now())
+            start_soon_triggers(now)
         } else {
             String::new()
         };
         let name = user_task::autostart(&account);
-        let xml = render_task_xml(&name, &exe_str, &user, &start_soon);
+        let (xml, start) = definitions(
+            &name,
+            &exe_str,
+            &user,
+            &account,
+            &start_soon,
+            now,
+            own_descriptor,
+        );
         // #3801: the account's own task, then a legacy one of its own retired,
-        // never another account's.
-        user_task::register(&mut Schtasks, &account, &xml)
+        // never another account's. FR-150 P1a: a task its account cannot
+        // replace registered again from an elevated token, and the start task
+        // left when the replace is refused.
+        user_task::register(
+            &mut Schtasks,
+            &account,
+            &user_task::Registration {
+                xml: &xml,
+                own_descriptor,
+                start: start.as_deref(),
+            },
+        )
     }
 
     /// `schtasks /Create /XML /F`: register `xml` as `name`.
@@ -930,6 +1078,27 @@ mod windows {
                 ))
             }
         }
+    }
+
+    /// FR-150 P1a — `service stop --for-upgrade`, the per-user MSI's
+    /// `StopOldDaemon`: [`stop`], unless there is nothing to stop
+    /// (`user_task::nothing_to_stop`). On a per-user update the old product's
+    /// `UnregisterAutostart` has ended and deleted the task before this step,
+    /// so [`stop`]'s hard stop finds no task to end and fails, and the
+    /// person's log, which records each step since P1a, would read every
+    /// healthy update as a failed one (#4128's C10). The MSI ignores this
+    /// step's exit code either way.
+    pub fn stop_for_upgrade(config_path: &Path) -> Result<String> {
+        use crate::win_service::stop_event::{user_stop_event_held, user_stop_event_name};
+        let name = user_stop_event_name(&crate::instance_lock::instance_id(config_path));
+        if user_task::nothing_to_stop(&Schtasks, &own_account()?, user_stop_event_held(&name)) {
+            return Ok(
+                "No daemon for this config holds a stop event this process can see, and this \
+                 account has no task to end: nothing to stop before the upgrade."
+                    .into(),
+            );
+        }
+        stop(config_path)
     }
 
     /// The Terminal Services session this process runs in. 0 is the services
@@ -1203,10 +1372,14 @@ mod windows {
     /// The check is a task of the account's own (`user_task::launcher_check`, #3801),
     /// registered only for the seconds this runs. One that a killed install leaves
     /// behind starts nothing that matters, and the account's next one replaces it.
-    fn launcher_is_blocked(launcher: &Path, user: &str, account: &str) -> bool {
+    fn launcher_is_blocked(launcher: &Path, user: &str, account: &str, own: bool) -> bool {
         let task = user_task::launcher_check(account);
         let task = task.as_str();
-        let xml = render_launcher_check_xml(task, &launcher.to_string_lossy(), user);
+        let mut xml = render_launcher_check_xml(task, &launcher.to_string_lossy(), user);
+        if own {
+            // FR-150 P1a: one a killed install leaves is the account's to replace.
+            xml = with_descriptor(&xml, &task_descriptor(account));
+        }
         let Ok(path) = write_temp_xml(&xml) else {
             return false;
         };
@@ -1277,6 +1450,91 @@ mod windows {
                 )
             })
             .collect()
+    }
+
+    /// FR-150 P1a — how long after its registration the start task's one-shots
+    /// may still fire, through a sleep (`StartWhenAvailable`), and when it
+    /// deletes itself (`DeleteExpiredTaskAfter`, #4128's C6b, C6c).
+    const START_TASK_LIFETIME_SECS: i64 = 3600;
+
+    /// FR-150 P1a — `Roomler start-<SID>` (`user_task::start_task`): what a
+    /// self-update leaves when the account's task could not be replaced. A
+    /// medium process may run a task it cannot replace (#4128's C2), so its
+    /// action is the launcher with `service start`, a `/Run` of the account's
+    /// task: the daemon runs under its own task, whose `IgnoreNew` drops the
+    /// later starts (C6b). The task's own one-shots, each ending an hour after
+    /// the registration, and then the task deletes itself (C6c). No logon or
+    /// boot trigger: the account's task has those.
+    fn render_start_task_xml(
+        name: &str,
+        command: &str,
+        user: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let end = (now + chrono::Duration::seconds(START_TASK_LIFETIME_SECS))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let triggers: String = START_AFTER_REGISTERING
+            .iter()
+            .map(|secs| {
+                let at = now + chrono::Duration::seconds(*secs);
+                format!(
+                    "    <TimeTrigger>\n      <StartBoundary>{}</StartBoundary>\n      \
+                     <EndBoundary>{end}</EndBoundary>\n      <Enabled>true</Enabled>\n    \
+                     </TimeTrigger>\n",
+                    at.format("%Y-%m-%dT%H:%M:%SZ")
+                )
+            })
+            .collect();
+        let name_xml = xml_escape(name);
+        let command_xml = xml_escape(command);
+        let user_xml = xml_escape(user);
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>roomlerd</Author>
+    <Description>Roomler Daemon — starts this account's Roomler task after an update that could not register it again, then deletes itself.</Description>
+    <URI>\{name_xml}</URI>
+  </RegistrationInfo>
+  <Triggers>
+{triggers}  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user_xml}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command_xml}</Command>
+      <Arguments>service start</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+        )
     }
 
     /// Build the Task Scheduler XML that `schtasks /XML` consumes, for the task
@@ -1492,6 +1750,138 @@ mod windows {
             let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(!xml.contains("<TimeTrigger>"), "{xml}");
             assert!(xml.contains("<LogonTrigger>") && xml.contains("</Triggers>"));
+        }
+
+        const SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+        fn at_noon() -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }
+
+        /// FR-150 P1a — the task names its own descriptor: built from the
+        /// account's SID, the owner and full access for it beside SYSTEM and
+        /// Administrators, once, in `<RegistrationInfo>` after `<URI>`, where
+        /// #4128's P0 registered it. The start task names it too, and so does
+        /// the launcher check.
+        #[test]
+        fn the_task_names_its_own_descriptor() {
+            let soon = start_soon_triggers(at_noon());
+            let (xml, start) = definitions(
+                TASK,
+                "C:\\P\\roomlerdw.exe",
+                "DOM\\u",
+                SID,
+                &soon,
+                at_noon(),
+                true,
+            );
+            let descriptor = format!(
+                "<SecurityDescriptor>O:{SID}D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{SID})\
+                 </SecurityDescriptor>"
+            );
+            assert_eq!(xml.matches("<SecurityDescriptor>").count(), 1, "{xml}");
+            let uri = xml.find("</URI>").unwrap();
+            let sd = xml.find(&descriptor).expect(&xml);
+            let info_end = xml.find("</RegistrationInfo>").unwrap();
+            assert!(uri < sd && sd < info_end, "{xml}");
+            // Everything else is the task as it was.
+            assert_eq!(
+                xml.replacen(&format!("    {descriptor}\n"), "", 1),
+                render_task_xml(TASK, "C:\\P\\roomlerdw.exe", "DOM\\u", &soon)
+            );
+            let start = start.expect("a start task on an enrolled device");
+            assert_eq!(start.matches(&descriptor).count(), 1, "{start}");
+            // No config, no start task.
+            let (_, start) = definitions(
+                TASK,
+                "C:\\P\\roomlerdw.exe",
+                "DOM\\u",
+                SID,
+                "",
+                at_noon(),
+                true,
+            );
+            assert!(start.is_none());
+            let check = with_descriptor(
+                &render_launcher_check_xml(CHECK, "C:\\P\\roomlerdw.exe", "DOM\\u"),
+                &task_descriptor(SID),
+            );
+            assert_eq!(check.matches(&descriptor).count(), 1, "{check}");
+        }
+
+        /// FR-150 P1a — `ROOMLERD_TASK_SD=0`: the task's definition before
+        /// FR-150, with no descriptor, and no start task.
+        #[test]
+        fn the_switch_registers_masters_task() {
+            let soon = start_soon_triggers(at_noon());
+            let (xml, start) = definitions(
+                TASK,
+                "C:\\P\\roomlerdw.exe",
+                "DOM\\u",
+                SID,
+                &soon,
+                at_noon(),
+                false,
+            );
+            assert_eq!(
+                xml,
+                render_task_xml(TASK, "C:\\P\\roomlerdw.exe", "DOM\\u", &soon)
+            );
+            assert!(!xml.contains("SecurityDescriptor"), "{xml}");
+            assert!(start.is_none());
+        }
+
+        /// FR-150 P1a — `Roomler start-<SID>`: the task's three one-shots, each
+        /// ending an hour after the registration, then deleted by the
+        /// scheduler (#4128's C6b, C6c); the launcher with `service start`,
+        /// which runs the account's task; no logon or boot trigger; one start
+        /// at a time, a few minutes at most.
+        #[test]
+        fn the_start_task_runs_the_launchers_start_and_goes_by_itself() {
+            let name = user_task::start_task(SID);
+            let xml = render_start_task_xml(&name, "C:\\P & Q\\roomlerdw.exe", "DOM\\u", at_noon());
+            assert!(xml.contains(&format!("<URI>\\{name}</URI>")), "{xml}");
+            let starts = ["12:01:00", "12:03:00", "12:10:00"];
+            for at in starts {
+                assert!(
+                    xml.contains(&format!(
+                        "<StartBoundary>2026-11-20T{at}Z</StartBoundary>\n      \
+                         <EndBoundary>2026-11-20T13:00:00Z</EndBoundary>\n      \
+                         <Enabled>true</Enabled>"
+                    )),
+                    "{xml}"
+                );
+            }
+            assert_eq!(xml.matches("<TimeTrigger>").count(), 3, "{xml}");
+            assert_eq!(xml.matches("<EndBoundary>").count(), 3, "{xml}");
+            for absent in [
+                "<LogonTrigger>",
+                "<EventTrigger>",
+                "<BootTrigger>",
+                "<RestartOnFailure>",
+            ] {
+                assert!(!xml.contains(absent), "{absent}: {xml}");
+            }
+            for setting in [
+                "<DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>",
+                "<StartWhenAvailable>true</StartWhenAvailable>",
+                "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+                "<ExecutionTimeLimit>PT5M</ExecutionTimeLimit>",
+                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+                "<LogonType>InteractiveToken</LogonType>",
+                "<RunLevel>LeastPrivilege</RunLevel>",
+                "<UserId>DOM\\u</UserId>",
+                "<Command>C:\\P &amp; Q\\roomlerdw.exe</Command>",
+                "<Arguments>service start</Arguments>",
+            ] {
+                assert!(xml.contains(setting), "{setting}: {xml}");
+            }
+            assert_eq!(xml.matches("<Exec>").count(), 1, "{xml}");
+            // Its name is no account's autostart, and is told apart from one.
+            assert_eq!(user_task::account_of(&name), None);
+            assert_ne!(name, user_task::autostart(SID));
         }
 
         /// #3292 — the launcher when the MSI shipped one, and the EXE itself when not:
@@ -2444,6 +2834,29 @@ mod macos {
     }
 }
 
+/// FR-150 P1a (#3507) — the answer to a plain `service status`: the
+/// `Auto-start:` line, then the note of [`unreplaceable_task_note`] when there
+/// is one. The companion's probe ([`companion_probe`]) matches a person's own
+/// `service status` too, so it and the `Status` arm both print this, and
+/// neither drops the note. The note's check reads one file's descriptor in
+/// this process: no child process and no log line on the probe's 10 s. The
+/// companion finds the `Auto-start:` line by its prefix, scanning from the
+/// last line up (#1682), so a `Note:` line after it changes nothing there.
+pub fn print_status() -> Result<()> {
+    let s = status().context("querying auto-start status")?;
+    for line in status_lines(&s, unreplaceable_task_note().as_deref()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// [`print_status`]'s lines: the answer first, the note after it.
+fn status_lines(s: &AutostartStatus, note: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("Auto-start: {s}")];
+    lines.extend(note.map(|n| format!("Note: {n}.")));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2582,6 +2995,22 @@ mod tests {
         assert_eq!(AutostartStatus::Installed.to_string(), "installed");
         assert_eq!(AutostartStatus::NotInstalled.to_string(), "not installed");
         assert_eq!(AutostartStatus::Unknown.to_string(), "unknown");
+    }
+
+    /// FR-150 P1a (#3507) — `service status` prints its answer line first and
+    /// the note after it, a sentence of its own. The companion reads the
+    /// answer by its prefix (roomler-desktop's
+    /// `a_note_after_the_answer_line_changes_nothing`).
+    #[test]
+    fn service_status_prints_its_answer_then_the_note() {
+        assert_eq!(
+            status_lines(&AutostartStatus::Installed, None),
+            ["Auto-start: installed"]
+        );
+        assert_eq!(
+            status_lines(&AutostartStatus::Installed, Some("an elevated task")),
+            ["Auto-start: installed", "Note: an elevated task."]
+        );
     }
 
     #[test]

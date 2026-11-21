@@ -52,7 +52,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:147-189`); `--user-steps` starts the
   LaunchAgent (`install.sh:959-968`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2560-2609`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2623-2672`). `install.sh --one-row` is
   the one-token path (`install.sh:1012-1108`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
   (`docs/installation.md:2146-2150`).
@@ -115,7 +115,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 |---|---|---|
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
-| Enrollment (`orchestrator_unix.rs:989-1084`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8830-8836`); no person's enrollment, no `--user-steps` |
+| Enrollment (`orchestrator_unix.rs:989-1084`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8922-8928`); no person's enrollment, no `--user-steps` |
 | Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1064-1069`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1093-1097`, `postinstall:355-388`); on a Mac that is one row already, the package only (`install.sh:1034-1052`) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
@@ -189,7 +189,7 @@ person's half on it and says why.
 ### 4. The terminal and the web dialog (P4)
 
 - `install.sh --overlay` on Linux, opt-in: with `--system` the TUN, per-user the netstack, as the wizard does. The
-  default stays off, as the daemon's hint says (`service.rs:518-529`, and its test at `:2481-2486`).
+  default stays off, as the daemon's hint says (`service.rs:556-567`, and its test at `:2871-2876`).
 - The dialog's Linux note says what a system install shows today (`enrollCommands.ts:239-241`). Its macOS block
   puts the wizard first where the server offers it (`enrollCommands.ts:198-203`) and says what the one-liner
   installs.
@@ -216,7 +216,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:2749-2750`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:2812-2813`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

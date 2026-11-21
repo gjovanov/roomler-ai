@@ -134,6 +134,20 @@ name before it), so a task under one of those is acted on only when its principa
 definition this process is refused, one that does not parse, or one that names another account is left.
 Never delete, end or `/Create /F` a task by a shared name, and match a task's name whole: `Roomler` is a
 prefix of every account's own name (`account_of`).
+⚠️ **Every per-user task definition names its account's own security descriptor, and only a delete and a
+create repair a task that lacks it** (FR-150, `agents/roomlerd/src/service/user_task.rs`,
+`docs/installation.md`). A task registered from an elevated token without one is owned by Administrators
+with read for its account, so every self-update's registration, at medium, is refused and the device stays
+down until the next sign-in (#3507). Task Scheduler applies a descriptor only when it creates a task: a
+`/Create /F` over a task keeps the old one, whoever asks. A medium process may still `/Run` and `/End` such a
+task, which is what `Roomler start-<SID>` relies on. The SDDL stays exactly
+`O:<sid>D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<sid>)`: the owner and access a medium registration already gives,
+never a grant to anyone else. The start task is no account's autostart, so `account_of` must keep reading no
+account in its name.
+⚠️ **Every custom action of the per-user MSI runs a step that writes its start and end lines in the person's
+log** (FR-150, `is_per_user_step` in `agents/roomlerd/src/app.rs`), because Windows Installer throws a custom
+action's output away. `every_per_user_msi_step_writes_its_record` holds a new per-user action to it, as
+`the_installer_role_is_what_each_msi_runs_as_local_system` holds the per-Machine ones.
 ⚠️ **The per-user arm of `cleanup-legacy-install` ends a task before it deletes it, and stops the account's
 daemon only after the delete** (#3885, `docs/installation.md`): deleting a task leaves its process running,
 which made two daemons on one machine, and until the delete a one-shot, logon or boot trigger or `service
