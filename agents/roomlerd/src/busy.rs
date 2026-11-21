@@ -8,7 +8,7 @@
 //!   OS) defers while any of it is live, on the budget transfers always had:
 //!   a recheck every hour, forced after
 //!   [`MAX_CONSECUTIVE_DEFERS`](crate::updater::MAX_CONSECUTIVE_DEFERS)
-//!   defers in a row ([`crate::updater::periodic_gate`]). An operator's push
+//!   defers in a row (`updater::periodic_gate`). An operator's push
 //!   still proceeds, and its warning names what it cuts.
 //! - **The replaced-binary restart** ([`crate::replaced_binary`], a per-user
 //!   Linux daemon) waits for it up to its 24 h ceiling.
@@ -30,11 +30,11 @@ use crate::power::{ActivityCounter, ActivityGuard};
 pub struct Busy {
     pub rc_sessions: usize,
     pub ssh_connections: usize,
-    /// Fleet RPC commands running in this process ([`exec_run`]). A command
+    /// Fleet RPC commands running in this process (`exec_run`). A command
     /// of an SSH session is its connection's, counted there once.
     pub exec_runs: usize,
     /// File transfers in flight, plus a screen recording
-    /// ([`crate::updater::active_work`]).
+    /// (`updater::active_work`).
     pub work: usize,
     /// The network moved in the last 10 min (R5b: a restart beside a VPN
     /// transition can lock the machine out).
@@ -144,8 +144,8 @@ pub(crate) fn exec_runs() -> usize {
     exec_run_counter().load(Ordering::Relaxed)
 }
 
-/// The count [`exec_run`] holds and [`exec_runs`] reads: the process's own,
-/// or in a test the one this thread was handed ([`EXEC_RUNS_HERE`]).
+/// The count `exec_run` holds and `exec_runs` reads: the process's own,
+/// or in a test the one this thread was handed (`EXEC_RUNS_HERE`).
 fn exec_run_counter() -> ActivityCounter {
     #[cfg(test)]
     if let Some(here) = EXEC_RUNS_HERE.with(|h| h.borrow().clone()) {
@@ -157,7 +157,7 @@ fn exec_run_counter() -> ActivityCounter {
 
 #[cfg(test)]
 thread_local! {
-    /// `Some(count)` is [`exec_run`]'s and [`exec_runs`]'s count on this
+    /// `Some(count)` is `exec_run`'s and `exec_runs`'s count on this
     /// thread, as `capture::seat_guard::LIVE_HERE` answers `live`: a test
     /// reads no other test's commands, and its own reach no other test.
     pub(crate) static EXEC_RUNS_HERE: std::cell::RefCell<Option<ActivityCounter>> =

@@ -2342,6 +2342,9 @@ impl ExecEngine {
         cancel: impl std::future::Future<Output = ()>,
         stdin: Option<StdinFeed>,
     ) -> ExecOutcome {
+        // #3429 — a Fleet RPC run is live work the periodic update waits for,
+        // until it returns; an SSH session's command is its connection's.
+        let _run = crate::busy::exec_run(req);
         #[cfg(windows)]
         let command = utf8_wrapped(program, &req.command);
         #[cfg(not(windows))]

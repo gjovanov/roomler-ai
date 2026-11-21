@@ -70,10 +70,10 @@ pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
 /// up + reach the clean-run threshold.
 pub const STARTUP_UPDATE_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// rc.19: short-cycle interval when the auto-updater defers because
-/// file transfers are in flight. Keeps checking every hour so the
-/// install fires shortly after the operator's last upload completes,
-/// without waiting the full 24h CHECK_INTERVAL between checks.
+/// rc.19, #3429: short-cycle interval when the auto-updater defers for
+/// live work (a session, SSH, an exec run, a transfer or a recording).
+/// Keeps checking every hour so the install fires shortly after the work
+/// ends, without waiting the full 24h CHECK_INTERVAL between checks.
 pub const TRANSFER_DEFER_RECHECK: Duration = Duration::from_secs(3600);
 
 /// rc.19: max number of consecutive defers before the auto-updater
@@ -163,10 +163,10 @@ pub fn recheck_after(
     }
 }
 
-/// rc.19: gating decision for the periodic loop given the current
-/// active-transfer count and consecutive-defer counter. Pure helper
-/// so the gating logic is unit-testable without spinning the full
-/// loop.
+/// rc.19: gating decision for the periodic loop given the count of live
+/// work a restart would cut (#3429: `busy::Busy::cuttable_count`) and the
+/// consecutive-defer counter. Pure helper so the gating logic is
+/// unit-testable without spinning the full loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferDecision {
     /// Run the update check this cycle.
@@ -178,9 +178,9 @@ pub enum DeferDecision {
     ForceAfterDefers,
 }
 
-/// Decide whether to gate the update check this cycle. Returns
-/// `Proceed` when nothing gates (no transfers active, no fresh network
-/// transition) OR the consecutive-defer limit has been reached. Pure /
+/// Decide whether to gate the update check this cycle: `Proceed` when
+/// nothing gates (no live work, no fresh network transition), else a
+/// defer, until the consecutive-defer limit forces it through. Pure /
 /// no I/O — tested directly.
 pub fn decide_defer(active: usize, net_transition: bool, consecutive_defers: u32) -> DeferDecision {
     if active == 0 && !net_transition {
@@ -3244,14 +3244,15 @@ fn act_on_outcome_with(
 /// the rest of the agent tears down cleanly.
 ///
 /// `trigger_rx` (S1a) delivers operator-forced cycles pushed over the
-/// WS (`rc:agent.update`): those bypass the transfer-defer gate (the
-/// operator asked NOW; a warn is logged if transfers are active) but
-/// still honour the install-storm cooldown marker.
+/// WS (`rc:agent.update`): those bypass the live-work gate (the operator
+/// asked NOW; a warn names the live work, #3429) but still honour the
+/// install-storm cooldown marker. `rc_sessions` is the daemon's registry.
 pub async fn run_periodic(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     interval: Duration,
     mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     // macOS: the agent processes install NOTHING — `com.roomler.update`
     // (the root update helper) owns check+download+verify+install, and this
@@ -3382,7 +3383,7 @@ pub async fn run_periodic(
         first = false;
 
         // S1a — operator-forced cycle (rc:agent.update). Bypasses the
-        // transfer-defer gate (explicit operator intent) but keeps the
+        // live-work gate (explicit operator intent) but keeps the
         // install-storm cooldown; a pinned tag skips the is-newer check
         // (pin_version semantics — the admin chose the version).
         if let Some(pin) = forced {
@@ -3392,12 +3393,8 @@ pub async fn run_periodic(
                 );
                 continue;
             }
-            let active = active_work();
-            if active > 0 {
-                tracing::warn!(
-                    active,
-                    "forced update proceeding despite in-flight file transfers or a recording"
-                );
+            if let Some(warning) = forced_update_warning(&crate::busy::now(&rc_sessions)) {
+                tracing::warn!("{warning}");
             }
             let outcome = match pin {
                 Some(tag) => pin_version(&tag).await,
@@ -3418,38 +3415,30 @@ pub async fn run_periodic(
             continue;
         }
 
-        // rc.19 gate: don't fire an installer while file transfers
-        // are in flight. Pair with resumable transfers — even with
-        // resume the install + restart kills the WebRTC peer for
-        // several seconds, which is a UX nuisance. Skip the cycle
-        // when active > 0 unless we've deferred MAX_CONSECUTIVE_DEFERS
-        // times in a row (security-vs-uptime trade-off documented in
-        // the rc.19 plan M3 fix).
-        let active = active_work();
-        let net_transition = net_transition_recent();
-        match decide_defer(active, net_transition, consecutive_defers) {
+        // rc.19 gate, #3429: don't fire an installer over live work. The
+        // install restarts the daemon, which cuts every session, SSH
+        // connection, Fleet RPC run, transfer and recording it serves
+        // (`busy`). Skip the cycle while any is live, or the network just
+        // moved (R5b), unless we've deferred MAX_CONSECUTIVE_DEFERS times
+        // in a row (security-vs-uptime trade-off documented in the rc.19
+        // plan M3 fix).
+        let busy = crate::busy::now(&rc_sessions);
+        let (decision, recheck) = periodic_gate(&busy, consecutive_defers);
+        match decision {
             DeferDecision::DeferOnce => {
                 consecutive_defers = consecutive_defers.saturating_add(1);
-                // R5b — a transition defer rechecks fast (the network
-                // settles in minutes); a transfer defer keeps its hour.
-                let recheck = if net_transition && active == 0 {
-                    NET_DEFER_RECHECK
-                } else {
-                    TRANSFER_DEFER_RECHECK
-                };
                 defer_recheck = Some(recheck);
                 tracing::info!(
-                    active,
-                    net_transition,
+                    %busy,
                     consecutive_defers,
                     next_check_secs = recheck.as_secs(),
-                    "auto-updater: deferring — transfers or a recording in flight, or the network just moved"
+                    "auto-updater: deferring — live work a restart would cut, or the network just moved"
                 );
                 continue;
             }
             DeferDecision::ForceAfterDefers => {
                 tracing::warn!(
-                    active,
+                    %busy,
                     consecutive_defers,
                     "auto-updater: forcing update after {} consecutive defers",
                     MAX_CONSECUTIVE_DEFERS
@@ -3496,14 +3485,22 @@ fn schedule_transport_retry(
     }
 }
 
-/// #3429 — the periodic check's gate on what [`crate::busy::now`] read.
-/// SEAM: the gate as it stands, transfers and a recording only.
+/// #3429 — the periodic check's gate, on what [`crate::busy::now`] read. The
+/// work a restart would cut (`Busy::cuttable_count`: sessions, SSH
+/// connections, Fleet RPC runs, transfers and a recording) is
+/// [`decide_defer`]'s `active`, on the budget transfers always had: a recheck
+/// after [`TRANSFER_DEFER_RECHECK`], forced after [`MAX_CONSECUTIVE_DEFERS`]
+/// defers in a row. R5b is unchanged: a network transition alone rechecks
+/// after [`NET_DEFER_RECHECK`], under the same cap. An install in flight is
+/// no input here. Pure: the unit cells' entry, and the loop's.
 pub(crate) fn periodic_gate(
     busy: &crate::busy::Busy,
     consecutive_defers: u32,
 ) -> (DeferDecision, Duration) {
-    let active = busy.work;
+    let active = busy.cuttable_count();
     let decision = decide_defer(active, busy.net_transition, consecutive_defers);
+    // R5b — a transition defer rechecks fast (the network settles in
+    // minutes); a defer for live work keeps its hour.
     let recheck = if busy.net_transition && active == 0 {
         NET_DEFER_RECHECK
     } else {
@@ -3512,11 +3509,12 @@ pub(crate) fn periodic_gate(
     (decision, recheck)
 }
 
-/// #3429 — the forced update's warning. SEAM: the warning as it stands.
+/// #3429 — what a forced update warns before it proceeds anyway: everything a
+/// restart now cuts or wedges, in `Busy`'s words. `None` when that is
+/// nothing. Pure.
 pub(crate) fn forced_update_warning(busy: &crate::busy::Busy) -> Option<String> {
-    (busy.work > 0).then(|| {
-        "forced update proceeding despite in-flight file transfers or a recording".to_string()
-    })
+    (busy.cuttable() || busy.unforceable())
+        .then(|| format!("forced update proceeding despite: {busy}"))
 }
 
 // ─── macOS update half (`com.roomler.update` + `update-helper`) ──────────

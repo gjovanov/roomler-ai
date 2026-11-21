@@ -24,11 +24,11 @@
 //! file that cannot run is never restarted onto, and a reinstall of the same
 //! release is not worth cutting anything for.
 //!
-//! **Idle** ([`Busy`], the model the periodic update reads too: #3429) is no
-//! remote-control session, no SSH connection, no exec run, no transfer or
-//! recording (work a restart cuts, and does cut after [`CEILING`]), no network
-//! transition in the last 10 min and no in-process install in flight (states a restart
-//! could wedge, never forced). Running agent turns are waited for as an install waits for them.
+//! **Idle** ([`Busy`], which the periodic update reads too, #3429) is no
+//! remote-control session, SSH connection, exec run, transfer or recording
+//! (work a restart cuts, and cuts after [`CEILING`]), no network move in the
+//! last 10 min and no in-process install in flight (a restart could wedge,
+//! never forced). Agent turns are waited for as an install waits for them.
 //!
 //! The restart itself is FR-84 D3's
 //! ([`crate::localapi_state::RestartHandle::arm_from_within`]): only under a

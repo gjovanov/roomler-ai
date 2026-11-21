@@ -5639,15 +5639,15 @@ async fn run_cmd(
     // tears down cleanly before the running binary gets overwritten.
     // Disable entirely with `ROOMLERD_AUTO_UPDATE=0` for air-
     // gapped / operator-managed deployments.
-    let upd_task = if let Some(update_trigger_rx) = update_trigger_rx {
+    let upd_task = if let Some(trigger_rx) = update_trigger_rx {
         tracing::info!(
             interval_h = update_interval.as_secs() / 3600,
             "auto-updater armed"
         );
         Some(tokio::spawn({
-            let rx = shutdown_rx.clone();
+            let (rx, rc) = (shutdown_rx.clone(), rc_sessions.clone());
             let tx = shutdown_tx.clone();
-            async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
+            async move { updater::run_periodic(rx, tx, update_interval, trigger_rx, rc).await }
         }))
     } else {
         match auto_update {

@@ -909,6 +909,9 @@ where
         .power_activity
         .as_ref()
         .map(crate::power::ActivityGuard::new);
+    // #3429 — and is an SSH connection the periodic update waits for, as the
+    // worker's own are: an update stops the service that serves it.
+    let _live = crate::ssh::LiveConnection::open();
     let asker = services.asker.clone();
     splice_framed(client, pipe, peer, move |ask| {
         let asker = asker.clone();
