@@ -99,7 +99,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:6324`), so the mechanism was already correct and
+   since FR-5 (`app.rs:6368`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -697,10 +697,10 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2268`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2302`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2318`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device

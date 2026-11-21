@@ -236,7 +236,7 @@ prevent, and the guard re-asserts it on every tick.
 
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
-| N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:884-890`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
+| N1 | In the mesh on a default install | ✅ | ✅ | ❌ | The default `.pkg` installs the per-user half, which cannot create a utun; the mesh needs `--daemon-token`, a second enrollment and a second device row (`scripts/install.sh:903-909`, `packaging/macos/com.roomler.daemon.plist` header) | FR-43 P3 |
 | N2 | Exit node, client | ✅ | ✅ | ✅ P1a + P1c (AC4, AC6 field-verified) | S1; no original-default capture (`tun.rs:1931-1939`, `3471-3503` are `cfg(any(linux, windows))`) | P0a, P1a |
 | N3 | Exit node, serving v4 | 🟡 WinNAT; Home ❌ | ✅ iptables | ✅ P1b: pf, in our own anchor (0.4.141; #2377 in 0.4.142; AC5, §8) | Silent no-op (`nat.rs:376-378`); Home: #2077 | P0b, P1b, P4e |
 | N4 | Exit node, serving v6 | ⛔ WinNAT has no v6 (`nat.rs:268-274`) | ✅ ip6tables | ✅ P1b: pf NAT66 to a stable address (global first, else a ULA), where an unscoped v6 default exists (0.4.141; AC5, §8) | — | P1b; Windows: D1 |
@@ -289,7 +289,7 @@ and the consent chain's fallbacks.
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3602`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:205`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:282-334`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
-| D5 | The setup wizard installs the daemon | ✅ | ✅ since 0.4.184 (FR-129 B1) | ✅ since 0.4.184 (FR-129 B1); the root half since 0.4.187 (B2) | Was: the tunnel client only on Linux and macOS (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offered it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`). *Since FR-129 B1:* the wizard has daemon roles on every OS (`agents/roomler-setup/src/role.rs:101-108`): on Linux the system daemon and the per-user one, on macOS the person's daemon, with the root half beside it when the private-network box is ticked (`role.rs:130`). Windows asks no server (`commands.rs:168`). On Linux and macOS a card shows only when the chosen server's switch for that OS is on (`commands.rs:255`, `features.rs:84`), and an install refuses without it (`orchestrator_unix.rs:331-343`). The server answers per OS on `GET /api/setup/features` from `[setup] wizard_linux_daemon` and `wizard_macos_daemon`, each default off (`crates/modules/fleet/src/setup_release.rs:210-222`, `crates/config/src/settings.rs:90`, `:94`). The enroll dialog and the homepages offer the wizard for an agent on that answer (`ui/src/utils/enrollCommands.ts:198-203`, `:290`). Field-verified on Ubuntu, Fedora KDE and macOS in [FR-129](FR-129-guided-cross-platform-installer.md) AC11, on 0.4.189 to 0.4.191 | P0c, D5, FR-129 B1, B2 |
+| D5 | The setup wizard installs the daemon | ✅ | ✅ since 0.4.184 (FR-129 B1) | ✅ since 0.4.184 (FR-129 B1); the root half since 0.4.187 (B2) | Was: the tunnel client only on Linux and macOS (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offered it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`). *Since FR-129 B1:* the wizard has daemon roles on every OS (`agents/roomler-setup/src/role.rs:101-108`): on Linux the system daemon and the per-user one, on macOS the person's daemon, with the root half beside it when the private-network box is ticked (`role.rs:130`). Windows asks no server (`commands.rs:193`). On Linux and macOS a card shows only when the chosen server's switch for that OS is on (`commands.rs:285`, `features.rs:93`), and an install refuses without it (`orchestrator_unix.rs:349-361`). The server answers per OS on `GET /api/setup/features` from `[setup] wizard_linux_daemon` and `wizard_macos_daemon`, each default off (`crates/modules/fleet/src/setup_release.rs:218-231`, `crates/config/src/settings.rs:90`, `:94`). The enroll dialog and the homepages offer the wizard for an agent on that answer (`ui/src/utils/enrollCommands.ts:198-203`, `:290`). Field-verified on Ubuntu, Fedora KDE and macOS in [FR-129](FR-129-guided-cross-platform-installer.md) AC11, on 0.4.189 to 0.4.191 | P0c, D5, FR-129 B1, B2 |
 | D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4411`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
 
 ### 2.5 SSH and Fleet RPC
@@ -308,12 +308,12 @@ and the consent chain's fallbacks.
 | O2 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | 🟡 built (P6a) | 🟡 built (P6a) | Was: `Unsupported`, so the install proceeded and a signed older package under a newer manifest installed (measured on 0.4.143, §8). P6a reads the `.deb`'s control `Version`, the tarball's top directory and the `.pkg`'s `PackageInfo` (`artifact_version.rs:114`) | P6a |
 | O3 | Tunnel CLI `roomler self-update` | ✅ | 🟡 built (P6b) | 🟡 built (P6b) | Was: Windows only, with the manifest's SHA-256 the only check. *P6b:* the `.asc` against the pinned key on every OS (`agents/roomler-cli/src/update.rs:227`); a tarball, or the `.deb` where dpkg owns the binary, by host (`:267`); the version named inside the signed archive (`:391`, `:574`) | P6b |
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
-| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1430`) | P6d |
+| O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1512`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:275-301`, `:1793-1800`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1013-1022` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3738`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3773`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2617-2623`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:86-87`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
@@ -361,7 +361,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
 | code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:4923`, `tun.rs:3364-3369` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:4954`, `crates/tunnel-core/src/overlay/tun.rs:4157-4158`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:316`), `crates/tunnel-core/src/overlay/mod.rs:95`, `crates/tunnel-core/src/overlay/tun.rs:4010`, `:4106`, `:4513`, `agents/roomlerd/src/app.rs:5492` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:316`), `crates/tunnel-core/src/overlay/mod.rs:95`, `crates/tunnel-core/src/overlay/tun.rs:4982`, `:5079`, `:5508`, `agents/roomlerd/src/app.rs:5527` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -458,7 +458,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:115`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3589`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4018`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:2966`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone kept image events (`clipboard.rs:817-822` before P3e-3a); since P3e-3a a Linux X11 session keeps them too, behind its change gate (`agents/roomlerd/src/clipboard.rs:1076`), and since P2e-1 a Mac, behind its change count (`agents/roomlerd/src/encode/caps.rs:2818`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
@@ -502,34 +502,34 @@ reach a viewer from agents on the release after P0c-1.
 Mirror the Linux arm with the BSD tools the macOS code already drives, and close two gaps the Linux arm has (N12):
 
 1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
-   (`tun.rs:4109`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
-   every pin (`current_uplink`, `tun.rs:5672`): a Mac that booted without a network still pins once it has one, and
-   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:316`) refuses a route on our
+   (`tun.rs:5421`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
+   every pin (`current_uplink`, `tun.rs:7772`): a Mac that booted without a network still pins once it has one, and
+   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:323`) refuses a route on our
    own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
    next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
    in transit does not move the pins.
-2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:5574`), never from a
+2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:7295`), never from a
    lookup. A destination a connection has used keeps an interface-scoped clone of the default route
    (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that clone even after the pin is in (field,
    §8: the first P1a read back by lookup and refused every pin for the server). The pin is the UNSCOPED static host
-   route for exactly the address (`bsd_pin_row`, `tun.rs:398`: flags `H` and `S`, never `W` or `I`), and it holds
-   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:411`).
-3. **`add_host_exemption`** (`tun.rs:4971`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+   route for exactly the address (`bsd_pin_row`, `tun.rs:405`: flags `H` and `S`, never `W` or `I`), and it holds
+   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:418`).
+3. **`add_host_exemption`** (`tun.rs:6312`) looks first, because BSD `route` has no idempotent write (#1856): a pin
    that holds is left alone; one that does not (the old uplink, a crashed run's, an interface route) is deleted, then
    added; anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6). Never `route
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
-4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:5069` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:599`)
+4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:6424` on macOS, an empty default
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:612`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
    unscoped pin left, `route -n delete -host` removed something else on the field Mac. The boot purge already
-   removes the `/1`s (`tun.rs:4834-4877` at the time of writing); pins an unclean exit leaves behind are N13, all
+   removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:393`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:405`) instead of `no original default route?`.
+   `route_guard.rs:406`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:418`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2316-2331`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2432-2447`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -965,10 +965,10 @@ test of the SIGKILL property itself.
   - Open: the layout is the system's (`localectl`, `/etc/default/keyboard`), not the session's own input source,
     which GNOME can set apart from it; P3f types for what the system names, as the table did.
 - **P3g, a companion where there is none** (with FR-93 D5/D6 and FR-95): an arm64 `.deb` and a tarball build;
-  `install.sh` already has the hook (`scripts/install.sh:1378-1388`).
+  `install.sh` already has the hook (`scripts/install.sh:1460-1470`).
   - *Done by FR-93 (checked 2026-10-20):* P6e builds the companion for aarch64 as a `.deb` and an `.rpm` on the
     arm64 runner (`.github/workflows/release-agent.yml:960`), in every release since 0.4.138, and `install.sh` picks
-    either by the host's package manager (`scripts/install.sh:1378-1388`). AC10 is field-verified in FR-93's lab.
+    either by the host's package manager (`scripts/install.sh:1460-1470`). AC10 is field-verified in FR-93's lab.
   - *Not built, the tarball:* a host with neither dpkg nor rpm gets no companion (`install.sh` says so and skips
     it). FR-93 P6f's notification prompt still answers consent there; what such a host lacks is the banner under
     Wayland and the tray. Whether to build it is D17.
@@ -1057,9 +1057,9 @@ test of the SIGKILL property itself.
     save and ignored. `docs/hive.md` §8 (*On Windows*) described it at master `7106d588d`, and the doc left
     master with Hive.
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`app.rs:3733-3748`):
+  reaches (`app.rs:3768-3783`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
-    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:876`).
+    waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:1024`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
     until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
     loaded.
@@ -1186,7 +1186,7 @@ model on Windows, so the three agree on what the mode means.
     had refused on the belief that launchd would restart the agent; it now stops the same way.
 - **P6d, `install.sh --uninstall [--keep-config]` (built).** One command removes what any install path put on a Linux
   or macOS machine: this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the tunnel CLI. Every
-  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:1430`).
+  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:1512`).
   - **The order is the design.** Every service stops through its manager while its files are still on disk
     (`uninstall_stop_linux`, `uninstall_stop_macos`). The stop is a SIGTERM, the daemon's clean stop, so P0e's purge
     takes back the exit `/1`s and the DNS steer, and an ephemeral device unenrolls itself. A daemon no manager owns

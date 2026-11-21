@@ -410,3 +410,178 @@ fn set_default_dacl(token: HANDLE, user_sid: PSID) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// FR-150 P1a — the file rights a replace and a delete of a scheduled task
+/// take on the task's file: `FILE_GENERIC_WRITE | DELETE`.
+const REPLACE_AND_DELETE: u32 = 0x0012_0116 | 0x0001_0000;
+
+/// The file generic mapping: `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`,
+/// `FILE_GENERIC_EXECUTE` and `FILE_ALL_ACCESS`.
+const FILE_MAPPING: windows_sys::Win32::Security::GENERIC_MAPPING =
+    windows_sys::Win32::Security::GENERIC_MAPPING {
+        GenericRead: 0x0012_0089,
+        GenericWrite: 0x0012_0116,
+        GenericExecute: 0x0012_00A0,
+        GenericAll: 0x001F_01FF,
+    };
+
+/// A security descriptor the system allocated, freed on drop.
+struct LocalDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+impl Drop for LocalDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: allocated by the call that filled it, freed once.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0 as _) };
+    }
+}
+
+/// FR-150 P1a — may a medium copy of this process's token
+/// ([`restricted_medium_copy`]) write and delete the file at `path`, by the
+/// file's own security descriptor? A per-user process asks it of its task's
+/// file under `System32\Tasks`: Task Scheduler refuses a replace or a delete of
+/// the task from a medium token exactly when this answers no (#4128's P0, C6
+/// and C3c), and that file is the copy of the task's descriptor a medium
+/// process may read. An elevated process gets the answer for the account
+/// behind it, which is what its next self-update runs with.
+pub fn medium_may_write_and_delete(path: &std::path::Path) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path and out-params; the descriptor is freed
+    // by the guard below.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "reading the security of {} failed (win32 error {rc})",
+            path.display()
+        ));
+    }
+    let sd = LocalDescriptor(sd);
+    medium_access_check(sd.0, REPLACE_AND_DELETE)
+}
+
+/// [`medium_may_write_and_delete`] over a descriptor given as SDDL, which
+/// names an owner, a group and a DACL.
+pub fn medium_may_write_and_delete_sddl(sddl: &str) -> Result<bool, String> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-param; the descriptor
+    // is freed by the guard below.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("parsing the SDDL"));
+    }
+    let sd = LocalDescriptor(sd);
+    medium_access_check(sd.0, REPLACE_AND_DELETE)
+}
+
+/// `AccessCheck` of a medium copy of this process's token against `sd`, for
+/// all of `desired`, under the file generic mapping.
+fn medium_access_check(
+    sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    desired: u32,
+) -> Result<bool, String> {
+    use windows_sys::Win32::Security::{AccessCheck, DuplicateToken, SecurityIdentification};
+    let primary = restricted_medium_copy()?;
+    let mut imp: HANDLE = std::ptr::null_mut();
+    // SAFETY: a token this process holds with TOKEN_DUPLICATE, and an
+    // out-param.
+    if unsafe { DuplicateToken(primary.raw(), SecurityIdentification, &mut imp) } == 0 {
+        return Err(last_error("DuplicateToken"));
+    }
+    let imp = Owned::new(imp).ok_or_else(|| "DuplicateToken returned no token".to_string())?;
+    // A PRIVILEGE_SET with room to spare: the medium copy holds no privilege
+    // an access check could use.
+    let mut privileges = [0u64; 32];
+    let mut privileges_len = std::mem::size_of_val(&privileges) as u32;
+    let mut granted = 0u32;
+    let mut status = 0;
+    // SAFETY: a descriptor with an owner, a group and a DACL, an
+    // impersonation token with TOKEN_QUERY, and buffers that outlive the call.
+    let ok = unsafe {
+        AccessCheck(
+            sd,
+            imp.raw(),
+            desired,
+            &FILE_MAPPING,
+            privileges.as_mut_ptr().cast(),
+            &mut privileges_len,
+            &mut granted,
+            &mut status,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("AccessCheck"));
+    }
+    Ok(status != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-150 P1a — the access check answers as Task Scheduler did in #4128's
+    /// P0, over the descriptors it read: yes for a task registered at medium
+    /// (C1) and for P1a's own descriptor (C3, C3b, C3c), no for a task
+    /// registered elevated (C2, #3507), whose account only reads it. Whatever
+    /// token runs the test: the medium copy holds Administrators deny-only.
+    #[test]
+    fn a_task_the_account_cannot_replace_is_named_at_start() {
+        let me = own_user_sid().expect("this process's SID");
+        if me == "S-1-5-18" {
+            // SYSTEM's own entries grant it the write: not a per-user process.
+            return;
+        }
+        let medium = format!(
+            "O:{me}G:SYD:(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;{me})(A;;FR;;;{me})"
+        );
+        let own = format!("O:{me}G:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{me})");
+        let elevated = format!(
+            "O:BAG:SYD:(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)(A;;FR;;;{me})"
+        );
+        assert_eq!(medium_may_write_and_delete_sddl(&medium), Ok(true));
+        assert_eq!(medium_may_write_and_delete_sddl(&own), Ok(true));
+        assert_eq!(medium_may_write_and_delete_sddl(&elevated), Ok(false));
+        // Write without delete is not enough: a replace that cannot delete is
+        // refused.
+        let no_delete = format!("O:BAG:SYD:(A;;0x120116;;;{me})");
+        assert_eq!(medium_may_write_and_delete_sddl(&no_delete), Ok(false));
+        assert!(medium_may_write_and_delete_sddl("not SDDL").is_err());
+    }
+
+    /// The check reads a real file's descriptor: one this account made in its
+    /// own temp folder is its own to write and delete.
+    #[test]
+    fn the_medium_check_reads_a_files_own_descriptor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("task");
+        std::fs::write(&file, b"<Task/>").unwrap();
+        assert_eq!(medium_may_write_and_delete(&file), Ok(true));
+        assert!(medium_may_write_and_delete(&dir.path().join("absent")).is_err());
+    }
+}
