@@ -181,7 +181,7 @@ The child's first statements, before it reads its verb's arguments or any file:
 
 So the child can do in the home what the person's account can do as its owner, and nothing through another group.
 
-Not through `sudo -u`, the form the worker's start (`macos_supervisor.rs:1324-1363`) and the package's `as_person`
+Not through `sudo -u`, the form the worker's start (`macos_supervisor.rs:1342-1381`) and the package's `as_person`
 (`agents/roomlerd/packaging/macos/postinstall:237-239`) use: an enrollment's token and WireGuard key cross these
 pipes, `sudo` records a command's input and output where it is set to, and it can pass the caller's `HOME` on.
 
@@ -204,7 +204,7 @@ with "nothing has changed" (exit 1).
 | # | State, from the child's `read` | What is printed |
 |---|---|---|
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
-| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:616-741`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1039`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
+| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:634-759`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1057`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
 | R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:3974`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
@@ -219,7 +219,7 @@ hold (the package's `sudo_line_fits`, `postinstall:260-266`, and its owner test,
    of the person's, not a link.
 4. The child reports that the target is a folder (R1) or a regular file (R3) of uid 0, not a link.
 
-The line, each word quoted by `sh_quote` (`macos_supervisor.rs:955-957`):
+The line, each word quoted by `sh_quote` (`macos_supervisor.rs:973-975`):
 
     <name> is an administrator of this Mac and can run this, then run `sudo roomlerd one-row` again:
       sudo chown -h '<name>' '<path>'
@@ -450,7 +450,7 @@ folder is not theirs: before it starts the screen worker, not after five fast ex
   rename `<F>` to `<F>.made-by-root-<stamp>`, rename `<F>.new-<stamp>` to `<F>`. The old copies' bytes go to root as
   records, so nothing of `one-row`'s stays in the home. The root-made folder stays beside it, as a named leftover
   that the person cannot delete.
-- The supervisor's own `lstat` of the folder (`person_folder_not_theirs`, `macos_supervisor.rs:1174-1181`) moves into
+- The supervisor's own `lstat` of the folder (`person_folder_not_theirs`, `macos_supervisor.rs:1192-1199`) moves into
   the verb's checks, so root reads nothing in the home.
 - P2 replaces the printed line, not the give-up's cause text, and it ships behind a switch whose off state is today's
   give-up with the printed line (since #3846, the administrator's command). It needs supervisor wiring and lab cells
@@ -471,7 +471,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `scripts/install.sh:1083` | `as_root grep` of the console person's `config.toml` | read |
 | `postinstall:145-163`, `:401`, `:486` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:262-265`, `:301` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
-| `macos_supervisor.rs:1174-1181` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
+| `macos_supervisor.rs:1192-1199` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
 | `agents/roomlerd/src/files.rs:5279-5289` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
 | `agents/roomlerd/src/recording/folder.rs:160-164` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:250`) | write |

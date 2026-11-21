@@ -332,7 +332,7 @@ explicit allowlist, `WORKER_ENV_FORWARD`
 (`agents/roomlerd/src/macos_supervisor.rs:275`): each through
 `tunnel_core::env::node_env` (environment, then config fallback), and only when
 the root has one, as `sudo -u '#uid' /usr/bin/env ROOMLERD_K=v … run
---supervised` (`macos_supervisor.rs:396`). In the worker an environment variable
+--supervised` (`macos_supervisor.rs:1342`). In the worker an environment variable
 beats its own config, so the session does what the hello promised. `env` execs
 into the agent, so the chain the supervisor reaps and the signals it relays are
 unchanged.
@@ -371,8 +371,8 @@ was refused as a `secret mismatch` every 30 s.
 
 | | as built |
 |---|---|
-| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:709`, `:581`, `:372`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:430`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:577`, `:625`). |
-| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:878`, `:499`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:1410`, `:1156`, `:382`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:440`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:577`, `:625`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1579`, `:509`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
 | **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
 
 An adversarial review before the merge found three edges, all fixed in the same PR:
@@ -507,7 +507,7 @@ flowchart TB
 
 | | Off, the default | On |
 |---|---|---|
-| The spawn (`agents/roomlerd/src/macos_supervisor.rs:731`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
+| The spawn (`agents/roomlerd/src/macos_supervisor.rs:1342`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
 | A person's enrollment on this Mac | what the worker runs on | ignored and left in the file, so turning the switch off brings it back until the migration strips it |
 | A secondary org's session | served by the root, no pixels | delegated |
 | A Mac with no per-user config | no worker | a worker |
@@ -520,7 +520,7 @@ flowchart TB
 
 Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but the receive deadline and the ping arms would each need a detached branch, on the path every platform's sessions take.
 
-⚠️ **The stand-in's lifetime is the worker's.** The secret proves the worker to the stand-in, and nothing proves the stand-in to the worker. If the listener ended while the worker lived, its port would be free, any local process could bind it, and the loop's reconnect would dial that process, hand it the secret and act on what it sent. That process would be a control plane for a worker holding the person's TCC grants. So when the listener's task ends, for any reason, the worker exits at once, with a code of its own, and the supervisor starts a new one on a new port with a new secret. It never dials an old port. The exit is a crash record on the root's enrollment (`agents/roomlerd/src/macos_supervisor.rs:271`), because that task ending is a defect. A test kills the listener and reads the exit from a real child process.
+⚠️ **The stand-in's lifetime is the worker's.** The secret proves the worker to the stand-in, and nothing proves the stand-in to the worker. If the listener ended while the worker lived, its port would be free, any local process could bind it, and the loop's reconnect would dial that process, hand it the secret and act on what it sent. That process would be a control plane for a worker holding the person's TCC grants. So when the listener's task ends, for any reason, the worker exits at once, with a code of its own, and the supervisor starts a new one on a new port with a new secret. It never dials an old port. The exit is a crash record on the root's enrollment (`agents/roomlerd/src/macos_supervisor.rs:275`), because that task ending is a defect. A test kills the listener and reads the exit from a real child process.
 
 Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
 
@@ -541,7 +541,7 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 | No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:214`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
 | Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay | from the file | blank or off in the view: the root holds all of them |
 | Preflight to the server (`app.rs:4310`) | runs | skipped |
-| Crash bookkeeping and rollback (`app.rs:4315-4453`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1777`) |
+| Crash bookkeeping and rollback (`app.rs:4315-4453`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1795`) |
 | Updater (`app.rs:4463`, `:5650`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
 | Crash upload (`app.rs:4667`), log upload (`app.rs:4711`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
 | Self-unenroll on a stop (`app.rs:5803`) | if its row is ephemeral | never: this process is not that row |
@@ -654,10 +654,10 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 | Invariant | Under P3 |
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
-| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:731-1014`). The migration touches no bundle, which is what AC5 reads |
+| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:1342-1401`). The migration touches no bundle, which is what AC5 reads |
 | The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:914`) | The worker no longer dials a server, so it can displace nothing |
-| The delegation channel's two gates (`delegate.rs:1173-1194`) | Unchanged |
-| The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
+| The delegation channel's two gates (`delegate.rs:1192-1214`) | Unchanged |
+| The reap's exact match (`macos_supervisor.rs:496`, `:509`) | Matches both command lines, so a worker of either kind is found |
 
 ### What rides what
 
@@ -815,7 +815,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       owning the worker, and the heartbeats of the AC8 row. On 0.4.191 a real viewer on the
       per-user row streamed lit pixels, and the daemon's row logged `no_display` and showed
       none. That is the pre-P1 pair. In the code the switch stops the supervisor before it does
-      anything (`macos_supervisor.rs:1415-1422`). "Byte-for-byte" is read off those surfaces;
+      anything (`macos_supervisor.rs:1713-1726`). "Byte-for-byte" is read off those surfaces;
       nothing here diffs two builds.)*
 - [~] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
       daemon, the worker and the delegation channel, its migration and its kill switch, under

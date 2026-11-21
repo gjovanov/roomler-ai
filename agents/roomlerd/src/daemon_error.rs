@@ -5,21 +5,22 @@
 //! A `main` that returns `Err` has std print `Error: {err:?}` on stderr, and
 //! the process exits 1. The AppKit `main` of the macOS release build
 //! (`viewer-indicator-macos`) cannot return: its main thread belongs to AppKit
-//! for good, so its daemon thread ends the process with `exit(1)` itself.
+//! for good, so its daemon thread ends the process with `exit` itself.
 //! Until #3802 that thread said the error through tracing only, and a screen
 //! worker whose folder another account owns has no log file for tracing to
 //! write: its error (the path, the owner, the OS error) reached no file.
 //! [`say`] also writes what std would have written, on the stderr a supervised
 //! worker inherits from the root daemon.
 //!
-//! #4023 — and the one end that is a state of the device, not a fault: `run`
-//! with no config to run ([`NoConfig`]). Neither a Windows worker that ends with it
-//! nor its service host records a crash ([`record_worker_exit`], #4028 [`exit_code`]).
+//! #4023 — and the one end that is a state of the device, not a fault: `run` with no
+//! config to run ([`NoConfig`]). Neither a Windows worker that ends with it nor a supervisor
+//! that reads its code (#4028, #4071) records a crash ([`record_worker_exit`], [`exit_code`]).
 
+use crate::supervision::Supervision;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The daemon thread's last words before `exit(1)`: the error on stderr, as std
+/// The daemon thread's last words before its `exit`: the error on stderr, as std
 /// prints it for the other `main` ([`write_to`]), and through tracing, as before.
 /// Stderr first, so nothing tracing does can keep the line from it.
 pub fn say(error: &anyhow::Error) {
@@ -32,7 +33,7 @@ pub fn say(error: &anyhow::Error) {
 /// `Caused by:`. A failed write is ignored, and the function returns.
 pub fn write_to(mut out: impl Write, error: &anyhow::Error) {
     // Never `eprintln!`: it panics when the write fails, and a panic on the daemon thread skips
-    // `exit(1)`: the main thread stays in AppKit, and no supervisor ever sees the process end.
+    // its `exit`: the main thread stays in AppKit, and no supervisor ever sees the process end.
     let _ = writeln!(out, "Error: {error:?}");
     let _ = out.flush();
 }
@@ -45,9 +46,9 @@ pub fn write_to(mut out: impl Write, error: &anyhow::Error) {
 #[derive(Debug)]
 pub struct NoConfig {
     path: PathBuf,
-    /// #4028 — the `run` that found no config is the worker the Windows service
-    /// host started ([`NoConfig::of_run`]), so it ends with its own exit code.
-    service_worker: bool,
+    /// #4028, #4071 — the `run` that found no config was started by a supervisor
+    /// that reads [`NO_ENROLLMENT_EXIT_CODE`] ([`NoConfig::under`]), so it ends with it.
+    supervisor_reads_the_code: bool,
 }
 
 impl NoConfig {
@@ -55,19 +56,31 @@ impl NoConfig {
     pub fn at(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
-            service_worker: false,
+            supervisor_reads_the_code: false,
         }
     }
 
-    /// #4028 — no config at `path`, found by the `run` whose spawner `supervisor`
-    /// names (`run --supervisor`, a hidden flag). Only the Windows service host's
-    /// word, `scm`, makes it the service's worker, and only on Windows: the one
-    /// rule `supervision::detect_here` keeps for every `run`. FR-43's macOS flag
-    /// can never make that answer, so it is not asked for.
+    /// #4028 — no config at `path`, found by a `run` whose spawner `supervisor`
+    /// names (`run --supervisor`, the Windows spawners' hidden flag), with no
+    /// FR-43 `--supervised`: [`NoConfig::under`] what `supervision::detect_here`
+    /// answers for that flag alone. `run` itself asks with both flags (#4071).
     pub fn of_run(path: &Path, supervisor: Option<&str>) -> Self {
-        use crate::supervision::{Supervision, detect_here};
+        Self::under(path, crate::supervision::detect_here(supervisor, false))
+    }
+
+    /// #4071 — no config at `path`, found by a `run` under `supervision`: what
+    /// `supervision::detect_here` answered for that `run`'s flags, the one rule
+    /// every `run` keeps, so the supervisor it proved decides, never a text. Two
+    /// read [`NO_ENROLLMENT_EXIT_CODE`]: the Windows service host (`WindowsScm`),
+    /// and FR-43's macOS supervisor (`MacosSupervisor`), whose worker is `run
+    /// --supervised` without `--unenrolled`. `detect_here` answers the second on
+    /// a Mac only, so the tests ask this with each answer itself.
+    pub fn under(path: &Path, supervision: Supervision) -> Self {
         Self {
-            service_worker: detect_here(supervisor, false) == Supervision::WindowsScm,
+            supervisor_reads_the_code: matches!(
+                supervision,
+                Supervision::WindowsScm | Supervision::MacosSupervisor
+            ),
             ..Self::at(path)
         }
     }
@@ -109,10 +122,18 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
 /// record for it (`win_service::supervisor::should_record_supervisor_crash`), and
 /// it backs off exactly as for an exit 1 (`decide_exit_reaction`'s generic arm).
 ///
-/// **The Windows service host's worker only** ([`NoConfig::of_run`]). Every other
-/// `run` that finds no config exits 1, as it always has: systemd's units, launchd,
-/// FR-43's macOS supervisor, a container's runtime and the per-user Scheduled Task
-/// read the exit code too, and none of them is told of this one.
+/// #4071 — and the code of the GUI worker FR-43's macOS supervisor started (`run
+/// --supervised`, without `--unenrolled`) whose console user has no enrollment on
+/// this Mac. That supervisor reaps `sudo`, which passes the code through as its
+/// own, and writes no crash record for it either (`macos_supervisor::crash_summary`).
+/// It counts the exit towards giving up as an exit 1, then says for certain why
+/// (`macos_supervisor::gave_up_reason`).
+///
+/// **Those two supervisors' workers only** ([`NoConfig::under`]). Every other
+/// `run` that finds no config exits 1, as it always has: systemd's units, launchd
+/// (a Mac's LaunchAgent and its root daemon), a container's runtime and the
+/// per-user Scheduled Task read the exit code too, and none of them is told of
+/// this one.
 ///
 /// Why 78. No other code in the tree is 78: not 0 or 1, the watchdog's sentinels
 /// (2, 7, 8, 9), the stand-in's 10, the probe and portal helpers' 3 to 5, a
@@ -126,13 +147,15 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
 pub const NO_ENROLLMENT_EXIT_CODE: i32 = 78;
 
 /// #4028 — the code a process whose `main` ends with `error` exits with, when it
-/// is not std's 1: [`NO_ENROLLMENT_EXIT_CODE`] for the Windows service host's
-/// worker that found no config ([`NoConfig::of_run`]), bare or under a context.
-/// `None` for every other error and every other process: they exit 1.
+/// is not std's 1: [`NO_ENROLLMENT_EXIT_CODE`] for a worker that found no config
+/// and whose supervisor reads that code ([`NoConfig::under`]: the Windows service
+/// host's worker, and since #4071 the one FR-43's macOS supervisor starts), bare
+/// or under a context. Both `main`s ask it, the AppKit one too (#4071). `None` for
+/// every other error and every other process: they exit 1.
 pub fn exit_code(error: &anyhow::Error) -> Option<i32> {
     error
         .downcast_ref::<NoConfig>()
-        .filter(|no_config| no_config.service_worker)
+        .filter(|no_config| no_config.supervisor_reads_the_code)
         .map(|_| NO_ENROLLMENT_EXIT_CODE)
 }
 
@@ -452,5 +475,73 @@ mod exit_code_tests {
         assert!((0x40..0x80).contains(&status), "{status:#x}");
         // An 8-bit exit status carries it unchanged.
         assert_eq!(status & 0xFF, status);
+    }
+
+    /// A person's config, where the GUI worker FR-43's macOS supervisor starts
+    /// as the console user reads it.
+    const MAC_PATH: &str = "/Users/p/Library/Application Support/live.roomler.roomler/config.toml";
+
+    /// #4071 — the rule, by the supervisor `detect_here` proved, so every
+    /// platform runs every cell: the worker FR-43's macOS supervisor started
+    /// (`run --supervised`) that finds no config leaves with the code, as the
+    /// Windows service host's does, under a context too. A Mac's LaunchAgent
+    /// (launchd), the per-user Task's worker, a systemd unit and a `run` that
+    /// nothing supervises exit 1, as they always have.
+    #[test]
+    fn a_worker_whose_supervisor_reads_the_code_leaves_with_it() {
+        use crate::supervision::{Supervision, SystemdUnit};
+        for (path, supervision) in [
+            (MAC_PATH, Supervision::MacosSupervisor),
+            (PATH, Supervision::WindowsScm),
+        ] {
+            let path = Path::new(path);
+            let bare = anyhow::Error::from(NoConfig::under(path, supervision));
+            assert_eq!(exit_code(&bare), Some(78), "{supervision:?}");
+            let under_a_context =
+                anyhow::Error::from(NoConfig::under(path, supervision)).context("starting");
+            assert_eq!(exit_code(&under_a_context), Some(78), "{supervision:?}");
+        }
+        let unit = SystemdUnit {
+            name: "roomlerd.service",
+            user: false,
+        };
+        for supervision in [
+            Supervision::Launchd,
+            Supervision::WindowsTask,
+            Supervision::Systemd(unit),
+            Supervision::None,
+        ] {
+            let err = anyhow::Error::from(NoConfig::under(Path::new(MAC_PATH), supervision));
+            assert_eq!(exit_code(&err), None, "{supervision:?}");
+        }
+    }
+
+    /// #4071 — how the macOS supervisor's worker with no config ends: the same
+    /// words `run` has always said, no crash record of its own, and through
+    /// `main` the line std writes, then the code.
+    #[test]
+    fn the_macos_supervisors_worker_says_the_same_words_and_leaves_with_the_code() {
+        use crate::supervision::Supervision;
+        let path = Path::new(MAC_PATH);
+        let no_config = || NoConfig::under(path, Supervision::MacosSupervisor);
+        assert_eq!(
+            anyhow::Error::from(no_config()).to_string(),
+            anyhow::Error::from(NoConfig::at(path)).to_string()
+        );
+        let mut written: Vec<String> = Vec::new();
+        record_worker_exit(&no_config().into(), |s| written.push(s.to_owned()));
+        assert!(written.is_empty(), "{written:?}");
+
+        let mut out = Vec::new();
+        let mut exited = None;
+        let res = leave_through(Err(no_config().into()), &mut out, |code| {
+            exited = Some(code)
+        });
+        let err = res.expect_err("the error comes back only because this exit returns");
+        assert_eq!(exited, Some(NO_ENROLLMENT_EXIT_CODE));
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!("Error: {err:?}\n")
+        );
     }
 }
