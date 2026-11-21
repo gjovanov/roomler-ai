@@ -333,7 +333,7 @@ explicit allowlist, `WORKER_ENV_FORWARD`
 (`agents/roomlerd/src/macos_supervisor.rs:275`): each through
 `tunnel_core::env::node_env` (environment, then config fallback), and only when
 the root has one, as `sudo -u '#uid' /usr/bin/env ROOMLERD_K=v … run
---supervised` (`macos_supervisor.rs:1346`). In the worker an environment variable
+--supervised` (`macos_supervisor.rs:1342`). In the worker an environment variable
 beats its own config, so the session does what the hello promised. `env` execs
 into the agent, so the chain the supervisor reaps and the signals it relays are
 unchanged.
@@ -372,8 +372,8 @@ was refused as a `secret mismatch` every 30 s.
 
 | | as built |
 |---|---|
-| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:1414`, `:1160`, `:386`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:444`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:600`, `:654`). |
-| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1583`, `:513`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:1410`, `:1156`, `:382`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:440`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:577`, `:625`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1579`, `:509`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
 | **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
 
 An adversarial review before the merge found three edges, all fixed in the same PR:

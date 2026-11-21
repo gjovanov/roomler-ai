@@ -596,7 +596,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
 
 - **Cause: launchd throttled the whole session pipeline.** `com.roomler.daemon.plist` set no `ProcessType`, and
   launchd gives such a job "light resource limits", throttling its CPU usage and I/O bandwidth. FR-43's worker, which
-  runs every session (capture, encode, send), is spawned inside the daemon's job (`macos_supervisor.rs:1346`) and
+  runs every session (capture, encode, send), is spawned inside the daemon's job (`macos_supervisor.rs:1342`) and
   inherits them. On the MacBook every thread of both halves scheduled at priority 20, the utility band, under
   WindowServer (79), coreaudiod (63) and the apps (47). The per-user LaunchAgent, which captured before FR-43, and
   the desktop companion have carried `ProcessType = Interactive` from their first installers. So the session
