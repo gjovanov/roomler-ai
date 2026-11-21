@@ -199,8 +199,8 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4780`,
-`:2491` via `with_config_lists` `:3098`) — in the daemon, never in the
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4779`,
+`:2488` via `with_config_lists` `:3095`) — in the daemon, never in the
 caps-probe child (§4.3).
 
 | Tier / path | Hello `apps` on 0.4.102 | `rc:apps.list.reply` on 0.4.102 | Reason reached the screen? | After P6 |
@@ -325,12 +325,12 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:332`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:4498`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:4497`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:3098`; `files_caps` `:4825`), which a
+  seam (`with_config_lists`, `caps.rs:3095`; `files_caps` `:4824`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -415,7 +415,7 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 
 **Switching it on takes two keys.** `window_capture` only says what to ask the
 portal for. The portal arm itself is `portal_capture`
-(`agents/roomlerd/src/capture/mod.rs:3435`), and DRM is tried before it, so a
+(`agents/roomlerd/src/capture/mod.rs:3546`), and DRM is tried before it, so a
 host with `drm_capture = true` never gets there. Set `portal_capture = true` and
 `window_capture = true`, leave `drm_capture` unset or false, then
 `roomler restart`.
@@ -525,7 +525,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3690`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3693`),
 not `load`, because `load` self-heals. When the live file is unreadable and its
 `.prev` copy loads, `load` promotes that copy back over it and logs
 *RECOVERED from the previous good copy* at ERROR. When no usable copy exists, it

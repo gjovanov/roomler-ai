@@ -1392,7 +1392,7 @@ one is a bug.
 | Shape | What happened | Why (master) |
 |---|---|---|
 | **S1**, an AMF host at its lock screen (4 sessions) | the capture flapped between DXGI (one display) and GDI (the virtual screen) about every 5 s. Full rebuilds opened at the virtual screen's uncapped native size while the plan held a capped size, and an M2 dims swap followed. First-divergence lines: 3 `dims`, 2 `bitrate` (an encoder built at 20 Mbit/s where the plan said 25, one at 16 where it said 20) | the move to GDI moved the plan to a capped box, and M2 opened a replacement at it behind the live encoder's `Native` pin (`peer.rs:8810-8813`). Under that pin the GDI frame passed the resampler unscaled (`:8866-8870`) and fit neither encoder, so with no stale-skip budget left (`:8948-8955`) the inline open built at the frame's native size (`:9043`), set `built_target` to the pin (`:9147`) and dropped the replacement opening at the plan's size (`:9148`). The next pass swapped again. The same open was rated before the pass's tick (`:8984-8992`), and the tick then ran under that uncapped frame's ceiling and area floor (`:8914-8929`, `encode/aimd.rs:203-208`) and moved the target a rung, so the shadow judged the open off the plan's rate |
-| **S2**, an NVENC laptop (1 session) | an encode-bound cap relaxed on an idle screen, and 0.3 s after the M2 swap to the native 2560x1600 was adopted, a full rebuild opened at the old 1920x1200; the rebuild after it opened at 2560x1600 | the 60 ms keepalive re-fed the last real frame, which DXGI-direct had scaled to 1920x1200 under the old cap (`system_context/dxgi_direct.rs:742-790`); the resampler never upscales (`encode/resample.rs:446-449`). The adoption lifted the cap, which reset the stale-skip budget to 3 (`peer.rs:8825-8829`); the keepalives spent it, and the next one took the inline open at 1920x1200. The native frame that the lift's duplication recycle redelivers (`dxgi_direct.rs:1179-1185`) then forced a second open |
+| **S2**, an NVENC laptop (1 session) | an encode-bound cap relaxed on an idle screen, and 0.3 s after the M2 swap to the native 2560x1600 was adopted, a full rebuild opened at the old 1920x1200; the rebuild after it opened at 2560x1600 | the 60 ms keepalive re-fed the last real frame, which DXGI-direct had scaled to 1920x1200 under the old cap (`system_context/dxgi_direct.rs:743-791`); the resampler never upscales (`encode/resample.rs:446-449`). The adoption lifted the cap, which reset the stale-skip budget to 3 (`peer.rs:8825-8829`); the keepalives spent it, and the next one took the inline open at 1920x1200. The native frame that the lift's duplication recycle redelivers (`dxgi_direct.rs:1180-1186`) then forced a second open |
 
 Releases 0.4.219 to 0.4.224 then read zero over 98 sessions, which is not a
 fix: `encode/plan.rs` did not change from 0.4.216 to 0.4.224, no pump commit
@@ -1447,7 +1447,7 @@ flowchart TD
   budget (28 of them, about 1.7 s, with nothing encoded), and then one opens an
   encoder at the old size, as on master, which the shadow counts as a `dims`
   divergence. DXGI-direct captures again only when a cap is lifted to none
-  (`dxgi_direct.rs:1179-1185`), so a cap raised to a larger box at rest is that
+  (`dxgi_direct.rs:1180-1186`), so a cap raised to a larger box at rest is that
   case: a Priority move that raises the cap, an encode-bound tier relaxed to a
   box below native, or an idle refine bounded by `idle_refine_max_edge`. The
   viewer keeps its picture through the wait. FR-135's ledger carries it as

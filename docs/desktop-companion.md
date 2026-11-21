@@ -1377,7 +1377,7 @@ flowchart TD
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12931`), `attach_files_declined` (`:12954`), `declined_reply` (`:12985`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12864`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
-| What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4482`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
+| What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4481`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:
 
@@ -1387,7 +1387,7 @@ What a viewer notices:
 - **On a two-row Mac's `-daemon` row** the same, whoever is signed in: the person's own row serves
   the screen and files.
 - **A session that began before the person signed in** keeps its declined channel until it ends.
-- **The no-screen sentence** that daemon sends (`no_display`, `agents/roomlerd/src/capture/mod.rs:774`)
+- **The no-screen sentence** that daemon sends (`no_display`, `agents/roomlerd/src/capture/mod.rs:885`)
   ends "Remote shell works here.", where it said file transfer worked there too.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 

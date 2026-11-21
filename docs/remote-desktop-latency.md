@@ -211,7 +211,7 @@ and the motion windows are what matter.
   (WINHOST-J) is offline and runs AV1, not the HEVC the original reference
   used, so the literal cell could not be driven live; this is the best available
   evidence.
-- **WGC drop ratio** (`wgc_backend.rs:718` `wgc: capture cadence`,
+- **WGC drop ratio** (`wgc_backend.rs:719` `wgc: capture cadence`,
   `drop_ratio_pct`): on the one WGC-capture host in the window (NEO16, 0.4.172,
   635 samples) the ratio was **median 2 %** (p90 27, max 65) — the ~33 % random
   drop pathology is gone. That host is NVENC/WGC, not a 2880×1800 Iris-Xe one (no
@@ -236,7 +236,7 @@ encodes at that geometry.
   allows 55 fps, while a frame costs about 25 ms in all, so delivery stays near 38.
 - **So P5's numbers are reachable on this hardware, and the default does not reach them
   yet.** `zero_copy` is off by default until [FR-132](fr/FR-132-zero-copy-by-default.md).
-- **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
+- **WGC drop ratio** (`wgc_backend.rs:791`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
 ### End-to-end age (AC8) — **met** (held for #3566, then met on 2026-11-08)
@@ -359,7 +359,7 @@ AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
 | `direct_queue_ms` | `ROOMLERD_DIRECT_QUEUE_MS` | 150 | direct send-queue lag bound (0 = off) |
 | `direct_hrd_pct` | `ROOMLERD_DIRECT_HRD_PCT` | 100 | direct HRD/VBV window (AV1 floored 200) |
 | `roomler-rc-input-gap` | — (localStorage) | 8 | pointer min-gap, ms (0–16) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | unset: the built-in default list, empty, so off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps. `on` takes every proven cell; unset only the default list's ([FR-132](fr/FR-132-zero-copy-by-default.md) P2) |
 
 The age pill needs agent ≥ 0.4.9 and a WebCodecs decode path (HEVC-over-DC or
 VP9-4:4:4); it is absent on the classic `<video>` path and on older agents.
