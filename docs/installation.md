@@ -1948,7 +1948,60 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3138-3145`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3138-3149`).
+Since #3931 it also runs every mode with every stand-in reading its stdin on every call, under dash
+with the script padded so that one of dash's 8 KiB reads ends inside the main block (from the
+`# ─── main ─` line to the end), and with the script cut short at sampled lines above the main block,
+at every line of it and at every byte of the last line. It checks the script's shape as well (the next section).
+
+### Nothing the script starts reads the piped script (#3931)
+
+`curl … | sh` makes the script the shell's stdin. The shell reads it as it goes: bash one byte at a
+time, dash 8 KiB at a time. Any command the script started that read its stdin (`installer -pkg`,
+`dpkg` asking about a configuration file, one of our own binaries) took the lines the shell had not
+read yet, and the shell carried on without them, often to exit 0 with half an install behind it.
+Four fixes put `</dev/null` on the calls each one named (#3917, #3924, #3930, #3926), 18 lines by
+the time of #3931, and the next new call would have had the script on its stdin again. Since #3931 the
+script's shape guards every call:
+
+```mermaid
+flowchart TD
+    A["the shell reads the header's comments"] --> B["it reads main() { … }<br/>to the closing brace:<br/>a definition, nothing runs"]
+    B --> C["it reads the last line, main #quot;$@#quot;,<br/>and calls main"]
+    C --> D["main's first statement:<br/>exec &lt;/dev/null"]
+    D --> E["every command main starts<br/>reads an end of file on stdin"]
+    E --> F["main ends with exit"]
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2182` | the shell has read every byte before the first command runs |
+| Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
+| The last line, `main "$@"`, is its only call, and nothing follows it | `:2183` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
+| Its last statement is `exit` | `:2181` | a byte after the last line never runs, whatever path `main` takes |
+| `main` is called as a plain command | `:2183` | `main \|\| …`, `if main` and `! main` each turn `set -e` off for the whole script |
+
+What the script asks a person goes to the terminal device, never to stdin: `sudo` asks for its
+password there, and so does the pairing's *"Join …?"* (see [Pairing from a terminal](#pairing-from-a-terminal)).
+The body is not indented, on purpose: no line moved when the function was made, so every
+`file:line` anchor into the script held.
+
+A download cut short installs nothing. The shell parses the whole function before it runs any of
+it, so a script cut inside `main` stops on a syntax error (exit 2), and a script cut before the call
+never calls it. The harness pipes each cut it makes, checks that no installing, enrolling or removing
+command ran, and prints the exit code. Under dash, bash 5 and bash 3.2 alike:
+
+| Cut after | Exit code |
+|---|---|
+| a header comment (line 1 to 93), or the closing brace | 0, and nothing is printed |
+| any line of `main` | 2: a syntax error, because the brace never closes |
+| `m`, `ma` or `mai`, part of the call | 127: command not found |
+| `main` or `main `, the call without its arguments | 1: the usage, because no `--role` was given |
+| `main "` to `main "$@`, the call cut inside its quotes | 2 |
+| `main "$@"` without its newline | the complete run |
+
+The first row is the only cut that ends silently with 0. curl reports its own failure on stderr,
+and with `set -o pipefail` (bash, zsh) the pipeline's status is curl's.
 
 ### What a bare host needs (#3204)
 

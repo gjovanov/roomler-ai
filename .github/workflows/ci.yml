@@ -3137,11 +3137,15 @@ jobs:
         run: bash scripts/macos-postinstall-check.sh --bash 3.2
       # #3881 — the served install script's own output (the release it names,
       # the installed daemon's --version), under the /bin/sh of both hosts.
+      # #3931 — each shell's verdict is read even when another's failed.
       - name: Run the install script's output cases under dash, Debian's /bin/sh
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell dash
       - name: Run the install script's output cases under bash 5 in POSIX mode
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell bash
       - name: Run the install script's output cases under bash 3.2 in POSIX mode, the version of macOS's /bin/sh
+        if: ${{ !cancelled() }}
         run: bash scripts/install-sh-output-check.sh --shell bash3.2
 
   vendored-sctp:
