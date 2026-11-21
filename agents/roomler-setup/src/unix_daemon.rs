@@ -648,10 +648,19 @@ impl HalfRefusal {
     /// How the line of [`HalfRefusal::RowOfItsOwn`] starts.
     pub const ROW_OF_ITS_OWN: &'static str = "error: this Mac's root half is enrolled already (";
 
-    /// The refusal among `stderr_tail`'s lines, if one is there.
+    /// The refusal among `stderr_tail`'s lines, if one is there. A line
+    /// counts only when it starts with the refusal's words: the script's
+    /// own progress lines, which name the same states, start with `==> `.
     pub fn read(stderr_tail: &str) -> Option<Self> {
-        let _ = stderr_tail;
-        None
+        stderr_tail.lines().map(str::trim).find_map(|line| {
+            if line.starts_with(Self::ONE_ROW_ALREADY) {
+                Some(Self::OneRowAlready)
+            } else if line.starts_with(Self::ROW_OF_ITS_OWN) {
+                Some(Self::RowOfItsOwn)
+            } else {
+                None
+            }
+        })
     }
 }
 

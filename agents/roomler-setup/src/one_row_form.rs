@@ -301,8 +301,18 @@ pub async fn read_here(
 }
 
 /// R1's read of root's config at `path`: whether it counts as there.
+///
+/// FR-141 P2's follow-up (F5) — only "no such file" reads as absent. Any
+/// other answer (a folder this person may not search, a path through a file,
+/// an I/O error) is a Mac R1 cannot tell about, so it counts as enrolled and
+/// closes the form, as R3 reads a person's config it cannot read
+/// ([`PersonConfig::Unreadable`]). `is_file()` read every error as "not
+/// enrolled", and the one token was then spent on a Mac that may be enrolled.
 pub fn root_config_seen(path: &Path) -> bool {
-    path.is_file()
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Read the form for one page or command: on this host, for `server`, asked

@@ -1161,14 +1161,19 @@ pub enum LateCancel {
 
 /// F1 — the install stopped by a cancel that came after the administrator
 /// steps had started: they ran to the end, and this says what that left.
+///
+/// FR-141 P2's follow-up (F2) — on a one-row Mac those steps were the whole
+/// install ([`finish_install`] only reports), so it ends as done, with these
+/// words as its warning, and keeps nothing. Stopped, it kept the attempt for
+/// a Retry, and that Retry met the reinstall guard (#4133) over the Mac this
+/// run had just made one device: the Done page never showed.
 pub fn cancelled_after_privileged(scope: Scope, layout: Layout) -> LateCancel {
-    LateCancel::Stop(match (scope, layout) {
-        (Scope::System, _) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this device is enrolled, its service running. Nothing else was done. Retry finishes the install without asking for the password or a token again.".to_string(),
-        (Scope::PerUser, Layout::TwoRows) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac's private network (its root half) is enrolled, its service running, but the screen half is not enrolled yet. Retry finishes the install without asking for the password or the private network's token again.".to_string(),
-        // FR-141 P2: those steps were the whole install.
-        (Scope::PerUser, Layout::OneRow) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac is enrolled as one device, its root service running. Nothing else was left to do. Retry finishes the install without asking for the password or the token again.".to_string(),
-        (Scope::PerUser, Layout::Device) => "Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again.".to_string(),
-    })
+    match (scope, layout) {
+        (Scope::System, _) => LateCancel::Stop("Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this device is enrolled, its service running. Nothing else was done. Retry finishes the install without asking for the password or a token again.".to_string()),
+        (Scope::PerUser, Layout::TwoRows) => LateCancel::Stop("Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed and this Mac's private network (its root half) is enrolled, its service running, but the screen half is not enrolled yet. Retry finishes the install without asking for the password or the private network's token again.".to_string()),
+        (Scope::PerUser, Layout::OneRow) => LateCancel::Finish("Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end, and they were this Mac's whole install: the package is installed and this Mac is enrolled as one device, its root service running. Nothing was left to stop, so the install is done.".to_string()),
+        (Scope::PerUser, Layout::Device) => LateCancel::Stop("Cancelled after the administrator steps had started. A step running as root cannot be stopped from here, so they ran to the end: the package is installed, but this device is not enrolled yet. Retry finishes the install without asking for the password again.".to_string()),
+    }
 }
 
 /// What the administrator steps' words name: the install they ran for.
@@ -1182,12 +1187,40 @@ pub struct HalfFor<'a> {
     pub device_name: &'a str,
 }
 
-/// The words when the person cancelled the administrator prompt.
+/// The words when the person cancelled the administrator prompt: nothing was
+/// installed.
+///
+/// FR-141 P2's follow-up (F3) — where the enrollment came before the prompt (a
+/// system scope's device, a Mac's root half, a one-row Mac), it used its token
+/// already. The attempt is kept, so a Retry in this window reuses it; closing
+/// the window drops it ([`ud::clear_kept`]), and the next install then needs a
+/// new token. A person's own device enrolls after the prompt: its words stay.
 pub fn prompt_cancelled(scope: Scope, layout: Layout) -> String {
-    let _ = (scope, layout);
-    "cancelled at the administrator prompt — nothing was installed. Try again and enter your \
-     password, or pick the tunnel client, which needs none."
-        .to_string()
+    const RETRY: &str = "Retry in this window and enter your password: it reuses that \
+                         enrollment, with no new token. Closing the window drops that \
+                         enrollment, and the next install then needs a new";
+    match (scope, layout) {
+        (Scope::PerUser, Layout::Device) => "cancelled at the administrator prompt — nothing \
+             was installed. Try again and enter your password, or pick the tunnel client, which \
+             needs none."
+            .to_string(),
+        (Scope::PerUser, Layout::TwoRows) => format!(
+            "cancelled at the administrator prompt — nothing was installed, but the enrollment \
+             before it used the private network's token: this Mac's root half is enrolled, not \
+             installed yet, and the screen's token is not used yet. {RETRY} private-network \
+             token."
+        ),
+        // One device (rule 5): no half, and no second token.
+        (Scope::PerUser, Layout::OneRow) => format!(
+            "cancelled at the administrator prompt — nothing was installed, but the enrollment \
+             before it used the token: this Mac is enrolled as one device, not installed yet. \
+             {RETRY} token."
+        ),
+        (Scope::System, _) => format!(
+            "cancelled at the administrator prompt — nothing was installed, but the enrollment \
+             before it used the token: this device is enrolled, not installed yet. {RETRY} token."
+        ),
+    }
 }
 
 /// What the person reads when the administrator steps exited with a failure,
@@ -1201,23 +1234,78 @@ pub struct ExitWords {
 /// The words for the administrator steps' exit with `code` (not 0), from the
 /// last lines they wrote to stderr; `cancelled` when a cancel came while they
 /// ran.
+///
+/// FR-141 P2's follow-up — a refusal the script words itself
+/// ([`ud::HalfRefusal`], F1 and F3) is said as its own case and keeps
+/// nothing: the steps stopped before they changed anything, and a Retry would
+/// meet the refusal again. Any other failure keeps the attempt for a Retry,
+/// and where the enrollment came before the steps, the words say what it used
+/// (F3): a Retry in this window reuses it, and a close drops it.
 pub fn privileged_exit(half: &HalfFor, code: i32, cancelled: bool, stderr_tail: &str) -> ExitWords {
-    let _ = (half.server, half.device_name, stderr_tail);
-    let words = if cancelled {
-        format!(
+    if let Some(words) = ud::HalfRefusal::read(stderr_tail).and_then(|r| half_refused(half, r)) {
+        return ExitWords { words, keep: false };
+    }
+    // What the enrollment before the steps used, and what a new start then
+    // needs. A person's own device enrolls after them.
+    let used = match (half.scope, half.layout) {
+        (Scope::PerUser, Layout::Device) => None,
+        (Scope::PerUser, Layout::TwoRows) => Some((
+            "the private network's token (the screen's is not used yet)",
+            "a new private-network token",
+        )),
+        _ => Some(("the token", "a new token")),
+    };
+    let words = match (cancelled, used) {
+        (true, _) => format!(
             "Cancelled while the administrator steps were running — a step running as root cannot be stopped from here — and they failed (exit {code}): see the lines above. Retry runs them again{}.",
-            if half.scope == Scope::System || half.layout != Layout::Device {
+            if used.is_some() {
                 " with the same enrollment"
             } else {
                 ""
             }
-        )
-    } else {
-        format!(
+        ),
+        (false, None) => format!(
             "the privileged install steps failed (exit {code}) — see the lines above. Nothing was enrolled on this side that a Retry cannot reuse."
-        )
+        ),
+        (false, Some((used, new))) => format!(
+            "the privileged install steps failed (exit {code}) — see the lines above. The enrollment before them used {used}: Retry in this window runs them again with that enrollment and needs no new token. Closing the window drops it, and the next install then needs {new}."
+        ),
     };
     ExitWords { words, keep: true }
+}
+
+/// FR-141 P2's follow-up (F1, F3) — the words for a refusal the script words
+/// itself, by this install's layout: the steps stopped before they changed
+/// anything, so a Retry will not help; what the enrollment before them used;
+/// and the person's road, as commands for the server they chose. `None` for a
+/// refusal this layout's half never writes, which then reads as any failure.
+fn half_refused(half: &HalfFor, refusal: ud::HalfRefusal) -> Option<String> {
+    let script = format!(
+        "curl -fsSL {}/api/setup/install.sh | sh -s --",
+        crate::reinstall_guard::terminal_server(half.server)
+    );
+    let name = half.device_name;
+    match (half.layout, refusal) {
+        // F1 — the two-row half (FR-129 B2) over a root config that is one
+        // row already: an attempt left half-placed, a one-row Mac removed with
+        // --keep-config, or one whose daemon missed the reinstall guard. In
+        // one organization its enrollment took that Mac's own row (both use
+        // the hardware's machine id), which comes back online when the Mac is
+        // finished as one device; in another it made a row that stays offline.
+        (Layout::TwoRows, ud::HalfRefusal::OneRowAlready) => Some(format!(
+            "This Mac is set up as one device already: its root config makes the root service hold the enrollment and start the screen worker in your session, so the two devices this install adds cannot run beside it. The administrator steps stopped before they changed anything. Retrying will not help. To finish this Mac as one device, run `{script} --role daemon --one-row` in Terminal: with no token, it installs only the package. To remove it instead, run `{script} --uninstall`, then start Roomler Setup again. The enrollment before these steps used the private network's token (the screen's is not used): if the device «{}» stays offline after that, delete it in the device list.",
+            crate::role::root_half_name(name)
+        )),
+        // F3 — the one-row half's two refusals (`install_macos_one_row_half`).
+        // One device in the words (rule 5).
+        (Layout::OneRow, ud::HalfRefusal::OneRowAlready) => Some(format!(
+            "This Mac is one device already, under another enrollment (another organization, or one made in Terminal), so the administrator steps stopped before they changed anything, and it stays as it was. Retrying will not help. The enrollment before these steps used the token, for a device this Mac will not run: delete the offline device «{name}» in the device list. To install this Mac here instead, remove Roomler with `{script} --uninstall` in Terminal, then start Roomler Setup again with a new token."
+        )),
+        (Layout::OneRow, ud::HalfRefusal::RowOfItsOwn) => Some(format!(
+            "This Mac's root service is enrolled already, as a device of its own, so the Mac keeps the layout it has: the administrator steps stopped before they changed anything. Retrying will not help. The enrollment before these steps used the token, for a device this Mac will not run: delete the offline device «{name}» in the device list. To make the Mac one device as it is, run `sudo roomlerd one-row` in Terminal: it says its plan and asks first, and `sudo roomlerd one-row --revert` puts the Mac back."
+        )),
+        _ => None,
+    }
 }
 
 /// What a refused enrollment adds to its words for this install (#3432).
