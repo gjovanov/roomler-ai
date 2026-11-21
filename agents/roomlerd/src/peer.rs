@@ -4514,7 +4514,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
+            if let Some(applied) = delivery.on_skip(false, |s| governor.on_gate_skip(s))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -8165,10 +8165,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            // FR-148 D46 B3, D51 B4a-1 — nor, under `on`, is the budget's own hold.
             let in_grace = constrained && !opener_grace_done;
             grace_bp_skips += u32::from(in_grace);
-            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
+            let bp_applied = delivery.on_skip(in_grace, |s| governor.on_gate_skip(s));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {

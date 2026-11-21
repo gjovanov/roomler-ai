@@ -147,6 +147,9 @@ pub enum CeilingSource {
     Learned,
     /// FR-59 P3 — the viewer's arrival rate while its queue grows (constrained).
     Arrival,
+    /// FR-148 D51 B4b — the in-flight budget's measured rate while it held a
+    /// frame in the last second (`on`, a relay session).
+    Budget,
     /// FR-63 — the slow-start ramp's cap (constrained).
     Opener,
 }
@@ -158,6 +161,7 @@ impl CeilingSource {
             CeilingSource::Pipe => "pipe",
             CeilingSource::Learned => "learned",
             CeilingSource::Arrival => "arrival",
+            CeilingSource::Budget => "budget",
             CeilingSource::Opener => "opener",
         }
     }

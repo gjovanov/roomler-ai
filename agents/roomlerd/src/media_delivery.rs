@@ -74,7 +74,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
-use crate::encode::governor::RateGovernor;
+use crate::encode::governor::{GateSkip, RateGovernor};
 use crate::encode::pipe::{Fall, PathNumber, PathRate, PathView, PushedBy, Ruled};
 use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
 
@@ -345,7 +345,66 @@ pub fn path_rate(s: &Shadow) -> Option<PathRate> {
         bps: b.rate_bps().map(|r| u32::try_from(r).unwrap_or(u32::MAX)),
         measured: b.rate_measured(),
         loss: b.loss()?,
+        ..PathRate::default()
     })
+}
+
+/// FR-148 D51 B4a-2 — the most the envelope's frame term adds to S, ms.
+pub const ENVELOPE_FRAME_MAX_MS: u64 = 100;
+
+/// FR-148 D51 B4a-2 — the budget's envelope, ms: S, and `frame` bytes at the
+/// budget's rate, that term at most [`ENVELOPE_FRAME_MAX_MS`] (all of it while
+/// no rate is known). Age within it is the queue the budget itself stands:
+/// S over the least, and a frame admitted just under the budget.
+pub fn envelope_ms(slack: Duration, frame: u64, rate_bps: Option<u64>) -> u16 {
+    let term = match rate_bps {
+        Some(r) if r > 0 => (frame.saturating_mul(8_000) / r).min(ENVELOPE_FRAME_MAX_MS),
+        _ => ENVELOPE_FRAME_MAX_MS,
+    };
+    let slack = u64::try_from(slack.as_millis()).unwrap_or(u64::MAX);
+    u16::try_from(slack.saturating_add(term)).unwrap_or(u16::MAX)
+}
+
+/// FR-148 D51 B4a-2 — the largest frame handed to the send channel over the
+/// last second at least: two one-second buckets, the older let go as the one
+/// after the newer starts.
+#[derive(Debug, Default, Clone, Copy)]
+struct Largest {
+    at: Option<Instant>,
+    newer: u64,
+    older: u64,
+}
+
+impl Largest {
+    const SPAN: Duration = Duration::from_secs(1);
+
+    fn note(&mut self, now: Instant, len: u64) {
+        match self.at {
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN => {}
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN * 2 => {
+                (self.older, self.newer) = (self.newer, 0);
+                self.at = Some(at + Self::SPAN);
+            }
+            _ => {
+                *self = Self {
+                    at: Some(now),
+                    ..Self::default()
+                }
+            }
+        }
+        self.newer = self.newer.max(len);
+    }
+
+    /// Bytes: the largest of the last second and the one before it.
+    fn bytes(&self, now: Instant) -> u64 {
+        match self.at {
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN => {
+                self.newer.max(self.older)
+            }
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN * 2 => self.newer,
+            _ => 0,
+        }
+    }
 }
 
 /// FR-148 D46 B2 — a sample's push-back (D46 item 10), or `None`:
@@ -608,6 +667,9 @@ pub struct DeliverySampler {
     /// said which mode acted (`None` before it first said).
     pass: Pass,
     said: Option<bool>,
+    /// FR-148 D51 B4a-2 — the largest frame handed lately, for the budget's
+    /// envelope ([`envelope_ms`]). Nothing with the budget off.
+    largest: Largest,
 }
 
 impl DeliverySampler {
@@ -644,6 +706,7 @@ impl DeliverySampler {
             waiting: VecDeque::new(),
             pass: Pass::default(),
             said: None,
+            largest: Largest::default(),
         }
     }
 
@@ -1002,11 +1065,23 @@ impl DeliverySampler {
     /// FR-148 D48 — the budget's last step, to the governor's shadow model:
     /// its rate, whether this association's figures gave it, and SCTP's loss
     /// count ([`path_rate`]). Off, or before the association's first step,
-    /// nothing.
+    /// nothing. FR-148 D51: while the budget acts, also that it acts, whether
+    /// it held lately outside a still span (B4b), and its envelope (B4a-2).
     fn note_path_rate(&self, governor: &mut RateGovernor) {
-        if let Some(rate) = self.budget.as_deref().and_then(path_rate) {
-            governor.note_path_rate(rate);
+        let Some(shadow) = self.budget.as_deref() else {
+            return;
+        };
+        let Some(mut rate) = path_rate(shadow) else {
+            return;
+        };
+        if self.pass.acts() {
+            let b = shadow.budget();
+            rate.acts = true;
+            rate.held = b.held_lately();
+            rate.envelope_ms =
+                envelope_ms(b.slack(), self.largest.bytes(Instant::now()), b.rate_bps());
         }
+        governor.note_path_rate(rate);
     }
 
     /// FR-148 D46 B1 — at the pumps' 5 s re-check of the transport: a new
@@ -1130,18 +1205,18 @@ impl DeliverySampler {
         }
     }
 
-    /// FR-148 D46 B3 — the gate's skip: `decrease` (the governor's
-    /// `on_backpressure_skip`, at the time it is given) runs unless FR-35's
-    /// opener grace is open (`grace`), or the pass is the budget's hold in a
-    /// still span, a stall of the carrier (D46's no-decrease rule). Anything
-    /// else decreases as today.
-    pub fn on_skip<T>(
-        &self,
-        grace: bool,
-        decrease: impl FnOnce(Instant) -> Option<T>,
-    ) -> Option<T> {
+    /// FR-148 D46 B3 — the gate's skip, handed to `skip` (the governor's
+    /// [`RateGovernor::on_gate_skip`]) as the pass classes it, at the time it
+    /// is given. Nothing inside FR-35's opener grace (`grace`), or for the
+    /// budget's hold in a still span, a stall of the carrier (D46's
+    /// no-decrease rule). FR-148 D51 B4a-1: the budget's own hold under `on`
+    /// is [`GateSkip::BudgetHold`], no AIMD event. Anything else is
+    /// [`GateSkip::Backpressure`], the decrease, as today.
+    pub fn on_skip<T>(&self, grace: bool, skip: impl FnOnce(GateSkip) -> Option<T>) -> Option<T> {
         if self.pass.decreases(grace) {
-            decrease(Instant::now())
+            skip(GateSkip::Backpressure(Instant::now()))
+        } else if self.pass.hears_hold(grace) {
+            skip(GateSkip::BudgetHold(Instant::now()))
         } else {
             None
         }
@@ -1172,10 +1247,12 @@ impl DeliverySampler {
     }
 
     /// FR-148 D46 B1 — a frame entered the send channel: its bytes are the
-    /// pump's own until SCTP takes them.
-    pub fn on_handed(&self, len: u64) {
+    /// pump's own until SCTP takes them. FR-148 D51 B4a-2: its size counts
+    /// toward the budget's envelope.
+    pub fn on_handed(&mut self, len: u64) {
         if let Some(b) = self.budget.as_ref() {
             b.on_handed(len);
+            self.largest.note(Instant::now(), len);
         }
     }
 
@@ -2175,6 +2252,8 @@ mod tests {
     struct Passes {
         skipped: u64,
         decreases: u64,
+        /// FR-148 D51 B4a-1 — skips the governor heard as the budget's hold.
+        heard: u64,
         marked: u64,
         shed: u64,
         went: u64,
@@ -2196,8 +2275,11 @@ mod tests {
         if f.full || s.shuts() {
             n.skipped += 1;
             s.note_gate(f.full, f.byte_gate);
-            let _ = s.on_skip(f.grace, |_| {
-                n.decreases += 1;
+            let _ = s.on_skip(f.grace, |skip| {
+                match skip {
+                    GateSkip::Backpressure(_) => n.decreases += 1,
+                    GateSkip::BudgetHold(_) => n.heard += 1,
+                }
                 Some(())
             });
             return;
@@ -2264,13 +2346,14 @@ mod tests {
     }
 
     /// FR-148 D46 B3 — the hold. Under `on`, on a relay session, over a deep
-    /// queue's readings: each pass the budget holds skips before capture with
-    /// one decrease call (FR-35's grace closed) and no keyframe asked, the
-    /// watermark arm (which asks one) sheds no frame that went, and the line
-    /// counts the holds that acted beside the passes the budget was asked
-    /// about, and the watermark's firings.
+    /// queue's readings: each pass the budget holds skips before capture,
+    /// heard once by the governor as the budget's hold and never as a
+    /// decrease (D51 B4a-1; B3 called one each, FR-35's grace closed), with
+    /// no keyframe asked, the watermark arm (which asks one) sheds no frame
+    /// that went, and the line counts the holds that acted beside the passes
+    /// the budget was asked about, and the watermark's firings.
     #[test]
-    fn under_on_the_budget_s_hold_skips_a_relay_pass_and_decreases_once_per_hold() {
+    fn under_on_the_budget_s_hold_skips_a_relay_pass_and_is_heard_once_per_hold() {
         let t0 = Instant::now();
         let mut s = DeliverySampler::new(true).with_budget_on();
         let mut n = Passes::default();
@@ -2293,7 +2376,7 @@ mod tests {
             n,
             Passes {
                 skipped: 200,
-                decreases: 200,
+                heard: 200,
                 went: 100,
                 ..Passes::default()
             }
@@ -2305,10 +2388,11 @@ mod tests {
 
     /// FR-148 D46 B3 — the no-decrease rule through the sampler. Under `on`, on
     /// a relay session, the clock stands still for a second with the megabyte
-    /// out: each hold skips its pass, and from the least and S on (210 ms)
-    /// none calls a decrease; the gate marks the stall for the governor at
-    /// those steps, as the shadow's step does after the gate; the line counts
-    /// the stalled holds apart.
+    /// out: each hold skips its pass, and none calls a decrease (D51 B4a-1:
+    /// a hold before the still span is heard as the budget's; B3 decreased
+    /// on it); from the least and S on (210 ms) none is heard either, the
+    /// gate marks the stall for the governor at those steps, as the shadow's
+    /// step does after the gate, and the line counts the stalled holds apart.
     #[test]
     fn under_on_a_stall_hold_calls_no_decrease_and_marks_the_stall() {
         let t0 = Instant::now();
@@ -2327,7 +2411,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases, n.marked), (60, 60, 0), "{n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard, n.marked),
+            (60, 0, 60, 0),
+            "{n:?}"
+        );
         // From 2 s the clock stands at its count then.
         let (stood, _) = deep_frame(60);
         for frame in 60..90u64 {
@@ -2341,10 +2429,82 @@ mod tests {
             );
         }
         // Frames 60 to 66 hold before the span is 210 ms old, 67 to 89 in it.
-        assert_eq!((n.skipped, n.decreases, n.marked), (90, 67, 23), "{n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard, n.marked),
+            (90, 0, 67, 23),
+            "{n:?}"
+        );
         assert_eq!((n.shed, n.went), (0, 0));
         let w = s.budget_mut().unwrap().take_window();
         assert_eq!((w.acted, w.acted_stalled), ((90, 90), 23), "{w:?}");
+    }
+
+    /// FR-148 D51 B4a-1 (C2) — the budget's holds leave the target and the
+    /// learned ceiling alone. Under `on`, on a relay session, 10 s of passes
+    /// 2 ms apart, each an acting hold while the clock moves (2 Mbit/s
+    /// acknowledged, a megabyte out), each skip handed to the governor as the
+    /// pump hands it, at the pass's time. The governor hears every one: the
+    /// opener's ramp would end on it. None is a full-channel sample, so when a
+    /// frame next reaches the encoder its target and the learned ceiling are
+    /// the ones the holds found.
+    #[test]
+    fn budget_holds_leave_the_target_and_the_learned_ceiling_alone() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget_on();
+        let mut governor = RateGovernor::new(
+            30,
+            2,
+            crate::encode::governor::GovernorFlags::default(),
+            8_000_000,
+            None,
+            t0,
+        );
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let opened = governor
+            .pre_encode_tick(3_000_000, floor, true, 2, t0)
+            .expect("the opening")
+            .bps;
+        let learned = governor.learned_ceiling_bps();
+        let g = Gauges {
+            max_payload: 1_200,
+            cwnd: 1_048_576,
+            ssthresh: 1_048_576,
+            rwnd: 131_072,
+            inflight_bytes: 1_000_000,
+            pending_bytes: 131_072,
+            ack_delay: Some(Duration::from_millis(60)),
+            ack_delay_min: Some(Duration::from_millis(60)),
+            ..Gauges::default()
+        };
+        let (mut held, mut moved) = (0u32, 0u32);
+        for ms in (0..10_000u64).step_by(2) {
+            let now = at(t0, ms);
+            // 2 Mbit/s: 250 bytes a millisecond.
+            let _ = s.gate_reading(now, ms * 250, g, 2_000_000, true, false);
+            assert!(s.shuts(), "at {ms} ms: the budget holds");
+            held += 1;
+            let skip = s.on_skip(false, |skip| {
+                let at_pass = match skip {
+                    GateSkip::Backpressure(_) => GateSkip::Backpressure(now),
+                    GateSkip::BudgetHold(_) => GateSkip::BudgetHold(now),
+                };
+                governor.on_gate_skip(at_pass)
+            });
+            moved += u32::from(skip.is_some());
+        }
+        assert_eq!(held, 5_000);
+        assert!(governor.slow_start_congested(), "the holds were heard");
+        let next = governor.pre_encode_tick(3_000_000, floor, true, 2, at(t0, 10_000));
+        assert_eq!(
+            (moved, next.map(|a| a.bps), governor.applied_bps()),
+            (0, None, opened),
+            "no hold moved the target"
+        );
+        assert_eq!(
+            governor.learned_ceiling_bps(),
+            learned,
+            "nor the learned ceiling"
+        );
     }
 
     /// FR-148 D46 B3 — a direct session under `on` computes the budget as
@@ -2506,9 +2666,10 @@ mod tests {
 
     /// FR-148 D46 B3 — FR-35's opener grace under `on`: on a relay session the
     /// budget's holds inside the grace skip their passes and call no decrease,
-    /// as today's skips there do; once the grace is over each hold decreases
-    /// once. The pumps hand the grace to the same call (`peer.rs`, pinned by
-    /// `both_pumps_gate_on_the_budget_s_pass`).
+    /// as today's skips there do, nor are they heard as the budget's; once
+    /// the grace is over each hold is heard once, and still calls no decrease
+    /// (D51 B4a-1; B3 decreased once). The pumps hand the grace to the same
+    /// call (`peer.rs`, pinned by `both_pumps_gate_on_the_budget_s_pass`).
     #[test]
     fn fr35_s_opener_grace_keeps_the_aimd_through_the_budget_s_holds_under_on() {
         let t0 = Instant::now();
@@ -2528,7 +2689,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases), (60, 0), "inside the grace: {n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard),
+            (60, 0, 0),
+            "inside the grace: {n:?}"
+        );
         let after = Facts {
             grace: false,
             ..grace
@@ -2542,7 +2707,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases), (120, 60), "after it: {n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard),
+            (120, 0, 60),
+            "after it: {n:?}"
+        );
         let w = s.budget_mut().unwrap().take_window();
         assert_eq!(w.acted, (120, 120));
     }
@@ -2656,13 +2825,13 @@ mod tests {
                 "VP9-444",
                 &vp9,
                 "delivery.gate(&pc, &mut governor, session_id, constrained_transport, false);",
-                "delivery.on_skip(false, |t| governor.on_backpressure_skip(t))",
+                "delivery.on_skip(false, |s| governor.on_gate_skip(s))",
             ),
             (
                 "FFmpeg",
                 &ffmpeg,
                 "delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate);",
-                "delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t))",
+                "delivery.on_skip(in_grace, |s| governor.on_gate_skip(s))",
             ),
         ] {
             assert_eq!(body.matches("delivery.gate(").count(), 1, "{name}");
@@ -2684,9 +2853,14 @@ mod tests {
                 "{name}: the arm asks no keyframe"
             );
             assert_eq!(
-                body.matches("on_backpressure_skip(").count(),
+                body.matches("on_gate_skip(").count(),
                 1,
-                "{name}: one decrease at the gate, the budget's"
+                "{name}: one skip at the gate, the budget's"
+            );
+            assert_eq!(
+                body.matches("on_backpressure_skip(").count(),
+                0,
+                "{name}: the decrease goes through the budget's skip (FR-148 D51 B4a-1)"
             );
             assert!(body[at..].contains(STEP), "{name}: the step after the gate");
         }
@@ -5873,6 +6047,7 @@ pub(crate) mod shaped_link {
                 bps: (s.rate_bps > 0).then(|| u32::try_from(s.rate_bps).unwrap_or(u32::MAX)),
                 measured: s.measured,
                 loss: s.fast_rtx + s.t3,
+                ..PathRate::default()
             }
         }
 
@@ -9119,7 +9294,7 @@ pub(crate) mod shaped_link {
                             p.holds += 1;
                         }
                         delivery.note_gate(full, false);
-                        let a = delivery.on_skip(false, |t| governor.on_backpressure_skip(t));
+                        let a = delivery.on_skip(false, |s| governor.on_gate_skip(s));
                         note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
                         tokio::time::sleep(GATE_RETRY).await;
                         continue;
