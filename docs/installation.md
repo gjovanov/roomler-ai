@@ -1406,7 +1406,7 @@ depends on the run (#3115):
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
 | A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` survives whole: the SystemContext switch and every entry `set-service-env-var` wrote |
 | A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first. From 0.4.200 its `Environment` comes back: the new package reads it before the removal and writes it into the new entry ([below](#what-the-services-environment-keeps-3375)) |
-| An uninstall | `UnregisterService` (`main.wxs:641`) | retired (`lifecycle.rs:384`, `retire`), its `Environment` with it |
+| An uninstall | `UnregisterService` (`main.wxs:698`) | retired (`lifecycle.rs:384`, `retire`), its `Environment` with it |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -1494,7 +1494,7 @@ whatever an operator set there, such as the SFTP kill switch
 `ROOMLERD_SFTP_AS_USER=0` ([roomler-ssh.md](roomler-ssh.md)).
 
 Up to 0.4.199 a major upgrade kept the switch alone. The old product's removal
-ran its `UnregisterService` (`main.wxs:641`), which deleted the service, its
+ran its `UnregisterService` (`main.wxs:698`), which deleted the service, its
 registry key and the `Environment` in it. The new `RegisterService` created an
 entry with none, and the SystemContext action after it wrote the switch back.
 Every other entry lapsed at the next release, and nothing said so.
@@ -1505,9 +1505,9 @@ DLL, `agents/roomler-msi-ca`:
 
 | Action | Runs | Does |
 |---|---|---|
-| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:346`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:590`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
-| `SetRestoreServiceEnvironment` (`main.wxs:623`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
-| `RestoreServiceEnvironment` (`msi.rs:356`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:626`) | puts the carried entries back into the new service's `Environment` and writes it once |
+| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:359`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:640`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
+| `SetRestoreServiceEnvironment` (`main.wxs:680`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
+| `RestoreServiceEnvironment` (`msi.rs:369`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:683`) | puts the carried entries back into the new service's `Environment` and writes it once |
 
 Each SystemContext action restarts the service, so what was carried is in
 effect from its first start. The capture belongs to the NEW package, so the
@@ -1561,7 +1561,7 @@ checks its imports with a negative control, and checks that it carries the
 payload's signature (`.github/workflows/release-agent.yml:2202`). `ROOMLER_TEST_CA_FAIL=capture` or
 `=restore` (`main.wxs:563`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
-(`.github/workflows/installer-smoke.yml:1120`). Its only effect is that nothing is
+(`.github/workflows/installer-smoke.yml:1139`). Its only effect is that nothing is
 carried.
 
 ```mermaid
@@ -1614,6 +1614,123 @@ The cure in both cases is to remove the entry with
 change has its own rule here: an entry the installer writes itself goes into
 `INSTALLER_OWNED` or is written after the restore, because the restore puts a
 carried entry over any entry of the same name (`carry.rs:190`).
+
+### A file in use at the old product's removal is still there after the boot (#4196)
+
+A per-Machine upgrade removes the old product first: `MajorUpgrade` is
+`afterInstallInitialize` (`agents/roomlerd/wix-perMachine/main.wxs:90`). When
+something holds one of its files open at that moment, the old product's
+`RemoveFiles` cannot simply delete it, and what Windows Installer does instead
+depends on the handle:
+
+| What holds `roomlerd.exe` | What the old product's `RemoveFiles` does | What is left pending at the install path |
+|---|---|---|
+| a running image: the old service's host if it has not exited, a worker it started in a session, the old `UnregisterService` action's own process, a `roomler` call that re-execs `roomlerd.exe` | an image can be renamed but not deleted, so it renames the file to an `.rbf` in `C:\Config.Msi` and schedules THAT file's delete | nothing |
+| an open handle that does not share delete: a scanner, a backup or indexing agent, any process reading the file | it can neither delete nor rename it: `Note: 1: 2329 2: 32`, then `Info 1903.Scheduling reboot operation: Deleting file C:\Program Files\Roomler\roomlerd.exe`, and the run ends 3010 | a delete in `PendingFileRenameOperations` |
+
+The new product's `InstallFiles` then puts its own `roomlerd.exe` at that path
+(`Overwrite`, when the file there is of a lower version) or keeps the one there
+(`Won't Overwrite`, an equal version). Neither cancels the pending delete, and up
+to #4196 the session manager ran it at the next boot, before any service starts.
+Measured on a Windows 11 lab VM, with a test process that did nothing but open
+the file to read it, sharing read only, from the old product's
+`InstallInitialize` until Windows Installer had scheduled the delete:
+
+| Cell | Up to #4196 |
+|---|---|
+| per-Machine, released 0.4.229 → 0.4.230 (a newer file version) | exit 3010 with the delete pending; after the boot `roomlerd.exe` is gone, the `Roomler` service is `STOPPED` with `AUTO_START`, and the SCM logs event 7000: the device stays offline until someone installs again |
+| per-Machine, one binary at two ProductVersions (an equal file version) | the same |
+| per-User, both shapes | unaffected: Windows Installer schedules no boot-time delete in a folder the user can write (`Warning: File …\Programs\Roomler\roomlerd.exe in unsafe path/junction present, skipping delete`), so the run ends 0 and the file stays |
+
+**The spare.** The per-Machine MSI takes those deletes out again, with two more
+actions in the custom-action DLL of [#3375](#what-the-services-environment-keeps-3375)
+(declared at `agents/roomlerd/wix-perMachine/main.wxs:621` and `:627`, sequenced at
+`:644` and `:647`):
+
+| Action | Runs | Does |
+|---|---|---|
+| `ListInstalledFiles` (`agents/roomler-msi-ca/src/msi.rs:723`) | immediate, after `InstallValidate`, where the component states are final; every run but an uninstall | lists the full path of every file whose component is installed when the run ends (`agents/roomler-msi-ca/src/pending_ops.rs:59`, `stays_local`) and hands the list on as the spare's `CustomActionData` |
+| `SpareInstalledFiles` (`msi.rs:733`) | deferred, as LocalSystem, after `InstallFiles` and after every action scheduled after it; every run but an uninstall | takes every delete of a listed file out of `PendingFileRenameOperations` and `PendingFileRenameOperations2` (`pending_ops.rs:217`, `plan`) and writes each value back with every other operation byte for byte as it was |
+
+```mermaid
+sequenceDiagram
+    participant M as msiexec, the new package
+    participant D as roomler_msi_ca.dll
+    participant Old as the old product's removal
+    participant H as a handle without share-delete
+    participant P as PendingFileRenameOperations
+    participant B as the next boot
+    M->>D: ListInstalledFiles, after InstallValidate
+    D-->>M: the paths of the files that stay
+    M->>Old: RemoveExistingProducts, right after InstallInitialize
+    H-->>Old: roomlerd.exe held open
+    Old->>P: a delete of the install path, 1903
+    M->>M: InstallFiles puts roomlerd.exe there, or keeps it
+    M->>D: SpareInstalledFiles, deferred, as LocalSystem
+    D->>P: the delete of a file that stays taken out
+    M-->>M: exit 3010, the restart still asked for
+    B->>P: runs what is left, and roomlerd.exe stays
+```
+
+**Why after `InstallFiles`, and in the NEW package.** The old product's removal
+runs inside this run, right after `InstallInitialize`, so the delete it
+schedules exists before `InstallFiles`, and whatever this product's copy had to
+schedule exists after it. A fix in the product being removed could not help the
+update into the first release that has it; the spare does, because the old
+product only schedules the delete. It acts on the outcome, not on the holder, so
+it covers every row of the first table, and with them a delete left behind by an
+earlier run that never rebooted (an uninstall and a reinstall, or an earlier
+upgrade that hit this): the next install, repair or upgrade drops it. A wait for
+the service would cover only the running images, which need nothing.
+
+**What it takes out, and what it never touches:**
+
+- only a delete, an operation whose destination is empty, whose source is EQUAL
+  to a listed path once `MoveFileEx`'s `*1`, `!` and `\??\` are taken off and
+  case is ignored. Equality, never a prefix: `roomlerd.exe2` and the folder
+  itself are not `roomlerd.exe`;
+- never a delete that is the first half of a replacement: a later rename in the
+  same value, or any rename in the other value, onto the same path keeps it,
+  because the file that rename brings is the one wanted;
+- never a rename, whatever its paths;
+- nothing on an uninstall (`REMOVE="ALL"`), whose deletes are wanted, and
+  nothing in a value that is not a `REG_MULTI_SZ` or whose strings do not pair
+  up.
+
+The values are read raw (`RegQueryValueExW`): their empty strings ARE the
+deletes, and a plain multi-string reader drops them
+(`agents/roomler-msi-ca/src/carry.rs:94`, `split_multi_sz`, does), so the spare
+has its own. Just before it writes, it reads the value again and compares it; if
+another program changed it in between, it plans again, three times at most. A
+value with no operation left is deleted, as the session manager deletes it after
+a boot.
+
+The run still ends 3010 when Windows Installer scheduled anything: it did ask for
+a restart, and the restart no longer takes the daemon with it. Neither action
+can fail an install: both are `Return="ignore"` and return success after a
+logged miss, like the carry, and a DLL that cannot load spares nothing, as before
+#4196. One limit, by design: a stale pending replacement onto the same path (a
+delete followed by a rename onto it) still runs at the next boot. It puts an
+older file there, never no file, and whoever scheduled it asked for it.
+
+For an EDR this is `msiexec.exe`'s own custom-action server running a DLL from
+the MSI's `Binary` table as LocalSystem, as the carry already does, and it only
+ever removes entries from the two values, never adds one.
+
+The MSI log says what it did, by path, in lines that start
+`roomler_msi_ca: list:` and `roomler_msi_ca: spare:`, for example
+`roomler_msi_ca: spare: dropped the delete of *1\??\C:\Program Files\Roomler\roomlerd.exe from PendingFileRenameOperations`.
+
+**How it is tested.** installer-smoke upgrades pm-6 to pm-7 (one binary, one
+version apart) while a test process holds `roomlerd.exe` open the way the lab's
+did, and fails on any boot-time delete of a file in the install folder
+(`.github/workflows/installer-smoke.yml:1533`). A runner cannot boot again, so the
+cell reads what the next boot would run. Its positive control is the log's own
+1903 line for the file: without it the hold did nothing, and the cell fails. The
+built-MSI step checks the two actions' order, their `Return="ignore"`, the
+spare's deferred LocalSystem type and the DLL's exports
+(`installer-smoke.yml:1058`). The parsing and the plan are unit-tested on every
+platform (`pending_ops.rs:260`), on the value as Windows 11 writes it.
 
 ### What the SYSTEM worker's console carries (#3438)
 
@@ -1682,12 +1799,12 @@ own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:123`):
 
 | Custom action | The verb | When it runs |
 |---|---|---|
-| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:404`, sequenced at `:609`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
-| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:593`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
-| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:447`, `:632`), and its rollback partner `RollbackSystemContext` (`:465`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
-| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:484`, `:635`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
-| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:508`, `:638`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
-| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:641`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
+| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:404`, sequenced at `:666`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
+| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:650`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
+| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:447`, `:689`), and its rollback partner `RollbackSystemContext` (`:465`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
+| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:484`, `:692`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
+| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:508`, `:695`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
+| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:698`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
 
 The order is the built MSI's `InstallExecuteSequence`, not the order of the file.
 `CleanupLegacyPerUser` and `RegisterService` are both `After='InstallFiles'`, and WiX v3 (which

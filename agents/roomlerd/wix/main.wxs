@@ -340,11 +340,11 @@
                     <Component Id='ApplicationShortcut' Guid='6D3F4A02-8B5E-4D4C-B03F-9C4D5E6F7081'>
                         <!-- FR-133 P1: the Start-menu entry's NAME follows the
                              product's; its Id and the component's Guid are identity
-                             and stay. MajorUpgrade runs afterInstallInitialize, so
-                             the old product (and its old .lnk) is removed before
-                             this one installs. #3292: it starts the task, through
-                             the launcher, so a click opens no terminal and never
-                             leaves a daemon nothing supervises. -->
+                             and stay. MajorUpgrade here is afterInstallExecute (see
+                             it above): this product, this entry included, is in
+                             place before the old one is removed. #3292: it starts
+                             the task, through the launcher, so a click opens no
+                             terminal and never leaves a daemon nothing supervises. -->
                         <Shortcut
                             Id='AgentShortcut'
                             Name='Roomler'

@@ -1055,12 +1055,31 @@ jobs:
           foreach ($a in 'DisableSystemContext', 'KeepSystemContext') {
             if ((Get-Seq $a) -le (Get-Seq 'RestoreServiceEnvironment')) { throw "$a runs before RestoreServiceEnvironment" }
           }
-          # msidbCustomActionTypeContinue (0x40): neither can fail an upgrade.
-          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+          # #4196 — the list once the component states are final and before the
+          # old product's removal; the spare after InstallFiles, and after every
+          # action scheduled after it, whose numbers docs/installation.md records.
+          $at = [ordered]@{}
+          foreach ($a in 'InstallValidate', 'ListInstalledFiles', 'InstallInitialize', 'InstallFiles', 'CleanupLegacyPerUser',
+                         'RegisterService', 'SetRestoreServiceEnvironment', 'RestoreServiceEnvironment', 'DisableSystemContext',
+                         'KeepSystemContext', 'RollbackSystemContext', 'EnableSystemContext', 'SpareInstalledFiles') { $at[$a] = Get-Seq $a }
+          Write-Host (($at.Keys | ForEach-Object { "$_=$($at[$_])" }) -join ' ')
+          if (-not ($at.InstallValidate -lt $at.ListInstalledFiles -and $at.ListInstalledFiles -lt $at.InstallInitialize)) {
+            throw 'ListInstalledFiles does not run between InstallValidate and InstallInitialize'
+          }
+          $before = @($at.Keys | Where-Object { $_ -notin 'InstallValidate', 'ListInstalledFiles', 'InstallInitialize', 'SpareInstalledFiles' } | ForEach-Object { $at[$_] })
+          if ($at.SpareInstalledFiles -le ($before | Measure-Object -Maximum).Maximum) {
+            throw "SpareInstalledFiles ($($at.SpareInstalledFiles)) does not come after InstallFiles and every action scheduled after it"
+          }
+          # msidbCustomActionTypeContinue (0x40): none of them can fail an install.
+          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment', 'ListInstalledFiles', 'SpareInstalledFiles') {
             $type = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='$a'") 'IntegerData')
             Write-Host "$a Type: $type"
             if (($type -band 0x40) -eq 0) { throw "$a can fail the install: its Return is not 'ignore'" }
           }
+          # The spare writes HKLM's Session Manager key: deferred (0x400) and
+          # not impersonated (0x800), so it runs as LocalSystem.
+          $spareType = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='SpareInstalledFiles'") 'IntegerData')
+          if (($spareType -band 0xC00) -ne 0xC00) { throw "SpareInstalledFiles is not a deferred action that runs as LocalSystem: Type $spareType" }
           # CustomActionData is logged under the restore's own name.
           $hidden = Get-Field (Get-Row "SELECT Value FROM Property WHERE Property='MsiHiddenProperties'") 'StringData'
           Write-Host "MsiHiddenProperties: $hidden"
@@ -1102,10 +1121,10 @@ jobs:
             throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
           }
           $exports = (& $dumpbin /exports $dll) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exited $LASTEXITCODE" }
-          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment', 'ListInstalledFiles', 'SpareInstalledFiles') {
             if ($exports -notmatch "\b$e\b") { throw "the DLL does not export $e" }
           }
-          Write-Host 'OK: the DLL imports only what Windows ships, and exports both entry points'
+          Write-Host 'OK: the DLL imports only what Windows ships, and exports its four entry points'
           # Negative control: the same crate built WITHOUT +crt-static imports the
           # VC++ runtime, and the audit has to say so.
           $neg = @(Get-Problems "$env:RUNNER_TEMP\msi-ca\plain-crt.dll")
