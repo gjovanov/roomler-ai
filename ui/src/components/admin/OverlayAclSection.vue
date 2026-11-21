@@ -86,6 +86,20 @@
         port-narrowed rule currently grants the whole peer at L3.
       </v-alert>
 
+      <!-- #4188: the store reads every page of the list up to its page cap;
+           past it, the tab says how much of the list it shows. -->
+      <v-alert
+        v-if="store.truncated"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        data-testid="overlay-acl-truncated"
+      >
+        Showing the first {{ store.policies.length }} of this organization's
+        {{ store.total }} rules.
+      </v-alert>
+
       <p v-if="!store.loading && store.policies.length === 0" class="text-medium-emphasis">
         No overlay rules yet. While enforcement is <code>off</code> every node
         sees every peer and all of its approved routes — the pre-ACL behaviour.
@@ -628,15 +642,26 @@ async function doDelete() {
   }
 }
 
+/** An id no list here holds (a node or role since removed, a member who left)
+ *  reads as its kind and these first 6 characters, as on the Tunnel ACL tab,
+ *  never as the bare kind: two of them must not read the same (#4190). */
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 6)}…` : id
+}
+
 function selectorLabel(s: OverlaySelector): string {
   if (s.kind === 'all_nodes') return 'All nodes'
-  if (s.kind === 'node_id') return nodeItems.value.find((n) => n.value === s.id)?.title ?? 'Node'
-  if (s.kind === 'role_id') return roleItems.value.find((r) => r.value === s.id)?.title ?? 'Role'
-  return memberItems.value.find((m) => m.value === s.id)?.title ?? 'User'
+  if (s.kind === 'node_id') {
+    return nodeItems.value.find((n) => n.value === s.id)?.title ?? `Node ${shortId(s.id)}`
+  }
+  if (s.kind === 'role_id') {
+    return roleItems.value.find((r) => r.value === s.id)?.title ?? `Role ${shortId(s.id)}`
+  }
+  return memberItems.value.find((m) => m.value === s.id)?.title ?? `User ${shortId(s.id)}`
 }
 function targetLabel(t: OverlayTarget): string {
   if (t.kind === 'all_nodes') return 'All nodes'
-  return nodeItems.value.find((n) => n.value === t.id)?.title ?? 'Node'
+  return nodeItems.value.find((n) => n.value === t.id)?.title ?? `Node ${shortId(t.id)}`
 }
 function portLabel(r: { low: number; high: number }): string {
   if (r.low === 1 && r.high === 65535) return 'any'

@@ -58,7 +58,7 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
 (`agents/roomlerd/src/signaling.rs:1842`), its central and regional DERP sockets
-(`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
+(`agents/roomlerd/src/derp.rs:424`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
 

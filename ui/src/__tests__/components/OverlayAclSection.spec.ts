@@ -11,6 +11,11 @@
 // teleported v-dialog, so the spec mounts attached to the document and reads
 // the dialog from there: a stub that hid the dialog's body would pass on the
 // broken shape too.
+//
+// #4190 — an id no list here holds (a node or a role since removed, a member
+// who left) reads as its kind and its first 6 characters, `Node 6a70a3…`, as
+// on the Tunnel ACL tab. It read as the bare kind, so two removed nodes looked
+// the same.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia, type Pinia } from 'pinia'
@@ -61,6 +66,7 @@ vi.mock('@/stores/members', () => ({
 import OverlayAclSection from '@/components/admin/OverlayAclSection.vue'
 import type { OverlayPolicy } from '@/stores/overlayAcl'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from '../stores/pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -205,7 +211,9 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     mockApi.get.mockResolvedValue(listOf([namedRule(), catchAllRule()]))
     const w = mountSection()
     await flushPromises()
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/overlay-acl`)
+    expect(mockApi.get).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/overlay-acl?page=1&per_page=100`,
+    )
     const rows = [...document.querySelectorAll('tbody tr')]
     expect(rows).toHaveLength(2)
     expect(chips(rows[0]!, 'Sources')).toEqual([NODE, 'Ops lead', 'Mesh operators'])
@@ -213,6 +221,44 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     expect(chips(rows[1]!, 'Sources')).toEqual(['All nodes'])
     expect(chips(rows[1]!, 'Via')).toEqual(['All nodes'])
     expect(document.body.textContent).not.toContain('[object Object]')
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('names one no list holds by its kind and its first 6 characters (#4190)', async () => {
+    // A node and a role since removed, and a member who left. The first 6
+    // characters are the top of an ObjectId's timestamp: these two nodes were
+    // minted eight days apart (two minted within the same 256 s share them).
+    const gone = {
+      node: '6a70a3f15e2d4c1b0a9f8e01',
+      otherNode: '6a7b52e05e2d4c1b0a9f8e02',
+      user: '6a61f4a2c3d4e5f60718293a',
+      role: '6a5c9e7b1a2b3c4d5e6f7081',
+    }
+    const rule: OverlayPolicy = {
+      ...namedRule(),
+      sources: [
+        { kind: 'node_id', id: wireId(gone.node) },
+        { kind: 'user_id', id: wireId(gone.user) },
+        { kind: 'role_id', id: wireId(gone.role) },
+      ],
+      via: [
+        { kind: 'node_id', id: wireId(gone.node) },
+        { kind: 'node_id', id: wireId(ids.node) },
+        { kind: 'node_id', id: wireId(gone.otherNode) },
+      ],
+    }
+    mockApi.get.mockResolvedValue(listOf([rule]))
+    const w = mountSection()
+    await flushPromises()
+    const rows = [...document.querySelectorAll('tbody tr')]
+    expect(rows).toHaveLength(1)
+    expect(chips(rows[0]!, 'Sources')).toEqual(['Node 6a70a3…', 'User 6a61f4…', 'Role 6a5c9e…'])
+    // The node it can resolve keeps its name alone, between the two it cannot.
+    const via = chips(rows[0]!, 'Via')
+    expect(via).toEqual(['Node 6a70a3…', NODE, 'Node 6a7b52…'])
+    // The issue's own complaint: two removed nodes no longer read the same.
+    expect(via[0]).not.toBe(via[2])
     expectNothingRaised()
     w.unmount()
   })
@@ -258,6 +304,44 @@ describe('OverlayAclSection — a rule that names its sources and via nodes by i
     expect(body.via).toEqual(rule.via)
     expect(body.destinations).toEqual(rule.destinations)
     expect(document.querySelector('.v-overlay--active .v-alert')).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+})
+
+// #4188 — the tab lists every page the route answers, up to the store's cap of
+// 50 pages. A route that serves one row a page reaches that cap at 50 rows.
+describe('OverlayAclSection — a list longer than one page', () => {
+  const row = (i: number): OverlayPolicy => ({
+    ...catchAllRule(),
+    id: rowId(i),
+    name: `rule-${i}`,
+  })
+  const note = () => document.querySelector('[data-testid="overlay-acl-truncated"]')
+
+  it('lists the rows of every page, with no note that the list was cut', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 3, row, extra: { mode: 'warn' }, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(mockApi.get).toHaveBeenCalledTimes(3)
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(3)
+    expect(note()).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('says how much of the list it shows when the page cap cut it', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 51, row, extra: { mode: 'warn' }, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(50)
+    expect(note()?.textContent?.replace(/\s+/g, ' ').trim()).toBe(
+      "Showing the first 50 of this organization's 51 rules.",
+    )
     expectNothingRaised()
     w.unmount()
   })

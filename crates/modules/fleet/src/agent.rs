@@ -13,8 +13,8 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentStatus, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind,
-    PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentStatus, ConsentMode, ExecPolicy, ExternalAccessPolicy, InputMode,
+    InstallInfo, LockOnEnd, OsKind, PeerRelayPolicy, SshPolicy,
 };
 use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
@@ -933,7 +933,8 @@ pub struct AgentResponse {
     /// which is what showed green on dead sockets).
     pub is_online: bool,
     pub last_seen_at: String,
-    pub access_policy: AccessPolicy,
+    /// The device's [`AccessPolicy`], its ids as 24-hex strings (#4189).
+    pub access_policy: AccessPolicyView,
     /// Subnet-router CIDRs this agent advertises for the mesh (Phase 2). The
     /// `roomler socks5` mesh longest-prefix-matches a LAN target IP
     /// against these to pick the covering agent, which then dials the real
@@ -1036,6 +1037,56 @@ pub struct AgentResponse {
     pub peer_auth_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_auth_fingerprint: Option<String>,
+}
+
+/// A device's [`AccessPolicy`] as its detail and the device list answer it
+/// (#4189): `allowed_role_ids` and `allowed_user_ids` as 24-hex strings, where
+/// the model serialises bson's `{"$oid": …}`. Every other field is the
+/// model's, under the same key. A save sends this shape straight back: the
+/// request reads an [`AccessPolicy`], whose ids take the hex as well as
+/// `{"$oid": …}`, so the same ObjectIds are stored.
+#[derive(Debug, Serialize)]
+pub struct AccessPolicyView {
+    pub consent_mode: Option<ConsentMode>,
+    pub prompt_owner: Option<bool>,
+    pub allowed_role_ids: Vec<String>,
+    pub allowed_user_ids: Vec<String>,
+    pub auto_terminate_idle_minutes: Option<u32>,
+    pub input_mode: Option<InputMode>,
+    pub rc_overlay: Option<bool>,
+    pub rc_overlay_auto: Option<bool>,
+    pub lock_on_end: Option<LockOnEnd>,
+}
+
+impl From<AccessPolicy> for AccessPolicyView {
+    fn from(policy: AccessPolicy) -> Self {
+        // Every field by name: one added to the model stops this compiling,
+        // so it cannot reach the answer in its bson form unseen.
+        let AccessPolicy {
+            consent_mode,
+            prompt_owner,
+            allowed_role_ids,
+            allowed_user_ids,
+            auto_terminate_idle_minutes,
+            input_mode,
+            rc_overlay,
+            rc_overlay_auto,
+            lock_on_end,
+        } = policy;
+        let hex =
+            |ids: Vec<ObjectId>| -> Vec<String> { ids.into_iter().map(|id| id.to_hex()).collect() };
+        Self {
+            consent_mode,
+            prompt_owner,
+            allowed_role_ids: hex(allowed_role_ids),
+            allowed_user_ids: hex(allowed_user_ids),
+            auto_terminate_idle_minutes,
+            input_mode,
+            rc_overlay,
+            rc_overlay_auto,
+            lock_on_end,
+        }
+    }
 }
 
 /// FR-40 — one device's overlay-key rotation as the dashboard reads it:
@@ -2087,7 +2138,7 @@ fn to_agent_response(
         ephemeral_ttl_secs: a.ephemeral_ttl_secs,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
-        access_policy: a.access_policy,
+        access_policy: a.access_policy.into(),
         routes: a.routes,
         advertised_routes: a.advertised_routes,
         capabilities: a.capabilities,
@@ -2595,5 +2646,65 @@ mod enrollment_token_request_tests {
         );
         assert_eq!(read(Some("application/json"), "{}"), Some(false));
         assert_eq!(read(Some("application/json"), "{not json"), None, "a 400");
+    }
+}
+
+/// #4189 — the device answer's `access_policy` is the model field for field,
+/// but for its two id lists, which are 24-hex strings. A save sends that
+/// answer back, and the request reads it as the same policy.
+#[cfg(test)]
+mod access_policy_view_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn hex(ids: &[ObjectId]) -> Value {
+        ids.iter().map(|id| Value::String(id.to_hex())).collect()
+    }
+
+    /// What is wrong with the view of `policy`, if anything.
+    fn problems(what: &str, policy: AccessPolicy) -> Vec<String> {
+        let mut wrong = Vec::new();
+        let mut want = serde_json::to_value(&policy).expect("the model serialises");
+        want["allowed_role_ids"] = hex(&policy.allowed_role_ids);
+        want["allowed_user_ids"] = hex(&policy.allowed_user_ids);
+        let got = serde_json::to_value(AccessPolicyView::from(policy.clone()))
+            .expect("the view serialises");
+        if got != want {
+            wrong.push(format!(
+                "{what}: the view {got} is not the model with hex ids {want}"
+            ));
+        }
+        // The save: the answer, sent back as the request's `access_policy`.
+        match serde_json::from_value::<AccessPolicy>(got) {
+            Err(e) => wrong.push(format!("{what}: the answer does not read back: {e}")),
+            Ok(back) => {
+                let (back, before) = (
+                    serde_json::to_value(&back).expect("the model serialises"),
+                    serde_json::to_value(&policy).expect("the model serialises"),
+                );
+                if back != before {
+                    wrong.push(format!("{what}: it reads back as {back}, not {before}"));
+                }
+            }
+        }
+        wrong
+    }
+
+    #[test]
+    fn the_view_changes_nothing_but_the_ids_and_reads_back_as_the_same_policy() {
+        let every_field = AccessPolicy {
+            consent_mode: Some(ConsentMode::Push),
+            prompt_owner: Some(true),
+            allowed_role_ids: vec![ObjectId::new(), ObjectId::new()],
+            allowed_user_ids: vec![ObjectId::new()],
+            auto_terminate_idle_minutes: Some(30),
+            input_mode: Some(InputMode::Exclusive),
+            rc_overlay: Some(false),
+            rc_overlay_auto: Some(true),
+            lock_on_end: Some(LockOnEnd::Always),
+        };
+        let mut wrong = problems("every field set", every_field);
+        wrong.extend(problems("the default", AccessPolicy::default()));
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

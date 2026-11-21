@@ -189,7 +189,7 @@ sequenceDiagram
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:365`); `UpdateRefusal` and `update_refusal()` (`:581`, `:1260`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5559`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3127`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3109`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:7189`, `:7205`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1742`): a 409 on one device (`:1789`), a `refused` row with its `refused_code` in a bulk (`:1921`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1793`): a 409 on one device (`:1840`), a `refused` row with its `refused_code` in a bulk (`:1972`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]

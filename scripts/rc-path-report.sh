@@ -58,6 +58,12 @@
 #   --from ISO --to ISO          the same as --since and --until
 #   --limit N                    --timeline only: stop after N rows (default
 #                                60,000, at most 200,000) and print TRUNCATED
+#   --viewer-agent HEX           --timeline only: the viewer's node, the other
+#                                end of a mesh-relay session, read over the same
+#                                window for its /derp lines only; each T3 line
+#                                is paired with both nodes' drop lines
+#   --viewer-tenant HEX          the viewer node's org, when it uploads its lines
+#                                under another than --tenant (the default)
 #
 # Every option but --agent and --label takes one value, and one given twice is
 # refused before the target is looked at (--timeline takes ONE --agent too).
@@ -112,6 +118,8 @@ NAGENTS=0
 NSINCE=0
 NUNTIL=0
 NLIMIT=0
+NVIEWER=0
+NVTENANT=0
 JSON=0
 
 while [ $# -gt 0 ]; do
@@ -147,7 +155,15 @@ while [ $# -gt 0 ]; do
       [ "$NLIMIT" = 0 ] || die "--limit is given twice"
       [[ "${2:-}" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$2" -le "$LIMIT_MAX" ] || die "--limit takes a row count, 1 to $LIMIT_MAX"
       ENVS+=("RC_PATH_LIMIT=$2"); PASS+=("$1" "$2"); NLIMIT=1; shift 2 ;;
-    -h|--help) sed -n '2,68p' "$0"; exit 0 ;;
+    --viewer-agent)
+      [ "$NVIEWER" = 0 ] || die "--viewer-agent is given twice: --timeline reads one viewer node"
+      [[ "${2:-}" =~ $HEX24 ]] || die "--viewer-agent takes a 24-hex agent id"
+      ENVS+=("RC_PATH_VIEWER=$2"); PASS+=("$1" "$2"); NVIEWER=1; shift 2 ;;
+    --viewer-tenant)
+      [ "$NVTENANT" = 0 ] || die "--viewer-tenant is given twice"
+      [[ "${2:-}" =~ $HEX24 ]] || die "--viewer-tenant takes a 24-hex tenant id"
+      ENVS+=("RC_PATH_VIEWER_TENANT=$2"); PASS+=("$1" "$2"); NVTENANT=1; shift 2 ;;
+    -h|--help) sed -n '2,74p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1 (--help)" ;;
   esac
 done
@@ -160,6 +176,9 @@ if [ "$TIMELINE" = 1 ]; then
   [ "$NTENANT" = 1 ] && [ "$NAGENTS" = 1 ] || die "--timeline reads one device: --tenant HEX and ONE --agent HEX"
   [ "$NSINCE" = 1 ] && [ "$NUNTIL" = 1 ] || die "--timeline needs the window: --from ISO --to ISO"
   [ "$JSON" = 0 ] || die "--json is not available with --timeline"
+  [ "$NVIEWER" = 1 ] || [ "$NVTENANT" = 0 ] || die "--viewer-tenant needs --viewer-agent: it names the viewer node's org"
+else
+  [ "$NVIEWER" = 0 ] && [ "$NVTENANT" = 0 ] || die "--viewer-agent is for --timeline: one device's window and its viewer node's /derp lines"
 fi
 # Every value bound for the remote command line (--mars) was checked above
 # against a pattern of plain characters, so `printf %q` hands it on unchanged

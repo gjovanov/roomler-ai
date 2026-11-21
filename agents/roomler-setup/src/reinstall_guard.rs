@@ -207,10 +207,7 @@ pub fn stop_text(mac: &OneRowMac, server: &str) -> String {
     } else {
         ""
     };
-    let server = match server.trim().trim_end_matches('/') {
-        "" => crate::commands::cmd_default_server_url(),
-        chosen => chosen.to_string(),
-    };
+    let server = terminal_server(server);
     format!(
         "This Mac is one device already{named}: its screen sharing, remote control and \
          private network run there, and it updates itself. Roomler Setup installs nothing \
@@ -220,6 +217,16 @@ pub fn stop_text(mac: &OneRowMac, server: &str) -> String {
          `curl -fsSL {server}/api/setup/install.sh | sh -s -- --uninstall`, then start \
          Roomler Setup again."
     )
+}
+
+/// The server a command for Terminal names: the one the person chose, with
+/// no trailing slash, or the default when none was chosen. Every text that
+/// tells the person to run the script uses it, so the line works as typed.
+pub fn terminal_server(server: &str) -> String {
+    match server.trim().trim_end_matches('/') {
+        "" => crate::commands::cmd_default_server_url(),
+        chosen => chosen.to_string(),
+    }
 }
 
 #[cfg(test)]

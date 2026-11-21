@@ -61,6 +61,7 @@ import TunnelPoliciesSection from '@/components/admin/TunnelPoliciesSection.vue'
 import type { TunnelPolicy } from '@/stores/tunnelPolicies'
 import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
+import { pagedRoute, rowId } from '../stores/pagedRoute'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = '69a1dbbad2000f26adc875ce'
@@ -220,7 +221,9 @@ describe('TunnelPoliciesSection — a policy that names subjects and targets by 
     mockApi.get.mockResolvedValue(listOf([namedPolicy(), catchAllPolicy()]))
     const w = mountSection()
     await flushPromises()
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/tunnel-policy`)
+    expect(mockApi.get).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/tunnel-policy?page=1&per_page=100`,
+    )
     const rows = [...document.querySelectorAll('tbody tr')]
     expect(rows).toHaveLength(2)
     expect(chips(rows[0]!, 'Subjects')).toEqual([
@@ -286,6 +289,44 @@ describe('TunnelPoliciesSection — a policy that names subjects and targets by 
     expect(body.targets).toEqual(policy.targets)
     expect(body.allowlist).toEqual(policy.allowlist)
     expect(document.querySelector('.v-overlay--active .v-alert')).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+})
+
+// #4188 — the tab lists every page the route answers, up to the store's cap of
+// 50 pages. A route that serves one row a page reaches that cap at 50 rows.
+describe('TunnelPoliciesSection — a list longer than one page', () => {
+  const row = (i: number): TunnelPolicy => ({
+    ...catchAllPolicy(),
+    id: rowId(i),
+    name: `policy-${i}`,
+  })
+  const note = () => document.querySelector('[data-testid="tunnel-acl-truncated"]')
+
+  it('lists the rows of every page, with no note that the list was cut', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 3, row, totalPages: true, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(mockApi.get).toHaveBeenCalledTimes(3)
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(3)
+    expect(note()).toBeNull()
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('says how much of the list it shows when the page cap cut it', async () => {
+    mockApi.get.mockImplementation(
+      pagedRoute({ total: 51, row, totalPages: true, perPageCap: 1 }),
+    )
+    const w = mountSection()
+    await flushPromises()
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(50)
+    expect(note()?.textContent?.replace(/\s+/g, ' ').trim()).toBe(
+      "Showing the first 50 of this organization's 51 tunnel policies.",
+    )
     expectNothingRaised()
     w.unmount()
   })

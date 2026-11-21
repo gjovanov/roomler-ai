@@ -331,6 +331,10 @@ beforeEach(() => {
   FakeDecoder.isConfigSupported.mockClear()
   vi.stubGlobal('VideoDecoder', FakeDecoder)
   vi.stubGlobal('EncodedVideoChunk', FakeChunk)
+  // No rAF: the DC worker's first frame starts its viewer-rate bursts
+  // (`rc-viewer-hz.ts`), whose late report would land after this file
+  // restores `postMessage`.
+  vi.stubGlobal('requestAnimationFrame', undefined)
   clock = 100_000
   vi.spyOn(performance, 'now').mockImplementation(() => clock)
   posted = []

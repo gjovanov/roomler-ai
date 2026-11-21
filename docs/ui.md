@@ -389,6 +389,11 @@ carrier types), `TimeSeriesChart`, `UptimeStrip`, `UsagePanel`, `UsageTable`,
 nodes) · `MagicDnsSection` · `TunnelPoliciesSection` · `MembersSection` ·
 `RolesSection` · `SettingsSection`.
 
+The Tunnel ACL and Overlay ACL tabs list every policy of the org. Their stores
+read the list route page by page through `fetchAllPages` (`utils/allPages.ts`):
+100 rows a page, the server's cap, and at most 50 pages. Past that the tab says
+how many of how many it shows (#4188).
+
 ### The devices list's "needs a person" chips
 
 `AgentsSection` shows these in both its table and its cards. Each appears only when someone has to act, and
