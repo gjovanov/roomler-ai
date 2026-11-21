@@ -18,8 +18,10 @@
 //! (`roomler:tmux:<session>` / `roomler:app:<key>`) so [`super::classify_title`]
 //! can map a window back to its session/app without pid/xprop games.
 //!
-//! A tmux session with **no live xterm** (after an agent restart, or the
-//! operator detached) still appears in the list with a synthetic
+//! A tmux session with **no live xterm** (its xterm ended with the virtual
+//! desktop when its X server died, #4100; a daemon no service manager owns
+//! restarted; or the operator detached) still appears in the list with a
+//! synthetic
 //! `tmux:<session>` window id; [`LinuxWm::focus`] special-cases that to
 //! spawn a fresh attached xterm — so "attach to an existing bash
 //! session" works within the 3-message protocol (no separate verb).
@@ -35,6 +37,7 @@ use super::{
     next_tmux_session_name, parse_tmux_sessions, parse_wmctrl_list,
 };
 use super::{MissingTool, Unavailable};
+use crate::virtual_desktop::{XStart, XStarter};
 
 /// Synthetic window-id prefix for a detached tmux session (no live X
 /// window). `focus()` treats it as "attach", not "raise".
@@ -88,11 +91,57 @@ pub enum Target {
 
 pub struct LinuxWm {
     target: Target,
+    /// The helper programs it runs.
+    tools: Tools,
+    /// #4100 — asked first, on [`Target::Daemon`], who starts an X client.
+    start: XStarter,
+}
+
+/// The helper programs [`LinuxWm`] runs, by name in the daemon (#4100: a test
+/// puts stand-ins here, and never runs the real ones).
+struct Tools {
+    tmux: String,
+    xterm: String,
+    wmctrl: String,
+    xprop: String,
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Self {
+            tmux: "tmux".into(),
+            xterm: "xterm".into(),
+            wmctrl: "wmctrl".into(),
+            xprop: "xprop".into(),
+        }
+    }
 }
 
 impl LinuxWm {
     pub fn new(target: Target) -> Self {
-        Self { target }
+        Self {
+            target,
+            tools: Tools::default(),
+            start: std::sync::Arc::new(crate::virtual_desktop::start_x_client),
+        }
+    }
+
+    /// #4100 — a backend on `target` whose helper programs are `tools` (tmux,
+    /// xterm, wmctrl and xprop, in that order) and which asks `start` first,
+    /// for the virtual desktop's tests.
+    #[cfg(test)]
+    pub(super) fn with(target: Target, tools: [String; 4], start: XStarter) -> Self {
+        let [tmux, xterm, wmctrl, xprop] = tools;
+        Self {
+            target,
+            tools: Tools {
+                tmux,
+                xterm,
+                wmctrl,
+                xprop,
+            },
+            start,
+        }
     }
 
     /// Build a command aimed at the target desktop.
@@ -146,22 +195,26 @@ impl LinuxWm {
 
     /// Spawn a detached, stdio-null child (an xterm / GUI app). The child
     /// keeps running after the handle drops (std, unlike tokio).
+    ///
+    /// #4100 — on the daemon's own display, the virtual desktop is asked
+    /// first who starts it: where its keeper runs, the keeper does, and a
+    /// start it cannot take fails here, never falling back to this spawn.
     fn spawn_detached(&self, program: &str, args: &[&str], apt: &str) -> Result<()> {
+        if let Target::Daemon { display } = &self.target {
+            match (self.start)(display, program, args) {
+                XStart::Direct => {}
+                XStart::Started => return Ok(()),
+                XStart::Failed(e) => return Err(spawn_error(program, apt, e)),
+                XStart::Refused(why) => bail!("`{program}` was not started: {why}"),
+            }
+        }
         self.cmd(program)?
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::anyhow!(
-                        "`{program}` not installed on the agent host (apt install {apt})"
-                    )
-                } else {
-                    anyhow::Error::new(e).context(format!("spawning {program}"))
-                }
-            })?;
+            .map_err(|e| spawn_error(program, apt, e))?;
         Ok(())
     }
 
@@ -170,7 +223,11 @@ impl LinuxWm {
     /// the property is unset.
     fn active_window(&self) -> Option<u64> {
         let out = self
-            .run_capture("xprop", &["-root", "_NET_ACTIVE_WINDOW"], "x11-utils")
+            .run_capture(
+                &self.tools.xprop,
+                &["-root", "_NET_ACTIVE_WINDOW"],
+                "x11-utils",
+            )
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         // e.g. "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x3400007"
@@ -181,7 +238,11 @@ impl LinuxWm {
     /// tmux session names (empty when no server is running — tmux exits
     /// non-zero for that, which is NOT an error here).
     fn tmux_sessions(&self) -> Vec<String> {
-        match self.run_capture("tmux", &["list-sessions", "-F", "#{session_name}"], "tmux") {
+        match self.run_capture(
+            &self.tools.tmux,
+            &["list-sessions", "-F", "#{session_name}"],
+            "tmux",
+        ) {
             Ok(out) => parse_tmux_sessions(&String::from_utf8_lossy(&out.stdout)),
             Err(_) => Vec::new(),
         }
@@ -189,7 +250,9 @@ impl LinuxWm {
 
     /// Find a freshly-launched window's id by its exact raw title.
     fn window_id_by_title(&self, want_title: &str) -> Option<String> {
-        let out = self.run_capture("wmctrl", &["-l"], "wmctrl").ok()?;
+        let out = self
+            .run_capture(&self.tools.wmctrl, &["-l"], "wmctrl")
+            .ok()?;
         parse_wmctrl_list(&String::from_utf8_lossy(&out.stdout))
             .into_iter()
             .find(|w| w.title == want_title)
@@ -243,7 +306,7 @@ fn on_path_in(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
 const HELPERS: &[MissingTool] = &[
     MissingTool {
         tool: "tmux",
-        blocks: "persistent shell sessions (the ones that survive an agent restart)",
+        blocks: "persistent shell sessions (the ones that outlive their terminal and a disconnect)",
         install: "apt install tmux",
     },
     MissingTool {
@@ -298,7 +361,7 @@ impl WindowManager for LinuxWm {
 
     fn list(&self) -> Result<Vec<WindowInfo>> {
         // Live X windows.
-        let out = self.run_capture("wmctrl", &["-l"], "wmctrl")?;
+        let out = self.run_capture(&self.tools.wmctrl, &["-l"], "wmctrl")?;
         // ⚠️ The status check is load-bearing, and it was missing. `wmctrl -l`
         // against a display it cannot open writes NOTHING to stdout and exits
         // non-zero, so parsing stdout regardless turned "I could not reach the
@@ -367,8 +430,16 @@ impl WindowManager for LinuxWm {
             }
             let title = format!("roomler:tmux:{session}");
             self.spawn_detached(
-                "xterm",
-                &["-T", title.as_str(), "-e", "tmux", "attach", "-t", session],
+                &self.tools.xterm,
+                &[
+                    "-T",
+                    title.as_str(),
+                    "-e",
+                    &self.tools.tmux,
+                    "attach",
+                    "-t",
+                    session,
+                ],
                 "xterm",
             )
             .with_context(|| format!("attaching to tmux session {session}"))?;
@@ -380,7 +451,7 @@ impl WindowManager for LinuxWm {
         if parse_hex(window_id).is_none() {
             bail!("invalid window id");
         }
-        let out = self.run_capture("wmctrl", &["-i", "-a", window_id], "wmctrl")?;
+        let out = self.run_capture(&self.tools.wmctrl, &["-i", "-a", window_id], "wmctrl")?;
         if !out.status.success() {
             bail!(
                 "wmctrl could not focus {window_id}: {}",
@@ -405,7 +476,7 @@ impl WindowManager for LinuxWm {
             // Create the detached session running the configured shell.
             let mut new_args: Vec<&str> = vec!["new-session", "-d", "-s", session.as_str()];
             new_args.extend(app.command.iter().map(String::as_str));
-            let created = self.run_capture("tmux", &new_args, "tmux")?;
+            let created = self.run_capture(&self.tools.tmux, &new_args, "tmux")?;
             if !created.status.success() {
                 bail!(
                     "tmux new-session failed: {}",
@@ -416,12 +487,12 @@ impl WindowManager for LinuxWm {
             // Attach it in an xterm titled by our convention.
             let title = format!("roomler:tmux:{session}");
             self.spawn_detached(
-                "xterm",
+                &self.tools.xterm,
                 &[
                     "-T",
                     title.as_str(),
                     "-e",
-                    "tmux",
+                    &self.tools.tmux,
                     "attach",
                     "-t",
                     session.as_str(),
@@ -441,7 +512,7 @@ impl WindowManager for LinuxWm {
             let title = format!("roomler:app:{}", app.key);
             let mut args: Vec<&str> = vec!["-T", title.as_str(), "-e"];
             args.extend(app.command.iter().map(String::as_str));
-            self.spawn_detached("xterm", &args, "xterm")?;
+            self.spawn_detached(&self.tools.xterm, &args, "xterm")?;
             std::thread::sleep(LAUNCH_SETTLE);
             return Ok(LaunchOutcome {
                 window_id: self.window_id_by_title(&title),
@@ -454,6 +525,17 @@ impl WindowManager for LinuxWm {
         let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
         self.spawn_detached(program, &rest, program)?;
         Ok(LaunchOutcome::default())
+    }
+}
+
+/// What a start of `program` that failed with `e` says, whoever started it
+/// (#4100: Remote Apps, or the virtual desktop's keeper): an actionable
+/// "install X" for a program that is not there, else the error.
+fn spawn_error(program: &str, apt: &str, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("`{program}` not installed on the agent host (apt install {apt})")
+    } else {
+        anyhow::Error::new(e).context(format!("spawning {program}"))
     }
 }
 

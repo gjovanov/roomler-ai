@@ -38,12 +38,12 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 
 | piece | where | note |
 |---|---|---|
-| primary key mint | `agents/roomlerd/src/main.rs:3439-3446` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
-| secondary-org mint | `crates/agent-core/src/enrollment.rs:704-705` | at enroll-append; never copied from the primary (cross-org correlation) |
-| storage | `crates/agent-core/src/config.rs:1908` (primary), `:2038` (`OrgEntry`), `for_org` at `:2172-2200` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
-| atomic save | `config.rs:4433` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
-| how a session gets its key | `agents/roomlerd/src/signaling.rs:480-485`, `:961-963`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
-| runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:430-438` | a changed secret already fails re-attach and rebuilds the runtime |
+| primary key mint | `agents/roomlerd/src/main.rs:2113-2121` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
+| secondary-org mint | `crates/agent-core/src/enrollment.rs:328-334` | at enroll-append; never copied from the primary (cross-org correlation) |
+| storage | `crates/agent-core/src/config.rs:1008` (primary), `:1132` (`OrgEntry`), `for_org` at `:1222-1245` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
+| atomic save | `config.rs:2130` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
+| how a session gets its key | `agents/roomlerd/src/signaling.rs:442-447`, `:881-883`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
+| runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:417-425` | a changed secret already fails re-attach and rebuilds the runtime |
 | existing per-org cycle | `main.rs:2893-2914` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
 | server join | `crates/api/src/ws/overlay.rs:232`, `:279-297` (`wg_key_taken_by_other`, machine-scoped ⇒ a same-machine rotation is allowed), `:299-390` (`rehydrate` stores `wg_public_key` + `key_epoch`) | `key_epoch` is stored and **read by nothing** (`models.rs:2982`; the agent always sends 0, `runtime.rs:1951`) |
 | peer fan-out | `overlay.rs:538-568` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:4194`) | an upsert IS the update; the re-join already carries the new key to every peer |

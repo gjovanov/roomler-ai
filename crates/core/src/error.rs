@@ -2,6 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -40,6 +41,18 @@ pub enum ApiError {
     Internal(String),
     Validation(String),
     ServiceUnavailable(String),
+    /// A request body axum's `Json` extractor refused, answered exactly as
+    /// the extractor answers it: its own status (400 for a body that is not
+    /// JSON, 413 past the size limit, 415 for one not sent as JSON, 422 for
+    /// one of the wrong shape) and its own plain-text words.
+    ///
+    /// #4187 — for a route whose permission is decided before its body is
+    /// read. Such a route takes `Result<Json<T>, JsonRejection>` in place of
+    /// `Json<T>`, so axum refuses no body before the handler runs, and reads
+    /// it with `let Json(body) = body?;` once its gate has answered. A caller
+    /// the gate refuses gets that refusal whatever the body is; a caller it
+    /// lets through gets the answer the extractor gave before.
+    JsonBody(JsonRejection),
 }
 
 impl std::fmt::Display for ApiError {
@@ -54,6 +67,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
             ApiError::Validation(msg) => write!(f, "Validation: {msg}"),
             ApiError::ServiceUnavailable(msg) => write!(f, "Service unavailable: {msg}"),
+            ApiError::JsonBody(rejection) => write!(f, "Refused body: {}", rejection.body_text()),
         }
     }
 }
@@ -93,6 +107,10 @@ impl IntoResponse for ApiError {
             ApiError::ServiceUnavailable(msg) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg)
             }
+            // The extractor's own answer, not the `{error, message}` shape:
+            // the words a caller got while the extractor refused the body
+            // before the handler ran (#4187).
+            ApiError::JsonBody(rejection) => return rejection.into_response(),
         };
 
         let body = ErrorResponse {
@@ -123,6 +141,14 @@ impl From<DaoError> for ApiError {
             DaoError::BsonSer(e) => ApiError::Internal(e.to_string()),
             DaoError::BsonDe(e) => ApiError::Internal(e.to_string()),
         }
+    }
+}
+
+/// #4187 — `?` on a body taken as `Result<Json<T>, JsonRejection>` answers
+/// as the extractor would have ([`ApiError::JsonBody`]).
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        ApiError::JsonBody(rejection)
     }
 }
 
@@ -230,5 +256,62 @@ index: email_1 dup key: { email: \"victim@corp.example\" }";
             conflict_text(DaoError::Conflict("Already reacted".to_string())),
             "Already reacted"
         );
+    }
+
+    /// #4187 — a body axum's `Json` extractor refused is answered exactly as
+    /// the extractor answers it, whatever the kind: the same status, the same
+    /// `Content-Type` and the same words. A route that reads its body after
+    /// its gate tells a caller the gate lets through what the extractor told
+    /// them before.
+    #[tokio::test]
+    async fn a_refused_body_is_answered_as_the_json_extractor_answers_it() {
+        use axum::extract::FromRequest;
+        use std::collections::HashMap;
+
+        async fn refused(content_type: &str, body: &'static str) -> JsonRejection {
+            let request = axum::http::Request::builder()
+                .header(axum::http::header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            match <Json<HashMap<String, String>> as FromRequest<()>>::from_request(request, &())
+                .await
+            {
+                Ok(_) => panic!("{body:?} as {content_type} parses"),
+                Err(rejection) => rejection,
+            }
+        }
+
+        async fn answer(response: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, content_type, body)
+        }
+
+        for (content_type, body, status) in [
+            ("application/json", "{", StatusCode::BAD_REQUEST),
+            (
+                "application/json",
+                r#"{"name": 7}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "text/plain",
+                r#"{"name": "x"}"#,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let ours =
+                answer(ApiError::from(refused(content_type, body).await).into_response()).await;
+            let extractors = answer(refused(content_type, body).await.into_response()).await;
+            assert_eq!(ours, extractors, "{body:?} as {content_type}");
+            assert_eq!(ours.0, status, "{body:?} as {content_type}");
+        }
     }
 }

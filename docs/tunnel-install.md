@@ -163,7 +163,7 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:1197-1201`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1279-1283`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
@@ -251,15 +251,15 @@ For an "ops team reaches the prod Postgres" policy:
 | Field | Value |
 |---|---|
 | Name | `ops-prod-postgres` |
-| Subjects | `Role ID` → `<your ops role hex>`, plus optionally `User ID` for specific users |
-| Targets | `Agent ID` → `<AGENT-CORP hex from Devices>` |
+| Subjects | `Role`, then your ops role from the picker; add a `User` row for someone outside the role. The pickers list the organization's members, roles, tunnel clients and devices by name |
+| Targets | `Agent`, then the device that reaches the database (`AGENT-CORP` on **Devices**) from the picker |
 | Allowlist | `Exact` `db.intranet.corp` ports `5432–5432`<br>(or `Wildcard` `*.intranet.corp` ports `5432–5432`<br>or `CIDR` `10.0.0.0/24` ports `1–65535`) |
 | Max concurrent flows | leave blank, or `64` for tight JDBC-pool bounds |
 | Max bytes / session | leave blank, or e.g. `10737418240` for 10 GiB cap |
 
-A `Role ID` subject matches whoever holds that role in this organization when they open a forward. Give someone the role and their next forward is allowed; take it back, or remove them from the organization, and their next forward is refused with `acl_denied`, on a tunnel that is already open too. A forward from `roomler` matches the roles of its owner, the person whose enrollment token enrolled it; a device that opens forwards itself (§6's `forward --daemon` and declared routes) acts for its owner, so it matches the roles its owner holds. Details: [tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635).
+A `Role` subject matches whoever holds that role in this organization when they open a forward. Give someone the role and their next forward is allowed; take it back, or remove them from the organization, and their next forward is refused with `acl_denied`, on a tunnel that is already open too. A forward from `roomler` matches the roles of its owner, the person whose enrollment token enrolled it; a device that opens forwards itself (§6's `forward --daemon` and declared routes) acts for its owner, so it matches the roles its owner holds. Details: [tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635).
 
-Click **Create policy**. The row appears in the table and goes live immediately — there's no policy cache in front of MongoDB; every `TcpForwardRequest` reads the live set.
+Click **Create policy**. The row appears in the table and goes live immediately — there's no policy cache in front of MongoDB; every `TcpForwardRequest` reads the live set. The table names every subject and target, and the pencil opens a policy with each picker on what it holds; an id the pickers do not list shows as its first six characters and `…`, and a save keeps it as it is.
 
 For a tenant-wide catch-all (everyone → every agent → anywhere) **for testing only**:
 

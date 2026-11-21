@@ -10,8 +10,9 @@
 //!
 //! - every route (list, get, create, update, delete) decides the bit first, so a
 //!   member without it gets one 403 `forbidden` whatever the id names or the
-//!   body says, and never `not_a_member`, the one 403 the web app leaves the org
-//!   on; someone outside the org is still told `not_a_member`;
+//!   body says, a body that does not parse included (#4187), and never
+//!   `not_a_member`, the one 403 the web app leaves the org on; someone outside
+//!   the org is still told `not_a_member`;
 //! - for a holder the policy resolves within the path org: another org's id, or
 //!   one that names nothing, is a 404;
 //! - the forward itself checks no permission bit. The policy is the grant: a
@@ -58,6 +59,137 @@ pub(crate) async fn call(
         status,
         serde_json::from_str(&text).unwrap_or(Value::String(text)),
     )
+}
+
+/// One request whose body is `body` as it stands, sent as `content_type`:
+/// the status, the answer's `Content-Type`, and the answer as text. For a
+/// body [`call`] cannot send because it is not JSON (#4187).
+pub(crate) async fn call_raw(
+    app: &TestApp,
+    method: &str,
+    path: &str,
+    token: &str,
+    content_type: &str,
+    body: &str,
+) -> (u16, String, String) {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let resp = app
+        .client
+        .request(method, app.url(path))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", content_type)
+        .body(body.to_owned())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let answered_as = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    (status, answered_as, resp.text().await.unwrap_or_default())
+}
+
+/// A body axum's `Json` extractor refuses (#4187): what it is, the
+/// `Content-Type` it is sent as, its bytes, and the status the extractor
+/// answers it with.
+pub(crate) struct Unparsed {
+    pub what: &'static str,
+    pub content_type: &'static str,
+    pub body: &'static str,
+    pub status: u16,
+}
+
+/// One body of each kind the extractor refuses: not JSON at all (400), JSON
+/// with a field its type refuses (422; `refused_field` is such a body for the
+/// route's own body type), and a body not sent as JSON (415). The 422 kind is
+/// valid JSON serde reads as a value of the wrong type: a number where an
+/// enum belongs is a syntax error to serde_json (`expected value`, 400), so
+/// an enum field takes an unknown variant.
+pub(crate) fn unparsed_bodies(refused_field: &'static str) -> [Unparsed; 3] {
+    [
+        Unparsed {
+            what: "not JSON",
+            content_type: "application/json",
+            body: "{",
+            status: 400,
+        },
+        Unparsed {
+            what: "a field its type refuses",
+            content_type: "application/json",
+            body: refused_field,
+            status: 422,
+        },
+        Unparsed {
+            what: "not sent as JSON",
+            content_type: "text/plain",
+            body: r#"{"name": "x"}"#,
+            status: 415,
+        },
+    ]
+}
+
+/// What axum's own `Json<T>` extractor answers a request carrying `body` as
+/// `content_type`: its status and its words. `T` is the route's own body
+/// type, so this is what the route answered while it took `Json<T>` as an
+/// extractor, and what a holder of the bit is still answered (#4187).
+pub(crate) async fn extractor_answer<T: serde::de::DeserializeOwned>(
+    content_type: &str,
+    body: &str,
+) -> (u16, String) {
+    use axum::extract::FromRequest;
+    let request = axum::http::Request::builder()
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from(body.to_owned()))
+        .unwrap();
+    match <axum::Json<T> as FromRequest<()>>::from_request(request, &()).await {
+        Ok(_) => panic!("{body:?} as {content_type} is a body the route reads"),
+        Err(refused) => (refused.status().as_u16(), refused.body_text()),
+    }
+}
+
+/// What is wrong with `(status, text)` as the refusal a caller is given
+/// before their body is read: `want` is `forbidden` (a member without the
+/// bit, and the message names it) or `not_a_member` (someone outside the
+/// org). `None` when it is that refusal.
+pub(crate) fn refusal_problem(want: &str, status: u16, text: &str) -> Option<String> {
+    let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if status != 403 || body["error"] != want {
+        return Some(format!("answered {status} {text:?}, want 403 `{want}`"));
+    }
+    let names_the_bit = body["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("MANAGE_AGENTS"));
+    if want == "forbidden" && !names_the_bit {
+        return Some(format!("the refusal does not name the permission: {text}"));
+    }
+    None
+}
+
+/// What is wrong with `(status, answered_as, text)` as what a holder of the
+/// bit is answered for `b`: the extractor's own `(status, words)` for the
+/// route's body type, `want`, in plain text, as before #4187. `None` when it
+/// is that answer.
+pub(crate) fn holder_answer_problem(
+    b: &Unparsed,
+    want: &(u16, String),
+    (status, answered_as, text): (u16, &str, &str),
+) -> Option<String> {
+    if want.0 != b.status {
+        return Some(format!(
+            "the extractor answers {} with {}, not {}: the body is not the kind it names",
+            b.what, want.0, b.status
+        ));
+    }
+    if (status, text) != (want.0, want.1.as_str()) || !answered_as.starts_with("text/plain") {
+        return Some(format!(
+            "answered {status} {answered_as:?} {text:?}, the extractor answers {} {:?} in plain text",
+            want.0, want.1
+        ));
+    }
+    None
 }
 
 fn policies(seeded: &SeededTenant) -> String {
@@ -261,10 +393,10 @@ async fn a_member_without_manage_agents_writes_no_tunnel_policy() {
     );
 }
 
-/// An id as a policy answers it: the `ObjectId` crosses the wire as
-/// `{"$oid": "<hex>"}`, though a request may name it as the bare hex.
+/// An id as a policy answers it: the 24-hex string `docs/api.md` promises
+/// (#3636). An answer that carries bson's `{"$oid": …}` reads as `None`.
 fn oid(v: &Value) -> Option<&str> {
-    v.as_str().or_else(|| v["$oid"].as_str())
+    v.as_str()
 }
 
 /// The org's tunnel ACL names who may reach which device and which internal
@@ -349,6 +481,104 @@ async fn the_bit_is_decided_before_the_policy_or_the_body_is_read() {
         assert_eq!(s, 403, "{method} {path}: {answer}");
         assert_eq!(answer["error"], "not_a_member", "{method} {path}: {answer}");
     }
+}
+
+/// #4187 — the bit is decided before the body is read at all, not only
+/// before it is validated. A member without it gets the one 403 `forbidden`
+/// for a body that does not even parse, and someone outside the org the one
+/// `not_a_member`. While create and update took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone, and the permission was never asked.
+#[tokio::test]
+async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tpperm-unparsed").await;
+    let other = app.seed_tenant("tpperm-unparsed-b").await;
+    let mine = owner_creates(&app, &seeded, grant_to(&seeded.admin.id, "mine")).await;
+    let callers = [
+        (
+            "a member without the bit",
+            &seeded.member.access_token,
+            "forbidden",
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            "not_a_member",
+        ),
+    ];
+    let routes = [("POST", policies(&seeded)), ("PUT", policy(&seeded, &mine))];
+
+    let mut wrong = Vec::new();
+    for (who, token, want) in callers {
+        for (method, path) in &routes {
+            for b in unparsed_bodies(r#"{"name": 7}"#) {
+                let (s, _, text) =
+                    call_raw(&app, method, path, token, b.content_type, b.body).await;
+                if let Some(why) = refusal_problem(want, s, &text) {
+                    wrong.push(format!(
+                        "{who}: {method} {} ({:?} as {}): {why}",
+                        b.what, b.body, b.content_type
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} answers came before the gate:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// #4187's control. A holder of the bit is answered a body that does not
+/// parse exactly as axum's `Json` extractor answers it, the status (400, 415
+/// or 422) and the plain-text words both: reading the body after the gate
+/// changes who is answered first, never what a holder is told. Nothing such a
+/// body names is written.
+#[tokio::test]
+async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use roomler_ai_mod_network::routes::tunnel::{
+        TunnelPolicyCreateRequest, TunnelPolicyUpdateRequest,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("tpperm-unparsed-holder").await;
+    let mine = owner_creates(&app, &seeded, grant_to(&seeded.admin.id, "mine")).await;
+    let owner = &seeded.admin.access_token;
+
+    let mut wrong = Vec::new();
+    for b in unparsed_bodies(r#"{"name": 7}"#) {
+        let routes = [
+            (
+                "POST",
+                policies(&seeded),
+                extractor_answer::<TunnelPolicyCreateRequest>(b.content_type, b.body).await,
+            ),
+            (
+                "PUT",
+                policy(&seeded, &mine),
+                extractor_answer::<TunnelPolicyUpdateRequest>(b.content_type, b.body).await,
+            ),
+        ];
+        for (method, path, want) in routes {
+            let (s, answered_as, text) =
+                call_raw(&app, method, &path, owner, b.content_type, b.body).await;
+            let answer = (s, answered_as.as_str(), text.as_str());
+            if let Some(why) = holder_answer_problem(&b, &want, answer) {
+                wrong.push(format!("{method} {}: {why}", b.what));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    // Nothing was written: the one policy, as the owner wrote it.
+    let (s, list) = call(&app, "GET", &policies(&seeded), owner, None).await;
+    assert_eq!(s, 200, "{list}");
+    assert_eq!(list["total"], 1, "{list}");
+    assert_eq!(list["items"][0]["id"], mine.as_str(), "{list}");
+    assert_eq!(list["items"][0]["name"], "mine", "{list}");
 }
 
 /// The people who manage the org's devices manage its tunnel policies: a
