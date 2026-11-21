@@ -151,30 +151,45 @@ pub async fn fetch_tail_chunked(
     let lines = lines.clamp(1, MAX_TAIL_LINES);
     let path = current_log_path()?;
     let (out, truncated) = read_tail_lines(&path, lines).await?;
+    Ok(reply_envelopes(
+        &path.to_string_lossy(),
+        out,
+        truncated,
+        request_id,
+    ))
+}
 
+/// The reply's envelopes for tail lines already read, in the order the
+/// caller sends them. Pure, so a test builds every frame from lines in
+/// memory (#4208).
+fn reply_envelopes(
+    path: &str,
+    out: Vec<String>,
+    truncated: bool,
+    request_id: Option<&str>,
+) -> Vec<serde_json::Value> {
     // Cheap heuristic: if total payload < MONO_THRESHOLD_BYTES,
     // send as a single rc.23-compatible envelope. Otherwise chunk.
     let approx_total: usize = out.iter().map(|s| s.len() + 4).sum();
     if approx_total < MONO_THRESHOLD_BYTES {
-        return Ok(vec![serde_json::json!({
+        return vec![serde_json::json!({
             "t": "rc:logs-fetch.reply",
             "ok": true,
-            "path": path.to_string_lossy(),
+            "path": path,
             "lines": out,
             "truncated": truncated,
-        })]);
+        })];
     }
 
     // Streamed path. Estimate ~150 chars/line + 4 bytes JSON
     // overhead per line. Aim for ~40 KB per chunk envelope so
     // each one + JSON overhead stays comfortably under 50 KB.
     let mut envelopes = Vec::new();
-    let path_str = path.to_string_lossy().to_string();
     envelopes.push(serde_json::json!({
         "t": "rc:logs-fetch.reply.start",
         "id": request_id,
         "ok": true,
-        "path": path_str,
+        "path": path,
         "total_lines": out.len(),
         "truncated": truncated,
     }));
@@ -205,7 +220,7 @@ pub async fn fetch_tail_chunked(
         "t": "rc:logs-fetch.reply.end",
         "id": request_id,
     }));
-    Ok(envelopes)
+    envelopes
 }
 
 /// Single-envelope cutoff. Payloads smaller than this go via the
@@ -391,6 +406,70 @@ mod tests {
         // emit a chunked stream that's smaller than what would have
         // fit in one envelope.
         assert!(MONO_THRESHOLD_BYTES <= CHUNK_BYTES);
+    }
+
+    // #4208 — every frame is measured as the bytes it is sent as: its JSON
+    // text, where a quote or a backslash takes two bytes and a control
+    // character six.
+
+    /// The largest message the peer takes (#4121): a webrtc-rs receiver
+    /// reads each one into a 65 535-byte buffer, and its SCTP stack refuses
+    /// to send one over 65 536 bytes. It is the peer's number, so it is
+    /// written out here, not read from the module's own budget.
+    const MESSAGE_LIMIT: usize = 65_535;
+
+    const PATH: &str = r"C:\ProgramData\roomler\logs\roomlerd.log.2026-11-21";
+
+    /// Each frame's size as `peer.rs` sends it: `serde_json::to_string`.
+    fn frame_sizes(envelopes: &[serde_json::Value]) -> Vec<usize> {
+        envelopes
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap().len())
+            .collect()
+    }
+
+    fn assert_every_frame_fits(envelopes: &[serde_json::Value]) {
+        let sizes = frame_sizes(envelopes);
+        assert!(
+            sizes.iter().all(|&n| n <= MESSAGE_LIMIT),
+            "a frame passes the {MESSAGE_LIMIT}-byte message limit; frame sizes: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunk_of_control_characters_fits_the_message_limit() {
+        // ESC starts every ANSI colour code, and JSON writes it as `\u001b`:
+        // six bytes for one. 64 lines of 1 KiB stream as chunks of 40 KiB of
+        // raw text.
+        let lines = vec!["\u{1b}".repeat(1024); 64];
+        assert_every_frame_fits(&reply_envelopes(PATH, lines, false, None));
+    }
+
+    #[test]
+    fn a_single_reply_of_control_characters_fits_the_message_limit() {
+        // 24 KiB of raw text is under the single reply's raw-text cut, and
+        // six times that once written as JSON.
+        let lines = vec!["\u{1b}".repeat(1024); 24];
+        assert_every_frame_fits(&reply_envelopes(PATH, lines, false, None));
+    }
+
+    #[test]
+    fn a_chunk_of_quotes_and_backslashes_fits_the_message_limit() {
+        // A Windows path or a quoted value: `"` and `\` take two bytes each.
+        let lines = vec!["\"\\".repeat(512); 64];
+        assert_every_frame_fits(&reply_envelopes(PATH, lines, false, Some("req-1")));
+    }
+
+    #[test]
+    fn one_line_of_40_kib_of_control_characters_fits_the_message_limit() {
+        let lines = vec!["\u{1b}".repeat(40 * 1024)];
+        assert_every_frame_fits(&reply_envelopes(PATH, lines, false, None));
+    }
+
+    #[test]
+    fn one_line_of_100_kib_fits_the_message_limit() {
+        let lines = vec!["x".repeat(100 * 1024)];
+        assert_every_frame_fits(&reply_envelopes(PATH, lines, false, None));
     }
 }
 // RETIRED-NAME-ANCHOR-END
