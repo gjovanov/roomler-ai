@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! #4121 — a folder listing's answer, as the frames that carry it.
 //!
 //! A webrtc-rs receiver reads each message into 65 535 bytes, and the SCTP
