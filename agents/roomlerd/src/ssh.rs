@@ -1013,6 +1013,12 @@ mod sshd {
         input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of this channel's terminal.
         terminal: Option<crate::pty::PtyHandle>,
+        /// Set when the channel was opened as a `direct-tcpip` forward, the
+        /// one kind besides `session` this server accepts, and alive while
+        /// its splice runs. RFC 4254 §6 gives pty-req, shell, exec, subsystem
+        /// and env to session channels only, so each of them on a forward is
+        /// answered with a failure and starts nothing.
+        forward: Option<std::sync::Weak<()>>,
     }
 
     /// Per-connection state.
@@ -1160,10 +1166,23 @@ mod sshd {
         ///
         /// russh has no `is_open`. The packet size it reports is 0 for a
         /// channel it does not hold, and this server's own (32 KiB, never 0)
-        /// for one it does.
+        /// for one it does. A forward stays while its splice runs as well:
+        /// russh holds an accepted channel only once its answer has gone
+        /// out, which can come after the next open, and the forward's mark
+        /// must be there for every request on it.
         fn channel_opens(&mut self, session: &Session) {
+            self.channels.retain(|id, state| {
+                session.max_packet_size(id) > 0
+                    || state.forward.as_ref().is_some_and(|f| f.strong_count() > 0)
+            });
+        }
+
+        /// A channel opened as a forward, not a session
+        /// ([`ChannelState::forward`]).
+        fn is_forward(&self, channel: ChannelId) -> bool {
             self.channels
-                .retain(|id, _| session.max_packet_size(id) > 0);
+                .get(&channel)
+                .is_some_and(|c| c.forward.is_some())
         }
 
         /// Serve the `sftp` subsystem — which is also how modern `scp` moves
@@ -1782,8 +1801,9 @@ mod sshd {
         ) -> Result<(), Self::Error> {
             use russh::ChannelOpenFailure;
 
-            // A forward keeps no state here (russh hands its bytes to its own
-            // stream, below), but it is a channel opening all the same.
+            // A channel opening all the same. A forward's bytes go to its own
+            // stream (below); its only state here is its mark, set once the
+            // forward is accepted.
             self.channel_opens(session);
             let host = host_to_connect.to_string();
             // A u32 on the wire; anything above 65535 is a malformed request,
@@ -1853,6 +1873,11 @@ mod sshd {
             };
             let _ = target.set_nodelay(true);
 
+            // Marked before the answer goes out, so the first request on it
+            // finds it: no session request runs on a forward.
+            let splicing = std::sync::Arc::new(());
+            self.channels.entry(channel.id()).or_default().forward =
+                Some(std::sync::Arc::downgrade(&splicing));
             reply.accept().await;
             info!(peer = %self.peer, ?caller, ?host, port, "ssh: forward opened");
             self.report(
@@ -1869,6 +1894,7 @@ mod sshd {
                 // hand-rolled select! gets wrong (see `sshcmd::pump`).
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
                 drop(permit);
+                drop(splicing);
             });
             Ok(())
         }
@@ -1881,6 +1907,10 @@ mod sshd {
         ) -> Result<(), Self::Error> {
             // #4168 — nothing runs on a refused channel (see `refused`).
             if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
                 return session.channel_failure(channel);
             }
             // The SSH exec payload is bytes, not necessarily UTF-8. Refuse
@@ -1984,6 +2014,10 @@ mod sshd {
             if self.refused.contains(&channel) {
                 return session.channel_failure(channel);
             }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
             if self
                 .channels
                 .get(&channel)
@@ -2018,6 +2052,10 @@ mod sshd {
         ) -> Result<(), Self::Error> {
             // #4168 — a refused channel gets no terminal (see `refused`).
             if self.refused.contains(&channel) {
+                return session.channel_failure(channel);
+            }
+            // Nor does a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
                 return session.channel_failure(channel);
             }
             // Recorded, not acted on: the terminal is allocated when the
@@ -2141,6 +2179,10 @@ mod sshd {
             if self.refused.contains(&channel) {
                 return session.channel_failure(channel);
             }
+            // Nor on a forward (see `ChannelState::forward`).
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
             if name == "sftp" {
                 // File operations happen inside `sftp-server`; this records
                 // only that a transfer channel was opened.
@@ -2153,6 +2195,23 @@ mod sshd {
                 name,
                 "only the `sftp` subsystem is implemented.",
             )
+        }
+
+        /// A variable for the session's environment. Nothing here takes one,
+        /// and a session channel's request is left unanswered, as russh's
+        /// default leaves it. On a forward it is answered with a failure
+        /// (see [`ChannelState::forward`]).
+        async fn env_request(
+            &mut self,
+            channel: ChannelId,
+            _variable_name: &str,
+            _variable_value: &str,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if self.is_forward(channel) {
+                return session.channel_failure(channel);
+            }
+            Ok(())
         }
     }
 
@@ -6809,6 +6868,83 @@ mod tests {
                 heard.out()
             );
             assert_eq!(heard.exit, Some(3), "the shell's own exit status");
+        }
+
+        /// The next answer to a request on `channel`, passing over what else
+        /// it carries; `None` once the channel has ended.
+        async fn next_answer(channel: &mut russh::Channel<russh::client::Msg>) -> Option<bool> {
+            let wait = async {
+                loop {
+                    match channel.wait().await? {
+                        russh::ChannelMsg::Success => return Some(true),
+                        russh::ChannelMsg::Failure => return Some(false),
+                        _ => {}
+                    }
+                }
+            };
+            tokio::time::timeout(WITHIN, wait)
+                .await
+                .expect("the server answers a request within the wait")
+        }
+
+        /// A channel opened as a forward takes no session request (RFC 4254
+        /// §6): a command, a terminal, a shell, a subsystem and a variable
+        /// asked for on it are each answered with a failure, nothing starts,
+        /// and the forward still carries its own bytes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_forward_takes_no_session_request() {
+            use tokio::io::AsyncReadExt;
+
+            let _slot = exec_slot().await;
+            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = destination.local_addr().unwrap().port();
+            let arrived = tokio::spawn(async move {
+                let (mut stream, _) = destination.accept().await.unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                got
+            });
+            let (key, line) = client_key(177);
+            let mut cfg = cfg_with_mode(vec![line], Some("daemon"));
+            cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
+            let session = connect(serve_one(&cfg).await, key).await;
+            let marks = tempfile::tempdir().expect("a temp dir");
+            let ran = marks.path().join("ran");
+            let touch = if cfg!(windows) {
+                format!("Set-Content -LiteralPath '{}' -Value ran", ran.display())
+            } else {
+                format!(": > '{}'", ran.display())
+            };
+
+            let mut forward = session
+                .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
+                .await
+                .expect("the allowlist names the destination");
+            forward.exec(true, touch.as_str()).await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a command");
+            forward
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a terminal");
+            forward.request_shell(true).await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a shell");
+            forward.request_subsystem(true, "sftp").await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a subsystem");
+            forward.set_env(true, "ROOMLER_TEST", "1").await.unwrap();
+            assert_eq!(next_answer(&mut forward).await, Some(false), "a variable");
+
+            forward.data(&b"forward-bytes"[..]).await.unwrap();
+            forward.eof().await.unwrap();
+            let arrived = tokio::time::timeout(WITHIN, arrived)
+                .await
+                .expect("the forward's EOF reached its destination")
+                .unwrap();
+            assert_eq!(
+                arrived, b"forward-bytes",
+                "the forward carries its own bytes"
+            );
+            assert!(!ran.exists(), "a command asked for on the forward ran");
         }
     }
 }

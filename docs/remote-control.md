@@ -3000,7 +3000,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    nothing or did not answer (#3967; `docs/desktop-companion.md` §10.8). An exec question reads it
    from `ensure_running_verdict` ([`:1181`](../agents/roomlerd/src/companion.rs#L1181)), an SSH
    question from `Companion::verdict` ([`:1458`](../agents/roomlerd/src/companion.rs#L1458)), in
-   `ask_here` ([`ssh.rs:2628`](../agents/roomlerd/src/ssh.rs#L2628)). `TrayVerdict::why_not_shown`
+   `ask_here` ([`ssh.rs:2687`](../agents/roomlerd/src/ssh.rs#L2687)). `TrayVerdict::why_not_shown`
    ([`companion.rs:1227`](../agents/roomlerd/src/companion.rs#L1227)) picks the closed road's
    sentence only where the tray was up with the question's marker to read, and FR-27's sentence
    otherwise. Until #4140 both causes were one `false` (`tray_up() && reaches_the_tray()`), so on a
