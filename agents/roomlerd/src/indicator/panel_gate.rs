@@ -906,7 +906,7 @@ mod tests {
     /// cannot reach the screen takes the road of one it does not take
     /// because another question is up. Each caller marks it for the person's
     /// app (`surface: if native { Native } else { Companion }`: remote
-    /// control at `signaling.rs:4373`, exec at `:5898`, SSH at `ssh.rs:2538`,
+    /// control at `signaling.rs:4373`, exec at `:5898`, SSH at `ssh.rs:2605`,
     /// a recording at `recording/remote.rs:1559`), and on a one-row Mac the
     /// app reads the root daemon's questions over the root daemon's relay
     /// (#3864). Here the root daemon's own LocalAPI answers the relay, so a
