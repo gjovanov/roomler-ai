@@ -68,7 +68,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
@@ -927,11 +927,16 @@ pub async fn request_session(
 ///
 /// `MANAGE_AGENTS`, not `SSH_DEVICE`: deciding a device may be SSHed into is a
 /// management act, distinct from being allowed to do it. Same split exec uses.
+///
+/// The bit is decided before the body is read or the device looked up
+/// (#4218): a caller without it gets the gate's answer whatever the body and
+/// the device id are. A holder is answered a body that does not parse as the
+/// `Json` extractor answered it (`ApiError::JsonBody`), whatever the id.
 pub async fn set_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    Json(body): Json<SshPolicyBody>,
+    body: Result<Json<SshPolicyBody>, JsonRejection>,
 ) -> Result<Json<SshPolicyBody>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -942,6 +947,7 @@ pub async fn set_policy(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
     let agent = load_agent(&state, tid, &agent_id).await?;
 
     let parse_ids = |v: &[String], what: &str| -> Result<Vec<ObjectId>, ApiError> {
@@ -1054,12 +1060,15 @@ pub async fn get_org_settings(
 /// `PUT /api/tenant/{tenant_id}/ssh-settings` — flip gate 1.
 ///
 /// `MANAGE_TENANT`, the highest bar of the three, because this one switch
-/// governs the whole org.
+/// governs the whole org. Decided before the body is read (#4218): a caller
+/// without it gets the gate's answer whatever the body is, and a holder is
+/// answered one that does not parse as the `Json` extractor answered it
+/// (`ApiError::JsonBody`).
 pub async fn set_org_settings(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<OrgSshSettings>,
+    body: Result<Json<OrgSshSettings>, JsonRejection>,
 ) -> Result<Json<OrgSshSettings>, ApiError> {
     let tid = tenant_of(&tenant_id).await?;
     require_permission(
@@ -1070,6 +1079,7 @@ pub async fn set_org_settings(
         "MANAGE_TENANT",
     )
     .await?;
+    let Json(body) = body?;
     let tenant = state
         .tenants
         .set_remote_ssh_enabled(tid, body.remote_ssh_enabled)
