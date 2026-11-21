@@ -375,7 +375,7 @@ Now no candidate is closed under the lock. Each local candidate closes on a task
 and one still closing after 5 s is named in a `closing candidate … is taking over 5s` warning.
 That line names the ICE role and the candidate, not the session, which the ICE agent never
 learns. A remote-desktop session logs each of its local candidates with the session
-(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:67`), and the candidate's
+(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:76`), and the candidate's
 address and port join the two lines.
 
 **The net under the rest:** `AgentPeer::close` and `TunnelPeer::close` run `pc.close()` through

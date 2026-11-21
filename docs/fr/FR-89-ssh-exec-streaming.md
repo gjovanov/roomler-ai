@@ -24,10 +24,13 @@ timeout; the command lives exactly as long as the channel does. Everything that 
 
 ## The field evidence
 
+Anchors are master `0019b4967` (#1819, 2026-10-07), the code this evidence was read on, before #1830
+changed it.
+
 | When | What |
 |---|---|
 | 2026-10-06 | `ssh <node> cat f > f` of a 4.4 MB MP4 arrived as 1.9 MB of U+FFFD noise — fixed by #1819 (bytes, not text). The same run then stopped at exactly 1 MiB: the engine's ceiling. On macOS the command died of `SIGPIPE` when the reader dropped the pipe and `ssh` exited 1 — with no word about why until #1819 added the stderr notice. |
-| since P5b | The managed corporate laptops run SSH sessions as `console_user`; `scp`/`sftp` **refuse** for Windows non-daemon accounts (`agents/roomlerd/src/ssh.rs:920-940`). So those hosts have had **no way to move a file over 1 MiB**: exec is capped, sftp refuses. |
+| since P5b | The managed corporate laptops run SSH sessions as `console_user`; `scp`/`sftp` **refuse** for Windows non-daemon accounts (`agents/roomlerd/src/ssh.rs:904-921`). So those hosts have had **no way to move a file over 1 MiB**: exec is capped, sftp refuses. |
 | since P2 | `docs/roomler-ssh.md:110-135` documents the cap as deliberate: *"output arrives when the command finishes rather than streaming, because the engine buffers to enforce its ceiling"*. A command that prompts waits on a question the caller cannot see; `tail -f` returns nothing for five minutes and then the last 1 MiB. |
 
 ## The mechanism, in the code (`origin/rec-demo-ssh-bytes-mac-banner`, #1819, the branch this builds on)
