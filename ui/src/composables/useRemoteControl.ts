@@ -94,6 +94,7 @@ import {
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import { createResumeRecordUploader } from './rcResumeRecord'
 import { createHoldPaintGap, createSessionHold, holdWindowFor, type RcHoldPaintGap, type RcHoldSummary } from './rcSessionHold'
+import { createDirListing, type DirEntry } from './remoteDirListing'
 import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from '@/workers/rc-paint-gap'
 import type { RcReloadState, RcReloadSurface, RcResumeArgs } from '@/utils/staleBuildPolicy'
 import {
@@ -10625,26 +10626,8 @@ export function useRemoteControl(
         return
       }
       const id = typeof msg.id === 'string' ? msg.id : ''
-      // Directory listing replies are demuxed by req_id, not id.
-      if (msg.t === 'files:dir-list') {
-        const reqId = typeof msg.req_id === 'string' ? msg.req_id : ''
-        const pending = settleDirRequest(reqId)
-        if (pending) {
-          pending.resolve({
-            path: String(msg.path ?? ''),
-            parent: typeof msg.parent === 'string' ? msg.parent : null,
-            entries: Array.isArray(msg.entries) ? msg.entries : [],
-          })
-        }
-        return
-      } else if (msg.t === 'files:dir-error') {
-        const reqId = typeof msg.req_id === 'string' ? msg.req_id : ''
-        const pending = settleDirRequest(reqId)
-        if (pending) {
-          pending.reject(new Error(String(msg.message ?? 'agent dir error')))
-        }
-        return
-      }
+      // Directory listing replies are demuxed by req_id, not id (`remoteDirListing.ts`).
+      if (dirListing.onFilesMessage(msg)) return
       if (msg.t === 'files:complete') {
         const entry = settleEntry(id)
         if (entry?.kind === 'upload') {
@@ -14099,68 +14082,9 @@ export function useRemoteControl(
     else cancelDownload(id)
   }
 
-  // --------------------------------------------------------------
-  // Directory listing (Phase 3 of file-DC v2).
-  //
-  // Request/response keyed by req_id, like the clipboard:read flow.
-  // 5 s timeout rejects stale requests so the drawer doesn't spin
-  // forever if the host is unreachable or the agent lacks the new
-  // capability (old 0.2.x agents will simply not reply).
-
-  type DirEntry = {
-    name: string
-    is_dir: boolean
-    size: number | null
-    mtime_unix: number | null
-  }
-  type DirListing = {
-    path: string
-    parent: string | null
-    entries: DirEntry[]
-  }
-  const pendingDirRequests = new Map<
-    string,
-    { resolve: (l: DirListing) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
-  >()
-  function settleDirRequest(reqId: string): {
-    resolve: (l: DirListing) => void
-    reject: (e: Error) => void
-  } | null {
-    const p = pendingDirRequests.get(reqId)
-    if (!p) return null
-    clearTimeout(p.timer)
-    pendingDirRequests.delete(reqId)
-    return { resolve: p.resolve, reject: p.reject }
-  }
-
-  /** List a directory on the host. `path` is the absolute host path;
-   *  the empty string / "~" enumerate the roots (logical drives on
-   *  Windows; a single "/" on Unix) — see `isRootsRequest`. "/" itself
-   *  is a directory and lists the Unix root (#2870). Resolves with the
-   *  listing or rejects on timeout / dir-error. */
-  function listDir(path: string): Promise<DirListing> {
-    const ch = channels.files
-    if (!ch || ch.readyState !== 'open') {
-      return Promise.reject(new Error('files channel not open'))
-    }
-    const reqId = `ls-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-    return new Promise<DirListing>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (pendingDirRequests.has(reqId)) {
-          pendingDirRequests.delete(reqId)
-          reject(new Error('list_dir timed out (5 s) Ã¢ÂÂ host may not support remote browse'))
-        }
-      }, 5_000)
-      pendingDirRequests.set(reqId, { resolve, reject, timer })
-      try {
-        ch.send(JSON.stringify({ t: 'files:dir', req_id: reqId, path }))
-      } catch (e) {
-        clearTimeout(timer)
-        pendingDirRequests.delete(reqId)
-        reject(e instanceof Error ? e : new Error(String(e)))
-      }
-    })
-  }
+  // Directory listing: its request, wait and answers (#4121, `remoteDirListing.ts`).
+  const dirListing = createDirListing({ channels })
+  const listDir = dirListing.listDir
 
   /** Upload multiple files sequentially. Each file is queued through
    *  `uploadOne`; the queue continues on individual failures so a
