@@ -5740,6 +5740,252 @@ mod tests {
         assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
     }
 
+    /// #4122 — T7's stop: a power loss inside casey's keep again, after their
+    /// agent was booted out (`steps` alone, no undo). Returns their files as
+    /// their agent's save left them; the calls and lines so far are forgotten.
+    async fn stopped_inside_the_keep_again(mac: &mut Fake) -> FakeHome {
+        let stopped = casey_saves_as_it_stops(mac, |_| {});
+        mac.fail = Some(("write_root", 6));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(e.contains("keeping casey's files again"), "{e}");
+        assert!(!mac.loaded.contains(&501), "their agent was booted out");
+        let home = mac.homes[&501].clone();
+        assert_eq!(home.config, Some((stopped, 0o600)), "the agent's save");
+        assert!(home.plist.is_some());
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+        home
+    }
+
+    /// #4122 — a stop inside casey's first keep, at its `record.json`, before
+    /// any bootout: their folder is unfinished and their agent still loaded.
+    async fn stopped_before_the_bootout(mac: &mut Fake) -> FakeHome {
+        // Root's copy, `root.json`, casey's config and plist: `record.json`
+        // is the fifth write.
+        mac.fail = Some(("write_root", 5));
+        let read = read_now(mac).await;
+        let plan = plan(&read.root, &read.people).unwrap();
+        let mut done = Done::default();
+        let e = format!(
+            "{:#}",
+            steps(mac, &read, &plan, &mut done).await.unwrap_err()
+        );
+        assert!(
+            e.contains("keeping casey's files") && !e.contains("again"),
+            "{e}"
+        );
+        assert!(calls_of(mac, &["bootout"]).is_empty(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501), "never booted out");
+        mac.fail = None;
+        mac.calls.clear();
+        mac.said.clear();
+        mac.homes[&501].clone()
+    }
+
+    /// #4122 T1: a stop inside the keep again, after the bootout, then
+    /// `--revert`. The folder goes, casey's files stay as their agent's save
+    /// left them, and their LaunchAgent is bootstrapped and kickstarted once
+    /// the restart has answered, as a person's given back is.
+    #[tokio::test]
+    async fn a_revert_after_a_stop_inside_the_keep_again_starts_the_booted_out_agent() {
+        let mut mac = Fake::new(one_row_daemon);
+        let root_before = mac.root_bytes();
+        let home = stopped_inside_the_keep_again(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+        assert_eq!(mac.root_bytes(), root_before);
+        assert_eq!(mac.homes[&501], home, "nothing of theirs was written");
+        assert_eq!(
+            calls_of(
+                &mac,
+                &[
+                    "remove records",
+                    "write Config",
+                    "kickstart",
+                    "status: daemon 1",
+                    "worker",
+                    "bootstrap",
+                    "agent"
+                ]
+            ),
+            [
+                "remove records 501",
+                "write Config",
+                "kickstart",
+                "status: daemon 1",
+                "worker 501: gone",
+                "bootstrap 501",
+                "agent kickstart 501"
+            ]
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4122 T2: a keep that stopped before the bootout, then `--revert`. The
+    /// folder goes, and the job, still loaded, is not bootstrapped again.
+    #[tokio::test]
+    async fn a_revert_after_a_stop_before_the_bootout_leaves_the_loaded_agent_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        let root_before = mac.root_bytes();
+        let home = stopped_before_the_bootout(&mut mac).await;
+        revert_now(&mut mac).await.unwrap();
+        assert!(
+            mac.said()
+                .contains("removed: /etc/roomler/one-row/501, a keep that never finished"),
+            "{}",
+            mac.said()
+        );
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+        assert_eq!(mac.root_bytes(), root_before);
+        assert_eq!(mac.homes[&501], home);
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        assert!(mac.loaded.contains(&501));
+    }
+
+    /// #4122 T3: the plan names that bootstrap for T1's stop and not for
+    /// T2's, in the words a person given back gets, and the two plans'
+    /// digests differ, so a yes to one is no yes to the other.
+    #[tokio::test]
+    async fn the_revert_plan_names_the_agent_a_keep_again_booted_out() {
+        let mut t1 = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut t1).await;
+        let r1 = revert_plan(&mut t1).await.unwrap().unwrap();
+        let mut t2 = Fake::new(one_row_daemon);
+        stopped_before_the_bootout(&mut t2).await;
+        let r2 = revert_plan(&mut t2).await.unwrap().unwrap();
+        assert_eq!(r1.unfinished, [501]);
+        assert_eq!(r2.unfinished, [501]);
+        let words = |r: &Revert| describe_revert(r).join("\n");
+        let named = "/etc/roomler/one-row/501 is removed: a keep of casey's files that never \
+                     finished, and their LaunchAgent is bootstrapped after the restart, once the \
+                     one-row screen worker that runs as them has stopped";
+        assert!(words(&r1).lines().any(|l| l == named), "{}", words(&r1));
+        let plain = "/etc/roomler/one-row/501 is removed: a keep that never finished";
+        assert!(words(&r2).lines().any(|l| l == plain), "{}", words(&r2));
+        assert!(!words(&r2).contains("LaunchAgent"), "{}", words(&r2));
+        let again = revert_plan(&mut t1).await.unwrap().unwrap();
+        assert_eq!(revert_digest(&r1), revert_digest(&again));
+        assert_ne!(revert_digest(&r1), revert_digest(&r2));
+    }
+
+    /// #4122 — after T1's stop, the cells where the rule names nobody and
+    /// the revert loads no agent: supervision on in root's file before the
+    /// conversion, another person or nobody at the console, and no plist in
+    /// casey's home.
+    #[tokio::test]
+    async fn a_revert_after_a_keep_again_loads_no_agent_the_rule_does_not_name() {
+        type Edit = fn(&mut Fake);
+        let cells: [(&str, Edit, Edit); 4] = [
+            (
+                "supervision on",
+                |mac| {
+                    let mut on = mac.root_cfg();
+                    on.macos_supervise_gui_worker = true;
+                    mac.root.insert(RootFile::Config, toml_of(&on));
+                },
+                |_| {},
+            ),
+            (
+                "another person at the console",
+                |_| {},
+                |mac| {
+                    mac.accounts.insert(502, account(502, "ana"));
+                    mac.console = Some(502);
+                },
+            ),
+            ("nobody at the console", |_| {}, |mac| mac.console = None),
+            (
+                "no plist in their home",
+                |_| {},
+                |mac| {
+                    mac.homes.get_mut(&501).unwrap().plist = None;
+                },
+            ),
+        ];
+        for (cell, before, after) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            before(&mut mac);
+            stopped_inside_the_keep_again(&mut mac).await;
+            after(&mut mac);
+            let r = revert_plan(&mut mac).await.unwrap().unwrap();
+            assert_eq!(r.unfinished, [501], "{cell}");
+            let words = describe_revert(&r).join("\n");
+            assert!(!words.contains("LaunchAgent"), "{cell}: {words}");
+            revert(&mut mac, &r).await.unwrap();
+            assert!(
+                calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+                "{cell}: {:?}",
+                mac.calls
+            );
+            assert!(!mac.loaded.contains(&501), "{cell}");
+        }
+    }
+
+    /// #4122 — a restart that does not answer: the agent T1's stop booted out
+    /// is not bootstrapped, as a person's given back is not, and the revert
+    /// says so in the same line.
+    #[tokio::test]
+    async fn a_revert_whose_restart_never_answers_names_the_agent_a_keep_again_booted_out() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        mac.stuck = true;
+        assert!(revert_now(&mut mac).await.is_err());
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        let line = "gui/501/com.roomler.agent: not bootstrapped, as the daemon did not restart \
+                    onto the files put back; launchd loads it at the next login";
+        assert!(mac.said().contains(line), "{}", mac.said());
+    }
+
+    /// #4122 — a bootstrap that fails is said in the line a person given back
+    /// gets, and the revert goes on.
+    #[tokio::test]
+    async fn a_failed_bootstrap_of_the_agent_a_keep_again_booted_out_is_said() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        mac.fail = Some(("bootstrap", 1));
+        revert_now(&mut mac).await.unwrap();
+        let line = "gui/501/com.roomler.agent did not start (bootstrap #1 failed (the test said \
+                    so)); launchd loads it at the next login";
+        assert!(mac.said().contains(line), "{}", mac.said());
+        assert!(calls_of(&mac, &["agent"]).is_empty(), "{:?}", mac.calls);
+        assert_eq!(mac.root.keys().collect::<Vec<_>>(), [&RootFile::Config]);
+    }
+
+    /// #4122 — the job is loaded between the plan and the bootstrap (casey
+    /// logged in again meanwhile): read again right before, it is left alone,
+    /// and the revert says so in one line.
+    #[tokio::test]
+    async fn an_agent_loaded_after_the_revert_plan_is_left_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        stopped_inside_the_keep_again(&mut mac).await;
+        let r = revert_plan(&mut mac).await.unwrap().unwrap();
+        mac.loaded.insert(501);
+        revert(&mut mac, &r).await.unwrap();
+        assert!(
+            calls_of(&mac, &["worker", "bootstrap", "agent"]).is_empty(),
+            "{:?}",
+            mac.calls
+        );
+        let line = "gui/501/com.roomler.agent: loaded since the plan was said, so it is left alone";
+        assert!(mac.said().contains(line), "{}", mac.said());
+        assert!(mac.loaded.contains(&501));
+    }
+
     /// #4097 — the second `read` lets through only a save of the agent's own
     /// run state: the same owner, Read's mode or the 0600 a save writes, and
     /// no other key; every other entry as Read found it.
