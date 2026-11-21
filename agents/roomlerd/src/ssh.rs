@@ -1036,13 +1036,14 @@ mod sshd {
         /// Who asks the person before anything runs: this process, or
         /// (FR-105) the worker that carried this connection.
         asker: Asker,
-        /// #4168 — channels [`refuse`](Self::refuse) answered whose close
-        /// russh still holds behind the reason: the client's window had no
-        /// room for all of it, or a key exchange was running. Until that
-        /// close goes out, russh still delivers what the client sends on the
-        /// channel; here a request on it is answered with a failure, and its
-        /// data, EOF and window changes are dropped. A channel whose close
-        /// went out at once is not kept: russh drops what arrives after it.
+        /// #4168 — refused channels ([`answer_refusal`](Self::answer_refusal))
+        /// whose close russh still holds behind the reason: the client's
+        /// window had no room for all of it, or a key exchange was running.
+        /// Until that close goes out, russh still delivers what the client
+        /// sends on the channel; here a request on it is answered with a
+        /// failure, and its data, EOF and window changes are dropped. A
+        /// channel whose close went out at once is not kept: russh drops what
+        /// arrives after it.
         refused: std::collections::HashSet<ChannelId>,
     }
 
@@ -1484,13 +1485,8 @@ mod sshd {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(peer = %self.peer, %e, "ssh: refusing a shell — unusable account mode");
-                    let _ = session.extended_data(
-                        channel,
-                        1,
-                        format!("roomler-ssh: {e}\r\n").into_bytes(),
-                    );
-                    session.channel_failure(channel)?;
-                    return Ok(());
+                    // #4168 — answered as `refuse` answers, so `ssh` shows it.
+                    return self.answer_refusal(session, channel, &e.to_string());
                 }
             };
 
@@ -2249,9 +2245,23 @@ mod sshd {
     const REFUSED_EXIT_STATUS: u32 = 1;
 
     impl Handler {
-        /// Tell the client no, in a way a human reads on their terminal.
+        /// Tell the client no, in a way a human reads on their terminal: log
+        /// the refusal, then [`answer_refusal`](Self::answer_refusal).
+        fn refuse(
+            &mut self,
+            session: &mut Session,
+            channel: ChannelId,
+            what: &str,
+            why: &str,
+        ) -> Result<(), russh::Error> {
+            warn!(peer = %self.peer, request = ?what, "ssh: refused an unsupported request");
+            self.answer_refusal(session, channel, why)
+        }
+
+        /// The answer to a request this channel will not serve, for a caller
+        /// that has logged its own line.
         ///
-        /// The request is answered with success, then the reason on stderr,
+        /// The request is answered with success, then `why` on stderr,
         /// [`REFUSED_EXIT_STATUS`], EOF and the close: how a program that
         /// could not start ends (#4168). A failure would be the plain answer,
         /// but OpenSSH's client takes a failed shell or subsystem request as
@@ -2264,14 +2274,12 @@ mod sshd {
         /// has closed. Where russh holds the close back behind the reason,
         /// `refused` keeps the channel until it goes, and the handlers turn
         /// away what arrives on it.
-        fn refuse(
+        fn answer_refusal(
             &mut self,
             session: &mut Session,
             channel: ChannelId,
-            what: &str,
             why: &str,
         ) -> Result<(), russh::Error> {
-            warn!(peer = %self.peer, request = ?what, "ssh: refused an unsupported request");
             session.channel_success(channel)?;
             let _ =
                 session.extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes());
@@ -5324,13 +5332,65 @@ mod tests {
 
     /// The identity gate applies to interactive sessions exactly as it does to
     /// one-shot commands: an unset key-list account mode means the client gets
-    /// a channel failure and a reason, not a root shell. Both platforms —
-    /// the refusal happens before any terminal is allocated.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// a reason, not a root shell. Both platforms — the refusal happens before
+    /// any terminal is allocated.
+    ///
+    /// #4168 — the shell is answered as `refuse` answers: success, the
+    /// reason, exit-status 1, EOF and close, so `ssh` prints the reason and
+    /// exits 1. Its log line is still the account-mode one, and no terminal
+    /// or shell starts. One thread, so the log is the server's.
+    #[tokio::test]
     async fn an_interactive_session_without_an_account_mode_gets_no_shell() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
         let (key, line) = client_key(42);
         let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
         let session = connect(addr, key).await;
+
+        let channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let reads = read_in_order(channel).await;
+        // `pty_request` only records the terminal; it is allocated when the
+        // shell starts, so this success allocates nothing.
+        assert_eq!(
+            reads.first(),
+            Some(&Read::Success),
+            "the terminal's answer, in {reads:?}"
+        );
+        assert_refused_in_order(&reads[1..], "ssh_account_mode");
+        let log = log.text();
+        assert!(
+            log.contains("ssh: refusing a shell — unusable account mode"),
+            "no account-mode refusal in:\n{log}"
+        );
+        for started in [
+            "ssh: interactive session started",
+            "ssh: could not start the terminal session",
+        ] {
+            assert!(
+                !log.contains(started),
+                "a refused shell got as far as {started:?}:\n{log}"
+            );
+        }
+    }
+
+    /// #4168 — a shell refused for its account mode holds its channel as a
+    /// `refuse` does. With a client window of 0 holding the close back, a
+    /// second shell, a command and `sftp` asked for on that channel are each
+    /// answered with a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_refused_for_its_account_mode_takes_nothing_more() {
+        let (key, line) = client_key(161);
+        let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
+        let no_window = russh::client::Config {
+            window_size: 0,
+            ..Default::default()
+        };
+        let session = connect_with(addr, key, no_window).await;
 
         let mut channel = session.channel_open_session().await.unwrap();
         channel
@@ -5338,28 +5398,31 @@ mod tests {
             .await
             .unwrap();
         channel.request_shell(true).await.unwrap();
-
-        let mut reason = Vec::new();
-        let mut out = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    reason.extend_from_slice(data)
-                }
-                russh::ChannelMsg::Failure => break,
-                _ => {}
-            }
+        for what in ["the terminal's answer", "the shell's answer"] {
+            assert_eq!(
+                next_read_soon(&mut channel, what).await,
+                Some(Read::Success)
+            );
         }
-        assert!(
-            out.is_empty(),
-            "no shell output may reach a session with no account mode, got {:?}",
-            String::from_utf8_lossy(&out)
+        assert_eq!(
+            next_read_soon(&mut channel, "the shell's exit status").await,
+            Some(Read::Exit(1))
         );
-        assert!(
-            String::from_utf8_lossy(&reason).contains("ssh_account_mode"),
-            "the refusal must name the key to set, got {:?}",
-            String::from_utf8_lossy(&reason)
+
+        channel.request_shell(true).await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "a second shell's answer").await,
+            Some(Read::Failure)
+        );
+        channel.exec(true, "whoami").await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "a command's answer").await,
+            Some(Read::Failure)
+        );
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        assert_eq!(
+            next_read_soon(&mut channel, "sftp's answer").await,
+            Some(Read::Failure)
         );
     }
 
