@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3880`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:710`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1830`, `delegate.rs:1874`; the worker side is `delegate_worker.rs:512`, wired at `app.rs:4892`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1830`, `delegate.rs:1874`; the worker side is `delegate_worker.rs:512`, wired at `app.rs:4927`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -3125,7 +3125,7 @@ account owns is refused (`:605`). An answer from the tray, from `roomlerd consen
 or from a native panel reaches the broker in process (`record_decision`, `:925`),
 which writes it there. `roomlerd consent` writes the file itself only when it
 cannot reach the device service, and then only a console-run agent in the same
-profile sees it (`consent_cmd`, [`app.rs:2509`](../agents/roomlerd/src/app.rs#L2509)).
+profile sees it (`consent_cmd`, [`app.rs:2544`](../agents/roomlerd/src/app.rs#L2544)).
 
 | The daemon's own folder | the file channel | questions and answers | the log, once at start |
 |---|---|---|---|
@@ -7515,7 +7515,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4317`](../agents/roomlerd/src/app.rs#L4317),
+([`agents/roomlerd/src/app.rs:4352`](../agents/roomlerd/src/app.rs#L4352),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -7674,6 +7674,16 @@ schtasks /Delete /TN RoomlerAgent /F
 After this, the freshly-created task has a normal ACL and future
 upgrades can self-manage. From 0.1.54 onwards new installs never
 hit this — only pre-existing locked tasks.
+
+> **Later finding (FR-150, #3507, 2026-11-20):** the cause was not a
+> Windows 11 quirk, and new installs did hit it. A task registered
+> from an elevated token is owned by Administrators and only readable
+> by its account, so every registration at medium, each self-update's
+> among them, is refused. Since FR-150 each task definition names a
+> descriptor of its account's own, an elevated `service install`
+> repairs a task left like that, and a refused registration leaves a
+> start task that brings the daemon back
+> ([`installation.md`](./installation.md#what-the-per-user-scheduled-task-runs-3292)).
 
 ### 19.8 Phase 7 / 8 / Effort 2 cycle — shipped 0.1.55 → 0.1.58
 

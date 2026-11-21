@@ -5,7 +5,7 @@
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
 
-**Anchors:** master `73f341a94` (2026-11-20), read in the tree.
+**Anchors:** master `73f341a94` (2026-11-20), read in the tree. The Evidence keeps them: it is the code before P1a. From Design on, the anchors into the code P1a moves follow it, since master was merged into #4135 (2026-11-20).
 
 ## Goal
 
@@ -131,8 +131,8 @@ offline, cannot happen on master for the same reason.
 
 ### P1a: the task names its own security descriptor
 
-`render_task_xml` (`service.rs:1285-1349`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
-Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:713-715`), the account
+`render_task_xml` (`service.rs:1543-1607`) writes a `<SecurityDescriptor>` into `<RegistrationInfo>`, after `<URI>`.
+Its SDDL is built from the SID of the account the process runs as (`own_account`, `service.rs:751-753`), the account
 the task runs as:
 
 ```text
@@ -159,7 +159,7 @@ P0 read what Task Scheduler does with it (the field log has each cell):
 | elevated, P1a, a new task | the account (C3) | full | yes |
 | elevated, P1a, over a task an elevated master registered | Administrators: the replace keeps it (C5) | read | not until the repair below |
 
-**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1310-1316`). At
+**Why full access is safe.** The task runs as the account itself, at `LeastPrivilege` (`service.rs:1568-1574`). At
 medium, Task Scheduler refuses a document at `HighestAvailable` (C4), and one whose principal is SYSTEM or another
 account, as a new task and over a task the account has full access to (C4b). So full access gives the account nothing
 beyond what every medium registration gives it today.
@@ -170,18 +170,18 @@ shell) replaces the task, and the task keeps its descriptor (C5). So when the ac
 cannot replace it, `register` deletes the task and registers it again, and the descriptor applies (C5c).
 `IRegisteredTask::SetSecurityDescriptor` repairs it in place too (C5b), but needs Task Scheduler's COM bindings, which
 the agent does not carry; the delete and the create go through the `Library` seam `register` already uses
-(`user_task.rs:91-113`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
+(`user_task.rs:115-158`). A daemon running under the deleted task keeps running (C5d), and a one-shot of the new task
 finds the instance lock held (`instance_lock.rs`) and exits. `register` then deletes the account's legacy `Roomler`
-too (`user_task.rs:159-174`), which no medium process can.
+too (`user_task.rs:246-257`), which no medium process can.
 
 **A self-update over a task its account cannot replace still comes back.** The update's `RegisterAutostart` runs the
 new package's launcher (`main.wxs:403-409`), so the first hop onto P1a already runs P1a's `service install`. At medium
 its replace is refused, but a medium process may still run that task (C2) and register a task of its own. So
 `service install` then registers `Roomler start-<SID>`, a task of the account's own:
 
-- the same three one-shots as the task's own (`service.rs:1266`), each with an end boundary an hour after the
+- the same three one-shots as the task's own (`service.rs:1439`), each with an end boundary an hour after the
   registration, so a sleep inside that hour keeps them (`StartWhenAvailable`);
-- one action, the launcher with `service start` (`service.rs:844-864`): a `/Run` of the account's task, so the daemon
+- one action, the launcher with `service start` (`service.rs:992-1012`): a `/Run` of the account's task, so the daemon
   runs under its own task, and its `IgnoreNew` drops the later starts (C6b);
 - `DeleteExpiredTaskAfter`, so it deletes itself once it has expired (C6b, C6c).
 
@@ -193,7 +193,9 @@ exists); the step names the repair only where the account cannot replace its tas
 **The daemon names such a task at its start.** A per-user daemon reads its own task's descriptor from the task's file
 under `%SystemRoot%\System32\Tasks` (the scheduler's copy in the registry is not readable at medium, C6) and checks it
 with a medium copy of its own token (`win_token::restricted_medium_copy`, `AccessCheck`). When its account cannot
-replace the task, it logs one WARN at start with the repair, and `service status` says so. Nothing is sent to the
+replace the task, it logs one WARN at start with the repair, and `service status` says so in a `Note:` line after its
+answer (`print_status`, `service.rs:2845-2851`). The companion's probe answers a plain `service status` with the same
+lines, and reads its answer by the `Auto-start:` prefix, so the note changes nothing there. Nothing is sent to the
 server (D5). `register` asks the same check.
 
 **Kill switch:** `ROOMLERD_TASK_SD=0` in the environment of `service install`. It registers master's task: no
@@ -202,14 +204,14 @@ descriptor in the XML, no repair and no `Roomler start-<SID>`.
 ### P1a: the per-user MSI's steps write their record
 
 #3230 gave the per-Machine MSI's steps a start line and an end line (`crates/agent-core/src/logging.rs:602-660`, begun
-at `app.rs:1608-1622`, ended at `app.rs:1405-1409`), because Windows Installer throws a custom action's stdout and
+at `app.rs:1633-1650`, ended at `app.rs:1405-1409`), because Windows Installer throws a custom action's stdout and
 stderr away. The per-user steps keep the profile's log (`app.rs:1430-1436`) and write no record. So a refused
 registration leaves nothing but the MSI log's `returned actual error code 1`.
 
 P1a gives the per-user steps the same record, in the person's own log, the dated file the daemon writes:
 `service install`, `service uninstall`, `service start` (what `Roomler start-<SID>` runs), `service stop` with and
 without `--for-upgrade`, and `cleanup-legacy-install --target-flavour perUser`. They get it through a predicate of
-their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1560-1571`) are unchanged. A person who
+their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1585-1596`) are unchanged. A person who
 runs the same verb by hand gets the same two lines.
 
 ### P1b: the watcher owns the per-user relaunch
@@ -236,9 +238,9 @@ flowchart TD
     W4 -- no --> R5["daemon: not running, with each rung's answer"]
 ```
 
-- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:877-881`, FR-97 P4d). The
+- **Up** is the daemon's stop event held for this config (`user_stop_event_held`, `service.rs:1025-1029`, FR-97 P4d). The
   daemon creates it at start, in the person's session, where the watcher runs too.
-- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1266`), with room for
+- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart` (`service.rs:1439`), with room for
   a slow guest.
 - **The first update onto P1b runs the old release's watcher.** `post_install.rs:703-705` says the same of #3292. So
   P1b protects the hops after it, and P1a protects the first one: through the task's own one-shots where the account
@@ -269,7 +271,7 @@ loop. The launcher's choices become one more row of `Install`'s table (`service.
 
 - **The crash ladder.** A launcher restart counts as a crash, because it is one. Three inside ten minutes on a version
   not yet promoted trip `should_rollback` (`crates/agent-core/src/config.rs:2705`), and on Windows the daemon raises
-  `rollback_failed` and stays up, with no download (`app.rs:4440-4451`).
+  `rollback_failed` and stays up, with no download (`app.rs:4475-4486`).
 - **An install in flight.** The launcher must not touch the data tree (`.claude/rules/installers.md`), so the daemon
   decides. A `run --supervisor task` that starts while the update-attempt marker is fresh (`updater.rs:230-256`; the
   MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex is held exits with a new
