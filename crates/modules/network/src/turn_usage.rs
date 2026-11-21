@@ -19,14 +19,33 @@
 //!
 //! Kill switch: `relay_allowance.turn_attribution`, off by default, because
 //! coturn must publish here first.
+//!
+//! #3952 — the subscription probes its own connection
+//! (`roomler_core::ws::sub_probe`), so a connection that went deaf is found
+//! and subscribed again. The subscriber's loop waits on nothing but its
+//! stream: each total goes to one recorder task over a bounded queue, so a
+//! slow database never delays a probe into a false verdict.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures::StreamExt;
 use roomler_core::turn_bytes::{self, Outcome, Source};
+use roomler_core::ws::redis_conn::LineBound;
+use roomler_core::ws::sub_probe::{Lifetime, ProbeSettings, Prober, Subscriber};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::NetworkState;
+
+/// Totals waiting for the recorder. Past this (a database slower than
+/// coturn for that long) a total goes unrecorded, with a warn line:
+/// under-reporting is the cheaper error, and the subscriber never waits.
+const RECORDER_QUEUE: usize = 4096;
+
+/// Totals not recorded because the recorder was behind.
+static RECORDER_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// One line a second for them.
+static RECORDER_DROP_LINES: LineBound = LineBound::per_second();
 
 pub use roomler_ai_remote_control::turn_stats::{CHANNELS, Reported, parse};
 pub use roomler_core::turn_bytes::TURN_UNATTRIBUTED_BYTES;
@@ -51,29 +70,53 @@ async fn record(state: &NetworkState, r: Reported) {
     }
 }
 
-/// One subscription's life: connect, subscribe, record until the stream ends.
-async fn run(state: &NetworkState, url: &str) -> Result<(), redis::RedisError> {
+/// Hand one leg to the recorder without waiting. When the recorder is
+/// behind, the leg goes unrecorded (under-reports) and the subscriber's loop
+/// is never held up.
+fn hand_over(recorder: &mpsc::Sender<Reported>, r: Reported) {
+    if recorder.try_send(r).is_ok() {
+        return;
+    }
+    let dropped = RECORDER_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(suppressed) = RECORDER_DROP_LINES.admit() {
+        warn!(
+            dropped,
+            suppressed,
+            "turn usage: a total was not recorded: the recorder is behind (under-reports)"
+        );
+    }
+}
+
+/// One subscription's life: connect, subscribe, hand each total to the
+/// recorder until the stream ends or the probe finds the connection deaf.
+/// A probe is matched before the kill switch and the parser see it.
+async fn run(
+    state: &NetworkState,
+    url: &str,
+    prober: &mut Prober,
+    recorder: &mpsc::Sender<Reported>,
+) -> Result<Lifetime, redis::RedisError> {
     let client = redis::Client::open(url)?;
-    let mut pubsub = client.get_async_pubsub().await?;
-    for channel in CHANNELS {
-        pubsub.psubscribe(channel).await?;
-    }
-    info!("turn usage: subscribed to coturn's statistics");
-    let mut stream = pubsub.on_message();
-    while let Some(msg) = stream.next().await {
-        if !state.settings.stats.enabled {
-            continue;
-        }
-        let channel = msg.get_channel_name().to_string();
-        let Ok(payload) = msg.get_payload::<String>() else {
-            continue;
-        };
-        match parse(&channel, &payload) {
-            Some(r) => record(state, r).await,
-            None => debug!(%channel, "turn usage: not a coturn total"),
-        }
-    }
-    Ok(())
+    let subscription = prober.subscribe(&client, &[], &CHANNELS).await?;
+    info!(
+        probe_ms = prober.interval_ms(),
+        "turn usage: subscribed to coturn's statistics"
+    );
+    Ok(prober
+        .run(subscription, |msg| {
+            if !state.settings.stats.enabled {
+                return;
+            }
+            let channel = msg.get_channel_name();
+            let Ok(payload) = msg.get_payload::<String>() else {
+                return;
+            };
+            match parse(channel, &payload) {
+                Some(r) => hand_over(recorder, r),
+                None => debug!(%channel, "turn usage: not a coturn total"),
+            }
+        })
+        .await)
 }
 
 /// Subscribe on every pod, reconnecting with a backoff; nothing at all with
@@ -84,20 +127,36 @@ pub fn spawn(state: NetworkState) {
         return;
     }
     let url = state.settings.redis.url.clone();
-    if url.trim().is_empty() || state.redis_pubsub.is_none() {
+    let publisher = state.redis_pubsub.as_ref().map(|redis| redis.connection());
+    let Some(publisher) = publisher.filter(|_| !url.trim().is_empty()) else {
         // No once-only claim without the cluster's Redis: every pod would
         // record every allocation. Under-reporting is the cheaper error.
         warn!("turn usage: no Redis pub/sub on this pod; TURN bytes are not attributed");
         return;
+    };
+    let probe = ProbeSettings::from_settings(&state.settings.redis);
+    // One recorder for the subscriber's whole life, so a new subscription
+    // loses nothing queued. Booking stays once per leg across pods.
+    let (recorder, mut queue) = mpsc::channel::<Reported>(RECORDER_QUEUE);
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(r) = queue.recv().await {
+                record(&state, r).await;
+            }
+        });
     }
     tokio::spawn(async move {
+        let mut prober = Prober::new(Subscriber::Turn, publisher, probe);
         let mut backoff = 1u64;
         loop {
-            match run(&state, &url).await {
-                Ok(()) => {
+            match run(&state, &url, &mut prober, &recorder).await {
+                Ok(Lifetime::Ended) => {
                     backoff = 1;
                     warn!("turn usage: the subscription ended; reconnecting");
                 }
+                // The verdict wrote its own line.
+                Ok(Lifetime::Deaf) => backoff = 1,
                 Err(e) => warn!(%e, "turn usage: subscribe failed; retrying in {backoff}s"),
             }
             tokio::time::sleep(Duration::from_secs(backoff)).await;

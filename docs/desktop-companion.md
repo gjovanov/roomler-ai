@@ -113,18 +113,18 @@ sequenceDiagram
 
 1. **The page never paints an error as data.** `cmd_tunnels_view` answers
    `{available, reason, routes, flows}` from one connection; `tunnels.js` keeps the last good
-   data on a failure and says why (`noteUnavailable`, `src/front/tunnels.js:98`), drops a
+   data on a failure and says why (`noteUnavailable`, `src/front/tunnels.js:105`), drops a
    response older than the newest it applied, and patches rows in place keyed by route id /
-   flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
+   flow id (`routeRows`, `:55`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
 2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4575`)
    binds the first instance (retrying while another process holds the name), then runs a
-   pool of accept tasks (`accept_pipe`, `:4484`), each owning one listening instance and
+   pool of accept tasks (`accept_pipe`, `:4689`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
-   (`DEFAULT_PIPE_POOL`, `:4223`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
+   (`DEFAULT_PIPE_POOL`, `:4428`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
    switch** and reproduces the old single-instance behaviour.
-3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:5467`) retries a
+3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:5762`) retries a
    busy pipe at 5, 10, 20, 40, 80, 160 ms (≤ 315 ms in total); any other error (the daemon
    is not running) returns at once.
 
@@ -132,7 +132,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`explain_route_edit_error`, `src/commands.rs:3188`), never as a blank page.
+service predates route editing"* (`explain_route_edit_error`, `src/commands.rs:3203`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -162,12 +162,12 @@ Permission denied …", where they mean **Offline** and "The device service is n
 (`src/front/overview.js:391-397`, `:591-598`).
 
 Every connect of the companion whose error is read now goes through `connect_service`
-(`src/commands.rs:3061`), the proof §10.9.2 made for the prompt, the banner and the tray's red:
+(`src/commands.rs:3076`), the proof §10.9.2 made for the prompt, the banner and the tray's red:
 a connect that failed while this person's own endpoint is gone is `NotFound`, no service.
 
 | | Through `connect_service` | Plain: nothing reads the error |
 |---|---|---|
-| the pages' reads | the device view (`cmd_device_view`, `src/commands.rs:505`), the encoders card (`cmd_encoder_caps`, `:1532`), the files card (`cmd_files_dir_view`, `:1668`), and the Routes, Recordings and Devices pages (`cmd_tunnels_view`, `cmd_recordings_view`, `cmd_devices`, `cmd_mesh`) | `daemon_node_status` (the files' word stands: not enrolled, or not known, §3.2), `cmd_tail_log` (the log file, read directly), the start folder of `cmd_pick_files_dir` (the picker opens without one) |
+| the pages' reads | the device view (`cmd_device_view`, `src/commands.rs:519`), the encoders card (`cmd_encoder_caps`, `:1547`), the files card (`cmd_files_dir_view`, `:1683`), and the Routes, Recordings and Devices pages (`cmd_tunnels_view`, `cmd_recordings_view`, `cmd_devices`, `cmd_mesh`) | `daemon_node_status` (the files' word stands: not enrolled, or not known, §3.2), `cmd_tail_log` (the log file, read directly), the start folder of `cmd_pick_files_dir` (the picker opens without one) |
 | actions | Ping, the files card's buttons, Restart, the route and recording verbs, the Edit view's folder (`editor.rs`), the banner's Disconnect, the stale-config cleanup, and the tray's keep-busy and recording toggles. An error shown as text keeps its words, and a stopped service now reads as not running in it | `cmd_config_entries` and `cmd_config_set` (the root half on a Mac, else the config file), `cmd_set_device_name` (the config file, written directly) |
 | the tray and a start | the recording watch (since #3998) | the keep-busy item's watch (the item reads off), and `first_run.rs`'s two asks at a start (the tour shows as always; the login-start switch counts as on) |
 
@@ -283,7 +283,7 @@ flowchart TD
 ## 5. Settings, grouped
 
 The config surface (`crates/agent-core/src/config_surface.rs`) is one table of
-`KeyMeta { key, kind, group, tier, live, description }` (`:268`) — adding a key without
+`KeyMeta { key, kind, group, tier, live, description }` (`:280`) — adding a key without
 saying which group and tier it belongs to, and whether the daemon applies it live, does not
 compile.
 
@@ -296,7 +296,7 @@ compile.
   change at once — `exec_enabled` and `remote_config_enabled` (the LocalAPI `ConfigSet`
   re-seeds them through `adopt_local`). Every other key is read once at startup.
 - **"Modified"** compares a value with the key's built-in default, computed from a config
-  that contains nothing but the identity fields (`builtin_default`, `:1481`).
+  that contains nothing but the identity fields (`builtin_default`, `:1980`).
 - **Which daemon it edits (#2871).** `cmd_config_entries` / `cmd_config_set` go to the
   daemon `localapi::connect()` resolves — on a Mac running both halves (FR-43), the
   per-user GUI worker, whose `config.toml` is its own: FR-43 keeps the worker enrolled
@@ -318,21 +318,21 @@ compile.
 
   `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:861`) builds the rows —
   machine-side keys from the root half's listing, in the worker's order — and
-  `cmd_config_set` (`:1039`) sends a machine-side key to the root half
-  (`root_half_config_set_beside`, `:964`), whose answer is final: the worker's copy of
+  `cmd_config_set` (`:1054`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:979`), whose answer is final: the worker's copy of
   such a key is a file the Mac's device never reads, so it is not written. The worker's
   own copies of machine keys stay reachable with `roomler config …` in a terminal, and
   the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
   the root half forwards its own value of a few session knobs to the worker as a floor
   (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
   halves' configs, so the worker's copy — the one this edits — can only tighten the
-  root's. The banner (`cmd_config_target`, `:1398`; `two_halves_note`, `:1218`) names both
+  root's. The banner (`cmd_config_target`, `:1413`; `two_halves_note`, `:1233`) names both
   halves' files and says which rows change here. It is shown only when the reached daemon
   says it runs unprivileged AND a root daemon of another identity answers `Status` over the
-  person socket (`two_halves`, `:1201`) — one daemon behind both sockets, a root daemon's
+  person socket (`two_halves`, `:1216`) — one daemon behind both sockets, a root daemon's
   legacy per-user bind, is not two halves. A root half older than design A still refuses
   the listing; the rows are then the worker's alone and the banner carries the #2879 words
-  (`two_halves_legacy_note`, `:1239`): the root half's switches are
+  (`two_halves_legacy_note`, `:1254`): the root half's switches are
   `sudo roomler config set <key> <value>`.
 - **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
   daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
@@ -345,19 +345,19 @@ compile.
   refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
   falls back to the file (`refused_by_root_daemon`,
   `agents/roomler-desktop/src/commands.rs:1368`). Since design A the same socket serves the
-  listing, marked: `cmd_config_target` (`:1398`) reports `root_only` (`root_daemon_only`,
-  `:1264`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  listing, marked: `cmd_config_target` (`:1413`) reports `root_only` (`root_daemon_only`,
+  `:1279`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
   are editable, and the rest — the device-owned gates, the network, SSH, the updater, the
   recordings folder — show the root daemon's value with "administrator's" and
   `sudo roomler config set <key> <value>`
-  (`settings.js`, the `read_only` row; `root_only_note`, `:1291`). From a daemon older than
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1306`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
-  (`root_only_legacy_note`, `:1313`).
+  (`root_only_legacy_note`, `:1328`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:3944`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3959`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -708,7 +708,7 @@ struck through, and how long the probe took.
   and only from a root daemon that this unprivileged app reached, which one `Status` on the
   same connection confirms (`refused_by_root_daemon`,
   `agents/roomler-desktop/src/commands.rs:1368`, the test the config verbs use, #2891; the
-  decision is `encoder_caps_view`, `:1569`). No answer at all (a failed write or read, a closed
+  decision is `encoder_caps_view`, `:1584`). No answer at all (a failed write or read, a closed
   connection) stays **Error**, with its stage. Windows serves the verb to every interactive
   user (the pipe's `IU` ace), and a Mac's companion asks its per-user half, which answers from
   its own probe.
@@ -783,7 +783,7 @@ flowchart TD
 | Who writes | `FsAs` (`:282-824`), chosen once in `begin` (`FsAs::for_write`, `:502`, off the async worker since #3711, §9.4) and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:1525-1528`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
 | How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
 | Their folder | `person_downloads` / `xdg_download_dir` (`:1117-1135`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
-| The staging | `stage_held` (`files.rs:5115`) → `staging::stage` (`agents/roomlerd/src/files/staging.rs:746`): `mkdirat` for its folders, `openat` with `O_CREAT`, `O_EXCL` and `O_NOFOLLOW` for its files | an upload's own folder (`<id>`) is never reused, and a link or a folder planted where it goes refuses the begin; the stager's own `.roomler-partial` is reused once it is made 0700, and a folder that keeps no modes stages privately (§9.5) |
+| The staging | `stage_held` (`files.rs:5116`) → `staging::stage` (`agents/roomlerd/src/files/staging.rs:746`): `mkdirat` for its folders, `openat` with `O_CREAT`, `O_EXCL` and `O_NOFOLLOW` for its files | an upload's own folder (`<id>`) is never reused, and a link or a folder planted where it goes refuses the begin; the stager's own `.roomler-partial` is reused once it is made 0700, and a folder that keeps no modes stages privately (§9.5) |
 
 ⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
 would be followed with root's rights, and the staging folder's `meta.json`, which a resume reads
@@ -823,7 +823,7 @@ flowchart TD
 |---|---|---|
 | Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:282-334`), chosen by `fs_as_for` (`:420`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
 | How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
-| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:832`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:8399`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:10956`): never the machine-global folder |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:832`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:8400`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:10957`): never the machine-global folder |
 | The staging | `stager_for` (`:2410`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
 | The end | `place_across` (`:2964`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
 | A resume | `resume_incoming_as` (`:3217`), `PartialMeta::person_sid` (`:1570`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
@@ -861,9 +861,9 @@ flowchart TD
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
 | Who reads | `FsAs::for_read` (`:480`) and `FsAs::for_write` (`:502`) through `reads::session_or_daemon_within` (`agents/roomlerd/src/files/reads.rs:390`), one rule with `FsAs::now` (`session_or_daemon`, `agents/roomlerd/src/files.rs:541`): `fs_as_for` (`:420`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`). #3682 — an async caller looks the person up on a thread of its own, through one lookup in flight (`PERSON`, `agents/roomlerd/src/files/reads.rs:379`), and waits for it 1.5 s (`PERSON_LOOKUP_WAIT`, `:374`), as a Linux read asks seat0 (§9.4). `WTSQueryUserToken` calls the session manager and the Downloads known folder reads the person's registry, and the async worker the lookup ran on served the whole files channel. No answer in that time is `FsAs::CannotTell`, never the service. `FsAs::now`, asked only on blocking threads (the status refresh, a `ConfigSet`), still asks on its own |
-| A download | `begin_outgoing_as` (`:3577`), `open_to_send` (`:3695`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
-| A folder | `begin_outgoing_zip_as` (`:4304`), `walk_and_zip` (`:4386`), `zip_folder_entries` (`:4576`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
-| A listing | `list_dir_as` (`:4063`), `list_dir_in` (`:4070`), `list_canonical` (`:4095`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of reaching its task (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s unless an upload's end, which the channel's read loop runs inline, delays its start (#4082). #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
+| A download | `begin_outgoing_as` (`files.rs:3577`), `open_to_send` (`:3695`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
+| A folder | `begin_outgoing_zip_as` (`files.rs:4304`), `walk_and_zip` (`:4386`), `zip_folder_entries` (`:4576`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
+| A listing | `list_dir_as` (`files.rs:4063`), `list_dir_in` (`:4070`), `list_canonical` (`:4095`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of reaching its task (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s unless an upload's end, which the channel's read loop runs inline, delays its start (#4082). #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
 | The Drives view | `reads::roots` (`agents/roomlerd/src/files/reads.rs:271`), `enumerate_roots` (`agents/roomlerd/src/files.rs:4220`) | #3682 — built inside a step as them, within the listing's bound, on a lane of its own (`Listings::drives`). Windows keeps drive letters per sign-in, so a letter the person mapped lives in their sign-in's device map, not the service's, and the service's own list left it out. `GetLogicalDrives` asks no drive anything, so the step touches no share, and a folder stuck on a share that stopped answering never holds it up |
 
 - **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
@@ -1246,15 +1246,15 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`, `agents/roomlerd/src/files/staging.rs`) | Why |
 |---|---|---|
-| The daemon's own default folder | `default_download_dir` (`files.rs:5021`), `own_home_and_downloads` (`:5334`), `account_home` (`:5190`), `may_receive` (`staging.rs:201`), `same_folder` (`:380`) | the XDG Downloads folder when it exists and passes, else `~/Downloads`, made 0700 when a file arrives (looking, for the status card, the sweep or a resume, makes nothing), else a refusal the viewer shows. An XDG folder that fails and is `~/Downloads` itself (the same device and inode, on the same mount, so a link to it counts) is that refusal at once, in the fallback's words, with no line saying `~/Downloads` is being tried: the fallback could only refuse it again for the same reason (#3734). Each is opened following its links, and the folder it leads to must be the writer's own and never the temp dir; for root, one no other account may write; for a per-user daemon, one not every account may (Ubuntu's private-group umask makes `~/Downloads` 0775), unless its file system keeps no owners or modes, where it need only be one the daemon can write into. Root's home is the one its account names (`getpwuid`), never `HOME`, and must pass root's rule itself; its `user-dirs.dirs` counts only when it is root's own plain file that nobody else may write, and only for a folder inside that home. It was the temp dir, which for root on a server is `/tmp`. The person at seat0 keeps their own folder (§9.1) |
-| The folder held | `stage_held` (`files.rs:5115`), called from `begin_as` (`:2603`) with what `drop_folder_for` (`:4878`) resolved | begin opens the target folder once and holds it; whenever begin resolved the daemon's default folder, that very handle is checked again by the rule above |
+| The daemon's own default folder | `default_download_dir` (`files.rs:5022`), `own_home_and_downloads` (`:5335`), `account_home` (`:5191`), `may_receive` (`staging.rs:201`), `same_folder` (`:380`) | the XDG Downloads folder when it exists and passes, else `~/Downloads`, made 0700 when a file arrives (looking, for the status card, the sweep or a resume, makes nothing), else a refusal the viewer shows. An XDG folder that fails and is `~/Downloads` itself (the same device and inode, on the same mount, so a link to it counts) is that refusal at once, in the fallback's words, with no line saying `~/Downloads` is being tried: the fallback could only refuse it again for the same reason (#3734). Each is opened following its links, and the folder it leads to must be the writer's own and never the temp dir; for root, one no other account may write; for a per-user daemon, one not every account may (Ubuntu's private-group umask makes `~/Downloads` 0775), unless its file system keeps no owners or modes, where it need only be one the daemon can write into. Root's home is the one its account names (`getpwuid`), never `HOME`, and must pass root's rule itself; its `user-dirs.dirs` counts only when it is root's own plain file that nobody else may write, and only for a folder inside that home. It was the temp dir, which for root on a server is `/tmp`. The person at seat0 keeps their own folder (§9.1) |
+| The folder held | `stage_held` (`files.rs:5116`), called from `begin_as` (`:2603`) with what `drop_folder_for` (`:4879`) resolved | begin opens the target folder once and holds it; whenever begin resolved the daemon's default folder, that very handle is checked again by the rule above |
 | The staging, made | `open_staging` (`staging.rs:541`), `stage` (`:746`) | every folder and file with an explicit mode, whatever the umask: a per-user daemon on Ubuntu runs under 0002, and its staging still passes its own checks. A `.roomler-partial` that is a link, or another account's, is refused with a reason and left as it is; the writer's own, open to others, is made 0700 again through its handle. Another upload's end removes an empty `.roomler-partial`, and one gone between its open and the making of `<id>` in it is made and opened again. `data` is 0600 for the daemon alone (§9.4), 0644 otherwise, and is the received file itself after the rename |
-| A folder that keeps no modes | `keeps_modes` (`staging.rs:296`), `writable` (`:244`), `stage_privately` (`:789`), `private_staging_root` (`files.rs:5156`), from `stage_held` (`:5145`) | whether a folder made in the target 0700, under a random name, reads back its writer's own (after one `fchmod`, made only on a folder that reads as the writer's), or exactly like the target (the same owner and permission bits: no modes kept). Anything else is no answer, and the target's owner and modes still count. A definite answer is kept per mount, file system type and writer, and nothing the probe makes stays: the startup sweep removes an empty probe folder a crash left (`sweep_probes`). Where it does not, the upload stages in its writer's own private folder, on a file system that keeps modes: `~/.local/state/roomler/staging` in the person's home, or a per-user daemon's (under `$XDG_STATE_HOME` when that is set), `/var/lib/roomler/staging` for root, in a `/var/lib/roomler` opened without following a link that is root's and no other account may write (made 0755 when absent), else that staging is refused; made 0700 and checked as `.roomler-partial` is. There a folder's owner and modes say nothing (a VirtualBox shared folder reads `root:vboxsf`, a share mounted with a fixed owner that owner), so a per-user daemon's default folder needs only to be one it can write into, as the kernel answers for it (`writable`), and receives by copy. A root writer still places only in a folder no other account may write |
+| A folder that keeps no modes | `keeps_modes` (`staging.rs:296`), `writable` (`:244`), `stage_privately` (`:789`), `private_staging_root` (`files.rs:5157`), from `stage_held` (`:5140`) | whether a folder made in the target 0700, under a random name, reads back its writer's own (after one `fchmod`, made only on a folder that reads as the writer's), or exactly like the target (the same owner and permission bits: no modes kept). Anything else is no answer, and the target's owner and modes still count. A definite answer is kept per mount, file system type and writer, and nothing the probe makes stays: the startup sweep removes an empty probe folder a crash left (`sweep_probes`). Where it does not, the upload stages in its writer's own private folder, on a file system that keeps modes: `~/.local/state/roomler/staging` in the person's home, or a per-user daemon's (under `$XDG_STATE_HOME` when that is set), `/var/lib/roomler/staging` for root, in a `/var/lib/roomler` opened without following a link that is root's and no other account may write (made 0755 when absent), else that staging is refused; made 0700 and checked as `.roomler-partial` is. There a folder's owner and modes say nothing (a VirtualBox shared folder reads `root:vboxsf`, a share mounted with a fixed owner that owner), so a per-user daemon's default folder needs only to be one it can write into, as the kernel answers for it (`writable`), and receives by copy. A root writer still places only in a folder no other account may write |
 | The staging, trusted | `reopen` (`staging.rs:819`), `read_notes` (`:875`), `reopen_data` (`:895`), `FilesHandler::resume_held` (`files.rs:3426`) | a resume walks the partial again from its notes' path: the folder it sits beside (links followed: that folder's own rule) or the writer's private folder, then each step below it without following a link (and without waiting on a FIFO), and trusts it only when its folder, `meta.json` and `data` are its stager's own and nobody else may write them. Anything else is "no partial state for id …", and the viewer starts that upload over. `data` is opened once and truncated on that handle |
-| A root writer's resume and end | `root_may_place_in` (`files.rs:5235`), `FsAs::writes_as_root` (`:678`), from `resume_held` (`:3483`, `:3498`) and `end` (`:2845`) | the folder a partial's notes record must be one the rule gives it now, under a bare name: the default folder, its handle passing the rule; for root at the screen or the switch off, also the configured folder or a folder a controller may choose now. A partial beside a folder must record that very folder; one in root's private folder places only in a folder no other account may write. The person's partial, and a per-user daemon's, are placed where their notes say, as them (§9.1) |
+| A root writer's resume and end | `root_may_place_in` (`files.rs:5236`), `FsAs::writes_as_root` (`:678`), from `resume_held` (`:3483`, `:3498`) and `end` (`:2845`) | the folder a partial's notes record must be one the rule gives it now, under a bare name: the default folder, its handle passing the rule; for root at the screen or the switch off, also the configured folder or a folder a controller may choose now. A partial beside a folder must record that very folder; one in root's private folder places only in a folder no other account may write. The person's partial, and a per-user daemon's, are placed where their notes say, as them (§9.1) |
 | The end | `place` (`staging.rs:937`), `copy_across` (`:1009`), `discard` (`:1040`), from `end` (`files.rs:2858`) | renamed from the held `<id>` into the held folder, under a name nothing there has yet, a link counted; a folder upload's subfolders are made and opened one by one from it, and for a root writer a link among them refuses. From a private folder, or across file systems, copied through handles into a new file (`O_CREAT`, `O_EXCL`, `O_NOFOLLOW`) with the staged file's mode. A folder moved aside mid-upload, with another put in its place, changes nothing |
 | Cancel and the sweep | `cancel_incoming` (`files.rs:3092`), `sweep_orphans` (`:1775`), `sweep_orphans_dir_here` (`:1920`), `sweep` (`staging.rs:1140`) | a cancel removes through the handles the transfer holds, or walks again with the same checks and removes only what passes. The startup sweep walks each drop folder's `.roomler-partial` and the writer's private folder. It registers only a partial that passes in full; removes one whose notes are missing or corrupt, and, once over a day old, the stager's own that fails the checks; and leaves a link, or anything another account owns, as it is |
-| A resume's lookup | `drop_folder_without_creating` (`files.rs:5097`), from `resume_incoming_as` (`:3258`) | with nothing registered, a resume looks in the writer's private folder, then beside the folder a file would land in now, and makes nothing while it looks |
+| A resume's lookup | `drop_folder_without_creating` (`files.rs:5098`), from `resume_incoming_as` (`:3258`) | with nothing registered, a resume looks in the writer's private folder, then beside the folder a file would land in now, and makes nothing while it looks |
 
 What a user notices:
 
@@ -1985,7 +1985,7 @@ flowchart TD
 |---|---|---|
 | the decision | `decide_startup`, `agents/roomler-desktop/src/first_run.rs:75` | an explicit `--view=` first, then a start for a prompt stays in the tray, the tour done or not. It never leaves either: `Exit` stays for `--autostart` with the login-start switch off |
 | the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), a reopen on macOS (`decide_reopen`, `first_run.rs:264`; §10.7), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called by `show_status`, `tray.rs:544`, from `:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
-| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, 300 ms for all of it, and a list that fails reads as an empty one, which holds no tour back (the consent watch keeps its last answer instead, §10.9.2): a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac. Since #3864 the screen worker's answer holds the root daemon's questions too (§10.8), so on a one-row Mac the root's question keeps the tour back. Since #3967 so does the per-user agent's on a two-row Mac (§10.8.1) |
+| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `first_run.rs:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, 300 ms for all of it, and a list that fails reads as an empty one, which holds no tour back (the consent watch keeps its last answer instead, §10.9.2): a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac. Since #3864 the screen worker's answer holds the root daemon's questions too (§10.8), so on a one-row Mac the root's question keeps the tour back. Since #3967 so does the per-user agent's on a two-row Mac (§10.8.1) |
 
 - **Old and new together.** An older companion started with `--for-prompt` ignores it, as it
   ignores any argument it does not know, and shows the tour as before. A newer companion that
@@ -2114,7 +2114,7 @@ sequenceDiagram
   ([`person_socket.rs:435`](../agents/roomlerd/src/person_socket.rs#L435)). It drops every connection whose kernel
   uid is neither that person's nor root's (`person_peer_ok`,
   [`crates/localapi/src/lib.rs:5108`](../crates/localapi/src/lib.rs#L5108), applied at `:5290`). It is 0600 and the
-  person's, in a folder only root writes (`:5149`). An answer is taken only after the seat is asked again (#3845).
+  person's, in a folder only root writes (`:5420`). An answer is taken only after the seat is asked again (#3845).
   The worker's own socket is 0600 in the person's private temporary folder. Nothing is written anywhere: the root's
   folder stays in root's home.
 - **The floor is every host's.** With the road closed, the app is not the question's surface: no
@@ -3089,7 +3089,7 @@ person's own `roomler` commands then fell through to the root-only socket:
 came 26.3 s into the pause. A look now has three answers (`person_socket::Look`,
 `agents/roomlerd/src/person_socket.rs:145`, from `look_of`, `:475`):
 
-| The look found | When | The poll (`step`, `:151`) | A change or a consent answer over the socket |
+| The look found | When | The poll (`step`, `:161`) | A change or a consent answer over the socket |
 |---|---|---|---|
 | a person | seat0's active session is a person's (`companion::seat0_uid`) | starts, keeps or moves the socket to them | taken from that person, refused in words from anyone else |
 | nobody | the seat itself says so: an empty seat, the login screen, a session that is not a person's, a host with no logind (`companion::is_nobody_at_the_screen`, the rule a received file follows, §9.4); root at the seat; no person logged in at all | closes the socket, as before: `person socket: nobody at the seat now; closing` | refused in words |
@@ -3108,13 +3108,13 @@ flowchart TD
 ```
 
 - **Failing closed stays.** Nothing changes through the socket while it is not known. Every
-  `ConfigSet` and every `ConsentDecide` asks the seat again first (`at_the_seat_now`, `:450`,
+  `ConfigSet` and every `ConsentDecide` asks the seat again first (`at_the_seat_now`, `:499`,
   1.5 s at most), and a look that cannot tell refuses with the try-again text, however it came
-  about (`seat_for`, `:504`). A failed lookup used to read "the seat changed". The person now
+  about (`seat_for`, `:568`). A failed lookup used to read "the seat changed". The person now
   gets the try-again text instead of a closed socket, and the banner, its Disconnect and keep
   busy keep working.
 - **The poll's look** goes through the lookup in flight the checks already share,
-  `PERSON_AT_SEAT0` on a thread named `seat0-person` (`:463`, `look_at_the_seat`, `:470`), and
+  `PERSON_AT_SEAT0` on a thread named `seat0-person` (`:527`, `look_at_the_seat`, `:534`), and
   waits 5 s at most (`LOOK_WAIT`, `:93`, the time between looks). It used to wait on a blocking
   thread for as long as `loginctl` took. A hung logind now holds that one thread, however
   often the poll and the checks ask. The wait is longer than a check's 1.5 s on purpose. A
@@ -3138,7 +3138,7 @@ flowchart TD
   for is rare.
 
 The tests: `person_socket::following_the_seat_tests` drives the real poll, a real person socket
-and the real check, with who is at the seat stood in (`:1032`, Linux, as the runner in CI's
+and the real check, with who is at the seat stood in (`person_socket.rs:1229`, Linux, as the runner in CI's
 agent lane). `person_socket::tests::a_look_that_cannot_tell_keeps_what_is_served` and
 `only_the_seats_own_answer_is_nobody` hold the pure rules, and `crates/localapi`'s
 `a_consent_answer_over_the_person_socket_comes_from_whoever_is_at_the_seat_now` holds the
@@ -3186,9 +3186,9 @@ flowchart TD
 | Piece | Where | What |
 |---|---|---|
 | the decision | `peer_may_decide_for_the_screen`, `crates/localapi/src/lib.rs:2679` | pure: the peer, the console session, the daemon's own session and uid. SYSTEM is named by its SID, because `ClientPeer::is_root` reads a uid, which a pipe client never has |
-| the daemon's own session | `own_session_id`, `:2658` | `ProcessIdToSessionId` of this process; `None` off Windows |
-| the dispatch | `:4028` (consent), `:4033` (Disconnect) | after the person socket's seat check (`:4009`), on every scope but the person socket's, so a new scope starts refused |
-| the refusals | `not_the_screens_person`, `:3785` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
+| the daemon's own session | `own_session_id`, `:2696` | `ProcessIdToSessionId` of this process; `None` off Windows |
+| the dispatch | `:4212` (consent), `:4221` (Disconnect) | after the person socket's seat check (`:4195`), on every scope but the person socket's, so a new scope starts refused |
+| the refusals | `not_the_screens_person`, `:3925` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
 
 Who calls them, and how each is read:
 
@@ -3218,9 +3218,9 @@ is. Each gate's other conditions are as they were:
 | Gate | Where | Taken on Windows | Also, as before |
 |---|---|---|---|
 | the external-access password's set and clear (`is_console_user`) | `peer_is_console_user`, `crates/localapi/src/lib.rs:2577`; the dispatch `:4226` | a peer in the screen's session | Unix: the daemon's own uid, or root |
-| a console person's key | `peer_may_set_console_key`, `:2582`; the dispatch `:3981` | the same | the person socket: its person, and the seat asked again (§12.3) |
-| the recording verbs: start, stop, delete | `peer_may_record`, `:2516`; the dispatch `:4081` | the same | the person socket: its person |
-| keep busy on | `peer_may_start_keep_busy`, `:2483`; the dispatch `:4077` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
+| a console person's key | `peer_may_set_console_key`, `:2620`; the dispatch `:4167` | the same | the person socket: its person, and the seat asked again (§12.3) |
+| the recording verbs: start, stop, delete | `peer_may_record`, `:2554`; the dispatch `:4269` | the same | the person socket: its person |
+| keep busy on | `peer_may_start_keep_busy`, `:2521`; the dispatch `:4265` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
 
 | The daemon serving the pipe | Who passes these gates on Windows |
 |---|---|

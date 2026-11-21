@@ -347,6 +347,7 @@ async fn run_install_inner(
         os,
         features.reinstall_guard_on(),
         crate::reinstall_guard::one_row_here().await.as_ref(),
+        &server,
     ) {
         return Err(steps.fail(ErrorCode::Preflight, Said(stop)));
     }

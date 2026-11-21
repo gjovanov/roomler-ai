@@ -941,14 +941,20 @@ stop the run. A check beside the run only tells you afterwards. Prove it before 
 once with an echo in the bench's place, and once with a limit nobody can pass, which must print a
 skip and run nothing. Send plain text: an encoded payload is the shape endpoint protection flags.
 
-| Stop on | Linux | Windows | macOS (read, not yet run) |
+| Stop on | Linux | Windows | macOS (first run 2026-11-20) |
 |---|---|---|---|
-| A live session | `roomlerd rc` | `roomlerd rc` | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions |
-| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session | `CGEventSourceSecondsSinceLastEventType` |
-| A busy host | `/proc/loadavg` at 3/4 of the CPUs | `LoadPercentage` at 50 | |
+| A live session | `roomlerd rc` | `roomlerd rc`. The 2026-11-20 runs read the server's record instead: no open session on the PC's row | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions. The 2026-11-20 run read the server's record instead: no open session on either of the Mac's rows |
+| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session. The 2026-11-20 runs read `quser`'s IDLE TIME instead, at 15 minutes for every interactive session, which needs no compiler on the PC. ⚠️ A running keep busy's moves reset both clocks, so read the row's `keep_busy` first: those runs went ahead only with it off | `CGEventSourceSecondsSinceLastEventType`. ⚠️ With keep busy on, its posted input resets that clock and `HIDIdleTime` alike: read keep busy's own `user_active` line in the per-user log instead |
+| A busy host | `/proc/loadavg` at 3/4 of the CPUs | `LoadPercentage` at 50 | `vm.loadavg` below `hw.ncpu` |
+| Another job's VMs | Any guest in `virsh list` but the host's own; count memory as allocated (`virsh dominfo`), never from `free` | | A running `tart` |
 
 Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
 the run too. Take the denominator from the server's device list, not from who answered exec.
+
+A check can print its reading instead of stopping the run, for one run, on the word of whoever owns
+the machine. On 2026-11-20 two Windows desktops in use ran the bench that way: the session and
+idle checks printed what they read, and the load check still stopped at 50 %
+([§ two Windows desktops](fr/FR-16-rc-quality-benchmark.md#l1-fleet-run-2026-11-20-two-windows-desktops)).
 
 ### The plain smoke and the sweep judge by the same verdict
 

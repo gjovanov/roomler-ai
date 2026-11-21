@@ -162,7 +162,25 @@ pub enum OverlayPath {
 /// answering, the daemon not running); it is consulted only for an overlay
 /// remote and must never turn into `direct` by default.
 pub fn carrier_of(pair: &PairView, overlay: Option<&OverlayPath>) -> SessionCarrier {
-    if crate::peer::addr_is_overlay_range(&pair.remote_addr) {
+    carrier_on(
+        pair,
+        crate::peer::addr_is_overlay_range(&pair.remote_addr),
+        overlay,
+    )
+}
+
+/// [`carrier_of`], given whether the pair rides the overlay. Under every
+/// `rc_carrier_rank` value but `route` that is its remote in the overlay's
+/// range ([`carrier_of`]); FR-148 P4 step 2 (D49 A2): under `route` it is the
+/// ICE agent's read of the pair (`RTCIceTransport::route_read`), the route
+/// rank's one predicate with the mesh's own blocks. Either end on the mesh
+/// counts there, and an address of the range outside the blocks does not.
+pub fn carrier_on(
+    pair: &PairView,
+    rides_the_overlay: bool,
+    overlay: Option<&OverlayPath>,
+) -> SessionCarrier {
+    if rides_the_overlay {
         return match overlay {
             Some(OverlayPath::Direct) => SessionCarrier::OverlayDirect,
             Some(OverlayPath::Relay(kind)) => match kind.as_deref() {
@@ -271,12 +289,13 @@ pub fn relay_transport_of(
     }
 }
 
-/// The nominated pair, polled every 100 ms for up to `wait`, and what
-/// carries the agent's relay for it.
-async fn nominated_pair(
-    pc: &RTCPeerConnection,
-    wait: Duration,
-) -> Option<(PairView, RelayTransport)> {
+/// The nominated pair as the carrier line reads it: the pair, what carries
+/// the agent's relay for it, and, under `route` alone, whether the ICE agent
+/// reads it as riding the mesh (`None` under every other value).
+type Nominated = (PairView, RelayTransport, Option<bool>);
+
+/// The nominated pair, polled every 100 ms for up to `wait`.
+async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
     let sctp = pc.sctp();
     let dtls = sctp.transport();
     let ice = dtls.ice_transport();
@@ -291,7 +310,8 @@ async fn nominated_pair(
                 remote_addr: remote.address.clone(),
             };
             let relay = relay_transport_of(view.local_kind, pair.local_relay_transport());
-            return Some((view, relay));
+            let rides = ice.route_read(&pair).await.map(|read| read.rides_the_mesh);
+            return Some((view, relay, rides));
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -301,8 +321,9 @@ async fn nominated_pair(
 }
 
 /// What the overlay says about `remote_addr`'s peer, within
-/// [`LOCALAPI_BUDGET`]; `None` when nothing could be learned.
-async fn overlay_path(remote_addr: &str) -> Option<OverlayPath> {
+/// [`LOCALAPI_BUDGET`]; `None` when nothing could be learned. Also what the
+/// path line names under `route` ([`crate::carrier_rank::log_path`]).
+pub(crate) async fn overlay_path(remote_addr: &str) -> Option<OverlayPath> {
     use tunnel_core::localapi::ConnectionType;
     let query = async {
         let mut client = tunnel_core::localapi::connect().await.ok()?;
@@ -331,15 +352,19 @@ pub async fn observe(pc: &RTCPeerConnection, session_id: bson::oid::ObjectId) ->
         return SessionCarrier::Unknown;
     };
     tokio::time::sleep(SETTLE).await;
-    let (pair, relay) = nominated_pair(pc, Duration::from_millis(500))
+    let (pair, relay, rides) = nominated_pair(pc, Duration::from_millis(500))
         .await
         .unwrap_or(first);
-    let overlay = if crate::peer::addr_is_overlay_range(&pair.remote_addr) {
+    // FR-148 P4 step 2: under `route` the agent's read decides; otherwise the
+    // remote's range, as built.
+    let rides_the_overlay =
+        rides.unwrap_or_else(|| crate::peer::addr_is_overlay_range(&pair.remote_addr));
+    let overlay = if rides_the_overlay {
         overlay_path(&pair.remote_addr).await
     } else {
         None
     };
-    let carrier = carrier_of(&pair, overlay.as_ref());
+    let carrier = carrier_on(&pair, rides_the_overlay, overlay.as_ref());
     emit(session_id, carrier, &pair, relay, overlay.as_ref());
     carrier
 }
@@ -807,8 +832,129 @@ mod tests {
         }
         let _ = server.close().await;
         assert!(up.is_ok(), "the relayed pair did not connect in 15 s");
-        let (view, relay) = read.expect("no nominated pair");
+        let (view, relay, rides) = read.expect("no nominated pair");
         assert_eq!(view.local_kind, CandidateKind::Relay, "{view:?}");
         assert_eq!(relay, RelayTransport::Udp, "{view:?}");
+        assert_eq!(rides, None, "no rank: the agent reads no route");
+    }
+
+    /// FR-148 P4 step 2 (A2): under `route` the carrier record reads the ICE
+    /// agent's predicate, the one the follow gate and the opening read, with
+    /// the mesh's own blocks. It agrees with that predicate on the field's two
+    /// shapes, the far TURN, a native pair and a direct mesh pair, as the range
+    /// rule does; the two part only where D49 says they must.
+    #[test]
+    fn under_route_the_carrier_record_agrees_with_the_route_ranks_predicate() {
+        use CandidateKind::{Host, Relay, Srflx};
+        use webrtc::ice::agent::agent_config::rides_the_mesh;
+        let route = crate::rc_overlay::RcOverlay {
+            allow: true,
+            carrier_rank: crate::rc_overlay::RankMode::Route,
+            mesh_last: true,
+            v4_nets: vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
+        }
+        .ice_rank()
+        .and_then(|rank| rank.route)
+        .expect("the route rank");
+        // Priorities as the agent's candidates carry them.
+        const HOST: u32 = 2_130_706_431;
+        const TYPE_90: u32 = (1 << 24) * 90 + (1 << 8) * 65535 + 255;
+        const UDP_RELAY: u32 = (1 << 8) * 65535 + 255;
+        let derp = OverlayPath::Relay(Some("derp".to_owned()));
+        let direct = OverlayPath::Direct;
+        for (name, (local, local_addr, priority), (remote, remote_addr), overlay, want) in [
+            // The field's two shapes: the viewer's relay on its device's mesh
+            // address, with the agent's LAN host (A) or its mesh host (B).
+            (
+                "shape A",
+                (Host, "192.168.1.10", HOST),
+                (Relay, "100.65.4.33"),
+                Some(&derp),
+                SessionCarrier::Derp,
+            ),
+            (
+                "shape B",
+                (Host, "100.65.4.34", 255),
+                (Relay, "100.65.4.33"),
+                Some(&derp),
+                SessionCarrier::Derp,
+            ),
+            (
+                "far TURN",
+                (Relay, "203.0.113.7", UDP_RELAY),
+                (Srflx, "198.51.100.4"),
+                None,
+                SessionCarrier::Turn,
+            ),
+            (
+                "native",
+                (Host, "192.168.1.10", HOST),
+                (Host, "192.168.1.20"),
+                None,
+                SessionCarrier::Direct,
+            ),
+            (
+                "direct mesh",
+                (Host, "100.65.4.34", TYPE_90),
+                (Host, "100.65.4.33"),
+                Some(&direct),
+                SessionCarrier::OverlayDirect,
+            ),
+        ] {
+            let p = pair(local, local_addr, remote, remote_addr);
+            let rides = rides_the_mesh(&*route.mesh, priority, 1, local_addr, remote_addr);
+            let carrier = carrier_on(&p, rides, overlay);
+            assert_eq!(carrier, want, "{name}");
+            assert_eq!(
+                carrier_of(&p, overlay),
+                want,
+                "{name}: the range rule agrees"
+            );
+            let on_the_overlay = matches!(
+                carrier,
+                SessionCarrier::OverlayDirect
+                    | SessionCarrier::OverlayTurn
+                    | SessionCarrier::Derp
+                    | SessionCarrier::OrgRelay
+            );
+            assert_eq!(on_the_overlay, rides, "{name}");
+        }
+        // Where they part. A remote in the /10 outside the mesh's blocks (a
+        // carrier's CGNAT, a corporate VPN) is a real path under `route`.
+        assert!(!rides_the_mesh(
+            &*route.mesh,
+            UDP_RELAY,
+            1,
+            "203.0.113.7",
+            "100.80.1.2"
+        ));
+        let cgnat = pair(Relay, "203.0.113.7", Srflx, "100.80.1.2");
+        assert_eq!(carrier_on(&cgnat, false, None), SessionCarrier::Turn);
+        assert_eq!(
+            carrier_of(&cgnat, None),
+            SessionCarrier::Unknown,
+            "as built"
+        );
+        // A pair whose local the mesh carries rides it, whatever its remote,
+        // and the overlay cannot name a carrier for a remote that is no peer.
+        assert!(rides_the_mesh(
+            &*route.mesh,
+            255,
+            1,
+            "100.65.4.34",
+            "198.51.100.4"
+        ));
+        let from_the_mesh = pair(Host, "100.65.4.34", Srflx, "198.51.100.4");
+        assert_eq!(
+            carrier_on(&from_the_mesh, true, None),
+            SessionCarrier::Unknown,
+            "never direct"
+        );
+        assert_eq!(
+            carrier_of(&from_the_mesh, None),
+            SessionCarrier::Direct,
+            "as built"
+        );
     }
 }

@@ -1773,22 +1773,22 @@ time, so that line of cells grows by about 20 s. Since D44 the line runs eight c
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
 names, right after `carrier`, what carries the agent's own TURN allocation for the
 nominated pair: `relay_transport` (`relay_transport_of`,
-`agents/roomlerd/src/session_carrier.rs:256`; the line, `:349`). A relay candidate names
+`agents/roomlerd/src/session_carrier.rs:274`; the line, `:374`). A relay candidate names
 its relayed address, which is UDP whatever carries the allocation to the TURN server, so
 the pair alone cannot tell TURN over UDP from TURN over TCP or TLS. The vendored
 webrtc-ice stamps each relay candidate it gathers with its TURN URL's transport and
 scheme (`Candidate::relay_transport`, `crates/vendored/webrtc-ice/src/candidate/mod.rs:95`,
-stamped at `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:1094`), and the vendored
+stamped at `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:1137`), and the vendored
 webrtc hands the stamp over with the selected pair
 (`RTCIceCandidatePair::local_relay_transport`,
 `crates/vendored/webrtc/src/ice_transport/ice_candidate_pair.rs:58`), both on the read
 the carrier line makes and on the pair the selection's change handler is given
-(`crates/vendored/webrtc/src/ice_transport/mod.rs:93`, `:148`).
+(`crates/vendored/webrtc/src/ice_transport/mod.rs:94`, `:165`).
 
 | The nominated pair's local candidate | `relay_transport` |
 |---|---|
 | a relay allocated over `turn:…?transport=udp` | `udp` |
-| a relay allocated over `turn:…?transport=tcp` | `tcp`. The fork gathers none today: it refuses the URL (`agent_gather.rs:981`) |
+| a relay allocated over `turn:…?transport=tcp` | `tcp`. The fork gathers none today: it refuses the URL (`agent_gather.rs:1024`) |
 | a relay allocated over `turns:…?transport=tcp`, TLS over TCP (`tcp_turn_conn`) | `tls` |
 | host, srflx or prflx | `none`: no allocation of the agent's carries the pair, though the browser's relay may |
 | a relay without a stamp, a relay over a URL pair the fork does not gather (TURN over DTLS), or a type webrtc-rs could not name | `unknown`, never a guess |
@@ -4104,7 +4104,7 @@ medians and their delivery are B2's.
 | the sampler and the line | `agents/roomlerd/src/media_delivery.rs:541` (the field), `:875` (`on_frame`), `:892` (`on_pair_check`), `:902` (`note_gate`), `:1018` (`on_handed`), `:1026` (`pump_count`), `:805` (`report`), `:1117` (`emit`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4293` (the send task's count), `:4307` and `:4336` (each frame taken, each chunk released), `:4390` (the pair), `:4507` (the gate's count), `:4525` (the step), `:5212` (the watermark), `:5247` (`on_handed`), `:5264` (a full channel) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:7306` (the send task's count), `:7328` and `:7384` (each frame taken, each chunk released), `:7722` (the pair), `:8125` (the gate's count, the ledger beside the channel), `:8200` (the step), `:9926` (`on_handed`), `:9952` (a full channel) |
-| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3463` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2758` (its check) |
+| the config key | `crates/agent-core/src/config.rs:1228` (the field), `:3501` (the env fallback); `crates/agent-core/src/config_surface.rs:1451` (the key), `:2157` (its echo), `:2758` (its check) |
 | the harness's outages and reads | `agents/roomlerd/src/media_delivery.rs:3684` (`Outages`), `:3882` (`out_direction`), `:5710` (`outaged`), `:6794` (`print_releases`), `:6854` (`recoveries`), `:7010` (`stalls_against_today`), `:7130` (`outages_against_today`) |
 | B2's view of the budget | `agents/roomlerd/src/media_inflight.rs:580` (`Over`), `:769` (`over`), `:812` (`held_each`), `:724` (`still_after`), `:737` (`take_mark`), `:673` (the mark in `step`), `:1609` (`Shadow::take_mark`); the opening: `:597` (`Over::opening`), `:798` (its reading in `over`), `:669` (the first measured rate, in `step`), `:1030` (the rate's provenance, in `rate_at`), `:850` (a new association's opening, in `on_new_association`) |
 | B2's push-backs | `agents/roomlerd/src/media_delivery.rs:254` (`SamplePushBack`), `:264` (`Burst`), `:308` (`BURST`), `:318` (`settle`), `:343` (`push_back_of`), `:355` (P3, with the opening's), `:744` (`Budget::over` at a sample's close), `:618` (`heartbeat`, the hand-off), `:642` (`due_push_back`), `:652` (`on_mark`), `:875` (`on_frame`, the mark) |

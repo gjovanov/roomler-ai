@@ -1328,6 +1328,10 @@ pub struct RedisSettings {
     /// #3840 — one connection attempt gives up after this; 0 = no bound, 1-999 = 1000.
     #[serde(default = "redis_bound_ms")]
     pub connection_timeout_ms: u64,
+    /// #3952 — how often each subscriber publishes a probe to itself; two
+    /// probes in a row unheard and it subscribes again. 0 = off, 1-999 = 1000.
+    #[serde(default = "redis_probe_ms")]
+    pub subscriber_probe_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2073,6 +2077,13 @@ fn redis_bound_ms() -> u64 {
     3000
 }
 
+/// #3952 — the default of `ROOMLER__REDIS__SUBSCRIBER_PROBE_MS`: 15 s. The
+/// reasoning is in `crates/core/src/ws/sub_probe.rs` and
+/// `docs/multi-pod-scale-out.md`.
+fn redis_probe_ms() -> u64 {
+    15_000
+}
+
 #[cfg(test)]
 mod redis_bound_tests {
     use super::RedisSettings;
@@ -2092,5 +2103,28 @@ mod redis_bound_tests {
         }))
         .unwrap();
         assert_eq!((s.response_timeout_ms, s.connection_timeout_ms), (0, 0));
+    }
+
+    /// #3952 — a config that names only the URL (every deployment before
+    /// #3952) probes its subscribers every 15 s; 0 (off) and a value under the
+    /// 1 s floor are taken as given here, and the floor is applied where the
+    /// setting is used (`roomler_core::ws::sub_probe`).
+    #[test]
+    fn the_subscriber_probe_defaults_to_15_s_and_takes_0() {
+        let s: RedisSettings =
+            serde_json::from_value(serde_json::json!({ "url": "redis://r:6379" })).unwrap();
+        assert_eq!(s.subscriber_probe_ms, 15_000);
+        for given in [0u64, 500, 1000, 60_000] {
+            let s: RedisSettings = serde_json::from_value(serde_json::json!({
+                "url": "redis://r:6379", "subscriber_probe_ms": given
+            }))
+            .unwrap();
+            assert_eq!(s.subscriber_probe_ms, given);
+            assert_eq!(
+                (s.response_timeout_ms, s.connection_timeout_ms),
+                (3000, 3000),
+                "the probe leaves #3840's bounds alone"
+            );
+        }
     }
 }
