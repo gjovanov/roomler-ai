@@ -1773,22 +1773,22 @@ time, so that line of cells grows by about 20 s. Since D44 the line runs eight c
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
 names, right after `carrier`, what carries the agent's own TURN allocation for the
 nominated pair: `relay_transport` (`relay_transport_of`,
-`agents/roomlerd/src/session_carrier.rs:256`; the line, `:349`). A relay candidate names
+`agents/roomlerd/src/session_carrier.rs:297`; the line, `:458`). A relay candidate names
 its relayed address, which is UDP whatever carries the allocation to the TURN server, so
 the pair alone cannot tell TURN over UDP from TURN over TCP or TLS. The vendored
 webrtc-ice stamps each relay candidate it gathers with its TURN URL's transport and
 scheme (`Candidate::relay_transport`, `crates/vendored/webrtc-ice/src/candidate/mod.rs:95`,
-stamped at `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:1094`), and the vendored
+stamped at `crates/vendored/webrtc-ice/src/agent/agent_gather.rs:1137`), and the vendored
 webrtc hands the stamp over with the selected pair
 (`RTCIceCandidatePair::local_relay_transport`,
 `crates/vendored/webrtc/src/ice_transport/ice_candidate_pair.rs:58`), both on the read
 the carrier line makes and on the pair the selection's change handler is given
-(`crates/vendored/webrtc/src/ice_transport/mod.rs:93`, `:148`).
+(`crates/vendored/webrtc/src/ice_transport/mod.rs:94`, `:165`).
 
 | The nominated pair's local candidate | `relay_transport` |
 |---|---|
 | a relay allocated over `turn:…?transport=udp` | `udp` |
-| a relay allocated over `turn:…?transport=tcp` | `tcp`. The fork gathers none today: it refuses the URL (`agent_gather.rs:981`) |
+| a relay allocated over `turn:…?transport=tcp` | `tcp`. The fork gathers none today: it refuses the URL (`agent_gather.rs:1024`) |
 | a relay allocated over `turns:…?transport=tcp`, TLS over TCP (`tcp_turn_conn`) | `tls` |
 | host, srflx or prflx | `none`: no allocation of the agent's carries the pair, though the browser's relay may |
 | a relay without a stamp, a relay over a URL pair the fork does not gather (TURN over DTLS), or a type webrtc-rs could not name | `unknown`, never a guess |

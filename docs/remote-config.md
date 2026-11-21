@@ -224,7 +224,7 @@ row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's
-value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
+value that way (`agents/roomlerd/src/macos_supervisor.rs:309`).
 
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it

@@ -33,6 +33,16 @@
 #     allocated over TCP or TLS at local preference 32767, and after its first
 #     selection the controlled agent keeps checking the pairs its follow gate
 #     would follow. Cells: src/agent/agent_carrier_rank_test.rs.
+#   - src/agent/agent_config.rs, agent_internal.rs, agent_gather.rs,
+#     agent_selector.rs and mod.rs (FR-148 P4 step 2): the route rank,
+#     `CarrierRank::route`, `None` and inert under every `rc_carrier_rank`
+#     value but `route`. One predicate (`rides_the_mesh`) says whether a pair
+#     rides the mesh; a pair from a local candidate off the mesh to a remote
+#     on it is not formed while a TURN URL or a host candidate on the mesh
+#     carries the same route; the controlled agent holds its mesh-route pairs
+#     while a relay off the mesh can still come (`ROUTE_HOLD` at most); the
+#     follow gate and the checks after the selection read the same predicate;
+#     `Agent::route_read` reads a pair and the hold. Cells: the same file.
 #   - src/candidate/mod.rs, candidate_base.rs and src/agent/agent_gather.rs
 #     (FR-148 P0): `Candidate::relay_transport`, the transport and the scheme
 #     of the TURN URL a relay candidate's allocation was made over, stamped

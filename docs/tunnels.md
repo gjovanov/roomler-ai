@@ -375,7 +375,7 @@ Now no candidate is closed under the lock. Each local candidate closes on a task
 and one still closing after 5 s is named in a `closing candidate … is taking over 5s` warning.
 That line names the ICE role and the candidate, not the session, which the ICE agent never
 learns. A remote-desktop session logs each of its local candidates with the session
-(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:67`), and the candidate's
+(`ICE: gathered local candidate`, `agents/roomlerd/src/carrier_rank.rs:76`), and the candidate's
 address and port join the two lines.
 
 **The net under the rest:** `AgentPeer::close` and `TunnelPeer::close` run `pc.close()` through
@@ -642,7 +642,7 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 | `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 | `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
 
-**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3147`), which is not
+**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3151`), which is not
 yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
 other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
 `Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two

@@ -825,6 +825,8 @@ async fn run_install_inner(
         anchored,
         // FR-129 B2 — the root half is macOS's; Windows has none.
         root_half: None,
+        // FR-141 P2 — nor one row of a Mac's two processes.
+        one_row: false,
     })
 }
 

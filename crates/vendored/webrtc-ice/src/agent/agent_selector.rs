@@ -11,6 +11,7 @@ use stun::message::*;
 use stun::textattrs::*;
 use tokio::time::{Duration, Instant};
 
+use crate::agent::agent_config::{CarrierRank, ROUTE_MOVE_CHECKS};
 use crate::agent::agent_internal::*;
 use crate::candidate::*;
 use crate::control::*;
@@ -54,6 +55,14 @@ const FOLLOW_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// overlay-possible. Env overrides: `ROOMLER_ICE_FOLLOW_RENOMINATION=0`
 /// never follows (rc.262 semantics), `=1` always follows (rc.260 semantics).
 pub(crate) fn should_follow_renomination(new_pair: &CandidatePair, current: &CandidatePair) -> bool {
+    follows_when(outranks_on_a_real_path(new_pair, current), current)
+}
+
+/// The follow gate around its upward test `outranks`: the env pins, and the
+/// stale-pair failover. Roomler patch (FR-148 P4 step 2): split out of
+/// [`should_follow_renomination`], so the route rank's upward test
+/// ([`outranks_off_the_mesh`]) passes the same gate.
+fn follows_when(outranks: bool, current: &CandidatePair) -> bool {
     let current_stale = std::time::SystemTime::now()
         .duration_since(current.remote.last_received())
         .map(|elapsed| elapsed > FOLLOW_STALE_AFTER)
@@ -62,7 +71,7 @@ pub(crate) fn should_follow_renomination(new_pair: &CandidatePair, current: &Can
         std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION")
             .ok()
             .as_deref(),
-        outranks_on_a_real_path(new_pair, current),
+        outranks,
         current_stale,
     )
 }
@@ -73,7 +82,9 @@ pub(crate) fn should_follow_renomination(new_pair: &CandidatePair, current: &Can
 ///
 /// Roomler patch (FR-148 P4): also the only test the controlled agent's checks
 /// after its first selection use ([`AgentInternal::check_pairs_above_selection`]),
-/// so the agent never validates a pair this gate would refuse to follow.
+/// so the agent never validates a pair this gate would refuse to follow. Under
+/// the route rank both read [`outranks_off_the_mesh`] instead
+/// ([`AgentInternal::outranks`]).
 pub(crate) fn outranks_on_a_real_path(pair: &CandidatePair, selected: &CandidatePair) -> bool {
     let remote_is_real_path = pair
         .remote
@@ -82,6 +93,24 @@ pub(crate) fn outranks_on_a_real_path(pair: &CandidatePair, selected: &Candidate
         .map(|ip| !crate::agent::agent_gather::is_roomler_overlay_ip(&ip))
         .unwrap_or(false);
     remote_is_real_path && pair.priority() > selected.priority()
+}
+
+/// Roomler patch (FR-148 P4 step 2, D49 A2): the upward test under the route
+/// rank. `pair`'s remote is an address (a name stays overlay-possible, as
+/// above), `pair` does not ride the mesh by rule 1's predicate with the rank's
+/// own addresses ([`CarrierRank::mesh_route`]), and it ranks strictly above
+/// `selected`. Unlike [`outranks_on_a_real_path`], which reads the whole overlay
+/// range, an address of 100.64.0.0/10 outside the mesh's blocks (a carrier's
+/// CGNAT, a corporate VPN) is a real path here, and a pair whose local candidate
+/// the mesh carries is not.
+pub(crate) fn outranks_off_the_mesh(
+    rank: &CarrierRank,
+    pair: &CandidatePair,
+    selected: &CandidatePair,
+) -> bool {
+    pair.remote.address().parse::<std::net::IpAddr>().is_ok()
+        && !rank.mesh_route(&*pair.local, &*pair.remote)
+        && pair.priority() > selected.priority()
 }
 
 /// Pure decision core of [`should_follow_renomination`] — unit-tested.
@@ -109,6 +138,34 @@ fn follow_renomination_policy(
 const WARM_STANDBY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentInternal {
+    /// Roomler patch (FR-148 P4 step 2): the route rank, when this agent runs
+    /// one (whatever the link).
+    fn route_rank(&self) -> Option<&CarrierRank> {
+        (*self.carrier_rank)
+            .as_ref()
+            .filter(|rank| rank.route.is_some())
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): the upward test this agent applies:
+    /// under the route rank [`outranks_off_the_mesh`] (D49 A2), otherwise
+    /// [`outranks_on_a_real_path`] exactly as built.
+    pub(crate) fn outranks(&self, pair: &CandidatePair, selected: &CandidatePair) -> bool {
+        match self.route_rank() {
+            Some(rank) => outranks_off_the_mesh(rank, pair, selected),
+            None => outranks_on_a_real_path(pair, selected),
+        }
+    }
+
+    /// Roomler patch (FR-148 P4 step 2): the follow gate this agent applies:
+    /// under the route rank around [`outranks_off_the_mesh`] (D49 A2),
+    /// otherwise [`should_follow_renomination`] exactly as built.
+    pub(crate) fn follows_renomination(&self, new_pair: &CandidatePair, current: &CandidatePair) -> bool {
+        match self.route_rank() {
+            Some(rank) => follows_when(outranks_off_the_mesh(rank, new_pair, current), current),
+            None => should_follow_renomination(new_pair, current),
+        }
+    }
+
     /// Ping succeeded-but-unselected pairs whose local candidate has been
     /// idle past [`WARM_STANDBY_INTERVAL`]. Self-gating rides the LOCAL
     /// candidate's `last_sent` — standby pairs own distinct local candidates
@@ -151,15 +208,44 @@ impl AgentInternal {
         }
     }
 
+    /// Roomler patch (FR-148 P4 step 2, phase B of D49, B2): does this agent
+    /// answer the controlling agent's nomination of `p` before its own check has
+    /// validated `p`, and take it once that check succeeds? Only under the route
+    /// rank, while the selection rides the mesh (rule 1's predicate), for a pair
+    /// that does not ([`CarrierRank::mesh_route`]), whose remote is an address
+    /// (a name stays overlay-possible, as the follow gate reads it), and that the
+    /// follow gate would follow ([`AgentInternal::follows_renomination`]): one
+    /// decision for the answer and for the move, so the agent answers exactly
+    /// the nominations it would take. Never a mesh-route pair: during the hold
+    /// silence stays the only form (rule 3).
+    pub(crate) fn answers_before_validating(&self, p: &CandidatePair) -> bool {
+        let Some(rank) = self.route_rank() else {
+            return false;
+        };
+        let Some(selected) = self.agent_conn.get_selected_pair() else {
+            return false;
+        };
+        rank.mesh_route(&*selected.local, &*selected.remote)
+            && !rank.mesh_route(&*p.local, &*p.remote)
+            && p.remote.address().parse::<std::net::IpAddr>().is_ok()
+            && self.follows_renomination(p, &selected)
+    }
+
     /// Roomler patch (FR-148 P4): with the carrier rank set, the controlled
     /// agent keeps checking after its first selection: every pair the follow
-    /// gate would follow ([`outranks_on_a_real_path`]), bounded the way
+    /// gate would follow ([`AgentInternal::outranks`]), bounded the way
     /// [`AgentInternal::ping_all_candidates`] bounds a check. Upstream checks
     /// nothing after the first selection, so a relay candidate gathered later
     /// never sends from its relay: its TURN client asks for a permission only
     /// when it first sends to a peer, and the server discards the far side's
     /// checks to it until then. The first check from the relay creates the
     /// permission. Without the rank this does nothing.
+    ///
+    /// Roomler patch (FR-148 P4 step 2, phase B of D49, B1): while the route
+    /// rank's selection rides the mesh, each such pair is checked on a budget
+    /// of its own, [`ROUTE_MOVE_CHECKS`] checks at the loop's 200 ms, then it
+    /// fails. With the selection off the mesh, and without the route rank, the
+    /// budget is the opening's, as built.
     pub(crate) async fn check_pairs_above_selection(&self) {
         if self.carrier_rank.is_none() {
             return;
@@ -167,11 +253,14 @@ impl AgentInternal {
         let Some(selected) = self.agent_conn.get_selected_pair() else {
             return;
         };
+        let moves = self
+            .route_rank()
+            .is_some_and(|rank| rank.mesh_route(&*selected.local, &*selected.remote));
         let pairs: Vec<_> = {
             let checklist = self.agent_conn.checklist.lock().await;
             let mut pairs = vec![];
             for p in checklist.iter() {
-                if !outranks_on_a_real_path(p, &selected) {
+                if !self.outranks(p, &selected) {
                     continue;
                 }
                 let p_state = p.state.load(Ordering::SeqCst);
@@ -181,10 +270,18 @@ impl AgentInternal {
                 } else if p_state != CandidatePairState::InProgress as u8 {
                     continue;
                 }
-                if p.binding_request_count.load(Ordering::SeqCst) > self.max_binding_requests {
+                let spent = if moves {
+                    p.move_checks.load(Ordering::SeqCst) >= ROUTE_MOVE_CHECKS
+                } else {
+                    p.binding_request_count.load(Ordering::SeqCst) > self.max_binding_requests
+                };
+                if spent {
                     p.state
                         .store(CandidatePairState::Failed as u8, Ordering::SeqCst);
                 } else {
+                    if moves {
+                        p.move_checks.fetch_add(1, Ordering::SeqCst);
+                    }
                     p.binding_request_count.fetch_add(1, Ordering::SeqCst);
                     pairs.push((p.local.clone(), p.remote.clone()));
                 }
@@ -575,7 +672,7 @@ impl ControllingSelector for AgentInternal {
                     let selected = self.agent_conn.get_selected_pair();
                     selected
                         .as_ref()
-                        .is_some_and(|s| should_follow_renomination(&p, s))
+                        .is_some_and(|s| self.follows_renomination(&p, s))
                 };
                 let already_selected = {
                     let selected = self.agent_conn.get_selected_pair();
@@ -742,6 +839,17 @@ impl ControlledSelector for AgentInternal {
                 p.state
                     .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                 log::trace!("Found valid candidate pair: {}", p);
+                // Roomler patch (FR-148 P4 step 2, phase B of D49, B2): the
+                // nomination this agent answered before its own check had
+                // validated the pair is taken now that one has (RFC 8445
+                // §7.3.1.5), if the decision that answered it still holds. The
+                // selection only ever moves onto a pair this agent's own check
+                // validated: it never sends on any other.
+                if p.nomination_pending.swap(false, Ordering::SeqCst)
+                    && self.answers_before_validating(&p)
+                {
+                    self.set_selected_pair(Some(p)).await;
+                }
             } else {
                 // This shouldn't happen
                 log::error!("Success response from invalid candidate pair");
@@ -763,6 +871,24 @@ impl ControlledSelector for AgentInternal {
     ) {
         if self.find_pair(local, remote).await.is_none() {
             self.add_pair(local.clone(), remote.clone()).await;
+        }
+
+        // Roomler patch (FR-148 P4 step 2): a held mesh-route pair is neither
+        // answered nor checked, as if a firewall dropped the check, so the
+        // browser cannot validate it, and so cannot select it, while the hold
+        // lasts ([`AgentInternal::holds_mesh_route`]).
+        if (*self.carrier_rank)
+            .as_ref()
+            .is_some_and(|rank| rank.mesh_route(&**local, &**remote))
+            && self.holds_mesh_route().await
+        {
+            log::trace!(
+                "[{}]: held, unanswered: {} <- {}",
+                self.get_name(),
+                local,
+                remote
+            );
+            return;
         }
 
         if let Some(p) = self.find_pair(local, remote).await {
@@ -801,7 +927,7 @@ impl ControlledSelector for AgentInternal {
                         let selected = self.agent_conn.get_selected_pair();
                         selected
                             .as_ref()
-                            .is_some_and(|s| should_follow_renomination(&p, s))
+                            .is_some_and(|s| self.follows_renomination(&p, s))
                     };
                     let already_selected = {
                         let selected = self.agent_conn.get_selected_pair();
@@ -824,9 +950,34 @@ impl ControlledSelector for AgentInternal {
                     // MUST remove the candidate pair from the valid list, set the
                     // candidate pair state to Failed, and set the checklist state to
                     // Failed.
+                    //
+                    // Roomler patch (FR-148 P4 step 2, phase B of D49, B2): while the
+                    // route rank's selection rides the mesh, a nomination of a pair
+                    // off it is answered at once (§7.3.1.4), and remembered: the
+                    // triggered check below, or any check of this agent's on the
+                    // pair, takes it once it succeeds (`handle_success_response`).
+                    // The browser marks its side writable on the answer; this agent
+                    // still sends nothing on the pair until its own check validates
+                    // it (the 2026-07-27 half-blackholed pair). Otherwise, as built:
+                    // no answer.
+                    if self.answers_before_validating(&p) {
+                        p.nomination_pending.store(true, Ordering::SeqCst);
+                        log::trace!(
+                            "[{}]: answered a nomination before validating: {} <- {}",
+                            self.get_name(),
+                            local,
+                            remote
+                        );
+                        self.send_binding_success(m, local, remote).await;
+                    }
                     self.ping_candidate(local, remote).await;
                 }
             } else {
+                // Roomler patch (FR-148 P4 step 2, phase B of D49, B2): the
+                // controlling agent's latest check of the pair does not nominate
+                // it, so a nomination answered before is withdrawn. Never set
+                // without the route rank.
+                p.nomination_pending.store(false, Ordering::SeqCst);
                 self.send_binding_success(m, local, remote).await;
                 self.ping_candidate(local, remote).await;
             }

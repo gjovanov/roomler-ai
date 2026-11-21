@@ -45,7 +45,7 @@ indexed by `session_id`) — the only structured per-session record and the shad
    (`queue_max_age` 100 ms, `crates/tunnel-core/src/transport/derp.rs:64–77`). The rc.319
    interface filter (`peer.rs:345`, `is_overlay_iface` :9289) is a **no-op on Windows** — webrtc-util
    reports every adapter with name `""` (`webrtc-util-0.10.0/src/ifaces/ffi/windows/mod.rs:331–348`)
-   — and misses macOS `utunN`; srflx (`agent_gather.rs:797–831`) and remote candidates
+   — and misses macOS `utunN`; srflx (`agent_gather.rs:828–862`) and remote candidates
    (`peer.rs:1293–1342`) are never filtered; host↔host type-preference wins whenever it connects.
    #1237 is the same class: "any interface other than ours" (`tun.rs:2427–2472`).
 
@@ -232,7 +232,7 @@ before B2: done in #4061).
    `status().overlay_ip/ip6` (`localapi/src/lib.rs:190–194`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:341–344`.
-2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:797–831`) — a 3-line
+2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:828–862`) — a 3-line
    addition to the already-forked webrtc-ice (`webrtc-ice.patch`, `--regen`) applying `ip_filter`
    to `xoraddr.ip` at :744, plus a belt at the signaling hop `peer.rs:737–753`.
 3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1293–1342`), after mDNS resolution:
@@ -240,7 +240,7 @@ before B2: done in #4061).
    query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
    `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:1004–1013`).
 
-Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:247`)
+Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`carrier_rank.rs:282`)
 and in the FR-35 memory key (`peer.rs:4785` → `"{ip}|{class}"`, which fixes "a fast day carried
 onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost

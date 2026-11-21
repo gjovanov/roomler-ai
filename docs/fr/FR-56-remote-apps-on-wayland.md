@@ -25,8 +25,8 @@ capture is what turns "a screen" into "an app".
 ## Why now, and what is actually broken
 
 Remote Apps exists and is good (`agents/roomlerd/src/apps/`, three verbs over
-the control DC, allowlisted launch, tmux-backed sessions that survive a
-restart). It is also, on Linux, **X11-only and gated on the daemon's own
+the control DC, allowlisted launch, tmux-backed sessions that outlive their
+terminal and a disconnect). It is also, on Linux, **X11-only and gated on the daemon's own
 `DISPLAY`** — so on every Wayland host it does not fail, it never engages.
 
 Measured 2026-09-01 on the WSL2 dev box (headless `mutter` + Xwayland) and
