@@ -159,7 +159,7 @@
     and a second viewer's requests never show on the reading tab. The next read searches the
     agent log for every line in the table right after the session ends, because the log
     listing returns only a device's newest 500 batches
-    (`crates/modules/fleet/src/agent_log.rs:226`).
+    (`crates/modules/fleet/src/agent_log.rs:262`).
 
 - **2026-10-31 22:47Z — the first relayed NVENC read: the cell works, and nothing was tested.**
   CORPLAP-2 on 0.4.191, `hevc_nvenc` 1920×1200, `constrained=true` on all 158 heartbeats over

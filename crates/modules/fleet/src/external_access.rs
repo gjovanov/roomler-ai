@@ -388,7 +388,8 @@ pub struct ExternalPrincipalBody {
 pub struct ConnectCodeResponse {
     /// Display form, `XXXX-XXXX-XXXX`.
     pub connect_code: String,
-    pub rotated_at: DateTime,
+    /// RFC 3339, as the device's `connect_code_rotated_at` reads (#4189).
+    pub rotated_at: String,
 }
 
 /// One device's connect code, as its External access dialog reads it.
@@ -709,7 +710,7 @@ pub async fn rotate_connect_code(
                 // membership.
                 return Ok(Json(ConnectCodeResponse {
                     connect_code: connect_code::format_grouped(&code),
-                    rotated_at: DateTime::now(),
+                    rotated_at: fmt_dt(DateTime::now()),
                 }));
             }
             Err(e) => last_err = Some(e),

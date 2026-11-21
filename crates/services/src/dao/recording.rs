@@ -61,7 +61,7 @@ impl RecordingDao {
         self.base
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "room_id": room_id, "deleted_at": null },
-                Some(doc! { "created_at": -1 }),
+                Some(doc! { "created_at": -1, "_id": -1 }),
                 params,
             )
             .await

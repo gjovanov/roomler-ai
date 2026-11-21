@@ -5,7 +5,7 @@
 // The store answers `null` for a caller who may not read them (known from the
 // mask, or the server's 403), and both dialogs explain that. Neither shows it
 // as an error, nor as an empty list that would read as "nothing happened".
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { reactive, type Component } from 'vue'
 import { createVuetify } from 'vuetify'
@@ -117,5 +117,67 @@ describe('the agent logs dialog', () => {
     await open(AgentLogsDialog, storeAnswering(null, []))
     expect(document.body.querySelector('[data-testid="agent-logs-refused"]')).toBeNull()
     expect(shown()).toContain('No logs uploaded yet')
+  })
+
+  // #4189 — a batch as `GET …/agent/{aid}/logs` answers it: each line's `ts`
+  // is an RFC 3339 string. The server used to send bson's `{"$date": …}`,
+  // which the time column printed raw and Copy wrote as `[object Object]`.
+  describe("a line's time", () => {
+    const TS = '2026-11-21T06:43:29.123Z'
+    const line = {
+      ts: TS,
+      level: 'INFO',
+      target: 'roomlerd::peer',
+      msg: 'input dispatch',
+      fields: { px: 1181 },
+    }
+    const batches = [
+      {
+        id: 'b00000000000000000000001',
+        source: 'agent',
+        agentId: 'c00000000000000000000001',
+        userId: null,
+        sessionId: null,
+        hostIdHash: null,
+        agentVersion: '0.4.230',
+        lineCount: 1,
+        createdAt: '2026-11-21T06:43:31.500Z',
+        lines: [line],
+      },
+    ]
+
+    let clipboard: PropertyDescriptor | undefined
+    const writeText = vi.fn()
+    beforeEach(() => {
+      clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+      writeText.mockReset().mockResolvedValue(undefined)
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    })
+    afterEach(() => {
+      if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+      else delete (navigator as unknown as Record<string, unknown>).clipboard
+    })
+
+    it('shows as the time of day, to the millisecond', async () => {
+      await open(AgentLogsDialog, storeAnswering(null, batches))
+      const cells = Array.from(document.body.querySelectorAll('.log-ts')).map((c) =>
+        (c.textContent ?? '').trim(),
+      )
+      const local = new Date(TS).toLocaleTimeString(undefined, { hour12: false })
+      expect(cells).toEqual([`${local}.123`])
+      expect(cells[0]).toMatch(/^\d{1,2}:\d{2}:\d{2}\.123$/)
+    })
+
+    it('is what Copy writes, ahead of the level, the target and the message', async () => {
+      await open(AgentLogsDialog, storeAnswering(null, batches))
+      const copy = Array.from(document.body.querySelectorAll('button')).find((b) =>
+        (b.textContent ?? '').includes('Copy visible'),
+      )
+      expect(copy).toBeDefined()
+      copy?.click()
+      await flushPromises()
+      expect(writeText).toHaveBeenCalledTimes(1)
+      expect(writeText).toHaveBeenCalledWith(`${TS} INFO roomlerd::peer input dispatch px=1181`)
+    })
   })
 })
