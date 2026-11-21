@@ -628,15 +628,26 @@ async function doDelete() {
   }
 }
 
+/** An id no list here holds (a node or role since removed, a member who left)
+ *  reads as its kind and these first 6 characters, as on the Tunnel ACL tab,
+ *  never as the bare kind: two of them must not read the same (#4190). */
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 6)}…` : id
+}
+
 function selectorLabel(s: OverlaySelector): string {
   if (s.kind === 'all_nodes') return 'All nodes'
-  if (s.kind === 'node_id') return nodeItems.value.find((n) => n.value === s.id)?.title ?? 'Node'
-  if (s.kind === 'role_id') return roleItems.value.find((r) => r.value === s.id)?.title ?? 'Role'
-  return memberItems.value.find((m) => m.value === s.id)?.title ?? 'User'
+  if (s.kind === 'node_id') {
+    return nodeItems.value.find((n) => n.value === s.id)?.title ?? `Node ${shortId(s.id)}`
+  }
+  if (s.kind === 'role_id') {
+    return roleItems.value.find((r) => r.value === s.id)?.title ?? `Role ${shortId(s.id)}`
+  }
+  return memberItems.value.find((m) => m.value === s.id)?.title ?? `User ${shortId(s.id)}`
 }
 function targetLabel(t: OverlayTarget): string {
   if (t.kind === 'all_nodes') return 'All nodes'
-  return nodeItems.value.find((n) => n.value === t.id)?.title ?? 'Node'
+  return nodeItems.value.find((n) => n.value === t.id)?.title ?? `Node ${shortId(t.id)}`
 }
 function portLabel(r: { low: number; high: number }): string {
   if (r.low === 1 && r.high === 65535) return 'any'
