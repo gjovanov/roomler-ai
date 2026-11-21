@@ -359,13 +359,22 @@ roles do not.
 - **The reads too.** The list is the org's whole tunnel ACL: every subject, every
   target device, and the internal hosts, ranges and ports behind them. A member
   learns what they may reach by reaching it; a refused forward says `acl_denied`.
-- **The bit is decided first**, before the policy id is parsed, the body validated or
-  a policy looked up. A member without it gets one 403 `forbidden` whatever the id
-  names (a policy of their org, another org's, nothing) or the body says, so the
+- **The bit is decided first**, before the policy id is parsed, the body read or a
+  policy looked up. A member without it gets one 403 `forbidden` whatever the id
+  names (a policy of their org, another org's, nothing) or the body is, so the
   refusal says nothing about which policies exist. It is never `not_a_member`, the
   one 403 the web app leaves the org on; someone outside the org is still told
   `not_a_member`. For a holder, another org's policy or an id that names nothing is
   a 404.
+- ⚠️ **A body that does not parse is no exception** (#4187). Taken as an extractor,
+  axum's `Json<T>` refuses such a body before the handler runs, so its 400, 415 or
+  422 came before the gate. The tunnel-policy writes, and the overlay ACL's create,
+  update and mode, take the body as `Result<Json<T>, JsonRejection>` and read it
+  with `let Json(body) = body?;` straight after the gate. `ApiError::JsonBody`
+  (`crates/core/src/error.rs:55`) answers it exactly as the extractor did, the
+  status and the plain-text words, so a holder sees no change. The overlay ACL's
+  half is pinned in `crates/tests/src/overlay_tests.rs`
+  (`overlay_acl_decides_the_bit_before_the_body`).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
   `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
