@@ -347,7 +347,7 @@ connection that one lost packet only delays. No number refuses boot (a value tha
 fails the settings load, as it does for every number setting): a pod that will not start holds a
 roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no
 replacement, restored by a setting on the deployment and a restart, with no new image
-(`crates/config/src/settings.rs:1323-1335`). The boot line `Redis Pub/Sub publisher connected`
+(`crates/config/src/settings.rs:1335-1347`). The boot line `Redis Pub/Sub publisher connected`
 names the bounds in use, `response_timeout_ms` and `connection_timeout_ms` (0 is no bound), and
 `addr`, Redis's host and port (`crates/core/src/ws/redis_pubsub.rs:465-479`).
 

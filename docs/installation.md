@@ -46,7 +46,7 @@ The Welcome page opens with a role already picked, which the person can change
 before anything happens: the background service on a machine with nothing
 installed, and an existing install's own flavour otherwise, so a default never
 switches a flavour or changes a device's security posture. Rust decides
-(`agents/roomler-setup/src/role.rs:287`, `default_role`, carried as
+(`agents/roomler-setup/src/role.rs:331`, `default_role`, carried as
 `defaultRole` on the detection); the SPA only applies it, when nothing is picked
 yet, and never saves it (a click does). The "Join the overlay network" box keeps
 its per-OS default, ticked for every preselected daemon role.
@@ -81,16 +81,16 @@ ahead) used to refuse tokens the server would still accept. The server verifies 
 token at enrollment either way.
 
 - **The reading** is the `Date` header of the server's answer to the setup-features
-  request the page sends when it opens (`agents/roomler-setup/src/features.rs:259`). It
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:284`). It
   counts only when the answer is the server's own: a 2xx JSON object from the origin that
-  was asked (`agents/roomler-setup/src/features.rs:214`, `tells_the_servers_clock`). The
+  was asked (`agents/roomler-setup/src/features.rs:239`, `tells_the_servers_clock`). The
   target of a redirect to another origin, a proxy's or a captive portal's page, and an
   older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
   arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
   clock, so a wall-clock step does not move it. It is used for 5
   minutes by either clock; after that the check asks the server again
   (`agents/roomler-setup/src/server_clock.rs:112`).
-- **The verdict** (`agents/roomler-setup/src/commands.rs:548`, `judge_expiry`):
+- **The verdict** (`agents/roomler-setup/src/commands.rs:614`, `judge_expiry`):
 
 | The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
 |---|---|---|---|
@@ -98,7 +98,7 @@ token at enrollment either way.
 | unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
 
 A token with no `exp` blocks, as before. The macOS second token follows the same rule
-(`agents/roomler-setup/src/front/app.js:1047`, `rootTokenProblem`). The expiry the page shows
+(`agents/roomler-setup/src/front/app.js:1105`, `rootTokenProblem`). The expiry the page shows
 ("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
 
 ### The install page: a list of steps, and a failure that says why (#3432, #3590)
@@ -129,7 +129,7 @@ preflight, resolve, download, verify, package, enroll
 preflight, resolve, download, verify, extract, integrate, enroll
 (`agents/roomler-setup/src/orchestrator_tunnel.rs:81`); on Linux and macOS
 preflight, package, the person's steps
-(`agents/roomler-setup/src/orchestrator_unix.rs:99`). The begin and end marks
+(`agents/roomler-setup/src/orchestrator_unix.rs:115`). The begin and end marks
 the opt-in diagnostics already record move the rows (`Steps::begin`,
 `steps.rs:389`). A step the plan does not name (the service restart, the
 companion, the anchor, the root half) gets its row where the run is when it
@@ -138,8 +138,8 @@ did not apply. After every change the tracker sends the whole checklist as one
 `ProgressEvent::Steps { rows }` snapshot
 (`crates/roomler-setup-core/src/progress.rs:227`, each row a
 `StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
-the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1688`;
-`renderInstall`, `app.js:1767`).
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1766`;
+`renderInstall`, `app.js:1845`).
 
 | Row state | When | The page shows |
 |---|---|---|
@@ -162,13 +162,13 @@ step's words (`steps.rs:305`); the download's ticks and a script's lines have
 panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
-in a person's words (`label_existing`, `orchestrator_agent.rs:1881`,
-`orchestrator_unix.rs:1237`; `orchestrator_tunnel.rs:410`), for example
+in a person's words (`label_existing`, `orchestrator_agent.rs:1883`,
+`orchestrator_unix.rs:1388`; `orchestrator_tunnel.rs:412`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
 `steps.rs:479`, into `DoneReport.warnings`,
-`agents/roomler-setup/src/commands.rs:685`; `renderDone`, `app.js:1856`): the
+`agents/roomler-setup/src/commands.rs:751`; `renderDone`, `app.js:1934`): the
 anchor's note there carries only its manual command.
 
 **The failure.** An error site hands over the error itself (`.or_fail(code)`
@@ -182,7 +182,7 @@ site's say. One function sends the terminal
 `ProgressEvent::Error { step, kind, status, words, chain }`
 (`progress.rs:216`) to the page and the replay log and writes the same line to
 the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
-failed at: ‹the failed row's label›" (`app.js:1810`), shows the words, and keeps
+failed at: ‹the failed row's label›" (`app.js:1888`), shows the words, and keeps
 the whole chain under Details.
 
 The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and
@@ -286,13 +286,13 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3988`, `crates/agent-core/src/config.rs:4515`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1295`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1297`), and the
 install refuses it before anything is downloaded (`:295`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:157`,
 never reported as a damaged config) or a folder it may not write (`:160`). The
@@ -354,7 +354,7 @@ themselves, and still shows that white window: there, start the wizard normally 
 button.
 
 **The cards follow what can work here** (`role::RoleLimit`,
-`agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
+`agents/roomler-setup/src/role.rs:235`), and a note on Welcome says why:
 
 | The situation | The cards | Why |
 |---|---|---|
@@ -1919,7 +1919,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2018-2097`):
+exit code (`scripts/install.sh:2100-2179`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -1975,11 +1975,11 @@ flowchart TD
 
 | Rule | Where | Why |
 |---|---|---|
-| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2182` | the shell has read every byte before the first command runs |
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2266` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
-| The last line, `main "$@"`, is its only call, and nothing follows it | `:2183` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
-| Its last statement is `exit` | `:2181` | a byte after the last line never runs, whatever path `main` takes |
-| `main` is called as a plain command | `:2183` | `main \|\| …`, `if main` and `! main` each turn `set -e` off for the whole script |
+| The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
+| Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
+| `main` is called as a plain command | `:2267` | `main \|\| …`, `if main` and `! main` each turn `set -e` off for the whole script |
 
 What the script asks a person goes to the terminal device, never to stdin: `sudo` asks for its
 password there, and so does the pairing's *"Join …?"* (see [Pairing from a terminal](#pairing-from-a-terminal)).
@@ -2044,7 +2044,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1488`), and the wizard's root half is the same code:
+`scripts/install.sh:1570`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -2076,7 +2076,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1222`, #2472).
+(`scripts/install.sh:1304`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -2156,7 +2156,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:84-90`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:93-99`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
@@ -2445,6 +2445,47 @@ socket, `/var/run/roomler/roomler.sock`, the root daemon's own, with the same
 root-only connect, the same bound and the same reading. A person with no person
 socket asks nothing; it never falls back to the system socket.
 
+**One device from the wizard (FR-141 P2, behind a switch).** With the server's
+`wizard_macos_one_row` on (`ROOMLER__SETUP__WIZARD_MACOS_ONE_ROW`, default off; the
+wizard reads only a JSON `true` as on), the daemon card with "Join the overlay network"
+ticked makes a Mac that is not enrolled yet ONE device row, as `install.sh --one-row`
+does from a terminal: root's daemon, which owns the overlay and supervises the person's
+screen worker. The wizard runs as the person, so it decides from four facts it can read
+as the person (`agents/roomler-setup/src/one_row_form.rs:139`), on the Welcome page, at
+pairing start and again in the install's preflight, before any token is spent:
+
+| Fact | Open when |
+|---|---|
+| The server's switch | `wizard_macos_one_row` is a JSON `true` |
+| Root's config | there is no `/etc/roomler/config.toml`, unless this run's own earlier attempt placed it (a Retry) |
+| The person's config | neither config tree names a device, and none is unreadable |
+| The release | the macOS `.pkg` the install takes is `agent-v0.4.201` or later, the first that knows `enroll --one-row` (an older one would stop after the token is spent) |
+
+Open, the card says one device. The pairing asks for one token (`halves: 1`), and the
+paste box has one field. The approval card and the Done page name one device. The token
+enrolls root's config in the wizard's process, under the device's own name, with the
+overlay on and both FR-43 switches. Before that, the wizard makes the person's app
+folders as the person and stops, with nothing enrolled, if one is not theirs to write
+(FR-147: nothing as root makes a folder in a home). The one administrator dialog then
+runs `install.sh --privileged-steps --one-row --config-from FILE`. That places root's
+config before the one package run, whose guard removes the LaunchAgent and starts root's
+service (`install_macos_one_row_half`). No person's enrollment and no user half run, so
+nothing starts a LaunchAgent beside the worker (#4092). A cancel or a failure after the
+enroll keeps the config for Retry, which never posts the token twice. Unticked, the card
+installs the per-user half alone, as before.
+
+Closed, the ticked box makes B2's two rows, as before. While the switch is on, the page
+says why under the card:
+
+| Closed because | What the page says to do |
+|---|---|
+| Root's service is enrolled already (two rows, or a supervised worker) | Keep its two devices; to make it one, `sudo roomlerd one-row` five minutes after this install |
+| The person's screen sharing is enrolled already | The private network joins as a second device; for one device, the install script's `--one-row` with a new token, then delete the old row |
+| The release is older than 0.4.201, or unknown | The box makes two devices |
+
+The wizard never converts an enrolled Mac: a layout changes by its person's own command
+(the operator's ruling on #971, 2026-11-02).
+
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
@@ -2695,10 +2736,11 @@ The guard decides it here as it does at every update after.
 | Its person enrolled in an earlier install | Goes ahead, and says that row now stays offline, to be deleted in the device list |
 
 It is refused, with a message that names the flag, off macOS, with `--role tunnel`,
-beside `--daemon-token`, with `--privileged-steps` or `--user-steps`, and with
-`--no-enroll`. It is the script's alone for now: the wizard has no one-row control, and
-FR-129's next phase decides whether it gets one. The script a server hands out changes
-with that server's roll.
+beside `--daemon-token`, with `--user-steps`, with `--privileged-steps` unless
+`--config-from` names the root config to place (the setup wizard's half, above), and with
+`--no-enroll`. The wizard's own one-row form is behind the server's
+`wizard_macos_one_row`, off by default (FR-141 P2, the macOS wizard above). The script a
+server hands out changes with that server's roll.
 
 Read on released 0.4.201, a fresh Mac and the script roomler.ai serves: one row at the
 first start, then, once both permissions were on and the root half had restarted as the
@@ -3567,8 +3609,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1430` (the section) — `uninstall_linux` at `:1874`,
-`uninstall_macos` at `:1939`.
+`scripts/install.sh:1512` (the section) — `uninstall_linux` at `:1956`,
+`uninstall_macos` at `:2021`.
 
 ```mermaid
 flowchart TD
