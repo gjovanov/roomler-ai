@@ -345,6 +345,10 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // worker's own session table and its hello follow the root's value, never
     // the person's config, so the root's off is the worker's off.
     "RC_SESSIONS_SURVIVE_REATTACH",
+    // FR-149 P1 — the session panel's switch: the root's `0` means its
+    // questions are never asked on the worker's panel, and the worker then
+    // does not say `consent-panel`.
+    "SESSION_PANEL",
 ];
 
 /// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
@@ -2291,6 +2295,17 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// FR-149 P1 — the session panel's switch is the root's: its off reaches
+    /// the worker as off, and the worker then does not say `consent-panel`.
+    #[test]
+    fn the_roots_session_panel_switch_binds_the_worker() {
+        assert!(WORKER_ENV_FORWARD.contains(&"SESSION_PANEL"));
+        assert_eq!(
+            worker_env_args(|s| (s == "SESSION_PANEL").then(|| "0".to_string())),
+            vec!["ROOMLERD_SESSION_PANEL=0"]
+        );
     }
 
     fn base() -> Inputs {

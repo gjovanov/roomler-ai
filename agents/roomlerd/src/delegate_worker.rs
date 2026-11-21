@@ -410,6 +410,7 @@ async fn attach_once(
     // change re-sends them (the arm below). Subscribed BEFORE the first
     // announcement, so a change in between is never missed.
     let mut gates = watch_gates();
+    let hosts_panel = crate::indicator::session_panel::hosts_the_panel(person.is_some());
     {
         let caps = own_caps();
         tracing::info!(
@@ -424,12 +425,23 @@ async fn attach_once(
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
                 // #3864 — a worker with no enrollment relays the root half's
-                // consent questions to its person's app.
-                features: crate::delegate::worker_features(person.is_some()),
+                // consent questions to its person's app. FR-149 P1 — and,
+                // with the macOS panel and the switch on, shows them.
+                features: crate::delegate::worker_features(person.is_some(), hosts_panel),
             },
         )
         .await?;
     }
+    // FR-149 P1 — the root daemon's panel frames, served off this loop: a
+    // show waits for the panel's main thread on a task of its own, and its
+    // answer comes back for this loop to write. The desk carries a click's
+    // word too, and the root daemon's questions on this panel come down with
+    // it when the channel ends, however it ends.
+    let mut panel = crate::indicator::session_panel::Desk::new(
+        std::sync::Arc::new(crate::indicator::session_panel::ThePanel),
+        hosts_panel,
+        true,
+    );
     // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
     // their row and its broker are gone, so the daemon's `Request` arm is the
     // only consent there is. Subscribed BEFORE the first frame, so a change in
@@ -539,12 +551,23 @@ async fn attach_once(
                             )
                             .await?;
                         }
+                        // FR-149 P1 — the root daemon asks this panel to show
+                        // its question. Never waited for here: the show waits
+                        // for the panel's main thread on a task of its own,
+                        // and its word comes back on the desk's arm below. A
+                        // worker that does not host the panel was never
+                        // asked, and says `not_up`.
+                        Ok(WorkerLane::Here(DelegateFrame::PanelAsk { id, question })) => {
+                            panel.ask(id, question);
+                        }
+                        Ok(WorkerLane::Here(DelegateFrame::PanelHide { id })) => panel.hide(&id),
                         Ok(WorkerLane::Here(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
                             | DelegateFrame::KeepBusyTold { .. }
                             | DelegateFrame::WorkerLogs { .. }
-                            | DelegateFrame::PersonFloor(..),
+                            | DelegateFrame::PersonFloor(..)
+                            | DelegateFrame::PanelTold { .. },
                         )) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -579,6 +602,12 @@ async fn attach_once(
                     None => return Ok(()),
                 }
             }
+            // FR-149 P1 — the panel's word for the root daemon: a question's
+            // answer, or a click's that the root half did not take. Written
+            // from THIS loop, as a delegated session's replies are.
+            (id, state) = panel.next_word() => {
+                write_frame(&mut wr, &DelegateFrame::PanelTold { id, state }).await?;
+            }
             // FR-43 P3a — this worker's own log lines, for the daemon to upload
             // on its row. What is queued goes in one frame, so a burst is one
             // write; lines logged while detached wait in the queue, which drops
@@ -608,7 +637,7 @@ async fn attach_once(
                         caps: Box::new(caps),
                         // #3864 — the same words as the first frame: the
                         // daemon keeps the words of the newest frame only.
-                        features: crate::delegate::worker_features(person.is_some()),
+                        features: crate::delegate::worker_features(person.is_some(), hosts_panel),
                     },
                 )
                 .await?;
