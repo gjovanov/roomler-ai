@@ -36,7 +36,9 @@
 //! ## Platform backends
 //! * `linux` — `wmctrl` (list/focus) + `tmux` (bash sessions) + `xterm`.
 //!   The flagship: a bash "session" is a tmux session, surfaced as an
-//!   xterm attached to it — survives agent restart/disconnect and is
+//!   xterm attached to it — outlives its xterm, a disconnect and the virtual
+//!   desktop's X server (a daemon restart only where no service manager owns
+//!   the daemon), and is
 //!   ssh-attachable. Windows are matched back to their session/app via a
 //!   `roomler:tmux:<s>` / `roomler:app:<key>` xterm-title convention.
 //! * `windows` — `EnumWindows` / `SetForegroundWindow` / a plain spawn on
@@ -475,6 +477,22 @@ pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
     {
         Err(Unavailable::Platform)
     }
+}
+
+/// #4100 — the Linux backend on the virtual desktop `display`, with stand-ins
+/// for its helper programs (tmux, xterm, wmctrl and xprop, in that order) and
+/// asking `start` first, for the virtual desktop's tests (`mod linux` is
+/// private).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn linux_backend_for_tests(
+    display: &str,
+    tools: [String; 4],
+    start: crate::virtual_desktop::XStarter,
+) -> Box<dyn WindowManager> {
+    let target = linux::Target::Daemon {
+        display: display.into(),
+    };
+    Box::new(linux::LinuxWm::with(target, tools, start))
 }
 
 // ---------------------------------------------------------------------------

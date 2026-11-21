@@ -234,6 +234,29 @@ stalled, every candidate only the mesh carries ranks below every TURN relay, so 
 video crosses the mesh only when nothing else connects
 ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)).
 
+A candidate's rank cannot see one route, though: a LAN socket whose checks reach a mesh
+address rides the mesh too, because the destination picks the route. Under the switch's
+`route` value (step 2) the unit is the pair: a pair rides the mesh when either end sits on
+the mesh's own blocks or its local candidate is ranked last, never on the whole
+`100.64.0.0/10` (`rides_the_mesh`,
+`crates/vendored/webrtc-ice/src/agent/agent_config.rs:183`). While a sibling on the mesh
+carries that route, the agent forms no pair from a socket off the mesh into it, and it
+holds the pairs the mesh carries, unanswered, for at most 2.5 s while a TURN relay can
+still come. A TURN pair that connects inside the hold wins; the mesh carries the video
+when none does, and the session's path line names the route and the hold
+([remote-control.md](remote-control.md#the-route-rank-fr-148-p4-step-2)).
+
+A TURN relay that allocates after the hold still takes the session off the mesh (phase
+B). While the selection rides the mesh, the agent checks each pair off it that ranks
+above, on every 200 ms tick of its ICE loop, up to 13 checks of the pair's own
+(`ROUTE_MOVE_CHECKS`, `crates/vendored/webrtc-ice/src/agent/agent_config.rs:130`). It
+answers the browser's nomination of such a pair before its own check has validated the
+pair, and moves onto it only once that check succeeds, so it never sends on a pair it
+has not validated (`answers_before_validating`,
+`crates/vendored/webrtc-ice/src/agent/agent_selector.rs:221`). Each move writes one
+`session carrier moved` line, from the carrier the session left to the one it took
+([remote-control.md](remote-control.md#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)).
+
 ### The direct carrier's socket buffers (FR-110)
 
 A direct carrier is one UDP socket, and the kernel holds whatever arrives
@@ -588,7 +611,7 @@ does instead:
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:3209`](../agents/roomler-cli/src/localclient.rs#L3209)):
+  reaches ([`localclient.rs:3210`](../agents/roomler-cli/src/localclient.rs#L3210)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -960,7 +983,7 @@ has deleted, or one of another org, never matches.
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
 re-fanned about 750 ms later, one re-fan for a burst of changes, while the org's ACL
 is `warn` or `enforce` (`refan_for_role_change`,
-`crates/modules/network/src/routes/overlay_policy.rs:334`). Under `off` a role shapes
+`crates/modules/network/src/routes/overlay_policy.rs:346`). Under `off` a role shapes
 nothing, so nothing is re-fanned. A node whose owner's roles cannot be read matches
 no role rule, with a WARN (`overlay acl: roles unreadable; role-scoped rules will not
 match this node`), and an org-relay grant that needs them is refused.
@@ -1468,13 +1491,13 @@ utun in #4117's shape, in the CI step `macOS overlay against a real utun`:
 | `a_datagram_to_its_own_address_is_delivered_and_answered` (`tun.rs:10832`) | a UDP datagram the Mac sends to `<self>:53` reaches a socket bound there, and its reply comes back |
 | `a_ping_to_its_own_address_is_answered` (`tun.rs:10871`) | `ping -c 3 -t 5 <self>` gets its 3 answers, two hand-backs per echo |
 | `a_handed_back_packet_is_delivered_once_and_never_read_again` (`tun.rs:10912`) | one datagram is one hand-back and its reply one more; no packet to `<self>` comes out of the read, nothing more comes into the utun in the 2 s after, and one INFO is logged |
-| `the_kill_switch_hands_nothing_back` (`tun.rs:10984`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
-| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:11039`) | the same datagram to the derived IPv6 reaches a socket bound to `[<self v6>]:53`, and its reply comes back. The route macOS answers for the address, and what `ping6 -c 3` to it gets, are printed |
-| `a_handed_back_v6_datagram_is_delivered_once_and_never_read_again` (`tun.rs:11120`) | for that datagram, one hand-back and one more for its reply; no packet to the address comes out of the read, and nothing more comes into the utun in the 2 s after |
-| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:11193`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
-| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:11273`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
-| `a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways` (`tun.rs:11421`) | a TCP connection from the Mac to a listener on the derived IPv6 carries a few bytes each way, and its segments are handed back. How much of a 64 KiB write arrives within 3 s is printed |
-| `a_tcp_connection_to_its_own_address_carries_bytes_both_ways` (`tun.rs:11451`) | the same over the IPv4 address, as a control |
+| `the_kill_switch_hands_nothing_back` (`tun.rs:11013`) | switched off, the datagram is read from the utun and never delivered, and the bring-up's INFO says so |
+| `a_datagram_to_its_own_derived_v6_is_delivered_and_answered` (`tun.rs:11083`) | the same datagram to the derived IPv6 reaches a socket bound to `[<self v6>]:53`, and its reply comes back. The route macOS answers for the address, and what `ping6 -c 3` to it gets, are printed |
+| `a_handed_back_v6_datagram_is_delivered_once_and_never_read_again` (`tun.rs:11164`) | for that datagram, one hand-back and one more for its reply; no packet to the address comes out of the read, and nothing more comes into the utun in the 2 s after |
+| `measure_what_the_utun_reads_for_a_datagram_to_its_own_derived_v6` (`tun.rs:11237`) | with the hand-back off: the checksum of that datagram as the utun reads it, beside the IPv4 one's, and whether macOS delivers it when it is written back in as read, with its checksum finished, or from a peer's derived address. Printed; it asserts only that both datagrams are read |
+| `the_resolver_on_its_own_address_answers_a_lookup_from_the_mac` (`tun.rs:11317`) | the overlay's resolver, bound to `<self>:53` as the runtime binds it, answers a lookup the Mac sends it |
+| `a_tcp_connection_to_its_own_derived_v6_carries_bytes_both_ways` (`tun.rs:11471`) | a TCP connection from the Mac to a listener on the derived IPv6 carries a few bytes each way, and its segments are handed back. How much of a 64 KiB write arrives within 3 s is printed |
+| `a_tcp_connection_to_its_own_address_carries_bytes_both_ways` (`tun.rs:11501`) | the same over the IPv4 address, as a control |
 
 The rules are pure and tested on every platform: the hand-back's
 (`utun_self_delivery_tests`, `tun.rs:8613`), and the checksum's, against

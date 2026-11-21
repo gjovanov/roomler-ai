@@ -51,7 +51,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 
 - **The wizard** (code): one paragraph on Done, "One manual step remains: macOS grants Screen Recording and
   Accessibility by hand…", which also says to choose Quit & Reopen and to allow the local-network prompt
-  (`agents/roomler-setup/src/front/app.js:1947-1951`). No live state, no button, nothing about prompt 4. Field
+  (`agents/roomler-setup/src/front/app.js:2028-2032`). No live state, no button, nothing about prompt 4. Field
   (11 Nov, 0.4.211): it names "Accessibility", which macOS 27 calls "Device Control and Data Access", and it says
   the same after a re-install with both grants on.
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —
@@ -76,13 +76,13 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - TCC binds a grant to the app's code requirement. When the signing identity changed on 2026-09-08, `tccd` logged
   `Failed to match existing code requirement for subject com.roomler.agent and service kTCCServiceScreenCapture`
   while the entry stayed listed and on (`docs/fr/FR-80-a-session-with-no-pixels-says-why.md:27-33`). A release's
-  Developer ID signature keeps the grants across our updates (`docs/installation.md:2245-2247`; field: no prompt
+  Developer ID signature keeps the grants across our updates (`docs/installation.md:2955-2957`; field: no prompt
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an
   existing grant" (`capture/mod.rs:789-790`).
 - Nothing of ours reads the stored grants. The one reset is the uninstall's, as root, while the bundle is there
-  (`scripts/install.sh:1945-1953`).
+  (`scripts/install.sh:2027-2035`).
 
 ### Bundle, signing and the network paths (code)
 
@@ -164,7 +164,7 @@ what is missing.
   that finds a grant it held before now refused, with the version or the macOS build changed, reads as stale.
 - **What the row says:** "On in System Settings, but macOS no longer accepts it. This can happen after an update."
   **One action, Repair:** `tccutil reset <service> com.roomler.agent` (through the root half as the uninstall does,
-  `install.sh:1950`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
+  `install.sh:2032`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
   again, which lists it in the pane, the person turns it on, and Roomler restarts it. Repair is never offered to a
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other

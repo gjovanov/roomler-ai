@@ -102,7 +102,7 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3561`](../crates/localapi/src/lib.rs#L3561), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
+  ([`lib.rs:3600`](../crates/localapi/src/lib.rs#L3600), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
   push it ([`models.rs:9768`](../crates/remote_control/src/models.rs#L9768)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
@@ -292,7 +292,7 @@ sequenceDiagram
   ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1613`](../agents/roomlerd/src/virtual_desktop.rs#L1613) `start_server`). An
+  the same display ([`virtual_desktop.rs:1712`](../agents/roomlerd/src/virtual_desktop.rs#L1712) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
