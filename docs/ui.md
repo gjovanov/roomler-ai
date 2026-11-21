@@ -388,6 +388,21 @@ read the list route page by page through `fetchAllPages` (`utils/allPages.ts`):
 100 rows a page, the server's cap, and at most 50 pages. Past that the tab says
 how many of how many it shows (#4188).
 
+Both tabs follow their org (#4248). The route reuses the two sections when only
+the org id in the URL changes, so each watches its `tenantId` prop, from the start
+and on every change, instead of loading once on mount. A change closes an editor
+or a delete prompt left open on the previous org's row, whose save would go to the
+new org (`components/admin/TunnelPoliciesSection.vue:832`,
+`components/admin/OverlayAclSection.vue:686`). The stores the tabs read (devices,
+tunnel clients, overlay nodes, roles, members and the two policy lists) hold one
+org's rows at a time and record which. A fetch for another org drops the rows at
+once, only the latest fetch writes, and a save answered for another org leaves the
+list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
+page that only names or picks devices asks with `ensureAgents` or
+`ensureTunnelClients` (`stores/agents.ts:1035`, `stores/tunnelClients.ts:117`),
+which fetch unless the store already holds, or is loading, that org's rows. Never
+gate a fetch on an empty list: a list that holds another org's rows is not empty.
+
 ### The devices list's "needs a person" chips
 
 `AgentsSection` shows these in both its table and its cards. Each appears only when someone has to act, and
