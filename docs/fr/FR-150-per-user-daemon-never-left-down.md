@@ -1,6 +1,6 @@
 # FR-150: A per-user daemon is never left down by its own update or by a crash
 
-**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a merged (#4135), its cells read on candidates the same day; P1b merged (#4159), its cells read on candidates the same day; P2 in review (#4199), its cells to come on candidates
+**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a merged (#4135, `e4160fa1c`), its cells read on candidates the same day; P1b merged (#4159, `29214ffc4`), its cells read on candidates the same day; P2 merged (#4199, `3cad49ba3`), its cells to come on candidates
 **Absorbs:** [#3507](https://github.com/gjovanov/roomler-ai/issues/3507) (the update path) and [#3295](https://github.com/gjovanov/roomler-ai/issues/3295) (the crash path), with the 2026-11-08 triage's re-spec of both
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
@@ -406,11 +406,11 @@ it (C5c).
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
-| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | merged (#4135); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
-| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | merged (#4159); C11 and C12 GREEN on candidates (field log) |
-| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | in review (#4199), after P1a; its cells to come on candidates built from P1b and P2 (C14b needs both) |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | merged (#4135, `e4160fa1c`); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
+| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | merged (#4159, `29214ffc4`); C11 and C12 GREEN on candidates (field log) |
+| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | merged (#4199, `3cad49ba3`); its cells to come on candidates built from P1b and P2 (C14b needs both) |
 | Field | each phase's cells on its candidates, then C19 on the release | read only | P1a's and P1b's cells read on candidates (field log); P2's cells and C19 to come |
-| Docs | each phase's docs in its own pull request | none | P1a's merged in #4135 and P1b's in #4159; P2's in review in #4199 |
+| Docs | each phase's docs in its own pull request | none | P1a's merged in #4135, P1b's in #4159 and P2's in #4199 |
 
 - **P1a leaves working by itself**: no new task is registered that its account cannot replace, a self-update over
   one that was still brings the daemon back, a registration that is refused says so in the person's log, and an
@@ -461,8 +461,15 @@ The docs:
 - [ ] **AC7** (#3295 RED then GREEN, P2): C13 fails on the current release and passes on the candidate: a per-user
   daemon that crashes is back online within a minute, with no window and no sign-in.
 - [ ] **AC8** (P2): C14–C18 and C14b pass, and a real crash loop still ends in #3289's handling.
-- [ ] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
-  shown failing on master first.
+- [~] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
+  shown failing on master first. Green on each phase's final head: #4135 at `409c6e839`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44900865689)), #4159 at `ea2636212`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44909372642)) and #4199 at `9bf2719c3`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44914023040)). P2's three tests over master's code failed
+  with master's lines put back
+  ([#4199's comment](https://github.com/gjovanov/roomler-ai/pull/4199#issuecomment-7055246347)). P1b's tests run over
+  the code P1b adds: the relaunch ladder over its seam, and the record's new field. Owed: the same read for P1a's tests
+  over code master already had, such as `the_task_names_its_own_descriptor` over `render_task_xml`.
 - [ ] **AC10** (the update path stays whole): C19 passes.
 - [ ] **AC11** — Docs updated in house style (tables, the watcher's ladder as a mermaid flow, `file:line` anchors):
   the sections above in `docs/installation.md`, the rule and the module docs, linked from `docs/README.md`.
