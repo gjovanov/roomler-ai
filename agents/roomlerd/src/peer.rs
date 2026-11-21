@@ -11487,8 +11487,8 @@ fn attach_cursor_handler(
     // left in ([`AgentPeer::session_end`]).
     session_end: tokio_util::sync::CancellationToken,
 ) -> JoinHandle<()> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    // #4207: the `cursor:shape` message, its bitmap scaled to fit one
+    // data-channel message, is built in `capture::cursor::shape_message`.
 
     tokio::spawn(async move {
         // Wait for the DC to be open before starting the pump — a
@@ -11549,25 +11549,25 @@ fn attach_cursor_handler(
                 Some(tick) => {
                     last_hidden = false;
                     if let Some(shape) = &tick.shape {
-                        let b64 = BASE64.encode(&shape.bgra);
-                        let msg = serde_json::json!({
-                            "t": "cursor:shape",
-                            "id": tick.shape_id,
-                            "w": shape.width,
-                            "h": shape.height,
-                            "hx": shape.hotspot_x,
-                            "hy": shape.hotspot_y,
-                            "bgra": b64,
-                            // Optional CSS `cursor` keyword for stock
-                            // system cursors ("text", "default", …);
-                            // null for app-custom cursors. Lets the
-                            // browser render the viewer's native OS
-                            // cursor instead of this bitmap. Additive —
-                            // old browsers ignore it.
-                            "css": shape.css,
-                        });
-                        if let Ok(s) = serde_json::to_string(&msg) {
-                            let _ = dc.send_text(s).await;
+                        // #4207: `shape_message` scales a bitmap down until the
+                        // message fits what a peer takes in one message
+                        // (`capture::cursor::SHAPE_MESSAGE_BUDGET`). A shape is
+                        // sent when the pointer changes to it, so a failed send
+                        // warns once for that change, and the pump goes on: a
+                        // refused message is not a closed channel (a closed one
+                        // ends the pump at the `cursor:pos` send below).
+                        let s = crate::capture::cursor::shape_message(tick.shape_id, shape);
+                        let bytes = s.len();
+                        if let Err(e) = dc.send_text(s).await {
+                            warn!(
+                                %session_id,
+                                shape_id = tick.shape_id,
+                                w = shape.width,
+                                h = shape.height,
+                                bytes,
+                                error = %e,
+                                "cursor:shape send failed; the viewer keeps its previous pointer"
+                            );
                         }
                     }
                     // Express the native-pixel cursor position in the

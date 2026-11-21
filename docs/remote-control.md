@@ -5941,6 +5941,23 @@ to-activate, so the browser never sees a bait-and-switch.
   (`ROOMLER_AGENT_WGC_CURSOR=1` re-enables) so the low-latency overlay /
   CSS cursor is the single source with no double cursor. Additive +
   back-compat: old browsers ignore `css` and draw the bitmap.
+  **A shape always fits one message (#4207):** a webrtc-rs reader takes
+  at most 65 535 bytes a message and the agent's SCTP stack refuses one
+  over 65 536, so a `cursor:shape` whose message would pass 64 000 bytes
+  (a bitmap of about 110×110 px or more: an enlarged accessibility
+  pointer, a large application cursor, a high DPI) goes out with its
+  bitmap scaled down, aspect kept, until the message fits
+  (`shape_message`, `agents/roomlerd/src/capture/cursor.rs:813`). `w`,
+  `h`, `hx`, `hy` and `bgra` describe the scaled bitmap, the hotspot
+  scaled with it and kept inside it, and `css` is kept, so the wire and
+  the viewer are unchanged: the viewer draws such a pointer smaller than
+  the host does, and a stock one as its own native cursor. The scale
+  averages premultiplied colour, so a transparent ground leaves no dark
+  fringe at the pointer's edge. A shape send that fails is logged at WARN
+  with its error, one line per send (a shape is sent when the pointer
+  changes to it), and the pump goes on. Before the fix such a shape never
+  arrived, silently: the viewer kept the previous pointer, even for a
+  stock cursor, whose `css` only counts once its shape is cached.
 - **Clipboard DC** (0.1.32): thread-pinned `arboard::Clipboard` worker;
   JSON protocol `clipboard:read` / `clipboard:write` /
   `clipboard:content` / `clipboard:error` with `req_id` round-trip
