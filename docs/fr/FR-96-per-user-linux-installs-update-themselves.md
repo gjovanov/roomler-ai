@@ -202,8 +202,8 @@ hand install alike, and the helper never speaks to a daemon.
 
 ### 3.5 The installers (P3, as built)
 
-`install.sh` turns the helper on for a per-user install and off for `--system` (`scripts/install.sh:564-640`, called
-at `:452` and `:461-469`):
+`install.sh` turns the helper on for a per-user install and off for `--system` (`scripts/install.sh:579-655`, called
+at `:467` and `:476-484`):
 
 | install | the helper | the daemon |
 |---|---|---|

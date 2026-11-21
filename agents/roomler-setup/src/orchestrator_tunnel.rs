@@ -362,6 +362,8 @@ async fn run_install_inner(
         anchored: None,
         // FR-129 B2 — nor a root half.
         root_half: None,
+        // FR-141 P2 — nor a Mac's one row.
+        one_row: false,
     })
 }
 

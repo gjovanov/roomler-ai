@@ -13,7 +13,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
 };
 use bson::oid::ObjectId;
@@ -786,12 +786,17 @@ pub async fn delete_tunnel_client(
 /// internal hosts and ports included. Membership alone authorizes neither
 /// (security-baseline.md §3).
 ///
-/// Decided FIRST, before the policy id is parsed, the body validated or the
-/// policy looked up. A member without the bit therefore gets one 403
+/// Decided FIRST, before the policy id is parsed, the body read or the policy
+/// looked up (#4187). A member without the bit therefore gets one 403
 /// `forbidden` whatever the id names (a policy of theirs, another org's,
-/// nothing) and whatever the body says. It is never `not_a_member`, the one 403
+/// nothing) and whatever the body is. It is never `not_a_member`, the one 403
 /// the web app leaves the org on; someone outside the org still gets that,
 /// from the membership read inside `require_permission`.
+///
+/// So the writes take their body as `Result<Json<T>, JsonRejection>` and read
+/// it after this: as an extractor, `Json<T>` answered a body that does not
+/// parse with a 400, 415 or 422 before the handler ran. A holder is answered
+/// such a body as before (`ApiError::JsonBody`).
 ///
 /// ⚠️ The forward itself (`crate::tunnel::handle_forward_request`) reads no
 /// permission bit, and must not: the policy IS the grant. It exists to let
@@ -947,16 +952,17 @@ fn subject_role_ids(subjects: &[PolicySubject]) -> Vec<ObjectId> {
 }
 
 /// POST /api/tenant/{tenant_id}/tunnel-policy — create a new policy.
-/// `MANAGE_AGENTS`, decided before the body is validated
+/// `MANAGE_AGENTS`, decided before the body is read
 /// ([`tunnel_policy_manager`]). A role subject names a role of this org, or
 /// the body is a 400 (`require_org_roles`).
 pub async fn create_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<TunnelPolicyCreateRequest>,
+    body: Result<Json<TunnelPolicyCreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TunnelPolicyResponse>), ApiError> {
     let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
+    let Json(body) = body?;
     validate_policy_input(&body.name, &body.subjects, &body.targets, &body.allowlist)?;
     roomler_core::guards::require_org_roles(&state, tid, &subject_role_ids(&body.subjects), &[])
         .await?;
@@ -1022,15 +1028,18 @@ pub async fn get_tunnel_policy(
 /// write underneath it is live-scoped on its own, so neither a stale page nor
 /// a caller that skips the read can edit a tombstone back into service.
 ///
-/// `MANAGE_AGENTS`, decided before the id is looked up or the body validated
+/// `MANAGE_AGENTS`, decided before the id is looked up or the body read
 /// ([`tunnel_policy_manager`]): editing a policy's subjects is granting.
 pub async fn update_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
-    Json(body): Json<TunnelPolicyUpdateRequest>,
+    body: Result<Json<TunnelPolicyUpdateRequest>, JsonRejection>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
     let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
+    // Read straight after the gate, before the id: a holder is answered a
+    // body that does not parse as before, whatever the id (#4187).
+    let Json(body) = body?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     // Resolve the target LIVE before touching it — a removed policy is a 404
