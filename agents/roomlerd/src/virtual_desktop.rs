@@ -5913,16 +5913,37 @@ mod supervise_tests {
         supervisor.join().expect("the supervisor left cleanly");
     }
 
-    /// The process of start `s` once its script has exec'd its `sleep`, as
-    /// `/proc` describes it: what every later look and signal checks against.
+    /// The process of start `s` once the `sleep` its script exec'd sleeps,
+    /// as `/proc` describes it: what every later look and signal checks
+    /// against ([`asleep_in_its_sleep`]).
     fn wm_proc(s: &WmStart) -> ProcInfo {
-        let mut info = None;
-        wait_for("the window manager to exec its sleep", || {
-            let comm = std::fs::read_to_string(format!("/proc/{}/comm", s.pid)).unwrap_or_default();
-            info = read_proc_stat(s.pid).filter(|_| comm.trim() == "sleep");
-            info.is_some()
-        });
-        info.unwrap()
+        asleep_in_its_sleep(s.pid)
+    }
+
+    /// `pid` once the `sleep` it exec'd is asleep in its sleep (#4197). Only
+    /// then does a look see what it holds for good, which is what it was
+    /// handed. From the exec on, its name reads `sleep` while its program
+    /// still starts: the loader holds each library open while it maps it, the
+    /// C library opens its locale's files, and a `sleep` built in Rust ignores
+    /// SIGPIPE until its `main` puts the default back. None of that sleeps
+    /// (state `S`); the program's own sleep is the first thing that does. The
+    /// name and the state come from one `/proc/<pid>/stat` line, one moment.
+    fn asleep_in_its_sleep(pid: i32) -> ProcInfo {
+        let mut stat = String::new();
+        poll_for(Duration::from_secs(20), || {
+            stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let name = stat.get(stat.find('(')? + 1..stat.rfind(')')?)?;
+            let (state, ppid, pgid, starttime) = parse_stat(&stat)?;
+            (name == "sleep" && state == "S").then_some(ProcInfo {
+                pid,
+                ppid,
+                pgid,
+                starttime,
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("the window manager {pid} was not asleep in its sleep in 20 s: {stat:?}")
+        })
     }
 
     /// Signal the process this test recorded, while `/proc` still shows it.
@@ -6012,6 +6033,68 @@ mod supervise_tests {
         assert!(keeper_ran, "the keeper left with the window manager");
         assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
         assert_eq!(desktop_starts, 0, "the desktop was started again");
+    }
+
+    /// #4197 — a window manager is read once the `sleep` it exec'd sleeps,
+    /// never while that program is still starting. From the exec on, its
+    /// name reads `sleep`, and its loader then holds each library open while
+    /// it maps it. A stand-in named `sleep` is caught there: stopped with a
+    /// library open on fd 3. A slow start, it goes on later, lets the library
+    /// go and execs a real `sleep`, and only that one, asleep, may be read.
+    #[test]
+    fn a_window_manager_still_starting_is_read_once_it_sleeps() {
+        let dir = scratch("wm-starting");
+        // A library this process maps, so one every host has.
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let lib = maps
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(5))
+            .find(|p| p.contains(".so"))
+            .expect("a library this process maps")
+            .to_string();
+        // Its name reads `sleep` from this exec on, as a real one's does.
+        std::os::unix::fs::symlink("/bin/sh", dir.join("sleep")).unwrap();
+        let mut stand_in = Command::new(dir.join("sleep"))
+            .arg("-c")
+            .arg(format!(
+                "exec 3<\"{lib}\"; kill -STOP $$; exec 3<&-; exec sleep 300"
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = stand_in.id() as i32;
+        let _end = KillAtTheEnd(read_proc_stat(pid).into_iter().collect());
+        wait_for("the stand-in to stop with the library open", || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| parse_stat(&s).map(|(state, ..)| state == "T"))
+                .unwrap_or(false)
+        });
+        let goes_on = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            RealProcs.signal(pid, libc::SIGCONT);
+        });
+        let seen = seen_of(
+            &wm_proc(&WmStart {
+                pid,
+                parent: 0,
+                at_ns: 0,
+            }),
+            0,
+        );
+        goes_on.join().unwrap();
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            seen.fds.get(&3),
+            None,
+            "the window manager was read while its program was still starting: {:?}",
+            seen.fds
+        );
     }
 
     /// #4099, box 2 — a window manager that exits at once, every time, is
@@ -7998,7 +8081,9 @@ mod supervise_tests {
         );
         let _stop = StopAtTheEnd(desk.clone());
         let keeper = desk.start_clients();
-        let wm = recorded(dir, "wm.pid");
+        // Its pid is written before its `exec sleep 300`: read it once that
+        // `sleep` sleeps, never while its script or its start runs (#4197).
+        let wm = asleep_in_its_sleep(pid_in(dir, "wm.pid"));
         let seen = seen_of(&wm, x_pid);
         desk.stop();
         (seen, keeper, wm.ppid)
