@@ -13,6 +13,12 @@ source of truth.
   is the code to branch on, and `message` is for reading. A collision no route put in
   words answers `409 conflict` with `That already exists`
   ([security-baseline.md](security-baseline.md) §5).
+- **Paged lists** take `page` (from 1) and `per_page` (1 to 100), and the page
+  parameters are kept within their range (`PaginationParams`,
+  `crates/services/src/dao/base.rs`). A paged list has a stable order: a list sorted in
+  memory ends its sort with `_id` in its last key's direction, so rows that share every
+  other sort key land on exactly one page, and a list an index orders reads in that
+  index's order (#4215).
 
 ## Authentication
 
