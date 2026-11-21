@@ -46,6 +46,20 @@
         tunnel, ask an organization administrator for a policy that names you.
       </v-alert>
 
+      <!-- #4188: the store reads every page of the list up to its page cap;
+           past it, the tab says how much of the list it shows. -->
+      <v-alert
+        v-if="store.truncated"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4"
+        data-testid="tunnel-acl-truncated"
+      >
+        Showing the first {{ store.policies.length }} of this organization's
+        {{ store.total }} tunnel policies.
+      </v-alert>
+
       <p v-if="!store.refused && !store.loading && store.policies.length === 0" class="text-medium-emphasis">
         No tunnel policies defined yet. Server-side ACL is default-deny — until
         you add at least one policy, every <code>roomler forward</code>

@@ -3652,10 +3652,69 @@ when one is needed (FR-27).
 
 | Component | Mechanism |
 |---|---|
-| `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version. On a Windows service install the post-install watcher's last act is to **settle** the `Roomler` service: it waits out a stop still in flight, starts the service when it reads STOPPED, and trusts RUNNING only after 15 s unbroken. Windows Installer's Restart Manager can stop the freshly installed service *after* the install has finished, and a single `sc start` answers 1056 ("already running") for a service that is still stopping (#2711). `last-install.json` records what it saw (`service Roomler: running (1 start; seen StopPending→Stopped→Running)`). The watcher writes its verdict without `println!` (#2934, #2935): an update driven by `roomler exec … self-update` leaves it the exec's stdout, whose reader is gone by then, and the panic that followed was filed as an agent crash |
+| `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts, but not over live work: a remote-control session, an SSH connection, an exec run, a transfer or a recording defers the periodic check by the hour, seven times at most ([below](#an-update-waits-for-live-work-3429)). A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version. On a Windows service install the post-install watcher's last act is to **settle** the `Roomler` service: it waits out a stop still in flight, starts the service when it reads STOPPED, and trusts RUNNING only after 15 s unbroken. Windows Installer's Restart Manager can stop the freshly installed service *after* the install has finished, and a single `sc start` answers 1056 ("already running") for a service that is still stopping (#2711). `last-install.json` records what it saw (`service Roomler: running (1 start; seen StopPending→Stopped→Running)`). The watcher writes its verdict without `println!` (#2934, #2935): an update driven by `roomler exec … self-update` leaves it the exec's stdout, whose reader is gone by then, and the panic that followed was filed as an agent crash |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin): since FR-97 P6b the release's `.asc` is checked against the pinned key on every OS, and Linux and macOS install too, the tarball or (where dpkg owns the binary) the `.deb` ([`tunnel-install.md` §10](tunnel-install.md)). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
 | `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — looks its own release up in the update feed on roomler.ai, never at GitHub's API (#3818, [above](#enrollment--what-every-path-does)), downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |
+
+### An update waits for live work (#3429)
+
+An install restarts the daemon, and the restart ends what it serves: a
+remote-control session, an SSH connection, a Fleet RPC `exec` run, a file
+transfer, a recording. So the periodic check defers while any of them is live,
+on the budget transfers always had. It reads one model, `Busy`
+(`agents/roomlerd/src/busy.rs:30`), the same one the per-user Linux
+daemon's restart onto a replaced binary reads
+([linux-self-update.md](linux-self-update.md#the-per-user-daemon-onto-the-new-binary-p2b)).
+
+```mermaid
+flowchart TD
+    C["the periodic check is due"] --> B{"Busy, read now"}
+    B -- "nothing live" --> I["check, and install a newer release"]
+    B -- "live work, or the network<br/>moved in the last 10 min" --> D{"7 defers in a row already?"}
+    D -- yes --> F["install anyway,<br/>with a warning that names the work"]
+    D -- "no: live work" --> H["defer, check again in 1 h"]
+    D -- "no: only the network moved" --> M["defer, check again in 2 min (R5b)"]
+    H --> B
+    M --> B
+```
+
+| What is live | What the periodic check does | Where |
+|---|---|---|
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3496` |
+| a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
+| only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
+| either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
+
+- **What counts.** A session in the daemon's registry. An SSH connection the
+  daemon serves, or carries to the Windows service on port 2223 (FR-105,
+  `agents/roomlerd/src/ssh_service.rs:914`). A Fleet RPC command for as long as
+  it runs, 5 min at most, counted by the exec engine for each run
+  (`agents/roomlerd/src/exec.rs:2347`); a command an SSH session runs
+  belongs to that connection and is not counted twice. A transfer or a
+  recording, as since rc.19 and FR-85 ([recording.md](recording.md)).
+- **An operator's push still installs at once.** `POST …/agent/update`
+  (`rc:agent.update`), and the check a daemon asks for when its control socket
+  comes back after a long outage, skip the gate and keep only the 5-min
+  install-storm cooldown. Each says what it cuts, in the daemon's log:
+  `forced update proceeding despite: 1 remote-control session(s)`.
+- **Only the process that installs is asked**, and it counts only what it
+  serves itself:
+
+| Install | Who decides to install | What it waits for |
+|---|---|---|
+| Windows, per-user (the Scheduled Task) | the daemon | all of it |
+| Windows, machine: attended or SystemContext (the `Roomler` service) | the worker the service runs | all of it, the SSH sessions it carries to the service included. ⚠️ Not a Fleet RPC command the service runs itself for an anchored device (FR-94): the update stops the service under it |
+| Linux, system (`roomlerd.service`, root) | the daemon | all of it |
+| Linux, per-user, with the root update helper | the helper, which asks nothing | nothing has to: the install replaces the binary under a daemon that runs on, and the daemon restarts onto it once `Busy` reads idle, or at its 24 h ceiling |
+| Linux, per-user, without the helper | the daemon, where it can install at all | all of it |
+| macOS, both halves | the root update helper (`com.roomler.update`), which asks nothing | ⚠️ nothing: the package's post-install reloads both halves, whatever they serve |
+
+- **What the log says.** Each defer: `auto-updater: deferring — live work a
+  restart would cut, or the network just moved busy=1 remote-control session(s)
+  consecutive_defers=1 next_check_secs=3600`. Once the budget is spent:
+  `auto-updater: forcing update after 7 consecutive defers`, with the same
+  `busy=`.
 
 ### macOS: an update with nobody signed in (#3783)
 
@@ -3730,7 +3789,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3519`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3540`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.

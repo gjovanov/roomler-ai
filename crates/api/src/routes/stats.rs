@@ -781,7 +781,7 @@ pub async fn tenant_mesh(
 #[derive(Debug, Default)]
 pub(crate) struct BuiltMesh {
     /// One per live overlay node: `id`, `agent_id_hex`, `name`, `overlay_ip`,
-    /// `relay_home`, `status`, `last_seen_at`.
+    /// `relay_home`, `status`.
     pub nodes: Vec<serde_json::Value>,
     /// One per live agent: `id`, `name`, `display_name`, `last_presence`,
     /// `agent_version`, `relay_home`, `os`.
@@ -890,9 +890,11 @@ pub(crate) async fn build_mesh(state: &Core, tid: ObjectId) -> Result<BuiltMesh,
                     Bson::Null,
                 ]},
             }},
+            // No `last_seen_at` (#4189): nothing reads it, and it went out as
+            // bson's `{"$date": …}`. A node's `status` says whether it is live.
             doc! { "$project": {
                 "_id": 0, "id": 1, "agent_id_hex": 1, "name": 1,
-                "overlay_ip": 1, "relay_home": 1, "status": 1, "last_seen_at": 1,
+                "overlay_ip": 1, "relay_home": 1, "status": 1,
             }},
             doc! { "$limit": 500 },
         ],
@@ -1473,7 +1475,14 @@ pub async fn admin_orgs(
         "tenants",
         vec![
             doc! { "$match": { "deleted_at": Bson::Null } },
-            doc! { "$set": { "id": { "$toString": "$_id" }, "created": "$created_at" } },
+            // #4189: an RFC 3339 string, where the stored date went out as
+            // bson's `{"$date": …}`.
+            doc! { "$set": {
+                "id": { "$toString": "$_id" },
+                "created": { "$dateToString": {
+                    "date": "$created_at", "format": "%Y-%m-%dT%H:%M:%S.%LZ",
+                } },
+            } },
             doc! { "$project": { "_id": 0, "id": 1, "name": 1, "slug": 1, "created": 1 } },
             doc! { "$limit": 500 },
         ],
@@ -1587,7 +1596,7 @@ mod mesh_payload_tests {
         let node = |id: &str, agent: &str, name: &str, ip: &str| {
             json!({
                 "id": id, "agent_id_hex": agent, "name": name, "overlay_ip": ip,
-                "relay_home": null, "status": "online", "last_seen_at": null,
+                "relay_home": null, "status": "online",
             })
         };
         let agent = |id: &str, name: &str, display: Option<&str>| {

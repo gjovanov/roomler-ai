@@ -524,6 +524,9 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
 }
 
 // Here, not in the list above, so that no line the docs anchor in this file moves.
+/// #3429 — what a restart would cut or wedge, now: the one model the periodic
+/// update check and the replaced-binary restart both read.
+pub mod busy;
 pub mod daemon_error;
 
 #[cfg(test)]

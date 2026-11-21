@@ -5554,8 +5554,8 @@ async fn handle_server_msg(
         // S1a — operator-triggered forced self-update from the web UI.
         // Hand the request to the updater loop's trigger channel; the
         // actual check/download/install runs there (same gates as the
-        // periodic path: 5-min install-storm cooldown; transfer-defer
-        // is bypassed with a warn because the operator asked NOW).
+        // periodic path: 5-min install-storm cooldown; the live-work gate
+        // is bypassed with a warn naming it: the operator asked NOW).
         ServerMsg::UpdateNow { pin } => {
             // Multi-org P1: the self-updater is machine-wide, so only the
             // PRIMARY enrollment may drive it — a secondary org's admin
