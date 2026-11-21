@@ -2270,6 +2270,7 @@ impl RateGovernor {
             model_floor_by: model.floor_by(),
             model_capacity_by: model.capacity_by(now),
             model_ruled: self.belief.ruled(now),
+            model_fell: model.fell(now),
         }
     }
 
@@ -6200,6 +6201,61 @@ mod tests {
         assert_eq!(s.g.belief_bps(s.t).1, Some(1_500_000), "Pipe's own floor");
         s.window(187_500, Some(28), more, false);
         assert_eq!(model(&s).0, Some(1_500_000));
+    }
+
+    /// FR-148 D50 — the `path model` line's last fall comes from the shadow
+    /// model through `path_view`. With no rate noted (the in-flight budget
+    /// off) two delivery samples' push-backs under the floor are damped and
+    /// read no fall; with the budget's measured rate noted under the floor,
+    /// the next one is a fall, and the view carries the floor before and
+    /// after, and its age as it grows. `Pipe`'s own numbers do not move, and
+    /// the heartbeat's are the view's at every window (`same_numbers`).
+    #[test]
+    fn the_path_view_carries_the_models_last_fall() {
+        use crate::encode::pipe::{Fall, PathRate, PushedBy};
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let link = viewer_rate::pack_link(2_000_000, 0);
+        for _ in 0..5 {
+            s.window(250_000, Some(28), link, false);
+        }
+        let v = s.g.path_view(s.t, None);
+        assert_eq!(
+            (v.model_floor.map(|f| f.bps), v.model_fell),
+            (Some(2_000_000), None)
+        );
+        let own = s.g.belief_bps(s.t);
+        for want in [1_500_000, 1_250_000] {
+            s.t += Duration::from_secs(2);
+            s.g.on_sample_push_back(1_000_000, PushedBy::P3, s.t);
+            let v = s.g.path_view(s.t, None);
+            assert_eq!(
+                (v.model_floor.map(|f| f.bps), v.model_fell),
+                (Some(want), None)
+            );
+        }
+        s.g.note_path_rate(PathRate {
+            bps: Some(1_020_000),
+            measured: true,
+            loss: 0,
+        });
+        s.t += Duration::from_secs(2);
+        s.g.on_sample_push_back(1_000_000, PushedBy::P3, s.t);
+        let v = s.g.path_view(s.t, None);
+        let floor = v.model_floor.expect("a floor");
+        assert_eq!((floor.bps, floor.word()), (1_020_000, "backlogged"));
+        assert_eq!(v.model_floor_by, Some(PushedBy::P3));
+        let fall = Fall {
+            from_bps: 1_250_000,
+            to_bps: 1_020_000,
+            age: Duration::ZERO,
+        };
+        assert_eq!(v.model_fell, Some(fall));
+        let later = s.t + Duration::from_millis(3_400);
+        let aged = s.g.path_view(later, None).model_fell.map(|f| f.age);
+        assert_eq!(aged, Some(Duration::from_millis(3_400)));
+        assert_eq!(s.g.belief_bps(s.t), own, "Pipe's own numbers");
+        same_numbers(&s.g, s.t);
     }
 
     /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:
