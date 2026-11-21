@@ -332,7 +332,7 @@ explicit allowlist, `WORKER_ENV_FORWARD`
 (`agents/roomlerd/src/macos_supervisor.rs:275`): each through
 `tunnel_core::env::node_env` (environment, then config fallback), and only when
 the root has one, as `sudo -u '#uid' /usr/bin/env ROOMLERD_K=v … run
---supervised` (`macos_supervisor.rs:396`). In the worker an environment variable
+--supervised` (`macos_supervisor.rs:1342`). In the worker an environment variable
 beats its own config, so the session does what the hello promised. `env` execs
 into the agent, so the chain the supervisor reaps and the signals it relays are
 unchanged.
@@ -371,8 +371,8 @@ was refused as a `secret mismatch` every 30 s.
 
 | | as built |
 |---|---|
-| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:709`, `:581`, `:372`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:430`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:577`, `:625`). |
-| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:878`, `:499`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:1410`, `:1156`, `:382`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:440`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:577`, `:625`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1579`, `:509`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
 | **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
 
 An adversarial review before the merge found three edges, all fixed in the same PR:
@@ -507,7 +507,7 @@ flowchart TB
 
 | | Off, the default | On |
 |---|---|---|
-| The spawn (`agents/roomlerd/src/macos_supervisor.rs:731`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
+| The spawn (`agents/roomlerd/src/macos_supervisor.rs:1342`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
 | A person's enrollment on this Mac | what the worker runs on | ignored and left in the file, so turning the switch off brings it back until the migration strips it |
 | A secondary org's session | served by the root, no pixels | delegated |
 | A Mac with no per-user config | no worker | a worker |
@@ -516,39 +516,39 @@ flowchart TB
 
 ### P3a — the worker holds no enrollment
 
-**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1753-1758` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:143` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
+**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1825-1826` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:284` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
 
 Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but the receive deadline and the ping arms would each need a detached branch, on the path every platform's sessions take.
 
-⚠️ **The stand-in's lifetime is the worker's.** The secret proves the worker to the stand-in, and nothing proves the stand-in to the worker. If the listener ended while the worker lived, its port would be free, any local process could bind it, and the loop's reconnect would dial that process, hand it the secret and act on what it sent. That process would be a control plane for a worker holding the person's TCC grants. So when the listener's task ends, for any reason, the worker exits at once, with a code of its own, and the supervisor starts a new one on a new port with a new secret. It never dials an old port. The exit is a crash record on the root's enrollment (`agents/roomlerd/src/macos_supervisor.rs:271`), because that task ending is a defect. A test kills the listener and reads the exit from a real child process.
+⚠️ **The stand-in's lifetime is the worker's.** The secret proves the worker to the stand-in, and nothing proves the stand-in to the worker. If the listener ended while the worker lived, its port would be free, any local process could bind it, and the loop's reconnect would dial that process, hand it the secret and act on what it sent. That process would be a control plane for a worker holding the person's TCC grants. So when the listener's task ends, for any reason, the worker exits at once, with a code of its own, and the supervisor starts a new one on a new port with a new secret. It never dials an old port. The exit is a crash record on the root's enrollment (`agents/roomlerd/src/macos_supervisor.rs:275`), because that task ending is a defect. A test kills the listener and reads the exit from a real child process.
 
 Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
 
-⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has three callers: the `next_delegated` arm (`signaling.rs:3027`), the `ws.next()` arm (`:3118`) and, since #3453, the `caps.news` arm (`:2475`), which hands on only the requests the `ws.next()` arm held until the encoder probe first answered. With `--unenrolled` the `ws.next()` arm drops every text frame before it holds any (`OrgCtx::unenrolled`, false in every other process), so the third caller has nothing to hand on. That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
+⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has three callers: the `next_delegated` arm (`signaling.rs:3107`), the `ws.next()` arm (`:3238`) and, since #3453, the `caps.news` arm (`:2582`), which hands on only the requests the `ws.next()` arm held until the encoder probe first answered. With `--unenrolled` the `ws.next()` arm drops every text frame before it holds any (`OrgCtx::unenrolled`, false in every other process), so the third caller has nothing to hand on. That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
 
 | Listener | What it serves | Why it stays |
 |---|---|---|
 | The per-user LocalAPI socket, `0600` | The person's own verbs. No verb starts a session, and the tunnel verbs refuse (below) | The companion and `roomler` as the console user |
-| The loopback probe, `127.0.0.1:47989` (`agents/roomlerd/src/rc_local_turn.rs:42-43`) | The TURN half answers 503 with no overlay address. The clipboard bridge serves the page in the person's own browser, behind an origin allowlist | As on any per-user install; root cannot reach the person's pasteboard |
+| The loopback probe, `127.0.0.1:47989` (`agents/roomlerd/src/rc_local_turn.rs:42-44`) | The TURN half answers 503 with no overlay address. The clipboard bridge serves the page in the person's own browser, behind an origin allowlist | As on any per-user install; root cannot reach the person's pasteboard |
 
 The WebRTC peers, the SSH server and the relay responder need an offer or an overlay this process no longer has.
 
-**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:3901`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:3906`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
+**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:3994`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:3999`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
 
 | In `run_cmd` | Enrolled worker | `--unenrolled` |
 |---|---|---|
-| No config file (`app.rs:3829`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
-| No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:210`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
+| No config file (`app.rs:3914`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
+| No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:214`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
 | Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay | from the file | blank or off in the view: the root holds all of them |
-| Preflight to the server (`app.rs:4218`) | runs | skipped |
-| Crash bookkeeping and rollback (`app.rs:4222-4360`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1531`) |
-| Updater (`app.rs:4370`, `:5554`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
-| Crash upload (`app.rs:4570`), log upload (`app.rs:4613`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
-| Self-unenroll on a stop (`app.rs:5716`) | if its row is ephemeral | never: this process is not that row |
+| Preflight to the server (`app.rs:4310`) | runs | skipped |
+| Crash bookkeeping and rollback (`app.rs:4315-4453`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1795`) |
+| Updater (`app.rs:4463`, `:5650`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
+| Crash upload (`app.rs:4667`), log upload (`app.rs:4711`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
+| Self-unenroll on a stop (`app.rs:5803`) | if its row is ephemeral | never: this process is not that row |
 
-**What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:272`, `:297`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:175`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:88`), which lets the daemon's word fill it in (`:156`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:1771`, `:1868`).
+**What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:323`, `:348`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:226`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:123`), which lets the daemon's word fill it in (`:198`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:2076`, `:2189`).
 
-⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3403`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:658`):
+⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3765`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:719`):
 
 | Verbs | Without that answer |
 |---|---|
@@ -559,16 +559,16 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 
 Declared `[[tunnel_routes]]` in a person's file are named by the migration, not moved.
 
-**The worker's logs, in a PR of their own.** The worker's `agent_logs` lines have no enrollment to upload on. So they cross the delegation channel, up to 100 a frame with each message cut at 8 KiB (`DelegateFrame::WorkerLogs`, `agents/roomlerd/src/delegate.rs:176`, sent from `agents/roomlerd/src/delegate_worker.rs:584`). The daemon uploads them on its own row, through an uploader of their own that starts only as root with both keys on (`agents/roomlerd/src/app.rs:4843`). The daemon marks each line `process: gui-worker` (`delegate.rs:621`), so a worker cannot pass a line off as the daemon's. `ROOMLERD_LOGS_UPLOAD_DISABLED` in either process stops it, and an older daemon skips the frame, which leaves the lines on the Mac. The worker's panic records stay on the Mac too: its supervisor records the crash itself.
+**The worker's logs, in a PR of their own.** The worker's `agent_logs` lines have no enrollment to upload on. So they cross the delegation channel, up to 100 a frame with each message cut at 8 KiB (`DelegateFrame::WorkerLogs`, `agents/roomlerd/src/delegate.rs:176`, sent from `agents/roomlerd/src/delegate_worker.rs:589`). The daemon uploads them on its own row, through an uploader of their own that starts only as root with both keys on (`agents/roomlerd/src/app.rs:4940`). The daemon marks each line `process: gui-worker` (`delegate.rs:655`), so a worker cannot pass a line off as the daemon's. `ROOMLERD_LOGS_UPLOAD_DISABLED` in either process stops it, and an older daemon skips the frame, which leaves the lines on the Mac. The worker's panic records stay on the Mac too: its supervisor records the crash itself.
 
 **What the daemon reads from its worker has a limit (#3695).** The worker runs as the person at the screen, so the daemon checks what it reads from the channel before it acts on it. Each line is read with one line reader that checks its limit before the buffer grows past it (`agents/roomlerd/src/line_limit.rs:52`):
 
 | What the daemon reads | The limit | Over it | Where |
 |---|---|---|---|
-| The attach line: the worker's secret, 64 hex characters | 1 KiB (`ATTACH_LINE_MAX`), 16 times the secret | The connection closes before any secret is compared | `delegate.rs:481`; read at `delegate.rs:2186` |
-| A frame line | 4 MiB (`DELEGATE_LINE_MAX`). The largest frame is a full `WorkerLogs`, 100 lines of at most 16 KiB each, about 1.6 MiB; every other frame is under 64 KiB | The channel closes with the reason logged, and what it leaves behind is cleared as on the worker's own close: its sender, its capabilities, the keep-busy questions it was asked | `delegate.rs:490`; the loop at `delegate.rs:1840`; the cleanup, `run`, `delegate.rs:1784` |
-| A log line in a `WorkerLogs` frame | 16 KiB as JSON (`WORKER_LOG_LINE_MAX`, twice the 8 KiB message cut). The worker holds each line to it before it sends and the daemon again before it keeps one: the line's fields go first, then its message and target are halved until it fits, so a full frame stays under the frame limit | — | `trim_worker_line`, `delegate.rs:518`; the worker's call, `delegate_worker.rs:657` |
-| The worker's capabilities | Only the words that are the worker's to say for its device, each a word this build knows, each once: `record` (what `RecordCap` reads), `apps` (`status`, `list`, `focus`, `launch`), `audio` (`opus`) and `permissions` (`screen-capture`, `input`, `no-gui-session`; a missing list stays apart from an empty one). The audio `unavailable` reason is kept when its code is a word of `[a-z0-9-]` of at most 64 bytes, and the reason is cut to 512 bytes. Every other field stays the daemon's own | A word this build does not know is dropped | `worker_words`, `delegate.rs:580`; applied at `delegate.rs:1875` |
+| The attach line: the worker's secret, 64 hex characters | 1 KiB (`ATTACH_LINE_MAX`), 16 times the secret | The connection closes before any secret is compared | `delegate.rs:488`; read at `delegate.rs:2225` |
+| A frame line | 4 MiB (`DELEGATE_LINE_MAX`). The largest frame is a full `WorkerLogs`, 100 lines of at most 16 KiB each, about 1.6 MiB; every other frame is under 64 KiB | The channel closes with the reason logged, and what it leaves behind is cleared as on the worker's own close: its sender, its capabilities, the keep-busy questions it was asked | `delegate.rs:497`; the loop at `delegate.rs:1860`; the cleanup, `run`, `delegate.rs:1804` |
+| A log line in a `WorkerLogs` frame | 16 KiB as JSON (`WORKER_LOG_LINE_MAX`, twice the 8 KiB message cut). The worker holds each line to it before it sends and the daemon again before it keeps one: the line's fields go first, then its message and target are halved until it fits, so a full frame stays under the frame limit | — | `trim_worker_line`, `delegate.rs:525`; the worker's call, `delegate_worker.rs:661` |
+| The worker's capabilities | Only the words that are the worker's to say for its device, each a word this build knows, each once: `record` (what `RecordCap` reads), `apps` (`status`, `list`, `focus`, `launch`), `audio` (`opus`) and `permissions` (`screen-capture`, `input`, `no-gui-session`; a missing list stays apart from an empty one). The audio `unavailable` reason is kept when its code is a word of `[a-z0-9-]` of at most 64 bytes, and the reason is cut to 512 bytes. Every other field stays the daemon's own | A word this build does not know is dropped | `worker_words`, `delegate.rs:587`; applied at `delegate.rs:1895` |
 
 ### P3b — a secondary org's session is delegated
 
@@ -654,10 +654,10 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 | Invariant | Under P3 |
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
-| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:731-1014`). The migration touches no bundle, which is what AC5 reads |
+| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:1342-1401`). The migration touches no bundle, which is what AC5 reads |
 | The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:914`) | The worker no longer dials a server, so it can displace nothing |
-| The delegation channel's two gates (`delegate.rs:1173-1194`) | Unchanged |
-| The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
+| The delegation channel's two gates (`delegate.rs:1192-1214`) | Unchanged |
+| The reap's exact match (`macos_supervisor.rs:496`, `:509`) | Matches both command lines, so a worker of either kind is found |
 
 ### What rides what
 
@@ -815,7 +815,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       owning the worker, and the heartbeats of the AC8 row. On 0.4.191 a real viewer on the
       per-user row streamed lit pixels, and the daemon's row logged `no_display` and showed
       none. That is the pre-P1 pair. In the code the switch stops the supervisor before it does
-      anything (`macos_supervisor.rs:1415-1422`). "Byte-for-byte" is read off those surfaces;
+      anything (`macos_supervisor.rs:1713-1726`). "Byte-for-byte" is read off those surfaces;
       nothing here diffs two builds.)*
 - [~] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
       daemon, the worker and the delegation channel, its migration and its kill switch, under
