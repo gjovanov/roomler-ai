@@ -34,26 +34,26 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 ### macOS today (code; the two rows also field-read in a lab on 2026-11-10)
 
 - One daemon card, "Be accessed — this Mac (recommended)", whose text says the Mac "joins as two devices" and
-  that screen-only means unticking a box under Advanced (`agents/roomler-setup/src/front/app.js:75-86`).
+  that screen-only means unticking a box under Advanced (`agents/roomler-setup/src/front/app.js:75-83`).
 - The "both" control is that box, "Join the overlay network", inside the collapsed "Advanced options" on the
-  Server page (`agents/roomler-setup/src/front/index.html:172-181`), ticked by default for the macOS daemon
-  (`app.js:505-509`). It drives `role::wants_root_half` (`agents/roomler-setup/src/role.rs:124-132`), mirrored in
-  the SPA (`app.js:511-518`).
+  Server page (`agents/roomler-setup/src/front/index.html:166-175`), ticked by default for the macOS daemon
+  (`app.js:490-494`). It drives `role::wants_root_half` (`agents/roomler-setup/src/role.rs:124-132`), mirrored in
+  the SPA (`app.js:496-503`).
 - Both token paths add the root half: pairing asks `halves: 2` (`role.rs:134-140`) and refuses an install whose
-  halves differ from the approval's (`agents/roomler-setup/src/pairing.rs:271-306`); the paste path shows a
-  second token field (`index.html:305-316`) and refuses a missing or repeated second token
-  (`agents/roomler-setup/src/commands.rs:919-962`).
+  halves differ from the approval's (`agents/roomler-setup/src/pairing.rs:262-305`); the paste path shows a
+  second token field (`index.html:282-292`) and refuses a missing or repeated second token
+  (`agents/roomler-setup/src/commands.rs:798-838`).
 - The server accepts `halves: 2` only for a macOS daemon (`crates/modules/fleet/src/pairing.rs:326-334`) and mints
   that many single-use tokens (`:985-1004`). Each half counts against the device cap
   (`docs/fr/FR-129-guided-cross-platform-installer.md:580-584`).
-- One run: the root half enrolls in the wizard's process as `<name>-daemon` (`role.rs:186-191`) under a machine id
-  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:989-1053`); one administrator prompt runs the
-  privileged half (marker, package, config placed, daemon started: `scripts/install.sh:905-912`, `:970-1004`); the
-  person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:147-189`); `--user-steps` starts the
-  LaunchAgent (`install.sh:959-968`). Two rows.
+- One run: the root half enrolls in the wizard's process as `<name>-daemon` (`role.rs:142-147`) under a machine id
+  from the hardware (`agents/roomler-setup/src/orchestrator_unix.rs:867-916`); one administrator prompt runs the
+  privileged half (marker, package, config placed, daemon started: `scripts/install.sh:884-891`, `:949-983`); the
+  person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
+  LaunchAgent (`install.sh:938-947`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2729-2778`). `install.sh --one-row` is
-  the one-token path (`install.sh:1012-1108`); it is refused with the halves the wizard runs: "have no one-row
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2016-2053`). `install.sh --one-row` is
+  the one-token path (`install.sh:991-1087`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299` at master `b08b6f383`). The docs say the wizard has no one-row control
   (`docs/installation.md:2697-2700` at master `b08b6f383`).
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
@@ -63,15 +63,15 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 
 ### Linux today (code)
 
-- The system card `daemon-system` is preselected on a clean machine (`role.rs:101-108`, `:331-349`), with the
-  overlay box on by default for both scopes (`orchestrator_unix.rs:129-139`, `app.js:505-506`). It gives one row:
+- The system card `daemon-system` is preselected on a clean machine (`role.rs:101-108`, `:287-305`), with the
+  overlay box on by default for both scopes (`orchestrator_unix.rs:125-135`, `app.js:490-491`). It gives one row:
   the root unit with the TUN mesh, exit node and subnet router (`docs/platform-support.md:126-129`).
 - Its desktop is reduced: GNOME or KDE, Wayland or X11, only while unlocked and on screen; no clipboard
   (`no-session`), no keyboard layout, no display match (`docs/platform-support.md:97`, `:106`, `:108-109`). That
   is FR-142's work.
 - The per-user card has the full desktop and a mesh that is outbound only, through a loopback SOCKS5 front
   (`docs/platform-support.md:79-83`).
-- **The script never turns the overlay on.** `enroll_daemon` passes no `--overlay` (`scripts/install.sh:1214-1270`),
+- **The script never turns the overlay on.** `enroll_daemon` passes no `--overlay` (`scripts/install.sh:1130-1186`),
   and the daemon's own system hint keeps it off on purpose: "a Linux system node is not forced onto the mesh"
   (`agents/roomlerd/src/service.rs:2324-2329`).
 - The web app's add-device dialog says, for a Linux machine-wide install, "Screen capture needs a logged-in
@@ -133,13 +133,13 @@ one row does not hold, the switch stays off and the wizard installs today's two 
   it) is 0.4.201 or later. That floor (D4-A) is the first release whose served `install.sh --one-row` made a fresh Mac
   one row (FR-43 P3d, field-verified 2026-11-05) and whose `roomlerd enroll --help` lists `--one-row`. An older one
   would stop only after the token is spent, so the wizard compares first, and the script's own `enroll --help` check
-  stays as the belt (`scripts/install.sh:1166`). Closed, the page says why under the card and the box makes today's
+  stays as the belt (`scripts/install.sh:1179`). Closed, the page says why under the card and the box makes today's
   two rows: a Mac whose root is enrolled is pointed to `sudo roomlerd one-row` (D1), and one with a person's
   enrollment to the install script's `--one-row` with a new token. Open, the box makes one device. One token, pasted
   or paired (`halves: 1`), enrolls root's config under the device's own name (D9-A, no `-daemon`), with the overlay on
   and both FR-43 switches. The privileged half, `install.sh --privileged-steps --one-row --config-from FILE`, places
   that config before the one package run, whose guard removes the LaunchAgent and starts root
-  (`scripts/install.sh:1126-1171`), and no person's enrollment and no user half run. Before root's enroll the wizard
+  (`scripts/install.sh:1139-1184`), and no person's enrollment and no user half run. Before root's enroll the wizard
   makes the person's folders as the person and writes into each (D5-A); one it cannot write stops the run, naming the
   folder and its owner, with nothing enrolled and the token not spent. Nothing as root makes or changes a folder in a
   home (FR-147). On the pasted path the page sends the form it showed, and an install whose fresh read differs is
