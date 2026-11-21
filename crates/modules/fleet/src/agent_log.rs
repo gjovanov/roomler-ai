@@ -25,14 +25,14 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use bson::{DateTime, oid::ObjectId};
-use roomler_ai_db::models::{AgentLogBatch, LogLine, LogSource};
+use bson::{DateTime, Document, oid::ObjectId};
+use roomler_ai_db::models::{AgentLogBatch, LogLevel, LogLine, LogSource};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
-use crate::{FleetState, auth_agent::AuthAgent, diagnostics};
+use crate::{FleetState, agent::fmt_dt, auth_agent::AuthAgent, diagnostics};
 
 /// Body shape POSTed by an uploader. `source` must NOT be `Browser`
 /// on the agent-authed route; route handler enforces this.
@@ -78,7 +78,43 @@ pub struct AgentLogBatchView {
     pub agent_version: Option<String>,
     pub line_count: u32,
     pub created_at: String,
-    pub lines: Vec<LogLine>,
+    pub lines: Vec<LogLineView>,
+}
+
+/// One line of a listed batch (#4189): the stored [`LogLine`] with its `ts`
+/// as an RFC 3339 string. The model serialises `ts` as bson's `{"$date": …}`,
+/// which the device logs dialog's time column printed raw and its Copy wrote
+/// as `[object Object]`. Only the answer changes: an upload is still read as
+/// a [`LogLine`], so a device or a browser sends `ts` as it always has.
+#[derive(Debug, Serialize)]
+pub struct LogLineView {
+    pub ts: String,
+    pub level: LogLevel,
+    pub target: String,
+    pub msg: String,
+    #[serde(skip_serializing_if = "Document::is_empty")]
+    pub fields: Document,
+}
+
+impl From<LogLine> for LogLineView {
+    fn from(line: LogLine) -> Self {
+        // Every field by name: one added to the model stops this compiling,
+        // so it cannot reach the answer in its bson form unseen.
+        let LogLine {
+            ts,
+            level,
+            target,
+            msg,
+            fields,
+        } = line;
+        Self {
+            ts: fmt_dt(ts),
+            level,
+            target,
+            msg,
+            fields,
+        }
+    }
 }
 
 impl From<AgentLogBatch> for AgentLogBatchView {
@@ -93,7 +129,7 @@ impl From<AgentLogBatch> for AgentLogBatchView {
             agent_version: b.agent_version,
             line_count: b.line_count,
             created_at: b.created_at.try_to_rfc3339_string().unwrap_or_default(),
-            lines: b.lines,
+            lines: b.lines.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -282,7 +318,6 @@ fn build_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roomler_ai_db::models::LogLevel;
 
     fn sample_line(msg: &str) -> LogLine {
         LogLine {
