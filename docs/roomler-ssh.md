@@ -249,12 +249,66 @@ can be pinned out of band.
 - **`sftp` and `scp`** (P7a) — see below.
 - **`ssh -L`, `-J` and `-W`** (P7b) — `direct-tcpip` channels, **default-deny**.
   See below.
-- Still **refused with a stated reason on stderr**: any other subsystem. A bare
-  channel failure reads as "administratively prohibited", which is
-  indistinguishable from a policy denial; a tool silently hanging is a much
-  worse diagnostic than "not implemented yet".
+- Still **refused, with the reason on stderr and exit status 1**: any other
+  subsystem. A tool silently hanging is a much worse diagnostic than "not
+  implemented yet", and how the reason reaches the caller is its own section,
+  [A refusal ends like a program that could not start](#a-refusal-ends-like-a-program-that-could-not-start-4168).
 - **`ssh -R` is not implemented** and is refused by russh's own default,
   promptly and cleanly. That is a decision, not a gap — see P7b below.
+
+### A refusal ends like a program that could not start (#4168)
+
+A shell or subsystem request the device will not serve, on a channel that is
+already open, is answered the way a program that could not start ends. That is
+every `Handler::refuse` (a shell without a terminal; `sftp` with no usable
+account, with no `sftp-server`, or on Windows as a named account or under
+`ROOMLERD_SFTP_AS_USER=0`; any other subsystem; the guards for a session with no
+policy, which authentication never leaves), and the shell of a session whose
+account mode is unusable: unset for a key-list session, above
+`ssh_max_privilege`, or above the SYSTEM service's ceiling.
+
+| # | The device sends | What OpenSSH's client (V_10_6_P2) does with it |
+|---|---|---|
+| 1 | `CHANNEL_SUCCESS` | goes on. A failure would end it: it asks for a shell, a command or a subsystem with `CONFIRM_CLOSE` (`clientloop.c:2801-2816`), and a failure on the session channel is `fatal` (`clientloop.c:844-846`) |
+| 2 | the reason on stderr, `roomler-ssh: …` | writes it to its own stderr |
+| 3 | `exit-status` 1 | keeps it as the exit code it returns (`clientloop.c:2014-2023`) |
+| 4 | `CHANNEL_EOF` | takes it as the end of the output (`nchan.c:258-264`). Stderr after it would be a protocol error that disconnects (`channels.c:3627-3633`), which is why the reason comes first |
+| 5 | `CHANNEL_CLOSE` | ends, but only once the stderr it holds is written: the output side waits for it (`channels.c:1389-1395`) |
+
+`ssh` prints the reason and exits 1. `sftp` and `scp` print it, then their own
+`Connection closed`, and exit 255. Before #4168 the device sent the reason and
+then `CHANNEL_FAILURE`: OpenSSH printed only `shell request failed on channel 0`
+(`subsystem …` under `sftp` and `scp`) and exited 255 without writing the reason
+it had already received. Exit status 1 is what sshd ends a session with when it
+cannot serve it (`session.c:1607-1612`, a shell that will not start at
+`session.c:1664-1666`), and what a command here that never ran ends with.
+
+Nothing starts: the success answers the request and grants nothing. The close
+goes out right behind the reason, and russh drops what a client sends on a
+channel it has closed. When the client's window has no room for the reason, or
+a key exchange is running, russh holds the EOF and the close back behind it.
+Until they go, the handler's `refused` set answers a request on that channel
+with a failure and drops its data, EOF and window changes
+(`Handler::answer_refusal`, [`ssh.rs:2277`](../agents/roomlerd/src/ssh.rs#L2277)).
+The log lines are as before: `ssh: refused an unsupported request` with `peer`
+and `request`, and the account-mode shell's
+`ssh: refusing a shell — unusable account mode`.
+
+Left as they were: a command whose bytes are not UTF-8 is answered with a bare
+failure and no reason, so `ssh` exits 255 with `exec request failed on channel
+0`. A refusal made after the request was accepted (consent refused, an account
+that cannot be reached) already sends its reason after the success.
+
+Tested in `ssh::tests`: `unsupported_requests_are_refused_with_a_reason`,
+`sftp_is_refused_when_the_session_resolved_to_no_account`,
+`a_shell_without_a_pty_is_refused_with_a_reason` and
+`an_interactive_session_without_an_account_mode_gets_no_shell` read the five
+messages in order, and the last three find no process started in the server's
+log. `a_refused_channel_takes_nothing_more_while_its_close_waits` holds the close
+back with a client window of 0: a command, a terminal and a second shell asked
+for on that channel are refused, and the data and EOF sent there reach no
+process. `a_shell_refused_for_its_account_mode_takes_nothing_more` does the same
+for the account-mode shell: a second shell, a command and `sftp` are refused.
 
 ### One-shot commands stream (FR-89)
 
@@ -387,7 +441,7 @@ Mechanics worth knowing:
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
   (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
-  (`agents/roomlerd/src/ssh.rs:1255`) sweep the same way. The overlay's TUN
+  (`agents/roomlerd/src/ssh.rs:1262`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
   never see EOF and a session whose shell exited would hang forever.
@@ -881,9 +935,11 @@ the policy's `account_mode`. A key-list session has no policy behind it, so it
 uses the device-owned `ssh_account_mode` — and while that was unset it fell
 back to the daemon's own identity, meaning listing a key quietly handed out
 SYSTEM/root and a policy of `console_user` was simply untrue for that path.
-Unset now means the session authenticates and runs nothing, with the reason on
-stderr. (Authenticate-then-refuse rather than refuse-the-auth, because it can
-explain itself; a bare auth failure cannot.)
+Unset now means the session authenticates and runs nothing: a command, a shell
+or `sftp` ends with the reason on stderr and exit status 1 (since #4168 the
+shell's and `sftp`'s reach the screen as well, § A refusal ends like a program
+that could not start). (Authenticate-then-refuse rather than refuse-the-auth,
+because it can explain itself; a bare auth failure cannot.)
 
 The rule the whole type exists to enforce: **never silently run as something
 more privileged than was asked for.** A policy that says `console_user` on a
@@ -938,7 +994,8 @@ Set to `console_user`, a grant asking for the daemon identity is **refused, not
 downgraded** — a caller who asked for root and silently got a user shell has
 been told something untrue about their own session, and would read every later
 permission error as the command's problem rather than the device's answer. The
-refusal names the setting, on stderr, at run time.
+refusal names the setting on stderr at run time, and OpenSSH shows it for a
+command, a shell and `sftp` alike (#4168).
 
 **Unset is permissive** and changes nothing, deliberately: a device-side
 ceiling that arrived switched on would revoke a working configuration in the
@@ -1215,7 +1272,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3084`](../agents/roomlerd/src/ssh.rs#L3084)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3116-3125`), so a skewed clock stays visible |
+| the device | `record_grant` ([`ssh.rs:3151`](../agents/roomlerd/src/ssh.rs#L3151)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3183-3192`), so a skewed clock stays visible |
 | the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2580`](../crates/remote_control/src/models.rs#L2580)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
@@ -1248,7 +1305,7 @@ server's. These bounds hold whatever the device's clock says:
    `agents/roomlerd/src/signaling.rs:66`, checked at `:2393`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:3031`), and no window longer than 60 s from
+   (`agents/roomlerd/src/ssh.rs:3098`), and no window longer than 60 s from
    arrival.
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
@@ -1312,7 +1369,7 @@ global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
 
 ⚠️ **Armed before it is shown (#3442).** The device registers the question with
-the broker first (`ask_here`, [`ssh.rs:2454`](../agents/roomlerd/src/ssh.rs#L2454)), then puts it up: the native panel, the
+the broker first (`ask_here`, [`ssh.rs:2521`](../agents/roomlerd/src/ssh.rs#L2521)), then puts it up: the native panel, the
 `.pending` marker the companion and `roomlerd consent --list` read, a companion
 it may have to start (up to 3 s), a notification. An answer counts from the
 moment anything shows the question. Until #3442 the question was armed last,
@@ -1324,7 +1381,7 @@ first the same way ([`signaling.rs:4298`](../agents/roomlerd/src/signaling.rs#L4
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
-[`ssh.rs:2320`](../agents/roomlerd/src/ssh.rs#L2320)).** Channels of one session can ask at once: a command waits in a
+[`ssh.rs:2387`](../agents/roomlerd/src/ssh.rs#L2387)).** Channels of one session can ask at once: a command waits in a
 task of its own, so a second channel can ask while the first waits. A channel
 that asks what a question already standing for its grant asks (the same
 activity: "run a command", "open an interactive shell", "transfer files over
@@ -1333,7 +1390,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2338`](../agents/roomlerd/src/ssh.rs#L2338)), and the answer's line carries the grant ([`:2537`](../agents/roomlerd/src/ssh.rs#L2537)), so a
+question's id ([`ssh.rs:2405`](../agents/roomlerd/src/ssh.rs#L2405)), and the answer's line carries the grant ([`:2604`](../agents/roomlerd/src/ssh.rs#L2604)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
@@ -1535,9 +1592,12 @@ included, and through a repair. An uninstall removes it with the service. Up to
 0.4.199 an update dropped it with every other entry but the SystemContext switch,
 silently (#3375, `docs/installation.md`,
 [What the service's `Environment` keeps](installation.md#what-the-services-environment-keeps-3375)).
-To check that the switch holds, try a transfer. OpenSSH's `sftp` shows the
-refusal only as `subsystem request failed on channel 0`, without the reason the
-device sends on stderr. The device's log has
+To check that the switch holds, try a transfer. OpenSSH's `sftp` prints the
+device's reason, `roomler-ssh: SFTP as the signed-in user is switched off on
+this device (ROOMLERD_SFTP_AS_USER=0).`, then `Connection closed`, and the
+`ssh` under it exits 1 (#4168). An agent before #4168 shows the refusal only as
+`subsystem request failed on channel 0`, without the reason it sends on stderr,
+and `ssh` exits 255. The device's log has
 `ssh: refused an unsupported request … request="sftp"`. An agent before #3815
 writes it unquoted, `request=sftp`, as measured on a Win11 SystemContext guest
 after an update (#3375).
@@ -1559,7 +1619,7 @@ channel — SFTP is binary and injected text corrupts a transfer. It is one
 `ssh: sftp-server stderr` line a session, written when the child closes its
 stderr, with the text as ONE escaped field, `msg="…"`: its first 4 KiB, and
 `cut_bytes` counting the rest (#3890, `SftpStderr`,
-`agents/roomlerd/src/ssh.rs:2174`). A line break or a control character in
+`agents/roomlerd/src/ssh.rs:2205`). A line break or a control character in
 it, or in a path it quotes from the client, stays inside that line. Up to 0.4.222
 the text was logged as it came, and on Windows one line per chunk.
 
