@@ -62,12 +62,12 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
   the grant until a restart (`crates/localapi/src/lib.rs:545-557`). No row for prompts 4 or 5, no stale state, no
   "Allowed" state. For its first 30 s after the install it says "Not enrolled yet" (#3700).
 - **The Devices page** (code): "No screen access" and "No input access" chips (`ui/src/components/admin/agentCodecChips.ts:92-115`)
-  from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4450-4479`).
+  from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4449-4478`).
   Field (11 Nov): "No input access" 4 minutes after the Accessibility grant, gone after a restart; and in the
   item 9 session, typed input landed while the row said it had no input permission (#3240 row 8).
 - **The viewer** (code): on `rc:media-unavailable` with code `permission`, "This device cannot capture its
   screen." and the agent's sentence (`ui/src/views/remote/RemoteControl.vue:1394-1409`,
-  `agents/roomlerd/src/capture/mod.rs:786-790`, corrected for old agents by `ui/src/composables/macPermissionHint.ts:33-39`).
+  `agents/roomlerd/src/capture/mod.rs:897-901`, corrected for old agents by `ui/src/composables/macPermissionHint.ts:33-39`).
   No signal reaches the viewer for a missing input grant (code: no such message on the wire). Nothing about a
   prompt on the Mac's screen (field, 11 Nov).
 
@@ -80,7 +80,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an
-  existing grant" (`capture/mod.rs:789-790`).
+  existing grant" (`capture/mod.rs:900-901`).
 - Nothing of ours reads the stored grants. The one reset is the uninstall's, as root, while the bundle is there
   (`scripts/install.sh:2027-2035`).
 
@@ -189,7 +189,7 @@ then shows today's two rows.
 
 | The Mac's state | The viewer says | Signal |
 |---|---|---|
-| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:700-704`) |
+| Screen Recording off | "This Mac has not allowed roomlerd to record its screen, so there is no picture. Someone at the Mac must turn it on: Roomler menu-bar app → Permissions." | `rc:media-unavailable` `permission`, which exists (`capture/mod.rs:811-815`) |
 | Screen Recording stale | "macOS no longer accepts this Mac's screen permission for roomlerd. This can happen after an update. Someone at the Mac must repair it: Roomler menu-bar app → Permissions → Repair." | the same code with a `stale` detail, additive |
 | Control off | "Your clicks and keys do not reach this Mac: roomlerd is not allowed to control it (Device Control and Data Access). Someone at the Mac must turn it on." | a new `rc:` notice from the input arbiter when it drops events for want of the grant (it already re-reads the grant once a second, `docs/remote-control.md:1830-1839`) |
 | macOS is asking now, the picture is live | "The Mac is showing a macOS question for roomlerd. Click Allow in the picture." | the agent sees it: Local Network by its own sends failing with `EHOSTUNREACH`; the picker by a window above the captured display at the alert layer, owned by a system process from a per-version table, appearing as capture starts (the owners are to verify in the field per version) |

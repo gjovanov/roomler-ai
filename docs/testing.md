@@ -263,7 +263,7 @@ Fixed since:
 > whenever it landed inside them. The probe's state is now one value, `ProbeState`, and a test
 > that asks whether there is an answer holds an instance of its own. A loop test is a plain
 > `#[test]` that takes `caps::loop_fixture()`
-> ([`caps.rs:2574`](../agents/roomlerd/src/encode/caps.rs#L2574)) and runs its body with the
+> ([`caps.rs:2571`](../agents/roomlerd/src/encode/caps.rs#L2571)) and runs its body with the
 > fixture's `block_on`. The first answer is in, the probe counts as started (no thread, no
 > child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
 > session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
@@ -874,7 +874,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:4579`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4578`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.

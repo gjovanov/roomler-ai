@@ -290,7 +290,7 @@ flowchart TD
 
 | Input | Where it comes from |
 |---|---|
-| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1085`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4913`). The Hub sends `auto` to no other agent |
+| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1085`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4912`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:2531`) |
 | the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3769`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: the last netcheck (`stun_udp`, since P2b alone) of the target and of the browser's best device, read by the server (below). The target folds its own netcheck in at the offer (D8, `own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:768`). `None` = not measured, read as usable |
@@ -825,7 +825,7 @@ supervisor reads who to tell on its own thread and sends one
 (`sessions_told_via`, `virtual_desktop.rs:513`), so it never waits on a
 channel. Only where the device's plan is the virtual desktop
 (`capture::sessions_capture_the_virtual_desktop`,
-`agents/roomlerd/src/capture/mod.rs:1535`); under an explicit `drm_capture` or
+`agents/roomlerd/src/capture/mod.rs:1646`); under an explicit `drm_capture` or
 `portal_capture` arm, and with `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`,
 nobody is told. **The viewer keeps that notice until the person connects
 again, even if frames reach the session later** (a follower promoted, a
@@ -868,7 +868,7 @@ one hold. It fails closed: `x11`, an arm this build does not know, a payload
 without the field and one that is not JSON all read as an X client, and so
 does a pipeline whose owner published nothing yet. Whether an arm reads an X
 server is decided in one place with no wildcard
-(`CaptureArm::reads_an_x_server`, `agents/roomlerd/src/capture/mod.rs:665`), and
+(`CaptureArm::reads_an_x_server`, `agents/roomlerd/src/capture/mod.rs:776`), and
 the test `media_share::tests::every_capture_arm_is_decided_on_or_off_x_and_what_is_unknown_fails_closed`
 walks every arm: a new `CaptureArm` does not compile until it is decided
 there and beside the tests' list (`media_share.rs:2179-2188`). A refused
@@ -894,7 +894,7 @@ here.
 outside every login session, the root LaunchDaemon in session 0, has no window
 server and never will, so it can never capture. The classifier always named
 that case `no_display` (`classify_capture_failure`,
-`agents/roomlerd/src/capture/mod.rs:2622`), but it asked only after the open had
+`agents/roomlerd/src/capture/mod.rs:2733`), but it asked only after the open had
 failed, and there the open took 30 s to fail. Read on the released 0.4.200 on a
 supervised lab Mac in FR-43's black-row layout (one root enrollment, no
 per-user config), with one viewer on the daemon's row:
@@ -908,11 +908,11 @@ per-user config), with one viewer on the daemon's row:
 Every re-created session waited the same 30 s, so each notice reached a session
 already gone, and the page blamed the network
 ([FR-43](fr/FR-43-macos-single-enrollment.md), the black rows). `scrap_open`
-(`agents/roomlerd/src/capture/mod.rs:4933`) now asks `tcc::has_gui_session`
-first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:4949`).
+(`agents/roomlerd/src/capture/mod.rs:5048`) now asks `tcc::has_gui_session`
+first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:5064`).
 Where it answers no, nothing runs that waits on a window server: TCC's
 preflight and request (`agents/roomlerd/src/capture/scrap_backend.rs:112`), the
-display wake (`agents/roomlerd/src/capture/scrap_backend.rs:160`) and
+display wake (`agents/roomlerd/src/capture/scrap_backend.rs:162`) and
 `CGDisplayStream`. The refusal is an ordinary open failure, so the classifier
 and the notice above are unchanged, and its warn line carries what the question
 itself cost (`checked_in_us`). A supervised Mac's delegated sessions never reach
@@ -926,7 +926,7 @@ off while the machine stayed up (FR-55's keeper holds
 `PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
-(`agents/roomlerd/src/capture/scrap_backend.rs:160`,
+(`agents/roomlerd/src/capture/scrap_backend.rs:162`,
 `agents/roomlerd/src/power.rs:539`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
@@ -973,17 +973,17 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:2985`](../agents/roomlerd/src/encode/caps.rs#L2985)), applied in
-`detect()` ([`caps.rs:2491`](../agents/roomlerd/src/encode/caps.rs#L2491))
+([`caps.rs:2982`](../agents/roomlerd/src/encode/caps.rs#L2982)), applied in
+`detect()` ([`caps.rs:2488`](../agents/roomlerd/src/encode/caps.rs#L2488))
 after the config lists, over plain `HostFacts`
-([`caps.rs:2699`](../agents/roomlerd/src/encode/caps.rs#L2699)), so it runs and
+([`caps.rs:2696`](../agents/roomlerd/src/encode/caps.rs#L2696)), so it runs and
 is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3938`](../agents/roomlerd/src/signaling.rs#L3938)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2966`](../agents/roomlerd/src/encode/caps.rs#L2966)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2963`](../agents/roomlerd/src/encode/caps.rs#L2963)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -1027,7 +1027,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:2848`](../agents/roomlerd/src/encode/caps.rs#L2848)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:2845`](../agents/roomlerd/src/encode/caps.rs#L2845)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | since FR-97 P2a: ScreenCaptureKit's mix of every app, this process's own excluded ([`audio/sck.rs`](../agents/roomlerd/src/audio/sck.rs)), in a process with a window-server session. On a supervised Mac that is the GUI worker, and the root's row carries the worker's offer (`DelegateHost::effective_audio`); the root decides a delegated session's audio by it. 48 kHz stereo float, 20 ms buffers: Opus's own frame, nothing resampled. It hears the apps with the output muted | the root half itself: `no-session`; the kill switch `ROOMLERD_SCK_AUDIO=0` (forwarded to the worker): `switched-off` on the hello, `switched_off` from a capture; ScreenCaptureKit's own refusal (the Screen Recording grant): `backend_error` with its words |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -1761,7 +1761,7 @@ without the switch behaves exactly as before. Spec and field log:
 
 **The switch and the wire.** `fps_high` in the config (or `ROOMLERD_FPS_HIGH`),
 default off. With it on, the hello's `AgentCaps.video` carries `fps-high` and
-`fps-retry` ([`caps.rs:3942`](../agents/roomlerd/src/encode/caps.rs#L3942)).
+`fps-retry` ([`caps.rs:3941`](../agents/roomlerd/src/encode/caps.rs#L3941)).
 Without them the viewer never offers above 60 and never sends `rc:fps`.
 
 | Message | Direction | Fields |
@@ -5247,7 +5247,7 @@ with an agent release. Every pairing behaves as before FR-138, or ends the sessi
 | The page predates P1c | It ignores `resume_secs` and `rc:session.detached` and never rejoins. The device's claim resumes the session, which waits the window for a viewer and then ends `controller_hangup`, marked `limit: hold_expired`. The page's own socket loss holds the session the same way, and its next request, which names nothing in `replaces`, reaps the held one as the same person's | `a_resume_its_viewer_never_rejoins_ends_marked_hold_expired` (`crates/tests/src/rc_resume_ends_tests.rs:610`); `a_held_session_never_costs_its_own_viewer_the_slot` (`crates/tests/src/rc_resume_rejoin_tests.rs:393`), its second half |
 | The page predates D5 = A | It hangs up before it redials a session the server called detached, so the row reads `controller_hangup` (§11.18) | `a_controllers_end_during_the_gap_is_enforced_at_the_claim` (`crates/tests/src/rc_resume_rejoin_tests.rs:558`) |
 | A supervised Mac's GUI worker or daemon predates P2b | The delegated session takes the path it took before (§11.16.1's version table). A P2b daemon with an older worker claims nothing for it, and the server ends it at the hello | `p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions` (`agents/roomlerd/src/delegate.rs:3174`); `p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse` (`:4779`) |
-| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11255`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
+| The server is rolled back during a gap, to an image at or above the floor below | The session's audit listing still reads, a kind the image does not know as `unknown`. Whether a kept session resumes is that image's claim to decide; an image that never answers the claim leaves the device to close the peer at its own deadline, so the session ends at the window | `an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads` (`crates/tests/src/rc_resume_tests.rs:257`); `an_audit_page_holding_an_unknown_kind_still_reads` (`crates/remote_control/src/models.rs:11275`); `a_reconnect_does_not_move_the_deadline` (`agents/roomlerd/src/session_table.rs:2572`) |
 
 The integration tests run on every master push that touches the server or the agent (`integration-tests.yml`), the
 agent's unit tests on Linux and on Windows in `ci.yml`, and the page's in the frontend checks.
@@ -6148,7 +6148,7 @@ to-activate, so the browser never sees a bait-and-switch.
   because an X server buffers what a client does not read. Our own writes
   change the owner too, and the content hashes swallow them as before.
   `AgentCaps.unavailable["clipboard-image-events"]` goes away where the
-  gate opens (`agents/roomlerd/src/encode/caps.rs:2811`). ⚠️ Not under
+  gate opens (`agents/roomlerd/src/encode/caps.rs:2808`). ⚠️ Not under
   Wayland: the clipboard is the compositor's there, and Xwayland's copy
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
@@ -6188,7 +6188,7 @@ to-activate, so the browser never sees a bait-and-switch.
   the gate skips cannot ask. The count is read inside an autorelease pool of
   its own (`clipboard.rs:1493`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
-  switch is on (`agents/roomlerd/src/encode/caps.rs:2818`), without asking this
+  switch is on (`agents/roomlerd/src/encode/caps.rs:2815`), without asking this
   process's own pasteboard (`clipboard.rs:1503`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
@@ -6536,7 +6536,7 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:3026`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:3023`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)
@@ -7441,7 +7441,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2671`](../crates/agent-core/src/config.rs#L2671))
+([`crates/agent-core/src/config.rs:2674`](../crates/agent-core/src/config.rs#L2674))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
