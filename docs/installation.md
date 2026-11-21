@@ -2942,7 +2942,7 @@ sequenceDiagram
         R->>R: root's file back
         R->>C: put-back, for every person started
         R->>R: the restart, if the conversion restarted, until it answers
-        R->>D: bootstrap gui/uid once the old screen worker is gone, then kickstart without -k
+        R->>D: once the old screen worker is gone, bootstrap gui/uid unless it is loaded, then kickstart without -k
         R->>R: then the records go
     end
 ```
@@ -2954,7 +2954,10 @@ ends only the command that waits for it. Its account also goes to
 every copy and the plist, and restarts: two rows again, until a person deletes a retired
 row, whose token then cannot come back. The LaunchAgent comes last, as in the undo: only
 once the restart has answered and the one-row screen worker, which holds the person's
-single-instance lock, has stopped is it bootstrapped and then kickstarted (#4092). Root's file goes back first;
+single-instance lock, has stopped is it bootstrapped and then kickstarted (#4092). A job that is
+loaded by then, after a run that stopped before it booted the agent out or after a login, is not
+bootstrapped again: the command says `gui/<uid>/com.roomler.agent: already loaded, so it is not
+bootstrapped again`, and only kickstarts it (#4227). Root's file goes back first;
 then each person in uid order, by that person's own process: `put-back` from root's
 records, or `put-back-legacy`, which renames back the copies an older release kept in
 the person's folder. A person who fails is named and keeps their record, the others go
