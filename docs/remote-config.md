@@ -329,7 +329,11 @@ read it through the config fallbacks
 (`crates/modules/fleet/src/remote_config.rs:342`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
-cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
+cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)). It binds a
+cell on the built-in default list exactly as it binds one a device turned on by
+hand: the deny is read after the switch's gate, whichever way that gate let the
+cell through (FR-132 P2,
+[encoders.md](encoders.md#the-default-list-fr-132-p2)).
 
 | pushed `zero_copy_deny` | what the device's key becomes |
 |---|---|

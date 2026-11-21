@@ -460,8 +460,8 @@ flowchart TD
     T -- "died / hung" --> H2["the 4:2:0 matrix, and the log names<br/>the last open — the entry for encoder_cells_deny"]
     G --> P
     H2 --> P
-    P{candidates_gpu:<br/>zero_copy on? the QSV, NVENC and VideoToolbox<br/>4:2:0 cells the GPU input covers,<br/>minus both denylists}
-    P -- "none: the switch is off, or no such cell" --> W
+    P{candidates_gpu:<br/>zero_copy on, or unset and the cell listed?<br/>the QSV, NVENC and VideoToolbox<br/>4:2:0 cells the GPU input covers,<br/>minus both denylists}
+    P -- "none: the switch is off, unset with no cell listed,<br/>or no such cell" --> W
     P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded<br/>(VideoToolbox: IOSurface frames until a packet)"]
     U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
     U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
@@ -501,8 +501,9 @@ VideoToolbox's (FR-118 P5) needs no device: the child feeds it IOSurfaces it
 makes itself until a packet comes out. A
 session opens that form only for an encoder the child proved
 (`input_reason=unproven` otherwise), so a driver that faults on it takes down a
-child, never the daemon. With `zero_copy` off there are no candidates and no
-third child. The proven names (`gpu_input`) ride the cache with the caps; they
+child, never the daemon. With `zero_copy` off, or unset while the default list
+names none of the host's cells (FR-132 P2, [below](#the-default-list-fr-132-p2):
+the list ships empty), there are no candidates and no third child. The proven names (`gpu_input`) ride the cache with the caps; they
 are not a wire capability.
 
 Why a cache (P3a): the matrix probe costs 4–6 s on a Windows host with two GPUs,
@@ -1382,7 +1383,9 @@ the denylist, and the raw dump of a healthy build decodes as-is.
 The input path is a third dimension of a cell, beside codec × backend and
 chroma: an encoder takes its frames from CPU memory, as every cell did until
 FR-118, or as textures on the capture's own GPU. The GPU form is **off by
-default** (`zero_copy`), and three families take it so far, all at 4:2:0:
+default** (`zero_copy`; unset reads a built-in default list of cells, which
+ships empty: [the default list](#the-default-list-fr-132-p2)), and three
+families take it so far, all at 4:2:0:
 
 - **QSV** (`hevc_qsv`, `av1_qsv`, `h264_qsv`) on the SystemContext DXGI arm, which is the arm every QSV host in
   the fleet captures through.
@@ -1419,7 +1422,7 @@ flowchart LR
 
 | Piece | What it is | Where |
 |---|---|---|
-| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it. On a supervised Mac the root's value is handed to the GUI worker, which captures and encodes | `capture::zero_copy_enabled` |
+| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), read three ways since FR-132 P2: `on` = every proven cell, `off` = none, unset = the cells on the built-in default list, which ships empty ([below](#the-default-list-fr-132-p2)); a restart applies it. On a supervised Mac the root's value is handed to the GUI worker, which captures and encodes | `capture::zero_copy`, `capture::zero_copy_admits` (an encoder's open), `capture::zero_copy_capture` (a capture's open) |
 | the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open; handed to a supervised Mac's GUI worker as the switch is. Pushable through remote config with `MANAGE_AGENTS` alone, the fleet's kill switch for a GPU-input cell ([FR-132](fr/FR-132-zero-copy-by-default.md) P1, [`remote-config.md`](remote-config.md) §6); the switch itself is not pushable | `encode::ffmpeg::gpu_hint::denied` |
 | the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. On macOS, `FrameData::IoSurface`: the display stream's surface, its use count held until the last clone goes. A consumer that needs bytes reads either back, once | `agents/roomlerd/src/capture/gpu_frame.rs`, `agents/roomlerd/src/capture/iosurface_frame.rs` |
 | the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter. macOS: none, an IOSurface is not bound to a device | `capture::gpu_frame::capture_adapter` |
@@ -1431,7 +1434,8 @@ The session reports which form it opened and why, on the heartbeat as
 
 | `input_reason` | Meaning |
 |---|---|
-| `switch_off` | `zero_copy` is off |
+| `switch_off` | `zero_copy` is off: set, to anything but `on` |
+| `default_off` | `zero_copy` is unset and this cell is not on the built-in default list (FR-132 P2): not on by default yet, which `switch_off` never means. An unset host read `switch_off` before the release that carries P2 |
 | `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback. Never on a Mac: VideoToolbox's GPU form takes a frame in memory too, with one copy |
 | `no_gpu_cell` | this encoder or chroma takes no GPU frames yet |
 | `denied` | `zero_copy_deny` names it |
@@ -1524,6 +1528,66 @@ The session reports which form it opened and why, on the heartbeat as
   measurement: its conversion and upload are 1.2 ms of a 4.1 ms encode stage, on
   the one 1600×900 virtual desktop that runs it (FR-118 open decision 6).
 
+### The default list (FR-132 P2)
+
+`zero_copy` reads three ways, as its config key already did (`kind: "tribool"`),
+so that a cell can be on by default without a host setting anything
+([FR-132 §3c](fr/FR-132-zero-copy-by-default.md#3c-a-default-per-cell-p2)):
+
+| `zero_copy` | A GPU-input open (the probe's candidates, a session's encoder) | A capture, at its open | A CPU-frame session reports |
+|---|---|---|---|
+| `on` (`1`, `true`, `yes`, `on`) | every cell the probe proved, as FR-118 built it | GPU frames | the gate that refused it |
+| unset (absent, or blank) | only a cell on the built-in default list | GPU frames only when a proven cell of the backend its frames go to is listed | `default_off` for an unlisted cell |
+| `off` (any other value) | none | CPU frames | `switch_off` |
+
+```mermaid
+flowchart TD
+  A["a GPU-input open:<br/>the probe's candidates, a session's encoder"] --> B{zero_copy}
+  B -->|off| C[CPU frames: switch_off]
+  B -->|unset| D{"the cell on<br/>DEFAULT_CELLS?"}
+  D -->|no| F[CPU frames: default_off]
+  D -->|yes| E
+  B -->|on| E{"a GPU frame, a GPU cell,<br/>not in zero_copy_deny, proven,<br/>a pool on its adapter?"}
+  E -->|no| G["CPU frames: cpu_frames, no_gpu_cell, denied,<br/>unproven, adapter_mismatch, open_failed"]
+  E -->|yes| H[GPU frames]
+```
+
+- **The list ships empty** (`capture::DEFAULT_CELLS`), so an unset host takes CPU
+  frames exactly as an `off` host does: the same capture, the same input form,
+  the same cell, the same bytes. Only the reason differs. Tests pin that at both
+  entry points, the probe's candidates (`the_gpu_phase_tries_only_what_a_session_may_open`)
+  and a session's open
+  (`with_the_list_empty_an_unset_switch_opens_as_off_and_reads_default_off`), and
+  for the capture (`unset_the_capture_delivers_gpu_frames_only_for_a_listed_cell`).
+  Their twins with cells on a test's own list are AC4's other cells:
+  `unset_the_gpu_phase_tries_the_listed_cells_and_no_other` and
+  `with_a_list_an_unset_switch_opens_a_listed_cell_as_on_does`.
+- **A listed cell is held to everything a cell turned on by hand is held to.**
+  The probe's `gpu` child proves it first, `zero_copy_deny` wins over the list,
+  and the adapter rule applies. The list replaces the switch's gate and nothing
+  after it.
+- **The capture decides at its open, before the session's cell is known.** With
+  the switch unset it delivers GPU frames only when a proven GPU-input cell of
+  the backend its frames go to is on the list. On Windows that backend is the
+  first one, in the cascades' order (NVENC, QSV, AMF), with a proven cell: the
+  one WGC opens its device for (`gpu_frame::preferred_cells`), and the DXGI arm
+  reads the same rule. On macOS it is VideoToolbox. An encoder on an unlisted
+  cell then reads such a frame back through `Frame::cpu()`, the bytes the CPU
+  path reads, and reports `default_off`. A listed cell of another backend reads
+  `cpu_frames` while none of that first backend's cells is listed.
+- **A fleet read counts both reasons.** Until the release that carries P2 an
+  unset host read `switch_off`; from it an unset host reads `default_off`, and
+  only a host set to `off` reads `switch_off`. A week that spans that release
+  (FR-132 §3d's canary and fleet weeks, or a read like AC1's) counts `switch_off`
+  and `default_off` together as "the switch kept this session off GPU input".
+- **Each flip is recorded here**, in the release that puts a cell on the list:
+  FR-132 P3–P5, each after a clean canary week of that cell's own. `hevc_qsv`
+  and `h264_qsv` stay off the list until FR-132's decision 9 says otherwise.
+
+| Since | `DEFAULT_CELLS` | Why |
+|---|---|---|
+| FR-132 P2 | empty | the three-valued reading and `default_off` ship first; no cell has had its canary week |
+
 ## Colour: one conversion, and the description that names it (FR-130)
 
 Every converter in the agent produces **BT.601 YUV at limited range**: the CPU converters
@@ -1604,7 +1668,7 @@ source's CSS values.
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `caps_learn_deny` | `ROOMLERD_CAPS_LEARN_DENY` | on | a dead `base` child costs the cell it died in ([above](#a-dead-child-costs-the-cell-it-died-in)); off = one child, and its death means no hardware. A change is a knob change, so the next start re-probes. Not pushable through remote config |
 | `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = no try, so it stands until the next start, and the word `probe-short` is not said. That is all it turns off: a stuck child's Media Foundation deny and the `444` and `gpu` answers that stand however their child ended answer to `caps_learn_deny`. Read at the start and again before each try. Not pushable through remote config |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them (an RTP pump's SystemContext capture stays on the CPU path, because it waits: [remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)); on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | unset: the built-in default list, empty, so off | `on` = every proven cell, `off` = none, unset = the cells on the built-in default list (FR-132 P2, [the default list](#the-default-list-fr-132-p2)). GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them (an RTP pump's SystemContext capture stays on the CPU path, because it waits: [remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)); on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
 | `qsv_rate_mode` | `ROOMLERD_QSV_RATE_MODE` | `cbr` | FR-148 P2: `qvbr` opens an HEVC or H.264 QSV session encoder off constant bitrate, at QVBR with its target at 0.9 × the cap ([below](#qsv-off-constant-bitrate-fr-148-p2)). A driver that refuses it opens at `cbr`, and the log says so. `vp9_qsv`, `av1_qsv` and recordings stay at `cbr`. Read at every encoder open, so a restart applies a change in the config; the probe child follows it. This device only: not pushable through remote config (FR-132 decision 1) |

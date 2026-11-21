@@ -1272,8 +1272,9 @@ Every Windows arm reads each captured frame back into memory. The
 SystemContext DXGI arm copies the duplication surface into a staging texture
 and maps it, inside the capture stage: about 4 ms at 1920×1200. WGC does the
 same in its `FrameArrived` handler, off the pump's clock: about 6 ms at
-2560×1600. With `zero_copy` on (default off), both arms keep the frame as a
-texture on their own device:
+2560×1600. With `zero_copy` on, both arms keep the frame as a texture on their
+own device. Unset reads a built-in default list of cells, which ships empty, so
+by default they do not (FR-132 P2, below):
 
 - **The DXGI arm** hands it to a QSV encoder whose GPU form the probe proved.
 - **WGC** (FR-118 P3) hands it to a proven NVENC encoder. WGC first moves its
@@ -1395,7 +1396,35 @@ flowchart TB
   (−97 %) and the worker's CPU (−82 %), which also counts the copy into memory
   ([FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29)).
 
-- The cells, the reasons a session took CPU frames, and the configuration:
+**The reasons a session reports.** Each session says which form its encoder
+opened, on the heartbeat (`input_path`, `input_reason`) and in
+`rc:session.stats` (`video.input_path`, `video.input_reason`, §11.12). `gpu`
+carries no reason. A CPU form names the first gate that refused it, in the order
+the open reads them:
+
+| `input_reason` | The gate |
+|---|---|
+| `switch_off` | `zero_copy` is set to `off` |
+| `default_off` | `zero_copy` is unset and the cell is not on the built-in default list (FR-132 P2) |
+| `cpu_frames` | the capture delivered frames in memory |
+| `no_gpu_cell` | the encoder or its chroma has no GPU form |
+| `denied` | `zero_copy_deny` names the cell |
+| `unproven` | the probe's `gpu` child did not prove the form on this host |
+| `adapter_mismatch` | the capture's device is on an adapter the encoder cannot take frames from |
+| `open_failed` | the GPU form failed to open, and the CPU form took over |
+
+`default_off` and `switch_off` are two reasons on purpose: "not on by default
+yet" is never read as "someone turned it off". The list ships empty, so until a
+cell has had its canary week (FR-132 P3–P5) an unset host behaves exactly as an
+`off` host and reads `default_off`, where it read `switch_off` before the
+release that carries P2. A fleet read across that release counts both. Every
+reader of the reason takes it as a string (the heartbeat's field, the server's
+`SessionVideo.input_reason`, whose only check is the name rule, and the
+viewer's media plan), so a reason an older reader has never seen is shown as
+it came.
+
+- The cells, the reasons a session took CPU frames, the default list and the
+  configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
   field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
   [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
