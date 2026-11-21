@@ -11549,8 +11549,26 @@ fn attach_cursor_handler(
                 Some(tick) => {
                     last_hidden = false;
                     if let Some(shape) = &tick.shape {
+                        // #4207: `shape_message` scales a bitmap down until the
+                        // message fits what a peer takes in one message
+                        // (`capture::cursor::SHAPE_MESSAGE_BUDGET`). A shape is
+                        // sent when the pointer changes to it, so a failed send
+                        // warns once for that change, and the pump goes on: a
+                        // refused message is not a closed channel (a closed one
+                        // ends the pump at the `cursor:pos` send below).
                         let s = crate::capture::cursor::shape_message(tick.shape_id, shape);
-                        let _ = dc.send_text(s).await;
+                        let bytes = s.len();
+                        if let Err(e) = dc.send_text(s).await {
+                            warn!(
+                                %session_id,
+                                shape_id = tick.shape_id,
+                                w = shape.width,
+                                h = shape.height,
+                                bytes,
+                                error = %e,
+                                "cursor:shape send failed; the viewer keeps its previous pointer"
+                            );
+                        }
                     }
                     // Express the native-pixel cursor position in the
                     // encoded frame's pixel space so the browser overlay
