@@ -348,7 +348,7 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:805`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:810`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
@@ -404,7 +404,7 @@ name upstream, and under an exit node the host's whole DNS goes there
 ([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
 changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
 overlay ACL's mode and the retired-key switch (`set_magic_dns`,
-`crates/modules/network/src/routes/overlay_route.rs:552`):
+`crates/modules/network/src/routes/overlay_route.rs:564`):
 
 - **Decided first**, before the body is read (#4218), normalized, or the plan gate or
   the domain checks run. A member without the bit gets one 403 `forbidden` whatever

@@ -756,7 +756,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1105`](../crates/modules/network/src/routes/agent_ssh.rs#L1105)).
+  [`agent_ssh.rs:1115`](../crates/modules/network/src/routes/agent_ssh.rs#L1115)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -1332,7 +1332,7 @@ server's. These bounds hold whatever the device's clock says:
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
 `grant_unconfirmed` and dials anyway (the route takes any OpenSSH public key,
-`agent_ssh.rs:1203`). On a stalled control connection, a grant that lands late
+`agent_ssh.rs:1213`). On a stalled control connection, a grant that lands late
 could then be redeemed up to about 165 s after mint, instead of 60 s. That
 matters only if the caller's authorization was revoked in between, and a
 redeemed session already outlives a revocation for its `session_secs` (12 h at
@@ -1908,7 +1908,7 @@ stay, each for a reason that outlives it:
 
 A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `claim_service_grant` reads no query, so the word is ignored
-(`crates/modules/network/src/routes/agent_ssh.rs:1223`). The verb
+(`crates/modules/network/src/routes/agent_ssh.rs:1233`). The verb
 `ssh-one-command` is reserved with the rest of FR-90's verbs.
 
 `a_ticketed_ssh_request_is_refused_and_audited`
