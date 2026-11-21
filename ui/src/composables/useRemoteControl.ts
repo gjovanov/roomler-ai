@@ -94,7 +94,7 @@ import {
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import { createResumeRecordUploader } from './rcResumeRecord'
 import { createHoldPaintGap, createSessionHold, holdWindowFor, type RcHoldPaintGap, type RcHoldSummary } from './rcSessionHold'
-import { createDirListing, type DirEntry } from './remoteDirListing'
+import { agentSendsDirPages, createDirListing, type DirEntry } from './remoteDirListing'
 import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from '@/workers/rc-paint-gap'
 import type { RcReloadState, RcReloadSurface, RcResumeArgs } from '@/utils/staleBuildPolicy'
 import {
@@ -14083,7 +14083,7 @@ export function useRemoteControl(
   }
 
   // Directory listing: its request, wait and answers (#4121, `remoteDirListing.ts`).
-  const dirListing = createDirListing({ channels })
+  const dirListing = createDirListing({ channels, hasDirPages: () => agentSendsDirPages(agent?.value) })
   const listDir = dirListing.listDir
 
   /** Upload multiple files sequentially. Each file is queued through

@@ -11,7 +11,7 @@
  * a fake files channel and fake timers.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createDirListing, createLatest, type DirEntry } from '@/composables/remoteDirListing'
+import { agentSendsDirPages, createDirListing, createLatest, type DirEntry } from '@/composables/remoteDirListing'
 
 /** A frame as the agent sends it. */
 type Frame = {
@@ -333,5 +333,29 @@ describe('remoteDirListing: a large folder in pages (#4121)', () => {
     const isCurrent = latest.begin()
     await settle()
     expect(isCurrent()).toBe(true)
+  })
+
+  it('VC5 an agent pages a listing only when its hello says dir-pages, by equality', () => {
+    expect(agentSendsDirPages({ capabilities: { files: ['upload', 'browse', 'dir-pages'] } })).toBe(true)
+    expect(agentSendsDirPages({ capabilities: { files: ['upload', 'browse'] } })).toBe(false)
+    expect(agentSendsDirPages({ capabilities: { files: ['dir-pages-v2', 'browse-pages'] } })).toBe(false)
+    expect(agentSendsDirPages({ capabilities: {} })).toBe(false)
+    expect(agentSendsDirPages({ capabilities: null })).toBe(false)
+    expect(agentSendsDirPages(null)).toBe(false)
+    expect(agentSendsDirPages(undefined)).toBe(false)
+  })
+
+  it('VC6 a stall in the roots view, or mid-pages, says no more than it knows', async () => {
+    const { ch, dl } = setup({ dirPages: false })
+    const roots = track(dl.listDir(''))
+    const big = track(dl.listDir('/home/p/w23-mid'))
+    dl.onFilesMessage(pageOf(reqIdOf(ch, 1), '/home/p/w23-mid', entries(10), 0, 3, 30))
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(roots.state).toBe('rejected')
+    expect(roots.error?.message).toBe('No answer from the host within 5 s.')
+    expect(big.state).toBe('rejected')
+    expect(big.error?.message).toContain('/home/p/w23-mid')
+    expect(big.error?.message).toContain('10 of 30')
+    expect(big.error?.message).not.toMatch(/update/i)
   })
 })

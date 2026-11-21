@@ -2501,6 +2501,9 @@
       <div v-if="dirError" class="pa-3 text-error text-caption">
         {{ dirError }}
       </div>
+      <div v-else-if="dirCapped" class="pa-3 text-caption text-medium-emphasis" data-testid="files-capped">
+        {{ dirEntries.length.toLocaleString() }} of this folder's entries are shown; it holds more.
+      </div>
       <v-progress-linear v-if="dirLoading" indeterminate />
       <v-list density="compact" class="pa-0">
         <v-list-item
@@ -3311,6 +3314,8 @@ async function copyAgentLog() {
 const filesDrawer = ref(false)
 const dirLoading = ref(false)
 const dirError = ref<string | null>(null)
+// The folder held more entries than the agent lists (#4121).
+const dirCapped = ref(false)
 const dirEntries = ref<{ name: string; is_dir: boolean; size: number | null; mtime_unix: number | null }[]>([])
 const currentDirPath = ref('')
 const currentParent = ref<string | null>(null)
@@ -3348,10 +3353,12 @@ async function navigateTo(path: string) {
     isRootsView.value = requestingRoots
     dirPathInput.value = listing.path
     dirEntries.value = listing.entries
+    dirCapped.value = listing.capped === true
   } catch (e) {
     if (!isCurrent()) return
     dirError.value = (e as Error).message
     dirEntries.value = []
+    dirCapped.value = false
   } finally {
     if (isCurrent()) dirLoading.value = false
   }
