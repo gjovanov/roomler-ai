@@ -234,6 +234,18 @@ stalled, every candidate only the mesh carries ranks below every TURN relay, so 
 video crosses the mesh only when nothing else connects
 ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)).
 
+A candidate's rank cannot see one route, though: a LAN socket whose checks reach a mesh
+address rides the mesh too, because the destination picks the route. Under the switch's
+`route` value (step 2) the unit is the pair: a pair rides the mesh when either end sits on
+the mesh's own blocks or its local candidate is ranked last, never on the whole
+`100.64.0.0/10` (`rides_the_mesh`,
+`crates/vendored/webrtc-ice/src/agent/agent_config.rs:170`). While a sibling on the mesh
+carries that route, the agent forms no pair from a socket off the mesh into it, and it
+holds the pairs the mesh carries, unanswered, for at most 2.5 s while a TURN relay can
+still come. A TURN pair that connects inside the hold wins; the mesh carries the video
+when none does, and the session's path line names the route and the hold
+([remote-control.md](remote-control.md#the-route-rank-fr-148-p4-step-2)).
+
 ### The direct carrier's socket buffers (FR-110)
 
 A direct carrier is one UDP socket, and the kernel holds whatever arrives
