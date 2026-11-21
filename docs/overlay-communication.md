@@ -960,7 +960,7 @@ has deleted, or one of another org, never matches.
 When someone is given a role or loses one, or a role is deleted, the org's nodes are
 re-fanned about 750 ms later, one re-fan for a burst of changes, while the org's ACL
 is `warn` or `enforce` (`refan_for_role_change`,
-`crates/modules/network/src/routes/overlay_policy.rs:334`). Under `off` a role shapes
+`crates/modules/network/src/routes/overlay_policy.rs:346`). Under `off` a role shapes
 nothing, so nothing is re-fanned. A node whose owner's roles cannot be read matches
 no role rule, with a WARN (`overlay acl: roles unreadable; role-scoped rules will not
 match this node`), and an org-relay grant that needs them is refused.
