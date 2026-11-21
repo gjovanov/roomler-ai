@@ -1749,6 +1749,35 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
+      # LAB ONLY (#4196), never merged: the per-User twin of pm-1/pm-2, two
+      # per-User MSIs of this run's one binary at 0.0.1-smoke.1 and
+      # 0.0.2-smoke.1, for a lab cell that upgrades over an equal file version.
+      - name: "LAB #4196: build a per-User pair of one binary"
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'pu-msi'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
+          foreach ($n in 1..2) {
+            cargo wix -p roomlerd --nocapture --no-build --install-version "0.0.$n-smoke.1"
+            if ($LASTEXITCODE -ne 0) { throw "cargo wix failed for pu-$n" }
+            $msi = Get-ChildItem 'target/wix/*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            Move-Item $msi.FullName (Join-Path $out "pu-$n.msi") -Force
+          }
+          Get-ChildItem $out | ForEach-Object { Write-Host "$($_.Name) $($_.Length) $((Get-FileHash $_.FullName).Hash)" }
+          Write-Host "roomlerd.exe: $((Get-Item target\release\roomlerd.exe).VersionInfo.FileVersion) $((Get-FileHash target\release\roomlerd.exe).Hash)"
+
+      - name: "LAB #4196: upload the per-User pair"
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-pu-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
+          path: ${{ runner.temp }}/pu-msi/pu-*.msi
+          if-no-files-found: warn
+          retention-days: 3
+
       # #3754 — what a failure leaves for its reader, taken before the runner
       # cleans up: every process with its image path, and the service's and the
       # per-User daemon's logs. A failed installer run has saved its own already.
