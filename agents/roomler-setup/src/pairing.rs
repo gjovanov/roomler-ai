@@ -42,13 +42,19 @@
 //! refused rather than half-served — the SPA cancels the pairing whenever the
 //! person goes back to where the choice is made, so a mismatch is a wizard
 //! bug, never a choice to guess at.
+//!
+//! **FR-141 P2 — one row.** The session holds the install's [`Layout`], not
+//! only a count: a one-row Mac's pairing covers one enrollment
+//! (`halves: 1`), like the screen alone, but its one token is ROOT's — the
+//! person's config holds no enrollment (FR-43 P3a). So an install whose
+//! layout is not the pairing's is refused even where the counts agree.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use roomlerd::pairing::{Approved, DeviceCode, PollOutcome, Started};
 use serde::Serialize;
 
-use crate::role::Role;
+use crate::role::{Layout, Role};
 
 /// What the SPA learns from a poll. `status` is the server's vocabulary
 /// plus `rate_limited` (an HTTP 429 from the per-IP governor, handled like
@@ -93,9 +99,10 @@ pub struct PairSession {
     server: String,
     /// The role the pairing was started for: the token's kind follows it.
     role: Role,
-    /// How many enrollments it was started for (FR-129 B2): `2` when the
-    /// install adds the macOS root half, else `1`.
-    halves: u8,
+    /// What the install makes of this machine (FR-141 P2), and so how many
+    /// enrollments the pairing was started for ([`Layout::halves`]): `2`
+    /// when the install adds the macOS root half (FR-129 B2), else `1`.
+    layout: Layout,
     device_code: DeviceCode,
     verification_uri: String,
     /// The delivered token(s), once a poll saw `approved`.
@@ -140,10 +147,11 @@ impl PairStore {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A pairing the server opened for `halves` enrollments: it replaces
-    /// whatever was held — an earlier session's device code and any token it
-    /// had delivered are dropped — and returns the new session's generation.
-    pub fn begin(&self, server: String, role: Role, halves: u8, started: Started) -> u64 {
+    /// A pairing the server opened for an install of `layout` (it asked for
+    /// [`Layout::halves`] enrollments): it replaces whatever was held — an
+    /// earlier session's device code and any token it had delivered are
+    /// dropped — and returns the new session's generation.
+    pub fn begin(&self, server: String, role: Role, layout: Layout, started: Started) -> u64 {
         let mut g = self.lock();
         g.generations += 1;
         let generation = g.generations;
@@ -152,7 +160,7 @@ impl PairStore {
             PairSession {
                 server,
                 role,
-                halves: halves.max(1),
+                layout,
                 device_code: started.device_code,
                 verification_uri: started.verification_uri,
                 approved: None,
@@ -252,18 +260,19 @@ impl PairStore {
         g.session = None;
     }
 
-    /// The delivered tokens for an install of `role` against `server`, with
-    /// or without the macOS root half, cloned — not consumed, see the module
-    /// doc. Refused when nothing was delivered, when the install asks for a
-    /// different role or server than the pairing was started for (the
-    /// token's kind follows the role, and a token minted by one server
-    /// enrolls into no other), and when it asks for other halves than the
-    /// pairing covers (FR-129 B2).
+    /// The delivered tokens for an install of `role` against `server` that
+    /// makes `layout`, cloned — not consumed, see the module doc. Refused
+    /// when nothing was delivered, when the install asks for a different
+    /// role or server than the pairing was started for (the token's kind
+    /// follows the role, and a token minted by one server enrolls into no
+    /// other), and when it makes another layout than the pairing covers
+    /// (FR-129 B2's halves, and FR-141 P2's one row, whose one token is
+    /// root's where the screen alone's is the person's).
     pub fn tokens_for(
         &self,
         role: Role,
         server: &str,
-        root_half: bool,
+        layout: Layout,
     ) -> Result<InstallTokens, String> {
         let g = self.lock();
         let Some((_, s)) = g.session.as_ref() else {
@@ -284,18 +293,10 @@ impl PairStore {
                     .to_string(),
             );
         }
-        let wanted = crate::role::pair_halves(root_half);
-        if s.halves != wanted {
-            return Err(if root_half {
-                "the approval covers this Mac's screen half only, and the private network is a \
-                 second device that needs its own enrollment — start the pairing again"
-                    .to_string()
-            } else {
-                "the approval covers this Mac's screen and its private network, and this install \
-                 is the screen alone — start the pairing again"
-                    .to_string()
-            });
+        if s.layout != layout {
+            return Err(layout_mismatch(s.layout, layout));
         }
+        let wanted = layout.halves();
         if approved.tokens.len() < usize::from(wanted) {
             return Err(format!(
                 "the pairing delivered {} enrollment token(s) for {wanted} enrollments — start \
@@ -303,20 +304,33 @@ impl PairStore {
                 approved.tokens.len()
             ));
         }
-        let main = approved
+        let first = approved
             .tokens
             .first()
             .cloned()
             .ok_or_else(|| "the pairing delivered no token".to_string())?;
-        let root_half = root_half.then(|| approved.tokens[1].clone());
-        if root_half.as_deref() == Some(main.as_str()) {
-            // A token works once: the second enroll would be refused, after
-            // the first had already made its device.
-            return Err(
-                "the pairing delivered the same token twice — start the pairing again".to_string(),
-            );
+        match layout {
+            Layout::Device => Ok(InstallTokens::Device(first)),
+            Layout::TwoRows => {
+                let root = approved.tokens[1].clone();
+                if root == first {
+                    // A token works once: the second enroll would be refused,
+                    // after the first had already made its device.
+                    return Err(
+                        "the pairing delivered the same token twice — start the pairing again"
+                            .to_string(),
+                    );
+                }
+                Ok(InstallTokens::TwoRows {
+                    person: first,
+                    root,
+                })
+            }
+            // FR-141 P2, rule 1: the one token is ROOT's. Never the screen
+            // half's, which `halves: 1` means for the screen alone: that would
+            // make a per-user row and no root row.
+            Layout::OneRow => Ok(InstallTokens::OneRow { root: first }),
         }
-        Ok(InstallTokens { main, root_half })
     }
 
     /// The install succeeded: the token is spent, the session is over.
@@ -336,21 +350,99 @@ impl PairStore {
     }
 }
 
-/// The enrollment tokens one install enrolls with: `main` for the device the
-/// role installs, and — FR-129 B2 — `root_half` for the macOS root half
-/// beside it. Ordinary single-use tokens, both; `Debug` prints neither.
+/// Why an install's layout is not the pairing's, in words that say what to do
+/// next. B2's two texts are kept as they were; FR-141 P2 adds the one row's.
+fn layout_mismatch(held: Layout, wanted: Layout) -> String {
+    match (held, wanted) {
+        (Layout::Device, Layout::TwoRows) => {
+            "the approval covers this Mac's screen half only, and the private network is a \
+             second device that needs its own enrollment — start the pairing again"
+        }
+        (Layout::TwoRows, Layout::Device) => {
+            "the approval covers this Mac's screen and its private network, and this install \
+             is the screen alone — start the pairing again"
+        }
+        (Layout::OneRow, Layout::Device) => {
+            "the approval makes this Mac one device with its private network, and this install \
+             is the screen alone — start the pairing again"
+        }
+        (Layout::OneRow, Layout::TwoRows) => {
+            "the approval makes this Mac one device, and this install makes it two — start the \
+             pairing again"
+        }
+        (Layout::Device, Layout::OneRow) => {
+            "the approval covers this Mac's screen alone, and this install makes it one device \
+             with its private network — start the pairing again"
+        }
+        (Layout::TwoRows, Layout::OneRow) => {
+            "the approval covers two devices, and this install makes this Mac one — start the \
+             pairing again"
+        }
+        (Layout::Device, Layout::Device)
+        | (Layout::TwoRows, Layout::TwoRows)
+        | (Layout::OneRow, Layout::OneRow) => {
+            "the approval is for another install — start the pairing again"
+        }
+    }
+    .to_string()
+}
+
+/// The enrollment tokens one install enrolls with, by its [`Layout`].
+/// Ordinary single-use tokens, all of them; `Debug` prints none.
 #[derive(Clone, Eq, PartialEq)]
-pub struct InstallTokens {
-    pub main: String,
-    pub root_half: Option<String>,
+pub enum InstallTokens {
+    /// The one device the role installs: every install off macOS, and a
+    /// Mac's screen alone.
+    Device(String),
+    /// FR-129 B2 — a Mac as two rows: the person's screen half, and the root
+    /// half beside it with a token of its own.
+    TwoRows { person: String, root: String },
+    /// FR-141 P2 — a Mac as one row: the one token enrolls ROOT's config,
+    /// and the person's holds no enrollment (FR-43 P3a).
+    OneRow { root: String },
+}
+
+impl InstallTokens {
+    /// The layout these tokens make: the one the pairing held, or the paste's.
+    pub fn layout(&self) -> Layout {
+        match self {
+            Self::Device(_) => Layout::Device,
+            Self::TwoRows { .. } => Layout::TwoRows,
+            Self::OneRow { .. } => Layout::OneRow,
+        }
+    }
+
+    /// The token of an install that makes one device of the role's own kind
+    /// (the tunnel client, every Windows install, a Mac's screen alone).
+    /// Refused for a Mac's two-row or one-row tokens, which only the macOS
+    /// pipeline takes: [`crate::role::layout`] makes neither off macOS, so a
+    /// refusal here is a wizard bug.
+    pub fn into_device(self) -> Result<String, String> {
+        match self {
+            Self::Device(token) => Ok(token),
+            Self::TwoRows { .. } | Self::OneRow { .. } => Err(
+                "this install makes one device, and the tokens are for a Mac's root service (a \
+                 bug) — start the pairing again"
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 impl std::fmt::Debug for InstallTokens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InstallTokens")
-            .field("main", &"<redacted>")
-            .field("root_half", &self.root_half.as_ref().map(|_| "<redacted>"))
-            .finish()
+        match self {
+            Self::Device(_) => f.debug_tuple("Device").field(&"<redacted>").finish(),
+            Self::TwoRows { .. } => f
+                .debug_struct("TwoRows")
+                .field("person", &"<redacted>")
+                .field("root", &"<redacted>")
+                .finish(),
+            Self::OneRow { .. } => f
+                .debug_struct("OneRow")
+                .field("root", &"<redacted>")
+                .finish(),
+        }
     }
 }
 
@@ -395,12 +487,11 @@ mod tests {
     /// The interval every test polls with, where it does not matter.
     const POLLED: u64 = 5;
 
-    /// The one token of an install without the root half.
+    /// The one token of an install that makes one device of the role's kind.
     fn one_token(store: &PairStore, role: Role, server: &str) -> Result<String, String> {
-        store.tokens_for(role, server, false).map(|t| {
-            assert!(t.root_half.is_none());
-            t.main
-        })
+        store
+            .tokens_for(role, server, Layout::Device)
+            .map(|t| t.into_device().expect("one device's token"))
     }
 
     fn approved_two(first: &str, second: &str) -> PollOutcome {
@@ -420,10 +511,15 @@ mod tests {
     #[test]
     fn a_two_half_pairing_hands_out_both_tokens() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::DaemonUser, 2, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::TwoRows,
+            started("dc-1"),
+        );
         assert!(
             store
-                .tokens_for(Role::DaemonUser, SERVER, true)
+                .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
                 .unwrap_err()
                 .contains("not been approved")
         );
@@ -433,12 +529,20 @@ mod tests {
             POLLED,
         );
         for _ in 0..2 {
-            let t = store.tokens_for(Role::DaemonUser, SERVER, true).unwrap();
-            assert_eq!(t.main, "eyJ.user.sig");
-            assert_eq!(t.root_half.as_deref(), Some("eyJ.root.sig"));
+            assert_eq!(
+                store
+                    .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
+                    .unwrap(),
+                InstallTokens::TwoRows {
+                    person: "eyJ.user.sig".into(),
+                    root: "eyJ.root.sig".into(),
+                }
+            );
         }
         // Nothing of either in a log line.
-        let t = store.tokens_for(Role::DaemonUser, SERVER, true).unwrap();
+        let t = store
+            .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
+            .unwrap();
         let text = format!("{t:?}");
         assert!(
             !text.contains("user.sig") && !text.contains("root.sig"),
@@ -446,7 +550,11 @@ mod tests {
         );
         assert!(text.contains("<redacted>"), "{text}");
         store.finish();
-        assert!(store.tokens_for(Role::DaemonUser, SERVER, true).is_err());
+        assert!(
+            store
+                .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
+                .is_err()
+        );
     }
 
     /// FR-129 B2 — the halves an install asks for must be the pairing's: a
@@ -456,10 +564,15 @@ mod tests {
     #[test]
     fn an_install_with_other_halves_than_the_pairing_is_refused() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::DaemonUser, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::Device,
+            started("dc-1"),
+        );
         store.apply_poll(generation, approved("eyJ.one.sig"), POLLED);
         let e = store
-            .tokens_for(Role::DaemonUser, SERVER, true)
+            .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
             .unwrap_err();
         assert!(
             e.contains("screen half only") && e.contains("start the pairing again"),
@@ -470,24 +583,157 @@ mod tests {
             "eyJ.one.sig"
         );
 
-        let generation = store.begin(SERVER.into(), Role::DaemonUser, 2, started("dc-2"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::TwoRows,
+            started("dc-2"),
+        );
         store.apply_poll(generation, approved_two("eyJ.a.sig", "eyJ.b.sig"), POLLED);
         let e = one_token(&store, Role::DaemonUser, SERVER).unwrap_err();
         assert!(e.contains("screen alone"), "{e}");
 
-        let generation = store.begin(SERVER.into(), Role::DaemonUser, 2, started("dc-3"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::TwoRows,
+            started("dc-3"),
+        );
         store.apply_poll(generation, approved("eyJ.only.sig"), POLLED);
         let e = store
-            .tokens_for(Role::DaemonUser, SERVER, true)
+            .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
             .unwrap_err();
         assert!(e.contains("delivered 1 enrollment token"), "{e}");
 
-        let generation = store.begin(SERVER.into(), Role::DaemonUser, 2, started("dc-4"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::TwoRows,
+            started("dc-4"),
+        );
         store.apply_poll(generation, approved_two("eyJ.x.sig", "eyJ.x.sig"), POLLED);
         let e = store
-            .tokens_for(Role::DaemonUser, SERVER, true)
+            .tokens_for(Role::DaemonUser, SERVER, Layout::TwoRows)
             .unwrap_err();
         assert!(e.contains("same token twice"), "{e}");
+    }
+
+    /// FR-141 P2, rule 1 — a one-row Mac's pairing (`halves: 1`) gives its one
+    /// token to ROOT's enrollment, and the person's config holds none (FR-43
+    /// P3a). Today's `halves: 1` mapping hands that token to the person's
+    /// screen half, which makes a per-user row and no root row: the opposite
+    /// of one row. Cloned, like every delivered token: a Retry reads it again.
+    #[test]
+    fn a_one_row_pairing_gives_its_one_token_to_root() {
+        let store = PairStore::new();
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::OneRow,
+            started("dc-1"),
+        );
+        store.apply_poll(generation, approved("eyJ.one.sig"), POLLED);
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .tokens_for(Role::DaemonUser, SERVER, Layout::OneRow)
+                    .unwrap(),
+                InstallTokens::OneRow {
+                    root: "eyJ.one.sig".into()
+                }
+            );
+        }
+        let text = format!(
+            "{:?}",
+            store
+                .tokens_for(Role::DaemonUser, SERVER, Layout::OneRow)
+                .unwrap()
+        );
+        assert!(
+            !text.contains("one.sig") && text.contains("<redacted>"),
+            "{text}"
+        );
+    }
+
+    /// FR-141 P2, rule 2 — the layout follows the pairing, never half-served:
+    /// a one-row approval is not spent on the screen alone or on two rows,
+    /// and neither of theirs on one row, although a one-row pairing and the
+    /// screen alone's both cover one enrollment (the token goes to another
+    /// config). Each refusal says to start the pairing again, and none of a
+    /// one-row Mac's says "second device".
+    #[test]
+    fn a_one_row_install_takes_only_a_one_row_pairing() {
+        let store = PairStore::new();
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::OneRow,
+            started("dc-1"),
+        );
+        store.apply_poll(generation, approved("eyJ.one.sig"), POLLED);
+        for wanted in [Layout::Device, Layout::TwoRows] {
+            let e = store
+                .tokens_for(Role::DaemonUser, SERVER, wanted)
+                .unwrap_err();
+            assert!(
+                e.contains("one device") && e.contains("start the pairing again"),
+                "{wanted:?}: {e}"
+            );
+            assert!(!e.contains("second device"), "{wanted:?}: {e}");
+        }
+        for held in [Layout::Device, Layout::TwoRows] {
+            let generation = store.begin(SERVER.into(), Role::DaemonUser, held, started("dc-2"));
+            store.apply_poll(generation, approved_two("eyJ.a.sig", "eyJ.b.sig"), POLLED);
+            let e = store
+                .tokens_for(Role::DaemonUser, SERVER, Layout::OneRow)
+                .unwrap_err();
+            assert!(
+                e.contains("makes it one device") || e.contains("makes this Mac one"),
+                "{held:?}: {e}"
+            );
+            assert!(e.contains("start the pairing again"), "{held:?}: {e}");
+        }
+        // The pairing's own layout still gets its token afterwards.
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonUser,
+            Layout::OneRow,
+            started("dc-3"),
+        );
+        assert!(
+            store
+                .tokens_for(Role::DaemonUser, SERVER, Layout::OneRow)
+                .unwrap_err()
+                .contains("not been approved")
+        );
+        store.apply_poll(generation, approved("eyJ.three.sig"), POLLED);
+        assert!(
+            store
+                .tokens_for(Role::DaemonUser, SERVER, Layout::OneRow)
+                .is_ok()
+        );
+    }
+
+    /// A token for a Mac's root service never reaches an install that makes
+    /// one device of the role's kind (the tunnel client, Windows).
+    #[test]
+    fn only_a_device_token_goes_to_a_one_device_install() {
+        assert_eq!(
+            InstallTokens::Device("eyJ.d.sig".into()).into_device(),
+            Ok("eyJ.d.sig".to_string())
+        );
+        for t in [
+            InstallTokens::OneRow {
+                root: "eyJ.r.sig".into(),
+            },
+            InstallTokens::TwoRows {
+                person: "eyJ.p.sig".into(),
+                root: "eyJ.r.sig".into(),
+            },
+        ] {
+            let e = t.into_device().unwrap_err();
+            assert!(!e.contains(".sig"), "{e}");
+        }
     }
 
     #[test]
@@ -496,7 +742,12 @@ mod tests {
         assert!(store.snapshot().is_none());
         assert_eq!(store.state(), (false, false));
 
-        let generation = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-1"),
+        );
         let snap = store.snapshot().expect("a session");
         assert_eq!(snap.generation, generation);
         assert_eq!(snap.server, SERVER);
@@ -514,7 +765,12 @@ mod tests {
     #[test]
     fn an_approval_is_delivered_cloned_and_spent_on_finish() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::DaemonSystem, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonSystem,
+            Layout::Device,
+            started("dc-1"),
+        );
 
         assert_eq!(
             one_token(&store, Role::DaemonSystem, SERVER).unwrap_err(),
@@ -531,7 +787,12 @@ mod tests {
 
         // An older server's approval, without the unique identifiers, still
         // reaches the SPA — with them absent, not invented.
-        let generation = store.begin(SERVER.into(), Role::DaemonSystem, 1, started("dc-2"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonSystem,
+            Layout::Device,
+            started("dc-2"),
+        );
         let v = store.apply_poll(
             generation,
             PollOutcome::Approved(Approved {
@@ -547,7 +808,12 @@ mod tests {
         assert_eq!(v.org_name.as_deref(), Some("Acme"));
         assert_eq!(v.org_slug, None);
         assert_eq!(v.approver_username, None);
-        let generation = store.begin(SERVER.into(), Role::DaemonSystem, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonSystem,
+            Layout::Device,
+            started("dc-1"),
+        );
         store.apply_poll(generation, approved("eyJ.tok.sig"), POLLED);
 
         // Cloned, not consumed: a Retry after a pre-enroll failure reads it
@@ -575,7 +841,12 @@ mod tests {
     #[test]
     fn the_token_is_refused_for_another_role_or_server() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-1"),
+        );
         store.apply_poll(generation, approved("tok"), POLLED);
 
         let e = one_token(&store, Role::DaemonUser, SERVER).unwrap_err();
@@ -594,11 +865,21 @@ mod tests {
     #[test]
     fn a_new_start_replaces_the_session_and_stale_polls_are_ignored() {
         let store = PairStore::new();
-        let first = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-1"));
+        let first = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-1"),
+        );
         store.apply_poll(first, approved("old-token"), POLLED);
         assert_eq!(store.state(), (true, true));
 
-        let second = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-2"));
+        let second = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-2"),
+        );
         assert_ne!(first, second);
         assert_eq!(store.state(), (true, false), "the old token is gone");
         assert_eq!(store.snapshot().unwrap().device_code.expose(), "dc-2");
@@ -629,7 +910,12 @@ mod tests {
     #[test]
     fn terminal_answers_end_the_session_and_the_others_keep_it() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::DaemonMachine, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonMachine,
+            Layout::Device,
+            started("dc-1"),
+        );
 
         let v = store.apply_poll(generation, PollOutcome::SlowDown { interval: 10 }, 5);
         assert_eq!(v.status, PairPollStatus::SlowDown);
@@ -648,7 +934,12 @@ mod tests {
         assert_eq!(v.status, PairPollStatus::AccessDenied);
         assert_eq!(store.state(), (false, false));
 
-        let generation = store.begin(SERVER.into(), Role::DaemonMachine, 1, started("dc-2"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::DaemonMachine,
+            Layout::Device,
+            started("dc-2"),
+        );
         let v = store.apply_poll(generation, PollOutcome::ExpiredToken, POLLED);
         assert_eq!(v.status, PairPollStatus::ExpiredToken);
         assert_eq!(store.state(), (false, false));
@@ -660,7 +951,12 @@ mod tests {
     #[test]
     fn a_rate_limit_backs_off_like_a_slow_down_and_keeps_the_session() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-1"),
+        );
 
         let v = store.apply_poll(
             generation,
@@ -701,7 +997,12 @@ mod tests {
     #[test]
     fn cancel_forgets_everything() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-1"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-1"),
+        );
         store.apply_poll(generation, approved("tok"), POLLED);
         store.cancel();
         assert_eq!(store.state(), (false, false));
@@ -717,7 +1018,12 @@ mod tests {
     #[test]
     fn debug_output_carries_no_secret() {
         let store = PairStore::new();
-        let generation = store.begin(SERVER.into(), Role::TunnelClient, 1, started("dc-SECRET"));
+        let generation = store.begin(
+            SERVER.into(),
+            Role::TunnelClient,
+            Layout::Device,
+            started("dc-SECRET"),
+        );
         store.apply_poll(generation, approved("eyJ.TOKEN.sig"), POLLED);
         let text = format!("{store:?}");
         assert!(!text.contains("SECRET"), "{text}");

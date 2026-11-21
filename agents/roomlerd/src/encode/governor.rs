@@ -1778,7 +1778,10 @@ impl RateGovernor {
                     // FR-148 P0 — with the switch off it gets here unoffered, and
                     // is then application-limited (the jupiter chain's trickle).
                     let basis = Basis::of_window(offer_held);
-                    self.belief.observe_capacity_in(rx_bps, basis, take, now);
+                    // FR-148 D48 — the window's own delivery: near a loss the
+                    // shadow model's window rules read it (rules 2 and 3).
+                    self.belief
+                        .observe_link_capacity_in(rx_bps, basis, take, now);
                     self.link_rx_bps = Some((rx_bps, now));
                     self.path.link_rx = basis;
                 }
@@ -2266,6 +2269,7 @@ impl RateGovernor {
             model_stand_in: model.stand_in(prior, now).map(aged),
             model_floor_by: model.floor_by(),
             model_capacity_by: model.capacity_by(now),
+            model_ruled: self.belief.ruled(now),
         }
     }
 
@@ -2288,6 +2292,27 @@ impl RateGovernor {
     /// ([`super::pipe::Pipe::note_stall`]). Nothing else moves.
     pub fn note_path_stall(&mut self) {
         self.belief.note_stall();
+    }
+
+    /// FR-148 D48 — a sample rule acted on a closed sample, at the pump's
+    /// heartbeat: rule 1 re-read its P3 push-back at the budget's rate, or
+    /// rule 4 kept it out. The `path model` line names it
+    /// ([`super::pipe::Pipe::note_ruled`]) when the push-back would have
+    /// reached the shadow model: after a window the gate rejected B2 files
+    /// none ([`Self::on_sample_push_back`]), so no rule acted on one.
+    pub fn on_sample_ruled(&mut self, rule: super::pipe::Ruled, now: Instant) {
+        if self.sample_take.is_some() {
+            self.belief.note_ruled(rule, now);
+        }
+    }
+
+    /// FR-148 D48 — the in-flight budget's last step, computing on or in
+    /// shadow, beside its stall mark ([`Self::note_path_stall`]): its rate,
+    /// whether this association's figures gave it, and SCTP's loss count. The
+    /// shadow model's window rules read it at the next window's close
+    /// ([`super::pipe::Pipe::note_path_rate`]). Nothing else moves.
+    pub fn note_path_rate(&mut self, rate: super::pipe::PathRate) {
+        self.belief.note_path_rate(rate);
     }
 
     /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged

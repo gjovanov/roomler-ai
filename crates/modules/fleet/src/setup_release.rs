@@ -146,6 +146,9 @@ pub struct SetupFeatures {
     /// `[setup] wizard_reinstall_guard` (FR-141 P3): the wizard's one-row
     /// guard, ON by default, the one switch here that is not a claim.
     pub wizard_reinstall_guard: bool,
+    /// `[setup] wizard_macos_one_row` (FR-141 P2): the released Roomler Setup
+    /// makes a new Mac one device row (FR-43), field-proven. Off by default.
+    pub wizard_macos_one_row: bool,
 }
 
 /// `GET /api/setup/features` — the server-wide switches a client reads before
@@ -155,7 +158,7 @@ pub struct SetupFeatures {
 /// ```json
 /// {"pairing": true, "wizard_linux_daemon": false, "wizard_macos_daemon": false,
 ///  "wizard_unix_daemon": false, "wizard_pairing": false,
-///  "wizard_reinstall_guard": true}
+///  "wizard_reinstall_guard": true, "wizard_macos_one_row": false}
 /// ```
 ///
 /// * `pairing` mirrors `[pairing] enabled` — a fact about THIS SERVER:
@@ -187,6 +190,11 @@ pub struct SetupFeatures {
 ///     by default, and a server image promoted before the first `setup-v*`
 ///     that carries A3 would otherwise promise a flow the download cannot
 ///     do.
+///   - `wizard_macos_one_row` (FR-141 P2): it makes a new Mac ONE device row
+///     (FR-43) from the macOS daemon card with "Join the overlay network"
+///     ticked, where it makes FR-129 B2's two rows while the switch is off.
+///     A Mac that is enrolled already keeps its layout either way, and a
+///     wizard released before P2 does not read it.
 /// * `wizard_reinstall_guard` (FR-141 P3) is a kill switch, not a claim: the
 ///   released wizard's one-row guard (on a Mac whose root daemon says it is
 ///   one row, it installs and pairs nothing), **on** by default, and a wizard
@@ -218,6 +226,7 @@ pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatur
         wizard_unix_daemon: linux && macos,
         wizard_pairing: setup.wizard_pairing,
         wizard_reinstall_guard: setup.wizard_reinstall_guard,
+        wizard_macos_one_row: setup.wizard_macos_one_row,
     })
 }
 

@@ -615,7 +615,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2263`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2298`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -1373,7 +1373,7 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12896`), asked as the channel opens (`files_channel_here`, `:12905`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12896`), asked as the channel opens (`files_channel_here`, `:12905`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1171`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12931`), `attach_files_declined` (`:12954`), `declined_reply` (`:12985`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12864`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
@@ -2440,7 +2440,7 @@ flowchart TD
 - **A restart, not a loop.** launchd relaunches the net's exit as it does any non-zero exit, one start per 10 s at most
   (the plist's `ThrottleInterval`). The net marks no clean shutdown, so a run that it ends before the run has been
   healthy for 5 minutes counts as a crash at the next start, as any other would, and the crash-loop rollback still
-  counts it (`app.rs:4315`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
+  counts it (`app.rs:4350`). A relaunched daemon makes a new connection at its start, and the first read decides for it.
 - **Why a code of its own.** 9, `RESTART_REQUESTED_EXIT_CODE`, is a requested restart: it says no failure happened, and
   the macOS (FR-43) and Windows supervisors keep it out of their crash records. The net's exit is a failure, so it
   leaves with 32, `APPKIT_ENDED_EXIT_CODE`, which no other exit in the tree uses, which is outside the Linux units'
@@ -3195,7 +3195,7 @@ Who calls them, and how each is read:
 | Caller | Runs | Taken as |
 |---|---|---|
 | the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2809`) and the banner's Disconnect (`cmd_rc_disconnect`, `:3105`) | as the person, in their session | the screen's session |
-| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2509`; `rc_cmd`, `:2406`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
+| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2544`; `rc_cmd`, `:2441`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
 The tests, in `crates/localapi`: `the_screen_decision_table` (every row above, a per-user daemon
@@ -3365,8 +3365,8 @@ The tests:
 | `a_removed_socket_file_is_served_again_within_a_look` | `agents/roomlerd/src/person_socket.rs:1726` | the real poll and a real socket (Linux, as the runner): a removed file is served again within a look, with no pause |
 | `a_replaced_socket_file_ends_the_listener_and_a_live_one_is_left_alone` | `agents/roomlerd/src/person_socket.rs:1769` | a stale replacement is cleared and served; a live one ends the listener, is kept and waits out the pause |
 | `a_runtime_directory_not_there_yet_is_tried_again_at_the_next_look` | `agents/roomlerd/src/person_socket.rs:1835` | a missing runtime directory is tried again at each look, said once for each log-in |
-| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:11829` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
-| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:11921` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
+| `a_person_socket_ends_when_its_path_no_longer_names_it` | `crates/localapi/src/lib.rs:11882` | the listener and its way out: unlinked or replaced, it ends with its connection, and removes nothing it did not bind |
+| `the_live_sessions_read_by_the_sockets_person_are_noted_as_theirs` | `crates/localapi/src/lib.rs:11974` | the dispatcher: only the socket's own person's read is noted, never root's nor the daemon's own endpoint's |
 | `a_session_is_told_only_by_a_read_after_its_registration` | `agents/roomlerd/src/rc_sessions.rs:448` | the decision, with a stubbed clock and record (every OS) |
 | `a_companion_that_stops_reading_for_longer_than_the_bound_has_gone_quiet` | `agents/roomlerd/src/rc_sessions.rs:481` | a told session's companion gone quiet |
 | `a_persons_read_is_noted_for_them_and_a_reannounce_keeps_the_registration` | `agents/roomlerd/src/rc_sessions.rs:505` | the record: per person, after the registration, kept across a re-announce |
