@@ -25,11 +25,12 @@ path = "src/main.rs"
 embed-resource = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# The job object and the shutdown order only. Bindings-only, on the 0.59 line the
-# agent already compiles in every Windows build.
+# The job object, the shutdown order and (FR-150 P2) `SM_SHUTTINGDOWN` only.
+# Bindings-only, on the 0.59 line the agent already compiles in every Windows build.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }

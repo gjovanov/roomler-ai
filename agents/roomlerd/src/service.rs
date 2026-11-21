@@ -1436,13 +1436,13 @@ mod windows {
     ///
     /// UTC, with the `Z` Task Scheduler reads as "synchronize across time zones",
     /// so no daylight-saving change can land one in the past.
-    const START_AFTER_REGISTERING: [i64; 3] = [60, 180, 600];
+    pub(super) const START_AFTER_REGISTERING: [i64; 3] = [60, 180, 600];
 
-    fn start_soon_triggers(now: chrono::DateTime<chrono::Utc>) -> String {
+    pub(super) fn start_soon_triggers(now: chrono::DateTime<chrono::Utc>) -> String {
         START_AFTER_REGISTERING
             .iter()
             .map(|secs| {
-                let at = now + chrono::Duration::seconds(*secs);
+                let at = super::whole_second_at_or_after(now) + chrono::Duration::seconds(*secs);
                 format!(
                     "    <TimeTrigger>\n      <StartBoundary>{}</StartBoundary>\n      \
                      <Enabled>true</Enabled>\n    </TimeTrigger>\n",
@@ -1465,7 +1465,7 @@ mod windows {
     /// later starts (C6b). The task's own one-shots, each ending an hour after
     /// the registration, and then the task deletes itself (C6c). No logon or
     /// boot trigger: the account's task has those.
-    fn render_start_task_xml(
+    pub(super) fn render_start_task_xml(
         name: &str,
         command: &str,
         user: &str,
@@ -1477,7 +1477,7 @@ mod windows {
         let triggers: String = START_AFTER_REGISTERING
             .iter()
             .map(|secs| {
-                let at = now + chrono::Duration::seconds(*secs);
+                let at = super::whole_second_at_or_after(now) + chrono::Duration::seconds(*secs);
                 format!(
                     "    <TimeTrigger>\n      <StartBoundary>{}</StartBoundary>\n      \
                      <EndBoundary>{end}</EndBoundary>\n      <Enabled>true</Enabled>\n    \
@@ -3190,5 +3190,184 @@ mod tests {
             Install::detect(&crate::appdirs::system_config_path()),
             Install::LinuxSystem
         );
+    }
+}
+
+// FR-150 P2 (#3295) — the per-user launcher's ends (`agents/roomlerdw/src/ends.rs`),
+// compiled here so that its codes are held to the daemon's own: one more row of
+// `Install`'s table, on purpose.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../roomlerdw/src/ends.rs"]
+mod launcher_ends;
+
+#[cfg(test)]
+mod launcher_ends_tests {
+    use super::Install;
+    use super::launcher_ends::{self as ends, End};
+    use crate::{daemon_error, watchdog};
+
+    /// FR-150 P2 — the launcher's table agrees with the daemon's codes, with
+    /// `Install`'s table, and (on Windows) with the service host's own reading
+    /// of a worker's end: the launcher starts again exactly what the host counts
+    /// as a crash, but for the session teardown, which it reads from
+    /// `SM_SHUTTINGDOWN` instead, and leaves on the host's other ends.
+    #[test]
+    fn the_launchers_ends_agree_with_the_install_table() {
+        assert_eq!(ends::AGENT_DELETED, watchdog::AGENT_DELETED_EXIT_CODE);
+        assert_eq!(ends::ALREADY_RUNNING, watchdog::ALREADY_RUNNING_EXIT_CODE);
+        assert_eq!(
+            ends::RESTART_REQUESTED,
+            watchdog::RESTART_REQUESTED_EXIT_CODE
+        );
+        assert_eq!(ends::NO_ENROLLMENT, daemon_error::NO_ENROLLMENT_EXIT_CODE);
+        assert_eq!(
+            ends::INSTALL_IN_FLIGHT,
+            daemon_error::INSTALL_IN_FLIGHT_EXIT_CODE
+        );
+
+        // `Install`'s row for the per-user task: a daemon the server removed
+        // stays down (D3), as the launcher leaves on exit 7.
+        assert!(
+            Install::WindowsTask
+                .after_removal()
+                .contains("does not restart"),
+            "{}",
+            Install::WindowsTask.after_removal()
+        );
+        assert_eq!(
+            ends::end_of(watchdog::AGENT_DELETED_EXIT_CODE, false),
+            End::Leave("agent-deleted")
+        );
+        // The watchdog's stall relies on a supervisor to bring a healthy copy
+        // back: it is a crash.
+        assert_eq!(ends::end_of(watchdog::STALL_EXIT_CODE, false), End::Restart);
+
+        #[cfg(windows)]
+        {
+            use crate::win_service::supervisor::{
+                SESSION_TEARDOWN_EXIT_CODE, worker_end_is_no_crash,
+            };
+            let deliberate = [
+                watchdog::ALREADY_RUNNING_EXIT_CODE,
+                daemon_error::NO_ENROLLMENT_EXIT_CODE,
+                daemon_error::INSTALL_IN_FLIGHT_EXIT_CODE,
+            ];
+            let codes = (0..=255).chain([
+                SESSION_TEARDOWN_EXIT_CODE as i32,
+                0xC000_0005_u32 as i32,
+                0xC000_013A_u32 as i32,
+            ]);
+            for code in codes {
+                let host = worker_end_is_no_crash(code as u32);
+                match ends::end_of(code, false) {
+                    End::Restart => assert!(
+                        host.is_none() || code == SESSION_TEARDOWN_EXIT_CODE as i32,
+                        "{code:#x}: the launcher restarts what the host calls {host:?}"
+                    ),
+                    End::Leave(word) => match host {
+                        Some(host_word) => assert_eq!(word, host_word, "{code:#x}"),
+                        None => assert!(deliberate.contains(&code), "{code:#x}: {word}"),
+                    },
+                }
+            }
+        }
+    }
+
+    /// FR-150 P2 — the backstop. A daemon that an install in flight sent away
+    /// (exit 75) is started again by the task's one-shots, and the last one,
+    /// +600 s, is the backstop: an unrelated install can hold Windows
+    /// Installer's mutex for longer than ten minutes, but by then the
+    /// update-attempt marker is no longer fresh, so the daemon starts whatever
+    /// runs. That holds because the per-user MSI's `StopOldDaemon` touches the
+    /// marker before its `RegisterAutostart` writes the task, the freshness test
+    /// is strict (`elapsed < cooldown`), each one-shot fires at or after its
+    /// offset, and the last offset is not shorter than the window. Raise the
+    /// window past it, and a daemon sent away stays down until the next sign-in.
+    #[cfg(windows)]
+    #[test]
+    fn the_tasks_last_start_is_after_the_update_window() {
+        use super::windows::{START_AFTER_REGISTERING, render_start_task_xml, start_soon_triggers};
+        let last = START_AFTER_REGISTERING
+            .iter()
+            .copied()
+            .max()
+            .expect("one-shots");
+        let last = std::time::Duration::from_secs(u64::try_from(last).expect("after"));
+        assert!(
+            crate::updater::UPDATE_STOP_WINDOW <= last,
+            "the update window ({:?}) outlasts the task's last start ({last:?})",
+            crate::updater::UPDATE_STOP_WINDOW
+        );
+
+        // Each one-shot at or after its offset: a `StartBoundary` names whole
+        // seconds, and the registration's clock does not.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-21T00:59:59.900Z")
+            .expect("a time")
+            .to_utc();
+        let boundaries = |xml: &str| -> Vec<chrono::DateTime<chrono::Utc>> {
+            xml.split("<StartBoundary>")
+                .skip(1)
+                .map(|rest| {
+                    let at = &rest[..rest.find("</StartBoundary>").expect("closed")];
+                    chrono::DateTime::parse_from_rfc3339(at)
+                        .expect("UTC")
+                        .to_utc()
+                })
+                .collect()
+        };
+        let start_task =
+            render_start_task_xml("Roomler start-S-1-5-21-1", "C:\\w.exe", "D\\u", now);
+        for xml in [start_soon_triggers(now), start_task] {
+            let at = boundaries(&xml);
+            assert_eq!(at.len(), START_AFTER_REGISTERING.len(), "{xml}");
+            for (at, secs) in at.iter().zip(START_AFTER_REGISTERING) {
+                let offset = now + chrono::Duration::seconds(secs);
+                assert!(*at >= offset, "{at} for +{secs} s after {now}");
+                assert!(
+                    *at < offset + chrono::Duration::seconds(1),
+                    "{at}, +{secs} s"
+                );
+            }
+        }
+
+        // The per-user MSI's order: `StopOldDaemon` runs `service stop
+        // --for-upgrade`, which touches the marker before it stops anything
+        // (`app.rs`'s `stop_for_upgrade_or_not`), right after `InstallFiles`;
+        // `RegisterAutostart` writes the task last, before the commit.
+        let wxs: &'static str = include_str!("../wix/main.wxs");
+        let scheduled = |action: &str| -> &'static str {
+            let from = wxs
+                .find(&format!("<Custom Action='{action}' "))
+                .unwrap_or_else(|| panic!("{action} is scheduled"));
+            let rest = &wxs[from..];
+            &rest[..rest.find('>').expect("closed")]
+        };
+        let after_files = scheduled("CleanupLegacyPerMachine");
+        assert!(
+            after_files.contains("After='InstallFiles'"),
+            "{after_files}"
+        );
+        let stop = scheduled("StopOldDaemon");
+        assert!(stop.contains("After='CleanupLegacyPerMachine'"), "{stop}");
+        let register = scheduled("RegisterAutostart");
+        assert!(register.contains("Before='InstallFinalize'"), "{register}");
+        assert!(wxs.contains("ExeCommand='service stop --for-upgrade'"));
+    }
+}
+
+/// FR-150 P2 — `now`, rounded up to a whole second. A task's `StartBoundary`
+/// names whole seconds, so a one-shot written from `now` itself would fire up to
+/// a second before its offset; from this, never before it. The task's last
+/// one-shot is the backstop for a daemon an install in flight sent away
+/// (`the_tasks_last_start_is_after_the_update_window`).
+#[cfg(target_os = "windows")]
+fn whole_second_at_or_after(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::SubsecRound;
+    let whole = now.trunc_subsecs(0);
+    if whole == now {
+        now
+    } else {
+        whole + chrono::Duration::seconds(1)
     }
 }

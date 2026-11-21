@@ -3952,13 +3952,13 @@ async fn run_cmd(
         // service host's worker exits with its own code, so the host records none.
         return Err(roomlerd::daemon_error::NoConfig::of_run(config_path, supervisor_flag).into());
     }
-    // Take the single-instance lock before doing anything else. If
-    // another agent is already attached to this config (typically the
-    // Scheduled Task / systemd unit launched at logon), exit cleanly
-    // instead of fighting it for the WS connection. Only `run` gates
-    // on the lock — `enroll`, `service install`, `caps`, `displays`,
-    // `encoder-smoke`, `self-update` are intentionally runnable
-    // alongside an active agent.
+    // FR-150 P2 — before the lock: the per-user task's daemon started inside an install leaves.
+    roomlerd::daemon_error::leave_if_an_install_runs(supervisor_flag)?;
+    // Take the single-instance lock before doing anything else. If another agent is already
+    // attached to this config (typically the Scheduled Task / systemd unit launched at logon),
+    // exit cleanly instead of fighting it for the WS connection. Only `run` gates on the lock —
+    // `enroll`, `service install`, `caps`, `displays`, `encoder-smoke`, `self-update` are
+    // intentionally runnable alongside an active agent.
     let _instance_lock =
         match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
             instance_lock::AcquireOutcome::Acquired(g) => g,
