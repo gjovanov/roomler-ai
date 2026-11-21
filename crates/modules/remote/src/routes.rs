@@ -889,7 +889,7 @@ mod tests {
         let (controller, watcher) = (ObjectId::new(), ObjectId::new());
         let resume_by = at("2026-11-21T07:01:00.250Z");
         let ended_at = at("2026-11-21T07:02:00Z");
-        let kinds = vec![
+        let kinds = [
             AuditKind::SessionRequested {
                 controller_user_id: controller,
                 controller_name: "ops".into(),

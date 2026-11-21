@@ -216,9 +216,9 @@ async fn a_rotated_connect_code_answers_its_time_as_rfc3339() {
     if read["connect_code"] != body["connect_code"] {
         wrong.push(format!("the read names another code: {read} vs {body}"));
     }
-    if !read["connect_code_rotated_at"]
+    if read["connect_code_rotated_at"]
         .as_str()
-        .is_some_and(|s| DateTime::parse_rfc3339_str(s).is_ok())
+        .is_none_or(|s| DateTime::parse_rfc3339_str(s).is_err())
     {
         wrong.push(format!("the read's time is not RFC 3339: {read}"));
     }
