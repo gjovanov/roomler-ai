@@ -996,7 +996,7 @@ sequenceDiagram
   `agents/roomlerd/src/files/reads.rs:35`), a read and a received file alike, never the service's own
   identity. A retry asks again, and joins a lookup still running rather than starting another.
 - **A listing too large for one message comes in pages** (#4121). The answer is measured as one
-  frame first (`answer_measured`, `agents/roomlerd/src/files/dir_pages.rs:42`): up to 65 535
+  frame first (`answer_measured`, `agents/roomlerd/src/files/dir_pages.rs:44`): up to 65 535
   bytes it goes whole, as before. Larger, it goes in pages of at most 40 KiB to a viewer whose
   request said `paged`, and as one `files:dir-error` naming the folder, its count and the
   listing's size to a viewer that did not, which every viewer shows. The task sends the pages in

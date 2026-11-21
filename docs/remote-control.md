@@ -6051,7 +6051,7 @@ to-activate, so the browser never sees a bait-and-switch.
   are enough): the drawer showed its 5 s timeout. The agent measures the
   listing as one frame and answers by what the request asked
   (`answer_measured`,
-  [`files/dir_pages.rs:42`](../agents/roomlerd/src/files/dir_pages.rs#L42)):
+  [`files/dir_pages.rs:44`](../agents/roomlerd/src/files/dir_pages.rs#L44)):
 
   | The listing as one frame | A viewer that asks for pages (`paged: true`) | An older viewer |
   |---|---|---|
@@ -6066,10 +6066,10 @@ to-activate, so the browser never sees a bait-and-switch.
   The limit is one byte under the stack's own: a frame of 65 536 bytes is
   sent, and closes a native receiver's stream for good. A page is filled
   entry by entry against each entry as serialized, then measured whole
-  (`paginate`, `dir_pages.rs:108`), so a name that escapes long (a control
+  (`paginate`, `dir_pages.rs:110`), so a name that escapes long (a control
   character is six bytes as `\u0001`) cannot carry a page past the budget.
   A folder whose path alone leaves a page no room is refused, named by its
-  last part, shortened to fit if need be (`refusal`, `dir_pages.rs:146`).
+  last part, shortened to fit if need be (`refusal`, `dir_pages.rs:148`).
   The listing's task sends the frames in order (`send_listing_frames`,
   [`peer.rs:13450`](../agents/roomlerd/src/peer.rs#L13450)), each waiting
   while the channel holds more than the download pumps' 4 MiB high-water
