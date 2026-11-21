@@ -24,11 +24,11 @@
 //! file that cannot run is never restarted onto, and a reinstall of the same
 //! release is not worth cutting anything for.
 //!
-//! **Idle** ([`Busy`]) is: no remote-control session, no SSH connection, no
-//! transfer or recording — work a restart cuts, and does cut after
-//! [`CEILING`] — and no network transition in the last 10 min and no
-//! in-process install in flight: states a restart could wedge, never forced.
-//! Running agent turns are waited for as an install waits for them.
+//! **Idle** ([`Busy`], which the periodic update reads too, #3429) is no
+//! remote-control session, SSH connection, exec run, transfer or recording
+//! (work a restart cuts, and cuts after [`CEILING`]), no network move in the
+//! last 10 min and no in-process install in flight (a restart could wedge,
+//! never forced). Agent turns are waited for as an install waits for them.
 //!
 //! The restart itself is FR-84 D3's
 //! ([`crate::localapi_state::RestartHandle::arm_from_within`]): only under a
@@ -77,60 +77,9 @@ pub enum Verdict {
     Unusable(String),
 }
 
-/// What a restart would cut, or wedge, right now.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Busy {
-    pub rc_sessions: usize,
-    pub ssh_connections: usize,
-    /// File transfers in flight, plus a screen recording
-    /// ([`crate::updater::active_work`]).
-    pub work: usize,
-    /// The network moved in the last 10 min (R5b: a restart beside a VPN
-    /// transition can lock the machine out).
-    pub net_transition: bool,
-    /// This daemon spawned an installer in the last 10 min: the in-process
-    /// path restarts the daemon itself, and a restart now would kill the
-    /// installer it is waiting on.
-    pub install_in_flight: bool,
-}
-
-impl Busy {
-    /// Work a restart would CUT — cut after [`CEILING`].
-    pub fn cuttable(&self) -> bool {
-        self.rc_sessions + self.ssh_connections + self.work > 0
-    }
-
-    /// States a restart could WEDGE — never forced.
-    pub fn unforceable(&self) -> bool {
-        self.net_transition || self.install_in_flight
-    }
-}
-
-impl std::fmt::Display for Busy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts: Vec<String> = Vec::new();
-        if self.rc_sessions > 0 {
-            parts.push(format!("{} remote-control session(s)", self.rc_sessions));
-        }
-        if self.ssh_connections > 0 {
-            parts.push(format!("{} SSH connection(s)", self.ssh_connections));
-        }
-        if self.work > 0 {
-            parts.push(format!("{} transfer(s) or recording", self.work));
-        }
-        if self.net_transition {
-            parts.push("the network moved in the last 10 min".into());
-        }
-        if self.install_in_flight {
-            parts.push("an install of this daemon's own is in flight".into());
-        }
-        if parts.is_empty() {
-            f.write_str("nothing")
-        } else {
-            f.write_str(&parts.join(", "))
-        }
-    }
-}
+/// What a restart would cut, or wedge, right now: [`crate::busy`]'s model,
+/// which the periodic update check reads too (#3429).
+pub use crate::busy::Busy;
 
 /// A replacement being followed.
 #[derive(Debug, Clone)]
@@ -286,31 +235,6 @@ fn baseline() -> Result<(std::path::PathBuf, FileId), String> {
     }
 }
 
-/// What a restart would cut or wedge, now.
-#[cfg(target_os = "linux")]
-fn busy_now(rc_sessions: &crate::rc_sessions::RcSessionRegistry) -> Busy {
-    Busy {
-        rc_sessions: rc_sessions.list().len(),
-        ssh_connections: ssh_connections(),
-        work: crate::updater::active_work(),
-        net_transition: crate::updater::net_transition_recent(),
-        install_in_flight: crate::updater::update_in_flight(),
-    }
-}
-
-/// Open SSH connections; none in a build without an overlay to serve on.
-#[cfg(target_os = "linux")]
-fn ssh_connections() -> usize {
-    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-    {
-        crate::ssh::live_connections()
-    }
-    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
-    {
-        0
-    }
-}
-
 /// Ask the binary at `path` its version.
 #[cfg(target_os = "linux")]
 async fn probe(path: &std::path::Path) -> Verdict {
@@ -407,7 +331,7 @@ async fn watch(
         let Some(p) = pending.as_mut() else {
             continue;
         };
-        let busy = busy_now(&rc_sessions);
+        let busy = crate::busy::now(&rc_sessions);
         match decide(Some(&*p), now, &busy) {
             Step::Nothing | Step::Settling => {}
             Step::Probe => {
@@ -504,13 +428,7 @@ mod tests {
         }
     }
 
-    const IDLE: Busy = Busy {
-        rc_sessions: 0,
-        ssh_connections: 0,
-        work: 0,
-        net_transition: false,
-        install_in_flight: false,
-    };
+    const IDLE: Busy = Busy::IDLE;
 
     fn other() -> Option<Verdict> {
         Some(Verdict::Other("0.4.999".into()))
@@ -577,6 +495,11 @@ mod tests {
             },
             Busy {
                 ssh_connections: 1,
+                ..IDLE
+            },
+            // #3429 — the one model: a Fleet RPC run waits here too.
+            Busy {
+                exec_runs: 1,
                 ..IDLE
             },
             Busy { work: 1, ..IDLE },
@@ -698,30 +621,6 @@ mod tests {
             pick_exec_path(Some(OsStr::new("/usr/bin/roomlerd")), exe.clone()),
             exe
         );
-    }
-
-    #[test]
-    fn busy_says_what_it_would_cut() {
-        assert_eq!(IDLE.to_string(), "nothing");
-        let b = Busy {
-            rc_sessions: 1,
-            ssh_connections: 2,
-            work: 1,
-            net_transition: true,
-            install_in_flight: true,
-        };
-        let s = b.to_string();
-        for part in [
-            "1 remote-control session",
-            "2 SSH connection",
-            "1 transfer",
-            "network moved",
-            "install",
-        ] {
-            assert!(s.contains(part), "{s}");
-        }
-        assert!(b.cuttable() && b.unforceable());
-        assert!(!IDLE.cuttable() && !IDLE.unforceable());
     }
 
     /// The premise: the file a running process runs and the file its path
