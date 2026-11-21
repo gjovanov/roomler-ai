@@ -16,7 +16,10 @@ use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_mod_fleet::agent::fmt_dt;
 use roomler_ai_remote_control::{
-    models::{RemoteAuditEvent, RemoteSession, SessionFeedback, SessionFeedbackRequest},
+    models::{
+        AuditKind, EndReason, EndSource, LockOnEnd, RemoteAuditEvent, RemoteSession,
+        SessionFeedback, SessionFeedbackRequest,
+    },
     permissions::Permissions,
     signaling::IceServer,
     turn_creds::{self, ice_servers_for},
@@ -158,11 +161,179 @@ pub async fn terminate_session(
 
 #[derive(Debug, Serialize)]
 pub struct AuditListResponse {
-    pub items: Vec<RemoteAuditEvent>,
+    pub items: Vec<RemoteAuditEventView>,
     pub total: u64,
     pub page: u64,
     pub per_page: u64,
     pub total_pages: u64,
+}
+
+/// One audit event as `GET …/session/{sid}/audit` answers it (#4189): every
+/// id the 24-hex string and every time RFC 3339, where the stored
+/// [`RemoteAuditEvent`] serialises bson's `{"$oid": …}` and `{"$date": …}`.
+/// The keys are the model's, `_id` included.
+#[derive(Debug, Serialize)]
+pub struct RemoteAuditEventView {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub session_id: String,
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub at: String,
+    pub event: AuditKindView,
+}
+
+impl From<RemoteAuditEvent> for RemoteAuditEventView {
+    fn from(event: RemoteAuditEvent) -> Self {
+        // Every field by name: one added to the model stops this compiling,
+        // so it cannot reach the answer in its bson form unseen.
+        let RemoteAuditEvent {
+            id,
+            session_id,
+            agent_id,
+            tenant_id,
+            at,
+            event,
+        } = event;
+        Self {
+            id: id.map(|id| id.to_hex()),
+            session_id: session_id.to_hex(),
+            agent_id: agent_id.to_hex(),
+            tenant_id: tenant_id.to_hex(),
+            at: fmt_dt(at),
+            event: event.into(),
+        }
+    }
+}
+
+/// An [`AuditKind`] as the audit answer carries it (#4189). The five kinds
+/// that hold an id or a time are typed here: that field is a string, and every
+/// other field, with its attributes, is the model's. Every other kind holds
+/// neither and goes out as the model serialises it.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditKindView {
+    SessionRequested {
+        controller_user_id: String,
+        controller_name: String,
+        permissions: Permissions,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        record_stripped: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        privacy_stripped: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        features_stripped: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idle_secs: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idle_enforced: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lock_on_end: Option<LockOnEnd>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lock_enforced: Option<bool>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        external: bool,
+    },
+    SessionEnded {
+        reason: EndReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attach_seq: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ended_at: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end_source: Option<EndSource>,
+    },
+    WatcherJoined {
+        user_id: String,
+    },
+    WatcherLeft {
+        user_id: String,
+    },
+    SessionDetached {
+        attach_seq: u32,
+        resume_by: String,
+    },
+    /// Every other kind: it holds no id and no time.
+    #[serde(untagged)]
+    Other(AuditKind),
+}
+
+impl From<AuditKind> for AuditKindView {
+    fn from(kind: AuditKind) -> Self {
+        match kind {
+            AuditKind::SessionRequested {
+                controller_user_id,
+                controller_name,
+                permissions,
+                record_stripped,
+                privacy_stripped,
+                features_stripped,
+                idle_secs,
+                idle_enforced,
+                lock_on_end,
+                lock_enforced,
+                external,
+            } => Self::SessionRequested {
+                controller_user_id: controller_user_id.to_hex(),
+                controller_name,
+                permissions,
+                record_stripped,
+                privacy_stripped,
+                features_stripped,
+                idle_secs,
+                idle_enforced,
+                lock_on_end,
+                lock_enforced,
+                external,
+            },
+            AuditKind::SessionEnded {
+                reason,
+                limit,
+                attach_seq,
+                ended_at,
+                end_source,
+            } => Self::SessionEnded {
+                reason,
+                limit,
+                attach_seq,
+                ended_at: ended_at.map(fmt_dt),
+                end_source,
+            },
+            AuditKind::WatcherJoined { user_id } => Self::WatcherJoined {
+                user_id: user_id.to_hex(),
+            },
+            AuditKind::WatcherLeft { user_id } => Self::WatcherLeft {
+                user_id: user_id.to_hex(),
+            },
+            AuditKind::SessionDetached {
+                attach_seq,
+                resume_by,
+            } => Self::SessionDetached {
+                attach_seq,
+                resume_by: fmt_dt(resume_by),
+            },
+            // These hold no id and no time. Each is named with all of its
+            // fields, so a kind that gains one stops this compiling instead
+            // of reaching the answer in its bson form.
+            kind @ (AuditKind::ConsentPrompted
+            | AuditKind::ConsentGranted
+            | AuditKind::ConsentDenied
+            | AuditKind::ConsentTimedOut
+            | AuditKind::SessionStarted { peer_auth: _ }
+            | AuditKind::ClipboardWriteToHost { bytes: _ }
+            | AuditKind::ClipboardReadFromHost { bytes: _ }
+            | AuditKind::FileSentToHost { name: _, bytes: _ }
+            | AuditKind::FileSentFromHost { name: _, bytes: _ }
+            | AuditKind::KeyframeRequested
+            | AuditKind::PermissionsChanged { permissions: _ }
+            | AuditKind::Error { message: _ }
+            | AuditKind::AdminOverride { reason: _ }
+            | AuditKind::SessionResumed { attach_seq: _ }
+            | AuditKind::Unknown) => Self::Other(kind),
+        }
+    }
 }
 
 pub async fn session_audit(
@@ -190,7 +361,7 @@ pub async fn session_audit(
 
     let page = state.remote_audit.list_for_session(sid, &params).await?;
     Ok(Json(AuditListResponse {
-        items: page.items,
+        items: page.items.into_iter().map(Into::into).collect(),
         total: page.total,
         page: page.page,
         per_page: page.per_page,
@@ -665,4 +836,296 @@ pub async fn privacy_activity(
         per_page: page.per_page,
         total_pages: page.total_pages,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! #4189 — what the session audit answer (`GET
+    //! …/session/{sid}/audit`) carries on the wire: every id the 24-hex
+    //! string and every time RFC 3339, never bson's `{"$oid": …}` or
+    //! `{"$date": …}`, the ids and times inside an event's kind included.
+
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn is_hex24(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn at(s: &str) -> DateTime {
+        DateTime::parse_rfc3339_str(s).expect("a test time")
+    }
+
+    /// What is wrong with `got` as an id: not a string, not 24 lowercase hex,
+    /// or not the stored one.
+    fn id_problem(what: &str, got: &Value, want: ObjectId) -> Option<String> {
+        match got.as_str() {
+            None => Some(format!("{what} is not a string: {got}")),
+            Some(s) if !is_hex24(s) => Some(format!("{what} is not 24 lowercase hex: {s}")),
+            Some(s) if s != want.to_hex() => Some(format!("{what} {s} is not the stored {want}")),
+            Some(_) => None,
+        }
+    }
+
+    /// What is wrong with `got` as a time: not a string, not RFC 3339, or
+    /// not the stored instant.
+    fn time_problem(what: &str, got: &Value, want: DateTime) -> Option<String> {
+        match got.as_str() {
+            None => Some(format!("{what} is not a string: {got}")),
+            Some(s) => match DateTime::parse_rfc3339_str(s) {
+                Err(_) => Some(format!("{what} is not RFC 3339: {s}")),
+                Ok(back) if back != want => Some(format!("{what} {s} is not the stored time")),
+                Ok(_) => None,
+            },
+        }
+    }
+
+    /// Every kind that carries an id or a time, and one that carries
+    /// neither: the answer names every id as hex and every time as RFC 3339,
+    /// and leaves the rest of each event as it was.
+    #[test]
+    fn a_session_audit_answer_carries_every_id_and_time_as_a_string() {
+        let (session, agent, tenant) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (controller, watcher) = (ObjectId::new(), ObjectId::new());
+        let resume_by = at("2026-11-21T07:01:00.250Z");
+        let ended_at = at("2026-11-21T07:02:00Z");
+        let kinds = [
+            AuditKind::SessionRequested {
+                controller_user_id: controller,
+                controller_name: "ops".into(),
+                permissions: Permissions::VIEW | Permissions::INPUT,
+                record_stripped: None,
+                privacy_stripped: None,
+                features_stripped: None,
+                idle_secs: Some(600),
+                idle_enforced: Some(true),
+                lock_on_end: None,
+                lock_enforced: None,
+                external: false,
+            },
+            AuditKind::WatcherJoined { user_id: watcher },
+            AuditKind::WatcherLeft { user_id: watcher },
+            AuditKind::SessionDetached {
+                attach_seq: 3,
+                resume_by,
+            },
+            AuditKind::SessionEnded {
+                reason: EndReason::AgentDisconnect,
+                limit: None,
+                attach_seq: Some(4),
+                ended_at: Some(ended_at),
+                end_source: None,
+            },
+            AuditKind::ConsentGranted,
+        ];
+        let times: Vec<DateTime> = (0..kinds.len())
+            .map(|i| DateTime::from_millis(1_763_708_400_000 + 1_000 * i as i64 + 7))
+            .collect();
+        let events: Vec<RemoteAuditEvent> = kinds
+            .iter()
+            .cloned()
+            .zip(&times)
+            .map(|(event, at)| RemoteAuditEvent {
+                id: Some(ObjectId::new()),
+                session_id: session,
+                agent_id: agent,
+                tenant_id: tenant,
+                at: *at,
+                event,
+            })
+            .collect();
+        let answer = AuditListResponse {
+            items: events.clone().into_iter().map(Into::into).collect(),
+            total: events.len() as u64,
+            page: 1,
+            per_page: 50,
+            total_pages: 1,
+        };
+        let answer = serde_json::to_value(&answer).expect("serialises");
+
+        let items = answer["items"].as_array().cloned().unwrap_or_default();
+        let mut wrong: Vec<String> = Vec::new();
+        if items.len() != events.len() {
+            wrong.push(format!(
+                "{} items, want {}: {answer}",
+                items.len(),
+                events.len()
+            ));
+        }
+        for (i, (item, stored)) in items.iter().zip(&events).enumerate() {
+            let p = |field: &str| format!("items[{i}].{field}");
+            wrong.extend(id_problem(&p("_id"), &item["_id"], stored.id.unwrap()));
+            wrong.extend(id_problem(&p("session_id"), &item["session_id"], session));
+            wrong.extend(id_problem(&p("agent_id"), &item["agent_id"], agent));
+            wrong.extend(id_problem(&p("tenant_id"), &item["tenant_id"], tenant));
+            wrong.extend(time_problem(&p("at"), &item["at"], stored.at));
+        }
+        let event = |i: usize| {
+            items
+                .get(i)
+                .map(|it| it["event"].clone())
+                .unwrap_or_default()
+        };
+        wrong.extend(id_problem(
+            "the request's controller_user_id",
+            &event(0)["controller_user_id"],
+            controller,
+        ));
+        wrong.extend(id_problem(
+            "watcher_joined.user_id",
+            &event(1)["user_id"],
+            watcher,
+        ));
+        wrong.extend(id_problem(
+            "watcher_left.user_id",
+            &event(2)["user_id"],
+            watcher,
+        ));
+        wrong.extend(time_problem(
+            "session_detached.resume_by",
+            &event(3)["resume_by"],
+            resume_by,
+        ));
+        wrong.extend(time_problem(
+            "session_ended.ended_at",
+            &event(4)["ended_at"],
+            ended_at,
+        ));
+
+        // What is not an id or a time is as it was: each kind's other keys,
+        // and a kind with neither, whole.
+        let request = event(0);
+        let want_request = json!({
+            "kind": "session_requested",
+            "controller_name": "ops",
+            "permissions": serde_json::to_value(Permissions::VIEW | Permissions::INPUT).unwrap(),
+            "idle_secs": 600,
+            "idle_enforced": true,
+        });
+        for (key, want) in want_request.as_object().unwrap() {
+            if request.get(key) != Some(want) {
+                wrong.push(format!("the request's {key} changed: {request}"));
+            }
+        }
+        if event(3)["kind"] != "session_detached" || event(3)["attach_seq"] != 3 {
+            wrong.push(format!(
+                "the detach's kind or attach_seq changed: {}",
+                event(3)
+            ));
+        }
+        if event(4)["reason"] != "agent_disconnect" || event(4)["attach_seq"] != 4 {
+            wrong.push(format!(
+                "the end's reason or attach_seq changed: {}",
+                event(4)
+            ));
+        }
+        if event(4).get("limit").is_some() || event(4).get("end_source").is_some() {
+            wrong.push(format!(
+                "the end's unset fields are left out, as before: {}",
+                event(4)
+            ));
+        }
+        if event(5) != json!({ "kind": "consent_granted" }) {
+            wrong.push(format!("a kind with no id or time changed: {}", event(5)));
+        }
+        let text = answer.to_string();
+        for raw in ["$oid", "$date"] {
+            if text.contains(raw) {
+                wrong.push(format!("the answer carries `{raw}`: {text}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The view changes nothing but the ids and the times: every other field
+    /// of an event, with its attributes, goes out as the model sends it. Each
+    /// kind the view types is here with every field set, beside a kind it
+    /// passes through, and the first event has no `_id`.
+    #[test]
+    fn the_audit_view_changes_nothing_but_the_ids_and_times() {
+        let (sid, aid, tid, who) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let when = at("2026-11-21T07:00:00.250Z");
+        let kinds = vec![
+            AuditKind::SessionRequested {
+                controller_user_id: who,
+                controller_name: "ops".to_string(),
+                permissions: Permissions::VIEW | Permissions::INPUT,
+                record_stripped: Some("policy".to_string()),
+                privacy_stripped: Some("unsupported".to_string()),
+                features_stripped: Some([("clipboard".to_string(), "policy".to_string())].into()),
+                idle_secs: Some(600),
+                idle_enforced: Some(false),
+                lock_on_end: Some(LockOnEnd::Always),
+                lock_enforced: Some(true),
+                external: true,
+            },
+            AuditKind::SessionEnded {
+                reason: EndReason::AgentDisconnect,
+                limit: Some("idle".to_string()),
+                attach_seq: Some(2),
+                ended_at: Some(at("2026-11-21T07:05:00Z")),
+                end_source: Some(EndSource::Sweep),
+            },
+            AuditKind::WatcherJoined { user_id: who },
+            AuditKind::WatcherLeft { user_id: who },
+            AuditKind::SessionDetached {
+                attach_seq: 1,
+                resume_by: at("2026-11-21T07:01:00Z"),
+            },
+            AuditKind::FileSentToHost {
+                name: "a.txt".to_string(),
+                bytes: 12,
+            },
+        ];
+        let mut wrong = Vec::new();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let event = RemoteAuditEvent {
+                id: (i > 0).then(ObjectId::new),
+                session_id: sid,
+                agent_id: aid,
+                tenant_id: tid,
+                at: when,
+                event: kind,
+            };
+            // The model's own answer, with each id and time it holds put
+            // as the view should send it.
+            let mut want = serde_json::to_value(&event).expect("the model serialises");
+            if let Some(id) = event.id {
+                want["_id"] = json!(id.to_hex());
+            }
+            want["session_id"] = json!(sid.to_hex());
+            want["agent_id"] = json!(aid.to_hex());
+            want["tenant_id"] = json!(tid.to_hex());
+            want["at"] = json!(fmt_dt(when));
+            let kind = &mut want["event"];
+            match &event.event {
+                AuditKind::SessionRequested {
+                    controller_user_id, ..
+                } => kind["controller_user_id"] = json!(controller_user_id.to_hex()),
+                AuditKind::SessionEnded {
+                    ended_at: Some(t), ..
+                } => kind["ended_at"] = json!(fmt_dt(*t)),
+                AuditKind::WatcherJoined { user_id } | AuditKind::WatcherLeft { user_id } => {
+                    kind["user_id"] = json!(user_id.to_hex())
+                }
+                AuditKind::SessionDetached { resume_by, .. } => {
+                    kind["resume_by"] = json!(fmt_dt(*resume_by))
+                }
+                _ => {}
+            }
+            let got = serde_json::to_value(RemoteAuditEventView::from(event))
+                .expect("the view serialises");
+            if got != want {
+                wrong.push(format!(
+                    "event {i}: the view {got} is not the model with string ids and times {want}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }

@@ -5230,7 +5230,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7031`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7204`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -5241,7 +5241,7 @@ session not yet live, and an external one, end as before FR-138.
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
 on, on 2026-11-10, so no server rollback goes to an image built before `79cf1019b` (P1a, #3607). `AuditKind` gained its
 tolerant `Unknown` there (`crates/remote_control/src/models.rs:6824-6825`), and the session's audit listing reads a
-page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:160-161`; `session_audit`, `:168`): on an older
+page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:163-164`; `session_audit`, `:339`): on an older
 image one unknown kind fails the whole page, FR-137 S-B5's class. The row sets no floor. `RemoteSession` denies no
 unknown field (`crates/remote_control/src/models.rs:6048-6049`), so an older image ignores `attach_seq`, `detached_at`,
 `resume_by`, `stats_at` and `end_source`, and FR-138 added no `EndReason` and no phase. An `end_source` value from a
@@ -5494,7 +5494,7 @@ that costs: every server-visible stall in 90 d of `remote_audit` had aged past
 the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
-(`crates/modules/fleet/src/agent_log.rs:171`, mounted at
+(`crates/modules/fleet/src/agent_log.rs:207`, mounted at
 `crates/modules/fleet/src/lib.rs:544`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
@@ -5564,7 +5564,7 @@ dropped; `error_code` must match the server's snake_case vocabulary or it is
 recorded as `other`; `msg` is mark names and millisecond deltas. No URL, token,
 message text or hostname can enter the record — locked by
 `rcConnectTimingUpload.spec.ts`, and the exact JSON is locked to parse on the
-route by `browser_connect_timing_record_parses` (`agent_log.rs:459`), because a
+route by `browser_connect_timing_record_parses` (`agent_log.rs:494`), because a
 422 is swallowed like every other failure and would look like nobody connecting.
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
@@ -7446,14 +7446,15 @@ the crash *reports* because the watchdog wrote its own.
 
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
 worker for an account with no config exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:147`](../agents/roomlerd/src/daemon_error.rs#L147)).
+(78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. It ends before this bookkeeping, with no
 config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
 GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
-its reports. Only those two workers exit 78: every other `run` with no config
-still exits 1.
+its reports. Since FR-150 P2 so does the per-user task's daemon, whose
+launcher leaves on it. Only those three workers exit 78: every other `run`
+with no config still exits 1.
 
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot

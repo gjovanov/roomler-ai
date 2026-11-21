@@ -1952,7 +1952,7 @@ jobs:
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
+          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings; cargo test -p roomlerdw
           cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}

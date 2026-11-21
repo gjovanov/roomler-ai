@@ -75,7 +75,7 @@ use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::governor::RateGovernor;
-use crate::encode::pipe::{PathNumber, PathRate, PathView, PushedBy, Ruled};
+use crate::encode::pipe::{Fall, PathNumber, PathRate, PathView, PushedBy, Ruled};
 use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
@@ -1331,6 +1331,19 @@ impl std::fmt::Display for RuledShown {
     }
 }
 
+/// FR-148 D50 — the shadow model's last fall as the line writes it:
+/// `<from_bps>-><to_bps>/<age>ms`, or `-` while none has.
+struct FellShown(Option<Fall>);
+
+impl std::fmt::Display for FellShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(fall) => fall.fmt(f),
+            None => f.write_str("-"),
+        }
+    }
+}
+
 /// Step 3's line. Each field is the heartbeat's field of the same name with
 /// its tag; `viewer_rx_bps` and `seed_bps` have none there, and the `model_`
 /// fields are the shadow model's. Their names and order are pinned by a test.
@@ -1358,6 +1371,9 @@ pub fn emit_model(session_id: ObjectId, v: &PathView) {
         // re-read it or bounded it (`stall`, `reread`, `ramp`, `bound` or
         // `hole`), and how long ago; `-` while none has.
         model_rule = %RuledShown(v.model_ruled),
+        // FR-148 D50 — the model's last fall: the floor before and after,
+        // and how long ago; `-` while none has.
+        model_fell = %FellShown(v.model_fell),
         "{MODEL_LINE}"
     );
 }
@@ -3506,6 +3522,13 @@ mod tests {
             model_floor_by: None,
             model_capacity_by: Some(PushedBy::P3),
             model_ruled: Some((Ruled::Hole, Duration::from_millis(3_400))),
+            // FR-148 D50: a fall a minute back, before a delivery raised the
+            // floor again.
+            model_fell: Some(Fall {
+                from_bps: 2_131_000,
+                to_bps: 1_162_000,
+                age: Duration::from_millis(61_300),
+            }),
         }
     }
 
@@ -3609,6 +3632,33 @@ mod tests {
             assert!(out.contains(&want), "{want:?} is not in {out:?}");
             assert_eq!(out.matches("model_rule=").count(), 1, "{out:?}");
         }
+    }
+
+    /// FR-148 D50 — the line's one new field, beside `model_rule`: the shadow
+    /// model's last fall, the floor before and after and how long ago, or `-`
+    /// while none has. The busy line carries one and stays under its cost.
+    #[test]
+    fn the_model_line_writes_the_last_fall() {
+        let busy = logged(|| emit_model(sid(), &busy_view()));
+        let want = "model_rule=hole/3400ms model_fell=2131000->1162000/61300ms";
+        assert!(busy.contains(want), "{want:?} is not in {busy:?}");
+        assert_eq!(busy.matches("model_fell=").count(), 1, "{busy:?}");
+        assert!(busy.len() < 800, "{} bytes: {busy:?}", busy.len());
+        let idle = logged(|| emit_model(sid(), &idle_view()));
+        let want = "model_rule=- model_fell=-";
+        assert!(idle.contains(want), "{want:?} is not in {idle:?}");
+        assert_eq!(idle.matches("model_fell=").count(), 1, "{idle:?}");
+        let view = PathView {
+            model_fell: Some(Fall {
+                from_bps: 1_983_640,
+                to_bps: 1_011_220,
+                age: Duration::ZERO,
+            }),
+            ..idle_view()
+        };
+        let out = logged(|| emit_model(sid(), &view));
+        let want = "model_fell=1983640->1011220/0ms";
+        assert!(out.contains(want), "{want:?} is not in {out:?}");
     }
 
     #[test]
@@ -5499,6 +5549,9 @@ pub(crate) mod shaped_link {
             /// run's end: `goodput` or `link` (a window's push-back, P0's law)
             /// or `p1` / `p3` (a sample's), when (µs from `t0`), and its rate.
             cap_by: Option<(&'static str, u64, u32)>,
+            /// FR-148 D50 — the falls the model read: none on a fold without
+            /// the clock.
+            falls: usize,
         }
 
         /// Whether the writer held, skipped or blocked in a second `w` covers.
@@ -5599,20 +5652,25 @@ pub(crate) mod shaped_link {
 
         /// FR-148 D48 — the rule sets a run is folded under: B2's (`c`), the
         /// drop step's first pick (`rr+bm0+u90+l`: rules 1 to 3, the product
-        /// without rule 4), and the product's (`d48`), each on the budget's
-        /// [`Over`] as the product reads it, B2's `held` share included. The
-        /// product's own code applies each: a sample's read through
-        /// [`sample_read_of`] on the budget's [`Over`], and a window's through
-        /// `Pipe`'s window rules, which read the budget's rate as the fold
-        /// notes it before each window's close ([`Pipe::note_path_rate`]).
+        /// without rule 4), D48's (`d48`: rules 1 to 4) and the product's
+        /// (`d50`), each on the budget's [`Over`] as the product reads it,
+        /// B2's `held` share included. The product's own code applies each: a
+        /// sample's read through [`sample_read_of`] on the budget's [`Over`],
+        /// and a window's through `Pipe`'s window rules, which read the
+        /// budget's rate as the fold notes it before each window's close
+        /// ([`Pipe::note_path_rate`]). FR-148 D50: only the product's fold
+        /// passes the shadow model the clock a fall is read against; the
+        /// others fold the law before D50 ([`Pipe::set_unclocked`]).
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Rules {
             /// B2 as built: no D48 rule.
             B2,
             /// Rules 1 to 3.
             Pick,
-            /// The product: rules 1 to 4.
+            /// D48: rules 1 to 4, on the law before D50.
             D48,
+            /// The product: rules 1 to 4, and D50's fall event.
+            D50,
         }
 
         impl Rules {
@@ -5626,7 +5684,7 @@ pub(crate) mod shaped_link {
                         ..o
                     },
                     Rules::Pick => Over { ramp: false, ..o },
-                    Rules::D48 => o,
+                    Rules::D48 | Rules::D50 => o,
                 }
             }
 
@@ -5635,13 +5693,20 @@ pub(crate) mod shaped_link {
             fn windows(self) -> bool {
                 self != Rules::B2
             }
+
+            /// FR-148 D50 — whether the shadow model reads a fall against the
+            /// budget's measured rate: the product's fold only.
+            fn clocked(self) -> bool {
+                self == Rules::D50
+            }
         }
 
         /// The rule sets, by the word the drop lines print.
-        const RULES: [(&str, Rules); 3] = [
+        const RULES: [(&str, Rules); 4] = [
             ("c", Rules::B2),
             ("rr+bm0+u90+l", Rules::Pick),
             ("d48", Rules::D48),
+            ("d50", Rules::D50),
         ];
 
         /// FR-148 D46 B2 — when the sampler hands sample `i`'s push-back
@@ -5691,9 +5756,10 @@ pub(crate) mod shaped_link {
             Ok((until, p))
         }
 
-        /// The product's fold: its rules, under `burst`, `gate` and `open`.
+        /// The product's fold: its rules and its law (FR-148 D50), under
+        /// `burst`, `gate` and `open`.
         fn model_fold(r: &TcpRun, burst: Burst, gate: u8, open: Open) -> ModelFold {
-            fold_with(r, burst, gate, open, Rules::D48, &mut Vec::new())
+            fold_with(r, burst, gate, open, Rules::D50, &mut Vec::new())
         }
 
         /// FR-148 D48 — what the budget's step read, as the governor notes it
@@ -5719,7 +5785,8 @@ pub(crate) mod shaped_link {
         /// `p1` or `p3` a sample's), when (µs from `t0`), at what rate, the
         /// floor before and after, and the window's or sample's index. FR-148
         /// D48: and the rule that re-read the sample or bounded the window
-        /// (`reread`, `bound`), or none.
+        /// (`reread`, `bound`), or none. FR-148 D50: a push-back the model
+        /// read as a fall says so (`fall`, `reread_fall`, `bound_fall`).
         #[derive(Debug, Clone, Copy)]
         struct FoldEvent {
             t_us: u64,
@@ -5741,6 +5808,11 @@ pub(crate) mod shaped_link {
         ) -> ModelFold {
             let mut pipe = Pipe::default();
             pipe.set_stall_gate(gate);
+            if !rules.clocked() {
+                pipe.set_unclocked();
+            }
+            // The events this fold logs, from here: its falls are counted.
+            let first = log.len();
             let mut link = LinkLoop::new();
             let mut offer = OfferLoop::default();
             let mut goodput = r.goodput_at.iter().peekable();
@@ -5775,7 +5847,9 @@ pub(crate) mod shaped_link {
                 if before.is_some_and(|f| p.bps > f) {
                     above += 1;
                 }
+                let was = pipe.model().fell(now);
                 pipe.observe_sample_capacity(p.bps, p.by, take, now);
+                let fell = pipe.model().fell(now) != was;
                 cap_by = Some((p.by.word(), t_us, p.bps));
                 // D46 item 10: a push-back never raises the floor, nor makes one.
                 let after = floor_of(pipe, now);
@@ -5790,7 +5864,12 @@ pub(crate) mod shaped_link {
                     floor: (before, after),
                     capacity: true,
                     of: i,
-                    rule: if p.reread { "reread" } else { "" },
+                    rule: match (p.reread, fell) {
+                        (true, true) => "reread_fall",
+                        (true, false) => "reread",
+                        (false, true) => "fall",
+                        (false, false) => "",
+                    },
                 });
             };
             // A window's push-back that the model took sets its capacity now.
@@ -5868,13 +5947,22 @@ pub(crate) mod shaped_link {
                 // the model takes as `Pipe::window_takes` says.
                 let mut push = |pipe: &mut Pipe, by: &'static str, k: usize, bps: u32| {
                     let before = floor_of(pipe, now);
+                    let was = pipe.model().fell(now);
                     if k == 2 {
                         pipe.observe_link_capacity_in(bps, Basis::Backlogged, t, now);
                     } else {
                         pipe.observe_capacity_in(bps, Basis::Backlogged, t, now);
                     }
+                    let fell = pipe.model().fell(now) != was;
                     let (takes, word) = pipe.window_takes(bps);
-                    let rule = if takes[k] == Some(bps) { "" } else { word };
+                    let rule = match (takes[k] == Some(bps), fell) {
+                        (true, false) => "",
+                        (true, true) => "fall",
+                        (false, false) => word,
+                        // Only rule 2's bound takes a push-back at another
+                        // rate; a window no rule lets in reads no fall.
+                        (false, true) => "bound_fall",
+                    };
                     let set = takes[k].is_some_and(|b| set_now(pipe, b, now));
                     let bps = takes[k].unwrap_or(bps);
                     if set {
@@ -5925,6 +6013,10 @@ pub(crate) mod shaped_link {
                 max_taken_rx,
                 closing: pipe.memory().closing(end, 0),
                 cap_by,
+                falls: log[first..]
+                    .iter()
+                    .filter(|e| e.rule.ends_with("fall"))
+                    .count(),
             }
         }
 
@@ -6289,16 +6381,22 @@ pub(crate) mod shaped_link {
 
         /// FR-148 D46, the drop step — each rule set's bracket at the run's
         /// end (floor / capacity, times the link's payload rate, and `on` or
-        /// `OFF` AC2's bar; [`RULES`]); and under a holding budget, the
-        /// product's reading on a shallow queue and on any run it leaves off
-        /// the bar: every change its fold made to the model, with the rule
-        /// that re-read or bounded it, and what SCTP's gauges and the budget's
-        /// verdicts read over the window or the sample that made it.
+        /// `OFF` AC2's bar; [`RULES`]), and how many falls the product's fold
+        /// read (FR-148 D50). Under a holding budget, D48's reading (the law
+        /// before D50) and the product's: every change each fold made to the
+        /// model, with the rule that re-read or bounded it or the fall it
+        /// read, and what SCTP's gauges and the budget's verdicts read over
+        /// the window or the sample that made it, on a shallow queue, on a
+        /// link whose rate falls, on any run the fold leaves off the bar, and
+        /// wherever the two end apart or the product read a fall. Then each
+        /// fall the product read: when, by what push-back at what rate, and
+        /// the floor before and after, with the depth (after over before).
         fn print_drop(r: &TcpRun) {
             let link = r.shape.payload_bps();
             let x = |v: u64| format!("{:.3}", v as f64 / link.max(1) as f64);
             let xo = |f: Option<u32>| f.map_or_else(|| "-".to_owned(), |f| x(u64::from(f)));
             let gate = crate::encode::pipe::STALL_WINDOWS;
+            let name = r.shape.name();
             let rules: Vec<String> = RULES
                 .iter()
                 .map(|&(word, rules)| {
@@ -6308,22 +6406,42 @@ pub(crate) mod shaped_link {
                 })
                 .collect();
             println!(
-                "D46 drop | {} | link={} | {}",
-                r.shape.name(),
+                "D46 drop | {name} | link={} | {}",
                 kbps(link),
                 rules.join(" ")
+            );
+            let (mut d48_log, mut d50_log) = (Vec::new(), Vec::new());
+            let d48 = fold_with(r, BURST, gate, Open::Start, Rules::D48, &mut d48_log);
+            let d50 = fold_with(r, BURST, gate, Open::Start, Rules::D50, &mut d50_log);
+            println!(
+                "D50 falls | {name} | link={} | d50={}",
+                kbps(link),
+                d50.falls
             );
             if r.trace.is_empty() {
                 return;
             }
-            let mut log = Vec::new();
-            let m = fold_with(r, BURST, gate, Open::Start, Rules::D48, &mut log);
-            let tag = match (r.shape.queue < DEEP, on_bar(r, &m)) {
-                (_, false) => "pick miss",
-                (true, true) => "pick event",
-                (false, true) => return,
-            };
-            print_events(r, &format!("{tag} d48"), &log, &m);
+            let apart = (d48.floor, d48.capacity) != (d50.floor, d50.capacity);
+            let link_falls = r.shape.step.is_some();
+            for (word, m, log) in [("d48", &d48, &d48_log), ("d50", &d50, &d50_log)] {
+                let on = on_bar(r, m);
+                if r.shape.queue < DEEP || !on || link_falls || apart || m.falls > 0 {
+                    let tag = if on { "pick event" } else { "pick miss" };
+                    print_events(r, &format!("{tag} {word}"), log, m);
+                }
+            }
+            for e in d50_log.iter().filter(|e| e.rule.ends_with("fall")) {
+                let (from, to) = (e.floor.0.unwrap_or(0), e.floor.1.unwrap_or(0));
+                println!(
+                    "D50 fall | {name} | {} ms {} {} floor {}->{} ({:.3})",
+                    e.t_us / 1_000,
+                    e.by,
+                    x(u64::from(e.bps)),
+                    x(u64::from(from)),
+                    x(u64::from(to)),
+                    f64::from(to) / f64::from(from.max(1)),
+                );
+            }
         }
 
         /// What the holding core's trace read from `from_us` to `to_us`, as

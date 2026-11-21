@@ -462,7 +462,7 @@ Mechanics worth knowing:
   `crates/tunnel-core/src/child.rs:465`; registered at
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
+  (`agents/roomlerd/src/exec.rs:2442`) and `sftp-server`
   (`agents/roomlerd/src/ssh.rs:1311`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
@@ -1444,7 +1444,7 @@ what was asked (#3465).
 
 The SYSTEM service (FR-105) coalesces before it relays, and the relayed
 question carries its own id, which the worker checks is an object id
-([`ssh_service.rs:928`](../agents/roomlerd/src/ssh_service.rs#L928)). ⚠️ **The fix needs the service, not only the worker.** A
+([`ssh_service.rs:931`](../agents/roomlerd/src/ssh_service.rs#L931)). ⚠️ **The fix needs the service, not only the worker.** A
 service from before #3442 relays the grant's id for every question and does not
 coalesce, so a worker behind it still has the second question withdraw the
 first, until the service is updated too.

@@ -70,16 +70,19 @@ impl NoConfig {
 
     /// #4071 — no config at `path`, found by a `run` under `supervision`: what
     /// `supervision::detect_here` answered for that `run`'s flags, the one rule
-    /// every `run` keeps, so the supervisor it proved decides, never a text. Two
-    /// read [`NO_ENROLLMENT_EXIT_CODE`]: the Windows service host (`WindowsScm`),
-    /// and FR-43's macOS supervisor (`MacosSupervisor`), whose worker is `run
-    /// --supervised` without `--unenrolled`. `detect_here` answers the second on
-    /// a Mac only, so the tests ask this with each answer itself.
+    /// every `run` keeps, so the supervisor it proved decides, never a text.
+    /// Three read [`NO_ENROLLMENT_EXIT_CODE`]: the Windows service host
+    /// (`WindowsScm`), (FR-150 P2) the per-user task's launcher (`WindowsTask`,
+    /// `agents/roomlerdw`), which leaves on it where it would start a crash
+    /// again, and FR-43's macOS supervisor (`MacosSupervisor`), whose worker is
+    /// `run --supervised` without `--unenrolled`. `detect_here` answers the first
+    /// two on Windows only and the third on a Mac only, so the tests ask this
+    /// with each answer itself.
     pub fn under(path: &Path, supervision: Supervision) -> Self {
         Self {
             supervisor_reads_the_code: matches!(
                 supervision,
-                Supervision::WindowsScm | Supervision::MacosSupervisor
+                Supervision::WindowsScm | Supervision::WindowsTask | Supervision::MacosSupervisor
             ),
             ..Self::at(path)
         }
@@ -129,11 +132,14 @@ pub fn record_worker_exit(err: &anyhow::Error, record: impl FnOnce(&str)) {
 /// It counts the exit towards giving up as an exit 1, then says for certain why
 /// (`macos_supervisor::gave_up_reason`).
 ///
-/// **Those two supervisors' workers only** ([`NoConfig::under`]). Every other
+/// FR-150 P2 — and the code of the per-user Scheduled Task's daemon (`run
+/// --supervisor task`), whose launcher (`agents/roomlerdw`) leaves on this code
+/// where it would start a crash again.
+///
+/// **Those three supervisors' workers only** ([`NoConfig::under`]). Every other
 /// `run` that finds no config exits 1, as it always has: systemd's units, launchd
-/// (a Mac's LaunchAgent and its root daemon), a container's runtime and the
-/// per-user Scheduled Task read the exit code too, and none of them is told of
-/// this one.
+/// (a Mac's LaunchAgent and its root daemon) and a container's runtime read the
+/// exit code too, and none of them is told of this one.
 ///
 /// Why 78. No other code in the tree is 78: not 0 or 1, the watchdog's sentinels
 /// (2, 7, 8, 9), the stand-in's 10, the probe and portal helpers' 3 to 5, a
@@ -149,10 +155,15 @@ pub const NO_ENROLLMENT_EXIT_CODE: i32 = 78;
 /// #4028 — the code a process whose `main` ends with `error` exits with, when it
 /// is not std's 1: [`NO_ENROLLMENT_EXIT_CODE`] for a worker that found no config
 /// and whose supervisor reads that code ([`NoConfig::under`]: the Windows service
-/// host's worker, and since #4071 the one FR-43's macOS supervisor starts), bare
-/// or under a context. Both `main`s ask it, the AppKit one too (#4071). `None` for
-/// every other error and every other process: they exit 1.
+/// host's worker, since #4071 the one FR-43's macOS supervisor starts, and since
+/// FR-150 P2 the per-user task's daemon), bare or under a context, and (FR-150 P2)
+/// [`INSTALL_IN_FLIGHT_EXIT_CODE`] for [`InstallInFlight`]. Both `main`s ask it,
+/// the AppKit one too (#4071). `None` for every other error and every other
+/// process: they exit 1.
 pub fn exit_code(error: &anyhow::Error) -> Option<i32> {
+    if error.downcast_ref::<InstallInFlight>().is_some() {
+        return Some(INSTALL_IN_FLIGHT_EXIT_CODE);
+    }
     error
         .downcast_ref::<NoConfig>()
         .filter(|no_config| no_config.supervisor_reads_the_code)
@@ -184,6 +195,106 @@ fn leave_through(
         exit(code);
     }
     res
+}
+
+/// FR-150 P2 (#3295) — the per-user task's daemon started while an install of
+/// Roomler runs ([`leaves_for_an_install`]). It leaves before it takes the
+/// single-instance lock, so it holds no file the install replaces, and its
+/// launcher (`agents/roomlerdw`) leaves on its code where it would start a crash
+/// again. The new task's one-shots start the daemon after the install. A state
+/// of the device, like [`NoConfig`], and no fault: the daemon leaves before it
+/// counts its run, so no crash is recorded for it.
+#[derive(Debug)]
+pub struct InstallInFlight;
+
+impl std::fmt::Display for InstallInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "an install of Roomler is running (an update was attempted in the last ten \
+             minutes, and Windows Installer runs an install), so this daemon leaves before it \
+             holds any file the install replaces. The new task starts it after the install",
+        )
+    }
+}
+
+impl std::error::Error for InstallInFlight {}
+
+/// FR-150 P2 — the code the per-user task's daemon exits with for
+/// [`InstallInFlight`]. Its launcher tells the exit apart by this code and by no
+/// text, and leaves.
+///
+/// Why 75. No other code in the tree is 75: not [`NO_ENROLLMENT_EXIT_CODE`] nor
+/// any code its own note lists. Windows cannot mistake it, for the same reasons:
+/// 0x4B lies between the wait results (0x00–0x3F) and the abandoned waits
+/// (0x80–0xBF), where no NTSTATUS is defined, and under every exception code. It
+/// fits an 8-bit exit status unchanged. It is BSD `sysexits.h`'s `EX_TEMPFAIL`
+/// ("a temporary failure … the user is invited to retry later"), a mnemonic only.
+pub const INSTALL_IN_FLIGHT_EXIT_CODE: i32 = 75;
+
+/// FR-150 P2 — whether a `run` that `supervision` started leaves at once, before
+/// its lock, for an install in flight. Only the per-user task's daemon
+/// (`run --supervisor task`, on Windows), and only while an update of ours was
+/// attempted within the last ten minutes (`update_attempted`:
+/// `updater::update_in_flight`, whose marker the updater's installer spawn and the
+/// per-user MSI's `service stop --for-upgrade` touch) AND Windows Installer runs an
+/// install (`installer_running`: `windows_installer_running`). Neither alone is
+/// enough: the marker stays fresh for ten minutes after an install that has ended,
+/// and any install on the machine holds the mutex. Each question is asked only
+/// when the answer still depends on it.
+pub fn leaves_for_an_install(
+    supervision: crate::supervision::Supervision,
+    update_attempted: impl FnOnce() -> bool,
+    installer_running: impl FnOnce() -> bool,
+) -> bool {
+    supervision == crate::supervision::Supervision::WindowsTask
+        && update_attempted()
+        && installer_running()
+}
+
+/// FR-150 P2 — `run`'s check before its lock, on this host: [`InstallInFlight`]
+/// when the per-user task's daemon must leave for an install in flight
+/// ([`leaves_for_an_install`]). `supervisor` is `run --supervisor`'s word. Every
+/// other OS has no per-user task to leave from: always `Ok`.
+pub fn leave_if_an_install_runs(supervisor: Option<&str>) -> Result<(), InstallInFlight> {
+    #[cfg(windows)]
+    {
+        let supervision = crate::supervision::detect_here(supervisor, false);
+        if leaves_for_an_install(
+            supervision,
+            crate::updater::update_in_flight,
+            windows_installer_running,
+        ) {
+            return Err(InstallInFlight);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = supervisor;
+    Ok(())
+}
+
+/// FR-150 P2 — Windows Installer runs an install on this machine: its execution
+/// mutex, `Global\_MSIExecute`, exists. Opened for `SYNCHRONIZE` only; a refusal
+/// (`ERROR_ACCESS_DENIED`) means it exists too. Every other answer, no such mutex
+/// included, is no: a wrong yes keeps the daemon down until its task's next
+/// start, where a wrong no only leaves the race P2 closes.
+#[cfg(windows)]
+pub fn windows_installer_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let name: Vec<u16> = "Global\\_MSIExecute"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `name` is NUL-terminated UTF-16 and outlives the call; a handle the
+    // call returns is closed here and nowhere else.
+    unsafe {
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        CloseHandle(handle);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -350,7 +461,10 @@ mod worker_exit_tests {
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{NO_ENROLLMENT_EXIT_CODE, NoConfig, exit_code, leave_through, record_worker_exit};
+    use super::{
+        INSTALL_IN_FLIGHT_EXIT_CODE, InstallInFlight, NO_ENROLLMENT_EXIT_CODE, NoConfig, exit_code,
+        leave_through, leaves_for_an_install, record_worker_exit,
+    };
     use std::path::Path;
 
     /// A person's config, where the service host's worker reads it.
@@ -364,20 +478,23 @@ mod exit_code_tests {
     }
 
     /// #4028 — the worker the Windows service host started (`run --supervisor
-    /// scm`) that finds no config has its own exit code, under a context too.
-    /// The per-user Task's worker, a bare `run`, a word no spawner says, and
-    /// every platform but Windows exit 1, as they always have. So does an error
-    /// of any other kind, one that only says the same words included.
+    /// scm`) that finds no config has its own exit code, under a context too,
+    /// and since FR-150 P2 so has the per-user task's daemon (`task`). A bare
+    /// `run`, a word no spawner says, and every platform but Windows exit 1, as
+    /// they always have. So does an error of any other kind, one that only says
+    /// the same words included.
     #[test]
-    fn only_the_service_hosts_worker_with_no_config_has_its_own_code() {
+    fn only_a_windows_supervisors_run_with_no_config_has_its_own_code() {
         let path = Path::new(PATH);
         let service = anyhow::Error::from(NoConfig::of_run(path, Some("scm")));
         assert_eq!(exit_code(&service), service_code());
         let under_a_context =
             anyhow::Error::from(NoConfig::of_run(path, Some("scm"))).context("starting the worker");
         assert_eq!(exit_code(&under_a_context), service_code());
+        let task = anyhow::Error::from(NoConfig::of_run(path, Some("task")));
+        assert_eq!(exit_code(&task), service_code());
 
-        for supervisor in [Some("task"), None, Some("nssm"), Some("")] {
+        for supervisor in [None, Some("nssm"), Some(""), Some("tasks")] {
             let err = anyhow::Error::from(NoConfig::of_run(path, supervisor));
             assert_eq!(exit_code(&err), None, "{supervisor:?}");
         }
@@ -430,7 +547,7 @@ mod exit_code_tests {
 
         let others: [anyhow::Result<()>; 3] = [
             Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock")),
-            Err(NoConfig::of_run(path, Some("task")).into()),
+            Err(NoConfig::of_run(path, None).into()),
             Ok(()),
         ];
         for res in others {
@@ -466,6 +583,8 @@ mod exit_code_tests {
             101,
             // `roomlerdw` and the CLI shim with no daemon to run.
             127,
+            // FR-150 P2: an install in flight at the per-user task's start.
+            INSTALL_IN_FLIGHT_EXIT_CODE,
         ];
         assert!(!taken.contains(&NO_ENROLLMENT_EXIT_CODE), "{taken:?}");
         let status = NO_ENROLLMENT_EXIT_CODE as u32;
@@ -477,6 +596,106 @@ mod exit_code_tests {
         assert_eq!(status & 0xFF, status);
     }
 
+    /// FR-150 P2 — the per-user task's daemon that starts while an update of ours
+    /// was attempted AND Windows Installer runs an install leaves with 75, which
+    /// its launcher leaves on. Either sign alone, and every other `run`, starts as
+    /// before, and the other runs never ask.
+    #[test]
+    fn a_start_inside_an_install_stays_down() {
+        use crate::supervision::Supervision;
+        use std::cell::Cell;
+
+        assert!(leaves_for_an_install(
+            Supervision::WindowsTask,
+            || true,
+            || true
+        ));
+        assert!(!leaves_for_an_install(
+            Supervision::WindowsTask,
+            || true,
+            || false
+        ));
+        let looked = Cell::new(false);
+        assert!(!leaves_for_an_install(
+            Supervision::WindowsTask,
+            || false,
+            || {
+                looked.set(true);
+                true
+            }
+        ));
+        assert!(!looked.get(), "no fresh update: the mutex is not looked at");
+
+        for supervision in [
+            Supervision::WindowsScm,
+            Supervision::Launchd,
+            Supervision::MacosSupervisor,
+            Supervision::None,
+        ] {
+            let asked = Cell::new(0);
+            let ask = || {
+                asked.set(asked.get() + 1);
+                true
+            };
+            assert!(
+                !leaves_for_an_install(supervision, ask, ask),
+                "{supervision:?}"
+            );
+            assert_eq!(asked.get(), 0, "{supervision:?}");
+        }
+
+        // Its exit: 75, bare or under a context, with the line std writes.
+        assert_eq!(
+            exit_code(&InstallInFlight.into()),
+            Some(INSTALL_IN_FLIGHT_EXIT_CODE)
+        );
+        let under_a_context = anyhow::Error::from(InstallInFlight).context("starting the daemon");
+        assert_eq!(
+            exit_code(&under_a_context),
+            Some(INSTALL_IN_FLIGHT_EXIT_CODE)
+        );
+        let mut out = Vec::new();
+        let mut exited = None;
+        let res = leave_through(Err(InstallInFlight.into()), &mut out, |code| {
+            exited = Some(code)
+        });
+        let err = res.expect_err("the error comes back only because this exit returns");
+        assert_eq!(exited, Some(75));
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            format!("Error: {err:?}\n")
+        );
+        // Its words alone are not the type.
+        assert_eq!(exit_code(&anyhow::anyhow!("{}", InstallInFlight)), None);
+    }
+
+    /// FR-150 P2 — the code is 75, pinned: the launcher's table, the docs and the
+    /// lab name it. It is no other code in the tree and no Windows status.
+    #[test]
+    fn the_install_in_flight_code_is_pinned_and_collides_with_nothing() {
+        assert_eq!(INSTALL_IN_FLIGHT_EXIT_CODE, 75);
+        let taken = [
+            0,
+            1,
+            crate::watchdog::STALL_EXIT_CODE,
+            crate::watchdog::AGENT_DELETED_EXIT_CODE,
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE,
+            crate::watchdog::RESTART_REQUESTED_EXIT_CODE,
+            crate::watchdog::APPKIT_ENDED_EXIT_CODE,
+            crate::unenrolled::STAND_IN_LOST_EXIT_CODE,
+            3,
+            4,
+            5,
+            101,
+            127,
+            NO_ENROLLMENT_EXIT_CODE,
+        ];
+        assert!(!taken.contains(&INSTALL_IN_FLIGHT_EXIT_CODE), "{taken:?}");
+        let status = INSTALL_IN_FLIGHT_EXIT_CODE as u32;
+        assert!((0x40..0x80).contains(&status), "{status:#x}");
+        assert_eq!(status & 0xFF, status);
+    }
+
     /// A person's config, where the GUI worker FR-43's macOS supervisor starts
     /// as the console user reads it.
     const MAC_PATH: &str = "/Users/p/Library/Application Support/live.roomler.roomler/config.toml";
@@ -484,15 +703,16 @@ mod exit_code_tests {
     /// #4071 — the rule, by the supervisor `detect_here` proved, so every
     /// platform runs every cell: the worker FR-43's macOS supervisor started
     /// (`run --supervised`) that finds no config leaves with the code, as the
-    /// Windows service host's does, under a context too. A Mac's LaunchAgent
-    /// (launchd), the per-user Task's worker, a systemd unit and a `run` that
-    /// nothing supervises exit 1, as they always have.
+    /// Windows service host's does and, since FR-150 P2, the per-user Task's
+    /// daemon, under a context too. A Mac's LaunchAgent (launchd), a systemd
+    /// unit and a `run` that nothing supervises exit 1, as they always have.
     #[test]
     fn a_worker_whose_supervisor_reads_the_code_leaves_with_it() {
         use crate::supervision::{Supervision, SystemdUnit};
         for (path, supervision) in [
             (MAC_PATH, Supervision::MacosSupervisor),
             (PATH, Supervision::WindowsScm),
+            (PATH, Supervision::WindowsTask),
         ] {
             let path = Path::new(path);
             let bare = anyhow::Error::from(NoConfig::under(path, supervision));
@@ -507,7 +727,6 @@ mod exit_code_tests {
         };
         for supervision in [
             Supervision::Launchd,
-            Supervision::WindowsTask,
             Supervision::Systemd(unit),
             Supervision::None,
         ] {

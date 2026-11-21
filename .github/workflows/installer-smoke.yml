@@ -1055,12 +1055,31 @@ jobs:
           foreach ($a in 'DisableSystemContext', 'KeepSystemContext') {
             if ((Get-Seq $a) -le (Get-Seq 'RestoreServiceEnvironment')) { throw "$a runs before RestoreServiceEnvironment" }
           }
-          # msidbCustomActionTypeContinue (0x40): neither can fail an upgrade.
-          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+          # #4196 — the list once the component states are final and before the
+          # old product's removal; the spare after InstallFiles, and after every
+          # action scheduled after it, whose numbers docs/installation.md records.
+          $at = [ordered]@{}
+          foreach ($a in 'InstallValidate', 'ListInstalledFiles', 'InstallInitialize', 'InstallFiles', 'CleanupLegacyPerUser',
+                         'RegisterService', 'SetRestoreServiceEnvironment', 'RestoreServiceEnvironment', 'DisableSystemContext',
+                         'KeepSystemContext', 'RollbackSystemContext', 'EnableSystemContext', 'SpareInstalledFiles') { $at[$a] = Get-Seq $a }
+          Write-Host (($at.Keys | ForEach-Object { "$_=$($at[$_])" }) -join ' ')
+          if (-not ($at.InstallValidate -lt $at.ListInstalledFiles -and $at.ListInstalledFiles -lt $at.InstallInitialize)) {
+            throw 'ListInstalledFiles does not run between InstallValidate and InstallInitialize'
+          }
+          $before = @($at.Keys | Where-Object { $_ -notin 'InstallValidate', 'ListInstalledFiles', 'InstallInitialize', 'SpareInstalledFiles' } | ForEach-Object { $at[$_] })
+          if ($at.SpareInstalledFiles -le ($before | Measure-Object -Maximum).Maximum) {
+            throw "SpareInstalledFiles ($($at.SpareInstalledFiles)) does not come after InstallFiles and every action scheduled after it"
+          }
+          # msidbCustomActionTypeContinue (0x40): none of them can fail an install.
+          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment', 'ListInstalledFiles', 'SpareInstalledFiles') {
             $type = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='$a'") 'IntegerData')
             Write-Host "$a Type: $type"
             if (($type -band 0x40) -eq 0) { throw "$a can fail the install: its Return is not 'ignore'" }
           }
+          # The spare writes HKLM's Session Manager key: deferred (0x400) and
+          # not impersonated (0x800), so it runs as LocalSystem.
+          $spareType = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='SpareInstalledFiles'") 'IntegerData')
+          if (($spareType -band 0xC00) -ne 0xC00) { throw "SpareInstalledFiles is not a deferred action that runs as LocalSystem: Type $spareType" }
           # CustomActionData is logged under the restore's own name.
           $hidden = Get-Field (Get-Row "SELECT Value FROM Property WHERE Property='MsiHiddenProperties'") 'StringData'
           Write-Host "MsiHiddenProperties: $hidden"
@@ -1102,10 +1121,10 @@ jobs:
             throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
           }
           $exports = (& $dumpbin /exports $dll) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exited $LASTEXITCODE" }
-          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment', 'ListInstalledFiles', 'SpareInstalledFiles') {
             if ($exports -notmatch "\b$e\b") { throw "the DLL does not export $e" }
           }
-          Write-Host 'OK: the DLL imports only what Windows ships, and exports both entry points'
+          Write-Host 'OK: the DLL imports only what Windows ships, and exports its four entry points'
           # Negative control: the same crate built WITHOUT +crt-static imports the
           # VC++ runtime, and the audit has to say so.
           $neg = @(Get-Problems "$env:RUNNER_TEMP\msi-ca\plain-crt.dll")
@@ -1126,11 +1145,12 @@ jobs:
         # (2026-09-26). The fix keeps the mode the machine was last switched to
         # (`roomlerd keep-system-context`, from the product's own record).
         #
-        # Four builds of the SAME binary at rising versions, so each install is
+        # Seven builds of the SAME binary at rising versions, so each install is
         # a real major upgrade (RemoveExistingProducts runs the old product's
         # service uninstall), the shape a hand-run install of a newer release
-        # has. ⚠️ Windows Installer ignores a version's FOURTH field when it
-        # decides an upgrade, so the versions differ in the third.
+        # has. Six are this step's; pm-7 is the held upgrade's (#4196), after
+        # the repair. ⚠️ Windows Installer ignores a version's FOURTH field when
+        # it decides an upgrade, so the versions differ in the third.
         #
         # What this CAN prove on a hosted runner: the switch in the service's
         # Environment, the record, and that the service is Running after each
@@ -1213,7 +1233,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item "agents\roomlerd\wix-perMachine\main.wxs" "$wixDir\main.wxs" -Force
           try {
-            foreach ($n in 1..6) {
+            foreach ($n in 1..7) {
               cargo wix -p roomlerd --nocapture --no-build --install-version "0.0.$n-smoke.1"
               if ($LASTEXITCODE -ne 0) { throw "cargo wix failed for v$n" }
               $msi = Get-ChildItem 'target/wix/*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -1488,6 +1508,172 @@ jobs:
           Assert-Mode 'v6, repaired' $false '0.0.6.1'
           Assert-Carried 'v6, repaired' $true
 
+      # #4196 — the held upgrade, in a step of its own so that a failure names
+      # its cell. When something holds roomlerd.exe open without
+      # FILE_SHARE_DELETE while the old product's removal deletes it, Windows
+      # Installer can only schedule a delete at the next boot
+      # (PendingFileRenameOperations) and end 3010. The new product then keeps
+      # the file there (pm-6 and pm-7 carry the same roomlerd.exe, an equal
+      # version), and up to #4196 the session manager deleted it at the next
+      # boot: the service could not start (SCM 7000, measured on a lab
+      # machine, and with a newer file version too). A runner cannot boot
+      # again, so the cell reads what the boot would run: no pending delete
+      # may name a file in the install folder.
+      #
+      # The holder is neutral: a process that opens the file to read it,
+      # sharing read only, from the old product's InstallInitialize (after
+      # every Restart Manager pass of both products) until Windows Installer
+      # has scheduled the delete, as the lab's did. It follows msiexec's log,
+      # written with /l*v! so each line is on disk at once.
+      #
+      # Negative control: on master this cell fails on the pending delete of
+      # roomlerd.exe. Positive control: the log's own 1903 line for the file;
+      # without it the hold did nothing and the cell fails rather than pass.
+      # It passes in about 1 min; 8 min leaves its one 300 s deadline room.
+      - name: "A per-Machine upgrade over a held roomlerd.exe leaves no boot-time delete of a file it installed (#4196)"
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          . $env:PM_CELLS
+          $ErrorActionPreference = 'Stop'
+          $folder = "$env:ProgramFiles\Roomler"
+          $target = Join-Path $folder 'roomlerd.exe'
+          $log = Join-Path $logDir 'pm-7-held.log'
+          $holdOut = Join-Path $logDir 'pm-7-held.hold.txt'
+          # The deletes the session manager will run at boot that name a file in
+          # the folder: an operation is a source and a destination, and an empty
+          # destination is a delete. `*1`, `!` and `\??\` are MoveFileEx's.
+          function Get-BootDeletes([string]$under) {
+            $prefix = $under.TrimEnd('\').ToLowerInvariant() + '\'
+            $sm = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+            foreach ($name in 'PendingFileRenameOperations', 'PendingFileRenameOperations2') {
+              $raw = $sm.GetValue($name)
+              if ($null -eq $raw) { continue }
+              $ops = [string[]]$raw
+              if ($ops.Count % 2) { throw "${name}: $($ops.Count) strings do not pair up: $($ops -join ' | ')" }
+              for ($i = 0; $i -lt $ops.Count; $i += 2) {
+                $path = ($ops[$i] -replace '^\*\d+', '' -replace '^!', '' -replace '^\\\?\?\\', '').ToLowerInvariant()
+                if ($ops[$i + 1] -eq '' -and $path.StartsWith($prefix)) { "${name}: delete $($ops[$i])" }
+              }
+            }
+          }
+          $before = @(Get-BootDeletes $folder)
+          if ($before.Count) { throw "before the cell a boot-time delete in the install folder is already pending, so the cell cannot tell its own apart: $($before -join '; ')" }
+
+          $holder = Join-Path $env:RUNNER_TEMP 'hold-4196.ps1'
+          @'
+          param([string]$Log, [string]$Target, [string]$Out, [int]$TimeoutSec = 360)
+          # Opens $Target to read it, sharing read only, on the old product's
+          # InstallInitialize (the log's second), and lets go once Windows
+          # Installer has scheduled its boot-time delete. Nothing else.
+          $ErrorActionPreference = 'Stop'
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          function Note([string]$s) { [IO.File]::AppendAllText($Out, "HOLD $([DateTime]::UtcNow.ToString('HH:mm:ss.fff')) +$($clock.ElapsedMilliseconds)ms $s`r`n") }
+          Note "start pid=$PID target=$Target"
+          $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+          while (-not (Test-Path -LiteralPath $Log)) {
+            if ([DateTime]::UtcNow -gt $deadline) { Note 'TIMEOUT before the log appeared'; exit 2 }
+            Start-Sleep -Milliseconds 5
+          }
+          $fs = [IO.FileStream]::new($Log, 'Open', 'Read', [IO.FileShare]'ReadWrite, Delete')
+          $buf = [byte[]]::new(262144); $chars = [char[]]::new(262144)
+          $dec = $null; $head = [IO.MemoryStream]::new(); $acc = [Text.StringBuilder]::new()
+          $state = 'wait-open'; $opens = 0; $h = $null; $done = $false; $afterCopy = $false
+          $any = [regex]::new('InstallInitialize|roomlerd\.exe|Note: 1: 2329|Info 19|INSTALL\.|MainEngineThread|ReplacedInUseFiles', 'Compiled')
+          while (-not $done) {
+            if ([DateTime]::UtcNow -gt $deadline) { Note "TIMEOUT in state $state"; break }
+            $n = $fs.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { Start-Sleep -Milliseconds 5; continue }
+            if ($null -eq $dec) {
+              $head.Write($buf, 0, $n)
+              if ($head.Length -lt 2) { continue }
+              $b = $head.ToArray(); $skip = 0
+              if ($b[0] -eq 0xFF -and $b[1] -eq 0xFE) { $enc = [Text.Encoding]::Unicode; $skip = 2 } else { $enc = [Text.Encoding]::Default }
+              Note "log encoding $($enc.WebName)"
+              $dec = $enc.GetDecoder()
+              $big = [char[]]::new($b.Length + 16)
+              [void]$acc.Append($big, 0, $dec.GetChars($b, $skip, $b.Length - $skip, $big, 0))
+            } else {
+              [void]$acc.Append($chars, 0, $dec.GetChars($buf, 0, $n, $chars, 0))
+            }
+            $all = $acc.ToString(); $cut = $all.LastIndexOf("`n")
+            if ($cut -lt 0) { continue }
+            [void]$acc.Clear(); [void]$acc.Append($all.Substring($cut + 1))
+            foreach ($line in $all.Substring(0, $cut).Split("`n")) {
+              $line = $line.TrimEnd("`r")
+              # The line after the new product's FileCopy says what it did there.
+              if ($afterCopy) { Note "SEEN $line"; $afterCopy = $false }
+              if (-not $any.IsMatch($line)) { continue }
+              if ($state -eq 'wait-open') {
+                if ($line -match 'Action start [0-9:]+: InstallInitialize\.') {
+                  $opens++
+                  if ($opens -ge 2) {
+                    try { $h = [IO.File]::Open($Target, 'Open', 'Read', 'Read'); $state = 'holding'; Note "OPEN ok (access Read, share Read) on: $line" }
+                    catch { $state = 'released'; Note "OPEN FAILED $($_.Exception.Message) on: $line" }
+                  }
+                }
+              } elseif ($state -eq 'holding') {
+                if ($line -match 'roomlerd\.exe|Note: 1: 2329|Info 1903') { Note "SEEN $line" }
+                if ($line -match 'Info 1903\..*roomlerd\.exe' -or $line -match 'Action ended [0-9:]+: INSTALL\.') {
+                  $h.Dispose(); $h = $null; $state = 'released'; Note "RELEASE on: $line"
+                }
+              } else {
+                if ($line -match 'FileCopy\(SourceName=roomlerd\.exe|Info 1903|Info 1904|Note: 1: 2329|ReplacedInUseFiles') { Note "SEEN $line" }
+                if ($line -match 'FileCopy\(SourceName=roomlerd\.exe') { $afterCopy = $true }
+              }
+              if ($line -match 'MSI \(c\).*MainEngineThread is returning') { $done = $true; break }
+            }
+          }
+          if ($h) { $h.Dispose(); Note 'RELEASE at the end' }
+          Note "end state=$state"
+          $fs.Dispose()
+          '@ | Set-Content -LiteralPath $holder -Encoding utf8
+          $hp = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -WindowStyle Hidden `
+            -ArgumentList "-NoProfile -File `"$holder`" -Log `"$log`" -Target `"$target`" -Out `"$holdOut`""
+          $null = $hp.Handle
+          # msiexec starts once the holder follows the log, or the open can come late.
+          $until = [DateTime]::UtcNow.AddSeconds(60)
+          while (-not ((Test-Path -LiteralPath $holdOut) -and (Select-String -LiteralPath $holdOut -SimpleMatch ' start pid=' -Quiet))) {
+            if ($hp.HasExited) { throw "the holder ended ($($hp.ExitCode)) before it started" }
+            if ([DateTime]::UtcNow -gt $until) { throw 'the holder did not start within 60 s' }
+            Start-Sleep -Milliseconds 50
+          }
+          $exit = 0
+          try {
+            Invoke-Installer -Label 'msiexec /i pm-7.msi over a held roomlerd.exe' -FilePath 'msiexec.exe' `
+              -Arguments "/i `"$(Join-Path $out 'pm-7.msi')`" /qn /norestart /l*v! `"$log`"" -Log $log -NoAnnotation
+          } catch {
+            # The delete it had to schedule is a restart Windows Installer
+            # asks for, with the fix as without it. Any other end fails here.
+            if ($_.Exception.Message -notlike '*exited 3010*') { throw }
+            $exit = 3010
+          } finally {
+            if (-not $hp.WaitForExit(120000)) { Stop-Process -Id $hp.Id -Force -ErrorAction SilentlyContinue; Write-Host 'the holder was still running 120 s after msiexec' }
+            Get-Content -LiteralPath $holdOut -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          }
+          Write-Host "msiexec exit: $exit"
+          # The positive control: the hold made the old product's removal schedule
+          # the delete, or this cell proves nothing.
+          $scheduled = @(Select-String -LiteralPath $log -SimpleMatch "Info 1903.Scheduling reboot operation: Deleting file $target.")
+          if (-not $scheduled) {
+            Get-RestartLines $log | ForEach-Object { Write-Host $_ }
+            throw "Windows Installer scheduled no boot-time delete of $target, so the hold did nothing and this cell proves nothing"
+          }
+          Write-Host "the old product's removal scheduled it, line $($scheduled[0].LineNumber): $($scheduled[0].Line.Trim())"
+          Select-String -LiteralPath $log -SimpleMatch 'roomler_msi_ca: list:', 'roomler_msi_ca: spare:' | ForEach-Object { Write-Host "$($_.LineNumber): $($_.Line.Trim())" }
+          # THE regression cell.
+          $after = @(Get-BootDeletes $folder)
+          $after | ForEach-Object { Write-Host "pending at the next boot: $_" }
+          if ($after.Count) {
+            throw "#4196: the upgrade leaves $($after.Count) file(s) it installed to be deleted at the next boot, and the service cannot start after it: $($after -join '; ')"
+          }
+          Write-Host 'OK: no boot-time delete names a file in the install folder'
+          if (-not (Test-Path -LiteralPath $target)) { throw "$target is gone" }
+          Assert-Logged 'pm-7-held.log' 'spare: dropped the delete of'
+          Assert-Mode 'v7, upgraded over a held roomlerd.exe' $false '0.0.7.1'
+          Assert-Carried 'v7, upgraded over a held roomlerd.exe' $true
+
       # #3810 — it passes in 1 to 2 s; 6 min leaves its one 300 s deadline room.
       - name: "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)"
         timeout-minutes: 6
@@ -1503,7 +1689,8 @@ jobs:
           }
           Write-Host 'OK: no MSI log holds a carried value'
 
-          Invoke-Msi '/x' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-uninstall.log') ''
+          # pm-7: the held upgrade's (#4196) is the installed product.
+          Invoke-Msi '/x' (Join-Path $out 'pm-7.msi') (Join-Path $logDir 'pm-uninstall.log') ''
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived the uninstall' }
           # #3375 — and every entry with it: an uninstall carries nothing.
           if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler') { throw 'the service key, and its Environment, survived the uninstall' }
@@ -1732,8 +1919,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # #3810 — the six per-Machine MSIs of this run, pm-1.msi to pm-6.msi:
-      # the same binary at versions 0.0.1-smoke.1 to 0.0.6-smoke.1, built by
+      # #3810 — the seven per-Machine MSIs of this run, pm-1.msi to pm-7.msi:
+      # the same binary at versions 0.0.1-smoke.1 to 0.0.7-smoke.1, built by
       # the hand-run upgrade step above. CI builds, unsigned: never ship them.
       # A lab replay of the per-Machine steps on a throwaway guest installs
       # exactly these. No step after the build moves or deletes them. Only on

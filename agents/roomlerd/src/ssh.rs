@@ -3114,10 +3114,10 @@ pub async fn serve_for_service<S>(
     }
 }
 
-/// FR-96 P2b — SSH connections open on this device right now. A daemon
-/// restart ends every one of them, so the restart onto a replaced binary
-/// waits while any is open: the likeliest way that binary gets replaced is an
-/// admin's `apt upgrade` typed INTO one of these sessions.
+/// FR-96 P2b, #3429 — SSH connections open on this device right now. A
+/// restart ends every one of them, so the restart onto a replaced binary and
+/// the periodic update wait while any is open: the likeliest way a binary gets
+/// replaced is an admin's `apt upgrade` typed INTO one of these sessions.
 static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// How many SSH connections are open right now; zero in a build without the
@@ -3127,13 +3127,13 @@ pub fn live_connections() -> usize {
 }
 
 /// Counts one connection in [`LIVE_CONNECTIONS`] for as long as it lives,
-/// whichever way `serve_conn` returns.
+/// whichever way `serve_conn`, or the carry to the SYSTEM service, returns.
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
-struct LiveConnection;
+pub(crate) struct LiveConnection;
 
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
 impl LiveConnection {
-    fn open() -> Self {
+    pub(crate) fn open() -> Self {
         LIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self
     }

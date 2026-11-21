@@ -104,6 +104,10 @@ mod agent_self_tests;
 mod agent_socket_end_tests;
 #[cfg(test)]
 mod agent_tests;
+/// #4189 — four answers that sent a stored id or time raw, read through the
+/// routes: every id the 24-hex string, every time RFC 3339.
+#[cfg(test)]
+mod answer_wire_tests;
 /// FR-88 P1a — sign-up attribution: stored once at creation, absent from
 /// every user-facing response, parked across OAuth, counted for the admin.
 #[cfg(test)]

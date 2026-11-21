@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2486-2501`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2538-2553`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -965,10 +965,10 @@ test of the SIGKILL property itself.
   - Open: the layout is the system's (`localectl`, `/etc/default/keyboard`), not the session's own input source,
     which GNOME can set apart from it; P3f types for what the system names, as the table did.
 - **P3g, a companion where there is none** (with FR-93 D5/D6 and FR-95): an arm64 `.deb` and a tarball build;
-  `install.sh` already has the hook (`scripts/install.sh:1460-1470`).
+  `install.sh` already has the hook (`scripts/install.sh:1378-1388`).
   - *Done by FR-93 (checked 2026-10-20):* P6e builds the companion for aarch64 as a `.deb` and an `.rpm` on the
     arm64 runner (`.github/workflows/release-agent.yml:960`), in every release since 0.4.138, and `install.sh` picks
-    either by the host's package manager (`scripts/install.sh:1460-1470`). AC10 is field-verified in FR-93's lab.
+    either by the host's package manager (`scripts/install.sh:1378-1388`). AC10 is field-verified in FR-93's lab.
   - *Not built, the tarball:* a host with neither dpkg nor rpm gets no companion (`install.sh` says so and skips
     it). FR-93 P6f's notification prompt still answers consent there; what such a host lacks is the banner under
     Wayland and the tray. Whether to build it is D17.
@@ -1022,7 +1022,7 @@ test of the SIGKILL property itself.
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:4063`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:4098`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.
@@ -1186,7 +1186,7 @@ model on Windows, so the three agree on what the mode means.
     had refused on the belief that launchd would restart the agent; it now stops the same way.
 - **P6d, `install.sh --uninstall [--keep-config]` (built).** One command removes what any install path put on a Linux
   or macOS machine: this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the tunnel CLI. Every
-  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:1512`).
+  step acts only on what is there, so it also works on a partial install and when run twice (`install.sh:1430`).
   - **The order is the design.** Every service stops through its manager while its files are still on disk
     (`uninstall_stop_linux`, `uninstall_stop_macos`). The stop is a SIGTERM, the daemon's clean stop, so P0e's purge
     takes back the exit `/1`s and the DNS steer, and an ephemeral device unenrolls itself. A daemon no manager owns

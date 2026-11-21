@@ -3952,13 +3952,13 @@ async fn run_cmd(
         let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
         return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
     }
-    // Take the single-instance lock before doing anything else. If
-    // another agent is already attached to this config (typically the
-    // Scheduled Task / systemd unit launched at logon), exit cleanly
-    // instead of fighting it for the WS connection. Only `run` gates
-    // on the lock — `enroll`, `service install`, `caps`, `displays`,
-    // `encoder-smoke`, `self-update` are intentionally runnable
-    // alongside an active agent.
+    // FR-150 P2 — before the lock: the per-user task's daemon started inside an install leaves.
+    roomlerd::daemon_error::leave_if_an_install_runs(supervisor_flag)?;
+    // Take the single-instance lock before doing anything else. If another agent is already
+    // attached to this config (typically the Scheduled Task / systemd unit launched at logon),
+    // exit cleanly instead of fighting it for the WS connection. Only `run` gates on the lock —
+    // `enroll`, `service install`, `caps`, `displays`, `encoder-smoke`, `self-update` are
+    // intentionally runnable alongside an active agent.
     let _instance_lock =
         match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
             instance_lock::AcquireOutcome::Acquired(g) => g,
@@ -5674,15 +5674,15 @@ async fn run_cmd(
     // tears down cleanly before the running binary gets overwritten.
     // Disable entirely with `ROOMLERD_AUTO_UPDATE=0` for air-
     // gapped / operator-managed deployments.
-    let upd_task = if let Some(update_trigger_rx) = update_trigger_rx {
+    let upd_task = if let Some(trigger_rx) = update_trigger_rx {
         tracing::info!(
             interval_h = update_interval.as_secs() / 3600,
             "auto-updater armed"
         );
         Some(tokio::spawn({
-            let rx = shutdown_rx.clone();
+            let (rx, rc) = (shutdown_rx.clone(), rc_sessions.clone());
             let tx = shutdown_tx.clone();
-            async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
+            async move { updater::run_periodic(rx, tx, update_interval, trigger_rx, rc).await }
         }))
     } else {
         match auto_update {
@@ -9167,21 +9167,18 @@ mod no_enrollment_exit_tests {
     }
 
     /// The worker the Windows service host started (`run --supervisor scm`)
-    /// ends with its own code. The per-user Task's worker, a bare `run`, and
-    /// every platform but Windows end with 1, as they always have, saying the
-    /// same words; and an error of any other kind ends with 1 too.
+    /// ends with its own code, as the per-user task's daemon does since FR-150
+    /// P2 (`a_task_run_with_no_config_exits_78`). A bare `run` and every
+    /// platform but Windows end with 1, as they always have, saying the same
+    /// words; and an error of any other kind ends with 1 too.
     #[test]
-    fn only_the_service_hosts_worker_with_no_config_ends_with_its_own_code() {
+    fn the_service_hosts_worker_with_no_config_ends_with_its_own_code() {
         let service = if cfg!(windows) {
             roomlerd::daemon_error::NO_ENROLLMENT_EXIT_CODE
         } else {
             EXIT_CODE_OF_AN_ERR
         };
-        for (supervisor, want) in [
-            (Some("scm"), service),
-            (Some("task"), EXIT_CODE_OF_AN_ERR),
-            (None, EXIT_CODE_OF_AN_ERR),
-        ] {
+        for (supervisor, want) in [(Some("scm"), service), (None, EXIT_CODE_OF_AN_ERR)] {
             let (missing, res) = run_with_no_config(supervisor, false);
             let (words, code) = step_outcome(&res);
             assert_eq!(code, want, "{supervisor:?}");
@@ -9203,6 +9200,30 @@ mod no_enrollment_exit_tests {
         let fault: Result<()> =
             Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock"));
         assert_eq!(step_outcome(&fault).1, EXIT_CODE_OF_AN_ERR);
+    }
+
+    /// FR-150 P2 (#3295) — the per-user task's daemon that finds no config ends
+    /// with the service host's worker's code, on Windows: its launcher reads 78
+    /// as "nothing to run until an enrollment" and leaves, where it would start
+    /// any other end again. It says the words `run` has always said. Off Windows
+    /// no such task exists, and `run` exits 1 as it always has.
+    #[test]
+    fn a_task_run_with_no_config_exits_78() {
+        let want = if cfg!(windows) {
+            roomlerd::daemon_error::NO_ENROLLMENT_EXIT_CODE
+        } else {
+            EXIT_CODE_OF_AN_ERR
+        };
+        let (missing, res) = run_with_no_config(Some("task"), false);
+        let (words, code) = step_outcome(&res);
+        assert_eq!(code, want);
+        assert_eq!(
+            words,
+            Some(format!(
+                "no config found at {}. Run `roomlerd enroll` first.",
+                missing.display()
+            ))
+        );
     }
 
     /// #4071 — the GUI worker FR-43's macOS supervisor starts on a two-row Mac

@@ -189,6 +189,10 @@ pub struct Pipe {
     /// and the pair memory, re-read it or bounded it, and when; the `path
     /// model` line names it ([`Self::ruled`]).
     ruled: Option<(Ruled, Instant)>,
+    /// The tcp_shape harness's fold of the law before FR-148 D50: no clock
+    /// reaches the shadow model ([`Self::set_unclocked`]).
+    #[cfg(test)]
+    unclocked: bool,
 }
 
 /// FR-148 D48 — what the in-flight budget's last step read, as the governor
@@ -452,11 +456,13 @@ impl Pipe {
         // Every caller is a valid window: the goodput fold and the link loop
         // both act only on one (`governor`). FR-148 D46 B2: a window after a
         // stall the budget saw is no reading for the model or the memory.
-        // FR-148 D48: nor what the window rules keep out.
+        // FR-148 D48: nor what the window rules keep out. FR-148 D50: the
+        // model reads a fall against the clock; the memory is passed none.
         if !self.window_gated
             && let Some(taken) = taken
         {
-            self.model.pushed_back(taken, basis, now);
+            let clock = self.clock();
+            self.model.pushed_back_clocked(taken, basis, clock, now);
             self.memory.pushed_back_in(taken, basis, take, now);
         }
         self.capacity_n = self.capacity_n.saturating_add(1);
@@ -492,6 +498,10 @@ impl Pipe {
     /// memory take it, under the last valid window's `take`; this type's own
     /// law never does, so nothing a session sends or opens moves. Neither
     /// ever raises a floor ([`PathModel::sample_pushed_back`]).
+    ///
+    /// FR-148 D50 — the shadow model reads it against the clock
+    /// ([`Self::clock`]), as the second of a fall or not; the pair memory is
+    /// passed none, and keeps the damped law (D30).
     pub fn observe_sample_capacity(
         &mut self,
         bps: u32,
@@ -502,7 +512,8 @@ impl Pipe {
         if bps == 0 {
             return;
         }
-        self.model.sample_pushed_back(bps, by, now);
+        let clock = self.clock();
+        self.model.sample_pushed_back_clocked(bps, by, clock, now);
         self.memory.sample_pushed_back_in(bps, by, take, now);
     }
 
@@ -545,6 +556,31 @@ impl Pipe {
     /// every window reaches the shadow model and the pair memory as before.
     pub fn note_path_rate(&mut self, rate: PathRate) {
         self.path_rate = Some(rate);
+    }
+
+    /// FR-148 D50 — the clock a fall is read against: the in-flight budget's
+    /// rate as [`Self::note_path_rate`] last noted it, when this association's
+    /// figures gave it. `None` with the budget off, while the opening rate
+    /// stands in, and at a rate of 0, which the window rules read as none
+    /// too ([`Self::close_window`]). Passed to the shadow model at each
+    /// push-back and never kept there: the pair memory is passed none.
+    fn clock(&self) -> Option<u32> {
+        #[cfg(test)]
+        if self.unclocked {
+            return None;
+        }
+        self.path_rate
+            .filter(|r| r.measured)
+            .and_then(|r| r.bps)
+            .filter(|&bps| bps > 0)
+    }
+
+    /// The tcp_shape harness's fold of the law before FR-148 D50 (`d48`):
+    /// D48's window rules read the budget's rate as before, and no clock
+    /// reaches the shadow model, so it reads no fall.
+    #[cfg(test)]
+    pub(crate) fn set_unclocked(&mut self) {
+        self.unclocked = true;
     }
 
     /// FR-148 D48 — `rule` kept a reading out of the shadow model and the
@@ -811,7 +847,7 @@ impl std::fmt::Display for PathNumber {
 /// | input | [`Pipe`] | here |
 /// |---|---|---|
 /// | a delivery, of either measured class | raises the floor | raises the floor |
-/// | a push-back, backlogged | sets the capacity; lowers the floor damped, or raises it | the same |
+/// | a push-back, backlogged | sets the capacity; lowers the floor damped, or raises it | the same, until a fall (D50) |
 /// | a push-back, application-limited | the same as a backlogged one | raises the floor, as a delivery does; the capacity does not move |
 /// | the pair memory's seed, at the open | never an input | an application-limited reading, marked remembered ([`Pipe::remember`]) |
 /// | anything assumed | never an input | never enters |
@@ -825,6 +861,18 @@ impl std::fmt::Display for PathNumber {
 /// ([`Self::sample_pushed_back`]), sets the capacity and lowers the floor
 /// damped, as a backlogged push-back does, and never raises it: its bytes are
 /// SCTP's acknowledgements, which a stall's release brings back at once.
+///
+/// FR-148 D50 — a fall. A backlogged push-back under the floor, a window's or
+/// a delivery sample's, opens a run when none is open or the open one is
+/// older than [`CAPACITY_TTL`], and the floor is damped as above. The next
+/// one while the run is open, with the clock the caller passes (the in-flight
+/// budget's measured rate, [`Pipe::clock`]) under the floor too, is a fall:
+/// the floor restarts at the more of the push-back and the clock,
+/// backlogged, by the push-back's class, and the run closes
+/// ([`Self::fell`]). A delivery that raises the floor, or a push-back at or
+/// over it, closes a run; nothing else does. With no clock (the pair memory,
+/// the budget off, the opening rate standing in) the law is the damped one,
+/// byte for byte.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PathModel {
     floor: Option<Held>,
@@ -833,6 +881,42 @@ pub struct PathModel {
     /// FR-148 D46 B2 — the delivery sample that set the capacity; `None` when
     /// a window's push-back did.
     capacity_by: Option<PushedBy>,
+    /// FR-148 D50 — the first backlogged push-back under the floor since a
+    /// reading last met or raised it; whatever the clock read.
+    run: Option<Instant>,
+    /// FR-148 D50 — the last fall, for the `path model` line.
+    fell: Option<Fell>,
+}
+
+/// FR-148 D50 — a fall as the model keeps it: when, and the floor before and
+/// after.
+#[derive(Debug, Clone, Copy)]
+struct Fell {
+    at: Instant,
+    from: u32,
+    to: u32,
+}
+
+/// FR-148 D50 — the model's last fall as the `path model` line writes it:
+/// the floor before and after, and how long ago ([`PathModel::fell`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fall {
+    pub from_bps: u32,
+    pub to_bps: u32,
+    pub age: Duration,
+}
+
+/// `<from_bps>-><to_bps>/<age>ms`, as the `path model` line writes it.
+impl std::fmt::Display for Fall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}->{}/{}ms",
+            self.from_bps,
+            self.to_bps,
+            self.age.as_millis()
+        )
+    }
 }
 
 /// FR-148 D46 B2 — the delivery sample whose push-back wrote a model number
@@ -883,23 +967,80 @@ impl PathModel {
     /// FR-148 D46 B2 — a delivery sample's push-back, P1 or P3: the capacity
     /// at its rate, and the floor lowered damped toward it when it stands
     /// above. Never a raise, and never a floor where there was none.
+    ///
+    /// With no clock: the pair memory's call (D30), which reads no fall.
     pub fn sample_pushed_back(&mut self, bps: u32, by: PushedBy, now: Instant) {
+        self.sample_pushed_back_clocked(bps, by, None, now);
+    }
+
+    /// FR-148 D50 — [`Self::sample_pushed_back`] with the clock a fall is
+    /// read against ([`Pipe::clock`]): under the floor, the second of a run
+    /// with the clock under the floor too restarts it ([`Self::under_floor`]).
+    /// At or over the floor it closes a run, and still never raises.
+    pub fn sample_pushed_back_clocked(
+        &mut self,
+        bps: u32,
+        by: PushedBy,
+        clock: Option<u32>,
+        now: Instant,
+    ) {
         if bps == 0 {
             return;
         }
         self.capacity = Some((bps, now));
         self.capacity_by = Some(by);
-        if let Some(f) = self.floor
-            && bps < f.bps
-        {
+        let Some(f) = self.floor else {
+            return;
+        };
+        if bps < f.bps {
             self.floor = Some(Held {
-                bps: super::rate_memory::damp(f.bps, bps),
+                bps: self.under_floor(f.bps, bps, clock, now),
                 basis: Basis::Backlogged,
                 remembered: false,
                 at: now,
                 by: Some(by),
             });
+        } else {
+            self.run = None;
         }
+    }
+
+    /// FR-148 D50 — a backlogged push-back of `bps` under the floor `floor`,
+    /// a window's or a delivery sample's: the floor it leaves. A fall when a
+    /// run is open, no older than [`CAPACITY_TTL`], and the clock reads under
+    /// the floor too: the floor restarts at the more of the push-back and the
+    /// clock, the run closes, and the fall is kept for the line. Else damped
+    /// as built, and the push-back opens a run unless one is open, which
+    /// keeps its first instant.
+    fn under_floor(&mut self, floor: u32, bps: u32, clock: Option<u32>, now: Instant) -> u32 {
+        let open = self
+            .run
+            .filter(|&first| now.saturating_duration_since(first) <= CAPACITY_TTL);
+        match (open, clock.filter(|&clock| clock < floor)) {
+            (Some(_), Some(clock)) => {
+                let to = bps.max(clock);
+                self.run = None;
+                self.fell = Some(Fell {
+                    at: now,
+                    from: floor,
+                    to,
+                });
+                to
+            }
+            _ => {
+                self.run = Some(open.unwrap_or(now));
+                super::rate_memory::damp(floor, bps)
+            }
+        }
+    }
+
+    /// FR-148 D50 — the last fall, and how long ago; `None` while none has.
+    pub fn fell(&self, now: Instant) -> Option<Fall> {
+        self.fell.map(|f| Fall {
+            from_bps: f.from,
+            to_bps: f.to,
+            age: now.saturating_duration_since(f.at),
+        })
     }
 
     /// FR-148 D46 B2 — the delivery sample that lowered the floor last, while
@@ -926,7 +1067,23 @@ impl PathModel {
     /// A push-back. Backlogged, it is [`Pipe::observe_capacity`]'s law;
     /// application-limited, the path took everything offered, so it is a
     /// delivery and nothing more.
+    ///
+    /// With no clock: the pair memory's call (D30), which reads no fall.
     pub fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+        self.pushed_back_clocked(bps, basis, None, now);
+    }
+
+    /// FR-148 D50 — [`Self::pushed_back`] with the clock a fall is read
+    /// against ([`Pipe::clock`]): a backlogged push-back under the floor, the
+    /// second of a run with the clock under the floor too, restarts it
+    /// ([`Self::under_floor`]); one at or over the floor closes a run.
+    pub fn pushed_back_clocked(
+        &mut self,
+        bps: u32,
+        basis: Basis,
+        clock: Option<u32>,
+        now: Instant,
+    ) {
         if bps == 0 {
             return;
         }
@@ -945,17 +1102,23 @@ impl PathModel {
                 };
                 match self.floor {
                     Some(f) if bps < f.bps => {
-                        self.floor = Some(set(super::rate_memory::damp(f.bps, bps)));
+                        let to = self.under_floor(f.bps, bps, clock, now);
+                        self.floor = Some(set(to));
                     }
-                    Some(f) if bps <= f.bps => {}
-                    _ => self.floor = Some(set(bps)),
+                    Some(f) if bps <= f.bps => self.run = None,
+                    _ => {
+                        self.run = None;
+                        self.floor = Some(set(bps));
+                    }
                 }
             }
         }
     }
 
+    /// FR-148 D50 — a reading that raises the floor closes a run.
     fn raise(&mut self, bps: u32, basis: Basis, remembered: bool, now: Instant) {
         if self.floor.is_none_or(|f| bps > f.bps) {
+            self.run = None;
             self.floor = Some(Held {
                 bps,
                 basis,
@@ -1043,6 +1206,9 @@ pub struct PathView {
     /// the memory, re-read it or bounded it, and how long ago
     /// ([`Pipe::ruled`]); `None` while none has.
     pub model_ruled: Option<(Ruled, Duration)>,
+    /// FR-148 D50 — the model's last fall: the floor before and after, and
+    /// how long ago ([`PathModel::fell`]); `None` while none has.
+    pub model_fell: Option<Fall>,
 }
 
 #[cfg(test)]
@@ -1941,5 +2107,565 @@ mod tests {
             assert_eq!(p.counts(), before.counts());
             assert_eq!(p.ruled(end), Some((Ruled::Stall, Duration::from_secs(4))));
         }
+    }
+
+    /// FR-148 D50 — the in-flight budget's measured rate, with no loss: the
+    /// clock the cells below note before a push-back.
+    fn clock(bps: u32) -> PathRate {
+        path(bps, true, 0)
+    }
+
+    /// FR-148 D50 — a pipe whose shadow model's floor a valid delivery of
+    /// `bps` set at `now`, with no rate noted yet.
+    fn floored(bps: u32, now: Instant) -> Pipe {
+        let mut p = Pipe::default();
+        p.observe_delivered_in(bps, Basis::AppLimited, true, now);
+        p
+    }
+
+    /// FR-148 D50 — a P3 sample's push-back of `bps` at `now`, the budget's
+    /// measured rate noted at `clock_bps` before it.
+    fn p3_at(p: &mut Pipe, bps: u32, clock_bps: u32, now: Instant) {
+        p.note_path_rate(clock(clock_bps));
+        p.observe_sample_capacity(bps, PushedBy::P3, pushed_take(), now);
+    }
+
+    fn model_floor(p: &Pipe, now: Instant) -> u32 {
+        m_floor(p, now).bps
+    }
+
+    /// FR-148 D50, cell 1 — a lone backlogged push-back under the floor is
+    /// damped as built, the clock under the floor or not: it sets the
+    /// capacity, opens a run, and the model reads no fall.
+    #[test]
+    fn a_lone_push_back_under_the_floor_is_damped_as_built() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let mut p = floored(2_000_000, now);
+        let t = now + Duration::from_secs(2);
+        p3_at(&mut p, 1_000_000, 1_000_000, t);
+        let m = p.model();
+        assert_eq!(
+            m.floor(t).map(|f| (f.bps, f.basis)),
+            Some((damp(2_000_000, 1_000_000), Basis::Backlogged))
+        );
+        assert_eq!(m.floor_by(), Some(PushedBy::P3));
+        assert_eq!(m.capacity(t).map(|c| c.bps), Some(1_000_000));
+        assert_eq!(m.fell(t), None);
+    }
+
+    /// FR-148 D50, cell 2 — the second backlogged push-back under the floor,
+    /// with the budget's measured rate under it too, is a fall: the floor
+    /// restarts at the more of the push-back and the clock, backlogged, by
+    /// the push-back's class, under the floor it replaced. The capacity is
+    /// the push-back's, as always. The model keeps the fall for the line:
+    /// the floor before and after, and its age.
+    #[test]
+    fn a_second_push_back_under_the_floor_with_the_clock_under_it_is_a_fall() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let mut p = floored(2_000_000, now);
+        let (t1, t2) = (now + Duration::from_secs(2), now + Duration::from_secs(4));
+        p3_at(&mut p, 1_000_000, 1_000_000, t1);
+        let damped = model_floor(&p, t1);
+        assert_eq!(damped, damp(2_000_000, 1_000_000));
+        p3_at(&mut p, 1_000_000, 1_020_000, t2);
+        let m = p.model();
+        let floor = m.floor(t2).expect("a floor");
+        assert_eq!(
+            (floor.bps, floor.basis, floor.age),
+            (1_020_000, Basis::Backlogged, Duration::ZERO)
+        );
+        assert!(floor.bps < damped, "never over the floor it replaced");
+        assert_eq!(m.floor_by(), Some(PushedBy::P3));
+        assert_eq!(m.capacity(t2).map(|c| c.bps), Some(1_000_000));
+        let fall = Fall {
+            from_bps: damped,
+            to_bps: 1_020_000,
+            age: Duration::ZERO,
+        };
+        assert_eq!(m.fell(t2), Some(fall));
+        assert_eq!(fall.to_string(), "1500000->1020000/0ms");
+        let later = t2 + Duration::from_millis(3_400);
+        assert_eq!(
+            m.fell(later).map(|f| f.to_string()),
+            Some("1500000->1020000/3400ms".to_owned())
+        );
+    }
+
+    /// FR-148 D50, cell 3 — a valid delivery that raises the floor between
+    /// the two closes the run: the second push-back under the floor is
+    /// damped and opens a new run, and the third is the fall. A delivery
+    /// under the floor is no such reading: the run stays open.
+    #[test]
+    fn a_delivery_that_raises_the_floor_between_them_is_no_fall() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut p = floored(2_000_000, s(0));
+        p3_at(&mut p, 1_000_000, 1_000_000, s(2));
+        p.observe_delivered_in(1_600_000, Basis::AppLimited, true, s(3));
+        assert_eq!(model_floor(&p, s(3)), 1_600_000, "raised");
+        p3_at(&mut p, 1_000_000, 1_000_000, s(4));
+        assert_eq!(model_floor(&p, s(4)), damp(1_600_000, 1_000_000));
+        assert_eq!(p.model().fell(s(4)), None);
+        p3_at(&mut p, 1_000_000, 1_000_000, s(6));
+        assert_eq!(model_floor(&p, s(6)), 1_000_000, "the new run's fall");
+        // A delivery under the floor between them neither raises nor closes.
+        let mut q = floored(2_000_000, s(0));
+        p3_at(&mut q, 1_000_000, 1_000_000, s(2));
+        q.observe_delivered_in(1_400_000, Basis::Backlogged, true, s(3));
+        assert_eq!(model_floor(&q, s(3)), 1_500_000, "no raise");
+        p3_at(&mut q, 1_000_000, 1_000_000, s(4));
+        assert_eq!(model_floor(&q, s(4)), 1_000_000, "the fall");
+    }
+
+    /// FR-148 D50, cell 4 — a push-back at or over the floor between the two
+    /// closes the run: a window's at it, a window's over it (which raises it,
+    /// `Pipe`'s law), a sample's at it and a sample's over it (which never
+    /// raises it). The next push-back under the floor is damped and opens a
+    /// new run, and the one after it is the fall.
+    #[test]
+    fn a_push_back_at_or_over_the_floor_between_them_is_no_fall() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let case = |what: &str, between: &dyn Fn(&mut Pipe, Instant), floor: u32| {
+            let mut p = floored(2_000_000, s(0));
+            p3_at(&mut p, 1_000_000, 1_000_000, s(2));
+            between(&mut p, s(3));
+            assert_eq!(model_floor(&p, s(3)), floor, "{what}");
+            p3_at(&mut p, 1_000_000, 1_000_000, s(4));
+            assert_eq!(model_floor(&p, s(4)), damp(floor, 1_000_000), "{what}");
+            assert_eq!(p.model().fell(s(4)), None, "{what}");
+            p3_at(&mut p, 1_000_000, 1_000_000, s(6));
+            assert_eq!(
+                model_floor(&p, s(6)),
+                1_000_000,
+                "{what}: the new run's fall"
+            );
+        };
+        let window = |bps: u32| {
+            move |p: &mut Pipe, t: Instant| {
+                p.observe_capacity_in(bps, Basis::Backlogged, pushed_take(), t)
+            }
+        };
+        let sample = |bps: u32| {
+            move |p: &mut Pipe, t: Instant| {
+                p.observe_sample_capacity(bps, PushedBy::P1, pushed_take(), t)
+            }
+        };
+        case("a window's at the floor", &window(1_500_000), 1_500_000);
+        case("a window's over it", &window(1_700_000), 1_700_000);
+        case("a sample's at it", &sample(1_500_000), 1_500_000);
+        case("a sample's over it", &sample(1_800_000), 1_500_000);
+    }
+
+    /// FR-148 D50, cell 4a — the level is the present, not the run. In the
+    /// deep halving's order: the old path's last sample opens the run just
+    /// under the floor, and the first sample after the fall, with the clock
+    /// under the floor, restarts it at the more of that push-back and the
+    /// clock, not at the run's first reading.
+    #[test]
+    fn the_level_is_the_present_not_the_run() {
+        let now = t0();
+        let mut p = floored(2_000_000, now);
+        let (t1, t2) = (now + Duration::from_secs(2), now + Duration::from_secs(6));
+        p3_at(&mut p, 1_960_000, 2_015_000, t1);
+        assert_eq!(model_floor(&p, t1), 1_980_000, "damped: it opens the run");
+        assert_eq!(p.model().fell(t1), None);
+        p3_at(&mut p, 1_000_000, 1_010_000, t2);
+        assert_eq!(model_floor(&p, t2), 1_010_000);
+        let fall = Fall {
+            from_bps: 1_980_000,
+            to_bps: 1_010_000,
+            age: Duration::ZERO,
+        };
+        assert_eq!(p.model().fell(t2), Some(fall));
+    }
+
+    /// FR-148 D50, cell 4b — the level is the more of the confirming
+    /// push-back and the clock, both under the floor it replaces.
+    #[test]
+    fn the_level_is_the_more_of_the_push_back_and_the_clock() {
+        let now = t0();
+        let (t1, t2) = (now + Duration::from_secs(2), now + Duration::from_secs(4));
+        for (bps, clock_bps) in [(1_000_000, 900_000), (900_000, 1_000_000)] {
+            let mut p = floored(2_000_000, now);
+            p3_at(&mut p, 1_000_000, 1_000_000, t1);
+            p3_at(&mut p, bps, clock_bps, t2);
+            assert_eq!(
+                model_floor(&p, t2),
+                1_000_000,
+                "{bps} with the clock at {clock_bps}"
+            );
+            let fall = p.model().fell(t2).expect("a fall");
+            assert!(fall.to_bps < fall.from_bps, "{fall:?}");
+        }
+    }
+
+    /// FR-148 D50, cell 5 — the clock at or over the floor is no fall yet:
+    /// the push-back is damped and the run stays open; the next one with
+    /// the clock under the floor is the fall.
+    #[test]
+    fn the_clock_at_or_over_the_floor_is_no_fall_yet() {
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut p = floored(2_000_000, s(0));
+        p3_at(&mut p, 1_000_000, 1_000_000, s(2));
+        assert_eq!(model_floor(&p, s(2)), 1_500_000);
+        p3_at(&mut p, 1_000_000, 1_600_000, s(4));
+        assert_eq!(model_floor(&p, s(4)), 1_250_000, "the clock over the floor");
+        p3_at(&mut p, 1_000_000, 1_250_000, s(6));
+        assert_eq!(model_floor(&p, s(6)), 1_125_000, "the clock at the floor");
+        assert_eq!(p.model().fell(s(6)), None);
+        p3_at(&mut p, 1_000_000, 1_050_000, s(8));
+        assert_eq!(
+            model_floor(&p, s(8)),
+            1_050_000,
+            "the clock under it: the fall"
+        );
+    }
+
+    /// FR-148 D50, cell 6 — a rate the opening stood in for is no clock, nor
+    /// is a measured rate of 0, nor none: every push-back under the floor is
+    /// damped, as built, and the model reads no fall.
+    #[test]
+    fn an_opening_rate_is_no_clock() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let none = PathRate {
+            bps: None,
+            measured: true,
+            loss: 0,
+        };
+        for rate in [path(1_000_000, false, 0), path(0, true, 0), none] {
+            let mut p = floored(2_000_000, s(0));
+            let mut want = 2_000_000;
+            for k in 1..=4 {
+                p.note_path_rate(rate);
+                p.observe_sample_capacity(1_000_000, PushedBy::P3, pushed_take(), s(2 * k));
+                want = damp(want, 1_000_000);
+                assert_eq!(model_floor(&p, s(2 * k)), want, "{rate:?}");
+            }
+            assert_eq!(want, 1_062_500);
+            assert_eq!(p.model().fell(s(8)), None, "{rate:?}");
+        }
+    }
+
+    /// FR-148 D50 — the shadow model's law before D50 (`8c7bb5f6d`),
+    /// verbatim: the floor and the capacity under a delivery, a window's
+    /// push-back and a delivery sample's. The kill switch's cell checks the
+    /// model against it.
+    #[derive(Default)]
+    struct DampedLaw {
+        floor: Option<(u32, Basis, bool, Instant, Option<PushedBy>)>,
+        capacity: Option<(u32, Instant)>,
+        capacity_by: Option<PushedBy>,
+    }
+
+    impl DampedLaw {
+        fn delivered(&mut self, bps: u32, basis: Basis, now: Instant) {
+            if bps > 0 && basis != Basis::Assumed {
+                self.raise(bps, basis, false, now);
+            }
+        }
+
+        fn remembered(&mut self, bps: u32, now: Instant) {
+            if bps > 0 {
+                self.raise(bps, Basis::AppLimited, true, now);
+            }
+        }
+
+        fn sample_pushed_back(&mut self, bps: u32, by: PushedBy, now: Instant) {
+            if bps == 0 {
+                return;
+            }
+            self.capacity = Some((bps, now));
+            self.capacity_by = Some(by);
+            if let Some(f) = self.floor
+                && bps < f.0
+            {
+                let damped = super::super::rate_memory::damp(f.0, bps);
+                self.floor = Some((damped, Basis::Backlogged, false, now, Some(by)));
+            }
+        }
+
+        fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+            if bps == 0 {
+                return;
+            }
+            match basis {
+                Basis::Assumed => {}
+                Basis::AppLimited => self.raise(bps, basis, false, now),
+                Basis::Backlogged => {
+                    self.capacity = Some((bps, now));
+                    self.capacity_by = None;
+                    let set = |bps| Some((bps, basis, false, now, None));
+                    match self.floor {
+                        Some(f) if bps < f.0 => {
+                            self.floor = set(super::super::rate_memory::damp(f.0, bps));
+                        }
+                        Some(f) if bps <= f.0 => {}
+                        _ => self.floor = set(bps),
+                    }
+                }
+            }
+        }
+
+        fn raise(&mut self, bps: u32, basis: Basis, remembered: bool, now: Instant) {
+            if self.floor.is_none_or(|f| bps > f.0) {
+                self.floor = Some((bps, basis, remembered, now, None));
+            }
+        }
+
+        fn floor(&self, now: Instant) -> Option<PathNumber> {
+            self.floor
+                .map(|(bps, basis, remembered, at, _)| PathNumber {
+                    bps,
+                    basis,
+                    remembered,
+                    age: now.saturating_duration_since(at),
+                })
+        }
+
+        fn capacity(&self, now: Instant) -> Option<PathNumber> {
+            self.capacity
+                .filter(|(_, at)| now.duration_since(*at) <= CAPACITY_TTL)
+                .map(|(bps, at)| {
+                    PathNumber::new(bps, Basis::Backlogged, now.saturating_duration_since(at))
+                })
+        }
+
+        /// The model's numbers, read at `now`, are this law's.
+        fn check(&self, m: &PathModel, now: Instant) {
+            assert_eq!(m.floor(now), self.floor(now), "floor");
+            assert_eq!(m.floor_by(), self.floor.and_then(|f| f.4), "floor_by");
+            assert_eq!(m.capacity(now), self.capacity(now), "capacity");
+            let by = self.capacity(now).and(self.capacity_by);
+            assert_eq!(m.capacity_by(now), by, "capacity_by");
+            assert_eq!(m.fell(now), None, "no fall");
+        }
+    }
+
+    /// FR-148 D50, cell 7 — the kill switch: with the in-flight budget off
+    /// nothing notes a rate, so no clock reaches the shadow model, and its
+    /// numbers are the law before D50 byte for byte ([`DampedLaw`]), over
+    /// 100,000 deliveries, window push-backs of each class and delivery
+    /// samples' push-backs, valid or not, over six decades with zeros and
+    /// repeats, at steps from none to past [`CAPACITY_TTL`], read after each
+    /// and at a random later moment. A seed opens it.
+    #[test]
+    fn with_the_budget_off_the_law_is_the_law_as_built() {
+        let mut next = rng(0x6A09_E667_F3BC_C908);
+        let mut t = t0();
+        let (mut p, mut law) = (Pipe::default(), DampedLaw::default());
+        p.remember(1_250_000, t);
+        law.remembered(1_250_000, t);
+        let mut last = 0;
+        let mut under = 0u32;
+        for _ in 0..100_000 {
+            let bps = draw_bps(&mut next, last);
+            last = bps;
+            t += match next() % 16 {
+                0 => CAPACITY_TTL + Duration::from_millis(next() % 5_000),
+                1 => Duration::ZERO,
+                _ => Duration::from_millis(next() % 3_000),
+            };
+            let basis = BASES[(next() % 3) as usize];
+            if p.model().floor(t).is_some_and(|f| bps < f.bps) {
+                under += 1;
+            }
+            match next() % 4 {
+                0 => {
+                    let valid = !next().is_multiple_of(4);
+                    p.observe_delivered_in(bps, basis, valid, t);
+                    if valid {
+                        law.delivered(bps, basis, t);
+                    }
+                }
+                1 => {
+                    p.observe_capacity_in(bps, basis, pushed_take(), t);
+                    law.pushed_back(bps, basis, t);
+                }
+                2 => {
+                    p.observe_link_capacity_in(bps, basis, pushed_take(), t);
+                    law.pushed_back(bps, basis, t);
+                }
+                _ => {
+                    let by = if next().is_multiple_of(2) {
+                        PushedBy::P1
+                    } else {
+                        PushedBy::P3
+                    };
+                    p.observe_sample_capacity(bps, by, pushed_take(), t);
+                    law.sample_pushed_back(bps, by, t);
+                }
+            }
+            law.check(p.model(), t);
+            law.check(p.model(), t + Duration::from_millis(next() % 70_000));
+        }
+        assert!(under > 20_000, "{under} readings under the floor");
+    }
+
+    /// FR-148 D50, cell 8 — the pair memory keeps the damped law (D30):
+    /// through `Pipe`, cell 2's readings restart the shadow model's floor
+    /// and damp the memory's twice, for the memory is passed no clock.
+    #[test]
+    fn the_pair_memory_keeps_the_damped_law() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let mut p = floored(2_000_000, now);
+        let (t1, t2) = (now + Duration::from_secs(2), now + Duration::from_secs(4));
+        p3_at(&mut p, 1_000_000, 1_000_000, t1);
+        p3_at(&mut p, 1_000_000, 1_020_000, t2);
+        assert_eq!(model_floor(&p, t2), 1_020_000, "the model restarted");
+        let memory = p.memory().closing(t2, 0).floor.map(|f| f.bps);
+        let twice = damp(damp(2_000_000, 1_000_000), 1_000_000);
+        assert_eq!(memory, Some(twice), "the memory damped twice");
+        assert_eq!(twice, 1_250_000);
+    }
+
+    /// FR-148 D50, cell 9 — a run older than [`CAPACITY_TTL`], from its
+    /// first push-back, starts again: the push-back is damped and opens a
+    /// new run, and the next one is the fall. A push-back the clock does not
+    /// confirm keeps the run's first instant; a run exactly
+    /// [`CAPACITY_TTL`] old still reads the fall.
+    #[test]
+    fn a_run_older_than_the_capacity_ttl_starts_again() {
+        use super::super::rate_memory::damp;
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut p = floored(2_000_000, s(0));
+        p3_at(&mut p, 1_900_000, 1_950_000, s(2));
+        p3_at(&mut p, 1_900_000, 1_950_000, s(30));
+        assert_eq!(model_floor(&p, s(30)), 1_925_000, "the clock at the floor");
+        let late = s(2) + CAPACITY_TTL + Duration::from_secs(1);
+        p3_at(&mut p, 1_000_000, 1_000_000, late);
+        assert_eq!(model_floor(&p, late), damp(1_925_000, 1_000_000));
+        assert_eq!(p.model().fell(late), None, "the run began 61 s back");
+        let next = late + Duration::from_secs(2);
+        p3_at(&mut p, 1_000_000, 1_000_000, next);
+        assert_eq!(model_floor(&p, next), 1_000_000, "the new run's fall");
+        let mut q = floored(2_000_000, s(0));
+        p3_at(&mut q, 1_000_000, 1_000_000, s(2));
+        let edge = s(2) + CAPACITY_TTL;
+        p3_at(&mut q, 1_000_000, 1_000_000, edge);
+        assert_eq!(model_floor(&q, edge), 1_000_000, "a run 60 s old");
+    }
+
+    /// FR-148 D50, cell 10 — a window's push-back and a delivery sample's
+    /// make one run, in either order: the link loop's push-back under the
+    /// floor opens it and a P3 is the fall (`floor_by` p3); a P3 opens it
+    /// and the link loop's push-back is the fall, backlogged, by a window
+    /// (`floor_by` none).
+    #[test]
+    fn a_window_and_a_sample_make_one_run() {
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut p = floored(2_000_000, s(0));
+        p.note_path_rate(clock(1_000_000));
+        p.observe_link_capacity_in(1_200_000, Basis::Backlogged, pushed_take(), s(1));
+        assert_eq!(model_floor(&p, s(1)), 1_600_000);
+        p3_at(&mut p, 1_000_000, 1_010_000, s(2));
+        assert_eq!(model_floor(&p, s(2)), 1_010_000);
+        assert_eq!(p.model().floor_by(), Some(PushedBy::P3));
+        let mut q = floored(2_000_000, s(0));
+        p3_at(&mut q, 1_200_000, 1_000_000, s(1));
+        assert_eq!(model_floor(&q, s(1)), 1_600_000);
+        q.observe_link_capacity_in(1_000_000, Basis::Backlogged, pushed_take(), s(2));
+        let floor = m_floor(&q, s(2));
+        assert_eq!((floor.bps, floor.basis), (1_000_000, Basis::Backlogged));
+        assert_eq!(q.model().floor_by(), None);
+        assert!(q.model().fell(s(2)).is_some());
+    }
+
+    /// FR-148 D50, cell 11 — a fall never raises a floor nor makes one (D46
+    /// item 10), over 100,000 random readings: deliveries, window push-backs,
+    /// delivery samples' push-backs, and the budget's rate noted measured or
+    /// not, over six decades with zeros and repeats, at steps from none to
+    /// past [`CAPACITY_TTL`]. After a sample's push-back the floor is at or
+    /// under the one before, and none where there was none. After a
+    /// backlogged push-back under the floor it lies at or over the push-back
+    /// and under the floor before: damped, or a fall that restarts it at
+    /// the more of the push-back and a clock that read under the floor.
+    #[test]
+    fn a_fall_never_raises_a_floor_nor_makes_one() {
+        use super::super::rate_memory::damp;
+        let mut next = rng(0x3C6E_F372_FE94_F82B);
+        let mut t = t0();
+        let mut p = Pipe::default();
+        let (mut last, mut clock_bps) = (0, None);
+        let (mut falls, mut damped) = (0u32, 0u32);
+        for _ in 0..100_000 {
+            let bps = draw_bps(&mut next, last);
+            last = bps;
+            t += match next() % 16 {
+                0 => CAPACITY_TTL + Duration::from_millis(next() % 5_000),
+                1 => Duration::ZERO,
+                _ => Duration::from_millis(next() % 3_000),
+            };
+            if next().is_multiple_of(3) {
+                let rate = draw_bps(&mut next, bps);
+                let measured = !next().is_multiple_of(4);
+                p.note_path_rate(path(rate, measured, 0));
+                clock_bps = (measured && rate > 0).then_some(rate);
+            }
+            let before = p.model().floor(t).map(|f| f.bps);
+            let was = p.model().fell(t);
+            let sample = match next() % 4 {
+                0 => {
+                    let valid = !next().is_multiple_of(4);
+                    p.observe_delivered_in(bps, BASES[(next() % 3) as usize], valid, t);
+                    continue;
+                }
+                1 => {
+                    p.observe_capacity_in(bps, Basis::Backlogged, pushed_take(), t);
+                    false
+                }
+                2 => {
+                    p.observe_link_capacity_in(bps, Basis::Backlogged, pushed_take(), t);
+                    false
+                }
+                _ => {
+                    p.observe_sample_capacity(bps, PushedBy::P3, pushed_take(), t);
+                    true
+                }
+            };
+            let after = p.model().floor(t).map(|f| f.bps);
+            let fell = p.model().fell(t) != was;
+            let Some(f) = before else {
+                let made = (!sample && bps > 0).then_some(bps);
+                assert_eq!(after, made, "{bps} on no floor");
+                continue;
+            };
+            if bps == 0 || bps >= f {
+                let want = if sample { f } else { f.max(bps) };
+                assert_eq!(after, Some(want), "{bps} at or over {f}");
+                assert!(!fell);
+                continue;
+            }
+            let a = after.expect("a floor");
+            assert!(bps <= a && a < f, "{bps} under {f}: {a}");
+            if fell {
+                let clock = clock_bps.expect("a fall reads a clock");
+                assert!(clock < f, "the clock {clock} under {f}");
+                assert_eq!(a, bps.max(clock), "{bps} with the clock at {clock}");
+                let fall = p.model().fell(t).expect("the fall");
+                assert_eq!(
+                    (fall.from_bps, fall.to_bps, fall.age),
+                    (f, a, Duration::ZERO)
+                );
+                falls += 1;
+            } else {
+                assert_eq!(a, damp(f, bps));
+                damped += 1;
+            }
+        }
+        assert!(
+            falls > 1_000 && damped > 1_000,
+            "{falls} falls, {damped} damped steps"
+        );
     }
 }
