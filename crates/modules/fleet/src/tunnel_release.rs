@@ -391,6 +391,46 @@ mod tests {
         assert!(pick_installer_asset(&assets, "linux-x86_64").is_none());
     }
 
+    /// FR-46 P1c: every platform takes its artifact under the published
+    /// spelling, `roomler-tunnel-<version>-<triple>`, and under the current
+    /// one, `roomler-<version>-<triple>`, which step 2 publishes; never a
+    /// sidecar or the release key. A release that lists both spellings gives
+    /// the first listed, in either order. The tunnel CLI's `manifest_asset`
+    /// keeps this same rule (its mirror tests are in
+    /// `agents/roomler-cli/src/update.rs`): it reads the digest and the `.asc`
+    /// URL from its own pick while this proxy streams the bytes of this one.
+    #[test]
+    fn pick_installer_asset_takes_either_spelling_and_the_first_listed() {
+        let platforms = [
+            ("linux-x86_64", "x86_64-unknown-linux-gnu.tar.gz"),
+            ("linux-deb", "x86_64-unknown-linux-gnu.deb"),
+            ("linux-aarch64", "aarch64-unknown-linux-gnu.tar.gz"),
+            ("linux-deb-aarch64", "aarch64-unknown-linux-gnu.deb"),
+            ("macos", "universal-apple-darwin.tar.gz"),
+            ("windows-x86_64", "x86_64-pc-windows-msvc.zip"),
+        ];
+        for (platform, tail) in platforms {
+            let retired = format!("roomler-tunnel-0.4.149-{tail}");
+            let current = format!("roomler-0.4.149-{tail}");
+            for name in [&retired, &current] {
+                let assets = vec![
+                    asset("roomler-release-pubkey.asc"),
+                    asset(&format!("{name}.sha256")),
+                    asset(&format!("{name}.asc")),
+                    asset(name),
+                ];
+                assert_eq!(pick_installer_asset(&assets, platform).unwrap().name, *name);
+            }
+            for (first, second) in [(&retired, &current), (&current, &retired)] {
+                let assets = vec![asset(first), asset(second)];
+                assert_eq!(
+                    pick_installer_asset(&assets, platform).unwrap().name,
+                    *first
+                );
+            }
+        }
+    }
+
     #[test]
     fn pick_release_latest_filters_to_tunnel_tags() {
         // Mixed releases — pick_release(version=latest) should ignore

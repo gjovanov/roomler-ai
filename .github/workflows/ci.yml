@@ -1655,11 +1655,11 @@ jobs:
       # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
       # `sudo roomlerd one-row` and the person's own child, whose plans, lines
       # and records every lane tests, on the platform they serve; the `mac`
-      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks). #4071: and `daemon_error::` with `app::no_enrollment_exit_tests::`: a `run --supervised` with no config leaves with 78 on a Mac, the one platform where `detect_here` answers FR-43's supervisor. FR-149 P1: and `indicator::session_panel::` (a one-row Mac's questions on the screen worker's panel: the chain, the worker's gate, a late `shown` taken down, D4's two cases, with stood-in readers and the real delegation channel), which compiles in every build, the panel's own `mac` half only with `viewer-indicator-macos` (the check above), with P1's three cells in other modules: the frames and the word (`delegate::tests::`) and the click on the app's road (`localapi_state::tests::`). Its C2 cell is `indicator::panel_gate::`'s.
+      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own). #4119: and `indicator::exit_net::` (the panel's exit net, in copies of the test binary: an exit inside a marked call leaves with its own code, 32, never the requested restart's 9, and every other keeps its code, on the libc whose `exit` it hooks). #4071: and `daemon_error::` with `app::no_enrollment_exit_tests::`: a `run --supervised` with no config leaves with 78 on a Mac, the one platform where `detect_here` answers FR-43's supervisor. #4157: and `app::config_at_start::`, with `app::no_enrollment_exit_tests::` above (what a root daemon's `run` does with a missing config: an enrolled copy is restored, and with none it ends with `NoConfig` as before). FR-149 P1: and `indicator::session_panel::` (a one-row Mac's questions on the screen worker's panel: the chain, the worker's gate, a late `shown` taken down, D4's two cases, with stood-in readers and the real delegation channel), which compiles in every build, the panel's own `mac` half only with `viewer-indicator-macos` (the check above), with P1's three cells in other modules: the frames and the word (`delegate::tests::`) and the click on the app's road (`localapi_state::tests::`). Its C2 cell is `indicator::panel_gate::`'s.
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch:: indicator::exit_net:: daemon_error:: app::no_enrollment_exit_tests:: indicator::session_panel:: delegate::tests::a_panel_question_is_read_on_the_attached_channel_only delegate::tests::the_panel_word_is_kept_by_equality localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch:: indicator::exit_net:: daemon_error:: app::no_enrollment_exit_tests:: app::config_at_start:: indicator::session_panel:: delegate::tests::a_panel_question_is_read_on_the_attached_channel_only delegate::tests::the_panel_word_is_kept_by_equality localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only
@@ -1773,9 +1773,9 @@ jobs:
       # it runs as, not from the `HOME` sudo kept from its caller
       # (`crates/agent-core/src/appdirs.rs`). Its test runs children of itself
       # with another `HOME`; the rule's other tests run on every lane, and only
-      # a Mac runs the macOS rule against a real account database.
-      - name: cargo test the agent's folders on a real Mac (#3802)
-        run: cargo test -p roomler-node-core --lib -- appdirs::tests
+      # a Mac runs the macOS rule against a real account database. #4157: and the restore of a missing config, which a root daemon's start now runs through.
+      - name: cargo test the agent's folders and its config restore on a real Mac (#3802, #4157)
+        run: cargo test -p roomler-node-core --lib -- appdirs::tests config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1948,12 +1948,12 @@ jobs:
       # refusal: `appdirs`' Windows tests run in no other lane.
       # #4067 — and the log uploader's, the pool's idle timeout among them: they
       # ran only on Linux.
-      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them).
+      # #4058 — and the config load's line for a missing live file, told from an unreadable one (a refused read on NTFS among them). #4157 — and a restore that clears the run marks, a copy that does not load leaving nothing written, and the copy a start reads.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings; cargo test -p roomlerdw
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests logs_upload::tests config::tests::only_a_read_that_found_no_file_is_missing config::tests::a_missing_config_is_restored_from_prev_and_logged_as_missing config::tests::a_config_that_does_not_parse_keeps_the_unreadable_line config::tests::a_config_whose_read_is_refused_keeps_the_unreadable_line config::tests::a_restored_config_brings_no_crash_to_the_next_start config::tests::a_missing_config_with_a_copy_that_does_not_load_leaves_nothing_written config::tests::previous_copy_reads_the_copy_and_writes_nothing
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |

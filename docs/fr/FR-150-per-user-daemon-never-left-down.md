@@ -293,7 +293,7 @@ Before P2, `roomlerdw.exe` waited for the daemon once and left with its code. P2
 - **An install in flight.** The launcher must not touch the data tree (`.claude/rules/installers.md`), so the daemon
   decides. A `run --supervisor task` that starts while the update-attempt marker is fresh (`updater.rs:230-256`; the
   MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex, `Global\_MSIExecute`, is
-  held exits 75 before it takes the lock (`app.rs:3959-3960`, `daemon_error.rs:244-298`). Its stderr goes to the
+  held exits 75 before it takes the lock (`app.rs:3960-3961`, `daemon_error.rs:244-298`). Its stderr goes to the
   person's log under the task (`app.rs:1656-1661`), so the log says why. Neither sign alone is enough: the marker stays
   fresh for ten minutes after an install that has ended, and any install on the machine holds the mutex. No other code
   in the tree is 75, and no Windows status is

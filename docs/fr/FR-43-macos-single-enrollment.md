@@ -477,7 +477,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:3138` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
-| `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3953-3958` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
+| `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3953-3959` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
 | Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3839-3845`, `agents/roomlerd/src/app.rs:5348`, `:5535` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
@@ -534,11 +534,11 @@ Rejected: a mutual check on the upgrade response. The secret goes out in the req
 
 The WebRTC peers, the SSH server and the relay responder need an offer or an overlay this process no longer has.
 
-**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:4033`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:4038`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
+**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:4034`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:4039`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
 
 | In `run_cmd` | Enrolled worker | `--unenrolled` |
 |---|---|---|
-| No config file (`app.rs:3953`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
+| No config file (`app.rs:3954`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
 | No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:214`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
 | Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay | from the file | blank or off in the view: the root holds all of them |
 | Preflight to the server (`app.rs:4349`) | runs | skipped |
