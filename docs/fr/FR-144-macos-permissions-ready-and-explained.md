@@ -164,7 +164,7 @@ what is missing.
   that finds a grant it held before now refused, with the version or the macOS build changed, reads as stale.
 - **What the row says:** "On in System Settings, but macOS no longer accepts it. This can happen after an update."
   **One action, Repair:** `tccutil reset <service> com.roomler.agent` (through the root half as the uninstall does,
-  `install.sh:2032`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
+  `install.sh:2045`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
   again, which lists it in the pane, the person turns it on, and Roomler restarts it. Repair is never offered to a
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
