@@ -255,6 +255,14 @@ must stay under the hub's 5 s grace (`CONSENT_VERDICT_GRACE`, `crates/remote_con
 session panel in front it is at most 4.5 s, and the compile-time assertion that keeps it under the grace
 (`companion.rs:1302-1312`) grows to include `PANEL_WITHIN`.
 
+**A worker that does not answer (review F4).** Ruled 2026-11-21: accepted as built, and documented here. The bound is
+500 ms over all states, the same as master's probe (`PROBE_WAIT`, `agents/roomlerd/src/indicator/mac.rs:1083`;
+`PANEL_WITHIN`, `agents/roomlerd/src/indicator/session_panel.rs:74`). The extra wait comes only in a degraded state, a
+worker that said `consent-panel` and then does not answer, where master's refused or ended panel answered at once. A
+consent question waits on a person, so up to 500 ms before it moves to the app is small beside that. Each question is
+asked again, which lets the panel come back by itself (`after_no_answer_the_next_question_is_asked_again`,
+`session_panel.rs:1629`); a silent state with a way back would add a state, and its failure modes, for little gain.
+
 **Old and new together.** The worker is the root daemon's own binary, started by it, and an update restarts both. A
 worker that does not say `consent-panel` is never asked, and the root daemon follows master's chain. A newer worker
 beside an older root daemon has its word dropped (`delegate.rs:250-258`) and is never asked.

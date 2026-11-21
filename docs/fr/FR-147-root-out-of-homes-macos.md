@@ -54,7 +54,7 @@ command's folders now come from the account it runs as (`crates/agent-core/src/a
 ### #3825: a line the person has to paste
 
 #3825 also gave the give-up a cause. When the console person's folder is another account's, the root daemon's log
-names the folder with its owner and mode (`agents/roomlerd/src/macos_supervisor.rs:535-549`), followed by a shell
+names the folder with its owner and mode (`agents/roomlerd/src/macos_supervisor.rs:531-545`), followed by a shell
 line for the person to run in a shell of their own (`move_aside`, `:587-651`; it changes nothing unless `id -u` is
 the person's, `:621`). The line builds a new folder beside the old one with the copies a revert needs, then swaps
 the two. What it cannot do:
@@ -71,7 +71,7 @@ directory that another account owns, in any parent, even a parent of their own: 
 permission on the directory itself. It was read in the release lab on macOS 15.7 with the 0.4.220 candidate, where
 the person's `mv` of a root-made `<F>` answered `Permission denied` and moved nothing. #3846 replaced the line. Read
 on master `3b7c98323` (its merge), the give-up names an administrator's `sudo mv` of the folder aside, then a
-restart of the daemon (`move_aside`, `macos_supervisor.rs:620-745`). That command is printed only under the
+restart of the daemon (`move_aside`, `macos_supervisor.rs:616-741`). That command is printed only under the
 package's rule: the console person is an administrator of this Mac, the folder is a real folder of root's, and the
 account name is plain (`:568-615`). Elsewhere it gives no command, says that only an administrator can move the
 folder aside (`:653-654`), and names the docs section. P2 below was built on the same rename (D8).

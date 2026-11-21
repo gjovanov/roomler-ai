@@ -477,7 +477,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:3138` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
-| `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3868-3873` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
+| `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3953-3958` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
 | Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3839-3845`, `agents/roomlerd/src/app.rs:5348`, `:5535` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
@@ -508,7 +508,7 @@ flowchart TB
 
 | | Off, the default | On |
 |---|---|---|
-| The spawn (`agents/roomlerd/src/macos_supervisor.rs:1342`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
+| The spawn (`agents/roomlerd/src/macos_supervisor.rs:1346`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
 | A person's enrollment on this Mac | what the worker runs on | ignored and left in the file, so turning the switch off brings it back until the migration strips it |
 | A secondary org's session | served by the root, no pixels | delegated |
 | A Mac with no per-user config | no worker | a worker |
@@ -525,7 +525,7 @@ Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `
 
 Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
 
-⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has three callers: the `next_delegated` arm (`signaling.rs:3107`), the `ws.next()` arm (`:3238`) and, since #3453, the `caps.news` arm (`:2582`), which hands on only the requests the `ws.next()` arm held until the encoder probe first answered. With `--unenrolled` the `ws.next()` arm drops every text frame before it holds any (`OrgCtx::unenrolled`, false in every other process), so the third caller has nothing to hand on. That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
+⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has three callers: the `next_delegated` arm (`signaling.rs:3138`), the `ws.next()` arm (`:3269`) and, since #3453, the `caps.news` arm (`:2582`), which hands on only the requests the `ws.next()` arm held until the encoder probe first answered. With `--unenrolled` the `ws.next()` arm drops every text frame before it holds any (`OrgCtx::unenrolled`, false in every other process), so the third caller has nothing to hand on. That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
 
 | Listener | What it serves | Why it stays |
 |---|---|---|
@@ -635,7 +635,7 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 `roomlerd enroll --one-row` writes both keys beside the enrollment, and `install.sh --role daemon --token <one> --one-row` enrolls the root half alone: the marker, the package, the enrollment with the overlay on, the LaunchAgent removed, the daemon kickstarted (`scripts/install.sh:905`, `:998`). `--pair` takes the same flag. The two-row commands stay as they are (`--daemon-token`, `scripts/install.sh:280`), so a person without admin rights keeps the per-user half alone, which is a one-row Mac with no mesh. The wizard's `halves: 2` (`docs/device-pairing.md:153`) and the dashboard's commands follow only when the default flips.
 
-**Built: `roomlerd enroll --one-row`** (`agents/roomlerd/src/app.rs:146`). It is refused off macOS and without root, beside the token check and so before the token is spent (`agents/roomlerd/src/app.rs:1763`, `:8818`). It sets both switches before the save, as `--overlay` does, so the daemon's first start is one row (`agents/roomlerd/src/app.rs:2975`, `:8847`). On a Mac the package has just installed, its LaunchAgent still has to go: running the package again removes it, because P2d's guard reads the switch. `install.sh --one-row` does that in the same command (below). The tests (`agents/roomlerd/src/app.rs:8853`) cover the flag, both refusals and the two keys it writes.
+**Built: `roomlerd enroll --one-row`** (`agents/roomlerd/src/app.rs:146`). It is refused off macOS and without root, beside the token check and so before the token is spent (`agents/roomlerd/src/app.rs:1798`, `:8910`). It sets both switches before the save, as `--overlay` does, so the daemon's first start is one row (`agents/roomlerd/src/app.rs:3010`, `:8939`). On a Mac the package has just installed, its LaunchAgent still has to go: running the package again removes it, because P2d's guard reads the switch. `install.sh --one-row` does that in the same command (below). The tests (`agents/roomlerd/src/app.rs:8945`) cover the flag, both refusals and the two keys it writes.
 
 **Built: `install.sh --one-row`** (`scripts/install.sh:229`, `:1027`). One token or one `--pair` approval, on a Mac that is not enrolled yet. The order differs from the design above in two places, both for the same reason: what removes the LaunchAgent is the package's own guard.
 
