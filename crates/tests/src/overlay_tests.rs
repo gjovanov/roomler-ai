@@ -3159,3 +3159,132 @@ mod overlay_policy_ids_on_the_wire {
         );
     }
 }
+
+/// #4187 — the overlay ACL's writes decide `MANAGE_AGENTS` before they read
+/// their body, as the tunnel-policy routes beside them do
+/// (`tunnel_policy_permission_tests`): create, update and the posture switch
+/// (`PUT …/overlay-acl/mode`). A member without the bit gets the one 403
+/// `forbidden` for a body that does not even parse, someone outside the org
+/// the one `not_a_member`, and a holder is still answered such a body exactly
+/// as axum's `Json` extractor answers it.
+mod overlay_acl_decides_the_bit_before_the_body {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::{
+        call, call_raw, extractor_answer, holder_answer_problem, refusal_problem, unparsed_bodies,
+    };
+    use roomler_ai_mod_network::routes::overlay_policy::{
+        SetAclModeRequest, UpsertOverlayPolicyRequest,
+    };
+
+    fn acl(seeded: &SeededTenant, tail: &str) -> String {
+        format!("/api/tenant/{}/overlay-acl{tail}", seeded.tenant_id)
+    }
+
+    /// The owner writes a rule; returns its id.
+    async fn owner_creates(app: &TestApp, seeded: &SeededTenant) -> String {
+        let (s, created) = call(
+            app,
+            "POST",
+            &acl(seeded, ""),
+            &seeded.admin.access_token,
+            Some(acl_body("the owner's own rule", true)),
+        )
+        .await;
+        assert_eq!(s, 200, "the owner writes a rule: {created}");
+        created["id"].as_str().expect("rule id").to_string()
+    }
+
+    /// The three writes, each with a field its own body's type refuses. The
+    /// mode is an enum, so it takes an unknown variant: `{"mode": 7}` is a
+    /// syntax error to serde_json (400), not the 422 kind.
+    fn writes(seeded: &SeededTenant, rule: &str) -> [(&'static str, String, &'static str); 3] {
+        [
+            ("POST", acl(seeded, ""), r#"{"name": 7}"#),
+            ("PUT", acl(seeded, &format!("/{rule}")), r#"{"name": 7}"#),
+            ("PUT", acl(seeded, "/mode"), r#"{"mode": "loud"}"#),
+        ]
+    }
+
+    /// While the three took `Json<T>` as an extractor, axum answered a body
+    /// that does not parse before the handler ran, with a 400, 415 or 422
+    /// decided by the body alone, and the permission was never asked.
+    #[tokio::test]
+    async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+        let app = TestApp::spawn().await;
+        let seeded = app.seed_tenant("ovacl-unparsed").await;
+        let other = app.seed_tenant("ovacl-unparsed-b").await;
+        let rule = owner_creates(&app, &seeded).await;
+        let callers = [
+            (
+                "a member without the bit",
+                &seeded.member.access_token,
+                "forbidden",
+            ),
+            (
+                "another org's owner",
+                &other.admin.access_token,
+                "not_a_member",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (who, token, want) in callers {
+            for (method, path, refused_field) in writes(&seeded, &rule) {
+                for b in unparsed_bodies(refused_field) {
+                    let (s, _, text) =
+                        call_raw(&app, method, &path, token, b.content_type, b.body).await;
+                    if let Some(why) = refusal_problem(want, s, &text) {
+                        wrong.push(format!(
+                            "{who}: {method} {path} {} ({:?} as {}): {why}",
+                            b.what, b.body, b.content_type
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} answers came before the gate:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The control: a holder's answer to such a body is the extractor's own,
+    /// the status and the plain-text words both, and nothing is written.
+    #[tokio::test]
+    async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+        let app = TestApp::spawn().await;
+        let seeded = app.seed_tenant("ovacl-unparsed-holder").await;
+        let rule = owner_creates(&app, &seeded).await;
+        let owner = &seeded.admin.access_token;
+
+        let mut wrong = Vec::new();
+        for (method, path, refused_field) in writes(&seeded, &rule) {
+            for b in unparsed_bodies(refused_field) {
+                let want = if path.ends_with("/mode") {
+                    extractor_answer::<SetAclModeRequest>(b.content_type, b.body).await
+                } else {
+                    extractor_answer::<UpsertOverlayPolicyRequest>(b.content_type, b.body).await
+                };
+                let (s, answered_as, text) =
+                    call_raw(&app, method, &path, owner, b.content_type, b.body).await;
+                let answer = (s, answered_as.as_str(), text.as_str());
+                if let Some(why) = holder_answer_problem(&b, &want, answer) {
+                    wrong.push(format!("{method} {path} {}: {why}", b.what));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // Nothing was written: the one rule, as the owner wrote it, and the
+        // posture as it was.
+        let (s, list) = call(&app, "GET", &acl(&seeded, ""), owner, None).await;
+        assert_eq!(s, 200, "{list}");
+        assert_eq!(list["total"], 1, "{list}");
+        assert_eq!(list["items"][0]["id"], rule.as_str(), "{list}");
+        assert_eq!(list["items"][0]["name"], "the owner's own rule", "{list}");
+        assert_eq!(list["mode"], "off", "{list}");
+    }
+}

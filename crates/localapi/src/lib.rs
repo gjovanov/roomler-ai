@@ -5281,17 +5281,17 @@ async fn serve_person_listener(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accept = listener.accept() => match accept {
                 Ok((stream, _addr)) => {
-                    let cred = stream.peer_cred().ok();
+                    let read = stream.peer_cred();
                     let peer = ClientPeer {
-                        uid: cred.map(|c| c.uid()),
-                        gid: cred.map(|c| c.gid()),
+                        uid: read.as_ref().ok().map(|c| c.uid()),
+                        gid: read.as_ref().ok().map(|c| c.gid()),
                         ..ClientPeer::UNKNOWN
                     };
                     if !person_peer_ok(&peer, owner_uid) {
-                        tracing::warn!(
-                            peer_uid = ?peer.uid, owner_uid,
-                            "localapi: person socket refused a caller that is neither its person nor root"
-                        );
+                        // #4202 — dropped either way, and only the line differs: a
+                        // caller that closed before it was read has gone, and is no
+                        // stranger ([`PersonDrop`]).
+                        PersonDrop::of(read.as_ref().err()).log(peer.uid, owner_uid);
                         continue;
                     }
                     let st = state.clone();
@@ -6872,6 +6872,59 @@ pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
         ),
         Ok(Ok(_)) | Err(_) => false,
+    }
+}
+
+/// #4202 — why [`serve_person_listener`] drops a caller that [`person_peer_ok`]
+/// refused, from what `peer_cred` answered for it: `None` when it read the
+/// caller, else its error. It decides the line the drop is logged with and
+/// nothing else: every such caller is dropped before a byte of it is read. On
+/// plain facts, so it is tested on every platform.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[derive(Debug)]
+enum PersonDrop<'e> {
+    /// Read, and neither the socket's person nor root: another account. A WARN
+    /// that names its uid, as before #4202.
+    Stranger,
+    /// `ENOTCONN`: the caller closed its end before its credentials were read,
+    /// so nobody waits on the connection. A Mac answers so: tokio's `peer_cred`
+    /// asks `LOCAL_PEEREPID` first, and the kernel answers that with `ENOTCONN`
+    /// once the caller's end is gone, while Linux still reads such a caller from
+    /// what it saved at `connect`. The person's own `roomler status` leaves one
+    /// whenever the root half is slower than its check
+    /// ([`macos_root_half_serves_me`]). A debug line that says the caller left,
+    /// where a WARN called it a refused stranger with `peer_uid=None`.
+    Gone,
+    /// Any other error: a WARN that names it.
+    Unread(&'e std::io::Error),
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+impl<'e> PersonDrop<'e> {
+    fn of(read_error: Option<&'e std::io::Error>) -> Self {
+        match read_error {
+            None => Self::Stranger,
+            Some(e) if e.kind() == std::io::ErrorKind::NotConnected => Self::Gone,
+            Some(e) => Self::Unread(e),
+        }
+    }
+
+    /// Logs the drop. `peer_uid` is the uid `peer_cred` read, if it read one.
+    fn log(self, peer_uid: Option<u32>, owner_uid: u32) {
+        match self {
+            Self::Stranger => tracing::warn!(
+                peer_uid = ?peer_uid, owner_uid,
+                "localapi: person socket refused a caller that is neither its person nor root"
+            ),
+            Self::Gone => tracing::debug!(
+                owner_uid,
+                "localapi: person socket: a caller closed its connection before it was read; nothing to serve"
+            ),
+            Self::Unread(e) => tracing::warn!(
+                error = %e, owner_uid,
+                "localapi: person socket refused a caller whose credentials could not be read"
+            ),
+        }
     }
 }
 
@@ -12122,6 +12175,237 @@ mod tests {
             srv.await.unwrap().unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — binds a socket in a folder of the test's own, connects to it,
+    /// closes that connection, and only then accepts it. The result is the
+    /// daemon's end of a caller that has gone, as the person socket's accept
+    /// loop meets one when `roomler status` closes its check
+    /// (`macos_root_half_serves_me`) before the loop reads it. Nothing here
+    /// depends on timing: the close has returned before the accept is called.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn accepted_after_its_caller_closed(tag: &str) -> (std::path::PathBuf, tokio::net::UnixStream) {
+        let dir = std::env::temp_dir().join(format!("roomler-4202-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let (gone, _) = listener.accept().unwrap();
+        gone.set_nonblocking(true).unwrap();
+        (dir, tokio::net::UnixStream::from_std(gone).unwrap())
+    }
+
+    /// #4202 — on a Mac the kernel names no peer for a caller that closed
+    /// before the accept. Tokio's `peer_cred` asks `LOCAL_PEEREPID` first, and
+    /// that answers `ENOTCONN` once the caller's end is gone, so the person
+    /// socket reads no uid for the caller. It drops it as a caller that has
+    /// gone ([`PersonDrop::Gone`], a debug line), where it used to log the
+    /// refusal #4202 is about. The caller's uid is still there: `getpeereid`
+    /// reads `LOCAL_PEERCRED`, which the kernel saved when the caller connected.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_mac_reads_no_credentials_for_a_caller_that_closed_before_the_accept() {
+        use std::os::unix::io::AsRawFd;
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("mac");
+        let e = gone
+            .peer_cred()
+            .expect_err("a caller that closed has no process for the kernel to name");
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTCONN), "{e}");
+        assert!(
+            matches!(PersonDrop::of(Some(&e)), PersonDrop::Gone),
+            "the kernel's own answer reads as a caller that has gone: {e}"
+        );
+        let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+        // SAFETY: an open socket, and two out-params of the types it writes.
+        let rc = unsafe { libc::getpeereid(gone.as_raw_fd(), &mut uid, &mut gid) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(
+            uid, me,
+            "the credentials saved at connect still name the caller"
+        );
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — on Linux the kernel keeps the credentials it saved when the
+    /// caller connected (`SO_PEERCRED`), so a caller that closed before the
+    /// accept is still read as itself. The person socket accepts it, and its
+    /// connection ends with nothing to read. That is why the refusal with
+    /// `peer_uid=None` was seen on a Mac only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_still_reads_a_caller_that_closed_before_the_accept() {
+        let me = own_uid().unwrap();
+        let (dir, gone) = accepted_after_its_caller_closed("linux");
+        let cred = gone
+            .peer_cred()
+            .expect("the credentials saved at connect are still read");
+        assert_eq!(cred.uid(), me);
+        drop(gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #4202 — the person socket's accept loop meets a caller that has gone,
+    /// queued just ahead of the person's live connection. Both are queued
+    /// before the loop runs. The gone caller is dropped on a Mac, with a debug
+    /// line that says it left, and ends with nothing to read on Linux. On both,
+    /// the live one is answered and nothing is logged as a WARN, so a caller
+    /// that has gone costs a waiting caller nothing and reads as no stranger.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_caller_gone_before_the_accept_costs_the_live_person_nothing() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        // This test's thread runs the loop too (a current-thread runtime).
+        let logged = Logged::default();
+        let _logging = tracing::subscriber::set_default(logged.clone());
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-4202-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("person.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let live = tokio::net::UnixStream::connect(&path).await.unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let (tx, mut rx) = watch::channel(false);
+        let srv = tokio::spawn(async move {
+            serve_person_listener(&listener, me, state, &mut rx, std::future::pending())
+                .await
+                .map(|_| ())
+        });
+        let (rd, mut wr) = tokio::io::split(live);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the live person is answered")
+            .unwrap()
+            .expect("an answer, not a close");
+        let r: Response = serde_json::from_str(&line).unwrap();
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let logged = logged.0.lock().unwrap().clone();
+        let loud: Vec<_> = logged
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN || *level == tracing::Level::ERROR)
+            .collect();
+        assert!(
+            loud.is_empty(),
+            "a caller that has gone is no WARN: {loud:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            logged
+                .iter()
+                .any(|(level, words)| *level == tracing::Level::DEBUG
+                    && words.contains("closed its connection before it was read")),
+            "the loop dropped the caller that had gone as gone: {logged:?}"
+        );
+    }
+
+    /// #4202 — every event's level and its words: the message, then each other
+    /// field as ` name=value`. A subscriber of the test's own, as tracing's
+    /// crate alone allows (this crate has no `tracing-subscriber`).
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing::Subscriber for Logged {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Words(String);
+            impl tracing::field::Visit for Words {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = match field.name() {
+                        "message" => write!(self.0, "{value:?}"),
+                        name => write!(self.0, " {name}={value:?}"),
+                    };
+                }
+            }
+            let mut words = Words(String::new());
+            event.record(&mut words);
+            let level = *event.metadata().level();
+            self.0.lock().unwrap().push((level, words.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// #4202 — the person socket's line for a caller it drops, by what
+    /// `peer_cred` answered: another account's uid, and a read that failed,
+    /// are each a WARN naming what is known, and a caller that closed before
+    /// it was read (`ENOTCONN`) is a debug line that says it left, never a
+    /// refused stranger. Every platform.
+    #[test]
+    fn a_caller_that_left_before_it_was_read_is_logged_as_gone_not_refused() {
+        let left = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        let unread = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(PersonDrop::of(None), PersonDrop::Stranger));
+        assert!(matches!(PersonDrop::of(Some(&left)), PersonDrop::Gone));
+        assert!(matches!(
+            PersonDrop::of(Some(&unread)),
+            PersonDrop::Unread(_)
+        ));
+        #[cfg(unix)]
+        {
+            let enotconn = std::io::Error::from_raw_os_error(libc::ENOTCONN);
+            assert!(matches!(PersonDrop::of(Some(&enotconn)), PersonDrop::Gone));
+            let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+            assert!(matches!(
+                PersonDrop::of(Some(&ebadf)),
+                PersonDrop::Unread(_)
+            ));
+        }
+
+        let logged = Logged::default();
+        tracing::subscriber::with_default(logged.clone(), || {
+            PersonDrop::of(None).log(Some(4242), 501);
+            PersonDrop::of(Some(&left)).log(None, 501);
+            PersonDrop::of(Some(&unread)).log(None, 501);
+        });
+        let logged = logged.0.lock().unwrap().clone();
+        let [stranger, gone, failed] = logged.as_slice() else {
+            panic!("one line a drop: {logged:?}");
+        };
+        assert_eq!(stranger.0, tracing::Level::WARN, "{stranger:?}");
+        assert!(
+            stranger.1.contains("neither its person nor root")
+                && stranger.1.contains("peer_uid=Some(4242)")
+                && stranger.1.contains("owner_uid=501"),
+            "{stranger:?}"
+        );
+        assert_eq!(
+            gone.0,
+            tracing::Level::DEBUG,
+            "a caller that left is no WARN: {gone:?}"
+        );
+        assert!(
+            gone.1.contains("closed its connection before it was read")
+                && !gone.1.contains("refused"),
+            "{gone:?}"
+        );
+        assert_eq!(failed.0, tracing::Level::WARN, "{failed:?}");
+        assert!(
+            failed.1.contains("could not be read") && failed.1.contains(" error="),
+            "{failed:?}"
+        );
     }
 
     /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
