@@ -108,7 +108,7 @@ roomler config set display_match auto     # auto (default) | always | never
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2749`](../crates/agent-core/src/config.rs#L2749) `DisplayMatchPolicy`).
+  ([`config.rs:2787`](../crates/agent-core/src/config.rs#L2787) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -292,7 +292,7 @@ sequenceDiagram
   ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1613`](../agents/roomlerd/src/virtual_desktop.rs#L1613) `start_server`). An
+  the same display ([`virtual_desktop.rs:1712`](../agents/roomlerd/src/virtual_desktop.rs#L1712) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`

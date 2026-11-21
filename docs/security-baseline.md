@@ -348,8 +348,8 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:800`; the
-overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:150`).
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:805`; the
+overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
 
@@ -359,13 +359,23 @@ roles do not.
 - **The reads too.** The list is the org's whole tunnel ACL: every subject, every
   target device, and the internal hosts, ranges and ports behind them. A member
   learns what they may reach by reaching it; a refused forward says `acl_denied`.
-- **The bit is decided first**, before the policy id is parsed, the body validated or
-  a policy looked up. A member without it gets one 403 `forbidden` whatever the id
-  names (a policy of their org, another org's, nothing) or the body says, so the
+- **The bit is decided first**, before the policy id is parsed, the body read or a
+  policy looked up. A member without it gets one 403 `forbidden` whatever the id
+  names (a policy of their org, another org's, nothing) or the body is, so the
   refusal says nothing about which policies exist. It is never `not_a_member`, the
   one 403 the web app leaves the org on; someone outside the org is still told
   `not_a_member`. For a holder, another org's policy or an id that names nothing is
   a 404.
+- ⚠️ **A body that does not parse is no exception** (#4187). Taken as an extractor,
+  axum's `Json<T>` refuses such a body before the handler runs, so its 400, 415 or
+  422 came before the gate. The tunnel-policy writes, and the overlay ACL's create,
+  update and mode, take the body as `Result<Json<T>, JsonRejection>` and read it
+  with `let Json(body) = body?;` straight after the gate. `ApiError::JsonBody`
+  (`crates/core/src/error.rs:55`) answers it exactly as the extractor did, the
+  status and the plain-text words, so a holder sees no change. The extractor
+  still buffers and parses the bytes before the handler runs, as `Bytes` would;
+  what waits for the gate is its answer. The overlay ACL's half is pinned in
+  `crates/tests/src/overlay_tests.rs` (`overlay_acl_decides_the_bit_before_the_body`).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
   `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
@@ -1215,7 +1225,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3708`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3887`).
   Since #3967 it also takes `ConsentRelaying`, from its own person only and never
   from root: a two-row Mac's per-user half saying it lists the root half's consent
   questions. It reads nothing and grants nothing. The root half keeps it in memory
@@ -1280,10 +1290,10 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
   made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2659`, by
-  `person_peer_ok`, `:4903`). The listener makes that check before a byte is read, and a
+  `person_peer_ok`, `:5147`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:4967`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:5298`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the

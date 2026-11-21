@@ -123,7 +123,7 @@ say:
 The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:659`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:622`).
+a record older than that (`never_reported`, `:669`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints

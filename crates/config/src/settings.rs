@@ -121,6 +121,17 @@ pub struct SetupSettings {
     /// Env: `ROOMLER__SETUP__WIZARD_REINSTALL_GUARD`.
     #[serde(default = "reinstall_guard_default_on")]
     pub wizard_reinstall_guard: bool,
+    /// FR-141 P2 — "the released Roomler Setup makes a new Mac ONE device row
+    /// (FR-43): root's daemon, supervising the person's screen worker, from
+    /// one token and one approval — and that is field-proven." While it is
+    /// on, the macOS daemon card with "Join the overlay network" ticked (the
+    /// macOS default) installs one row on a Mac that is not enrolled yet;
+    /// off, it installs the two rows of FR-129 B2, as before. An enrolled Mac
+    /// keeps its layout either way. A claim like the others above: default
+    /// **off**, flipped by the operator after P2's field read.
+    /// Env: `ROOMLER__SETUP__WIZARD_MACOS_ONE_ROW`.
+    #[serde(default)]
+    pub wizard_macos_one_row: bool,
 }
 
 impl Default for SetupSettings {
@@ -131,6 +142,7 @@ impl Default for SetupSettings {
             wizard_unix_daemon: false,
             wizard_pairing: false,
             wizard_reinstall_guard: reinstall_guard_default_on(),
+            wizard_macos_one_row: false,
         }
     }
 }
@@ -1328,6 +1340,10 @@ pub struct RedisSettings {
     /// #3840 — one connection attempt gives up after this; 0 = no bound, 1-999 = 1000.
     #[serde(default = "redis_bound_ms")]
     pub connection_timeout_ms: u64,
+    /// #3952 — how often each subscriber publishes a probe to itself; two
+    /// probes in a row unheard and it subscribes again. 0 = off, 1-999 = 1000.
+    #[serde(default = "redis_probe_ms")]
+    pub subscriber_probe_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1928,6 +1944,20 @@ mod setup_settings_tests {
         assert!(!off.wizard_reinstall_guard);
         assert!(!off.linux_daemon() && !off.macos_daemon() && !off.wizard_pairing);
     }
+
+    /// FR-141 P2 — the one-row form is a claim about a released wizard: OFF
+    /// built whole and from a file without the key, on only when set, and
+    /// neither way does it touch the guard or the daemon cards.
+    #[test]
+    fn the_macos_one_row_form_is_off_until_turned_on() {
+        assert!(!SetupSettings::default().wizard_macos_one_row);
+        let absent: SetupSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.wizard_macos_one_row, "a file without the key");
+        let on: SetupSettings = toml::from_str("wizard_macos_one_row = true").unwrap();
+        assert!(on.wizard_macos_one_row);
+        assert!(on.wizard_reinstall_guard, "the guard stays on");
+        assert!(!on.macos_daemon(), "no claim about the macOS daemon card");
+    }
 }
 
 #[cfg(test)]
@@ -2073,6 +2103,13 @@ fn redis_bound_ms() -> u64 {
     3000
 }
 
+/// #3952 — the default of `ROOMLER__REDIS__SUBSCRIBER_PROBE_MS`: 15 s. The
+/// reasoning is in `crates/core/src/ws/sub_probe.rs` and
+/// `docs/multi-pod-scale-out.md`.
+fn redis_probe_ms() -> u64 {
+    15_000
+}
+
 #[cfg(test)]
 mod redis_bound_tests {
     use super::RedisSettings;
@@ -2092,5 +2129,28 @@ mod redis_bound_tests {
         }))
         .unwrap();
         assert_eq!((s.response_timeout_ms, s.connection_timeout_ms), (0, 0));
+    }
+
+    /// #3952 — a config that names only the URL (every deployment before
+    /// #3952) probes its subscribers every 15 s; 0 (off) and a value under the
+    /// 1 s floor are taken as given here, and the floor is applied where the
+    /// setting is used (`roomler_core::ws::sub_probe`).
+    #[test]
+    fn the_subscriber_probe_defaults_to_15_s_and_takes_0() {
+        let s: RedisSettings =
+            serde_json::from_value(serde_json::json!({ "url": "redis://r:6379" })).unwrap();
+        assert_eq!(s.subscriber_probe_ms, 15_000);
+        for given in [0u64, 500, 1000, 60_000] {
+            let s: RedisSettings = serde_json::from_value(serde_json::json!({
+                "url": "redis://r:6379", "subscriber_probe_ms": given
+            }))
+            .unwrap();
+            assert_eq!(s.subscriber_probe_ms, given);
+            assert_eq!(
+                (s.response_timeout_ms, s.connection_timeout_ms),
+                (3000, 3000),
+                "the probe leaves #3840's bounds alone"
+            );
+        }
     }
 }
