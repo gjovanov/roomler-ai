@@ -736,8 +736,8 @@ Verified against `origin/master`, 2026-08-28.
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
-`crates/agent-core/src/config_surface.rs:38-40`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:42`); getter + setter arms; and `env_bridge_bools` (`config.rs:3226`),
+`crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:1794`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

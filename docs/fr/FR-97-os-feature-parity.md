@@ -458,7 +458,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:115`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3589`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4018`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:2966`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone kept image events (`clipboard.rs:817-822` before P3e-3a); since P3e-3a a Linux X11 session keeps them too, behind its change gate (`agents/roomlerd/src/clipboard.rs:1076`), and since P2e-1 a Mac, behind its change count (`agents/roomlerd/src/encode/caps.rs:2818`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
@@ -502,34 +502,34 @@ reach a viewer from agents on the release after P0c-1.
 Mirror the Linux arm with the BSD tools the macOS code already drives, and close two gaps the Linux arm has (N12):
 
 1. **The uplink, per family.** At bring-up, `route -n get [-inet6] default` gives the next hop and the interface
-   (`tun.rs:4109`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
-   every pin (`current_uplink`, `tun.rs:5672`): a Mac that booted without a network still pins once it has one, and
-   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:316`) refuses a route on our
+   (`tun.rs:5421`). It is kept in a mutex rather than a fixed field like `orig_default`, because it is RE-READ before
+   every pin (`current_uplink`, `tun.rs:7772`): a Mac that booted without a network still pins once it has one, and
+   one that changed networks pins through the new uplink. `bsd_default_uplink` (`tun.rs:323`) refuses a route on our
    own utun, one narrower than `/0` (a `/1` also prints `destination: default`; only the mask tells), and one with no
    next-hop address (another VPN's interface route). A family with no usable default keeps what it had, so a network
    in transit does not move the pins.
-2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:5574`), never from a
+2. **A pin is read from the routing TABLE** (`netstat -rnW -f inet[6]`, `bsd_table` `tun.rs:7295`), never from a
    lookup. A destination a connection has used keeps an interface-scoped clone of the default route
    (`WASCLONED,IFSCOPE`), and an unscoped `route -n get` answers with that clone even after the pin is in (field,
    §8: the first P1a read back by lookup and refused every pin for the server). The pin is the UNSCOPED static host
-   route for exactly the address (`bsd_pin_row`, `tun.rs:398`: flags `H` and `S`, never `W` or `I`), and it holds
-   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:411`).
-3. **`add_host_exemption`** (`tun.rs:4971`) looks first, because BSD `route` has no idempotent write (#1856): a pin
+   route for exactly the address (`bsd_pin_row`, `tun.rs:405`: flags `H` and `S`, never `W` or `I`), and it holds
+   when it is flagged `G` through the uplink's next hop on its interface (`bsd_pin_holds`, `tun.rs:418`).
+3. **`add_host_exemption`** (`tun.rs:6312`) looks first, because BSD `route` has no idempotent write (#1856): a pin
    that holds is left alone; one that does not (the old uplink, a crashed run's, an interface route) is deleted, then
    added; anything else gets `route add -host <ip> <gw>` (`-inet6` and a zoned `fe80::1%en0` for v6). Never `route
    change`: it resolves its target the way the lookup does, and on the field Mac it left the pin untouched. The table
    then decides; a pin that does not hold comes out again and the call errs.
-4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:5069` on macOS, an empty default
-   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:599`)
+4. **The pins follow the uplink.** `TunIo::stale_host_exemptions` (new; `tun.rs:6424` on macOS, an empty default
+   elsewhere) names the pins the table does not show through the current uplink. The gate (`route_guard.rs:612`)
    asks at most every 3 s, re-pins each, and DELETES one it cannot re-pin before forgetting it, so an untracked
    route never outlives the exit. Then the usual rule applies: a v4 pin missing means WITHHOLD.
 5. **`del_host_exemption`** removes only the pin the table shows, never a route on our utun (a peer route): with no
    unscoped pin left, `route -n delete -host` removed something else on the field Mac. The boot purge already
-   removes the `/1`s (`tun.rs:4834-4877` at the time of writing); pins an unclean exit leaves behind are N13, all
+   removes the `/1`s (`tun.rs:4603-4646` at the time of writing); pins an unclean exit leaves behind are N13, all
    three OSes.
 6. **The two 0.4.132 follow-ups.** The pin WARN fires once per (endpoint, cause) (`note_exemption_failure`,
-   `route_guard.rs:393`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
-   (`exemption_withheld_reason`, `route_guard.rs:405`) instead of `no original default route?`.
+   `route_guard.rs:406`), and the withheld reason carries the device's own cause for the lowest missing v4 endpoint
+   (`exemption_withheld_reason`, `route_guard.rs:418`) instead of `no original default route?`.
 
 Kill switch: `ROOMLERD_EXIT_CLIENT_MACOS=0` refuses every exemption, as 0.4.132 did. DNS is not steered yet (P1c):
 `roomler status` says `DNS NOT steered`.
