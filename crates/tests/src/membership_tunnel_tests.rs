@@ -790,6 +790,61 @@ async fn a_device_manager_who_brings_back_a_removed_members_client_owns_it() {
     assert_eq!(body["pairs"], 0, "nobody's leftover: {body}");
 }
 
+/// #4218 — the operator step decides its gate before it reads its body at
+/// all: anyone but a platform operator, the org's owner included, gets the one
+/// 404 for a body that does not even parse, the answer a body the route reads
+/// gets, so the route stays unseen. While it took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone.
+#[tokio::test]
+async fn the_operator_gate_is_decided_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let org = app.seed_tenant("tcprune-unparsed").await;
+    let write = GatedWrite {
+        method: "POST",
+        path: PRUNE.to_string(),
+        reads: json!({}),
+        refused_field: r#"{"dry_run": 7}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token) in [
+        ("the org's owner", &org.admin.access_token),
+        ("a member", &org.member.access_token),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, Gate::Unseen, &write).await);
+    }
+    assert_no_problems("answered before the gate", &wrong);
+}
+
+/// #4218's control. A platform operator is answered a body that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words.
+#[tokio::test]
+async fn an_operator_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_network::membership::PruneRequest;
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let op = operator_token(&app, operator, "tcprune-unparsed-op");
+
+    let wrong =
+        holder_problems::<PruneRequest>(&app, &op, "POST", PRUNE, r#"{"dry_run": 7}"#).await;
+    assert_no_problems("a platform operator", &wrong);
+}
+
 /// What a removal could not end is left for the operator step, and the rest
 /// of the removal still happens. A tombstone that fails leaves the client
 /// live, yet the person's room memberships still end (the network hook does
