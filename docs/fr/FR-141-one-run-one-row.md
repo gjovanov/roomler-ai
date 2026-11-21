@@ -52,7 +52,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:940-949`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2016-2053`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2466-2515`). `install.sh --one-row` is
   the one-token path (`install.sh:993-1089`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
   (`docs/installation.md:2146-2150`).
