@@ -2383,7 +2383,7 @@ The stop also says how to go on, in Terminal, naming only what works on that Mac
 | The Mac | The stop offers | Why |
 |---|---|---|
 | any one-row Mac | remove Roomler with `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --uninstall` ([Uninstall](#uninstall-every-platform)), then start Setup again | the road to a fresh enrollment, for example after the row was deleted (launchd starts the daemon again after its exit 7, so the stop can still show); it names no layout, since what Setup installs then is its own form's choice |
-| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:64-82`, `:2695-2700`); with no copy the revert says only "nothing to revert" (`:2730-2735`), so it is not offered there |
+| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:66-84`, `:2966-2971`); with no copy the revert says only "nothing to revert" (`:3001-3006`), so it is not offered there |
 
 A wizard started as root (`sudo` from Terminal, the only root road: it never
 elevates itself on a Mac, and the administrator prompt runs `install.sh`'s
