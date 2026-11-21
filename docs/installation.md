@@ -1649,8 +1649,8 @@ actions in the custom-action DLL of [#3375](#what-the-services-environment-keeps
 
 | Action | Runs | Does |
 |---|---|---|
-| `ListInstalledFiles` (`agents/roomler-msi-ca/src/msi.rs:723`) | immediate, after `InstallValidate`, where the component states are final; every run but an uninstall | lists the full path of every file whose component is installed when the run ends (`agents/roomler-msi-ca/src/pending_ops.rs:59`, `stays_local`) and hands the list on as the spare's `CustomActionData` |
-| `SpareInstalledFiles` (`msi.rs:733`) | deferred, as LocalSystem, after `InstallFiles` and after every action scheduled after it; every run but an uninstall | takes every delete of a listed file out of `PendingFileRenameOperations` and `PendingFileRenameOperations2` (`pending_ops.rs:217`, `plan`) and writes each value back with every other operation byte for byte as it was |
+| `ListInstalledFiles` (`agents/roomler-msi-ca/src/msi.rs:723`) | immediate, after `InstallValidate` (1401 in the built MSI), where the component states are final; every run but an uninstall | lists the full path of every file whose component is installed when the run ends (`agents/roomler-msi-ca/src/pending_ops.rs:59`, `stays_local`) and hands the list on as the spare's `CustomActionData` |
+| `SpareInstalledFiles` (`msi.rs:733`) | deferred, as LocalSystem, after `InstallFiles` and after every action scheduled after it (4009, after `EnableSystemContext`'s 4008); every run but an uninstall | takes every delete of a listed file out of `PendingFileRenameOperations` and `PendingFileRenameOperations2` (`pending_ops.rs:217`, `plan`) and writes each value back with every other operation byte for byte as it was |
 
 ```mermaid
 sequenceDiagram
@@ -1813,7 +1813,9 @@ order of their names: `InstallFiles` is 4000, `CleanupLegacyPerUser` 4001 and `R
 4002. The three after `RestoreServiceEnvironment` follow the same rule against the file's order:
 `DisableSystemContext` 4005, `KeepSystemContext` 4006, `RollbackSystemContext` 4007, then
 `EnableSystemContext` 4008 after its rollback partner. 0.4.208 and the two test builds of the
-fix carry these numbers. On a Windows 11 lab guest msiexec's log showed this order on every
+fix carry these numbers. #4196's `SpareInstalledFiles` is `After='InstallFiles'` too, and its
+name sorts after `RegisterService`, so it takes 4009, after all of them (installer-smoke prints
+the numbers of the built MSI on every run). On a Windows 11 lab guest msiexec's log showed this order on every
 install, repair and upgrade, and the installer log's timestamps agree
 ([#3640](https://github.com/gjovanov/roomler-ai/issues/3640#issuecomment-6775284876)). On an
 upgrade the old product goes first: `MajorUpgrade` removes it right after `InstallInitialize`

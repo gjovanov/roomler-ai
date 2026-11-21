@@ -399,14 +399,15 @@ mod tests {
     }
 
     /// Equality, never a prefix: a file the install does not list keeps its
-    /// delete, whatever it shares with one it does. So does the retired
-    /// alias that an upgrade removes on purpose.
+    /// delete, whatever it shares with one it does. So does a file in the
+    /// install folder that this product no longer installs, such as an old
+    /// alias an upgrade removes on purpose.
     #[test]
     fn a_file_the_install_does_not_list_keeps_its_delete() {
         let before = value(concat!(
             r"*1\??\C:\Program Files\Roomler\roomlerd.exe2||",
             r"*1\??\C:\Program Files\Roomler\roomlerd.ex||",
-            r"*1\??\C:\Program Files\Roomler\roomler-agent.exe||",
+            r"*1\??\C:\Program Files\Roomler\old-alias.exe||",
             r"*1\??\C:\Program Files\Roomler||",
             r"*1\??\D:\Roomler\roomlerd.exe|||",
         ));
