@@ -763,6 +763,18 @@ environment as it is.
   There the window manager is also started once per server: one that exits is
   not started again ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099),
   decision D1).
+- Where the desktop's keeper does not run, Remote Apps (FR-56) starts its apps
+  and terminals itself, as before
+  [#4100](https://github.com/gjovanov/roomler-ai/issues/4100): each is the
+  daemon's child, in the daemon's process group and outside the desktop's tree.
+  One that exits stays uncollected until the daemon stops, and the teardown
+  signals neither it nor what it leaves behind: an X client ends with its X
+  server, and a job started from it with `nohup` or `setsid` outlives that.
+- The tmux server of a Remote Apps bash session, by design, whether the keeper
+  runs or not: `tmux new-session -d` starts it in a session of its own, outside
+  the desktop's process group and any keeper's tree, so it and the programs in
+  its sessions outlive an X server's death. They end with the daemon only where
+  a service manager's control group takes them (§2.3, *What a person notices*).
 - Where the keeper runs, a window manager that exits while its server runs is
   started again ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099),
   §2.3), and what it had set up is not all brought back: §2.3, *What a start
@@ -848,7 +860,10 @@ So the daemon starts its own binary once per desktop as `roomlerd vd-keeper`.
 `answer_keeper` `virtual_desktop.rs:59`), so the desktop's keeper builds no
 runtime, reads no config, opens no log and takes no lock. It runs in the
 desktop's process group as a child subreaper, and it is the parent of the
-window manager and the startup apps. In `ps` it is `roomlerd-keeper`. The
+window manager, the startup apps, and the apps and terminals Remote Apps
+(FR-56) starts on the desktop
+([#4100](https://github.com/gjovanov/roomler-ai/issues/4100)). In `ps` it is
+`roomlerd-keeper`. The
 module is `agents/roomlerd/src/virtual_desktop/keeper.rs`, and the daemon's
 side is in `virtual_desktop.rs`.
 
@@ -856,10 +871,15 @@ side is in `virtual_desktop.rs`.
 flowchart TD
     D["roomlerd, the daemon"] -->|child| X["Xvfb or Xorg: leads the desktop's process group"]
     D -->|"child; its stdin is the lifeline"| K["roomlerd-keeper: in the desktop's group, a child subreaper"]
+    D -.->|"a start on the lifeline: an argv and a deadline (#4100)"| K
+    K -.->|"its answer on stderr: started, failed or refused"| D
     K --> W["the window manager"]
     K --> A["the startup apps"]
+    K --> R["Remote Apps' apps and terminals (#4100)"]
     A -.->|"setsid, then its parent exits"| O["an orphan"]
+    R -.->|"setsid, then its parent exits"| O
     K -->|"adopts and collects"| O
+    D -.->|"tmux new-session -d: outside the desktop"| T["a bash session's tmux server"]
 ```
 
 | Rule | What it means | Where |
@@ -873,6 +893,7 @@ flowchart TD
 | **It signals only the desktop's** | Never pid 0, 1 or -1, itself or the daemon, and never a group, since it is a member of the desktop's. A pid that is not its own child is signalled only after its `/proc` start time matches the snapshot that selected it | `may_signal` `virtual_desktop/keeper.rs:409`, `KeeperProcs` `virtual_desktop/keeper.rs:953` |
 | **A window manager that exits is started again** ([#4099](https://github.com/gjovanov/roomler-ai/issues/4099)) | While the X server runs, the keeper starts it again through the same `spawn_client` as its first start, so it gets what the first got, after the X server's own backoff: 1 s after the exit at first, doubling with each exit to 5 min, and 1 s again after one that ran a minute (a job's floor is never under 100 ms). One that cannot be started, its file gone or not executable, is tried at the same delays, and a failed start never starts them over. An exit only schedules the start. The start runs at the loop's tail and looks then, not at the exit, at the keeper's teardown and at the X server, the group's leader: an exit in a teardown starts nothing, and a start that comes due in one, or while the server is not running, is dropped, never left due, so no `poll` turns into a loop of 0 ms ones. Each attempt writes at most one line, a WARN: the exit's, held as the next row says, `virtual-desktop vd-keeper: the window manager (<pid>) exited: <how> — it is started again <delay> after its exit`, or a failed start's, at once, `virtual-desktop vd-keeper: the window manager <path> failed to start: <error> — it is tried again in <delay>`. A start that works says nothing of its own | `Book::start_wm` `virtual_desktop/keeper.rs:735`, `Book::start_wm_when_due` `virtual_desktop/keeper.rs:764`, `WmDelays` `virtual_desktop/keeper.rs:657`, `Book::wait_ms` `virtual_desktop/keeper.rs:817` |
 | **Quiet about what a stop or a death caused** | An exit of the window manager or an app is held for 2 s and said only while the X server still runs. A service manager's stop and an X server's death end those clients first, and neither is news. One false notice is left: an X server that closes its clients' connections and then takes over 2 s to exit. The window manager's start does not wait for this hold, so such a server also gets one start of the window manager, which fails on the dying display at once; the next delay, twice as long, finds the server gone. A server that has exited reads as not running, a zombie or reaped, and its pid cannot come back as another process while the keeper lives, because the keeper's membership holds the group's number | `Book::say_notices` `virtual_desktop/keeper.rs:888` |
+| **It starts what Remote Apps asks for** ([#4100](https://github.com/gjovanov/roomler-ai/issues/4100)) | On the desktop's display, Remote Apps (FR-56) asks the desktop who starts each X client it starts: a GUI app, a terminal app's xterm, a bash session's xterm and its re-attach. Where the keeper runs, the daemon decides under its state lock and never waits there. A stopping daemon refuses; a desktop that is down refuses with its reason, since a client started then dies at once or lands on the next server outside any tree (decision D1); a start longer than one atomic write, `KEEPER_JOB_MAX` (4096 bytes), is refused before it is written. Otherwise the daemon writes one line on the lifeline, the program and its arguments (an argv, never a shell line) and a deadline 3 s ahead on `CLOCK_MONOTONIC`, the clock both processes read, and waits for the answer outside the lock, until the deadline and 1 s more. The lifeline is non-blocking once the job is out, so a full pipe or a keeper that is gone refuses at once. The keeper reads its input in whole lines: one over the bound is dropped whole, and one that is no start is warned about. It starts each start at the loop's tail, in the wake that read it, through the same `spawn_client` as the window manager, so the client gets what a startup app gets: its parent is the keeper and its process group the desktop's, where both were the daemon's. It answers on stderr, `start <id>: ` and the answer as JSON: started, failed with the start's OS error (so the launch fails with the text Remote Apps' own start gave, "not installed" included), or refused. It refuses a start it reads in its teardown, while the X server is not running, or past its deadline, when the daemon has stopped waiting and the launch has failed already, so a start given up on never starts later. The exits of these clients are collected and said nowhere (decision D2). Nothing is started again directly after a failure: where the keeper runs, only it starts these clients | `Desktop::start_x_client` `virtual_desktop.rs:2018`, `X_CLIENT_WAIT` `virtual_desktop.rs:1168`, `X_CLIENT_SLACK` `virtual_desktop.rs:366`, `answered` `virtual_desktop.rs:2204`, `Start` `virtual_desktop/keeper.rs:243`, `Answer` `virtual_desktop/keeper.rs:275`, `Lines` `virtual_desktop/keeper.rs:325`, `Book::start_x_client` `virtual_desktop/keeper.rs:782`, `spawn_detached` `apps/linux.rs:202` |
 | **Its exit is the desktop's failure** | Once it has its job, the keeper's exit takes the desktop down and brings it back with the supervisor's backoff, as the server's exit does, never with a start on top. The reason reads `its keeper process (vd-keeper) exited: …`. A job it refuses (one it cannot read, or one for another group) is logged first, as a warning with its reason, `virtual-desktop vd-keeper: refused: …`, because the supervisor's warning names only the exit code | `supervise` `virtual_desktop.rs:2307`, `Gone` `virtual_desktop.rs:2509`, `keeper_line` `virtual_desktop.rs:2237` |
 
 **A window manager's exit, and its start again**
@@ -919,8 +940,9 @@ flowchart TD
 - The startup apps are never started again.
 
 **When the daemon starts the clients itself**, as before #3665, what the apps
-leave behind is out of the teardown's reach again. The log says so at every
-start:
+leave behind is out of the teardown's reach again, and Remote Apps starts its
+apps and terminals itself, as before #4100 (§2.2, *Not covered*). The log says
+so at every start:
 
 | Case | The daemon's log |
 |---|---|
@@ -961,7 +983,10 @@ about 4.5 s, and the daemon waits for nothing beyond its own. A start costs
 one more process of the daemon's binary, two pipes (the keeper's input and its
 stderr), a thread that follows that stderr, and the wait for `ready`, 5 s at
 most. A keeper the daemon gives up on adds up to 1 s, the wait to collect it
-after its SIGKILL.
+after its SIGKILL. A Remote Apps launch on the desktop waits for the keeper's
+answer at most 4 s, the start's 3 s and 1 s of slack, on the blocking thread
+that serves the request (`peer.rs:11407`) and outside the daemon's state lock;
+its write never waits.
 
 **What a person notices.** A program started from a terminal that the
 desktop's own window manager or startup apps opened, such as a `tmux` or
@@ -970,12 +995,18 @@ and the desktop comes back, and when the daemon stops or restarts. Before, it
 outlived an X server's death while the daemon ran on, and, on a host where no
 service manager owns the daemon, a restart of the daemon. Under the shipped
 systemd units it never outlived a restart: the unit's control group took it.
-A remote-apps terminal (FR-56) is another matter: the daemon starts it itself,
-outside the desktop's process group and tree, so it is not the keeper's
-([`remote-apps.md`](remote-apps.md)). What a person starts from one, such as a
-`nohup` job, outlives an X server's death as before. It ends with the unit's
-control group when a service manager stops or restarts the daemon, and outlives
-a restart of a daemon that no service manager owns.
+The apps and terminals Remote Apps (FR-56) starts on the desktop are the
+keeper's too since [#4100](https://github.com/gjovanov/roomler-ai/issues/4100):
+each ends with the desktop, and so does what a person starts from a terminal
+app, such as a `nohup` job. A bash session is the exception: its shell runs
+under a tmux server that Remote Apps starts outside the desktop
+([`remote-apps.md`](remote-apps.md) §5), so the shell and what runs in it
+outlive an X server's death. Only the session's xterm ends with the desktop.
+When the desktop is back, the session is listed as detached, and a click on it
+opens a new xterm, the new keeper's, attached to it. The session ends with the
+unit's control group when a service manager stops or restarts the daemon, and
+outlives only a restart of a daemon that no service manager owns. Where the
+keeper does not run, Remote Apps starts its clients itself, as before.
 
 **Its name.** Log lines and the down reason say `vd-keeper` (the field
 `vd_keeper`), because the power module has a keeper of its own (FR-55). Its
@@ -1002,9 +1033,33 @@ delays, and none is started in a stop, in the daemon's teardown, or onto a
 server that is gone or dying (#4099, the production numbers pinned);
 nothing reaches a keeper's input before its `ready`; a keeper that is slow,
 refuses or exits early falls back as the tables say; and a client sees the
-same on both paths. The issue's three
+same on both paths. Since #4100: the apps and terminals Remote Apps starts on
+the desktop, a bash session's xterm and its re-attach among them, are the
+keeper's children in the desktop's group, collected when they exit, and ended
+with what they leave behind by the desktop's stop and by its X server's death;
+a bash session's tmux server stays outside the keeper and outlives the stop;
+no start is made in the keeper's stop, onto a server that is gone, longer than
+one write, or after the daemon gave up on it; a start written right behind the
+job is answered; a client's exit starts no window manager; and where the
+keeper does not run, Remote Apps starts as before, with the same failure text
+on both paths. The issue's three
 paths failed on the code before the keeper, and each later fix's test fails
 with that fix taken out.
+
+**What #4100 leaves as it is:**
+
+- An answer the keeper could not write, its stderr full (it never blocks on
+  it, `say` `virtual_desktop/keeper.rs:445`), reads as a failed launch
+  although the client runs, the keeper's like any other. An answer that comes
+  after the daemon stopped waiting is logged; one that started a client warns:
+  `virtual-desktop vd-keeper: Remote Apps' start <id> began client <pid> after
+  the daemon stopped waiting for it, so its launch was reported failed (#4100)`.
+- A start the keeper read just before its input ended is started, and that
+  teardown ends it at once.
+- A bash session's tmux server, and what its sessions run, stay outside the
+  desktop (§2.2, *Not covered*).
+- The clients run as the daemon's account, as before: root under the system
+  unit.
 
 **In the field** (2026-11-15,
 [#3665](https://github.com/gjovanov/roomler-ai/issues/3665#issuecomment-6890893043)):
@@ -2985,8 +3040,8 @@ is still in its file (`scripts/code-map-audit.sh`).
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session`, `parse_show`, `sessions`); FR-93 P5g: a session in the background, never one closing (`in_background`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener; #3671: a capture whose X server went away answers no frame and says so once (`connection_lost`), and a damage watcher on a dead connection stays blind (`blind`) |
 | `agents/roomlerd/src/capture/x11_cursor.rs` | FR-97 P3a: the X11 pointer for the cursor channel (`X11Cursor::open`, `publish`), its shape (`shape_of`) and its CSS keyword (`css_for`) |
-| `agents/roomlerd/src/virtual_desktop.rs` | the X server + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` (`start`); #3643: the server's EGL vendor (`egl_vendor_pin`), "it answers" (`wait_display_ready`), the supervisor (`supervise`) and why the desktop is down (`down`); the teardown (`teardown`, `kill_tree_with`); #3665: the daemon's side of the desktop's keeper (`start_keeper`, `discard_keeper`, `wait_desktop_exit`, `KeeperStrikes`, the kill switch in `Plan`); #3671: the desktop's X server generation (`generation`, `x_server_now`), the stop grace (`STOP_GRACE`, `wait_unless_stopping`), the sessions marked and told (`sessions_told`, `sessions_to_tell`) and the retires of the shared pipelines (`retire_if`) |
-| `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, starts a window manager that exits again with the X server's backoff (#4099), collects what exits and takes the desktop down when its input ends (`run`, `serve`, `Book::start_wm`, `teardown_with`, `may_signal`) |
+| `agents/roomlerd/src/virtual_desktop.rs` | the X server + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` (`start`); #3643: the server's EGL vendor (`egl_vendor_pin`), "it answers" (`wait_display_ready`), the supervisor (`supervise`) and why the desktop is down (`down`); the teardown (`teardown`, `kill_tree_with`); #3665: the daemon's side of the desktop's keeper (`start_keeper`, `discard_keeper`, `wait_desktop_exit`, `KeeperStrikes`, the kill switch in `Plan`); #3671: the desktop's X server generation (`generation`, `x_server_now`), the stop grace (`STOP_GRACE`, `wait_unless_stopping`), the sessions marked and told (`sessions_told`, `sessions_to_tell`) and the retires of the shared pipelines (`retire_if`); #4100: Remote Apps' door to the desktop (`start_x_client`, `XStart`), the daemon's decision and its bounded wait (`Desktop::start_x_client`, `X_CLIENT_WAIT`, `X_CLIENT_SLACK`) and each answer handed to its start (`Waiting`, `answered`) |
+| `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, starts a window manager that exits again with the X server's backoff (#4099), starts the apps and terminals Remote Apps asks for and answers each on stderr (#4100), collects what exits and takes the desktop down when its input ends (`run`, `serve`, `Book::start_wm`, `Book::start_x_client`, `Start`, `Answer`, `Lines`, `teardown_with`, `may_signal`) |
 | `agents/roomlerd/src/media_share.rs` | #3671: the shared pipelines retired with the desktop's X server (`retire_all`); #3918: a joiner under a marked owner (`try_join`), from what the owner published (`names_a_capture_off_x`) |
 | `agents/roomlerd/src/input/x_follow.rs` | #3918: the X11 injector's follow (`gate`, `let_go`, `opened_under`) and its kill switch (`enabled`); the marks (`no_picture`) and who is left behind (`Sessions`) |
 | `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`); FR-93 P4c's warm-up (`warm`) and its kill switch (`warm_on`); #4069: the wait for a planned automatic capture (`awaits_automatic_capture`), the one prediction it and the caps' word share (`automatic_uinput_planned`), and the capture's live edge (`live_edge`, `CaptureLive`) |

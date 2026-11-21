@@ -100,7 +100,7 @@ flowchart TD
 
 | Arm | Runs as | Needs | Why it is the way it is |
 |---|---|---|---|
-| **Daemon** (`Target::Daemon`, `linux.rs:61`) | the daemon (root) | `DISPLAY` only | The daemon started that Xvfb and owns it — the only case where root on the display is the right answer. It is also the only population that used the feature before FR-56, and AC3 keeps it **unchanged, first, and unprobed** |
+| **Daemon** (`Target::Daemon`, `linux.rs:61`) | the daemon (root) | `DISPLAY` only | The daemon started that Xvfb and owns it — the only case where root on the display is the right answer. It is also the only population that used the feature before FR-56, and AC3 keeps it **unchanged, first, and unprobed**. Where the desktop's keeper runs, the keeper starts each app and xterm, as its child in the desktop's process group and under the daemon's account, so it is collected when it exits and ends with the desktop ([#4100](https://github.com/gjovanov/roomler-ai/issues/4100), [`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)); `spawn_detached` (`linux.rs:202`) asks the desktop first and never falls back to its own start there |
 | **Session** (`Target::Session`) | the session's owner, by **name** | `DISPLAY` **and** `XAUTHORITY` | ⚠️ Measured before any code: with `DISPLAY` alone — what the pre-FR-56 code passed — every call on a compositor-started Xwayland dies `Authorization required, but no authorization protocol specified`. The cookie's file name is a glob (`.mutter-Xwaylandauth.XXXXXX`), so the runtime dir is scanned newest-first (a compositor restart leaves a stale one behind that authorises nothing; `linux.rs:766`) |
 
 Four rules the session arm enforces, each paid for somewhere:
@@ -347,17 +347,29 @@ xterm), it is `ssh`-attachable from a real login (`tmux attach -t s2`), and it
 is one X window per session, so focus works. It does **not** survive a stop or
 a restart of the daemon under the shipped systemd units: the unit's whole
 control group ends with the daemon, the tmux server in it. Only a daemon that
-no service manager owns leaves it running. These sessions are the daemon's
-own children, not the desktop's keeper's
-([`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)).
+no service manager owns leaves it running. The daemon starts the tmux server
+itself, outside the virtual desktop and its keeper, while on that desktop the
+xterm attached to a session is the desktop's keeper's
+([#4100](https://github.com/gjovanov/roomler-ai/issues/4100),
+[`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)). So
+an X server's death ends the xterm and not the session: the desktop comes back
+and lists the session as detached (below).
 
 | Entry kind | What `launch` does | How the list finds it again |
 |---|---|---|
 | `tmux = true` | `tmux new-session -d -s s<N> <command>`, then `xterm -T roomler:tmux:s<N> -e tmux attach -t s<N>`; at most **32** live sessions (`linux.rs:48`) — a bound on what a misbehaving viewer can spawn | title convention `roomler:tmux:<s>` → `session` |
 | `terminal = true` | `xterm -T roomler:app:<key> -e <command>` — for TUIs | `roomler:app:<key>` → `app_key` |
 | neither | `<command>` as argv, detached, stdio to `/dev/null`; the app sets its own title | unmanaged — reported as-is |
-| **detached session** (no live xterm after a restart or a detach) | listed anyway, as `Terminal (s2) — detached` with the synthetic id `tmux:s2` (`linux.rs:44`); `focus` on it spawns a fresh attached xterm — "attach" fits the three-verb protocol with no fourth verb | `tmux list-sessions` minus the attached ones |
+| **detached session** (no live xterm: its X server died and the xterm ended with the desktop, a daemon that no service manager owns restarted, or a detach) | listed anyway, as `Terminal (s2) — detached` with the synthetic id `tmux:s2` (`linux.rs:44`); `focus` on it spawns a fresh attached xterm — "attach" fits the three-verb protocol with no fourth verb | `tmux list-sessions` minus the attached ones |
 
+- 🔑 **On the daemon's own virtual desktop, the desktop's keeper starts every
+  X client in this table** where it runs
+  ([#4100](https://github.com/gjovanov/roomler-ai/issues/4100)): the app, the
+  terminal app's xterm, a session's xterm and its re-attach. A start that is
+  refused (the desktop is down, the daemon is stopping, the start is too long,
+  or the keeper refused it) or not answered within 4 s fails the launch with its
+  reason, and nothing then starts it directly. `tmux new-session -d` is never
+  the keeper's: the session outlives its xterm by design.
 - 🔑 **Our own windows carry a known title**, so a window maps back to its
   session or allowlist key without pid/`xprop` correlation
   (`classify_title`, `mod.rs:763`). Anything else is an unmanaged window and is
@@ -528,7 +540,7 @@ is still in its file (`scripts/code-map-audit.sh`).
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage`, `MissingTool`, `Unavailable` with `code` and `reason`), the `WindowManager` trait, the env floor (`APPS_ENV`, `permitted`), `availability` and `availability_for`, `has_backend`, `backend`, `handle_control_message` and the pure `dispatch` seam, the three reply builders (`build_list_reply`, `build_focus_reply`, `build_launch_reply`), `unavailable_reply`, `resolve_app`, the `wmctrl`/tmux parsers and `classify_title`, the macOS listing (`QuartzWindow`, `quartz_listing`) and the Terminal script (`terminal_script`) |
-| `agents/roomlerd/src/apps/linux.rs` | `Target`, `LinuxWm::cmd` and the privilege drop, `on_path` and `HELPERS`, `coverage`, `list`, `focus`, `launch`, `discover` and its test seam `discover_with`, `refused`, `Probe` and `probe`, `find_xauthority` |
+| `agents/roomlerd/src/apps/linux.rs` | `Target`, `LinuxWm::cmd` and the privilege drop, `on_path` and `HELPERS`, `coverage`, `list`, `focus`, `launch`, `discover` and its test seam `discover_with`, `refused`, `Probe` and `probe`, `find_xauthority`; #4100: `spawn_detached`, which asks the virtual desktop who starts an X client, and `spawn_error`, the failure's text on both paths |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (through `enum_proc`), `coverage`, `list`, `focus`, `launch` |
 | `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
 | `agents/roomlerd/src/delegate.rs` · `signaling.rs` · `macos_supervisor.rs` | FR-97 P2c on a supervised Mac: `effective_apps` (the worker's words), the hello and heartbeat that carry them, and `WORKER_ENV_FORWARD`'s `APPS` |
