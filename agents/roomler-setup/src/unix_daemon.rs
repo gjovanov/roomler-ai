@@ -627,6 +627,34 @@ pub fn classify(tool: Tool, run: &HalfRun) -> HalfOutcome {
     }
 }
 
+/// FR-141 P2's follow-up — a refusal the script words itself, found in the
+/// last lines the half wrote to stderr. Each stops the half before it changes
+/// anything, on a Mac whose root config it will not touch, so a Retry meets
+/// it again. The wizard runs its own copy of the script ([`INSTALL_SH`]), so
+/// these are this build's words, and a test holds them to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfRefusal {
+    /// Root's config is one row already, its two switches on (FR-43 P3d):
+    /// the two-row half's refusal, or the one-row half's when that row is
+    /// another enrollment's.
+    OneRowAlready,
+    /// Root's config is a row of its own: the one-row half's refusal.
+    RowOfItsOwn,
+}
+
+impl HalfRefusal {
+    /// How the line of [`HalfRefusal::OneRowAlready`] starts.
+    pub const ONE_ROW_ALREADY: &'static str = "error: this Mac is one row already (";
+    /// How the line of [`HalfRefusal::RowOfItsOwn`] starts.
+    pub const ROW_OF_ITS_OWN: &'static str = "error: this Mac's root half is enrolled already (";
+
+    /// The refusal among `stderr_tail`'s lines, if one is there.
+    pub fn read(stderr_tail: &str) -> Option<Self> {
+        let _ = stderr_tail;
+        None
+    }
+}
+
 /// Why `pkexec` exited 127, from what it printed.
 fn pkexec_reason(stderr_tail: &str) -> String {
     let lower = stderr_tail.to_ascii_lowercase();
@@ -1646,6 +1674,47 @@ mod tests {
         );
         assert!(INSTALL_SH.contains("MACOS_DAEMON_CONFIG=\"/etc/roomler/config.toml\""));
         assert_eq!(SYSTEM_CONFIG, "/etc/roomler/config.toml");
+    }
+
+    /// FR-141 P2's follow-up — the two-row half (FR-129 B2) on a Mac whose
+    /// root config is one row already stops before its marker and its package
+    /// run, as root, where both switches are read; and each refusal the wizard
+    /// words by its start is a line this build's script writes.
+    #[test]
+    fn the_two_row_half_stops_on_a_one_row_root_config_before_its_marker() {
+        let start = INSTALL_SH
+            .find("install_daemon_macos() {")
+            .expect("the macOS install");
+        let body = &INSTALL_SH[start..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let refusal = at(
+            "if [ \"$PRIV_STEPS\" = 1 ] && [ -n \"$CONFIG_FROM\" ] && as_root test -f \"$MACOS_DAEMON_CONFIG\" \\\n        && root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then\n        echo \"error: this Mac is one row already ($MACOS_DAEMON_CONFIG): ",
+        );
+        assert!(at("install_macos_one_row_half \"$pkg\" \"$daemon_bin\"") < refusal);
+        assert!(refusal < at("as_root touch \"$MACOS_DAEMON_MARKER\""));
+        assert!(refusal < at("as_root installer -pkg \"$pkg\" -target /"));
+        for start in [HalfRefusal::ONE_ROW_ALREADY, HalfRefusal::ROW_OF_ITS_OWN] {
+            assert!(INSTALL_SH.contains(&format!("echo \"{start}")), "{start}");
+        }
+    }
+
+    /// FR-141 P2's follow-up — the refusal is read from the half's own lines,
+    /// whatever came before it, and nothing else reads as one.
+    #[test]
+    fn a_refusal_is_read_from_the_halfs_last_lines() {
+        let tail = "WARNING: something earlier\nerror: this Mac is one row already (/etc/roomler/config.toml): its root service holds its one row";
+        assert_eq!(HalfRefusal::read(tail), Some(HalfRefusal::OneRowAlready));
+        let tail = "error: this Mac's root half is enrolled already (/etc/roomler/config.toml), as a row of its own";
+        assert_eq!(HalfRefusal::read(tail), Some(HalfRefusal::RowOfItsOwn));
+        for other in [
+            "",
+            "error: the package did not install /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd",
+            "==> this Mac is one row already: the package updates, and its enrollment stays",
+            "osascript: execution error: User canceled. (-128)",
+        ] {
+            assert_eq!(HalfRefusal::read(other), None, "{other}");
+        }
     }
 
     /// The macOS prompt: a constant AppleScript, then `--`, the three output

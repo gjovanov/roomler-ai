@@ -396,7 +396,9 @@ SH=""
 # its stdin first. READS='<stand-in> <words>' makes that stand-in read its
 # stdin first in the call whose line holds the words; FAILS, in the same
 # form, makes it exit 1 in that call. HAS_CONFIG=1 puts an
-# earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
+# earlier install's config at /etc/roomler/config.toml, ONE_ROW_CONFIG=1 a
+# one-row Mac's there instead (the same agent_id, both one-row switches on),
+# HAS_PLIST=1 the root
 # half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
 # as root, as a privileged half runs. READS_ALL=1 makes every call of every
 # stand-in read its stdin first, and SCRIPT=<file> pipes that file in place of
@@ -409,6 +411,11 @@ run() {
     if [ "${HAS_CONFIG:-0}" = 1 ]; then
         mkdir -p /etc/roomler
         printf 'agent_id = "check-earlier"\n' >/etc/roomler/config.toml
+    fi
+    if [ "${ONE_ROW_CONFIG:-0}" = 1 ]; then
+        mkdir -p /etc/roomler
+        printf 'agent_id = "check-earlier"\nmacos_supervise_gui_worker = true\nmacos_one_row = true\n' \
+            >/etc/roomler/config.toml
     fi
     if [ "${HAS_PLIST:-0}" = 1 ]; then
         mkdir -p /Library/LaunchDaemons
@@ -776,6 +783,38 @@ for SH in $SHELLS; do
     want "$nouser"; want "==> done."; done_case
     AS_ROOT=1 HAS_CONFIG=1 run pkg-wizard-one-row-own-row/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
     lines "sudo roomlerd one-row" 1; lines "$placed" 0; lines "==> done." 0; WANT_RC=1 done_case
+    # FR-141 P2's follow-up — a root config that is one row already, under
+    # another enrollment (another org, or the terminal's one row), stops the
+    # half before any change too. The wizard words the line by its start.
+    AS_ROOT=1 ONE_ROW_CONFIG=1 run pkg-wizard-one-row-over-another/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    lines "error: this Mac is one row already (" 1; lines "$placed" 0; lines "==> done." 0; WANT_RC=1 done_case
+    # FR-141 P2 — the three flags the one-row half refuses, before anything is
+    # downloaded: no user half, no half without the config its caller enrolled,
+    # and nothing folded into that config.
+    run pkg-one-row-refused/user-half Darwin arm64 0 normal "$new" 0 --role daemon --user-steps --one-row
+    lines "error: a one-row Mac has no user half" 1; WANT_RC=1 done_case
+    run pkg-one-row-refused/no-config Darwin arm64 0 normal "$new" 0 --role daemon --privileged-steps --one-row
+    lines "error: --privileged-steps --one-row places the root config its caller enrolled" 1; WANT_RC=1 done_case
+    run pkg-one-row-refused/config-take Darwin arm64 0 normal "$new" 0 "${wiz[@]}" --config-take overlay_enabled
+    lines "error: --one-row places the root config whole and folds nothing into it" 1; WANT_RC=1 done_case
+    # FR-141 P2's follow-up (F1) — the wizard's two-row half (FR-129 B2) on a
+    # Mac whose root config is one row already: an attempt the wizard left
+    # half-placed, a one-row Mac whose daemon did not answer the wizard's guard
+    # in time, or one removed with --keep-config. Before it, the fold kept both
+    # switches and the package removed the per-user LaunchAgent the second row
+    # needs. It stops before the marker and the package run, changes nothing,
+    # and names the roads that finish or remove such a Mac. Beside it, the same
+    # half over a two-row root config folds the new enrollment in, as before.
+    b2=(--role daemon --privileged-steps --config-from "$S/enrolled.toml")
+    req="==> requesting the privileged half (root LaunchDaemon — the overlay needs root)"
+    AS_ROOT=1 HAS_CONFIG=1 HAS_PLIST=1 run pkg-wizard-two-rows/normal Darwin arm64 0 normal "$new" 0 "${b2[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$req"; want "$fold"; want "==> done."; done_case
+    AS_ROOT=1 ONE_ROW_CONFIG=1 HAS_PLIST=1 run pkg-wizard-two-rows-over-one-row/normal Darwin arm64 0 normal "$new" 0 "${b2[@]}"
+    lines "error: this Mac is one row already (" 1; lines "sh -s -- --role daemon --one-row" 1
+    lines "sh -s -- --uninstall" 1; lines "$req" 0; lines "$fold" 0; lines "==> done." 0
+    [ ! -e /etc/roomler/enable-daemon ] || WHY="$WHY"$'\n'"    the marker was placed"
+    grep -qx 'macos_one_row = true' /etc/roomler/config.toml || WHY="$WHY"$'\n'"    root's config changed"
+    WANT_RC=1 done_case
     # #3925 — a Mac given its root half as a second row (--daemon-token): that
     # half's enrollment, through sudo, reads its stdin.
     two=(--role daemon --token check-token --daemon-token check-token-2)
