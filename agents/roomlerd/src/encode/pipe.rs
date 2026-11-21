@@ -176,7 +176,95 @@ pub struct Pipe {
     /// The tcp_shape harness's count of such windows; `None` is
     /// [`STALL_WINDOWS`].
     stall_gate: Option<u8>,
+    /// FR-148 D48 — the in-flight budget's last step as the governor noted it
+    /// ([`Self::note_path_rate`]), and what it read at the last two window
+    /// closes, the older first. `None` while the budget is off: then no
+    /// window rule reads anything.
+    path_rate: Option<PathRate>,
+    closes: [Option<PathRate>; 2],
+    /// FR-148 D48 — how the last window's readings reach the shadow model and
+    /// the pair memory, ruled at its close ([`Self::observe_delivered_in`]).
+    window_rule: WindowRule,
+    /// FR-148 D48 — the rule that last kept a reading out of the shadow model
+    /// and the pair memory, re-read it or bounded it, and when; the `path
+    /// model` line names it ([`Self::ruled`]).
+    ruled: Option<(Ruled, Instant)>,
 }
+
+/// FR-148 D48 — what the in-flight budget's last step read, as the governor
+/// notes it for the shadow model's window rules: the budget's rate, whether
+/// this association's figures gave it, and SCTP's loss count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PathRate {
+    /// The budget's rate, bit/s: the most of its one-second figures over two
+    /// seconds; `None` before one is known.
+    pub bps: Option<u32>,
+    /// This association's figures gave the rate; else the opening rate stood
+    /// in for it.
+    pub measured: bool,
+    /// SCTP's fast retransmits and T3-rtx expiries over the budget's
+    /// associations together: a count that never runs back.
+    pub loss: u64,
+}
+
+/// FR-148 D48 — the rule that kept a reading out of the shadow model and the
+/// pair memory, re-read it or bounded it. The `path model` line names the last
+/// one, and how long ago it acted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ruled {
+    /// B2's stall gate: a window after a stall the in-flight budget saw
+    /// ([`Pipe::note_stall`]).
+    Stall,
+    /// Rule 1: a P3 sample with a loss in it, re-read at the budget's rate at
+    /// its close.
+    ReRead,
+    /// Rule 4: a P3 sample with no loss in it and a hold SCTP's congestion
+    /// window sized, kept out: the association's ramp bound it.
+    Ramp,
+    /// Rule 2 (`bm0`): a window near a loss that read over the budget's
+    /// measured rate, taken at that rate; over a rate the opening stood in
+    /// for, taken at nothing.
+    Bound,
+    /// Rule 3 (`u90`): a window near a loss that read under 0.9 times the
+    /// measured rate, its link push-back kept out.
+    Hole,
+}
+
+impl Ruled {
+    /// The word the `path model` line writes.
+    pub fn word(self) -> &'static str {
+        match self {
+            Ruled::Stall => "stall",
+            Ruled::ReRead => "reread",
+            Ruled::Ramp => "ramp",
+            Ruled::Bound => "bound",
+            Ruled::Hole => "hole",
+        }
+    }
+}
+
+/// FR-148 D48 — how a window's readings reach the shadow model and the pair
+/// memory, near a loss (rules 2 and 3). `Pipe`'s own law takes every window
+/// as it is, and B2's stall gate acts before any of these.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum WindowRule {
+    /// As read.
+    #[default]
+    Take,
+    /// The delivery and the link push-back at no more than this measured
+    /// rate (`bm0`).
+    Bound(u32),
+    /// None of the window's readings: it read over a rate the opening stood
+    /// in for (`bm0`).
+    Out,
+    /// No link push-back; the delivery and the goodput push-back as read
+    /// (`u90`).
+    Hole,
+}
+
+/// FR-148 D48, rule 3 — a window near a loss that reads under this many
+/// tenths of the budget's measured rate read a hole the viewer waited on.
+const HOLE_TENTHS: u64 = 9;
 
 /// FR-148 D46 B2 — the windows a stall the in-flight budget saw keeps out of
 /// the shadow model and the pair memory, counted from the last step that saw
@@ -218,6 +306,12 @@ impl Pipe {
     ///
     /// FR-148 D46 B2 — nor from one of the [`STALL_WINDOWS`] after a stall the
     /// in-flight budget saw ([`Self::note_stall`]).
+    ///
+    /// FR-148 D48 — the call is the window's close: near a loss the shadow
+    /// model and the pair memory take the delivery at no more than the
+    /// budget's measured rate there, and nothing of it over a rate the
+    /// opening stood in for (rule 2, `bm0`; [`Self::close_window`]). The
+    /// stall gate acts first.
     pub fn observe_delivered_in(
         &mut self,
         bps: u32,
@@ -228,13 +322,32 @@ impl Pipe {
         // A window that delivered nothing is gated while a stall's count
         // stands, and uses none of it.
         self.window_gated = self.stall_windows > 0;
+        self.window_rule = self.close_window(bps);
         if bps == 0 {
             return false;
         }
         self.stall_windows = self.stall_windows.saturating_sub(1);
-        if valid && !self.window_gated {
-            self.model.delivered(bps, basis, now);
-            self.memory.delivered(bps, basis, now);
+        if valid {
+            let taken = if self.window_gated {
+                self.note_ruled(Ruled::Stall, now);
+                None
+            } else {
+                match self.window_rule {
+                    WindowRule::Take | WindowRule::Hole => Some(bps),
+                    WindowRule::Bound(rate) => {
+                        self.note_ruled(Ruled::Bound, now);
+                        Some(rate)
+                    }
+                    WindowRule::Out => {
+                        self.note_ruled(Ruled::Bound, now);
+                        None
+                    }
+                }
+            };
+            if let Some(taken) = taken {
+                self.model.delivered(taken, basis, now);
+                self.memory.delivered(taken, basis, now);
+            }
         }
         self.delivered_n = self.delivered_n.saturating_add(1);
         match self.floor {
@@ -279,9 +392,56 @@ impl Pipe {
     /// it either way, exactly as before; the pair memory takes it as a sample
     /// only from a read window in which the sender pushed, and otherwise only
     /// counts it.
+    ///
+    /// FR-148 D48 — of the window rules, only rule 2's over a stand-in rate
+    /// reaches this push-back (the goodput fold's): the window is no reading
+    /// at all then. The link loop's goes through
+    /// [`Self::observe_link_capacity_in`].
     pub fn observe_capacity_in(
         &mut self,
         bps: u32,
+        basis: Basis,
+        take: super::pair_memory::Take,
+        now: Instant,
+    ) {
+        let taken = (self.window_rule != WindowRule::Out).then_some(bps);
+        self.capacity_in(bps, taken, basis, take, now);
+    }
+
+    /// FR-148 D48 — [`Self::observe_capacity_in`] for the link loop's
+    /// push-back: the viewer's arrival rate while its queue grew, the window's
+    /// own delivery. Near a loss the shadow model and the pair memory take it
+    /// at no more than the budget's measured rate (rule 2, `bm0`), and none of
+    /// it under 0.9 times that rate (rule 3, `u90`): behind a hole the viewer
+    /// reads SCTP's order, not the path. This type's own law takes it as
+    /// [`Self::observe_capacity_in`] does.
+    pub fn observe_link_capacity_in(
+        &mut self,
+        bps: u32,
+        basis: Basis,
+        take: super::pair_memory::Take,
+        now: Instant,
+    ) {
+        let taken = match self.window_rule {
+            WindowRule::Take => Some(bps),
+            WindowRule::Bound(rate) => Some(bps.min(rate)),
+            WindowRule::Out => None,
+            WindowRule::Hole => {
+                if bps > 0 && !self.window_gated {
+                    self.note_ruled(Ruled::Hole, now);
+                }
+                None
+            }
+        };
+        self.capacity_in(bps, taken, basis, take, now);
+    }
+
+    /// A push-back at `bps`, which the shadow model and the pair memory take
+    /// at `taken`, or not at all.
+    fn capacity_in(
+        &mut self,
+        bps: u32,
+        taken: Option<u32>,
         basis: Basis,
         take: super::pair_memory::Take,
         now: Instant,
@@ -292,9 +452,12 @@ impl Pipe {
         // Every caller is a valid window: the goodput fold and the link loop
         // both act only on one (`governor`). FR-148 D46 B2: a window after a
         // stall the budget saw is no reading for the model or the memory.
-        if !self.window_gated {
-            self.model.pushed_back(bps, basis, now);
-            self.memory.pushed_back_in(bps, basis, take, now);
+        // FR-148 D48: nor what the window rules keep out.
+        if !self.window_gated
+            && let Some(taken) = taken
+        {
+            self.model.pushed_back(taken, basis, now);
+            self.memory.pushed_back_in(taken, basis, take, now);
         }
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
@@ -355,6 +518,82 @@ impl Pipe {
     #[cfg(test)]
     pub(crate) fn set_stall_gate(&mut self, n: u8) {
         self.stall_gate = Some(n);
+    }
+
+    /// FR-148 D48, the tcp_shape harness — what the shadow model and the pair
+    /// memory take of a reading of `bps` in the last window under the rule its
+    /// close ruled, B2's stall gate aside: as its delivery, its goodput
+    /// push-back and its link push-back, each at most this or none; and the
+    /// rule's word, empty for none.
+    #[cfg(test)]
+    pub(crate) fn window_takes(&self, bps: u32) -> ([Option<u32>; 3], &'static str) {
+        match self.window_rule {
+            WindowRule::Take => ([Some(bps); 3], ""),
+            WindowRule::Bound(rate) => {
+                let bound = Some(bps.min(rate));
+                ([bound, Some(bps), bound], "bound")
+            }
+            WindowRule::Out => ([None; 3], "out"),
+            WindowRule::Hole => ([Some(bps), Some(bps), None], "hole"),
+        }
+    }
+
+    /// FR-148 D48 — the in-flight budget's last step, computing on or in
+    /// shadow: its rate, whether this association's figures gave it, and
+    /// SCTP's loss count. The next window's close reads it
+    /// ([`Self::close_window`]). With the budget off nothing notes it, and
+    /// every window reaches the shadow model and the pair memory as before.
+    pub fn note_path_rate(&mut self, rate: PathRate) {
+        self.path_rate = Some(rate);
+    }
+
+    /// FR-148 D48 — `rule` kept a reading out of the shadow model and the
+    /// pair memory, re-read it or bounded it, at `now`.
+    pub fn note_ruled(&mut self, rule: Ruled, now: Instant) {
+        self.ruled = Some((rule, now));
+    }
+
+    /// FR-148 D48 — the rule that last kept a reading out, re-read it or
+    /// bounded it, and how long ago; `None` while none has.
+    pub fn ruled(&self, now: Instant) -> Option<(Ruled, Duration)> {
+        self.ruled
+            .map(|(rule, at)| (rule, now.saturating_duration_since(at)))
+    }
+
+    /// FR-148 D48 — a window's close, `bps` its delivery: how its readings
+    /// reach the shadow model and the pair memory. Near a loss (SCTP's count
+    /// moved since the close two windows back: over the window or the
+    /// window's length before it, since a hole's release reaches the viewer a
+    /// round trip or so after the retransmission the count counts), a window
+    /// over the budget's rate is taken at that rate when this association's
+    /// figures gave it, and not at all over a rate the opening stood in for
+    /// (rule 2); one under 0.9 times a measured rate makes no link push-back
+    /// (rule 3). Anywhere else, and with the budget off, as read.
+    fn close_window(&mut self, bps: u32) -> WindowRule {
+        let [back, last] = self.closes;
+        self.closes = [last, self.path_rate];
+        let Some(now) = self.path_rate else {
+            return WindowRule::Take;
+        };
+        let lost = now.loss > back.map_or(0, |b| b.loss);
+        match now.bps.filter(|&rate| rate > 0) {
+            Some(rate) if lost && bps > rate => {
+                if now.measured {
+                    WindowRule::Bound(rate)
+                } else {
+                    WindowRule::Out
+                }
+            }
+            Some(rate)
+                if lost
+                    && bps > 0
+                    && now.measured
+                    && u64::from(bps) * 10 < u64::from(rate) * HOLE_TENTHS =>
+            {
+                WindowRule::Hole
+            }
+            _ => WindowRule::Take,
+        }
     }
 
     /// The demonstrated lower bound: the most this path has EVER been shown to
@@ -800,6 +1039,10 @@ pub struct PathView {
     /// [`PathModel::capacity_by`]); `None` where a window's reading did.
     pub model_floor_by: Option<PushedBy>,
     pub model_capacity_by: Option<PushedBy>,
+    /// FR-148 D48 — the rule that last kept a reading out of the model and
+    /// the memory, re-read it or bounded it, and how long ago
+    /// ([`Pipe::ruled`]); `None` while none has.
+    pub model_ruled: Option<(Ruled, Duration)>,
 }
 
 #[cfg(test)]
@@ -1480,5 +1723,223 @@ mod tests {
         p.observe_delivered_in(1_300_000, Basis::Backlogged, false, now);
         p.observe_delivered_in(1_400_000, Basis::Backlogged, true, now);
         assert_eq!(p.model().floor(now).map(|f| f.bps), Some(1_400_000));
+    }
+
+    /// FR-148 D48 — what the in-flight budget's last step read: its rate,
+    /// given by this association's figures or not, and SCTP's loss count.
+    fn path(bps: u32, measured: bool, loss: u64) -> PathRate {
+        PathRate {
+            bps: Some(bps),
+            measured,
+            loss,
+        }
+    }
+
+    /// The take every D48 cell files its push-backs under.
+    fn pushed_take() -> super::super::pair_memory::Take {
+        use super::super::pair_memory::{Read, Take};
+        Take::Sample(Read::Overproduced)
+    }
+
+    /// FR-148 D48 — a window's close at `now`, the budget's step `noted`
+    /// before it: its delivery, then the link loop's push-back at it.
+    fn link_window(p: &mut Pipe, noted: PathRate, bps: u32, now: Instant) {
+        p.note_path_rate(noted);
+        p.observe_delivered_in(bps, Basis::Backlogged, true, now);
+        p.observe_link_capacity_in(bps, Basis::Backlogged, pushed_take(), now);
+    }
+
+    /// The window as the model took it before D48: its delivery and its
+    /// push-back at `bps`.
+    fn plain_window(p: &mut Pipe, bps: u32, now: Instant) {
+        p.observe_delivered_in(bps, Basis::Backlogged, true, now);
+        p.observe_capacity_in(bps, Basis::Backlogged, pushed_take(), now);
+    }
+
+    /// The shadow model and the pair memory read exactly what `want`'s did.
+    fn assert_same_reading(p: &Pipe, want: &Pipe) {
+        assert_eq!(format!("{:?}", p.model()), format!("{:?}", want.model()));
+        assert_eq!(format!("{:?}", p.memory()), format!("{:?}", want.memory()));
+    }
+
+    /// FR-148 D48, rule 2 (`bm0`) — near a loss, a window that read over the
+    /// budget's measured rate reaches the shadow model and the pair memory at
+    /// that rate, its delivery and its link push-back alike: a hole's release
+    /// comes back at once. This type's own law takes it as read, and the
+    /// `path model` line names the rule.
+    #[test]
+    fn near_a_loss_a_window_over_the_measured_rate_is_taken_at_that_rate() {
+        let now = t0();
+        let later = now + Duration::from_secs(1);
+        let mut p = Pipe::default();
+        link_window(&mut p, path(1_000_000, true, 0), 900_000, now);
+        assert_eq!(p.ruled(now), None);
+        link_window(&mut p, path(1_000_000, true, 1), 2_500_000, later);
+        let mut want = Pipe::default();
+        plain_window(&mut want, 900_000, now);
+        plain_window(&mut want, 1_000_000, later);
+        assert_same_reading(&p, &want);
+        assert_eq!(p.model().floor(later).map(|f| f.bps), Some(1_000_000));
+        assert_eq!(p.model().capacity(later).map(|c| c.bps), Some(1_000_000));
+        assert_eq!(p.floor_bps(later), Some(2_500_000), "its own law: as read");
+        assert_eq!(p.capacity_bps(later), Some(2_500_000));
+        assert_eq!(p.ruled(later), Some((Ruled::Bound, Duration::ZERO)));
+        assert_eq!(
+            p.ruled(later + Duration::from_millis(1_200)),
+            Some((Ruled::Bound, Duration::from_millis(1_200)))
+        );
+    }
+
+    /// FR-148 D48, rule 2 — near a loss, a window that read over a rate the
+    /// opening stood in for is no reading for the shadow model or the pair
+    /// memory, its delivery and both push-backs, as a stall's window is not:
+    /// a stand-in is no measurement to bound it by, nor to call a hole by.
+    /// This type's own law takes it as read.
+    #[test]
+    fn near_a_loss_a_window_over_a_stand_in_rate_is_no_reading() {
+        let now = t0();
+        let (later, next) = (now + Duration::from_secs(1), now + Duration::from_secs(2));
+        let mut p = Pipe::default();
+        link_window(&mut p, path(1_500_000, false, 0), 900_000, now);
+        p.note_path_rate(path(1_500_000, false, 2));
+        p.observe_delivered_in(2_500_000, Basis::Backlogged, true, later);
+        p.observe_capacity_in(2_400_000, Basis::Backlogged, pushed_take(), later);
+        p.observe_link_capacity_in(2_500_000, Basis::Backlogged, pushed_take(), later);
+        let mut want = Pipe::default();
+        plain_window(&mut want, 900_000, now);
+        assert_same_reading(&p, &want);
+        assert_eq!(p.floor_bps(later), Some(2_500_000), "its own law took it");
+        assert_eq!(p.capacity_bps(later), Some(2_500_000));
+        assert_eq!(p.ruled(later), Some((Ruled::Bound, Duration::ZERO)));
+        // Under the stand-in, as read: no hole is called by one.
+        link_window(&mut p, path(1_500_000, false, 2), 600_000, next);
+        plain_window(&mut want, 600_000, next);
+        assert_same_reading(&p, &want);
+    }
+
+    /// FR-148 D48, rule 3 (`u90`) — near a loss, a window that read under 0.9
+    /// times the budget's measured rate makes no link push-back on the shadow
+    /// model or the pair memory: the viewer read SCTP's order behind a hole,
+    /// not the path. Its delivery and the goodput fold's push-back count, and
+    /// this type's own law takes all of it. At 0.9 times the rate it is a
+    /// reading.
+    #[test]
+    fn near_a_loss_a_window_under_nine_tenths_of_the_rate_makes_no_link_push_back() {
+        let now = t0();
+        let (later, next) = (now + Duration::from_secs(1), now + Duration::from_secs(2));
+        let mut p = Pipe::default();
+        link_window(&mut p, path(2_000_000, true, 0), 1_900_000, now);
+        p.note_path_rate(path(2_000_000, true, 1));
+        p.observe_delivered_in(1_000_000, Basis::Backlogged, true, later);
+        p.observe_capacity_in(1_200_000, Basis::Backlogged, pushed_take(), later);
+        p.observe_link_capacity_in(1_000_000, Basis::Backlogged, pushed_take(), later);
+        // The delivery and the goodput fold's push-back; no link push-back.
+        let mut want = Pipe::default();
+        plain_window(&mut want, 1_900_000, now);
+        want.observe_delivered_in(1_000_000, Basis::Backlogged, true, later);
+        want.observe_capacity_in(1_200_000, Basis::Backlogged, pushed_take(), later);
+        assert_same_reading(&p, &want);
+        assert_eq!(
+            p.capacity_bps(later),
+            Some(1_000_000),
+            "its own law took it"
+        );
+        assert_eq!(p.ruled(later), Some((Ruled::Hole, Duration::ZERO)));
+        // The equal case: 1.8 Mbit/s is 0.9 times the rate, a reading.
+        link_window(&mut p, path(2_000_000, true, 1), 1_800_000, next);
+        plain_window(&mut want, 1_800_000, next);
+        assert_same_reading(&p, &want);
+        assert_eq!(p.ruled(next), Some((Ruled::Hole, Duration::from_secs(1))));
+    }
+
+    /// FR-148 D48 — near a loss is the window SCTP's count moved over, or
+    /// the window's length before it: a hole's release reaches the viewer a
+    /// round trip or so after the retransmission the count counts. Two
+    /// windows on, the rules read nothing, and a window over the rate is
+    /// taken as read.
+    #[test]
+    fn a_loss_is_near_for_the_window_it_moved_in_and_the_next_only() {
+        let now = t0();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let floor = |p: &Pipe, n: u64| p.model().floor(s(n)).map(|f| f.bps);
+        let mut p = Pipe::default();
+        link_window(&mut p, path(1_000_000, true, 0), 1_000_000, s(0));
+        link_window(&mut p, path(1_000_000, true, 1), 1_500_000, s(1));
+        assert_eq!(floor(&p, 1), Some(1_000_000), "the window it moved in");
+        link_window(&mut p, path(1_000_000, true, 1), 1_600_000, s(2));
+        assert_eq!(floor(&p, 2), Some(1_000_000), "the window after it");
+        link_window(&mut p, path(1_000_000, true, 1), 1_700_000, s(3));
+        assert_eq!(floor(&p, 3), Some(1_700_000), "two windows on: as read");
+    }
+
+    /// FR-148 D48 — B2's stall gate acts before the window rules: a window
+    /// after a stall the budget saw is no reading, whatever it read near a
+    /// loss, and the `path model` line names the gate. A window that
+    /// delivered nothing is no reading either way.
+    #[test]
+    fn the_stall_gate_acts_before_the_window_rules() {
+        let now = t0();
+        let later = now + Duration::from_secs(1);
+        let mut p = Pipe::default();
+        link_window(&mut p, path(2_000_000, true, 0), 1_900_000, now);
+        p.note_stall();
+        link_window(&mut p, path(2_000_000, true, 1), 3_000_000, later);
+        let mut want = Pipe::default();
+        plain_window(&mut want, 1_900_000, now);
+        assert_same_reading(&p, &want);
+        assert_eq!(p.ruled(later), Some((Ruled::Stall, Duration::ZERO)));
+        // Under 0.9 times the rate, after a stall: the gate's, not a hole's.
+        p.note_stall();
+        link_window(&mut p, path(2_000_000, true, 2), 1_000_000, later);
+        assert_same_reading(&p, &want);
+        assert_eq!(p.ruled(later), Some((Ruled::Stall, Duration::ZERO)));
+        let next = later + Duration::from_secs(1);
+        link_window(&mut p, path(2_000_000, true, 3), 0, next);
+        assert_same_reading(&p, &want);
+    }
+
+    /// FR-148 D48 — with the in-flight budget off nothing notes a rate, and
+    /// with it on a path that loses nothing the rules read nothing: every
+    /// window reaches the shadow model and the pair memory byte for byte as
+    /// before, over and under the rate, the link loop's push-back as the
+    /// goodput fold's, and a stall's gate as B2 left it. No rule is named.
+    #[test]
+    fn with_no_loss_or_the_budget_off_the_model_reads_every_window_as_before() {
+        let now = t0();
+        let s = |n: u64| now + Duration::from_millis(n * 1_000);
+        let windows: [(u32, Option<u32>, bool); 6] = [
+            (900_000, Some(850_000), false),
+            (2_500_000, None, false),
+            (600_000, Some(700_000), true),
+            (3_000_000, Some(2_900_000), false),
+            (0, None, false),
+            (1_100_000, None, false),
+        ];
+        let (mut before, mut off, mut lossless) =
+            (Pipe::default(), Pipe::default(), Pipe::default());
+        for (n, &(rx, goodput, stall)) in (0..).zip(windows.iter()) {
+            let now = s(n);
+            lossless.note_path_rate(path(1_000_000, n > 1, 0));
+            for p in [&mut before, &mut off, &mut lossless] {
+                if stall {
+                    p.note_stall();
+                }
+                p.observe_delivered_in(rx, Basis::Backlogged, true, now);
+                if let Some(g) = goodput {
+                    p.observe_capacity_in(g, Basis::Backlogged, pushed_take(), now);
+                }
+            }
+            before.observe_capacity_in(rx, Basis::Backlogged, pushed_take(), now);
+            off.observe_link_capacity_in(rx, Basis::Backlogged, pushed_take(), now);
+            lossless.observe_link_capacity_in(rx, Basis::Backlogged, pushed_take(), now);
+        }
+        let end = s(6);
+        for p in [&off, &lossless] {
+            assert_same_reading(p, &before);
+            assert_eq!(p.floor_bps(end), before.floor_bps(end));
+            assert_eq!(p.capacity_bps(end), before.capacity_bps(end));
+            assert_eq!(p.counts(), before.counts());
+            assert_eq!(p.ruled(end), Some((Ruled::Stall, Duration::from_secs(4))));
+        }
     }
 }
