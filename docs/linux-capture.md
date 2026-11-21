@@ -2901,7 +2901,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1170-1257`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3218-3228`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3256-3266`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
