@@ -960,8 +960,8 @@ const DROP_LOG_EVERY: Duration = Duration::from_secs(30);
 /// FR-148 D52 — the most (network, destination) pairs one cause's line book
 /// holds (a race can add one more per thread in flight). Past it the counts
 /// still move, and a new pair's line waits for the next sweep, which runs at
-/// most once per [`DROP_LOG_EVERY`]: a flood of new pairs costs one scan per
-/// window, never one per frame.
+/// most once per [`DROP_LOG_EVERY`] and removes the pairs whose last line is
+/// older than that.
 const DROP_LOG_KEYS: usize = 4096;
 
 /// The first 8 hex characters of a pubkey: enough to match a drop line here
