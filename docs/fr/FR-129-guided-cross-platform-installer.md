@@ -28,7 +28,7 @@ Read on master `b4e72ff0d` and on production, 2026-10-27/28.
 ### The token step is a dead end for anyone without an account
 
 The wizard's step 3 is a text box: "Paste a fresh token from the Roomler admin UI"
-(`agents/roomler-setup/src/front/index.html:182`). Nothing on it opens a browser, names a
+(`agents/roomler-setup/src/front/index.html:179`). Nothing on it opens a browser, names a
 signup page or says where a token comes from. To get one, a new person must:
 
 1. register — production answers with a message and **no session**
@@ -50,7 +50,7 @@ path is the same: `install.sh` without `--token` prints the enroll command to ru
 Every daemon-role arm of the wizard's detection says
 `supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:85, 92, 99, 109`),
 and the daemon surface off Windows is a set of no-op stubs
-(`agents/roomler-setup/src/orchestrator_agent.rs:1376, 1590, 1624`). The docs say so plainly:
+(`agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922`). The docs say so plainly:
 on Linux and macOS the daemon is `install.sh` in a terminal, and the wizard does the tunnel
 client only (`docs/installation.md:22, 26`).
 
@@ -66,13 +66,13 @@ them:
 
 | Step | Where | Why it is not optional |
 |---|---|---|
-| package format follows the host | `scripts/install.sh:453-472` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
-| the macOS root-half marker | `scripts/install.sh:590-599` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
-| the per-user half as the console user | `scripts/install.sh:204-224` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
-| the macOS second enrollment | `scripts/install.sh:621-651` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
-| the FR-96 update helper | `scripts/install.sh:375-393` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:912`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
-| digest verification | `scripts/install.sh:234-243` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
+| package format follows the host | `scripts/install.sh:402-421` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
+| the macOS root-half marker | `scripts/install.sh:539-548` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
+| the per-user half as the console user | `scripts/install.sh:199-210` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
+| the macOS second enrollment | `scripts/install.sh:570-600` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
+| the FR-96 update helper | `scripts/install.sh:324-342` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
+| the desktop companion | `scripts/install.sh:842`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| digest verification | `scripts/install.sh:219-228` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
 
