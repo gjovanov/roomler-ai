@@ -93,6 +93,16 @@ pub const FLOOR_PACKETS: u64 = 3;
 /// long, so the core's rings are fixed.
 pub const GRAIN: Duration = Duration::from_millis(50);
 
+/// FR-148 D48 — B2's `held` ([`Over::held`]): the verdicts held a frame in
+/// at least this share of the whole grains of each of a span's seconds, per
+/// cent. On the `tcp_shape` loaded cells a backlogged writer's samples held
+/// 0.36 of a second's grains or more, an application-limited writer's 0.08
+/// or less: a hold or three as an outage's release drained or the next stall
+/// filled the budget, which made such a sample a P3 that set the shadow
+/// model's capacity under the link. Chosen between the two
+/// (`docs/rate-control.md`).
+pub const HELD_SHARE_PERCENT: u64 = 20;
+
 /// FR-148 D46 — a still span's release is a burst when this share of what
 /// SCTP had in flight at the span's last still reading is acknowledged by the
 /// first frame [`BURST_WITHIN`] after that reading, per mille. A head-of-line
@@ -509,6 +519,15 @@ fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The grains wholly inside `a` to `b`, µs: from the first that starts at or
+/// after `a` to the last that ends at or before `b` (FR-148 D48). Empty when
+/// there is none.
+fn whole_grains(a: u64, b: u64) -> std::ops::Range<u64> {
+    let grain = us(GRAIN);
+    let (lo, hi) = (a.div_ceil(grain), b / grain);
+    lo..hi.max(lo)
+}
+
 /// SCTP's own window binds and nothing waits in its queue: the vendored SCTP
 /// grows its window only while a chunk waits, so a frame goes whatever the
 /// budget (else a window a T3 cut to one packet stays there).
@@ -536,6 +555,10 @@ pub struct Budget {
     /// `hold_grain`'s.
     holds: u64,
     hold_grain: u64,
+    /// FR-148 D48, rule 4 — of those, the holds SCTP's congestion window
+    /// sized ([`Self::ramp_sized`]), by grain as `holds` keeps them. Only
+    /// [`Self::over`] reads it, for [`Over::ramp`].
+    ramp_holds: u64,
     last_acked: Option<u64>,
     still: Option<Still>,
     /// FR-148 D46 — the stall classifier: its thresholds, the release being
@@ -571,6 +594,14 @@ pub struct Budget {
     first_measured: Option<u64>,
     /// The last step's budget, `out` and rate.
     last: (u64, u64, Option<u64>),
+    /// FR-148 D48 — SCTP's fast retransmits and T3-rtx expiries at the last
+    /// step, over this budget's associations together; `None` before this
+    /// association's first step. The shadow model's window rules read it
+    /// ([`Self::loss`]).
+    loss: Option<u64>,
+    /// The associations' before this one: a new association's counts start
+    /// from 0, and the sum never runs back.
+    loss_before: u64,
     window: Window,
 }
 
@@ -584,7 +615,9 @@ pub struct Over {
     /// That span stood still for [`Budget::still_after`] or more inside the
     /// span itself, from its first still reading to its last.
     pub still_inside: bool,
-    /// The verdicts held a frame in each whole second of the span.
+    /// The verdicts held a frame in at least [`HELD_SHARE_PERCENT`] of the
+    /// grains of each whole second of the span, counting only the grains
+    /// wholly inside it (FR-148 D48).
     pub held: bool,
     /// The span starts inside the last released still span, or while its
     /// release came back: how long before the span's start that span's first
@@ -595,6 +628,17 @@ pub struct Over {
     /// window was still opening, so a hold or a backlog said nothing of the
     /// path. Before the budget's first step, every span is.
     pub opening: bool,
+    /// FR-148 D48, rule 4 — SCTP's congestion window sized a hold in a grain
+    /// wholly inside the span: the budget's window term was under its rate
+    /// and the congestion window was the smaller window
+    /// (`cwnd <= rwnd + inflight`). The association's ramp bound such a hold,
+    /// not the path. A hold the receive window sized is the viewer's, and is
+    /// not one.
+    pub ramp: bool,
+    /// FR-148 D48, rule 1 — the budget's rate at its last step, bit/s: the
+    /// most of its one-second figures over two seconds, at the sample's
+    /// close. `None` before the budget's first step.
+    pub rate: Option<u64>,
 }
 
 impl Default for Budget {
@@ -632,6 +676,7 @@ impl Budget {
             standing: None,
             holds: 0,
             hold_grain: 0,
+            ramp_holds: 0,
             last_acked: None,
             still: None,
             classifier,
@@ -645,6 +690,8 @@ impl Budget {
             measured: false,
             first_measured: None,
             last: (0, 0, None),
+            loss: None,
+            loss_before: 0,
             window: Window::new(),
         }
     }
@@ -690,8 +737,16 @@ impl Budget {
         if verdict.holds() {
             self.age_holds(t);
             self.holds |= 1;
+            if self.ramp_sized(rate, &r.gauges) {
+                self.ramp_holds |= 1;
+            }
         }
         self.last = (budget, out, rate);
+        self.loss = Some(
+            self.loss_before
+                .saturating_add(r.gauges.fast_retransmits)
+                .saturating_add(r.gauges.t3_expiries),
+        );
         let w = &mut self.window;
         w.offered += 1;
         w.held += u64::from(verdict.holds());
@@ -762,9 +817,12 @@ impl Budget {
     /// `from` to `to`, whose clock stood at `from_acked` at its start: whether
     /// a still span of the least and S met it, from its first still reading to
     /// its release's ([`Over::stood`]), and stood that long inside it; whether
-    /// the verdicts held a frame in each of its whole seconds; and whether it
+    /// the verdicts held a frame in a share of each of its whole seconds
+    /// ([`Over::held`]); and whether it
     /// starts inside the last released span, or while its release came back;
     /// and whether it starts before the first measured rate ([`Over::opening`]).
+    /// FR-148 D48: whether SCTP's congestion window sized a hold in it
+    /// ([`Over::ramp`]), and the rate at the last step ([`Over::rate`]).
     /// Nothing before the first step, and nothing of an earlier association.
     pub fn over(&self, from: Instant, to: Instant, from_acked: u64) -> Over {
         let Some(epoch) = self.epoch else {
@@ -796,33 +854,66 @@ impl Budget {
                     )
                 }),
             opening: self.first_measured.is_none_or(|m| a < m),
+            ramp: whole_grains(a, b).any(|g| self.in_mask(self.ramp_holds, g)),
+            rate: self.last.2,
         }
     }
 
     /// FR-148 D46 B2 — whether this association's figures gave the last
-    /// step's rate: the tcp_shape harness's look at the opening.
-    #[cfg(test)]
-    pub(crate) fn rate_measured(&self) -> bool {
+    /// step's rate, or the opening rate stood in. FR-148 D48: the shadow
+    /// model's window rules bound a window by a measured rate only.
+    pub fn rate_measured(&self) -> bool {
         self.measured
     }
 
-    /// Whether the verdicts held a frame in each of `parts` equal stretches
-    /// of the grains from `a` to `b`, µs. The mask keeps 64 grains: a grain
-    /// older than that, or newer than the last hold, held nothing it knows.
+    /// FR-148 D48 — SCTP's fast retransmits and T3-rtx expiries at the last
+    /// step, over this budget's associations together, so the count never
+    /// runs back; `None` before this association's first step.
+    pub fn loss(&self) -> Option<u64> {
+        self.loss
+    }
+
+    /// Whether the verdicts held a frame in at least [`HELD_SHARE_PERCENT`]
+    /// of the grains of each of `parts` equal stretches of the grains wholly
+    /// inside `a` to `b`, µs. FR-148 D48: a grain the span only partly covers
+    /// is its edge's, and the mask keeps no finer time, so a hold there (an
+    /// outage's release before the span, or the next one's start after it) is
+    /// not the span's; a span with no whole grain held nothing. And a hold or
+    /// three in a second say nothing of the path: an application-limited
+    /// writer's release drains through them.
     fn held_each(&self, a: u64, b: u64, parts: u64) -> bool {
-        let grain = us(GRAIN);
-        let (lo, hi) = (a / grain, b / grain);
-        let n = hi - lo + 1;
-        let held_in = |g: u64| {
-            g <= self.hold_grain
-                && self.hold_grain - g < 64
-                && (self.holds >> (self.hold_grain - g)) & 1 == 1
-        };
+        let grains = whole_grains(a, b);
+        if grains.is_empty() {
+            return false;
+        }
+        let (lo, n) = (grains.start, grains.end - grains.start);
         (0..parts).all(|p| {
             let first = lo + p * n / parts;
             let last = (lo + (p + 1) * n / parts).max(first + 1);
-            (first..last).any(held_in)
+            let held = (first..last)
+                .filter(|&g| self.in_mask(self.holds, g))
+                .count();
+            let held = u64::try_from(held).unwrap_or(u64::MAX);
+            held > 0 && held.saturating_mul(100) >= HELD_SHARE_PERCENT * (last - first)
         })
+    }
+
+    /// Whether `mask`, kept by grain as `holds` is, has grain `g`. The masks
+    /// keep 64 grains: a grain older than that, or newer than the last one
+    /// they moved to, held nothing they know.
+    fn in_mask(&self, mask: u64, g: u64) -> bool {
+        g <= self.hold_grain && self.hold_grain - g < 64 && (mask >> (self.hold_grain - g)) & 1 == 1
+    }
+
+    /// FR-148 D48, rule 4 — whether SCTP's congestion window, not the rate,
+    /// sized a step's budget at `rate`: its window term under the rate (as
+    /// [`Self::size`] takes the smaller), with the congestion window the
+    /// smaller of the two windows. With the receive window the smaller, the
+    /// viewer sized it: a real limit of the pair, and no ramp.
+    fn ramp_sized(&self, rate: Option<u64>, g: &Gauges) -> bool {
+        let by_window = self.by_window(g);
+        rate.is_none_or(|r| by_window < r)
+            && u64::from(g.cwnd) <= u64::from(g.rwnd).saturating_add(g.inflight_bytes)
     }
 
     /// The selected candidate pair changed: the old path's least is no floor
@@ -841,6 +932,8 @@ impl Budget {
         self.clock.clear();
         self.figures.clear();
         self.holds = 0;
+        self.ramp_holds = 0;
+        self.loss_before = self.loss.take().unwrap_or(self.loss_before);
         self.last_acked = None;
         self.still = None;
         self.last_still = None;
@@ -1047,12 +1140,13 @@ impl Budget {
         });
     }
 
-    /// The holds' mask, moved on to `t`'s grain.
+    /// The holds' masks, moved on to `t`'s grain.
     fn age_holds(&mut self, t: u64) {
         let grain = t / us(GRAIN);
         if grain > self.hold_grain {
             let by = grain - self.hold_grain;
             self.holds = if by >= 64 { 0 } else { self.holds << by };
+            self.ramp_holds = if by >= 64 { 0 } else { self.ramp_holds << by };
             self.hold_grain = grain;
         }
     }
@@ -2460,6 +2554,8 @@ mod tests {
                 held: false,
                 released_from: Some((d(400), 0)),
                 opening: false,
+                ramp: false,
+                rate: b.rate_bps(),
             }
         );
         // Met by its last 200 ms of stand and its release only.
@@ -2475,6 +2571,7 @@ mod tests {
                 b.over(at(t0, from), at(t0, to), count(from)),
                 Over {
                     opening: from == 0,
+                    rate: b.rate_bps(),
                     ..Over::default()
                 },
                 "{from} to {to} ms"
@@ -2509,6 +2606,122 @@ mod tests {
             "none in its second second"
         );
         assert!(!b.over(at(t0, 3_000), at(t0, 4_950), 0).held);
+    }
+
+    /// FR-148 D48 — B2's `held` on an application-limited writer: one hold
+    /// in the grain a span starts in, before its start (an outage's release
+    /// draining), and one in the grain it ends in, after its end (the next
+    /// outage filling the budget), are the edges', not the span's; nor is one
+    /// inside it in a grain it only partly covers, as the mask keeps no finer
+    /// time. A hold in a grain wholly inside it is the span's: in a span of
+    /// four whole grains, a quarter of them, over [`HELD_SHARE_PERCENT`].
+    #[test]
+    fn a_hold_in_a_span_s_edge_grains_is_not_the_span_s() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let hold = |b: &mut Budget, t: u64, acked: u64| {
+            let verdict = b.step(at(t0, t), &read(acked, wide(10 << 20, 1), 1_500_000));
+            assert_eq!(verdict, Verdict::Hold, "at {t} ms");
+        };
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 1);
+        hold(&mut b, 2_010, acked);
+        let acked = run(&mut b, t0, 2_050, 3_950, acked, 2_000_000, 1);
+        hold(&mut b, 3_990, acked);
+        run(&mut b, t0, 4_000, 4_950, acked, 2_000_000, 1);
+        // Grains 2.00-2.05 s and 3.95-4.00 s: the holds fall outside the span.
+        assert!(!b.over(at(t0, 2_030), at(t0, 3_970), 0).held);
+        // Inside it, but in the grains it only partly covers.
+        assert!(!b.over(at(t0, 2_005), at(t0, 3_995), 0).held);
+        assert!(
+            !b.over(at(t0, 2_005), at(t0, 2_045), 0).held,
+            "no whole grain"
+        );
+        // Wholly inside, the grain a span starts in holds its hold, and so
+        // does the grain it ends in; ended 5 ms short, the one hold is in a
+        // grain the span partly covers.
+        assert!(b.over(at(t0, 1_990), at(t0, 2_240), 0).held);
+        assert!(b.over(at(t0, 3_760), at(t0, 4_000), 0).held);
+        assert!(!b.over(at(t0, 3_760), at(t0, 3_995), 0).held);
+    }
+
+    /// FR-148 D48 — B2's `held` takes a share: a second is held when the
+    /// verdicts held a frame in at least a fifth of its whole grains
+    /// ([`HELD_SHARE_PERCENT`]). Eight holds in 39 grains are; seven are not;
+    /// one hold 30 ms into a span, an application-limited writer's outage
+    /// draining as on the `tcp_shape` 80 % outage cells, is not; and each of
+    /// a span's seconds needs its own share.
+    #[test]
+    fn a_second_is_held_when_a_fifth_of_its_whole_grains_are() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 1);
+        let acked = run(&mut b, t0, 2_000, 2_350, acked, 2_000_000, 10 << 20);
+        let acked = run(&mut b, t0, 2_400, 3_950, acked, 2_000_000, 1);
+        let verdict = b.step(at(t0, 4_030), &read(acked, wide(10 << 20, 1), 1_500_000));
+        assert_eq!(verdict, Verdict::Hold);
+        let held = |b: &Budget, from: u64, to: u64| b.over(at(t0, from), at(t0, to), 0).held;
+        assert!(held(&b, 2_000, 3_990), "8 of its 39 grains");
+        assert!(!held(&b, 2_050, 4_040), "7 of 39");
+        assert!(!held(&b, 2_000, 4_000), "none in its second second");
+        assert!(held(&b, 2_000, 2_990), "8 of 19");
+        run(&mut b, t0, 4_050, 5_950, acked, 2_000_000, 1);
+        assert!(!held(&b, 4_000, 5_990), "one hold, 30 ms in");
+        assert!(held(&b, 4_000, 4_200), "the same hold, one of four grains");
+    }
+
+    /// FR-148 D48, rule 4 — a hold SCTP's congestion window sized, in a
+    /// grain wholly inside a span, is the association's ramp
+    /// ([`Over::ramp`]): a 15 kB window over the 150 ms least (none read
+    /// yet) carries 800 kbit/s, under the 2 Mbit/s rate, and 30 kB out holds.
+    /// The congestion window the smaller window, or equal to the receive
+    /// window and what is in flight, it is the ramp's; the receive window the
+    /// smaller, the viewer's; a wide window, the rate's. Neither of those is,
+    /// though both hold. A hold in an edge grain is not the span's, as for
+    /// `held`, and a new association forgets them. The count of losses the
+    /// window rules read never runs back across associations.
+    #[test]
+    fn a_hold_sctp_s_congestion_window_sized_is_the_ramp_s() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let hold = |b: &mut Budget, t: u64, acked: u64, gauges: Gauges| {
+            let verdict = b.step(at(t0, t), &read(acked, gauges, 1_500_000));
+            assert_eq!(verdict, Verdict::Hold, "at {t} ms");
+        };
+        let span = |b: &Budget, from: u64, to: u64| b.over(at(t0, from), at(t0, to), 0);
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 10 << 20);
+        assert!(near(b.rate_bps(), 2_000_000), "{:?}", b.rate_bps());
+        assert!(!span(&b, 0, 1_950).ramp, "the rate's holds");
+        hold(&mut b, 2_010, acked, g(15_000, 1 << 20, 10_000, 20_000));
+        let acked = run(&mut b, t0, 2_050, 2_950, acked, 2_000_000, 1);
+        assert!(span(&b, 2_000, 2_950).ramp, "the congestion window's");
+        assert!(!span(&b, 2_030, 2_950).ramp, "an edge grain's");
+        hold(&mut b, 3_010, acked, g(15_000, 5_000, 10_000, 20_000));
+        let acked = run(&mut b, t0, 3_050, 3_950, acked, 2_000_000, 1);
+        assert!(span(&b, 3_000, 3_950).ramp, "the equal case");
+        hold(&mut b, 4_010, acked, g(1 << 20, 5_000, 10_000, 20_000));
+        let acked = run(&mut b, t0, 4_050, 4_950, acked, 2_000_000, 1);
+        hold(&mut b, 5_010, acked, wide(10 << 20, 1));
+        let acked = run(&mut b, t0, 5_050, 5_950, acked, 2_000_000, 1);
+        for from in [4_000, 5_000] {
+            let o = span(&b, from, from + 200);
+            assert!(o.held && !o.ramp, "{from} ms: {o:?}");
+        }
+        assert!(span(&b, 3_000, 5_950).ramp);
+        let loss = |b: &mut Budget, t: u64, fast: u64, t3: u64| {
+            let gauges = Gauges {
+                fast_retransmits: fast,
+                t3_expiries: t3,
+                ..wide(1, 0)
+            };
+            b.step(at(t0, t), &read(acked, gauges, 1_500_000));
+            b.loss()
+        };
+        assert_eq!(loss(&mut b, 6_000, 3, 1), Some(4));
+        b.on_new_association();
+        assert!(!span(&b, 3_000, 5_950).ramp, "a new association's");
+        assert_eq!(b.loss(), None);
+        assert_eq!(loss(&mut b, 6_050, 0, 0), Some(4), "never runs back");
+        assert_eq!(loss(&mut b, 6_100, 1, 0), Some(5));
     }
 
     /// FR-148 D46 B2 — the budget's opening, which a P3 sample may not start

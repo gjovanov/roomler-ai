@@ -207,7 +207,7 @@ The plumbing is one shape for all of them:
 
 ```mermaid
 flowchart LR
-  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3165–3170 → ROOMLERD_*"]
+  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3156–3161 → ROOMLERD_*"]
   bridge --> rd["readers<br/>encode/mod.rs:319–450<br/>on unless the value is \"0\""]
   rd --> gf["GovernorFlags::from_env<br/>governor.rs:171"]
   rd --> pk["PlanKnobs::from_env<br/>plan.rs:187 (P2)"]

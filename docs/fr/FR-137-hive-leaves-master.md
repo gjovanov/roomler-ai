@@ -93,15 +93,15 @@ the design:
 
 | # | Fact | Evidence | Consequence |
 |---|---|---|---|
-| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4369`) and `merge_unknown_keys` (`:4503`), locked by `:5065` | Removing the 23 keys strands nothing, and a rollback finds them again. |
-| 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1591`, deserialized at `:1712`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
+| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4328`) and `merge_unknown_keys` (`:4457`), locked by `:4994` | Removing the 23 keys strands nothing, and a rollback finds them again. |
+| 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1839`, deserialized at `:1959`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
 | 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:605`; no handler (`:612`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4411`) and `crates/modules/fleet/src/socket.rs:801` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
-| 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:2988`, `:2993`, "Deliberately not fatal" (`:2985`) | The agent needs no stub variant. |
+| 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:3100`, `:3105`, "Deliberately not fatal" (`:3097`) | The agent needs no stub variant. |
 | 5 | `ClientMsg` ignores unknown fields. | `crates/remote_control/src/signaling.rs:523-525` | If P2 dropped `ssh_ticket` or `net_grant`, an old agent's ticketed request would parse as **the owner's own**. Hence S-B3. |
-| 6 | Role reconcile only adds bits. | `let reconciled = stored \| def.permissions;` (`crates/services/src/dao/tenant.rs:459`) | Bits 32-34 stay in stored masks for good. A deleted name would let a future bit pass both bit tests (`crates/db/src/models/role.rs:529`, `:544`) and reach every member. Hence S-A5. |
+| 6 | Role reconcile only adds bits. | `let reconciled = stored \| def.permissions;` (`crates/services/src/dao/tenant.rs:427`) | Bits 32-34 stay in stored masks for good. A deleted name would let a future bit pass both bit tests (`crates/db/src/models/role.rs:529`, `:544`) and reach every member. Hence S-A5. |
 | 7 | `SshDenyReason` is a strict enum in stored audit rows. | `pub enum SshDenyReason` (`crates/remote_control/src/models.rs:5253`); a 90-day TTL (`:5546`); one unknown word fails a page (`crates/services/src/dao/base.rs:237`) | Its three FR-90 variants stay (S-A6, S-B5). |
 | 8 | DERP's `RMHIVE01` demux keeps a replica frame away from WireGuard. | `crates/tunnel-core/src/transport/derp.rs:566`, `:570`; otherwise `Unrouted` (`:625`) leads to `demote_follow` (`crates/tunnel-core/src/overlay/runtime.rs:2875`) | Without a stub, a 0.4.199 peer's frame would pin a healthy direct pair to the relay for up to 15 minutes at a time. Hence S-B1. |
-| 9 | The module ids are part of core's contract. | every wire owner must be a module (`crates/core/src/composition.rs:264`); `HOOK_ORDER` must equal the modules (`crates/core/src/hooks.rs:531`) | `hive`, `vault` and `knowhow` leave `graph::MODULES` in P2 with the wire, not in P1. |
+| 9 | The module ids are part of core's contract. | every wire owner must be a module (`crates/core/src/composition.rs:264`); `HOOK_ORDER` must equal the modules (`crates/core/src/hooks.rs:483`) | `hive`, `vault` and `knowhow` leave `graph::MODULES` in P2 with the wire, not in P1. |
 | 10 | A release list that names a missing feature fails at **tag** time. | the four lines in §2.2; the features at `agents/roomlerd/Cargo.toml:806`, `:814`, `:823` | The crate's features and all four lists change in one commit, rehearsed before merge (B-I1). |
 | 11 | The updater never moves down. | `if !is_newer(&latest_parsed, &current)` (`agents/roomlerd/src/updater.rs:1864`); both MSI flavours refuse a downgrade (`:1796`) | P2's kill switch on the fleet is a **new** release built from the revert, never a reinstall of 0.4.199. |
 | 12 | Boot drops no collection and no index outside the plan, but TTL indexes keep running. | `apply_index_sets` walks the plan only (`crates/db/src/indexes.rs:72`, `:80`) | Every FR-90 collection stays. Production holds 13 of the 21 the plan names, with 48 indexes: boot applies only mounted modules' index sets, so the vault's eight were never created. Six of the 13 keep expiring rows on their own TTL (D2). |
@@ -163,7 +163,7 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | A-I4 | No PR drops a collection or an index. | D2 |
 | B-I6 | No removal changes how an old agent's frame parses on the server, except as intended: a retired variant fails the parse (`debug!`), and `ssh_ticket` / `net_grant` stay so they can be refused. | Fact 5. A hello that failed to parse would leave the device unregistered without a word (`crates/modules/fleet/src/socket.rs:1309`). |
 | B-I1 | In P2, one commit drops `hive`, `vault` and `hive-test-launcher` from the crate and `hive,` from all four release lists. | Fact 10 |
-| B-I2 | `ssh-one-command` stops being advertised (`agents/roomlerd/src/encode/caps.rs:4465`) in the same PR that removes the agent's enforcement of it. | A build that advertised the verb and ignored the field would serve an agent session's key a full session on a pre-P1 server. Not advertising is fail-closed: the old server refuses `TargetTooOld` (`crates/modules/network/src/routes/agent_ssh.rs:519`). |
+| B-I2 | `ssh-one-command` stops being advertised (`agents/roomlerd/src/encode/caps.rs:4465`) in the same PR that removes the agent's enforcement of it. | A build that advertised the verb and ignored the field would serve an agent session's key a full session on a pre-P1 server. Not advertising is fail-closed: the old server refuses `TargetTooOld` (`crates/modules/network/src/routes/agent_ssh.rs:509`). |
 | B-I3 | Each `cfg(hive_host)` and `cfg(worker_calls)` leaves together with its `rustc-check-cfg` line. | `unexpected_cfgs` fails `clippy -D warnings`. |
 | B-I4 | A 0.4.199 peer's `RMHIVE01` frame never reaches WireGuard, a tunnel consumer or `Unrouted`. | Fact 8 |
 | B-I5 | Every removed wire spelling stays reserved. | Verb matching is equality (`crates/remote_control/src/models.rs:1474`), and 0.4.199 agents keep advertising the 21 verbs until they update. A reused spelling would be claimed by each of them. |
@@ -184,8 +184,8 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | **S-B2**: a hidden `roomler hive hook` that exits 0 | `agents/roomler-cli/src/cli.rs` | Adopted terminals' Claude Code hooks call it on every session event (`agents/roomler-cli/src/hive_hooks.rs:34`). Their contract is "prints nothing and always exits 0" (`:17`). | Those accounts are unadopted (D6). |
 | **S-B3**: `SshRequest.ssh_ticket` and `TunnelOpen.net_grant` stay on the wire, parse-only and refused | `crates/remote_control/src/signaling.rs` | fact 5 | The last ≤0.4.199 agent is gone (D8). |
 | **S-B4**: `RETIRED_RPC_VERBS` (the 21 spellings) and a test that guards them, the tag families `rc:hive.`, `rc:vault.`, `rc:knowhow.`, the user socket's `hive:` and the module ids | `crates/remote_control/src/models.rs` | B-I5 | Never. |
-| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4369`, `:4503` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
-| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4631` | Every host carries them (§2.2). | — (D11) |
+| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4328`, `:4457` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
+| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4562` | Every host carries them (§2.2). | — (D11) |
 | **S-B8**: FR-90's refactors of shipped code: SOCKS5 `negotiate()`, `flow_listener::bind()`, `TempDir::named`, `within_ngroups_max`, the Windows Job Object code, shared `windows-sys` features and deps | `inventory-B.md` §B1 | Shipped paths now run on them. | Never. |
 
 Two decisions also keep lines that name Hive. They are not stubs, and AC1's read classes them here
@@ -194,7 +194,7 @@ Two decisions also keep lines that name Hive. They are not stubs, and AC1's read
 | Kept line | Where | Why | It may go when |
 |---|---|---|---|
 | **The parked rows' binding**: the doc comment and the shape test that spell `{module: "hive", ref: …}`, and the SPA's note that such a room opens as a plain Secret room | `crates/db/src/models/binding.rs:8-9`, `:42`, `:45`; `ui/src/stores/rooms.ts:37` | D2 keeps the rooms bound to `hive` (73 on production), and D9 opens them as plain Secret rooms. The comment says which rows carry the binding and why chat never reads it. | Those rows are dropped (out of scope, §7), or Hive returns and owns them again. |
-| **D3's retired-switch test**: `a_retired_module_switch_loads_and_switches_nothing` | `crates/config/src/settings.rs:1869`, its two `toml::from_str` lines at `:1871` and `:1875` | A config that still sets `hive`, `vault` or `knowhow` under `[modules]` must load and switch nothing. D3 removed production's Hive env on 2026-11-05 (AC8), but an older deploy or a self-host config can still carry a switch. | No supported config can carry a retired switch, or never: the test costs nothing. |
+| **D3's retired-switch test**: `a_retired_module_switch_loads_and_switches_nothing` | `crates/config/src/settings.rs:1786`, its two `toml::from_str` lines at `:1788` and `:1792` | A config that still sets `hive`, `vault` or `knowhow` under `[modules]` must load and switch nothing. D3 removed production's Hive env on 2026-11-05 (AC8), but an older deploy or a self-host config can still carry a switch. | No supported config can carry a retired switch, or never: the test costs nothing. |
 
 LocalAPI needs no verb stubs. An unknown verb answers `Error("bad request: …")` and the connection lives on
 (`crates/localapi/src/lib.rs:3614`). The 0.4.199 macOS update helper therefore installs without a Hive hold,
@@ -220,7 +220,7 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
    - Every 0.4.199 SYSTEM SSH service still claims with `&one_command=true`
      (`agents/roomlerd/src/ssh_service.rs:638`). The field is gone and axum ignores it. No pending row with
      `one_command: true` was ever written, because gate 3 refused every session first
-     (`crates/modules/network/src/routes/agent_ssh.rs:334`).
+     (`crates/modules/network/src/routes/agent_ssh.rs:324`).
    - A session still running on a test device keeps running locally with no viewer, so stop them first (D4).
    - A stale browser tab's `hive:*` frame finds no handler and gets `debug!` "Unknown WS message type"
      (`crates/api/src/ws/handler.rs:414`).
@@ -238,7 +238,7 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
    - New roles' presets lack the bits.
    - Production's `ROOMLER__HIVE__*`, `ROOMLER__VAULT__*` and `ROOMLER__KNOWHOW__*` are ignored, and must
      stay until P1 is past rollback (D3). The vault's key-encryption key is never deleted: it alone opens
-     the parked secrets (`crates/config/src/settings.rs:242`).
+     the parked secrets (`crates/config/src/settings.rs:230`).
 4. **An agent rolled back from P2 to Hive.**
    - The updater only moves up (fact 11). On Windows the MSI also refuses a downgrade, so a rollback is a
      new release built from P2's revert.

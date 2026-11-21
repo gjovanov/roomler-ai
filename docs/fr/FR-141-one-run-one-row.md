@@ -52,7 +52,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:147-189`); `--user-steps` starts the
   LaunchAgent (`install.sh:959-968`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2623-2672`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2677-2726`). `install.sh --one-row` is
   the one-token path (`install.sh:1012-1108`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
   (`docs/installation.md:2146-2150`).
@@ -159,7 +159,7 @@ person's half on it and says why.
   says it is one row gets no install and no pairing at all, not a package-only road (which waits for a field need).
   The wizard runs as the person and cannot read root's config, so it asks the root daemon itself over the person
   socket root serves the console user (`/var/run/roomler-person/<uid>.sock`), which admits `status`
-  (`crates/localapi/src/lib.rs:3683-3685`) and passes it through whole (`:3804-3826`). The read is bounded to 3 s and
+  (`crates/localapi/src/lib.rs:3722-3724`) and passes it through whole (`:3843-3865`). The read is bounded to 3 s and
   believed only from a socket root serves; unknown is never one row. The stop is one decision
   (`agents/roomler-setup/src/reinstall_guard.rs`, `stop`) asked on the Welcome page, at pairing start and in the
   install's preflight. It sits behind `wizard_reinstall_guard`, default on, NOT behind P2's switch: the terminal makes
@@ -177,9 +177,9 @@ person's half on it and says why.
     writes it, a finished revert removes it (`:2695-2700`), and with no copy the revert says only "nothing to revert"
     (`:2730-2735`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
-  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5681-5685`), so
-    it asks the system socket (`:4795-4799`), the root daemon's own, through the same root-only connect
-    (`:6018-6021`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
+  - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5720-5724`), so
+    it asks the system socket (`:4834-4838`), the root daemon's own, through the same root-only connect
+    (`:6057-6060`): `status` alone, under the same 3 s bound, believed only through `one_row_from`. A person's road is
     unchanged, and a person with no person socket asks nothing, never the system socket (`socket_to_ask`). The only
     root road on a Mac is a person starting the wizard as root: it never elevates itself there
     (`crates/roomler-setup-core/src/elevation.rs:231-235`), its command line has no headless mode
@@ -216,7 +216,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:2812-2813`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:2866-2867`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.

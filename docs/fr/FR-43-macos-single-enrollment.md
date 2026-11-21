@@ -476,9 +476,9 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
-| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2950` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
+| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:3107` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3829-3834` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
-| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3610-3612`, `agents/roomlerd/src/app.rs:5202`, `:5389` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
+| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3808-3814`, `agents/roomlerd/src/app.rs:5334`, `:5521` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
 
@@ -549,7 +549,7 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 
 **What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:323`, `:348`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:226`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:123`), which lets the daemon's word fill it in (`:198`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:2076`, `:2189`).
 
-⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3765`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:719`):
+⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3804`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:719`):
 
 | Verbs | Without that answer |
 |---|---|
@@ -573,7 +573,7 @@ Declared `[[tunnel_routes]]` in a person's file are named by the migration, not 
 
 ### P3b — a secondary org's session is delegated
 
-Built behind the switch, and proven in unit tests only. Under the switch, `run_cmd` gives every org loop the host (`agents/roomlerd/src/app.rs:4832`, `:5202`, and `:5389` for a join, through `Delegation::for_secondary`, `agents/roomlerd/src/delegate.rs:839`). The gates that read `ctx.is_primary` now read whether the loop holds the host: the delegation (`agents/roomlerd/src/signaling.rs:3610-3612`), the session params (`:3984`), the audio offer (`:3790`), and the caps on the hello and the heartbeat (`:1861-1879`, `:2573-2587`). Off one row only the primary's loop holds the host, so with the switch off nothing changes.
+Built behind the switch, and proven in unit tests only. Under the switch, `run_cmd` gives every org loop the host (`agents/roomlerd/src/app.rs:4960`, `:5334`, and `:5521` for a join, through `Delegation::for_secondary`, `agents/roomlerd/src/delegate.rs:846`). The gates that read `ctx.is_primary` now read whether the loop holds the host: the delegation (`agents/roomlerd/src/signaling.rs:3808-3814`), the session params (`:4207`), the audio offer (`:4014`), and the caps on the hello and the heartbeat (`:1936-1940`, `:2686-2687`). Off one row only the primary's loop holds the host, so with the switch off nothing changes.
 
 | Who holds the host | Switch off, the default | Switch on |
 |---|---|---|
@@ -585,15 +585,15 @@ Built behind the switch, and proven in unit tests only. Under the switch, `run_c
 
 **No org reaches into another's session.** One worker now serves sessions from orgs that trust each other no more than any two tenants do. A session belongs to the org whose params crossed for it, and another org's params or messages about the same id never cross, whichever came first (`send_to_worker`, `delegate.rs:1371`). On a one-row Mac a session crosses only once its params did, the primary's included, so the worker hears of no session that skipped its org's `Request` arm and consent. Off one row the primary keeps P2's rule: a session whose params never crossed still crosses.
 
-**The consent names the org.** The prompt stays the daemon's. `prompt_org` already names the org on a multi-org device (`signaling.rs:7353`, `docs/multi-org.md` §8b), and `asking_org` already reaches the worker's banner in the session params. This is the same rule Windows and Linux run. The field proof reads the prompt itself, because the macOS native panel is still FR-27's open item.
+**The consent names the org.** The prompt stays the daemon's. `prompt_org` already names the org on a multi-org device (`signaling.rs:7354`, `docs/multi-org.md` §8b), and `asking_org` already reaches the worker's banner in the session params. This is the same rule Windows and Linux run. The field proof reads the prompt itself, because the macOS native panel is still FR-27's open item.
 
-**The person's floor crosses too.** `DelegateFrame::PersonFloor` (`delegate.rs:177`) carries the person's `auto_grant_session` and their `rc_*` floor. A worker with no enrollment sends it at attach, and again when a `config set` changes the floor (`agents/roomlerd/src/delegate_worker.rs:377`, `:526`). A one-row daemon keeps it, across a detach too, and its `Request` arm takes the stricter of the person's and its own, for the consent mode (`signaling.rs:3907`) and for the session policy (`:3926`). The heartbeat's caps report the same combined floor (`:2606`), so the hub's strip can say why. A frame that leaves a value out reads as the strict one. The floor only tightens, so it is not the authority over the root's gates that #2871 left open. A daemon that isn't one row's skips the frame, and a worker that never sends one leaves the root's values standing. It binds remote-desktop sessions only: `rc:exec` runs as root, under the root's own floor (`signaling.rs:5576`).
+**The person's floor crosses too.** `DelegateFrame::PersonFloor` (`delegate.rs:184`) carries the person's `auto_grant_session` and their `rc_*` floor. A worker with no enrollment sends it at attach, and again when a `config set` changes the floor (`agents/roomlerd/src/delegate_worker.rs:437`, `:618`). A one-row daemon keeps it, across a detach too, and its `Request` arm takes the stricter of the person's and its own, for the consent mode (`signaling.rs:4131`) and for the session policy (`:4150`). The heartbeat's caps report the same combined floor (`:7072`), so the hub's strip can say why. A frame that leaves a value out reads as the strict one. The floor only tightens, so it is not the authority over the root's gates that #2871 left open. A daemon that isn't one row's skips the frame, and a worker that never sends one leaves the root's values standing. It binds remote-desktop sessions only: `rc:exec` runs as root, under the root's own floor (`signaling.rs:5835`).
 
 **Side effects, all under the switch.**
 
-- **Keep busy.** Every org's policy now reaches the worker (`signaling.rs:5338`), and the worker gets the strictest, as `note_keep_busy_policy` intends (`delegate.rs:1429`). Off one row a secondary's deny still never reaches the worker, as before.
+- **Keep busy.** Every org's policy now reaches the worker (`signaling.rs:5605`), and the worker gets the strictest, as `note_keep_busy_policy` intends (`delegate.rs:1447`). Off one row a secondary's deny still never reaches the worker, as before.
 - **The privacy curtain.** P3a left one fact open: the worker's `Reporter.tenant_id` and `drain_leftovers` run on its blank tenant, so a curtain a dead worker left up would go unreported. On a Mac no curtain goes up at all (`agents/roomlerd/src/privacy.rs:109`: Windows only), so there is nothing to report. If a Mac curtain is ever built, the worker's reporter needs the asking org's tenant, and `PrivacyActivity` needs a place in the relay's whitelist (`delegable_outbound`, `delegate.rs:921`), which drops it today.
-- **FR-121's loopback relay** stays the primary's (`signaling.rs:2172`): a secondary's delegated session gets none, as before.
+- **FR-121's loopback relay** stays the primary's (`signaling.rs:2274`): a secondary's delegated session gets none, as before.
 
 ### P3c — a person's one command
 
@@ -763,7 +763,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       3 without. All three platforms are measured.)*
       *(Reworded 2026-10-31: it said "no `caps` at all", which stopped being true when later
       FRs made more of the caps live, so a heartbeat now re-announces on any change
-      (`signaling.rs:2320-2331`). Measured with a capture server on released agents, a live
+      (`signaling.rs:2350-2361`). Measured with a capture server on released agents, a live
       `rc_clipboard off` as the same-run control. Linux 0.4.190: 15 heartbeats, 14 without
       `caps`, one 16 s after the flip. macOS 0.4.190, root daemon, key absent, hello
       `no-gui-session`: 5 without, one after the flip, then none. **Windows is not measured**:
