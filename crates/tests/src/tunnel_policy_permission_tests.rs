@@ -103,9 +103,12 @@ pub(crate) struct Unparsed {
 }
 
 /// One body of each kind the extractor refuses: not JSON at all (400), JSON
-/// with a field of the wrong type (422; `wrong_type` names a field of the
-/// route's own body), and a body not sent as JSON (415).
-pub(crate) fn unparsed_bodies(wrong_type: &'static str) -> [Unparsed; 3] {
+/// with a field its type refuses (422; `refused_field` is such a body for the
+/// route's own body type), and a body not sent as JSON (415). The 422 kind is
+/// valid JSON serde reads as a value of the wrong type: a number where an
+/// enum belongs is a syntax error to serde_json (`expected value`, 400), so
+/// an enum field takes an unknown variant.
+pub(crate) fn unparsed_bodies(refused_field: &'static str) -> [Unparsed; 3] {
     [
         Unparsed {
             what: "not JSON",
@@ -114,9 +117,9 @@ pub(crate) fn unparsed_bodies(wrong_type: &'static str) -> [Unparsed; 3] {
             status: 400,
         },
         Unparsed {
-            what: "a field of the wrong type",
+            what: "a field its type refuses",
             content_type: "application/json",
-            body: wrong_type,
+            body: refused_field,
             status: 422,
         },
         Unparsed {

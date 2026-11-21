@@ -3195,12 +3195,14 @@ mod overlay_acl_decides_the_bit_before_the_body {
         created["id"].as_str().expect("rule id").to_string()
     }
 
-    /// The three writes, each with a field of the wrong type for its own body.
+    /// The three writes, each with a field its own body's type refuses. The
+    /// mode is an enum, so it takes an unknown variant: `{"mode": 7}` is a
+    /// syntax error to serde_json (400), not the 422 kind.
     fn writes(seeded: &SeededTenant, rule: &str) -> [(&'static str, String, &'static str); 3] {
         [
             ("POST", acl(seeded, ""), r#"{"name": 7}"#),
             ("PUT", acl(seeded, &format!("/{rule}")), r#"{"name": 7}"#),
-            ("PUT", acl(seeded, "/mode"), r#"{"mode": 7}"#),
+            ("PUT", acl(seeded, "/mode"), r#"{"mode": "loud"}"#),
         ]
     }
 
@@ -3228,8 +3230,8 @@ mod overlay_acl_decides_the_bit_before_the_body {
 
         let mut wrong = Vec::new();
         for (who, token, want) in callers {
-            for (method, path, wrong_type) in writes(&seeded, &rule) {
-                for b in unparsed_bodies(wrong_type) {
+            for (method, path, refused_field) in writes(&seeded, &rule) {
+                for b in unparsed_bodies(refused_field) {
                     let (s, _, text) =
                         call_raw(&app, method, &path, token, b.content_type, b.body).await;
                     if let Some(why) = refusal_problem(want, s, &text) {
@@ -3259,8 +3261,8 @@ mod overlay_acl_decides_the_bit_before_the_body {
         let owner = &seeded.admin.access_token;
 
         let mut wrong = Vec::new();
-        for (method, path, wrong_type) in writes(&seeded, &rule) {
-            for b in unparsed_bodies(wrong_type) {
+        for (method, path, refused_field) in writes(&seeded, &rule) {
+            for b in unparsed_bodies(refused_field) {
                 let want = if path.ends_with("/mode") {
                     extractor_answer::<SetAclModeRequest>(b.content_type, b.body).await
                 } else {
