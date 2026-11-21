@@ -102,7 +102,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(all(unix, not(target_os = "windows")))]
 use std::time::Instant;
-use tunnel_core::localapi::LastInstallStatus;
+use tunnel_core::localapi::{InstallDaemon, LastInstallStatus};
 
 /// Wall-clock budget for waiting on the installer to finish.
 /// Conservative — the longest-observed install in the field is
@@ -134,6 +134,11 @@ pub struct InstallOutcome {
     pub new_binary_version: Option<String>,
     pub status: InstallStatus,
     pub note: String,
+    /// FR-150 P1b — a Windows per-user daemon after the verdict, and how the
+    /// watcher brought it back ([`relaunch_user_daemon`]). Absent from a
+    /// record of an older watcher, which still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<InstallDaemon>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -313,6 +318,7 @@ pub fn watch(
         new_binary_version: None,
         status: InstallStatus::InProgress,
         note: String::new(),
+        daemon: None,
     };
     // Persist the InProgress state immediately so a watcher that
     // crashes mid-wait still leaves a forensic trail.
@@ -391,11 +397,15 @@ pub fn watch(
     // leave the host's SCM service stopped. The settle can take up to
     // SERVICE_SETTLE_BUDGET, so the install's own verdict is on disk
     // first: a watcher that dies mid-settle still leaves it behind.
-    // perUser: a failed verdict starts the task.
+    // perUser (FR-150 P1b): the daemon runs, or the record says why not.
     #[cfg(target_os = "windows")]
     {
         let _ = write_outcome(&outcome);
-        ensure_service_running(&mut outcome, install_flavour(origin_exe.as_deref()));
+        ensure_service_running(
+            &mut outcome,
+            install_flavour(origin_exe.as_deref()),
+            origin_exe.as_deref(),
+        );
     }
     let _ = write_outcome(&outcome);
     Ok(outcome)
@@ -663,14 +673,20 @@ fn run_recovery_cmd(cmd: &str, args: &[&str]) {
 /// The verdict records that honestly ([`ServiceVerdict::Denied`])
 /// instead of pretending the net exists where it can't act.
 ///
-/// A per-user device has a task instead, [`start_user_daemon_after_a_failure`].
+/// A per-user device has a task instead: [`relaunch_user_daemon`] (FR-150 P1b),
+/// or with [`WATCHER_RELAUNCH_ENV`] `=0`, [`start_user_daemon_after_a_failure`].
 #[cfg(target_os = "windows")]
 fn ensure_service_running(
     outcome: &mut InstallOutcome,
     flavour: crate::updater::WindowsInstallFlavour,
+    origin: Option<&Path>,
 ) {
     if flavour != crate::updater::WindowsInstallFlavour::PerMachine {
-        start_user_daemon_after_a_failure(outcome);
+        if watcher_relaunch_wanted(std::env::var(WATCHER_RELAUNCH_ENV).ok().as_deref()) {
+            settle_user_daemon(outcome, origin);
+        } else {
+            start_user_daemon_after_a_failure(outcome);
+        }
         return;
     }
     let name = crate::win_service::NEW_SERVICE_NAME;
@@ -703,6 +719,9 @@ fn ensure_service_running(
 /// the next sign-in. Harmless if a rollback already started it: `IgnoreNew` drops
 /// this one. This runs in the watcher of the release being updated FROM, so the
 /// first update onto this code does not have it.
+///
+/// FR-150 P1b: the per-user arm with [`WATCHER_RELAUNCH_ENV`] `=0` only;
+/// [`relaunch_user_daemon`] otherwise.
 #[cfg(target_os = "windows")]
 fn start_user_daemon_after_a_failure(outcome: &mut InstallOutcome) {
     if !user_daemon_needs_a_start(&outcome.status) {
@@ -726,12 +745,294 @@ fn start_user_daemon_after_a_failure(outcome: &mut InstallOutcome) {
 
 /// Exit 0 means the new task is registered, verified or not, and its one-shots do
 /// this. A start from here would race Restart Manager's late stop (#2711).
+///
+/// FR-150 P1b: and an install that did not go through starts the relaunch at
+/// its first rung, with no wait for a one-shot it may never have registered.
 #[cfg(any(target_os = "windows", test))]
 fn user_daemon_needs_a_start(status: &InstallStatus) -> bool {
     matches!(
         status,
         InstallStatus::InstallerFailed | InstallStatus::Timeout
     )
+}
+
+// ─── FR-150 P1b — the watcher owns the per-user relaunch ────────────────────
+//
+// #3507: a successful per-user install that registered nothing (its account
+// could not replace the task an elevated install had registered) left the
+// device offline until the next sign-in, while the record said
+// `SucceededVerified`. The per-Machine arm above has always settled the
+// service after every verdict; this gives the per-user arm the same contract:
+// after every verdict the daemon runs, or the record says why not. Everything
+// up to the OS calls is pure and runs in the tests on every OS
+// ([`UserDaemonHandle`] is the seam).
+
+/// FR-150 P1b's kill switch: `ROOMLERD_WATCHER_RELAUNCH=0` in the daemon's
+/// environment, which the watcher inherits, keeps the per-user arm master's:
+/// a start only after a failure ([`start_user_daemon_after_a_failure`]).
+pub const WATCHER_RELAUNCH_ENV: &str = "ROOMLERD_WATCHER_RELAUNCH";
+
+/// Past the first one-shot, which fires 60 s after `RegisterAutostart`
+/// (`service.rs`'s `start_soon_triggers`), with room for a slow guest.
+#[cfg(any(target_os = "windows", test))]
+const USER_DAEMON_FIRST_WAIT: Duration = Duration::from_secs(120);
+
+/// How long the daemon gets to come up after each rung's start.
+#[cfg(any(target_os = "windows", test))]
+const USER_DAEMON_RUNG_WAIT: Duration = Duration::from_secs(30);
+
+/// How often the ladder looks.
+#[cfg(any(target_os = "windows", test))]
+const USER_DAEMON_LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// The installed binary's `service install` (a handful of `schtasks` calls).
+#[cfg(target_os = "windows")]
+const USER_REGISTER_BUDGET: Duration = Duration::from_secs(60);
+
+/// Anything but `0` keeps the ladder: unset is the default.
+#[cfg(any(target_os = "windows", test))]
+fn watcher_relaunch_wanted(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+/// What the ladder asks of the host: [`UserDaemon`] on Windows, a scripted
+/// host in the tests.
+#[cfg(any(target_os = "windows", test))]
+trait UserDaemonHandle {
+    /// A daemon for this config holds its stop event.
+    fn up(&mut self) -> bool;
+    /// `service start`: a `/Run` of the account's task.
+    fn start(&mut self) -> Result<(), String>;
+    /// The installed binary's `service install`.
+    fn register(&mut self) -> Result<(), String>;
+    /// The installed launcher, outside its task (D2).
+    fn launch(&mut self) -> Result<(), String>;
+}
+
+/// Look until the daemon is up or `budget` has passed since the call.
+#[cfg(any(target_os = "windows", test))]
+fn came_up(
+    host: &mut impl UserDaemonHandle,
+    budget: Duration,
+    elapsed: &impl Fn() -> Duration,
+    sleep: &impl Fn(Duration),
+) -> bool {
+    let until = elapsed() + budget;
+    loop {
+        if host.up() {
+            return true;
+        }
+        if elapsed() >= until {
+            return false;
+        }
+        sleep(USER_DAEMON_LOOK_EVERY);
+    }
+}
+
+/// One rung's answer, as the record keeps it.
+#[cfg(any(target_os = "windows", test))]
+fn rung_answer(rung: &str, answer: Result<(), String>) -> String {
+    match answer {
+        Ok(()) => format!("{rung}: asked"),
+        Err(e) => format!("{rung}: {e}"),
+    }
+}
+
+/// FR-150 P1b — the per-user relaunch, after every verdict.
+///
+/// An install that went through gets [`USER_DAEMON_FIRST_WAIT`] for its own
+/// one-shot, so no start of ours races Restart Manager's late stop (#2711);
+/// one that did not starts at the first rung, as #3292's start did, unless a
+/// daemon already runs (a rollback's start). Then, each with
+/// [`USER_DAEMON_RUNG_WAIT`]: `service start`; `service install` and
+/// `service start`; the launcher itself. The first rung after which a daemon
+/// holds its stop event ends the ladder, and every rung taken is in the
+/// answer.
+#[cfg(any(target_os = "windows", test))]
+fn relaunch_user_daemon(
+    went_through: bool,
+    host: &mut impl UserDaemonHandle,
+    elapsed: impl Fn() -> Duration,
+    sleep: impl Fn(Duration),
+) -> InstallDaemon {
+    let running = |how: &str, rungs: Vec<String>| InstallDaemon {
+        running: true,
+        how: Some(how.to_string()),
+        rungs,
+    };
+    let mut rungs = Vec::new();
+    let first_wait = if went_through {
+        USER_DAEMON_FIRST_WAIT
+    } else {
+        Duration::ZERO
+    };
+    if came_up(host, first_wait, &elapsed, &sleep) {
+        return running(InstallDaemon::BY_THE_TASK, rungs);
+    }
+    if went_through {
+        rungs.push(format!(
+            "not up {} s after the install",
+            USER_DAEMON_FIRST_WAIT.as_secs()
+        ));
+    }
+    let not_up = || format!("not up {} s later", USER_DAEMON_RUNG_WAIT.as_secs());
+
+    rungs.push(rung_answer("service start", host.start()));
+    if came_up(host, USER_DAEMON_RUNG_WAIT, &elapsed, &sleep) {
+        return running(InstallDaemon::STARTED_THROUGH_THE_TASK, rungs);
+    }
+    rungs.push(not_up());
+
+    rungs.push(rung_answer("service install", host.register()));
+    rungs.push(rung_answer("service start", host.start()));
+    if came_up(host, USER_DAEMON_RUNG_WAIT, &elapsed, &sleep) {
+        return running(InstallDaemon::AFTER_THE_TASK_WAS_REGISTERED_AGAIN, rungs);
+    }
+    rungs.push(not_up());
+
+    rungs.push(rung_answer("the launcher", host.launch()));
+    if came_up(host, USER_DAEMON_RUNG_WAIT, &elapsed, &sleep) {
+        return running(InstallDaemon::OUTSIDE_ITS_TASK, rungs);
+    }
+    rungs.push(not_up());
+    InstallDaemon {
+        running: false,
+        how: None,
+        rungs,
+    }
+}
+
+/// The Windows host of the ladder: this person's daemon for the default
+/// config, and the binary the install laid down.
+#[cfg(target_os = "windows")]
+struct UserDaemon {
+    /// The daemon's stop event (FR-97 P4d): held means it runs. `Local\`, in
+    /// the person's session, where this watcher runs too.
+    stop_event: String,
+    /// The installed `roomlerd.exe`. Never this watcher's own image: that is a
+    /// copy in the staging folder, and a task registered from it would name a
+    /// launcher in `%TEMP%`.
+    exe: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl UserDaemon {
+    fn resolve(origin: Option<&Path>, new_binary: Option<&str>) -> Result<Self> {
+        let config = crate::config::default_config_path()?;
+        let stop_event = crate::win_service::stop_event::user_stop_event_name(
+            &crate::instance_lock::instance_id(&config),
+        );
+        let exe = match (origin, new_binary) {
+            (Some(o), _) => o.to_path_buf(),
+            (None, Some(n)) => PathBuf::from(n),
+            (None, None) => std::env::current_exe()?,
+        };
+        Ok(Self { stop_event, exe })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl UserDaemonHandle for UserDaemon {
+    fn up(&mut self) -> bool {
+        crate::win_service::stop_event::user_stop_event_held(&self.stop_event)
+    }
+
+    fn start(&mut self) -> Result<(), String> {
+        crate::service::start().map_err(|e| format!("{e:#}"))
+    }
+
+    fn register(&mut self) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = std::process::Command::new(&self.exe)
+            .args(["service", "install"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run {}: {e}", self.exe.display()))?;
+        let began = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if began.elapsed() < USER_REGISTER_BUDGET => {
+                    std::thread::sleep(Duration::from_millis(250))
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    return Err(format!("no answer in {} s", USER_REGISTER_BUDGET.as_secs()));
+                }
+                Err(e) => return Err(format!("waiting for it: {e}")),
+            }
+        };
+        if status.success() {
+            return Ok(());
+        }
+        let mut said = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err, &mut said);
+        }
+        let last = said
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("");
+        Err(format!("exit {}: {last}", status.code().unwrap_or(-1)))
+    }
+
+    fn launch(&mut self) -> Result<(), String> {
+        // The task's own command line (`service.rs`'s `render_task_xml`), so a
+        // daemon started here is told apart from the task's by nothing but its
+        // parent, and the next `service start` puts it back under its task.
+        let launcher = self.exe.with_file_name("roomlerdw.exe");
+        let exe = if launcher.is_file() {
+            launcher
+        } else {
+            self.exe.clone()
+        };
+        crate::win_service::companion_spawn::spawn_detached_no_inherit(
+            &exe,
+            &["run", "--supervisor", "task"],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// FR-150 P1b — the per-user arm: the ladder, and its answer in the record.
+#[cfg(target_os = "windows")]
+fn settle_user_daemon(outcome: &mut InstallOutcome, origin: Option<&Path>) {
+    let went_through = !user_daemon_needs_a_start(&outcome.status);
+    let mut host = match UserDaemon::resolve(origin, outcome.new_binary_path.as_deref()) {
+        Ok(host) => host,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "the per-user daemon cannot be looked at: the relaunch is master's");
+            start_user_daemon_after_a_failure(outcome);
+            return;
+        }
+    };
+    let began = std::time::Instant::now();
+    let found = relaunch_user_daemon(
+        went_through,
+        &mut host,
+        || began.elapsed(),
+        std::thread::sleep,
+    );
+    let rungs = found.rungs.join("; ");
+    if found.running {
+        tracing::info!(
+            how = found.how.as_deref().unwrap_or("-"),
+            rungs,
+            "post-install: the per-user daemon runs"
+        );
+    } else {
+        tracing::warn!(
+            rungs,
+            "post-install: NO per-user daemon runs after the install, and every rung was taken (FR-150)"
+        );
+    }
+    outcome.daemon = Some(found);
 }
 
 // ─── #2711 — settle the service, never probe it once ─────────────────────────
@@ -1480,6 +1781,7 @@ pub(crate) fn summarize(
         installer_exit_code: None,
         note: None,
         path: path.clone(),
+        daemon: None,
     };
     match read {
         Ok(None) => empty(LastInstallStatus::ABSENT),
@@ -1492,6 +1794,7 @@ pub(crate) fn summarize(
             installer_exit_code: o.installer_exit_code,
             note: (!o.note.is_empty()).then_some(o.note),
             path,
+            daemon: o.daemon,
         },
         Err(e) => LastInstallStatus {
             // The chain, not just the outermost context: a context-less
@@ -1570,6 +1873,22 @@ pub fn log_at_startup() {
             ),
         }
     }
+    // FR-150 P1b — and what the watcher found of the daemon after it.
+    if let Some(d) = &li.daemon {
+        let rungs = d.rungs.join("; ");
+        if d.running {
+            tracing::info!(
+                how = d.how.as_deref().unwrap_or("-"),
+                rungs,
+                "last install: the daemon was back when the watcher finished"
+            );
+        } else {
+            tracing::warn!(
+                rungs,
+                "last install: the watcher left NO daemon running; this one was started later (FR-150)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1616,6 +1935,7 @@ mod tests {
             new_binary_version: None,
             status: InstallStatus::InProgress,
             note: String::new(),
+            daemon: None,
         }
     }
 
@@ -1998,6 +2318,7 @@ mod tests {
                 new_binary_version: None,
                 status: InstallStatus::InProgress,
                 note: String::new(),
+                daemon: None,
             })),
             Some(path),
         );
@@ -2028,6 +2349,7 @@ mod tests {
                 new_binary_version: Some("roomlerd 0.4.172".into()),
                 status: InstallStatus::SucceededVerified,
                 note: "new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into(),
+                daemon: None,
             })),
             Some(path),
         );
@@ -2111,6 +2433,7 @@ mod tests {
             installer_exit_code: Some(0),
             note: None,
             path: None,
+            daemon: None,
         };
         let with = |status: &str| LastInstallStatus {
             status: status.into(),
@@ -2237,6 +2560,7 @@ mod tests {
             new_binary_version: Some("roomlerd 0.1.50".into()),
             status: InstallStatus::SucceededVerified,
             note: "ok".into(),
+            daemon: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"installer_pid\":1234"));
@@ -2258,6 +2582,7 @@ mod tests {
             new_binary_version: None,
             status: InstallStatus::InProgress,
             note: "".into(),
+            daemon: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"finished_unix\":null"));
@@ -2659,5 +2984,261 @@ mod tests {
         let trail = s.trail();
         assert_eq!(trail.matches('→').count(), ServiceSettle::TRAIL_MAX);
         assert!(trail.ends_with("→…+18"), "{trail}");
+    }
+
+    // ─── FR-150 P1b — the per-user relaunch ladder ─────────────────────────
+
+    /// A scripted person: the daemon comes up `after` the step named `by`
+    /// (`"install"`: by itself, the install's own one-shot, counted from the
+    /// start). `start` answers as the task does: refused while there is no
+    /// task, until `register` puts one back.
+    struct ScriptedUser {
+        clock: Rc<Cell<Duration>>,
+        by: Option<&'static str>,
+        after: Duration,
+        up_at: Option<Duration>,
+        task: bool,
+        refuse_register: bool,
+        asked: Vec<&'static str>,
+    }
+
+    impl ScriptedUser {
+        fn new(by: Option<&'static str>, after_s: u64) -> Self {
+            let clock = Rc::new(Cell::new(Duration::ZERO));
+            let after = Duration::from_secs(after_s);
+            Self {
+                up_at: (by == Some("install")).then_some(after),
+                clock,
+                by,
+                after,
+                task: true,
+                refuse_register: false,
+                asked: Vec::new(),
+            }
+        }
+
+        fn step(&mut self, s: &'static str) {
+            self.asked.push(s);
+            if self.by == Some(s) && self.up_at.is_none() {
+                self.up_at = Some(self.clock.get() + self.after);
+            }
+        }
+    }
+
+    impl UserDaemonHandle for ScriptedUser {
+        fn up(&mut self) -> bool {
+            self.up_at.is_some_and(|t| self.clock.get() >= t)
+        }
+        fn start(&mut self) -> Result<(), String> {
+            if !self.task {
+                self.asked.push("start");
+                return Err("no auto-start task is registered".into());
+            }
+            self.step("start");
+            Ok(())
+        }
+        fn register(&mut self) -> Result<(), String> {
+            if self.refuse_register {
+                self.asked.push("register");
+                return Err("exit 1: Access is denied".into());
+            }
+            self.task = true;
+            self.step("register");
+            Ok(())
+        }
+        fn launch(&mut self) -> Result<(), String> {
+            self.step("launch");
+            Ok(())
+        }
+    }
+
+    fn run_ladder(went_through: bool, host: &mut ScriptedUser) -> (InstallDaemon, Duration) {
+        let (now, tick) = (host.clock.clone(), host.clock.clone());
+        let found = relaunch_user_daemon(
+            went_through,
+            host,
+            move || now.get(),
+            move |d| tick.set(tick.get() + d),
+        );
+        (found, host.clock.get())
+    }
+
+    /// FR-150 P1b — the install's own one-shot brings the daemon back: no
+    /// rung is taken, and the look ends when it comes up.
+    #[test]
+    fn a_daemon_back_by_its_own_one_shot_takes_no_rung() {
+        let mut host = ScriptedUser::new(Some("install"), 70);
+        let (found, took) = run_ladder(true, &mut host);
+        assert_eq!(
+            found,
+            InstallDaemon {
+                running: true,
+                how: Some(InstallDaemon::BY_THE_TASK.into()),
+                rungs: vec![],
+            }
+        );
+        assert!(host.asked.is_empty(), "{:?}", host.asked);
+        assert_eq!(took, Duration::from_secs(70));
+    }
+
+    /// FR-150 P1b — each rung, when it is the one that brings the daemon
+    /// back: what was asked, in order, and what the record says.
+    #[test]
+    fn each_rung_brings_the_daemon_back_and_says_so() {
+        // `service start`: the task is there and the account may run it (C2).
+        let mut host = ScriptedUser::new(Some("start"), 5);
+        let (found, took) = run_ladder(true, &mut host);
+        assert_eq!(
+            found.how.as_deref(),
+            Some(InstallDaemon::STARTED_THROUGH_THE_TASK)
+        );
+        assert!(found.running);
+        assert_eq!(
+            found.rungs,
+            ["not up 120 s after the install", "service start: asked"]
+        );
+        assert_eq!(host.asked, ["start"]);
+        assert_eq!(took, Duration::from_secs(125));
+
+        // `service install`: the task was gone (C12), registered again.
+        let mut host = ScriptedUser::new(Some("register"), 3);
+        host.task = false;
+        let (found, _) = run_ladder(true, &mut host);
+        assert_eq!(
+            found.how.as_deref(),
+            Some(InstallDaemon::AFTER_THE_TASK_WAS_REGISTERED_AGAIN)
+        );
+        assert_eq!(
+            found.rungs,
+            [
+                "not up 120 s after the install",
+                "service start: no auto-start task is registered",
+                "not up 30 s later",
+                "service install: asked",
+                "service start: asked",
+            ]
+        );
+        assert_eq!(host.asked, ["start", "register", "start"]);
+
+        // The launcher itself (D2): the task cannot start it and cannot be
+        // registered again.
+        let mut host = ScriptedUser::new(Some("launch"), 4);
+        host.task = false;
+        host.refuse_register = true;
+        let (found, _) = run_ladder(true, &mut host);
+        assert_eq!(found.how.as_deref(), Some(InstallDaemon::OUTSIDE_ITS_TASK));
+        assert!(found.running);
+        assert_eq!(
+            found.rungs,
+            [
+                "not up 120 s after the install",
+                "service start: no auto-start task is registered",
+                "not up 30 s later",
+                "service install: exit 1: Access is denied",
+                "service start: no auto-start task is registered",
+                "not up 30 s later",
+                "the launcher: asked",
+            ]
+        );
+        assert_eq!(host.asked, ["start", "register", "start", "launch"]);
+    }
+
+    /// FR-150 P1b — nothing brings it back: every rung is taken, the record
+    /// says each answer and `running: false`, and the ladder ends on its own
+    /// clock.
+    #[test]
+    fn no_rung_brings_it_back_and_the_record_says_each_answer() {
+        let mut host = ScriptedUser::new(None, 0);
+        let (found, took) = run_ladder(true, &mut host);
+        assert!(!found.running);
+        assert_eq!(found.how, None);
+        assert_eq!(
+            found.rungs,
+            [
+                "not up 120 s after the install",
+                "service start: asked",
+                "not up 30 s later",
+                "service install: asked",
+                "service start: asked",
+                "not up 30 s later",
+                "the launcher: asked",
+                "not up 30 s later",
+            ]
+        );
+        assert_eq!(host.asked, ["start", "register", "start", "launch"]);
+        assert_eq!(took, Duration::from_secs(120 + 3 * 30));
+    }
+
+    /// FR-150 P1b — an install that did not go through waits for no one-shot:
+    /// the first rung at once, as #3292's start did; and a daemon a rollback
+    /// already started is left alone.
+    #[test]
+    fn a_failed_install_starts_at_the_first_rung() {
+        let mut host = ScriptedUser::new(Some("start"), 2);
+        let (found, took) = run_ladder(false, &mut host);
+        assert_eq!(
+            found.how.as_deref(),
+            Some(InstallDaemon::STARTED_THROUGH_THE_TASK)
+        );
+        assert_eq!(found.rungs, ["service start: asked"]);
+        assert_eq!(took, Duration::from_secs(2));
+
+        let mut host = ScriptedUser::new(Some("install"), 0);
+        let (found, took) = run_ladder(false, &mut host);
+        assert_eq!(found.how.as_deref(), Some(InstallDaemon::BY_THE_TASK));
+        assert!(host.asked.is_empty(), "{:?}", host.asked);
+        assert_eq!(took, Duration::ZERO);
+    }
+
+    /// FR-150 P1b's kill switch: `0` keeps master's arm, anything else the
+    /// ladder.
+    #[test]
+    fn the_switch_keeps_masters_start_after_a_failure() {
+        assert!(watcher_relaunch_wanted(None));
+        assert!(watcher_relaunch_wanted(Some("1")));
+        assert!(watcher_relaunch_wanted(Some("")));
+        assert!(!watcher_relaunch_wanted(Some("0")));
+        assert!(!watcher_relaunch_wanted(Some(" 0 ")));
+    }
+
+    /// FR-150 P1b — the record's `daemon` field round-trips through the file,
+    /// and a record an older watcher wrote, without it, still parses.
+    #[test]
+    fn the_records_daemon_field_round_trips_and_an_old_record_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-install.json");
+        let mut outcome = unreported("agent-v0.4.251", 1000);
+        outcome.status = InstallStatus::SucceededVerified;
+        outcome.daemon = Some(InstallDaemon {
+            running: false,
+            how: None,
+            rungs: vec![
+                "not up 120 s after the install".into(),
+                "service start: asked".into(),
+            ],
+        });
+        write_outcome_at(&path, &outcome).unwrap();
+        assert_eq!(read_outcome_at(&path).unwrap(), outcome);
+
+        let old = serde_json::json!({
+            "installer_pid": 2876,
+            "installer_path": "C:\\T\\roomlerd-0.4.228-x86_64-pc-windows-msvc.msi",
+            "expected_version": "agent-v0.4.228",
+            "started_unix": 1_795_185_131u64,
+            "finished_unix": 1_795_185_138u64,
+            "installer_exit_code": 0,
+            "new_binary_path": "C:\\P\\roomlerd.exe",
+            "new_binary_version": "roomlerd 0.4.228",
+            "status": "SucceededVerified",
+            "note": "new binary reports roomlerd 0.4.228"
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let back = read_outcome_at(&path).unwrap();
+        assert_eq!(back.daemon, None);
+        assert_eq!(back.status, InstallStatus::SucceededVerified);
+        let summary = summarize(Ok(Some(back)), Some(path.as_path()));
+        assert_eq!(summary.daemon, None);
+        let summary = summarize(Ok(Some(outcome)), Some(path.as_path()));
+        assert_eq!(summary.daemon.map(|d| d.running), Some(false));
     }
 }
