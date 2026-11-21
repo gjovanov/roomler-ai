@@ -1064,6 +1064,60 @@ failed step into every healthy update (`nothing_to_stop`,
 `agents/roomlerd/src/service/user_task.rs:190`, #4128's C10). A task still there, or a
 daemon still holding its event, is stopped as before.
 
+**After every update the daemon runs, or the record says why not (FR-150 P1b).** The
+post-install watcher has always settled a per-Machine service after every verdict
+(`settle_service`, `agents/roomlerd/src/post_install.rs:1261`). Its per-user arm started the
+task only after a failed install, because an exit 0 means the new task's one-shots do it, and
+#3507 was an exit 0 that had registered nothing. So the per-user arm is now a ladder
+(`relaunch_user_daemon`, `post_install.rs:852`, run by `settle_user_daemon`, `:1005`). "Up"
+is the daemon's stop event held for this config (`user_stop_event_held`,
+`agents/roomlerd/src/win_service/stop_event.rs:514`), in the person's session, where the
+watcher runs too:
+
+```mermaid
+flowchart TD
+    V["the installer went through"] --> W{"up within 120 s?"}
+    F["the installer failed or timed out"] --> W0{"up already?<br/>a rollback's start"}
+    W -- yes --> R1["running, by the task"]
+    W0 -- yes --> R1
+    W -- no --> S["service start:<br/>a /Run of the account's task"]
+    W0 -- no --> S
+    S --> W2{"up within 30 s?"}
+    W2 -- yes --> R2["running, started through the task"]
+    W2 -- no --> I["the installed binary's service install,<br/>then service start"]
+    I --> W3{"up within 30 s?"}
+    W3 -- yes --> R3["running, after the task was registered again"]
+    W3 -- no --> L["the installed launcher itself,<br/>with the task's own command line"]
+    L --> W4{"up within 30 s?"}
+    W4 -- yes --> R4["running, outside its task"]
+    W4 -- no --> R5["not running"]
+```
+
+| `daemon` in `last-install.json` | What brought it back |
+|---|---|
+| `running: true`, `how: "by the task"` | the install's own one-shot, or a rollback's start; `rungs` is empty |
+| `how: "started through the task"` | `service start`: the task is there, and its account may run it even where it may not replace it |
+| `how: "after the task was registered again"` | the task was gone, and the installed binary's `service install` put it back |
+| `how: "outside its task"` | neither start worked, so the watcher started the launcher itself (`run --supervisor task`); the next `service start` puts it back under its task |
+| `running: false` | nothing: every rung was taken, and `rungs` says what each answered |
+
+- **120 s** is past the first one-shot, which fires 60 s after `RegisterAutostart`, so no start
+  of the watcher's races Restart Manager's late stop (#2711). A failed install starts at the
+  first rung, as #3292's start did.
+- **The rungs run the binary the install laid down** (`--origin-exe`; `UserDaemon::resolve`,
+  `post_install.rs:920`), never the watcher's own image. That is a copy in the staging
+  folder, and a task registered from it would name a launcher in `%TEMP%`. The launcher is
+  spawned with no handle of the watcher's (`:984`).
+- **The record says it in three places.** The field sits in `last-install.json`, in
+  `NodeStatus.last_install` (`InstallDaemon`, `crates/localapi/src/lib.rs:620`, additive both
+  ways), and in the next daemon's `last install:` line, a WARN when the watcher left no daemon
+  running (`post_install.rs:1888`).
+- **The first update onto P1b runs the old release's watcher**, so P1b protects the hops after
+  it. P1a's `Roomler start-<SID>` protects that one.
+- `ROOMLERD_WATCHER_RELAUNCH=0` in the daemon's environment, which the watcher inherits, keeps
+  the old arm: a start only after a failure (`start_user_daemon_after_a_failure`,
+  `post_install.rs:726`; the switch, `:773`).
+
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
 `UnregisterAutostart` runs, and nothing after that. From a launcher release onward nothing
@@ -1146,10 +1200,10 @@ built MSI, because WiX orders actions that share a parent by itself.
 
 **An install that never reaches its script has no rollback.** `msiexec` exits 1618 while
 another install holds the machine's mutex, so on a self-update the daemon has left and no
-action ran. `start_user_daemon_after_a_failure` (`agents/roomlerd/src/post_install.rs`)
-starts the task on a failed verdict. It runs in the watcher of the release being updated
-FROM, so the first update onto it does not have it: that device stays down until the next
-sign-in.
+action ran. The watcher starts the task on a failed verdict (#3292), and since FR-150 P1b
+climbs the rest of its ladder (above) when that does not bring the daemon back. It runs in
+the watcher of the release being updated FROM, so the first update onto a release with that
+start does not have it: that device stays down until the next sign-in.
 
 **A standard user's rollback cannot restore the Installer's own registration.** The files
 come back and the registration does not: the rollback's registry opens under
@@ -1195,8 +1249,8 @@ What it does not do:
   goes through.
 - **It does not help the failed version again.** That answers 1612, so an updater retrying the
   same release gets that until a newer one publishes.
-  `start_user_daemon_after_a_failure` has the device back in seconds; on the first update
-  onto it, the device stays down until the next sign-in.
+  The watcher's start after a failed verdict has the device back in seconds; on the first
+  update onto a release with that start, the device stays down until the next sign-in.
 
 The per-machine table has no such attribute, and none of this was read on it.
 
@@ -2372,7 +2426,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3536`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2480,7 +2534,7 @@ two privacy grants below remain the person's; the Done page says so.
 **A Mac that is one row already gets nothing from the wizard (FR-141 P3).** Before
 it offers the device install, the wizard asks the root daemon over the person
 socket it serves the console user (`/var/run/roomler-person/<uid>.sock`), which
-answers `status` (`crates/localapi/src/lib.rs:3683-3685`) with
+answers `status` (`crates/localapi/src/lib.rs:3722-3724`) with
 `gui_worker.one_row` in it (`:530-543`). When the root daemon says one row, the
 Welcome page says "This Mac is one device already", Continue stays off for every
 device card, and pairing start and the install's preflight refuse with the same
@@ -3200,7 +3254,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5649`).
+(`crates/localapi/src/lib.rs:5688`).
 
 On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
 the console user's `roomler …` is the screen worker the root daemon starts for
@@ -3229,9 +3283,9 @@ The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3497`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3536`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3551`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3722`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 
