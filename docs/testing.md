@@ -795,7 +795,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8004`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8096`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -951,6 +951,11 @@ skip and run nothing. Send plain text: an encoded payload is the shape endpoint 
 Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
 the run too. Take the denominator from the server's device list, not from who answered exec.
 
+A check can print its reading instead of stopping the run, for one run, on the word of whoever owns
+the machine. On 2026-11-20 two Windows desktops in use ran the bench that way: the session and
+idle checks printed what they read, and the load check still stopped at 50 %
+([§ two Windows desktops](fr/FR-16-rc-quality-benchmark.md#l1-fleet-run-2026-11-20-two-windows-desktops)).
+
 ### The plain smoke and the sweep judge by the same verdict
 
 `roomlerd encoder-smoke` without `--bench` is the bench's judgement on ONE cell (#3652). Its flags map
@@ -1062,7 +1067,7 @@ corporate laptop, a real relay path, or both:
 
 | found | defect | fix |
 |---|---|---|
-| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1086`](../agents/roomlerd/src/ssh.rs#L1086)) |
+| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1337`](../agents/roomlerd/src/ssh.rs#L1337)) |
 | round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:410`](../agents/roomlerd/src/ssh.rs#L410)) |
 | round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:478`](../crates/modules/network/src/routes/agent_ssh.rs#L478)) |
 | round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |

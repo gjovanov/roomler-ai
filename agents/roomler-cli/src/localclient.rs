@@ -3049,6 +3049,7 @@ mod last_install_tests {
             installer_exit_code: Some(0),
             note: Some("new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into()),
             path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+            daemon: None,
         }
     }
 

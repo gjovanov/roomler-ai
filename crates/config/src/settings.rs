@@ -121,6 +121,17 @@ pub struct SetupSettings {
     /// Env: `ROOMLER__SETUP__WIZARD_REINSTALL_GUARD`.
     #[serde(default = "reinstall_guard_default_on")]
     pub wizard_reinstall_guard: bool,
+    /// FR-141 P2 — "the released Roomler Setup makes a new Mac ONE device row
+    /// (FR-43): root's daemon, supervising the person's screen worker, from
+    /// one token and one approval — and that is field-proven." While it is
+    /// on, the macOS daemon card with "Join the overlay network" ticked (the
+    /// macOS default) installs one row on a Mac that is not enrolled yet;
+    /// off, it installs the two rows of FR-129 B2, as before. An enrolled Mac
+    /// keeps its layout either way. A claim like the others above: default
+    /// **off**, flipped by the operator after P2's field read.
+    /// Env: `ROOMLER__SETUP__WIZARD_MACOS_ONE_ROW`.
+    #[serde(default)]
+    pub wizard_macos_one_row: bool,
 }
 
 impl Default for SetupSettings {
@@ -131,6 +142,7 @@ impl Default for SetupSettings {
             wizard_unix_daemon: false,
             wizard_pairing: false,
             wizard_reinstall_guard: reinstall_guard_default_on(),
+            wizard_macos_one_row: false,
         }
     }
 }
@@ -1931,6 +1943,20 @@ mod setup_settings_tests {
         let off: SetupSettings = toml::from_str("wizard_reinstall_guard = false").unwrap();
         assert!(!off.wizard_reinstall_guard);
         assert!(!off.linux_daemon() && !off.macos_daemon() && !off.wizard_pairing);
+    }
+
+    /// FR-141 P2 — the one-row form is a claim about a released wizard: OFF
+    /// built whole and from a file without the key, on only when set, and
+    /// neither way does it touch the guard or the daemon cards.
+    #[test]
+    fn the_macos_one_row_form_is_off_until_turned_on() {
+        assert!(!SetupSettings::default().wizard_macos_one_row);
+        let absent: SetupSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.wizard_macos_one_row, "a file without the key");
+        let on: SetupSettings = toml::from_str("wizard_macos_one_row = true").unwrap();
+        assert!(on.wizard_macos_one_row);
+        assert!(on.wizard_reinstall_guard, "the guard stays on");
+        assert!(!on.macos_daemon(), "no claim about the macOS daemon card");
     }
 }
 

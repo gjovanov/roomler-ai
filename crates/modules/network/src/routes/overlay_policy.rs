@@ -19,7 +19,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
@@ -147,6 +147,13 @@ fn source_role_ids(sources: &[OverlaySelector]) -> Vec<ObjectId> {
         .collect()
 }
 
+/// The gate on every route here: `MANAGE_AGENTS` in the path org, decided
+/// FIRST, before a policy id is parsed, a body read or a policy looked up
+/// (#4187), as its tunnel-policy twin `tunnel_policy_manager` is. A member
+/// without the bit gets one 403 `forbidden` whatever the body is, so the
+/// writes take their body as `Result<Json<T>, JsonRejection>` and read it
+/// after this; a holder is answered one that does not parse as before
+/// (`ApiError::JsonBody`).
 async fn gate(
     state: &NetworkState,
     tenant_id: &str,
@@ -187,9 +194,10 @@ pub async fn create(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<UpsertOverlayPolicyRequest>,
+    body: Result<Json<UpsertOverlayPolicyRequest>, JsonRejection>,
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    let Json(body) = body?;
     validate(&body)?;
     // A role source names a role of this org, or the body is a 400.
     roomler_core::guards::require_org_roles(&state, tid, &source_role_ids(&body.sources), &[])
@@ -237,9 +245,12 @@ pub async fn update(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
-    Json(body): Json<UpsertOverlayPolicyRequest>,
+    body: Result<Json<UpsertOverlayPolicyRequest>, JsonRejection>,
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    // Read straight after the gate, before the id: a holder is answered a
+    // body that does not parse as before, whatever the id (#4187).
+    let Json(body) = body?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     // Resolve the target LIVE before touching it — a removed policy is a 404
@@ -316,9 +327,10 @@ pub async fn set_mode(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<SetAclModeRequest>,
+    body: Result<Json<SetAclModeRequest>, JsonRejection>,
 ) -> Result<Json<AclModeResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
+    let Json(body) = body?;
     state.overlay_networks.set_acl_mode(tid, body.mode).await?;
     refan_tenant(&state, tid).await;
     Ok(Json(AclModeResponse { mode: body.mode }))

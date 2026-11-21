@@ -224,7 +224,7 @@ row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's
-value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
+value that way (`agents/roomlerd/src/macos_supervisor.rs:309`).
 
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
@@ -648,7 +648,7 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3497`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3536`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check

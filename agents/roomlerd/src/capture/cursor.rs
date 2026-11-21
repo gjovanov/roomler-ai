@@ -14,8 +14,8 @@
 //!
 //! ```text
 //! { "t": "cursor:pos",   "id": u64, "x": i32, "y": i32 }
-//! { "t": "cursor:shape", "id": u64, "w": u32, "h": u32,
-//!                        "hx": i32, "hy": i32, "bgra": "<base64>" }
+//! { "t": "cursor:shape", "id": u64, "w": u32, "h": u32, "hx": i32,
+//!                        "hy": i32, "bgra": "<base64>", "css": str|null }
 //! { "t": "cursor:hide" }
 //! ```
 //!
@@ -779,5 +779,383 @@ mod windows_impl {
             // the browser uses the streamed bitmap.
             assert_eq!(tracker.classify(HCURSOR(std::ptr::null_mut())), None);
         }
+    }
+}
+
+/// What one data-channel message carries to every peer: a webrtc-rs reader
+/// reads each message into a 65 535-byte buffer (`DATA_CHANNEL_BUFFER_SIZE`
+/// in the vendored `webrtc` crate), and the agent's SCTP stack refuses to
+/// send one over 65 536 bytes (`ErrOutboundPacketTooLarge`). #4121 measured
+/// both.
+pub const PEER_MESSAGE_MAX: usize = 65_535;
+
+/// #4207 — the most a `cursor:shape` message may serialize to. The fit
+/// measures the whole serialized message, so the margin under
+/// [`PEER_MESSAGE_MAX`] is not slack for an estimate: it keeps the message
+/// off the limit's exact edge, and costs a scaled pointer about 1% of its
+/// edge (an edge scales with the square root of the budget).
+pub const SHAPE_MESSAGE_BUDGET: usize = 64_000;
+
+const _: () = assert!(SHAPE_MESSAGE_BUDGET < PEER_MESSAGE_MAX);
+
+/// #4207 — the `cursor:shape` message for one shape, as the pump in
+/// `peer.rs` sends it on the `cursor` channel when the tracker reports a new
+/// shape. It always fits one data-channel message.
+///
+/// A shape whose message would pass [`SHAPE_MESSAGE_BUDGET`] (a bitmap of
+/// about 110×110 px or more: an enlarged accessibility pointer, a large
+/// application cursor, a high DPI) goes out with its bitmap scaled down,
+/// keeping its aspect, until the message fits. `w`, `h`, `hx`, `hy` and
+/// `bgra` then all describe the scaled bitmap, so the viewer draws it as it
+/// draws any other, only smaller than the host's pointer, and `css` is
+/// kept. A shape that fits goes out exactly as before: the wire is
+/// unchanged.
+pub fn shape_message(shape_id: u64, shape: &CursorInfo) -> String {
+    let as_is = shape_message_as_is(shape_id, shape);
+    if as_is.len() <= SHAPE_MESSAGE_BUDGET || shape.width == 0 || shape.height == 0 {
+        return as_is;
+    }
+    // Everything in the message but the bitmap's base64 stays (its numbers
+    // only lose digits), and base64 spends 4 characters on 3 bytes, at 4
+    // bytes a pixel: the pixels the rest of the budget holds.
+    let rest = as_is.len().saturating_sub(shape.bgra.len().div_ceil(3) * 4);
+    let pixels = SHAPE_MESSAGE_BUDGET.saturating_sub(rest) / 4 * 3 / 4;
+    let (w, h) = (shape.width, shape.height);
+    let f = (pixels as f64 / (f64::from(w) * f64::from(h))).sqrt();
+    let edge = |n: u32| ((f64::from(n) * f).floor() as u32).clamp(1, n);
+    let (mut sw, mut sh) = (edge(w), edge(h));
+    loop {
+        let msg = shape_message_as_is(shape_id, &scaled(shape, sw, sh));
+        // The arithmetic fits on the first pass, except where an edge
+        // clamps to one pixel (a pointer hundreds of times wider than
+        // tall); shrinking both edges by an eighth ends it whatever the
+        // shape.
+        if msg.len() <= SHAPE_MESSAGE_BUDGET || (sw, sh) == (1, 1) {
+            tracing::debug!(
+                shape_id,
+                w,
+                h,
+                scaled_w = sw,
+                scaled_h = sh,
+                bytes = msg.len(),
+                "cursor:shape scaled down to fit one data-channel message (#4207)"
+            );
+            return msg;
+        }
+        let shrink = |n: u32| (n - n / 8).saturating_sub(1).max(1);
+        (sw, sh) = (shrink(sw), shrink(sh));
+    }
+}
+
+/// `shape` with its bitmap scaled down to `w`×`h`, the hotspot with it.
+fn scaled(shape: &CursorInfo, w: u32, h: u32) -> CursorInfo {
+    CursorInfo {
+        width: w,
+        height: h,
+        hotspot_x: scaled_hotspot(shape.hotspot_x, shape.width, w),
+        hotspot_y: scaled_hotspot(shape.hotspot_y, shape.height, h),
+        bgra: area_average(&shape.bgra, (shape.width, shape.height), (w, h)),
+        css: shape.css,
+    }
+}
+
+/// A hotspot coordinate on an edge of `from` pixels, moved to the same
+/// edge scaled to `to`: rounded, and kept inside the image.
+fn scaled_hotspot(at: i32, from: u32, to: u32) -> i32 {
+    let at = (f64::from(at) * f64::from(to) / f64::from(from)).round();
+    at.clamp(0.0, f64::from(to - 1)) as i32
+}
+
+/// A top-down, straight-alpha BGRA bitmap of `from` (width, height) scaled
+/// down to `to`: each output pixel is the mean of the source pixels it
+/// covers, each weighted by the share of it that it fills (a box filter,
+/// which does not alias on a downscale).
+///
+/// The mean is taken over PREMULTIPLIED colour, then divided back by the
+/// mean alpha. A mean of straight colour would mix the colour of the
+/// transparent pixels round a pointer (black, in most) into its edge, and
+/// leave a dark fringe on every pointer drawn on a transparent ground.
+fn area_average(src: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
+    let cols = coverage(from.0, to.0);
+    let rows = coverage(from.1, to.1);
+    let mut out = Vec::with_capacity(to.0 as usize * to.1 as usize * 4);
+    for row in &rows {
+        for col in &cols {
+            // Premultiplied blue, green and red, then alpha.
+            let mut sum = [0.0f64; 4];
+            for &(y, wy) in row {
+                for &(x, wx) in col {
+                    let at = (y as usize * from.0 as usize + x as usize) * 4;
+                    // A bitmap shorter than its size reads as transparent.
+                    let Some(px) = src.get(at..at + 4) else {
+                        continue;
+                    };
+                    let a = f64::from(px[3]) * wy * wx;
+                    for (s, &c) in sum.iter_mut().zip(&px[..3]) {
+                        *s += f64::from(c) * a;
+                    }
+                    sum[3] += a;
+                }
+            }
+            let alpha = sum[3];
+            if alpha > 0.0 {
+                out.extend(
+                    sum[..3]
+                        .iter()
+                        .map(|s| (s / alpha).round().min(255.0) as u8),
+                );
+            } else {
+                out.extend_from_slice(&[0, 0, 0]);
+            }
+            out.push(alpha.round().min(255.0) as u8);
+        }
+    }
+    out
+}
+
+/// For each of the `to` output pixels along an edge of `from` source
+/// pixels, the source pixels it covers, each with the share of the output
+/// pixel it fills (the shares of one output pixel sum to 1).
+fn coverage(from: u32, to: u32) -> Vec<Vec<(u32, f64)>> {
+    let step = f64::from(from) / f64::from(to);
+    (0..to)
+        .map(|i| {
+            let (start, end) = (f64::from(i) * step, f64::from(i + 1) * step);
+            let last = (end.ceil() as u32).min(from);
+            (start.floor() as u32..last)
+                .filter_map(|j| {
+                    let share = (end.min(f64::from(j + 1)) - start.max(f64::from(j))) / step;
+                    (share > 0.0).then_some((j, share))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The message with the bitmap as the host drew it.
+fn shape_message_as_is(shape_id: u64, shape: &CursorInfo) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    serde_json::json!({
+        "t": "cursor:shape",
+        "id": shape_id,
+        "w": shape.width,
+        "h": shape.height,
+        "hx": shape.hotspot_x,
+        "hy": shape.hotspot_y,
+        "bgra": BASE64.encode(&shape.bgra),
+        // Optional CSS `cursor` keyword for stock system cursors ("text",
+        // "default", …); null for app-custom cursors. Lets the browser
+        // render the viewer's native OS cursor instead of this bitmap.
+        // Additive — old browsers ignore it.
+        "css": shape.css,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod shape_message_tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    /// What one data-channel message carries to every peer (#4121): a
+    /// webrtc-rs reader reads each message into a 65 535-byte buffer, and
+    /// the agent's SCTP stack refuses to send one over 65 536 bytes. The
+    /// tests keep their own copy rather than trust the code's.
+    const ONE_MESSAGE: usize = 65_535;
+
+    /// Every pixel opaque, the colours varied across the image.
+    fn opaque(w: u32, h: u32) -> CursorInfo {
+        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                bgra.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 255]);
+            }
+        }
+        CursorInfo {
+            width: w,
+            height: h,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
+            css: None,
+        }
+    }
+
+    /// An opaque white disc on fully transparent black: the edge a resample
+    /// must not darken.
+    fn transparent_edged(w: u32, h: u32) -> CursorInfo {
+        let (cx, cy) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+        let r = f64::from(w.min(h)) / 2.0 - 2.0;
+        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (f64::from(x) + 0.5 - cx, f64::from(y) + 0.5 - cy);
+                let inside = dx * dx + dy * dy <= r * r;
+                bgra.extend_from_slice(&if inside { [255; 4] } else { [0; 4] });
+            }
+        }
+        CursorInfo {
+            width: w,
+            height: h,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
+            css: None,
+        }
+    }
+
+    /// The message for `shape`, checked to be one `cursor:shape` that a peer
+    /// takes in one message and whose bitmap is `w`×`h`×4 bytes, as the
+    /// viewer reads it (`applyCursorShape` drops a shorter one).
+    fn sent(shape: &CursorInfo, what: &str) -> (serde_json::Value, Vec<u8>) {
+        let msg = shape_message(7, shape);
+        assert!(
+            msg.len() <= ONE_MESSAGE,
+            "{what}: the message is {} bytes, over the {ONE_MESSAGE} a peer takes in one",
+            msg.len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&msg).expect("the message is JSON");
+        assert_eq!(v["t"], "cursor:shape", "{what}");
+        assert_eq!(v["id"], 7, "{what}");
+        let (w, h) = (v["w"].as_u64().unwrap(), v["h"].as_u64().unwrap());
+        assert!(w >= 1 && h >= 1, "{what}: {w}x{h}");
+        let bgra = BASE64.decode(v["bgra"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            bgra.len() as u64,
+            w * h * 4,
+            "{what}: bgra is not w*h*4 bytes"
+        );
+        (v, bgra)
+    }
+
+    #[test]
+    fn a_128_px_pointer_fits_one_message() {
+        sent(&opaque(128, 128), "opaque 128x128");
+        sent(&transparent_edged(128, 128), "transparent-edged 128x128");
+    }
+
+    #[test]
+    fn a_256_px_pointer_fits_one_message() {
+        sent(&opaque(256, 256), "opaque 256x256");
+        sent(&transparent_edged(256, 256), "transparent-edged 256x256");
+    }
+
+    #[test]
+    fn a_64_px_pointer_is_sent_byte_for_byte_as_before() {
+        for css in [None, Some("text")] {
+            let mut shape = transparent_edged(64, 64);
+            (shape.hotspot_x, shape.hotspot_y, shape.css) = (3, 5, css);
+            // The pump's own build before #4207 (`peer.rs`, `6168d66fa`).
+            let before = serde_json::to_string(&serde_json::json!({
+                "t": "cursor:shape",
+                "id": 42u64,
+                "w": shape.width,
+                "h": shape.height,
+                "hx": shape.hotspot_x,
+                "hy": shape.hotspot_y,
+                "bgra": BASE64.encode(&shape.bgra),
+                "css": shape.css,
+            }))
+            .unwrap();
+            assert_eq!(shape_message(42, &shape), before, "css {css:?}");
+            sent(&shape, "64x64");
+        }
+    }
+
+    #[test]
+    fn a_pointer_that_fits_is_sent_unchanged() {
+        // 100×100 is 40 000 bytes of bitmap, 53 336 in base64: it fits.
+        let mut shape = transparent_edged(100, 100);
+        (shape.hotspot_x, shape.hotspot_y, shape.css) = (50, 7, Some("pointer"));
+        let (v, bgra) = sent(&shape, "100x100");
+        assert_eq!((v["w"].as_u64(), v["h"].as_u64()), (Some(100), Some(100)));
+        assert_eq!((v["hx"].as_i64(), v["hy"].as_i64()), (Some(50), Some(7)));
+        assert_eq!(v["css"], "pointer");
+        assert_eq!(bgra, shape.bgra);
+        assert_eq!(shape_message(7, &shape), shape_message_as_is(7, &shape));
+    }
+
+    #[test]
+    fn a_scaled_pointer_keeps_its_aspect_and_its_hotspot_inside() {
+        // The top-left stays put, the middle stays the middle, the last
+        // pixel stays the last, and a hotspot off the image comes inside it.
+        for (hx, hy) in [(0, 0), (128, 128), (255, 255), (300, -4)] {
+            let mut shape = opaque(256, 256);
+            (shape.hotspot_x, shape.hotspot_y) = (hx, hy);
+            let (v, _) = sent(&shape, "256x256");
+            let (w, h) = (v["w"].as_i64().unwrap(), v["h"].as_i64().unwrap());
+            let (sx, sy) = (v["hx"].as_i64().unwrap(), v["hy"].as_i64().unwrap());
+            assert!(w < 256 && w == h, "{w}x{h}");
+            assert!(
+                (0..w).contains(&sx) && (0..h).contains(&sy),
+                "({hx}, {hy}) became ({sx}, {sy}), outside {w}x{h}"
+            );
+            match (hx, hy) {
+                (0, 0) => assert_eq!((sx, sy), (0, 0)),
+                (128, 128) => assert!(
+                    (sx - w / 2).abs() <= 1 && (sy - h / 2).abs() <= 1,
+                    "the middle became ({sx}, {sy}) in {w}x{h}"
+                ),
+                (255, 255) => assert_eq!((sx, sy), (w - 1, h - 1)),
+                _ => assert_eq!((sx, sy), (w - 1, 0)),
+            }
+        }
+        // A wide pointer stays four times as wide as it is tall.
+        let (v, _) = sent(&opaque(512, 128), "512x128");
+        let (w, h) = (v["w"].as_f64().unwrap(), v["h"].as_f64().unwrap());
+        assert!(w < 512.0 && (w / h - 4.0).abs() < 0.1, "{w}x{h}");
+    }
+
+    #[test]
+    fn the_css_keyword_survives_the_scale() {
+        for css in [Some("text"), Some("nwse-resize"), None] {
+            let mut shape = opaque(256, 256);
+            shape.css = css;
+            let (v, _) = sent(&shape, "256x256");
+            assert!(v["w"].as_u64().unwrap() < 256, "the bitmap was scaled");
+            assert_eq!(v["css"].as_str(), css);
+        }
+    }
+
+    #[test]
+    fn a_scaled_pointer_has_no_dark_fringe() {
+        let (v, bgra) = sent(&transparent_edged(256, 256), "transparent-edged 256x256");
+        let w = v["w"].as_u64().unwrap() as usize;
+        assert!(w < 256, "the bitmap was scaled");
+        // A mean of straight colour would turn the rim grey: white mixed
+        // with the transparent black round it.
+        let mut rim = 0;
+        for px in bgra.chunks_exact(4).filter(|px| px[3] > 0) {
+            assert_eq!(
+                px[..3],
+                [255, 255, 255],
+                "a visible pixel is not white: {px:?}"
+            );
+            rim += usize::from(px[3] < 255);
+        }
+        assert!(rim > 0, "the disc's rim is partly covered");
+        let middle = (w / 2 * w + w / 2) * 4;
+        assert_eq!(
+            (bgra[middle + 3], bgra[3]),
+            (255, 0),
+            "the middle opaque, a corner clear"
+        );
+    }
+
+    #[test]
+    fn the_fit_ends_on_any_size() {
+        // Large, and hundreds of times wider than tall: there an edge clamps
+        // to one pixel, so the first guess does not fit and the loop shrinks.
+        for (w, h) in [(1024, 1024), (40_000, 1), (1, 40_000), (300, 70)] {
+            sent(&opaque(w, h), &format!("{w}x{h}"));
+        }
+        // A bitmap shorter than its size says: the missing pixels are clear.
+        let mut shape = opaque(256, 256);
+        shape.bgra.truncate(100_000);
+        let (_, bgra) = sent(&shape, "256x256 with 100 000 bytes");
+        assert!(bgra.chunks_exact(4).any(|px| px[3] == 255));
+        assert!(bgra.chunks_exact(4).any(|px| px[3] == 0));
     }
 }
