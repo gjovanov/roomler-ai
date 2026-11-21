@@ -2608,8 +2608,8 @@ sequenceDiagram
   session panel (`native=true panel=session`), Approve and Deny, with the root daemon's pid unchanged; over a
   full-screen app; a fast user switch (the first question `session_panel=not_asked`, then the new person's panel); a
   locked screen; a second viewer while the panel is busy (`session_panel=busy`, the app); a worker ended and replaced
-  (`why=no_worker`, never `native=true`); a click the root half cannot take in time (C9b: the worker says so, and
-  the waited click decides, after a move to the app if the word is read first); and `ROOMLERD_SESSION_PANEL=0`
+  (`why=no_worker`, never `native=true`); a click the root half cannot take in time (C9b: the worker says so, the
+  waited click is dropped unread, and the app gets the question to answer again); and `ROOMLERD_SESSION_PANEL=0`
   (master's chain), then `ROOMLERD_PERSON_SOCKET=0` alone (`why=person_socket`). No lab cell stalls the panel.
 
 ### 10.9 A click on the prompt is acted on, or logged (#3873)
