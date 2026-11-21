@@ -76,7 +76,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - TCC binds a grant to the app's code requirement. When the signing identity changed on 2026-09-08, `tccd` logged
   `Failed to match existing code requirement for subject com.roomler.agent and service kTCCServiceScreenCapture`
   while the entry stayed listed and on (`docs/fr/FR-80-a-session-with-no-pixels-says-why.md:27-33`). A release's
-  Developer ID signature keeps the grants across our updates (`docs/installation.md:2838-2840`; field: no prompt
+  Developer ID signature keeps the grants across our updates (`docs/installation.md:2901-2903`; field: no prompt
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an
@@ -149,7 +149,7 @@ what is missing.
   stay up (which process the verb restarts on a one-row Mac is to verify in P1). "Live" counts everything the
   restarted process serves: a remote-control session, an SSH session, a tunnel forward. The step's text before the
   switch: "macOS will offer Quit & Reopen: choose Later. Roomler restarts roomlerd for you." For a person who chooses
-  Quit & Reopen anyway, the process LaunchServices starts (`app.rs:3842`) takes LaunchServices' open event before it
+  Quit & Reopen anyway, the process LaunchServices starts (`app.rs:3877`) takes LaunchServices' open event before it
   leaves, so Finder has nothing to report (#3240 row 9 was triaged "Discard" as owned by the OS; the operator's
   decision takes it back; that the open event is what Finder waits for is to verify in the field).
 - **Where it lives.** The companion's banner (`index.html:102-130`) becomes this section; its "or choose Quit &
@@ -169,7 +169,7 @@ what is missing.
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
   app's grants.
-- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:3991`), so after
+- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:4026`), so after
   our own update and after a macOS update without a separate trigger; and when a session's capture fails with
   `permission`.
 

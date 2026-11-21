@@ -167,7 +167,7 @@ and never outliving the daemon (FR-97 P0e).
 | A per-user install updates itself | ✅ | ✅ a root update helper (FR-96) | ✅ | `docs/installation.md` |
 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ✅ the `.deb`'s `Version`, the tarball's top directory | ✅ the `.pkg`'s `PackageInfo` | `agents/roomlerd/src/artifact_version.rs:114` |
 | A private staging directory per download | ✅ | ✅ | ✅ measured: the root helper's temp directory is root's own | `agents/roomlerd/src/updater.rs:989`, `:1012` |
-| One verb registers the system service | ✅ | ✅ | ✅ | `service install --as-service` (alias `--system`, `agents/roomlerd/src/service.rs:421-428`) |
+| One verb registers the system service | ✅ | ✅ | ✅ | `service install --as-service` (alias `--system`, `agents/roomlerd/src/service.rs:459-466`) |
 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | ✅ `install.sh --uninstall` | ✅ the same | `docs/installation.md`, Uninstall |
 | An ephemeral device removes itself on a clean stop | ✅ | ✅ | ✅ | `docs/ephemeral-nodes.md` |
 | A crash in a worker is recorded by its supervisor | ✅ | ⛔ systemd | ✅ from 0.4.149, where the root daemon supervises the GUI worker (`macos_supervise_gui_worker`) | a signal, or an exit the agent did not choose; the record rides the root daemon's enrollment (`agents/roomlerd/src/macos_supervisor.rs:275-301`, FR-97 P6e-2) |
