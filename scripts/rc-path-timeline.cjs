@@ -29,7 +29,14 @@
 //   |            | and each heartbeat `target_moves`: the moves since the one before it     |
 //   | delivery   | `path delivery (FR-148 P0, shadow, ≈10s)`, `path model (…)`              |
 //   |            | (media_delivery.rs); a delivery line with a queued sample prints as a    |
-//   |            | `queue` event: `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low`   |
+//   |            | `queue` event: `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low`,  |
+//   |            | `ack_ms`; one with an SCTP loss or a one-packet window as a `loss`       |
+//   |            | event (THE MESH RELAY'S T3 below); the model line with its floor's       |
+//   |            | push-back, its rule and its fall (FR-148 D46 B2, D48, D50)               |
+//   | /derp      | `overlay derp: shed stale carrier frames (queue age bound)` and the      |
+//   |            | /derp WS owner's lifecycle lines (derp.rs `run`): connected, closed and  |
+//   |            | why, a connect that failed or timed out (DERP_STATES), as `shed` and     |
+//   |            | `derp` events; the relay they name stays in the database                 |
 //   | open       | `path open (FR-148 P0, O10)` (media_delivery.rs): once a pump, at its    |
 //   |            | first media write, which way SCTP opened the association (FR-148 O10)    |
 //   | memory     | `FR-148 P1 path memory: the pair's entry at the open` / `…: what the     |
@@ -63,6 +70,34 @@
 //   A held FFmpeg target landing (`deferred bitrate …`) prints `held b bps …`
 //   with the `why` it was handed out with. It is no new move.
 //
+// THE MESH RELAY'S T3 (FR-148 AC4)
+//
+//   An expiry of SCTP's retransmit timer (T3-rtx) sets the congestion window
+//   to one packet, 1,228 bytes (T3_CWND, the vendored SCTP's MTU), and nothing
+//   else sets it that low. A delivery line is a T3 line when its `loss` (fast
+//   retransmissions, T3 expiries over its samples) counts a T3, or when its
+//   `cwnd` was one packet at a sample's close. A line with a loss or a
+//   one-packet window prints a `loss` row, a T3 line's with `; T3`.
+//   On the mesh relay (carrier `derp`) the /derp writer drops a frame that
+//   waited past its age bound, and the keepalive tick writes the shed line
+//   when the count changed: at most one every 25 s per relay node
+//   (SHED_AFTER_MS), with the drops since the line before (`since_last`). For
+//   each T3 line of a session on the mesh relay, its row and the summaries say
+//   which shed line that told drops (since_last > 0) comes nearest (`pairOf`):
+//   - `after`: one at most 25 s after the line. A drop could have fired the
+//     T3: FR-148 AC4's Read A takes this one;
+//   - `before`: none in the 25 s after, but one inside the line's own span
+//     (`span_ms` before it). The tick fell between a drop and the line's
+//     write, so the drop was told first;
+//   - `none`: none from the start of the span to 25 s after the line.
+//   Each also says whether a /derp lifecycle line falls between: from the
+//   span's start to the later of the line and its shed line (to 25 s after
+//   the line when there is none). A reconnect there could have fired the T3
+//   itself, or restarted the tick that tells a drop.
+//   The /derp lines carry no session id. Each prints in the session its time
+//   falls in (as an encoder line does), and the pairing reads every one of the
+//   device's, whichever session printed it.
+//
 //   `target_moves` counts every move the governor handed out since the
 //   heartbeat before it (`record_applied`, `take_moves`: governor.rs), as
 //   `why:n` joined by `,`. The pumps write a target line for only some: the
@@ -89,6 +124,22 @@
 //     two do; otherwise it is counted as unattributed.
 //   - Whether a session ended: a session whose last line is within
 //     OPEN_AT_END_MS of the window's end is printed as open at the window's end.
+//   - Which relay node a /derp line came from. Its `relay` field names the
+//     node (`central`, or a regional relay's host) and stays in the database,
+//     so the lines of a device on two nodes read as one device's, while each
+//     node counts and ticks its own drops (a DerpMux each).
+//   - Whether a drop fired a T3. A shed line counts the drops of up to 25 s
+//     before it (later when a blocked send held its tick up), and a delivery
+//     line the T3 expiries of its ≈10 s, so the pairing says only that a drop
+//     could have come first. The relay server's own drops and a lost SACK are
+//     in no shed line.
+//   - A T3 count, on an agent before 0.4.227: its delivery lines carry no
+//     `loss`, so its T3 lines show only by the one-packet window, and their
+//     count prints `-`. A line whose samples were read without SCTP's gauges
+//     carries neither `loss` nor `cwnd`.
+//   - The model's push-back, rule and fall, on an agent before FR-148 D46 B2,
+//     D48 (#4191) and D50 (#4231): its model lines carry none of the three
+//     fields, which print `-`, as the agent's own `-` (none yet) does.
 //
 // BOUNDED BY CONSTRUCTION (the read runs on production `agent_logs`)
 //
@@ -109,12 +160,22 @@
 //     their batches were stored, so what is missing is every batch stored
 //     after the last one read, and some of its lines can be older than the
 //     last time printed: narrow the window, or raise --limit.
-//   - What leaves the database: named fields only (`viewers` only as a
-//     number: the rank line's count, never the overlay line's list of viewer
-//     addresses), plus the two path-memory lines' fields with every key that
-//     could name an address, a host or a person removed on the server
-//     (DENY_KEY). Ids print as their last 4 hex in the report and in --rows
-//     alike (`masks`), and every printed line, like every string --rows
+//   - What leaves the database: the named fields of the line's own kind only
+//     (`fieldsOf`): the projection picks them by the line's message, as the
+//     fold does, so a field named for one kind never leaves from another's
+//     line. The ICE line's `relay` is a yes or no, while the /derp lines'
+//     `relay` names the relay node, a host, and a failed connect's `e` is an
+//     error text that can name its address: both stay in the database
+//     (KEPT). The read is not built if either is named (`projectionOf`), the
+//     /derp lines' counts leave as numbers only (NUMBER_KINDS), and the
+//     self-test fails on either, or on a /derp line the agent writes with a
+//     field the reader neither names nor keeps. `viewers` leaves only as a
+//     number: the rank line's count (the overlay line names no `viewers`, and
+//     its auto line's list of viewer addresses stays). The two path-memory
+//     lines leave every field but a key that could name an address, a host or
+//     a person, removed on the server (DENY_KEY). --rows keeps a line to its
+//     kind's fields again. Ids print as their last 4 hex in the report and in
+//     --rows alike (`masks`), and every printed line, like every string --rows
 //     prints, is scrubbed of addresses and 24-hex ids again. `why` and
 //     `target_moves` leave as written: the agent builds both from fixed words
 //     and counts only (encode/aimd.rs `Cause`, encode/governor.rs `Why` and
@@ -138,6 +199,11 @@
 //   most once a ≈1 s window). That is a few a minute where a session climbs
 //   and backs off; even one a second for all eight hours adds 28,800 rows of
 //   about 200 bytes, about 50,000 rows in all, under DEFAULT_LIMIT.
+//   The /derp lines add a shed line at most every 25 s per relay node while it
+//   drops (1,440 in the ten hours if it never stops) and a few lifecycle lines
+//   a reconnect, about 150 bytes each: about 51,500 rows with one relay node,
+//   still under DEFAULT_LIMIT. Choosing a line's fields by its kind runs on
+//   the rows read, never on the documents examined, which do not change.
 //
 // RUN
 //
@@ -165,6 +231,23 @@ const RATE_MAX_GAP_MS = 10000;
 const RELAY_NOMINAL_BPS = 3000000;
 /** A session whose last line is this close to the window's end may be open. */
 const OPEN_AT_END_MS = 30000;
+/** FR-148 AC4: the congestion window a T3-rtx expiry leaves, one packet: the
+ *  vendored SCTP's INITIAL_MTU (association/mod.rs), its `mtu` for good, to
+ *  which the expiry sets the window (`self.cwnd = self.mtu;`,
+ *  association_internal.rs). A fast retransmit sets it to ssthresh, four
+ *  packets at least, and nothing else sets it. The self-test reads all three. */
+const T3_CWND = 1228;
+/** The /derp keepalive tick (derp.rs DERP_KEEPALIVE): the shed line is written
+ *  on it, so a drop is told at most this long after it, later only when a
+ *  send held the tick up or a reconnect restarted it. The self-test reads it. */
+const SHED_AFTER_MS = 25000;
+/** A delivery line's span when it names none (media_delivery.rs LINE_EVERY). */
+const LINE_EVERY_MS = 10000;
+/** A session on the mesh relay: its carrier word (session_carrier.rs). */
+const MESH_RELAY = 'derp';
+/** A model line's rule or fall whose start (the line's time less its age)
+ *  moved more than this is a new one: its row prints again. */
+const MODEL_ONSET_SLACK_MS = 1000;
 /** A batch is stored after its lines; the created_at range is padded so. */
 const UPLOAD_PAD_MS = 10 * 60 * 1000;
 const DEFAULT_LIMIT = 60000;
@@ -175,6 +258,23 @@ const MAX_WINDOW_MS = 24 * 3600 * 1000;
  *  A time without a zone is refused: JavaScript reads it in the zone of the
  *  machine that runs the read. */
 const ISO_TIME = /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]{1,3})?)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9]))?$/;
+
+/** FR-148 AC4: the /derp WS owner's lifecycle lines (derp.rs `run`), each by
+ *  the word the report prints for it and the start of its message as the
+ *  agent writes it. The self-test finds each in `run`, and fails on a line
+ *  there that it does not name. */
+const DERP_STATES = [
+  ['registration-failed', 'overlay derp: registration send failed; reconnecting'],
+  ['connected', 'overlay derp: /derp WS connected + registered'],
+  ['suspend-resume', 'overlay derp: suspend/resume detected — cycling the /derp WS'],
+  ['frozen', 'overlay derp: no inbound frames within the RX deadline, but this agent did not run for ~'],
+  ['half-open', 'overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting'],
+  ['ping-failed', 'overlay derp: keepalive ping failed; reconnecting'],
+  ['closed', 'overlay derp: /derp WS closed; reconnecting'],
+  ['connect-failed', 'overlay derp: /derp connect failed'],
+  ['lb-no-pod', 'overlay derp: the load balancer has no pod for this org yet; redialling flat (FR-28)'],
+  ['connect-timed-out', 'overlay derp: /derp connect timed out'],
+];
 
 /** The lines read: kind, the message's start, and the call site whose
  *  literal the self-test finds in the source. */
@@ -193,6 +293,13 @@ const KINDS = [
   { k: 'delivery', re: /^path delivery \(FR-148 P0/, src: ['media_delivery.rs', 'path delivery (FR-148 P0, shadow, ≈10s)'] },
   { k: 'model', re: /^path model \(FR-148 P0/, src: ['media_delivery.rs', 'path model (FR-148 P0, shadow, ≈10s)'] },
   { k: 'open', re: /^path open \(FR-148 P0, O10\)/, src: ['media_delivery.rs', 'path open (FR-148 P0, O10)'] },
+  // FR-148 AC4: the /derp writer's shed line, and its WS owner's lifecycle lines.
+  { k: 'shed', re: /^overlay derp: shed stale carrier frames/, src: ['derp.rs', 'overlay derp: shed stale carrier frames (queue age bound)'] },
+  {
+    k: 'derp',
+    re: /^overlay derp: (registration send failed|\/derp WS (connected|closed)|suspend\/resume detected|no inbound frames within the RX deadline|keepalive ping failed|\/derp connect (failed|timed out)|the load balancer has no pod for this org)/,
+    src: ['derp.rs'].concat(DERP_STATES.map((x) => x[1])),
+  },
   { k: 'memOpen', re: /^FR-148 P1 path memory: the pair's entry at the open/, src: ['media_pair_memory.rs', "FR-148 P1 path memory: the pair's entry at the open"] },
   { k: 'memClose', re: /^FR-148 P1 path memory: what the close wrote/, src: ['media_pair_memory.rs', 'FR-148 P1 path memory: what the close wrote'] },
   { k: 'rateMem', re: /^FR-148 P1 rate memory/, src: ['encode/rate_memory.rs', "FR-148 P1 rate memory: the pair's entry has no measured provenance"] },
@@ -214,51 +321,74 @@ const ID_KEYS = new Map([
  *  (rc_overlay.rs `log_rank`); the overlay-auto line's is its list of viewer
  *  addresses, which stays in the database. */
 const NUMBER_ONLY = ['viewers'];
+/** FR-148 AC4: the kinds whose every field leaves only as a number: the /derp
+ *  lines', whose counts are all they let out. */
+const NUMBER_KINDS = ['shed', 'derp'];
+/** The fields every line leaves with: its session's id, by either name (the
+ *  id prints as its last 4 hex). */
+const IDS = ['session_id', 'session'];
+/**
+ * FR-148 AC4: what the /derp lines write and the read leaves in the database.
+ * `relay` names the relay node: `central`, or a regional relay's host
+ * (derp.rs `spawn_regional`); a failed connect's `e` is an error text, which
+ * can name the relay's address. `projectionOf` refuses to build a read that
+ * would project either, and the self-test fails on it, and on a /derp line
+ * that writes a field neither FIELDS nor this names.
+ */
+const KEPT = { shed: ['relay'], derp: ['relay', 'e'] };
+
+/** True when a field leaves only as a number: NUMBER_ONLY, or a field of a
+ *  NUMBER_KINDS line. */
+function numberOnly(kind, k) {
+  return NUMBER_ONLY.includes(k) || NUMBER_KINDS.includes(kind);
+}
 
 /**
  * The named fields that leave the database, by the row that prints them: a
  * line of a kind (KINDS) prints as a row of `k=v` in this order, a field the
- * line does not carry left out (the model row prints it as `-`). Adding a field
- * to a line kind is ONE entry here and nothing else: the read projects every
- * field named here (`named`), and the row prints its list. The path-memory
+ * line does not carry left out (the model, queue, loss and shed rows print it
+ * as `-`). A line leaves with its own kind's fields only (`fieldsOf`): its
+ * session's id, what the code reads of it, and its rows'. Adding a field to a
+ * line kind is ONE entry here and nothing else: the read projects it for that
+ * kind's lines (`projectionOf`), and the row prints its list. The path-memory
  * lines are the exception the other way: every field they carry leaves and
  * prints (MEM_PATTERN), named here or not.
  */
 const FIELDS = {
-  // Projected, and printed only where the code reads them: the ids (as their
-  // last 4 hex), the heartbeat's (the minute rows, the pipe row, the summary)
-  // and a target line's new target (`a -> b bps`). The rank lines' `read_ms`
-  // and the capture-timing line's two print nowhere.
-  read: [
-    'session_id',
-    'session',
+  // Projected, and printed only where the code reads them, by kind: the
+  // heartbeat's (the minute rows, the pipe row, the summary) and a target
+  // line's new target (`a -> b bps`). The rank lines' `read_ms` and the
+  // capture-timing line's two print nowhere.
+  read: {
     // heartbeat (peer.rs)
-    'codec_label',
-    'encoder',
-    'constrained',
-    'target_bps',
-    'target_fps',
-    'width',
-    'height',
-    'frames_sent',
-    'bytes_written',
-    'maxrate_bps',
-    'pipe_state',
-    'pipe_measured',
-    'readings_refuted',
-    'link_unoffered',
-    'frames_keepalive',
-    'keepalive_bytes',
-    'window_ms',
-    // FR-148 P0: the moves since the heartbeat before, `why:n` joined by `,`
-    'target_moves',
-    // the VP9-444 watermark line's new target (the other target lines': target_bps)
-    'new_target',
-    'read_ms',
+    heartbeat: [
+      'codec_label',
+      'encoder',
+      'constrained',
+      'target_bps',
+      'target_fps',
+      'width',
+      'height',
+      'frames_sent',
+      'bytes_written',
+      'maxrate_bps',
+      'pipe_state',
+      'pipe_measured',
+      'readings_refuted',
+      'link_unoffered',
+      'frames_keepalive',
+      'keepalive_bytes',
+      'window_ms',
+      // FR-148 P0: the moves since the heartbeat before, `why:n` joined by `,`
+      'target_moves',
+    ],
+    // the VP9-444 watermark line's new target is `new_target`, the other target lines' `target_bps`
+    target: ['target_bps', 'new_target'],
+    landed: ['target_bps'],
+    rank: ['read_ms'],
     // capture timing (system_context/capture_pump.rs)
-    'worker_avg_capture_ms',
-    'calls',
-  ],
+    capTiming: ['worker_avg_capture_ms', 'calls'],
+  },
   // carrier + ICE (session_carrier.rs, carrier_rank.rs)
   carrier: ['carrier', 'relay_transport', 'local_typ', 'remote_typ'],
   ice: ['relay', 'local_typ', 'local_proto', 'remote_typ', 'remote_proto', 'waited_ms', 'opening'],
@@ -271,10 +401,15 @@ const FIELDS = {
   rejected: ['encoder', 'open_err'],
   // delivery (media_delivery.rs): a window with stalled time prints `stall`,
   // one with a queued sample `queue` (FR-148 P0's standing queue, as `emit`
-  // names it; its `cwnd` is a pair there, a number on the open line)
+  // names it; its `cwnd` is a pair there, a number on the open line), one
+  // with an SCTP loss or a one-packet window `loss` (FR-148 AC4: `loss` is
+  // fast retransmissions and T3-rtx expiries over the line's samples)
   stall: ['span_ms', 'delivery_samples', 'backlogged_bps', 'app_limited_bps', 'stalled_ms'],
-  queue: ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low'],
-  model: ['viewer_rx_bps', 'model_capacity_bps', 'model_floor_bps'],
+  queue: ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low', 'ack_ms'],
+  loss: ['span_ms', 'stalled_ms', 'acked_bytes', 'loss', 'cwnd', 'pending_high'],
+  // the model line (`emit_model`), with the floor's push-back (FR-148 D46 B2),
+  // the rule that last kept a reading out (D48) and the last fall (D50)
+  model: ['viewer_rx_bps', 'model_capacity_bps', 'model_floor_bps', 'model_floor_push_back', 'model_rule', 'model_fell'],
   // open path (media_delivery.rs, FR-148 O10), in the order `emit_open` writes them
   open: ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'],
   // FR-148 P0: the target lines (peer.rs), after `a -> b bps`
@@ -282,12 +417,26 @@ const FIELDS = {
   landed: ['why'],
   // rate memory (encode/rate_memory.rs) — its `peer` never leaves
   rateMem: ['assumed_bps', 'age_s'],
+  // FR-148 AC4: the /derp lines (derp.rs `run`), numbers only (NUMBER_KINDS);
+  // their `relay` and a failed connect's `e` stay in the database (KEPT)
+  shed: ['dropped_stale', 'since_last'],
+  derp: ['napped_s', 'silent_s', 'paused_s', 'wait_ms', 'left'],
 };
 
-/** Every field FIELDS names, once: what the read projects. Built on each call,
- *  so it never lags FIELDS. */
+/** The rows a kind's line prints as, where they are not one row of its name. */
+const ROWS = { delivery: ['stall', 'queue', 'loss'] };
+
+/** The fields a line of one kind leaves the database with, and --rows keeps:
+ *  its session's id, what the code reads of it, and its rows', in that order.
+ *  Built on each call, so it never lags FIELDS. */
+function fieldsOf(kind) {
+  const lists = [IDS, FIELDS.read[kind] || []].concat((ROWS[kind] || [kind]).map((r) => (Array.isArray(FIELDS[r]) ? FIELDS[r] : [])));
+  return Array.from(new Set([].concat(...lists)));
+}
+
+/** Every field a line of some kind leaves with, once. */
 function named() {
-  return Array.from(new Set(Object.keys(FIELDS).reduce((all, k) => all.concat(FIELDS[k]), [])));
+  return Array.from(new Set([].concat(...KINDS.map((d) => fieldsOf(d.k)))));
 }
 
 /** The close line's sample counts, both generations (0.4.225 carries
@@ -363,6 +512,17 @@ function shown(v) {
   return m ? { bps: Number(m[1]), basis: m[2], ageMs: m[3] === undefined ? null : Number(m[3]) } : { raw: s };
 }
 
+/** `<what>/<age>ms` as the model line writes its rule (media_delivery.rs
+ *  `RuledShown`: `stall/3400ms`) and its fall (FR-148 D50 `FellShown`:
+ *  `2131000->1162000/61300ms`): the what and the age; the agent's `-` (none
+ *  yet) as the what `-`; null on a line without the field. */
+function aged(v) {
+  const s = text(v);
+  if (s === null) return null;
+  const m = /^(.+)\/(\d+)ms$/.exec(s);
+  return m ? { what: m[1], ageMs: Number(m[2]) } : { what: s, ageMs: null };
+}
+
 /** A heartbeat's `target_moves` (governor.rs `Moves`: `why:n` joined by `,`,
  *  then `more:n` past 16 whys, or `none`) as [why, n] pairs; null on a line
  *  without it. A part that is not `why:n` counts once as `unreadable`. */
@@ -388,6 +548,12 @@ function epochMs(t) {
 function kindOf(msg) {
   for (const d of KINDS) if (d.re.test(msg)) return d.k;
   return null;
+}
+
+/** A /derp lifecycle line's word (DERP_STATES), from its message. */
+function derpState(msg) {
+  const s = DERP_STATES.find((x) => String(msg).startsWith(x[1]));
+  return s ? s[0] : 'unknown';
 }
 
 // ---------------------------------------------------------------- privacy
@@ -470,6 +636,20 @@ function kv(f, keys) {
   return out.join(' ');
 }
 
+/** Every one of `keys` as `k=v`, a field the line does not carry as `k=-`, so
+ *  the row has one shape whatever the agent's version. */
+function kvAll(f, keys) {
+  return keys
+    .filter((k) => !DENY_KEY.test(k))
+    .map((k) => `${k}=${ID_KEYS.has(k) ? mask((f || {})[k]) : dash(text((f || {})[k]))}`)
+    .join(' ');
+}
+
+/** One decimal second, signed: `+7.3 s`, `-2.0 s`. */
+function signedSecs(ms) {
+  return `${ms < 0 ? '-' : '+'}${(Math.abs(ms) / 1000).toFixed(1)} s`;
+}
+
 // ---------------------------------------------------------------- the fold
 
 function newSession(sid, t) {
@@ -530,13 +710,53 @@ function fold(rows, opts) {
     else unattributed[rec.kind] = (unattributed[rec.kind] || 0) + 1;
   }
   const to = epochMs(opts.to);
-  for (const s of list) finishSession(s, to);
-  return { sessions: list, device: deviceOf(list, unattributed), truncated: !!opts.truncated, rows: rows.length, opts };
+  // FR-148 AC4: the /derp lines name no session; the pairing reads the
+  // device's every one, whichever session printed it.
+  const derp = recs.filter((x) => x.kind === 'shed' || x.kind === 'derp').map((x) => ({ t: x.t, kind: x.kind, since: num(x.f.since_last), state: x.kind === 'derp' ? derpState(x.m) : null }));
+  for (const s of list) finishSession(s, to, derp);
+  return { sessions: list, device: deviceOf(list, unattributed, derp), truncated: !!opts.truncated, rows: rows.length, opts };
 }
 
-function finishSession(s, windowEnd) {
+/**
+ * FR-148 AC4: a T3 line at `t`, its samples from `span` ms before it, against
+ * the device's /derp lines in time order (THE MESH RELAY'S T3). The shed line
+ * that told drops (since_last > 0) nearest after it, within SHED_AFTER_MS
+ * (`after`: a drop could have fired the T3, Read A's rule); else the last one
+ * inside its span (`before`: the tick fell between a drop and the line);
+ * else `none`. `between`: a lifecycle line from the span's start to the later
+ * of the line and its shed line (SHED_AFTER_MS after the line when none).
+ */
+function pairOf(t, span, derp) {
+  const start = t - span;
+  const told = derp.filter((d) => d.kind === 'shed' && d.since !== null && d.since > 0);
+  const after = told.find((d) => d.t > t && d.t <= t + SHED_AFTER_MS) || null;
+  const before = after ? null : told.filter((d) => d.t > start && d.t <= t).pop() || null;
+  const end = after ? after.t : before ? t : t + SHED_AFTER_MS;
+  const between = derp.some((d) => d.kind === 'derp' && d.t > start && d.t <= end);
+  const shed = after || before;
+  const says = shed
+    ? `shed ${after ? 'after' : 'before'} ${signedSecs(shed.t - t)}${before ? ' (inside the span)' : ''} since_last=${shed.since}`
+    : `no shed line (the span's start to ${signedSecs(SHED_AFTER_MS)})`;
+  return { bucket: after ? 'after' : before ? 'before' : 'none', between, says: says + (between ? ', a /derp lifecycle line between' : '') };
+}
+
+/** The T3 lines by their pairing (pairOf), each with how many had a /derp
+ *  lifecycle line between. */
+function newBuckets() {
+  return { after: { n: 0, between: 0 }, before: { n: 0, between: 0 }, none: { n: 0, between: 0 } };
+}
+
+function bucketCells(by) {
+  return ['after', 'before', 'none'].map((k) => `${by[k].n} (${by[k].between})`).join(' / ');
+}
+
+function finishSession(s, windowEnd, derp) {
   const ev = [];
-  const push = (t, what, line) => ev.push({ t, what, line });
+  const push = (t, what, line) => {
+    const e = { t, what, line };
+    ev.push(e);
+    return e;
+  };
   const hb = { n: 0, noCounters: 0, resets: 0, holes: 0, ivs: [], prev: null, firstT: null, lastT: null };
   // The last target any line gave: a heartbeat's applied target, or a target
   // line's new one. A held target landing gives none: it was handed out before.
@@ -557,8 +777,14 @@ function finishSession(s, windowEnd) {
   // FR-148 P0: `carried` counts the lines with the standing queue's fields,
   // `queued` those with a queued sample, `standingHigh` the highest standing.
   const del = { windows: 0, stalled: 0, longestMs: 0, stalledMs: 0, carried: 0, queued: 0, standingHigh: null };
+  // FR-148 AC4: the T3 lines (a T3 in `loss`, or a one-packet `cwnd`), the
+  // expiries `loss` counts and the lines carrying it, the stalled lines by
+  // whether they had a T3, and each T3 line's row for the pairing.
+  const t3 = { lines: 0, expiries: 0, carried: 0, stalledWith: 0, stalledWithout: 0, stalledUnread: 0, at: [], by: newBuckets() };
   const model = { n: 0, lastRx: null, maxRx: null, lastCap: null };
   let lastModelKey = null;
+  let lastRuleAt = null;
+  let lastFellAt = null;
   // FR-148 O10: the open lines, and the first one's answer.
   const open = { n: 0, path: null, ssthresh: null, rwnd: null };
   const mem = { open: [], close: [], rate: [] };
@@ -711,7 +937,29 @@ function finishSession(s, windowEnd) {
           if (standing) del.standingHigh = del.standingHigh === null ? standing[1] : Math.max(del.standingHigh, standing[1]);
           if (queued >= 1) {
             del.queued++;
-            push(r.t, 'queue', kv(f, FIELDS.queue));
+            push(r.t, 'queue', kvAll(f, FIELDS.queue));
+          }
+        }
+        // FR-148 AC4: a T3-rtx expiry, by its count (`loss`, from 0.4.227) or
+        // by the one-packet window it leaves; a fast retransmission prints
+        // its row too, untagged. A line read without SCTP's gauges carries
+        // neither field, and its stall is counted apart.
+        const loss = couple(f.loss);
+        const cw = couple(f.cwnd);
+        if (loss) t3.carried++;
+        const isT3 = (loss !== null && loss[1] > 0) || (cw !== null && cw[0] === T3_CWND);
+        if (st !== null && st > 0) {
+          if (isT3) t3.stalledWith++;
+          else if (loss !== null || cw !== null) t3.stalledWithout++;
+          else t3.stalledUnread++;
+        }
+        if (isT3 || (loss !== null && loss[0] > 0)) {
+          const e = push(r.t, 'loss', kvAll(f, FIELDS.loss) + (isT3 ? '; T3' : ''));
+          if (isT3) {
+            t3.lines++;
+            if (loss !== null) t3.expiries += loss[1];
+            const span = num(f.span_ms);
+            t3.at.push({ t: r.t, span: span === null ? LINE_EVERY_MS : span, e });
           }
         }
         break;
@@ -723,11 +971,22 @@ function finishSession(s, windowEnd) {
         if (rx) model.lastRx = rx;
         if (rx && rx.bps !== undefined) model.maxRx = model.maxRx === null ? rx.bps : Math.max(model.maxRx, rx.bps);
         model.lastCap = mc;
-        const key = [rx ? rx.basis || rx.raw : null, mc ? mc.basis || mc.raw : null].join('|');
-        if (key !== lastModelKey) {
+        // The row prints when a basis, the floor's push-back, the rule or the
+        // fall changes, and again when a rule or a fall starts anew: its
+        // start (the line's time less its age) moved (MODEL_ONSET_SLACK_MS).
+        const rule = aged(f.model_rule);
+        const fell = aged(f.model_fell);
+        const startOf = (a) => (a && a.ageMs !== null ? r.t - a.ageMs : null);
+        const moved = (a, b) => a !== null && b !== null && Math.abs(a - b) > MODEL_ONSET_SLACK_MS;
+        const ruleAt = startOf(rule);
+        const fellAt = startOf(fell);
+        const key = [rx ? rx.basis || rx.raw : null, mc ? mc.basis || mc.raw : null, text(f.model_floor_push_back), rule && rule.what, fell && fell.what].join('|');
+        if (key !== lastModelKey || moved(ruleAt, lastRuleAt) || moved(fellAt, lastFellAt)) {
           lastModelKey = key;
-          push(r.t, 'model', FIELDS.model.map((k) => `${k}=${dash(text(f[k]))}`).join(' '));
+          push(r.t, 'model', kvAll(f, FIELDS.model));
         }
+        lastRuleAt = ruleAt;
+        lastFellAt = fellAt;
         break;
       }
       case 'open':
@@ -750,6 +1009,23 @@ function finishSession(s, windowEnd) {
       case 'capTiming':
         capTiming++;
         break;
+      // FR-148 AC4: the /derp lines print in the session their time falls in;
+      // the relay they name never left the database (KEPT).
+      case 'shed':
+        push(r.t, 'shed', kvAll(f, FIELDS.shed));
+        break;
+      case 'derp':
+        push(r.t, 'derp', [derpState(r.m), kv(f, FIELDS.derp)].filter(Boolean).join(' '));
+        break;
+    }
+  }
+  // FR-148 AC4: on the mesh relay, each T3 line by its shed line (pairOf).
+  if (carrier === MESH_RELAY) {
+    for (const x of t3.at) {
+      const p = pairOf(x.t, x.span, derp || []);
+      t3.by[p.bucket].n++;
+      if (p.between) t3.by[p.bucket].between++;
+      x.e.line += '; ' + p.says;
     }
   }
   const whole = rateOf(hb.ivs);
@@ -778,6 +1054,7 @@ function finishSession(s, windowEnd) {
     ka,
     enc,
     del,
+    t3,
     model,
     open,
     mem,
@@ -787,8 +1064,12 @@ function finishSession(s, windowEnd) {
   s.ivs = hb.ivs;
 }
 
-function deviceOf(list, unattributed) {
+function deviceOf(list, unattributed, derp) {
   const d = {
+    // FR-148 AC4: the sessions on the mesh relay, summed; and the /derp lines,
+    // every relay node's, in sessions or not.
+    mesh: { sessions: 0, windows: 0, stalled: 0, lines: 0, expiries: 0, carried: 0, stalledWith: 0, stalledWithout: 0, stalledUnread: 0, pipes: {}, by: newBuckets() },
+    derp: { shed: 0, since: 0, states: {} },
     sessions: list.length,
     byCarrier: {},
     rankOn: 0,
@@ -828,6 +1109,18 @@ function deviceOf(list, unattributed) {
     d.stalledWindows += x.del.stalled;
     d.longestStallMs = Math.max(d.longestStallMs, x.del.longestMs);
     d.capTiming += x.capTiming;
+    if (x.carrier === MESH_RELAY) {
+      const m = d.mesh;
+      m.sessions++;
+      m.windows += x.del.windows;
+      m.stalled += x.del.stalled;
+      for (const k of ['lines', 'expiries', 'carried', 'stalledWith', 'stalledWithout', 'stalledUnread']) m[k] += x.t3[k];
+      for (const k of Object.keys(x.pipes)) m.pipes[k] = (m.pipes[k] || 0) + x.pipes[k];
+      for (const k of Object.keys(m.by)) {
+        m.by[k].n += x.t3.by[k].n;
+        m.by[k].between += x.t3.by[k].between;
+      }
+    }
     for (const f of x.mem.close) {
       d.closes++;
       const key = `wrote=${dash(text(f.wrote))} why=${dash(text(f.why))}`;
@@ -841,6 +1134,12 @@ function deviceOf(list, unattributed) {
         }
       }
     }
+  }
+  for (const x of derp || []) {
+    if (x.kind === 'shed') {
+      d.derp.shed++;
+      d.derp.since += x.since || 0;
+    } else d.derp.states[x.state] = (d.derp.states[x.state] || 0) + 1;
   }
   return d;
 }
@@ -930,6 +1229,13 @@ function render(r) {
     L.push(`| encoder: opens / QVBR opens / rejected quality options | ${x.enc.opens} / ${x.enc.qsv} / ${x.enc.rejected} |`);
     L.push(`| delivery: windows / stalled / share / longest stall | ${x.del.windows} / ${x.del.stalled} / ${pct(x.del.stalled, x.del.windows)} / ${x.del.windows ? x.del.longestMs + ' ms' : '-'} |`);
     L.push(`| delivery: windows with a queued sample / carrying the standing queue / highest standing | ${x.del.carried ? x.del.queued : '-'} / ${x.del.carried} / ${x.del.standingHigh === null ? '-' : x.del.standingHigh + ' ms'} |`);
+    // FR-148 AC4's Read A: a session on the mesh relay's T3 lines.
+    if (x.carrier === MESH_RELAY) {
+      const t = x.t3;
+      L.push(`| mesh relay T3 (FR-148 AC4): delivery lines with a T3 / T3 expiries counted (delivery lines carrying loss) | ${t.lines} / ${t.carried ? t.expiries : '-'} (${t.carried} of ${x.del.windows}) |`);
+      L.push(`| mesh relay T3: stalled delivery lines with a T3 / without one / carrying neither loss nor cwnd | ${t.stalledWith} / ${t.stalledWithout} / ${t.stalledUnread} |`);
+      L.push(`| mesh relay T3: T3 lines by the nearest shed line with since_last > 0: within ${SHED_AFTER_MS / 1000} s after / only before, inside the line's span / none (of each, with a /derp lifecycle line between) | ${bucketCells(t.by)} |`);
+    }
     const rx = x.model.lastRx;
     const mc = x.model.lastCap;
     L.push(`| path model: lines / last viewer_rx (basis, age) / highest viewer_rx / last model_capacity (basis) | ${x.model.n} / ${rx ? `${dash(rx.bps)} (${dash(rx.basis || rx.raw)}, ${dash(rx.ageMs)} ms)` : '-'} / ${dash(x.model.maxRx)} / ${mc ? `${dash(mc.bps)} (${dash(mc.basis || mc.raw)})` : '-'} |`);
@@ -957,6 +1263,13 @@ function render(r) {
   }
   L.push(`| delivery windows stalled, all sessions | ${d.stalledWindows} of ${d.windows} (${pct(d.stalledWindows, d.windows)}), longest ${d.windows ? d.longestStallMs + ' ms' : '-'} |`);
   L.push(`| heartbeat windows transit-stalled, all sessions (AC22) | ${pipeCells(d.pipes).share} |`);
+  // FR-148 AC4's Read A, over the sessions on the mesh relay; and the /derp lines.
+  const mr = d.mesh;
+  L.push(`| mesh relay (carrier ${MESH_RELAY}, FR-148 AC4): sessions / delivery lines / stalled / with a T3 / T3 expiries counted (lines carrying loss) | ${mr.sessions} / ${mr.windows} / ${mr.stalled} / ${mr.lines} / ${mr.carried ? mr.expiries : '-'} (${mr.carried} of ${mr.windows}) |`);
+  L.push(`| mesh relay: stalled delivery lines with a T3 / without one / carrying neither loss nor cwnd; heartbeat windows transit-stalled | ${mr.stalledWith} / ${mr.stalledWithout} / ${mr.stalledUnread}; ${pipeCells(mr.pipes).share} |`);
+  L.push(`| mesh relay: T3 lines by the nearest shed line with since_last > 0: within ${SHED_AFTER_MS / 1000} s after / only before, inside the line's span / none (of each, with a /derp lifecycle line between) | ${bucketCells(mr.by)} |`);
+  const states = Object.keys(d.derp.states);
+  L.push(`| /derp lines, every relay node: shed lines (since_last summed) / lifecycle lines by state | ${d.derp.shed} (${d.derp.since}) / ${states.map((k) => `${k} ${d.derp.states[k]}`).join(', ') || '-'} |`);
   L.push(`| sessions by open path (O10) | ${Object.keys(d.openPaths).map((k) => `${k} ${d.openPaths[k]}`).join(', ')}; no open line ${d.noOpenLine} |`);
   L.push(`| path-memory closes by wrote / why | ${Object.keys(d.closesBy).map((k) => `${k}: ${d.closesBy[k]}`).join('; ') || '-'} |`);
   for (const k of O7_COUNTED.concat(O7_ASIDE)) {
@@ -976,15 +1289,33 @@ function render(r) {
 // ---------------------------------------------------------------- the query
 
 /**
+ * One kind's fields as the read projects them (`fieldsOf`): each as stored,
+ * or only as a number where `numberOnly` says so. A field KEPT names for the
+ * kind throws: no read is built that would let it out.
+ */
+function projectionOf(kind) {
+  const p = {};
+  for (const k of fieldsOf(kind)) {
+    if ((KEPT[kind] || []).includes(k)) throw new Error(`the read would project ${kind}.${k}, which stays in the database (KEPT)`);
+    const v = '$lines.fields.' + k;
+    p[k] = numberOnly(kind, k) ? { $cond: [{ $isNumber: v }, v, '$$REMOVE'] } : v;
+  }
+  return p;
+}
+
+/**
  * The read for one agent and one window. `tenant` and `agent` are ObjectIds
- * (strings in the self-test); `from` and `to` are Dates.
+ * (strings in the self-test); `from` and `to` are Dates. A line's fields are
+ * its own kind's: the `$switch` takes the first kind whose message pattern
+ * matches, in KINDS order, as `kindOf` does.
  */
 function timelinePipeline(o) {
-  const project = {};
-  for (const k of named()) {
-    const v = '$lines.fields.' + k;
-    project[k] = NUMBER_ONLY.includes(k) ? { $cond: [{ $isNumber: v }, v, '$$REMOVE'] } : v;
-  }
+  const project = {
+    $switch: {
+      branches: KINDS.map((d) => ({ case: { $regexMatch: { input: '$lines.msg', regex: d.re.source } }, then: projectionOf(d.k) })),
+      default: { $literal: {} },
+    },
+  };
   return [
     {
       $match: {
@@ -1060,27 +1391,34 @@ const CARRIER_OPTIONS = { maxTimeMS: 30000, allowDiskUse: false, hint: { agent_i
 
 /**
  * One row as `--rows` prints it and as the direct mode folds it, so that the
- * offline re-read renders byte for byte as the direct read: ids masked
- * through `ids` (one `masks()` per read), every key DENY_KEY names left out,
- * every string scrubbed as a printed line is.
+ * offline re-read renders byte for byte as the direct read: the projection
+ * again (the line's own kind's fields, `fieldsOf`, less KEPT, numbers only
+ * where `numberOnly` says so; the ids alone for a message no kind matches;
+ * the memory lines' `fm`), ids masked through `ids` (one `masks()` per read),
+ * every key DENY_KEY names left out, every string scrubbed as a printed line
+ * is.
  */
 function rowOut(row, ids) {
   const idOf = ids || masks();
-  const plain = (o) => {
+  const msg = typeof row.m === 'string' ? row.m : '';
+  const kind = kindOf(msg);
+  const keep = kind ? fieldsOf(kind).filter((k) => !(KEPT[kind] || []).includes(k)) : IDS;
+  const plain = (o, only) => {
     if (!o) return undefined;
     const f = {};
     for (const k of Object.keys(o)) {
-      if (DENY_KEY.test(k)) continue;
+      if (DENY_KEY.test(k) || (only && !only.includes(k))) continue;
       let v = o[k];
       if (v !== null && typeof v === 'object' && typeof v.toNumber === 'function') v = v.toNumber();
+      if (only && numberOnly(kind, k) && typeof v !== 'number') continue;
       if (ID_KEYS.has(k)) v = idOf(ID_KEYS.get(k), v);
       else if (typeof v === 'string') v = scrub(v);
       f[k] = v;
     }
     return f;
   };
-  const out = { t: row.t instanceof Date ? row.t.toISOString() : row.t, m: typeof row.m === 'string' ? scrub(row.m) : row.m, f: plain(row.f) };
-  if (row.fm) out.fm = plain(row.fm);
+  const out = { t: row.t instanceof Date ? row.t.toISOString() : row.t, m: typeof row.m === 'string' ? scrub(row.m) : row.m, f: plain(row.f, keep) };
+  if (row.fm && new RegExp(MEM_PATTERN).test(msg)) out.fm = plain(row.fm, null);
   return out;
 }
 
@@ -1326,6 +1664,113 @@ function whyWordsOf(aimd, gov) {
   return words.sort();
 }
 
+/**
+ * FR-148 AC4: the tracing calls in a Rust text (LF line ends), each as its
+ * level, the fields written before its message (`%relay`, `?x`, `name = …`
+ * by name) and the message: the first string literal that starts an
+ * argument, a line continued with `\` joined as Rust joins it.
+ */
+function derpCalls(body) {
+  const out = [];
+  for (const m of body.matchAll(/\b(trace|debug|info|warn|error)!\(/g)) {
+    const args = [];
+    let cur = '';
+    let depth = 1;
+    let msg = null;
+    for (let i = m.index + m[0].length; i < body.length && depth > 0; ) {
+      const c = body[i];
+      if (c === '"') {
+        const lit = /^"((?:[^"\\]|\\[\s\S])*)"/.exec(body.slice(i));
+        if (!lit) break;
+        if (depth === 1 && cur.trim() === '') {
+          msg = lit[1].replace(/\\\n[ \t]*/g, '');
+          break;
+        }
+        cur += lit[0];
+        i += lit[0].length;
+        continue;
+      }
+      if ('([{'.includes(c)) depth++;
+      if (')]}'.includes(c)) depth--;
+      if (c === ',' && depth === 1) {
+        args.push(cur.trim());
+        cur = '';
+      } else cur += c;
+      i++;
+    }
+    if (msg === null) continue;
+    const fields = args.map((a) => (/^[%?]?\s*([A-Za-z_]\w*)\s*(?:=|$)/.exec(a) || [])[1]).filter(Boolean);
+    out.push({ level: m[1], fields, msg });
+  }
+  return out;
+}
+
+/**
+ * The read's two `$project` stages, evaluated as the server would on lines
+ * as the agent writes them (`{ ts, msg, fields }`): the filter by message
+ * and time, then `t`, `m`, the kind's fields (`f`, the first `$switch`
+ * branch that matches) and a memory line's `fm`. It knows the shapes the
+ * read is built of ($switch, $regexMatch on the message, a field path, $cond
+ * on $isNumber, $literal, the memory filter) and throws on any other, so it
+ * never passes a shape it did not evaluate. The self-test's (FR-148 AC4).
+ */
+function serverRows(pipeline, lines) {
+  const fail = (what, x) => {
+    throw new Error(`serverRows: ${what}: ${JSON.stringify(x)}`);
+  };
+  const keep = pipeline[2].$project.lines.$filter.cond.$and;
+  const second = pipeline[4].$project;
+  const field = (p, line) => {
+    const m = typeof p === 'string' && /^\$lines\.fields\.(\w+)$/.exec(p);
+    if (!m) fail('not a field path', p);
+    return line.fields && Object.prototype.hasOwnProperty.call(line.fields, m[1]) ? line.fields[m[1]] : undefined;
+  };
+  const matches = (c, line) => {
+    const r = c && c.$regexMatch;
+    if (!r || Object.keys(c).length !== 1 || r.input !== '$lines.msg' || Object.keys(r).join(',') !== 'input,regex') fail('not a $regexMatch on the message', c);
+    return new RegExp(r.regex).test(line.msg);
+  };
+  const valueOf = (v, line) => {
+    if (typeof v === 'string') return field(v, line);
+    const c = v && v.$cond;
+    if (Array.isArray(c) && Object.keys(v).length === 1 && c.length === 3 && c[0] && Object.keys(c[0]).join(',') === '$isNumber' && c[0].$isNumber === c[1] && c[2] === '$$REMOVE') {
+      const x = field(c[1], line);
+      return typeof x === 'number' ? x : undefined;
+    }
+    return fail('an expression it does not evaluate', v);
+  };
+  const objectOf = (o, line) => {
+    const out = {};
+    for (const k of Object.keys(o)) {
+      if (k[0] === '$') fail('an operator where a field was', k);
+      const x = valueOf(o[k], line);
+      if (x !== undefined) out[k] = x;
+    }
+    return out;
+  };
+  const sw = second.f && second.f.$switch;
+  if (!sw || Object.keys(second.f).length !== 1 || Object.keys(sw).join(',') !== 'branches,default') fail('f is not one $switch', second.f);
+  if (JSON.stringify(sw.default) !== JSON.stringify({ $literal: {} })) fail('a default other than {}', sw.default);
+  const fm = second.fm && second.fm.$cond;
+  if (!fm || fm[2] !== '$$REMOVE' || fm[0].$regexMatch.regex !== MEM_PATTERN || fm[1].$arrayToObject.$filter.cond.$not[0].$regexMatch.regex !== DENY_KEY.source) fail('fm is not the memory filter', second.fm);
+  if (second.t !== '$lines.ts' || second.m !== '$lines.msg' || Object.keys(second).join(',') !== 't,m,f,fm') fail('the stage projects more than t, m, f and fm', Object.keys(second));
+  // Every branch's shape, whether a line takes it or not.
+  for (const b of sw.branches) {
+    if (Object.keys(b).join(',') !== 'case,then') fail('a branch other than case and then', b);
+    matches(b.case, { msg: '' });
+    objectOf(b.then, { msg: '', fields: {} });
+  }
+  const out = [];
+  for (const line of lines) {
+    if (!(new RegExp(keep[0].$regexMatch.regex).test(line.msg || '') && line.ts >= keep[1].$gte[1] && line.ts < keep[2].$lt[1])) continue;
+    const b = sw.branches.find((x) => matches(x.case, line));
+    const row = { t: line.ts, m: line.msg, f: b ? objectOf(b.then, line) : {} };
+    if (matches(fm[0], line)) row.fm = Object.fromEntries(Object.entries(line.fields || {}).filter((kv) => !DENY_KEY.test(kv[0])));
+    out.push(row);
+  }
+  return out;
+}
+
 function selfTest() {
   let fails = 0;
   let cases = 0;
@@ -1336,13 +1781,23 @@ function selfTest() {
       console.log(`FAIL ${name}${detail ? ': ' + detail : ''}`);
     }
   };
+  const firstDiffOf = (a, b) => {
+    const x = String(a).split('\n');
+    const y = String(b).split('\n');
+    const i = x.findIndex((l, j) => l !== y[j]);
+    return i < 0 ? `lengths ${x.length} / ${y.length}` : `line ${i + 1}: ${x[i]} | ${y[i]}`;
+  };
   // 1. Every message literal is in the agent's source, at the file named.
   try {
     const fs = require('fs');
     const path = require('path');
     const src = path.join(__dirname, '..', 'agents', 'roomlerd', 'src');
+    // A checkout can have CRLF line ends; a Rust string continued with `\`
+    // at a line's end goes on after the next line's indent.
+    const lf = (s) => s.replace(/\r\n/g, '\n');
+    const cont = (s) => lf(s).replace(/\\\n[ \t]*/g, '');
     for (const d of KINDS) {
-      const body = fs.readFileSync(path.join(src, d.src[0]), 'utf8');
+      const body = cont(fs.readFileSync(path.join(src, d.src[0]), 'utf8'));
       for (const lit of d.src.slice(1)) {
         check(`source: ${d.k} literal in ${d.src[0]}`, body.includes(lit), lit);
         check(`source: ${d.k} pattern matches its literal`, d.re.test(lit), lit);
@@ -1353,10 +1808,68 @@ function selfTest() {
     const md = fs.readFileSync(path.join(src, 'media_delivery.rs'), 'utf8');
     for (const k of FIELDS.open) check(`source: open line field ${k}`, md.includes(`${k} = `));
     for (const k of OPEN_PATHS) check(`source: open line answer ${k}`, md.includes(`"${k}"`));
-    // FR-148 P0: the delivery line's standing-queue fields, as `emit` writes them.
-    for (const k of FIELDS.queue) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??q\\.${k},`).test(md));
+    // FR-148 P0: the delivery line's standing-queue fields, and FR-148 AC4's
+    // loss row's, as `emit` writes them.
+    for (const k of new Set(FIELDS.queue.concat(FIELDS.loss))) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??(?:q|line)\\.${k},`).test(md));
+    // FR-148 D46 B2 and D48: the model line's push-back and rule, as
+    // `emit_model` writes them (a fixed word; `<word>/<age>ms`, which `aged`
+    // reads); D50's fall where the agent writes it (#4231), `<from>-><to>/<age>ms`.
+    for (const lit of ['model_floor_push_back = %PushedBy::word_of(v.model_floor_by),', 'model_rule = %RuledShown(v.model_ruled),', 'write!(f, "{}/{}ms", rule.word(), age.as_millis())']) check(`source: model line ${lit}`, md.includes(lit));
+    check('source: model_fell, where the agent writes it, as D50 writes it', !md.includes('model_fell') || md.includes('model_fell = %FellShown(v.model_fell),'));
+    for (const k of FIELDS.model.filter((k) => k !== 'model_fell')) check(`source: model line field ${k}`, md.includes(`${k} = %`));
     const sc = fs.readFileSync(path.join(src, 'session_carrier.rs'), 'utf8');
     check('source: carrier line field relay_transport', /\brelay_transport = relay\.as_str\(\),/.test(sc));
+    // FR-148 AC4: the constants the T3 rows stand on, from the code.
+    check(`source: the mesh relay's carrier word is ${MESH_RELAY}`, sc.includes(`SessionCarrier::Derp => "${MESH_RELAY}",`));
+    const every = /pub const LINE_EVERY: Duration = Duration::from_secs\((\d+)\);/.exec(md);
+    check('source: LINE_EVERY_MS is the delivery line\'s period', every && Number(every[1]) * 1000 === LINE_EVERY_MS, every && every[1]);
+    const sctp = path.join(__dirname, '..', 'crates', 'vendored', 'webrtc-sctp', 'src', 'association');
+    const amod = lf(fs.readFileSync(path.join(sctp, 'mod.rs'), 'utf8'));
+    const aint = lf(fs.readFileSync(path.join(sctp, 'association_internal.rs'), 'utf8'));
+    const mtu = /\bconst INITIAL_MTU: u32 = (\d+);/.exec(amod);
+    check('source: T3_CWND is the vendored SCTP\'s MTU, which nothing changes', mtu && Number(mtu[1]) === T3_CWND && aint.includes('let mtu = INITIAL_MTU;') && !/\bself\.mtu\s*=[^=]/.test(aint), mtu && mtu[1]);
+    const halve = 'self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);';
+    const sets = Array.from(aint.matchAll(/^\s*(.*)\n\s*self\.cwnd = ([^;]+);/gm), (m) => `${m[1]} => ${m[2]}`);
+    check(
+      'source: only a T3 expiry sets cwnd to one packet: it starts at 4,380 at least two packets, a fast retransmit sets it to ssthresh (four packets at least), and the rest adds',
+      aint.includes('let cwnd = std::cmp::min(4 * mtu, std::cmp::max(2 * mtu, 4380));') && sets.length === 2 && sets.includes(`${halve} => self.ssthresh`) && sets.includes(`${halve} => self.mtu`),
+      sets.join(' | '),
+    );
+    // FR-148 AC4: derp.rs `run` writes the shed line on its keepalive tick,
+    // change-gated, and every tracing line there that opens "overlay derp:"
+    // is read under the kind its message names, with only fields the read
+    // names (FIELDS) or keeps (KEPT); a debug line is not read at all.
+    const derpSrc = lf(fs.readFileSync(path.join(src, 'derp.rs'), 'utf8'));
+    const ka = /\bconst DERP_KEEPALIVE: Duration = Duration::from_secs\((\d+)\);/.exec(derpSrc);
+    check('source: SHED_AFTER_MS is the /derp keepalive tick', ka && Number(ka[1]) * 1000 === SHED_AFTER_MS, ka && ka[1]);
+    const runAt = derpSrc.indexOf('\nasync fn run(');
+    const run = runAt < 0 ? '' : derpSrc.slice(runAt, derpSrc.indexOf('\n}\n', runAt));
+    const tick = run.indexOf('due = keepalive.tick() =>');
+    const shedAt = run.indexOf('"overlay derp: shed stale carrier frames (queue age bound)"');
+    check('source: the shed line is written on the keepalive tick, when the count changed', tick > 0 && shedAt > tick && run.indexOf('out = outbound_rx.recv() =>') > shedAt && run.slice(tick, shedAt).includes('if shed != last_reported_stale {'));
+    const calls = derpCalls(run);
+    const seen = {};
+    for (const c of calls.filter((x) => x.msg.startsWith('overlay derp:'))) {
+      if (c.level === 'debug' || c.level === 'trace') {
+        check(`source: derp.rs ${c.level} line not read (${c.msg.slice(14, 50)})`, !new RegExp(MSG_PATTERN).test(c.msg));
+        continue;
+      }
+      const kind = kindOf(c.msg);
+      const word = kind === 'shed' ? 'shed' : kind === 'derp' ? derpState(c.msg) : null;
+      check(`source: derp.rs ${c.level} line read as shed or a lifecycle word (${c.msg.slice(14, 50)})`, word !== null && word !== 'unknown', c.msg);
+      if (word === null || word === 'unknown') continue;
+      seen[word] = (seen[word] || 0) + 1;
+      const known = fieldsOf(kind).concat(KEPT[kind] || []);
+      const stray = c.fields.filter((k) => !known.includes(k));
+      check(`source: derp.rs ${word} line: every field named or kept`, stray.length === 0, stray.join(','));
+      for (const k of KEPT[kind] || []) seen[`${kind}.${k}`] = (seen[`${kind}.${k}`] || 0) + (c.fields.includes(k) ? 1 : 0);
+    }
+    check('source: derp.rs `run` writes the shed line once, and each lifecycle word once', seen.shed === 1 && DERP_STATES.every((x) => seen[x[0]] === 1), JSON.stringify(seen));
+    check('source: what KEPT names, the /derp lines write (relay on all, e on the failed connect)', Object.keys(KEPT).every((kind) => KEPT[kind].every((k) => seen[`${kind}.${k}`] >= 1)) && seen['derp.relay'] === DERP_STATES.length, JSON.stringify(seen));
+    check(
+      'source: the shed line writes relay, dropped_stale and since_last, and nothing else',
+      calls.filter((x) => x.msg === 'overlay derp: shed stale carrier frames (queue age bound)').map((x) => x.fields.join(',')).join(' | ') === 'relay,dropped_stale,since_last',
+    );
     // FR-148 P0: the target lines' fields and the heartbeats' count, as the
     // pumps write them, and the words a `why` is made of, from the code that
     // writes them.
@@ -1365,8 +1878,6 @@ function selfTest() {
       check(`source: target line fields ${lit}`, peer.includes(lit));
     }
     check('source: both heartbeats carry target_moves', peer.split('target_moves = %governor.take_moves(),').length - 1 === 2);
-    // A checkout can have CRLF line ends.
-    const lf = (s) => s.replace(/\r\n/g, '\n');
     const aimd = lf(fs.readFileSync(path.join(src, 'encode', 'aimd.rs'), 'utf8'));
     const gov = lf(fs.readFileSync(path.join(src, 'encode', 'governor.rs'), 'utf8'));
     const words = whyWordsOf(aimd, gov);
@@ -1376,12 +1887,12 @@ function selfTest() {
     for (const lit of ['sep = "+";', '("", _) => f.write_str("none"),', '(_, true) => f.write_str("+more"),', 'write!(f, "{sep}{why}:{n}")?;', 'sep = ",";', 'write!(f, "{sep}more:{}", self.more)?;', 'return f.write_str("none");']) {
       check(`source: the written form ${lit}`, gov.includes(lit));
     }
-    // `why` leaves by its name from every line read, so every line read that
-    // writes one must write the governor's `Why` (a target line) or the path
-    // memory's word (the close line): fixed words, never free text. A line
-    // read that writes any other `why` fails here. A call's message is its
-    // first string literal at the start of a line after the field, a
-    // `{CONST}` in it read from its file.
+    // `why` leaves as written from a kind that names it and from the path
+    // memory's lines, so every line read that writes one must write the
+    // governor's `Why` (a target line) or the path memory's word (the close
+    // line): fixed words, never free text. A line read that writes any other
+    // `why` fails here. A call's message is its first string literal at the
+    // start of a line after the field, a `{CONST}` in it read from its file.
     const whyOk = ['%applied.why', '%held.why', '%why.word()'];
     const whyRead = [];
     for (const file of Array.from(new Set(KINDS.map((d) => d.src[0])))) {
@@ -1568,8 +2079,8 @@ function selfTest() {
   const sqOut = render(sq);
   check('relay_transport: the carrier line prints it after the carrier', /^  07:00:10\.000  carrier  carrier=turn relay_transport=tcp local_typ=Relay remote_typ=Relay$/m.test(sqOut), (sqOut.match(/^.*  carrier  .*$/m) || [''])[0]);
   check(
-    'queue: a delivery line with a queued sample is a queue row, with the fields it carries',
-    /^  07:00:20\.000  queue    queued=2 standing_ms=\(40, 610\) inflight=\(327500, 540000\) cwnd=\(332780, 544380\) rwnd_low=508576$/m.test(sqOut),
+    'queue: a delivery line with a queued sample is a queue row, every field, the one it does not carry (ack_ms) as -',
+    /^  07:00:20\.000  queue    queued=2 standing_ms=\(40, 610\) inflight=\(327500, 540000\) cwnd=\(332780, 544380\) rwnd_low=508576 ack_ms=-$/m.test(sqOut),
     (sqOut.match(/^.*  queue  .*$/m) || [''])[0],
   );
   check('queue: a line with none queued, or none of the fields, is no row', (sqOut.match(/^ {2}\S+ {2}queue /gm) || []).length === 1);
@@ -1702,6 +2213,220 @@ function selfTest() {
       JSON.stringify([[['open', 1], [FOLD, 1]], [], [['none', 1]], [['more', 3]], null, [['unreadable', 1]]]),
   );
   check('scrub: every why and every count as written', WHY_WORDS.concat([FOLD, MORE, 'none', `${MORE}:1,more:2`, `open:1,${FOLD}:1,hard-decrease:12`]).every((s) => scrub(s) === s));
+  // FR-148 AC4 (THE MESH RELAY'S T3), end to end: lines as the agent writes
+  // them, the server's read evaluated on them (`serverRows`), --rows, the
+  // report. Session M on the mesh relay, from an agent with `loss`: a T3 line
+  // whose shed line comes 8 s after; one with none in the 25 s after but one
+  // inside its span; one whose next shed line comes 43 s after; one with a
+  // relay node's reconnect between it and its shed line; one whose only shed
+  // line in reach told no drop (since_last 0), with a freeze in its window; a
+  // stall without a T3, a fast retransmission, quiet lines; model lines with
+  // the floor's push-back, the rule (again later) and D50's fall. Session T
+  // on TURN with a T3 (no pairing). Session O on the mesh relay from an agent
+  // before 0.4.227: a T3 by its one-packet window alone, no `loss`, no
+  // ack_ms, a stall read without SCTP's gauges, a model line without D48's
+  // fields. Relay names and addresses are reserved examples (RFC 2606, 5737,
+  // 3849), and appear in no output.
+  const B = 1000;
+  const raw = (sec, msg, fields) => ({ ts: new Date(at(B + sec)), msg, fields });
+  const DL = 'path delivery (FR-148 P0, shadow, ≈10s)';
+  const ML = 'path model (FR-148 P0, shadow, ≈10s)';
+  const SHED = 'overlay derp: shed stale carrier frames (queue age bound)';
+  const said = (w) => DERP_STATES.find((x) => x[0] === w)[1];
+  const REGIONAL = 'derp-eu.example.net:443';
+  const sm = oid('d3a1');
+  const sn = oid('d3a2');
+  const sp = oid('d3a3');
+  const dq = (sec, sid, o) =>
+    raw(
+      sec,
+      DL,
+      Object.assign(
+        { session_id: sid, span_ms: 10000, delivery_samples: '(5, 0, 0)', backlogged_bps: 'None', app_limited_bps: 'None', stalled_ms: 0, acked_bytes: 1250000, ack_ms: 'Some((12, 14, 40))', standing_ms: 'Some((2, 28))', queued: 0, inflight: '(4096, 61440)', cwnd: '(60000, 120000)', ssthresh: 98304, rwnd_low: 1040000, pending_high: 2400, loss: '(0, 0)' },
+        o,
+      ),
+    );
+  const mq = (sec, o) => raw(sec, ML, Object.assign({ session_id: sm, viewer_rx_bps: '2100000/backlogged/150ms', model_capacity_bps: 'None', model_floor_bps: '1000000/pushed-back/900ms', model_floor_push_back: 'p1', model_rule: '-', model_fell: '-' }, o));
+  const agentLines = [
+    raw(-30, said('connected'), { relay: 'central' }),
+    raw(0, 'session carrier recorded (FR-102 P9c)', { session_id: sm, carrier: MESH_RELAY, relay_transport: 'none', local_typ: 'Host', remote_typ: 'Host' }),
+    raw(1, 'per-session ICE path detected (adaptive bitrate)', { session_id: sm, relay: false, local_typ: 'Host', local_proto: 'Udp', remote_typ: 'Host', remote_proto: 'Udp', waited_ms: 900, opening: 'moved' }),
+    dq(12, sm, { stalled_ms: 2100, delivery_samples: '(3, 0, 2)', acked_bytes: 51200, queued: 3, standing_ms: 'Some((40, 2900))', cwnd: '(1228, 98304)', pending_high: 180000, loss: '(0, 2)' }),
+    mq(12.5, {}),
+    raw(20, SHED, { relay: 'central', dropped_stale: 41, since_last: 41 }),
+    dq(22, sm, { cwnd: '(1228, 64000)', loss: '(0, 1)' }),
+    mq(22.5, { model_rule: 'stall/400ms' }),
+    dq(32, sm, { stalled_ms: 3000, delivery_samples: '(3, 0, 2)', cwnd: '(4912, 30000)' }),
+    mq(32.5, { model_rule: 'stall/10400ms' }),
+    dq(42, sm, { cwnd: '(4912, 40000)', loss: '(2, 0)' }),
+    mq(42.5, { model_rule: 'stall/1200ms' }),
+    dq(52, sm, { stalled_ms: 4100, delivery_samples: '(1, 0, 4)', acked_bytes: 0, cwnd: '(1228, 9000)', loss: '(0, 3)' }),
+    mq(52.5, { model_rule: 'stall/11200ms', model_fell: '2131000->1162000/61300ms' }),
+    dq(62, sm, {}),
+    raw(95, SHED, { relay: 'central', dropped_stale: 46, since_last: 5 }),
+    dq(102, sm, { stalled_ms: 2500, delivery_samples: '(3, 0, 2)', cwnd: '(1228, 20000)', loss: '(1, 1)' }),
+    raw(110, said('closed'), { relay: REGIONAL }),
+    raw(110.5, said('connect-failed'), { relay: '203.0.113.7:443', e: 'IO error: connection refused (os error 111) at 198.51.100.9:443 for wss://derp-eu.example.net/derp' }),
+    raw(111, said('lb-no-pod'), { relay: '[2001:db8::7]:443', wait_ms: 2000, left: 3 }),
+    raw(113, said('connected'), { relay: REGIONAL }),
+    raw(120, SHED, { relay: 'central', dropped_stale: 55, since_last: 9 }),
+    dq(142, sm, { cwnd: '(1228, 30000)', loss: '(0, 1)' }),
+    raw(145, SHED, { relay: 'central', dropped_stale: 55, since_last: 0 }),
+    raw(150, `${said('frozen')}29 s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting`, { relay: 'central', silent_s: 31, paused_s: 29 }),
+    raw(150, said('closed'), { relay: 'central' }),
+    raw(151, said('connected'), { relay: 'central' }),
+    dq(172, sm, {}),
+    raw(176, SHED, { relay: 'central', dropped_stale: 58, since_last: 3 }),
+    raw(188, SHED, { relay: REGIONAL, dropped_stale: 2, since_last: 2 }),
+    raw(300, 'session carrier recorded (FR-102 P9c)', { session_id: sn, carrier: 'turn', relay_transport: 'tls', local_typ: 'Relay', remote_typ: 'Srflx' }),
+    dq(310, sn, { stalled_ms: 1800, delivery_samples: '(4, 0, 1)', cwnd: '(1228, 40000)', loss: '(0, 1)' }),
+    raw(400, 'session carrier recorded (FR-102 P9c)', { session_id: sp, carrier: MESH_RELAY, local_typ: 'Host', remote_typ: 'Host' }),
+    raw(410, DL, { session_id: sp, span_ms: 10000, delivery_samples: '(3, 0, 2)', backlogged_bps: 'None', app_limited_bps: 'None', stalled_ms: 2000, standing_ms: 'Some((40, 1900))', queued: 1, inflight: '(52000, 52000)', cwnd: '(1228, 50000)', rwnd_low: 1040000 }),
+    raw(410.5, ML, { session_id: sp, viewer_rx_bps: '900000/backlogged/150ms', model_capacity_bps: 'None', model_floor_bps: 'None' }),
+    raw(420, DL, { session_id: sp, span_ms: 10000, delivery_samples: '(2, 0, 3)', backlogged_bps: 'None', app_limited_bps: 'None', stalled_ms: 2600 }),
+  ];
+  const acSet = { tenant: FX.tenant, agent: FX.agent, from: new Date(at(B - 60)), to: new Date(at(B + 600)), limit: 1000 };
+  const acPipe = timelinePipeline(acSet);
+  const served = serverRows(acPipe, agentLines);
+  const acIds = masks();
+  const acPrinted = served.map((x) => rowOut(x, acIds));
+  const acText = rowsHead(acSet, {})
+    .concat(
+      acPrinted.map((x) => JSON.stringify(x)),
+      [rowsTail(acPrinted.length, acSet.limit)],
+    )
+    .join('\n');
+  const acr = fold(acPrinted, readOpts(acSet, false, {}));
+  const ac = render(acr);
+  const acl = ac.split('\n');
+  const at3 = (sec, what) => `  ${clock(epochMs(at(B + sec)))}  ${what.padEnd(8)} `;
+  check('AC4: every line read, three sessions, in order', served.length === agentLines.length && acr.sessions.map((x) => x.sid).join(',') === [sm, sn, sp].map(mask).join(','), acr.sessions.map((x) => x.sid).join(','));
+  const want3 = [
+    `${at3(12, 'loss')}span_ms=10000 stalled_ms=2100 acked_bytes=51200 loss=(0, 2) cwnd=(1228, 98304) pending_high=180000; T3; shed after +8.0 s since_last=41`,
+    `${at3(22, 'loss')}span_ms=10000 stalled_ms=0 acked_bytes=1250000 loss=(0, 1) cwnd=(1228, 64000) pending_high=2400; T3; shed before -2.0 s (inside the span) since_last=41`,
+    `${at3(42, 'loss')}span_ms=10000 stalled_ms=0 acked_bytes=1250000 loss=(2, 0) cwnd=(4912, 40000) pending_high=2400`,
+    `${at3(52, 'loss')}span_ms=10000 stalled_ms=4100 acked_bytes=0 loss=(0, 3) cwnd=(1228, 9000) pending_high=2400; T3; no shed line (the span's start to +25.0 s)`,
+    `${at3(102, 'loss')}span_ms=10000 stalled_ms=2500 acked_bytes=1250000 loss=(1, 1) cwnd=(1228, 20000) pending_high=2400; T3; shed after +18.0 s since_last=9, a /derp lifecycle line between`,
+    `${at3(142, 'loss')}span_ms=10000 stalled_ms=0 acked_bytes=1250000 loss=(0, 1) cwnd=(1228, 30000) pending_high=2400; T3; no shed line (the span's start to +25.0 s), a /derp lifecycle line between`,
+    `${at3(310, 'loss')}span_ms=10000 stalled_ms=1800 acked_bytes=1250000 loss=(0, 1) cwnd=(1228, 40000) pending_high=2400; T3`,
+    `${at3(410, 'loss')}span_ms=10000 stalled_ms=2000 acked_bytes=- loss=- cwnd=(1228, 50000) pending_high=-; T3; no shed line (the span's start to +25.0 s)`,
+  ];
+  const lossRows = acl.filter((l) => / {2}loss {5}/.test(l));
+  check(
+    'AC4: the loss rows: a T3 by its count or its window, the 25 s rule (after, before inside the span, none, a lifecycle line between, since_last 0 not a drop), a fast retransmission untagged, TURN unpaired, an older agent dashed',
+    lossRows.join('\n') === want3.join('\n'),
+    firstDiffOf(want3.join('\n'), lossRows.join('\n')),
+  );
+  check(
+    'AC4: a stall without a T3, and a quiet line, print no loss row',
+    !acl.some((l) => l.startsWith(at3(32, 'loss')) || l.startsWith(at3(62, 'loss')) || l.startsWith(at3(172, 'loss'))) && acl.includes(`${at3(32, 'stall')}span_ms=10000 delivery_samples=(3, 0, 2) backlogged_bps=- app_limited_bps=- stalled_ms=3000`),
+  );
+  check(
+    'AC4: the queue row prints ack_ms, and - on an agent that writes none',
+    acl.includes(`${at3(12, 'queue')}queued=3 standing_ms=(40, 2900) inflight=(4096, 61440) cwnd=(1228, 98304) rwnd_low=1040000 ack_ms=(12, 14, 40)`) &&
+      acl.includes(`${at3(410, 'queue')}queued=1 standing_ms=(40, 1900) inflight=(52000, 52000) cwnd=(1228, 50000) rwnd_low=1040000 ack_ms=-`),
+  );
+  const wantShed = [
+    `${at3(20, 'shed')}dropped_stale=41 since_last=41`,
+    `${at3(95, 'shed')}dropped_stale=46 since_last=5`,
+    `${at3(120, 'shed')}dropped_stale=55 since_last=9`,
+    `${at3(145, 'shed')}dropped_stale=55 since_last=0`,
+    `${at3(176, 'shed')}dropped_stale=58 since_last=3`,
+    `${at3(188, 'shed')}dropped_stale=2 since_last=2`,
+  ];
+  const wantDerp = [
+    `${at3(110, 'derp')}closed`,
+    `${at3(110.5, 'derp')}connect-failed`,
+    `${at3(111, 'derp')}lb-no-pod wait_ms=2000 left=3`,
+    `${at3(113, 'derp')}connected`,
+    `${at3(150, 'derp')}frozen silent_s=31 paused_s=29`,
+    `${at3(150, 'derp')}closed`,
+    `${at3(151, 'derp')}connected`,
+  ];
+  check('AC4: each shed line a row, its time, dropped_stale and since_last', acl.filter((l) => / {2}shed {5}/.test(l)).join('\n') === wantShed.join('\n'), acl.filter((l) => / {2}shed {5}/.test(l)).join(' | '));
+  check('AC4: each lifecycle line a row, its word and its counts', acl.filter((l) => / {2}derp {5}/.test(l)).join('\n') === wantDerp.join('\n'), acl.filter((l) => / {2}derp {5}/.test(l)).join(' | '));
+  const MESH = '| mesh relay T3 (FR-148 AC4): delivery lines with a T3 / T3 expiries counted (delivery lines carrying loss) | ';
+  const STALLED = '| mesh relay T3: stalled delivery lines with a T3 / without one / carrying neither loss nor cwnd | ';
+  const PAIRS = "| mesh relay T3: T3 lines by the nearest shed line with since_last > 0: within 25 s after / only before, inside the line's span / none (of each, with a /derp lifecycle line between) | ";
+  const sessionRows = (n) => {
+    const a = acl.findIndex((l) => l.startsWith(`## session ${n}: `));
+    const b = acl.findIndex((l, i) => i > a && /^## /.test(l));
+    return acl.slice(a, b);
+  };
+  check(
+    'AC4: the session rows on the mesh relay, from an agent with loss',
+    [`${MESH}5 / 8 (9 of 9) |`, `${STALLED}3 / 1 / 0 |`, `${PAIRS}2 (1) / 1 (0) / 2 (1) |`].every((l) => sessionRows(1).includes(l)),
+    sessionRows(1).filter((l) => l.startsWith('| mesh')).join(' | '),
+  );
+  check('AC4: a TURN session prints no mesh relay rows', !sessionRows(2).some((l) => l.startsWith('| mesh')));
+  check(
+    'AC4: the session rows of an agent before 0.4.227: expiries not counted (-), a stall read without gauges apart',
+    [`${MESH}1 / - (0 of 2) |`, `${STALLED}1 / 0 / 1 |`, `${PAIRS}0 (0) / 0 (0) / 1 (0) |`].every((l) => sessionRows(3).includes(l)),
+    sessionRows(3).filter((l) => l.startsWith('| mesh')).join(' | '),
+  );
+  check(
+    'AC4: the device rows: the mesh relay sessions summed, every /derp line counted, the one outside the sessions too',
+    [
+      `| mesh relay (carrier ${MESH_RELAY}, FR-148 AC4): sessions / delivery lines / stalled / with a T3 / T3 expiries counted (lines carrying loss) | 2 / 11 / 6 / 6 / 8 (9 of 11) |`,
+      '| mesh relay: stalled delivery lines with a T3 / without one / carrying neither loss nor cwnd; heartbeat windows transit-stalled | 4 / 1 / 1; 0 of 0 (-) |',
+      "| mesh relay: T3 lines by the nearest shed line with since_last > 0: within 25 s after / only before, inside the line's span / none (of each, with a /derp lifecycle line between) | 2 (1) / 1 (0) / 3 (1) |",
+      '| /derp lines, every relay node: shed lines (since_last summed) / lifecycle lines by state | 6 (60) / connected 3, closed 2, connect-failed 1, lb-no-pod 1, frozen 1 |',
+      '| lines in no session | derp 1 |',
+    ].every((l) => acl.includes(l)),
+    acl.filter((l) => /^\| (mesh relay[:( ]|\/derp|lines in no)/.test(l)).join(' | '),
+  );
+  const wantModel = [
+    `${at3(12.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=- model_fell=-`,
+    `${at3(22.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/400ms model_fell=-`,
+    `${at3(42.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/1200ms model_fell=-`,
+    `${at3(52.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/11200ms model_fell=2131000->1162000/61300ms`,
+    `${at3(410.5, 'model')}viewer_rx_bps=900000/backlogged/150ms model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=-`,
+  ];
+  check(
+    "model: the push-back, the rule and the fall print with the fields it printed; a row when one changes or starts anew, none for the same rule older; - where a line carries none",
+    acl.filter((l) => / {2}model {4}/.test(l)).join('\n') === wantModel.join('\n'),
+    firstDiffOf(wantModel.join('\n'), acl.filter((l) => / {2}model {4}/.test(l)).join('\n')),
+  );
+  check('aged: a rule, a fall, the agent\'s -, none', JSON.stringify([aged('stall/3400ms'), aged('2131000->1162000/61300ms'), aged('-'), aged(undefined)]) === JSON.stringify([{ what: 'stall', ageMs: 3400 }, { what: '2131000->1162000', ageMs: 61300 }, { what: '-', ageMs: null }, null]));
+  check('AC4: no undefined or NaN', !/undefined|NaN/.test(ac), (ac.match(/.{0,40}(undefined|NaN).{0,40}/) || [''])[0]);
+  check('AC4: the --rows text, read back offline, renders byte for byte as the direct read', renderRows([acText], {}) === ac, firstDiffOf(ac, renderRows([acText], {})));
+  // FR-148 AC4: no relay URL, host or address leaves the database. Three
+  // layers, each shown to hold alone: the projection names no KEPT field
+  // (and refuses to: above); the /derp kinds' fields leave as numbers only;
+  // --rows keeps a line to its kind's fields. The search for the relay's
+  // values runs on the rows as the server returns them (before any scrub),
+  // on --rows and on the report, and is shown to find a leak where one is.
+  const RELAY_SAID = ['central', 'example.net', '203.0.113', '198.51.100', '2001:db8', 'wss:', 'refused'];
+  const leaks = (s) => RELAY_SAID.filter((x) => String(s).includes(x));
+  const derpServed = served.filter((x) => ['shed', 'derp'].includes(kindOf(x.m)));
+  check('address: the read returns the /derp lines with their counts and no relay, no e', derpServed.length === 14 && derpServed.every((x) => !('relay' in x.f) && !('e' in x.f)) && served.find((x) => x.m === SHED).f.dropped_stale === 41, JSON.stringify(derpServed[0]));
+  check('address: the ICE line still leaves its relay, a yes or no', served.find((x) => kindOf(x.m) === 'ice').f.relay === false);
+  check('address: no relay value or error text in the rows the server returns, in --rows or in the report', leaks(JSON.stringify(served.map((x) => [x.m, x.f]))).length === 0 && leaks(acText).length === 0 && leaks(ac).length === 0, [leaks(JSON.stringify(served.map((x) => [x.m, x.f]))), leaks(acText), leaks(ac)].join(' / '));
+  check('address: and no address reached the scrub', !/<ip>/.test(acText) && !/<ip>/.test(ac));
+  // The search finds a leak where there is one: a read whose shed branch lets
+  // `relay` out as stored, built by hand (projectionOf refuses to).
+  const leaky = timelinePipeline(acSet);
+  leaky[4].$project.f.$switch.branches[KINDS.findIndex((d) => d.k === 'shed')].then.relay = '$lines.fields.relay';
+  check('address: the search finds the relay in a read that lets it out (the control)', leaks(JSON.stringify(serverRows(leaky, agentLines).map((x) => x.f))).join(',') === 'central,example.net');
+  // The numbers-only layer alone: the same field, as the /derp kinds project, stays in.
+  leaky[4].$project.f.$switch.branches[KINDS.findIndex((d) => d.k === 'shed')].then.relay = { $cond: [{ $isNumber: '$lines.fields.relay' }, '$lines.fields.relay', '$$REMOVE'] };
+  leaky[4].$project.f.$switch.branches[KINDS.findIndex((d) => d.k === 'derp')].then.e = { $cond: [{ $isNumber: '$lines.fields.e' }, '$lines.fields.e', '$$REMOVE'] };
+  check('address: a relay or an e named as the /derp kinds name their fields still stays in (numbers only)', leaks(JSON.stringify(serverRows(leaky, agentLines).map((x) => x.f))).length === 0);
+  // The --rows layer alone: a row that came back with them anyway.
+  const back = [
+    rowOut({ t: new Date(at(B)), m: SHED, f: { relay: REGIONAL, dropped_stale: 2, since_last: 'derp-eu.example.net' } }),
+    rowOut({ t: new Date(at(B)), m: said('connect-failed'), f: { relay: '203.0.113.7:443', e: 'refused at 198.51.100.9:443', wait_ms: 5 } }),
+  ];
+  check('address: --rows keeps a /derp line to its counts, numbers only, whatever the read returned', JSON.stringify(back.map((x) => x.f)) === JSON.stringify([{ dropped_stale: 2 }, { wait_ms: 5 }]), JSON.stringify(back.map((x) => x.f)));
+  let unknownShape = null;
+  try {
+    const odd = timelinePipeline(acSet);
+    odd[4].$project.f.$switch.branches[0].then.extra = { $toString: '$lines.fields.relay' };
+    serverRows(odd, agentLines);
+  } catch (e) {
+    unknownShape = e.message;
+  }
+  check('address: the evaluation refuses a shape it does not know, so it cannot pass one', unknownShape !== null && /does not evaluate/.test(unknownShape), String(unknownShape));
   // 3. Masking: a full id and an address in a field print neither.
   const leak = fold(
     [
@@ -1743,21 +2468,61 @@ function selfTest() {
     }
   }
   check('settings refuse no org, two agents, a window over 24 h', threw === 3);
-  const fv = p[4].$project.f;
+  // The second $project's `f`: one branch a kind, in KINDS order, with the
+  // kind's message pattern and its fields (`projectionOf`); `{}` for a line
+  // no kind matches, which the filter has already left out.
+  const sw = p[4].$project.f.$switch;
+  const thenOf = (k) => (sw.branches[KINDS.findIndex((d) => d.k === k)] || {}).then || {};
   check(
-    'viewers leaves only as a number, every other named field as stored',
-    JSON.stringify(fv.viewers) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.viewers' }, '$lines.fields.viewers', '$$REMOVE'] }) && named().every((k) => k === 'viewers' || fv[k] === '$lines.fields.' + k),
-    JSON.stringify(fv.viewers),
+    'f: one $switch branch a kind, in KINDS order, with its pattern and its fields',
+    Object.keys(p[4].$project.f).join(',') === '$switch' &&
+      sw.branches.length === KINDS.length &&
+      sw.branches.every((b, i) => b.case.$regexMatch.input === '$lines.msg' && b.case.$regexMatch.regex === KINDS[i].re.source && JSON.stringify(Object.keys(b.then)) === JSON.stringify(fieldsOf(KINDS[i].k))) &&
+      JSON.stringify(sw.default) === JSON.stringify({ $literal: {} }),
   );
-  check('the read projects the named fields and nothing else', Object.keys(fv).sort().join(',') === named().sort().join(','), Object.keys(fv).length + ' / ' + named().length);
+  const asStored = (k, x) => thenOf(k)[x] === '$lines.fields.' + x;
+  const asNumber = (k, x) => JSON.stringify(thenOf(k)[x]) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.' + x }, '$lines.fields.' + x, '$$REMOVE'] });
+  const projecting = (x) =>
+    KINDS.filter((d) => x in thenOf(d.k))
+      .map((d) => d.k)
+      .join(',');
   check(
-    "open: the query's filter keeps the line, and its fields leave as stored",
-    new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && FIELDS.open.every((k) => named().includes(k) && fv[k] === '$lines.fields.' + k),
+    "viewers leaves only as a number and from the rank lines only, the /derp lines' fields only as numbers, every other field as stored",
+    asNumber('rank', 'viewers') && projecting('viewers') === 'rank' && KINDS.every((d) => fieldsOf(d.k).every((x) => (numberOnly(d.k, x) ? asNumber(d.k, x) : asStored(d.k, x)))),
   );
+  check('the read projects the named fields and nothing else', Array.from(new Set([].concat(...sw.branches.map((b) => Object.keys(b.then))))).sort().join(',') === named().sort().join(','));
   check(
-    "queue and relay transport: the delivery line's queue fields and the carrier line's relay_transport leave as stored",
-    FIELDS.queue.concat(['relay_transport']).every((k) => named().includes(k) && fv[k] === '$lines.fields.' + k),
+    "a line leaves with the ids and its own kind's fields only: no heartbeat field from a delivery line, the ICE line's relay from no other",
+    !('target_bps' in thenOf('delivery')) && !('bytes_written' in thenOf('shed')) && projecting('relay') === 'ice' && KINDS.every((d) => IDS.every((x) => x in thenOf(d.k))),
+    projecting('relay'),
   );
+  check("open: the query's filter keeps the line, and its fields leave as stored", new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && FIELDS.open.every((x) => asStored('open', x)));
+  check(
+    "queue, loss and relay transport: the delivery line's queue and loss fields and the carrier line's relay_transport leave as stored",
+    FIELDS.queue.concat(FIELDS.loss).every((x) => asStored('delivery', x)) && asStored('carrier', 'relay_transport'),
+  );
+  check("model: the floor's push-back, the rule and the fall leave as stored", ['model_floor_push_back', 'model_rule', 'model_fell'].every((x) => asStored('model', x)));
+  // FR-148 AC4: no relay address leaves. Neither /derp kind projects what
+  // KEPT names, no kind projects `e`, and the counts leave as numbers only.
+  check('KEPT: no /derp kind projects relay or e, and no kind e', Object.keys(KEPT).every((k) => KEPT[k].every((x) => !(x in thenOf(k)))) && projecting('e') === '');
+  check('the /derp lines leave their counts, as numbers only', FIELDS.shed.concat(FIELDS.derp).length === 7 && FIELDS.shed.every((x) => asNumber('shed', x)) && FIELDS.derp.every((x) => asNumber('derp', x)));
+  check(
+    'the /derp patterns read the shed line and the lifecycle lines, and none of the other "overlay derp:" lines',
+    new RegExp(cond[0].$regexMatch.regex).test('overlay derp: shed stale carrier frames (queue age bound)') &&
+      DERP_STATES.every((x) => kindOf(x[1]) === 'derp') &&
+      ['overlay derp: regional relay pushed but no admission ticket yet', 'overlay derp: regional /derp carrier opened', 'overlay derp: /derp WS recovered — walking now', 'overlay derp: send buffer capped below the request'].every((m) => kindOf(m) === null),
+  );
+  // A read that would project what KEPT names is refused before it is built.
+  FIELDS.shed.push('relay');
+  let refused = null;
+  try {
+    timelinePipeline({ tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(60)), limit: 7 });
+  } catch (e) {
+    refused = e.message;
+  } finally {
+    FIELDS.shed.pop();
+  }
+  check("KEPT: a read that would project the shed line's relay is refused, not built", refused !== null && /shed\.relay/.test(refused) && !fieldsOf('shed').includes('relay'), String(refused));
   // FR-148 P0: the target lines are read, and their `why`, the heartbeats'
   // `target_moves`, the watermark line's `new_target` and the FFmpeg line's
   // `deferred` leave as stored; the capture-wait line, which writes a `why`
@@ -1774,14 +2539,15 @@ function selfTest() {
     ].every((m) => msgRe.test(m)),
   );
   check('target: the capture-wait line is not read', !msgRe.test('capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller'));
-  check('target: why, target_moves, new_target and deferred leave as stored', ['why', 'target_moves', 'new_target', 'deferred'].every((k) => fv[k] === '$lines.fields.' + k));
+  check('target: why, target_moves, new_target and deferred leave as stored', asStored('target', 'why') && asStored('landed', 'why') && asStored('heartbeat', 'target_moves') && asStored('target', 'new_target') && asStored('target', 'deferred'));
   // Adding a field to a line kind is ONE entry in FIELDS: the read projects
   // it and the kind's row prints it, nothing else changed. A made-up field on
   // the ICE path line and on the path model line, taken out again after.
   FIELDS.ice.push('probe_extra');
   FIELDS.model.push('probe_extra');
   try {
-    const pf = timelinePipeline({ tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(60)), limit: 7 })[4].$project.f;
+    const pb = timelinePipeline({ tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(60)), limit: 7 })[4].$project.f.$switch.branches;
+    const pt = (k) => pb[KINDS.findIndex((d) => d.k === k)].then;
     const po = render(
       fold(
         [
@@ -1791,10 +2557,11 @@ function selfTest() {
         { to: at(60) },
       ),
     );
-    check('one FIELDS entry: the read projects the field', pf.probe_extra === '$lines.fields.probe_extra');
+    check('one FIELDS entry: the read projects the field, for its kind only', pt('ice').probe_extra === '$lines.fields.probe_extra' && pt('model').probe_extra === '$lines.fields.probe_extra' && !('probe_extra' in pt('delivery')));
     check(
       'one FIELDS entry: the row prints it',
-      /^ {2}07:00:01\.000 {2}ice {6}relay=false local_typ=Host probe_extra=p1$/m.test(po) && /^ {2}07:00:02\.000 {2}model {4}viewer_rx_bps=- model_capacity_bps=- model_floor_bps=- probe_extra=p2$/m.test(po),
+      /^ {2}07:00:01\.000 {2}ice {6}relay=false local_typ=Host probe_extra=p1$/m.test(po) &&
+        /^ {2}07:00:02\.000 {2}model {4}viewer_rx_bps=- model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=- probe_extra=p2$/m.test(po),
       (po.match(/^ {2}07:00:0[12].*$/gm) || []).join(' | '),
     );
   } finally {
@@ -1843,13 +2610,7 @@ function selfTest() {
   check('--rows: ids and key ids as the report masks them', /"session":"…5e51"/.test(body) && /"session_id":"…5e51~2"/.test(body) && /"key_id":"…a001"/.test(body) && /"key_id":"…a001~2"/.test(body));
   const direct = render(fold(printed, readOpts(set, false, { turn: 2 })));
   const offline = renderRows([full], {});
-  const firstDiff = (a, b) => {
-    const x = a.split('\n');
-    const y = b.split('\n');
-    const i = x.findIndex((l, j) => l !== y[j]);
-    return i < 0 ? `lengths ${x.length} / ${y.length}` : `line ${i + 1}: ${x[i]} | ${y[i]}`;
-  };
-  check('the masked --rows, read back offline, renders byte for byte as the direct read', offline === direct && !/[0-9a-fA-F]{24}/.test(full), firstDiff(direct, offline));
+  check('the masked --rows, read back offline, renders byte for byte as the direct read', offline === direct && !/[0-9a-fA-F]{24}/.test(full), firstDiffOf(direct, offline));
   check(
     '--rows: why, target_moves and deferred as the lines carry them, and the rows they print',
     /"why":"decrease\(transit-stall\)\+ceiling\(pipe\)","deferred":true/.test(body) &&
@@ -1862,7 +2623,7 @@ function selfTest() {
   check('two ids with one last 4 hex stay two sessions (…5e51, …5e51~2)', sids.join(',') === '…5e51,…5e52,…5e51~2' && /^## session 3: …5e51~2, /m.test(direct) && /^## session 3: …5e51~2, /m.test(offline), sids.join(','));
   const cut = 40;
   const directCut = render(fold(printed.slice(0, cut), readOpts(Object.assign({}, set, { limit: cut }), true, { turn: 2 })));
-  check('a TRUNCATED --rows read back offline renders as the direct read, its limit too', renderRows([rowsText(cut)], {}) === directCut && /stopped at 40 rows/.test(directCut), firstDiff(directCut, renderRows([rowsText(cut)], {})));
+  check('a TRUNCATED --rows read back offline renders as the direct read, its limit too', renderRows([rowsText(cut)], {}) === directCut && /stopped at 40 rows/.test(directCut), firstDiffOf(directCut, renderRows([rowsText(cut)], {})));
   check('mask: an id already masked prints as it is', mask('…5e51~2') === '…5e51~2' && mask(FX.s1) === '…5e51' && mask(null) === '-');
   check('the header prints the range of storage times read', /^batches read: stored 2026-11-18T06:50:00\.000Z -> 2026-11-18T07:16:40\.000Z \(the window ± 10 min\)\. /m.test(direct), direct.split('\n')[1]);
   check(
@@ -1952,7 +2713,14 @@ if (typeof module !== 'undefined' && module.exports) {
     CARRIER_OPTIONS,
     KINDS,
     FIELDS,
+    KEPT,
+    DERP_STATES,
     named,
+    fieldsOf,
+    projectionOf,
+    pairOf,
+    serverRows,
+    derpCalls,
     tally,
     MSG_PATTERN,
     ISO_TIME,
