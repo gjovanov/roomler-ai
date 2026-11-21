@@ -3716,14 +3716,16 @@ when one is needed (FR-27).
 An install restarts the daemon, and the restart ends what it serves: a
 remote-control session, an SSH connection, a Fleet RPC `exec` run, a file
 transfer, a recording. So the periodic check defers while any of them is live,
-on the budget transfers always had. It reads one model, `Busy`
-(`agents/roomlerd/src/busy.rs:30`), the same one the per-user Linux
-daemon's restart onto a replaced binary reads
+on the budget transfers always had, and so does the check a daemon runs early
+when its control socket comes back after an hour or more down (#4245). It
+reads one model, `Busy` (`agents/roomlerd/src/busy.rs:30`), the same one the
+per-user Linux daemon's restart onto a replaced binary reads
 ([linux-self-update.md](linux-self-update.md#the-per-user-daemon-onto-the-new-binary-p2b)).
 
 ```mermaid
 flowchart TD
     C["the periodic check is due"] --> B{"Busy, read now"}
+    O["the control socket is back<br/>after 1 h or more down"] --> B
     B -- "nothing live" --> I["check, and install a newer release"]
     B -- "live work, or the network<br/>moved in the last 10 min" --> D{"7 defers in a row already?"}
     D -- yes --> F["install anyway,<br/>with a warning that names the work"]
@@ -3735,7 +3737,7 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3496` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3580` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
@@ -3747,11 +3749,24 @@ flowchart TD
   (`agents/roomlerd/src/exec.rs:2347`); a command an SSH session runs
   belongs to that connection and is not counted twice. A transfer or a
   recording, as since rc.19 and FR-85 ([recording.md](recording.md)).
-- **An operator's push still installs at once.** `POST …/agent/update`
-  (`rc:agent.update`), and the check a daemon asks for when its control socket
-  comes back after a long outage, skip the gate and keep only the 5-min
-  install-storm cooldown. Each says what it cuts, in the daemon's log:
+- **Only an operator's push installs at once.** `POST …/agent/update`
+  (`rc:agent.update`) skips the gate and keeps only the 5-min install-storm
+  cooldown. It says what it cuts, in the daemon's log:
   `forced update proceeding despite: 1 remote-control session(s)`.
+- **The recheck after a long control-socket outage waits too (#4245).** A
+  daemon whose control socket comes back after an hour or more down checks for
+  an update at once, for a push it may have missed while the socket was down
+  (`UPDATE_RECHECK_AFTER_DOWN`, `agents/roomlerd/src/signaling.rs:612`). That
+  check is the periodic one run early: the same gate, the same cooldown, and
+  the same seven defers, so a recheck that defers spends one, and one at the
+  cap installs anyway as the timer's would. Until #4245 it took the push's way
+  and installed over whatever was live. No session of that organization
+  outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
+  an SSH session on the mesh does, and so does a session another enrollment of
+  the daemon serves; and a long outage often ends on a network that just moved.
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3113`),
+  and one function picks the cycle's way (`cycle_arm`,
+  `agents/roomlerd/src/updater.rs:3649`).
 - **Only the process that installs is asked**, and it counts only what it
   serves itself:
 
@@ -3766,9 +3781,14 @@ flowchart TD
 
 - **What the log says.** Each defer: `auto-updater: deferring — live work a
   restart would cut, or the network just moved busy=1 remote-control session(s)
-  consecutive_defers=1 next_check_secs=3600`. Once the budget is spent:
-  `auto-updater: forcing update after 7 consecutive defers`, with the same
-  `busy=`.
+  consecutive_defers=1 next_check_secs=3600 cycle=periodic`, and
+  `cycle=outage_recheck` on a recheck after a long outage. Once the budget is
+  spent: `auto-updater: forcing update after 7 consecutive defers`, with the
+  same `busy=` and `cycle=`. The recheck starts with `control WS recovered
+  after a long outage — requesting the update recheck down_mins=61
+  update_check_fired=true`, and one inside the cooldown logs `auto-updater:
+  recheck suppressed by recent-install cooldown; the timer checks next
+  cycle=outage_recheck`.
 
 ### macOS: an update with nobody signed in (#3783)
 
@@ -3843,7 +3863,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3540`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3702`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.
