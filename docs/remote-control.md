@@ -741,10 +741,10 @@ and every session registered at that moment gets, one stop grace (1 s) after
 the exit, the reason a session opened while the desktop is down gets:
 `backend_error`, with *this device's virtual desktop is down: its X server
 (Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
-(`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:361`). The
+(`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:438`). The
 supervisor reads who to tell on its own thread and sends one
 `spawn_capture_unavailable_notice` per session on the daemon's runtime
-(`sessions_told_via`, `virtual_desktop.rs:436`), so it never waits on a
+(`sessions_told_via`, `virtual_desktop.rs:513`), so it never waits on a
 channel. Only where the device's plan is the virtual desktop
 (`capture::sessions_capture_the_virtual_desktop`,
 `agents/roomlerd/src/capture/mod.rs:1535`); under an explicit `drm_capture` or
@@ -764,7 +764,7 @@ desktop, the supervisor retires every registered pipeline
 (`media_share::retire_all`, `agents/roomlerd/src/media_share.rs:1006`) after
 the stop grace, before the sessions are told, and again once the restarted
 desktop is up, which catches what registered while it was down (`retire_if`,
-`virtual_desktop.rs:468`). A retired pipeline takes no joiner and its key is
+`virtual_desktop.rs:545`). A retired pipeline takes no joiner and its key is
 free, so the next viewer of the profile runs a capture and an encoder of its
 own on the new server. Its owner and its followers keep what they share and
 are told with the rest; detaching a follower would send it back into an open
@@ -2011,7 +2011,7 @@ server.
 - **Who is marked.** At an X server exit the supervisor marks every session
   registered at that moment, on its own thread, before it reads the device's
   plan or the tell's switch and before the restart can publish the desktop up
-  (`sessions_told_via`, `agents/roomlerd/src/virtual_desktop.rs:436`). FR-80's
+  (`sessions_told_via`, `agents/roomlerd/src/virtual_desktop.rs:513`). FR-80's
   notice also marks the session it tells, when its reason is this daemon's
   virtual desktop being down (`input::told_no_picture`,
   `agents/roomlerd/src/input/mod.rs:93`): a session whose open was refused
