@@ -485,7 +485,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1308`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1313`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -2902,7 +2902,7 @@ Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
 the last 19 of them after the wake.
 
 Now the viewer keeps a `host_sleep` notice through the redial
-(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1071`). Its
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1147`). Its
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it

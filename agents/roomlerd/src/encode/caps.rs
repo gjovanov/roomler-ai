@@ -4838,6 +4838,9 @@ fn files_caps_for(browse_enabled: bool) -> Vec<String> {
     ];
     if browse_enabled {
         files.push("browse".to_string());
+        // #4121 — a listing too large for one message goes in pages to a
+        // viewer that asks; never `browse-pages`, whose prefix is `browse`.
+        files.push("dir-pages".to_string());
     }
     files
 }
@@ -5710,8 +5713,15 @@ mod tests {
         let on = files_caps_for(true);
         assert_eq!(
             on,
-            vec!["upload", "download", "download-folder", "resume", "browse"],
-            "browse enabled: the same four, plus `browse`"
+            vec![
+                "upload",
+                "download",
+                "download-folder",
+                "resume",
+                "browse",
+                "dir-pages"
+            ],
+            "browse enabled: the same four, plus `browse` and its paged listings (#4121)"
         );
     }
 
