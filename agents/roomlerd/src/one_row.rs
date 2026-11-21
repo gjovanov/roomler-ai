@@ -1788,6 +1788,9 @@ pub fn revert_digest(r: &Revert) -> u64 {
     (r.supervised, &r.unfinished, &r.strays).hash(&mut h);
     // #4122 — whose LaunchAgent it bootstraps for a keep that never finished.
     r.unfinished_agent.as_ref().map(|a| a.uid).hash(&mut h);
+    // #4227 — whether the job of the person given back is loaded: the plan's
+    // words for them turn on it.
+    r.agent_loaded.hash(&mut h);
     for p in &r.people {
         p.uid.hash(&mut h);
         match &p.back {
@@ -2400,6 +2403,13 @@ async fn worker_gone<H: Host>(host: &mut H, uid: u32) -> Option<String> {
 /// starts a job that lost the race anyway and does nothing to one that runs:
 /// the supervisor's own hand-back (`kickstart_launch_agent` in
 /// `macos_supervisor.rs`). `Err`: the bootstrap's, which the caller says.
+///
+/// #4227 — the job is read right before the bootstrap, here, for every
+/// caller: one still loaded (a run that stopped after the person's Keep and
+/// before its bootout) or loaded again (a login since) is never bootstrapped a
+/// second time, which launchd refuses, and one line says so. The kickstart
+/// still follows: an agent that started while the one-row daemon's screen
+/// worker held its lock exited 0, so its job is loaded and nothing runs.
 async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) -> Result<()> {
     let job = format!("gui/{uid}/com.roomler.agent");
     if wait && let Some(why) = worker_gone(host, uid).await {
@@ -2408,8 +2418,14 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
              worker has stopped, `sudo launchctl kickstart {job}` starts it"
         ));
     }
-    host.bootstrap(&bootstrap_argv(uid, home))?;
-    host.say(&format!("bootstrapped: {job}"));
+    if host.agent_loaded(uid) {
+        host.say(&format!(
+            "{job}: already loaded, so it is not bootstrapped again"
+        ));
+    } else {
+        host.bootstrap(&bootstrap_argv(uid, home))?;
+        host.say(&format!("bootstrapped: {job}"));
+    }
     match host.kickstart_agent(uid) {
         Ok(()) => host.say(&format!("kickstarted: {job}")),
         Err(e) => host.say(&format!(
@@ -2545,6 +2561,12 @@ pub struct Revert {
     /// in their home as their own process read it, and their job not loaded.
     /// A keep again that stopped after the bootout (#4097) leaves just that.
     pub unfinished_agent: Option<Account>,
+    /// #4227 — the LaunchAgent of the person given back whom
+    /// [`bootstrap_after_revert`] names was loaded as the plan read it, as a
+    /// run that stopped after their Keep and before its bootout leaves it.
+    /// The plan then says it is started, not bootstrapped; [`start_agent`]
+    /// reads it again right before either.
+    pub agent_loaded: bool,
     /// [`Host::record_strays`]: temporary files a power loss left, removed
     /// first.
     pub strays: Vec<String>,
@@ -2687,6 +2709,11 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
     {
         unfinished_agent = Some(p.account.clone());
     }
+    // #4227 — the job of the person given back whom the bootstrap names, read
+    // so that the plan says what the revert does with it.
+    let agent_loaded = bootstrap_after_revert(supervised, console_uid)
+        .filter(|uid| people.iter().any(|p| p.uid == *uid))
+        .is_some_and(|uid| host.agent_loaded(uid));
     Ok(Some(Revert {
         root_kept,
         root_record,
@@ -2695,6 +2722,7 @@ pub async fn revert_plan<H: Host>(host: &mut H) -> Result<Option<Revert>> {
         people,
         unfinished,
         unfinished_agent,
+        agent_loaded,
         strays,
         unread,
         console_uid,
@@ -2714,6 +2742,14 @@ pub fn bootstrap_after_revert(supervised: bool, console_uid: Option<u32>) -> Opt
 /// ([`Revert::unfinished_agent`], #4122).
 const AGENT_AFTER_RESTART: &str = ", and their LaunchAgent is bootstrapped after the restart, \
                                    once the one-row screen worker that runs as them has stopped";
+
+/// #4227 — what the plan adds instead for a person given back whose job is
+/// loaded as it reads it ([`Revert::agent_loaded`]): never bootstrapped
+/// again, only kickstarted without `-k`, which starts it if it is not running
+/// ([`start_agent`]).
+const LOADED_AGENT_AFTER_RESTART: &str = ", and their LaunchAgent, already loaded, is started \
+                                          after the restart if it is not running, once the \
+                                          one-row screen worker that runs as them has stopped";
 
 /// The revert's plan, in the words it says before it asks.
 pub fn describe_revert(r: &Revert) -> Vec<String> {
@@ -2749,15 +2785,16 @@ pub fn describe_revert(r: &Revert) -> Vec<String> {
             Back::Record { .. } => format!("from what root keeps in {RECORDS}/{}", p.uid),
             Back::Legacy => "from the copies an earlier release kept in their folder".to_string(),
         };
+        let agent = if bootstrap_for != Some(p.uid) {
+            ""
+        } else if r.agent_loaded {
+            LOADED_AGENT_AFTER_RESTART
+        } else {
+            AGENT_AFTER_RESTART
+        };
         out.push(format!(
-            "{} (uid {}): their files go back {how}, by their own process{}",
-            p.name,
-            p.uid,
-            if bootstrap_for == Some(p.uid) {
-                AGENT_AFTER_RESTART
-            } else {
-                ""
-            }
+            "{} (uid {}): their files go back {how}, by their own process{agent}",
+            p.name, p.uid
         ));
     }
     for (uid, name, why) in &r.unread {
@@ -2965,8 +3002,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     let failed: Vec<String> = failed.into_iter().map(|(_, name)| name).collect();
     // #4122 — the person of an unfinished folder the plan named, at the same
     // point and in the same way as one given back, and once, whichever path
-    // names them. Their job is read again first: a login since loads it.
-    let read_again = r.unfinished_agent.as_ref().map(|a| a.uid);
+    // names them. `start_agent` reads their job again first, as it does
+    // anyone's (#4227): a login since loads it.
     let agent = agent.or_else(|| r.unfinished_agent.as_ref().map(|a| (a.uid, a.home.clone())));
     host.say("restarting the daemon onto the files put back: live sessions end now");
     let leaving = host.status().await.ok().map(|s| DaemonInstance::of(&s));
@@ -2991,17 +3028,13 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     // the one-row file, whose moved enrollments the person's file holds again:
     // two processes on one enrollment, which root's file going first prevents.
     // Now it runs root's file put back, which leaves this person to launchd.
-    if let Some((uid, home)) = &agent {
-        if read_again == Some(*uid) && host.agent_loaded(*uid) {
-            host.say(&format!(
-                "gui/{uid}/com.roomler.agent: loaded since the plan was said, so it is left alone"
-            ));
-        } else if let Err(e) = start_agent(host, *uid, home, true).await {
-            host.say(&format!(
-                "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
-                 login"
-            ));
-        }
+    if let Some((uid, home)) = &agent
+        && let Err(e) = start_agent(host, *uid, home, true).await
+    {
+        host.say(&format!(
+            "gui/{uid}/com.roomler.agent did not start ({e:#}); launchd loads it at the next \
+             login"
+        ));
     }
     for uid in given_back {
         host.remove_records_of(uid)
@@ -6438,6 +6471,7 @@ mod tests {
             people: Vec::new(),
             unfinished: Vec::new(),
             unfinished_agent: None,
+            agent_loaded: false,
             strays: Vec::new(),
             unread: Vec::new(),
             console_uid: Some(501),
