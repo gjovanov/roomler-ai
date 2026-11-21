@@ -204,14 +204,14 @@ descriptor in the XML, no repair and no `Roomler start-<SID>`.
 ### P1a: the per-user MSI's steps write their record
 
 #3230 gave the per-Machine MSI's steps a start line and an end line (`crates/agent-core/src/logging.rs:602-660`, begun
-at `app.rs:1633-1650`, ended at `app.rs:1405-1409`), because Windows Installer throws a custom action's stdout and
-stderr away. The per-user steps keep the profile's log (`app.rs:1430-1436`) and write no record. So a refused
+at `app.rs:1637-1654`, ended at `app.rs:1409-1413`), because Windows Installer throws a custom action's stdout and
+stderr away. The per-user steps keep the profile's log (`app.rs:1434-1440`) and write no record. So a refused
 registration leaves nothing but the MSI log's `returned actual error code 1`.
 
 P1a gives the per-user steps the same record, in the person's own log, the dated file the daemon writes:
 `service install`, `service uninstall`, `service start` (what `Roomler start-<SID>` runs), `service stop` with and
 without `--for-upgrade`, and `cleanup-legacy-install --target-flavour perUser`. They get it through a predicate of
-their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1585-1596`) are unchanged. A person who
+their own, so that `is_installer_step` and #3702's migration rule (`app.rs:1589-1600`) are unchanged. A person who
 runs the same verb by hand gets the same two lines.
 
 ### P1b: the watcher owns the per-user relaunch
@@ -289,12 +289,12 @@ Before P2, `roomlerdw.exe` waited for the daemon once and left with its code. P2
   is the launcher, the update has replaced the launcher's file, so P2's launcher supervises it.
 - **The crash ladder.** A launcher restart counts as a crash, because it is one. Three inside ten minutes on a version
   not yet promoted trip `should_rollback` (`crates/agent-core/src/config.rs:2705`), and on Windows the daemon raises
-  `rollback_failed` and stays up, with no download (`app.rs:4475-4486`).
+  `rollback_failed` and stays up, with no download (`app.rs:4479-4490`).
 - **An install in flight.** The launcher must not touch the data tree (`.claude/rules/installers.md`), so the daemon
   decides. A `run --supervisor task` that starts while the update-attempt marker is fresh (`updater.rs:230-256`; the
   MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex, `Global\_MSIExecute`, is
-  held exits 75 before it takes the lock (`app.rs:3955-3956`, `daemon_error.rs:244-298`). Its stderr goes to the
-  person's log under the task (`app.rs:1652-1657`), so the log says why. Neither sign alone is enough: the marker stays
+  held exits 75 before it takes the lock (`app.rs:3959-3960`, `daemon_error.rs:244-298`). Its stderr goes to the
+  person's log under the task (`app.rs:1656-1661`), so the log says why. Neither sign alone is enough: the marker stays
   fresh for ten minutes after an install that has ended, and any install on the machine holds the mutex. No other code
   in the tree is 75, and no Windows status is
   (`the_install_in_flight_code_is_pinned_and_collides_with_nothing`); it is `sysexits.h`'s `EX_TEMPFAIL`, a mnemonic
@@ -310,7 +310,7 @@ Before P2, `roomlerdw.exe` waited for the daemon once and left with its code. P2
     `service.rs:3359-3373`);
   - the per-user MSI touches the marker before it writes the task. `StopOldDaemon` (`main.wxs:565`) runs after
     `CleanupLegacyPerMachine`, which runs after `InstallFiles` (`:555`). Its `service stop --for-upgrade` records the
-    attempt before it stops anything (`app.rs:5960-5974`). `RegisterAutostart` runs last, before the commit (`:542`).
+    attempt before it stops anything (`app.rs:5974-5988`). `RegisterAutostart` runs last, before the commit (`:542`).
 
   So the last one-shot comes more than ten minutes after the marker's last touch, and the freshness test reads it as
   stale. That the test is strict, `elapsed < cooldown` (`updater.rs:268-279`), is only a second margin.
