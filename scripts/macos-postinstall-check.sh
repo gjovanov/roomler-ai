@@ -826,6 +826,52 @@ called "launchctl bootout gui/501/com.roomler.agent"
 not_called "launchctl bootstrap gui/501 $LA/com.roomler.agent.plist"
 absent "$LA/com.roomler.agent.plist"
 said "is owned by the ROOT DAEMON"
+said "To go back to the per-user LaunchAgent, set that key false"
+not_said "no per-user agent to go back to"
+daemon_reloaded
+done_case
+
+# FR-141 P2's follow-up (F4) — a one-row Mac (`macos_one_row = true`) holds no
+# per-user enrollment, so the per-user LaunchAgent is no way back there: its
+# line names the uninstall, with the server the root daemon enrolled with, or
+# on a Mac that `roomlerd one-row` made one row, that command's revert.
+ONE_ROW_ROOT=$(printf '%s\n' 'server_url = "https://roomler.example"' \
+    'macos_supervise_gui_worker = true' 'macos_one_row = true')
+start "signed in, one row: no per-user agent to go back to, and the uninstall names the Mac's server"
+signed_in_two_rows
+enrolled "$ONE_ROW_ROOT"
+run
+rc_is 0
+absent "$LA/com.roomler.agent.plist"
+said "is owned by the ROOT DAEMON"
+said "no per-user agent to go back to"
+said "curl -fsSL https://roomler.example/api/setup/install.sh | sh -s -- --uninstall"
+not_said "To go back to the per-user LaunchAgent"
+not_said "one-row --revert"
+daemon_reloaded
+done_case
+
+start "signed in, one row that roomlerd one-row made: the way back is its revert"
+signed_in_two_rows
+enrolled "$ONE_ROW_ROOT"
+marker config.toml.pre-one-row
+run
+rc_is 0
+absent "$LA/com.roomler.agent.plist"
+said "sudo roomlerd one-row --revert"
+not_said "To go back to the per-user LaunchAgent"
+not_said "sh -s -- --uninstall"
+daemon_reloaded
+done_case
+
+start "signed in, one row whose server is not a plain URL: the uninstall line names none"
+signed_in_two_rows
+enrolled "$(printf '%s\n' 'server_url = "https://x.example/$(id)"' \
+    'macos_supervise_gui_worker = true' 'macos_one_row = true')"
+run
+rc_is 0
+said "curl -fsSL <your server>/api/setup/install.sh | sh -s -- --uninstall"
+not_said "x.example"
 daemon_reloaded
 done_case
 
