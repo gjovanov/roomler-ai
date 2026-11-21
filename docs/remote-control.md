@@ -483,7 +483,7 @@ AC23's case, TURN blackholed: the hold ran to its bound, and the session opened 
 INFO per-session ICE path detected (adaptive bitrate) session_id=<id> relay=false local_typ=Host local_proto=Udp local_addr=100.64.0.12:50123 remote_typ=Relay remote_proto=Udp remote_addr=100.64.0.9:50200 waited_ms=0 opening=route route=mesh-relayed hold_ms=2500 hold_exit=bound
 ```
 
-`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:287`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
+`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:341`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
 
 **The kill switch.** `rc_carrier_rank` back to `1`, `prio` or `0` (or `ROOMLERD_RC_CARRIER_RANK`), then a restart; it is read once per session. Under every value but `route` the agent gets no route rank, and every branch above is a no-op: the vnet cells `kill_switch_under_prio_and_1_every_pair_is_formed_and_nothing_is_held` and `kill_switch_under_prio_shapes_a_and_b_still_open_on_the_mesh` hold that.
 
@@ -7041,7 +7041,7 @@ otherwise keep (§11.16). The reconnect is the same either way.
 | control WS RX deadline (`signaling.rs:2393`) | the keepalive's own due instant, which `tick()` returns (`:2336`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
 | control WS, a failed heartbeat send (`signaling.rs:2720`) or read (`:3387`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2337`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
 | the reconnect after any of them (`signaling.rs:1562`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
-| `/derp` RX deadline (`agents/roomlerd/src/derp.rs:445`) | the keepalive's due instant (`:432`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
+| `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3166`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:779`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
 
@@ -7445,7 +7445,8 @@ own failure, although `should_record_supervisor_crash` leaves it out of
 the crash *reports* because the watchdog wrote its own.
 
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
-worker for an account with no config exits `NO_ENROLLMENT_EXIT_CODE`
+worker for an account with no config, and no last good copy of one that
+holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
 (78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. It ends before this bookkeeping, with no
@@ -7454,7 +7455,23 @@ GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
 its reports. Since FR-150 P2 so does the per-user task's daemon, whose
 launcher leaves on it. Only those three workers exit 78: every other `run`
-with no config still exits 1.
+with no config still exits 1. The macOS supervisor's worker exits 78 even
+beside an enrolled copy, because it never restores at its start (#4157): on a
+converted one-row Mac the person's `config.toml.prev` can still hold the
+enrollment that moved to root (#4184). The other two restore a missing config
+from such a copy, and exit 78 only without one.
+
+**A restored config counts nowhere either** (#4157). When `config::load`
+restores a config from its last good copy (`config.toml.prev`), the live
+file missing or unreadable, it clears the copy's run marks first:
+`last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
+[`crates/agent-core/src/config.rs:4924`](../crates/agent-core/src/config.rs#L4924)).
+A save kept that copy while its run went on, so its mark says nothing of
+how the run ended. Before #4157 the copy kept the mark, and the start after
+a restore read the run before it as `Crashed` on the same boot, one step
+toward `should_rollback`. Since #4157 a start restores a missing config
+itself, so that start reads `Clean`. The crash count stays the copy's, and
+a crash of the run started on the restored config counts as any crash does.
 
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot
