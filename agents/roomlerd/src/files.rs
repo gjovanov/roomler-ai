@@ -4117,9 +4117,10 @@ pub const STAGING_SENTINEL: &str = "<staging>";
 /// List a directory. Empty / `~` enumerates the roots (logical drives on
 /// Windows; a single `/` on Unix); [`STAGING_SENTINEL`] resolves to this
 /// host's staging root; anything else is canonicalised and read, `/`
-/// included. Returns at most 10000 entries — a directory with more is a
-/// degenerate case (deeply nested `node_modules` on a dev box) that we'd
-/// rather refuse than stream a 1 MiB JSON listing.
+/// included. Returns at most 10000 entries ([`DIR_ENTRIES_MAX`]): a folder
+/// with more is listed to that limit and says so (`capped`, #4121), and a
+/// listing too large for one message reaches the viewer in pages
+/// ([`dir_pages`]).
 ///
 /// ⚠️ `/` is a DIRECTORY, not a roots request (#2870). Until this change the
 /// roots arm also matched `/`, so on a Unix host the roots view listed one
@@ -4261,11 +4262,13 @@ pub(crate) const DIR_ENTRIES_MAX: usize = 10_000;
 /// (#4121). #3688 — a listing through a folder's
 /// handle (`/proc/self/fd/N`, [`folder_listing`]) names its entries after that
 /// handle, so read only `file_name()` and `metadata()` here, never `path()`.
-fn collect_dir_entries(read: std::fs::ReadDir, max: usize) -> (Vec<DirEntryView>, bool) {
-    let capped = false;
+fn collect_dir_entries(mut read: std::fs::ReadDir, max: usize) -> (Vec<DirEntryView>, bool) {
     let mut entries: Vec<DirEntryView> = Vec::new();
-    for entry in read.take(max) {
+    let (mut taken, mut failed) = (0, false);
+    for entry in read.by_ref().take(max) {
+        taken += 1;
         let Ok(entry) = entry else {
+            failed = true;
             break;
         };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -4288,6 +4291,8 @@ fn collect_dir_entries(read: std::fs::ReadDir, max: usize) -> (Vec<DirEntryView>
             mtime_unix,
         });
     }
+    // The folder held more when one more entry is there to read.
+    let capped = !failed && taken == max && matches!(read.next(), Some(Ok(_)));
     // Sort: dirs first then files; both alphabetical case-insensitive.
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,

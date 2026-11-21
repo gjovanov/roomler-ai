@@ -13416,17 +13416,19 @@ async fn answer_dir_listing<S: DownloadSink>(
     }
     match listed {
         Ok(listing) => {
+            let (frames, bytes) =
+                crate::files::dir_pages::answer_measured(&req_id, &listing, paged);
+            let pages = frames.iter().filter(|f| f.kind == "files:dir-list").count();
             info!(
                 %session_id, ?req_id,
                 path = ?listing.path,
                 entries = listing.entries.len(),
+                capped = listing.capped,
+                bytes,
+                pages,
                 "files: dir listed"
             );
-            for frame in crate::files::dir_pages::answer(&req_id, &listing, paged) {
-                if !matches!(or_stopped(&closed, dc.send_frame(frame)).await, Ok(Ok(()))) {
-                    return;
-                }
-            }
+            send_listing_frames(&dc, &closed, frames).await;
         }
         Err(e) => {
             warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
@@ -13436,6 +13438,40 @@ async fn answer_dir_listing<S: DownloadSink>(
                 message: &message,
             };
             let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+        }
+    }
+}
+
+/// #4121 — a listing's frames ([`crate::files::dir_pages`]), in order. Each
+/// waits while the channel's buffer is over the download pumps' high-water
+/// mark (a listing in pages never fills it alone, but it shares the channel
+/// with them), and the frames stop at the channel's end, the session's, or
+/// the first send that fails, which [`send_files_frame`] logs.
+async fn send_listing_frames<S: DownloadSink>(
+    dc: &S,
+    closed: &tokio_util::sync::CancellationToken,
+    frames: Vec<crate::files::FilesFrame>,
+) {
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    for frame in frames {
+        // ⚠️ After a drop the buffer never drains (only a SACK lowers it):
+        // the channel's state ends the wait too.
+        loop {
+            match or_stopped(closed, dc.buffered()).await {
+                Ok(buffered) if buffered > BACKPRESSURE_HIGH => {}
+                Ok(_) => break,
+                Err(_) => return,
+            }
+            if or_stopped(closed, tokio::time::sleep(Duration::from_millis(20)))
+                .await
+                .is_err()
+                || dc.gone()
+            {
+                return;
+            }
+        }
+        if dc.gone() || !matches!(or_stopped(closed, dc.send_frame(frame)).await, Ok(Ok(()))) {
+            return;
         }
     }
 }
@@ -13853,15 +13889,26 @@ async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutg
 }
 
 /// #4121 — every answer on the files channel goes out here, a listing's
-/// pages among them, and the send's result comes back.
+/// pages among them, and the send's result comes back. A send that fails is
+/// a WARN naming the frame's kind, size, id and the error, never its text:
+/// a listing names a person's files. One line an answer at most: a stop
+/// (`or_stopped`) drops the send rather than failing it, the senders stop at
+/// the channel's end, and no listing frame is over the stack's limit.
 async fn send_files_frame(
     dc: &RTCDataChannel,
     frame: crate::files::FilesFrame,
 ) -> anyhow::Result<()> {
-    dc.send_text(frame.text)
+    let crate::files::FilesFrame { kind, id, text } = frame;
+    let bytes = text.len();
+    let sent = dc
+        .send_text(text)
         .await
         .map(|_| ())
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from);
+    if let Err(e) = &sent {
+        warn!(kind, bytes, id = ?id, e = %e, "files: answer not sent");
+    }
+    sent
 }
 
 /// #1730 — what a download pump needs of its data channel: the channel
