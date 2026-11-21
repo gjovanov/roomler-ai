@@ -3496,6 +3496,29 @@ fn schedule_transport_retry(
     }
 }
 
+/// #3429 — the periodic check's gate on what [`crate::busy::now`] read.
+/// SEAM: the gate as it stands, transfers and a recording only.
+pub(crate) fn periodic_gate(
+    busy: &crate::busy::Busy,
+    consecutive_defers: u32,
+) -> (DeferDecision, Duration) {
+    let active = busy.work;
+    let decision = decide_defer(active, busy.net_transition, consecutive_defers);
+    let recheck = if busy.net_transition && active == 0 {
+        NET_DEFER_RECHECK
+    } else {
+        TRANSFER_DEFER_RECHECK
+    };
+    (decision, recheck)
+}
+
+/// #3429 — the forced update's warning. SEAM: the warning as it stands.
+pub(crate) fn forced_update_warning(busy: &crate::busy::Busy) -> Option<String> {
+    (busy.work > 0).then(|| {
+        "forced update proceeding despite in-flight file transfers or a recording".to_string()
+    })
+}
+
 // ─── macOS update half (`com.roomler.update` + `update-helper`) ──────────
 //
 // `installer -target /` needs root and the DEFAULT macOS install is the
@@ -6847,6 +6870,156 @@ mod tests {
         // most ~31h between successful update fires for a
         // chronically-busy host. Bounded.
         assert!(MAX_CONSECUTIVE_DEFERS >= 3 && MAX_CONSECUTIVE_DEFERS <= 24);
+    }
+
+    // ---- #3429 — the periodic check waits for live remote work ----
+    //
+    // Each cell reads the daemon's own counts through `busy::now`, as the
+    // loop does, and decides with `periodic_gate`. Tests share the process:
+    // a cell only ever ADDS work to what another test may hold, so each
+    // asserts what its own work decides, never that nothing else is live.
+
+    /// The daemon's registry, holding one live remote-control session as the
+    /// signalling loop registers it.
+    fn one_live_session() -> crate::rc_sessions::RcSessionRegistry {
+        let sessions = crate::rc_sessions::RcSessionRegistry::new();
+        let (kill, _) = tokio::sync::mpsc::channel(1);
+        sessions.insert(
+            bson::oid::ObjectId::new(),
+            "viewer".into(),
+            "VIEW".into(),
+            String::new(),
+            kill,
+        );
+        sessions
+    }
+
+    /// Cell 1 — a remote-control session in the registry defers the periodic
+    /// update, rechecked in the hour a transfer gets.
+    #[test]
+    fn a_live_session_defers_the_periodic_update_by_the_hour() {
+        let busy = crate::busy::now(&one_live_session());
+        assert_eq!(busy.rc_sessions, 1, "{busy}");
+        assert_eq!(
+            periodic_gate(&busy, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK),
+            "{busy}"
+        );
+    }
+
+    /// Cell 2 — an open SSH connection defers it the same way: the count
+    /// `serve_conn`, and the carry to the SYSTEM service, hold.
+    #[cfg(feature = "ssh-server")]
+    #[test]
+    fn a_live_ssh_connection_defers_the_periodic_update() {
+        let _connection = crate::ssh::LiveConnection::open();
+        let busy = crate::busy::now(&crate::rc_sessions::RcSessionRegistry::new());
+        assert!(busy.ssh_connections >= 1, "{busy}");
+        assert_eq!(
+            periodic_gate(&busy, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK),
+            "{busy}"
+        );
+    }
+
+    /// Cell 3 — a Fleet RPC run defers it: a guard on the count the gate
+    /// reads, as the exec engine holds one for each run (`busy::exec_run`).
+    /// This thread's count, so no other test's command is read here.
+    #[test]
+    fn a_live_exec_run_defers_the_periodic_update() {
+        let runs = crate::power::new_activity_counter();
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = Some(runs.clone()));
+        let run = crate::power::ActivityGuard::new(&runs);
+        let during = crate::busy::now(&crate::rc_sessions::RcSessionRegistry::new());
+        drop(run);
+        let after = crate::busy::now(&crate::rc_sessions::RcSessionRegistry::new());
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = None);
+        assert_eq!(during.exec_runs, 1, "{during}");
+        assert_eq!(
+            periodic_gate(&during, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK),
+            "{during}"
+        );
+        assert_eq!(after.exec_runs, 0, "{after}");
+    }
+
+    /// Cell 4 — the control: with nothing live the check proceeds, whatever
+    /// came before, so the gate never holds an idle device back.
+    #[test]
+    fn with_nothing_live_the_periodic_update_proceeds() {
+        let idle = crate::busy::Busy::IDLE;
+        assert_eq!(periodic_gate(&idle, 0).0, DeferDecision::Proceed);
+        assert_eq!(
+            periodic_gate(&idle, MAX_CONSECUTIVE_DEFERS).0,
+            DeferDecision::Proceed
+        );
+    }
+
+    /// Cell 5 — the budget is the transfers': a session that never ends is
+    /// deferred seven times in a row, and the eighth check forces through.
+    #[test]
+    fn a_session_that_stays_is_forced_after_seven_defers() {
+        let busy = crate::busy::now(&one_live_session());
+        for defers in 0..MAX_CONSECUTIVE_DEFERS {
+            assert_eq!(
+                periodic_gate(&busy, defers).0,
+                DeferDecision::DeferOnce,
+                "after {defers} defers: {busy}"
+            );
+        }
+        assert_eq!(
+            periodic_gate(&busy, MAX_CONSECUTIVE_DEFERS).0,
+            DeferDecision::ForceAfterDefers,
+            "{busy}"
+        );
+    }
+
+    /// Cell 6 — an operator's forced update still proceeds over a live
+    /// session, and its warning names the session.
+    #[test]
+    fn the_forced_updates_warning_names_a_live_session() {
+        let busy = crate::busy::now(&one_live_session());
+        let warning = forced_update_warning(&busy);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("1 remote-control session")),
+            "{warning:?} for {busy}"
+        );
+        assert_eq!(forced_update_warning(&crate::busy::Busy::IDLE), None);
+    }
+
+    /// R5b, unchanged: a network transition alone rechecks in two minutes, the
+    /// hour once live work stands beside it, and an install of the daemon's
+    /// own in flight is no input here (the replaced-binary watch's alone).
+    #[test]
+    fn a_network_transition_alone_keeps_its_fast_recheck() {
+        use crate::busy::Busy;
+        let moved = Busy {
+            net_transition: true,
+            ..Busy::IDLE
+        };
+        assert_eq!(
+            periodic_gate(&moved, 0),
+            (DeferDecision::DeferOnce, NET_DEFER_RECHECK)
+        );
+        assert_eq!(
+            periodic_gate(&moved, MAX_CONSECUTIVE_DEFERS).0,
+            DeferDecision::ForceAfterDefers
+        );
+        let moved_in_a_session = Busy {
+            rc_sessions: 1,
+            ..moved
+        };
+        assert_eq!(
+            periodic_gate(&moved_in_a_session, 0),
+            (DeferDecision::DeferOnce, TRANSFER_DEFER_RECHECK)
+        );
+        let installing = Busy {
+            install_in_flight: true,
+            ..Busy::IDLE
+        };
+        assert_eq!(periodic_gate(&installing, 0).0, DeferDecision::Proceed);
     }
 
     // ---- #1755 — a check that failed on the transport retries early ----

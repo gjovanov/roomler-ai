@@ -2980,6 +2980,38 @@ mod tests {
         );
     }
 
+    /// #3429 — a Fleet RPC command is live work for as long as it runs, so the
+    /// periodic update waits for it (`busy::exec_run`, taken by the engine).
+    /// The command waits for its input, so it runs until the feed ends. This
+    /// thread's count, so no other test's command is read here.
+    #[tokio::test]
+    async fn a_fleet_rpc_command_is_live_work_while_it_runs() {
+        use std::time::Duration;
+        let runs = crate::power::new_activity_counter();
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = Some(runs.clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (engine, redactor) = (engine(), Redactor::default());
+        let run = engine.run_fed(req(cat_stdin()), &redactor, Some(rx));
+        tokio::pin!(run);
+        let counted = async {
+            while runs.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let seen = tokio::select! {
+            out = &mut run => panic!("the command ended before its input did: {out:?}"),
+            seen = tokio::time::timeout(Duration::from_secs(20), counted) => seen,
+        };
+        let during = runs.load(Ordering::Relaxed);
+        drop(tx); // end-of-input: the command ends
+        let out = run.await;
+        crate::busy::EXEC_RUNS_HERE.with(|h| *h.borrow_mut() = None);
+        assert!(seen.is_ok(), "the running command was never counted");
+        assert_eq!(during, 1);
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert_eq!(runs.load(Ordering::Relaxed), 0, "counted after it ended");
+    }
+
     /// A command keeps its standard streams and nothing else: a descriptor
     /// the daemon holds without close-on-exec does not reach it.
     #[cfg(unix)]
