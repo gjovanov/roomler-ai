@@ -451,7 +451,7 @@ explained dialog, not a broken page.
 The org's tunnel ACL is gated there too. Every `…/tunnel-policy` route is
 `MANAGE_AGENTS`, the reads included, as on the Overlay ACL beside it
 ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
-`fetchPolicies` (`ui/src/stores/tunnelPolicies.ts:152`) sends nothing for a caller
+`fetchPolicies` (`ui/src/stores/tunnelPolicies.ts:156`) sends nothing for a caller
 the mask refuses and sets `refused`, and a server 403 lands in the same state; the
 Tunnel ACL tab then says who manages policies, with no editor and no "New policy".
 Its predicate, `canManageTunnelPolicies` (`ui/src/utils/permissions.ts:375`), fails
