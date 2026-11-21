@@ -236,6 +236,60 @@ names that no release ever carried, and `TermsView` called a section heading a "
 the Terms" when the Terms define the word in the body and reference the heading nowhere. Both
 were free. An anchor is a *claim*, and FR-21 wrote them under time pressure across ~1 849 sites.
 
+### P1c — who reads the tunnel lane's names (inventory 2026-11-21, master `368f39902`)
+
+The rename has two halves, and the readers treat them differently:
+
+- the **asset name**, `roomler-tunnel-<v>-<triple>.<ext>` → `roomler-<v>-<triple>.<ext>`
+  (`release-tunnel.yml:178,205,260,278,400,483`);
+- the **one dir inside each tarball**, `roomler-tunnel-<v>-<triple>/` → `roomler-<v>-<triple>/`.
+  The Windows zip has no dir: `release-tunnel.yml:494` zips `$name\*`, so its entries sit at the
+  root, and they have since the lane's first commit (`35a0786bf`).
+
+| # | reader | where | what it reads | how it matches | both spellings on master? |
+|---|---|---|---|---|---|
+| 1 | CLI `artifact_for` | `agents/roomler-cli/src/update.rs:101` | platform + kind → proxy token, triple, ext | reads no name | n/a |
+| 2 | CLI `manifest_asset` | `update.rs:118` | the asset whose digest and `.asc` URL it uses | `contains(triple) && ends_with(ext)`, the first listed | **yes** |
+| 3 | CLI `tarball_dir` + `extract_tarball_binary` | `update.rs:391`, `:402`, called at `:242` | the tarball's dir, entry `<dir>/roomler` | **exact** `roomler-tunnel-<v>-<triple>/roomler` | **no: the one strict reader** |
+| 4 | CLI `extract_windows_exe` | `update.rs:440` | zip entry names | suffix `roomler.exe` or `roomler-tunnel.exe` | yes (the zip has no dir) |
+| 5 | CLI `.deb` route | `install_deb` `:531`, `deb_version_is` `:587`, `dpkg_owner` `:316` | the control `Version`, the owning package | the package, never the asset name | yes |
+| 6 | CLIs older than tunnel-v0.4.149, in the field | `c02ca67a3^:agents/roomler-cli/src/update.rs:96-101,119-123,209` | Windows only: the first `.zip` asset, then `roomler.exe` by suffix | `ends_with(".zip")` | yes; Linux and macOS had no self-update |
+| 7 | server `pick_installer_asset`, behind `installer_health` and `installer_proxy` | `crates/modules/fleet/src/tunnel_release.rs:234`, `:78`, `:109` | the asset name | `contains(triple) && ends_with(ext)`, `.sha256` skipped, the first listed; the same rule since `35a0786bf` | **yes** |
+| 8 | server `latest_release`, `pick_release` | `tunnel_release.rs:66`, `:204` | the tag | `tunnel-v` prefix | P1c keeps the tag |
+| 9 | server `installer_proxy` header | `tunnel_release.rs:148-155` | — | passes the asset name on as `Content-Disposition` | passes either through |
+| 10 | setup wizard, tunnel card | `agents/roomler-setup/src/orchestrator_tunnel.rs:149-188`; `asset_resolver::plain_name` `crates/roomler-setup-core/src/asset_resolver.rs:343`; `extract_archive` `extract.rs:43`; `find_tunnel_binary` `extract.rs:260` | the health `filename` as the staged name, the archive layout | any plain name, by extension; the binary flat or in any one subdir | yes |
+| 11 | wizard publisher check (Windows) | `agents/roomler-setup/src/package_step.rs:741-757` | the extracted files | `find_tunnel_binary` | yes |
+| 12 | `scripts/install.sh` | `install_tunnel_linux` `:1274`, `install_tunnel_macos` `:1324`, `install_tunnel_tarball` `:1353` | proxy tokens; saves `roomler-cli.deb` / `.tar.gz`; `find -maxdepth 2 -name roomler` | reads no name | yes |
+| 13 | `scripts/install.ps1` | `Install-TunnelClient` `:414-440` | the health `filename` as the local name; `Get-ChildItem -Recurse -Filter roomler.exe` | any name | yes |
+| 14 | UI | `ui/src` | — | no tunnel download names a file | n/a |
+| 15 | GitHub release page | `release-tunnel.yml:561-576` | — | names no file | n/a |
+| 16 | a person following the docs | `docs/tunnel-install.md:148`, `:191`, `:201` | the dir after `Expand-Archive` / `tar -x` | `roomler-tunnel-*-<triple>/roomler` | **no: step 2 rewrites them** |
+
+What the inventory shows:
+
+1. **One reader is strict, and it reads the dir, not the asset name.** Every asset-name reader
+   (#2, #6, #7, #10, #12, #13) matches by triple and extension or by token, in this tree, on
+   every server version since the lane began, and in every CLI in the field. Renaming the asset
+   alone strands nobody. The dir (#3) is the half step 2 has to wait for.
+2. **The population step 2 can strand is narrower than "every tunnel-only host":** a CLI from
+   tunnel-v0.4.149 up to step 1's floor that installs the TARBALL, which is macOS, and Linux
+   where no package owns the binary. Windows (the zip, #4), Linux on dpkg (the `.deb`, #5) and
+   CLIs older than 0.4.149 (#6) never read the dir. The gate as written, every tunnel-only host
+   on `tunnel_clients.client_version` by `last_seen_at`, is a superset of that population, so it
+   is safe; narrowing it is the operator's call.
+3. **The asset-name pick is not a security boundary, and it must stay one rule on both ends.**
+   The CLI takes the digest and the `.asc` URL from its own pick (#2) while the bytes come from
+   the proxy's (#7), so a spelling preference on one side only would split them on a manifest that
+   carried both spellings. A server can stream any bytes it likes; the pinned key and the dir
+   inside the signed bytes decide what installs.
+4. **`docs/tunnel-install.md:148` names a dir that never existed.** It tells a Windows person to
+   put `…\roomler-cli\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc` on PATH, but the zip has
+   been flat since `35a0786bf`, so `Expand-Archive` puts `roomler.exe` straight into `…\roomler-cli`.
+   Its `RETIRED-NAME-ANCHOR(4)` reason ("the ARCHIVE directory keeps the roomler-tunnel prefix by
+   contract") is the seventh anchor reason found false. It is wrong today, whatever step 2 does.
+
+⚠️ Status: the inventory is written; **step 1 itself is not built yet** (2026-11-21).
+
 ## Acceptance criteria
 
 - [~] `name-audit.sh` reports **`anchors = 0`** — the counter is the LIVE class — and CI blocks on it.
