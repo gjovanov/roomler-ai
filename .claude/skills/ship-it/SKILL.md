@@ -302,7 +302,7 @@ the listing to 85.5 GB against a 5 GB limit (2026-11-11).
 
 ⚠️ **`scripts/install.sh` ships on two trains (FR-129 B1).** The server compiles
 it in and serves it as `/api/setup/install.sh`
-(`crates/modules/fleet/src/setup_release.rs:357`), so the **terminal's** copy
+(`crates/modules/fleet/src/setup_release.rs:366`), so the **terminal's** copy
 changes with a **promote**. The wizard compiles in its own for the Linux and macOS
 daemon installs (`agents/roomler-setup/src/unix_daemon.rs:78`), so the **GUI's**
 copy changes with an **agent release** (its `setup-v<V>` twin). A fix reaches each
