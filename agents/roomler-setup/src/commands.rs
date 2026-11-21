@@ -1241,6 +1241,7 @@ mod tests {
 
         let mac = crate::reinstall_guard::OneRowMac {
             name: "Studio Mac".into(),
+            migrated: false,
         };
         let d = detect_unix(HostOs::Macos, server, said, false, Some(&mac), &Ok(()));
         assert!(d.one_row_stop.is_some());
