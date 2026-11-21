@@ -305,7 +305,7 @@ describe('OverlayAclSection — the org changes while the tab is open (#4248)', 
     expect(shownMode(w)).toBe('off')
 
     const since = asked().length
-    await w.setProps({ tenantId: ORG_B })
+    await w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
     await settle()
 
     const after = asked().slice(since)
@@ -330,7 +330,7 @@ describe('OverlayAclSection — the org changes while the tab is open (#4248)', 
   it("offers only org B's nodes, roles and people in the editor, its nodes by device name", async () => {
     const w = mountSection(ORG_A)
     await settle()
-    await w.setProps({ tenantId: ORG_B })
+    await w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
     await settle()
     await openEditor(0)
     const node = `Node: ${B.node} (Org B box — ${B.ip})`
@@ -347,7 +347,7 @@ describe('OverlayAclSection — the org changes while the tab is open (#4248)', 
     await openEditor(0)
     expect(w.findAllComponents(components.VDialog).map((d) => d.props('modelValue'))).toContain(true)
 
-    await w.setProps({ tenantId: ORG_B })
+    await w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
     await settle()
     expect(w.findAllComponents(components.VDialog).map((d) => d.props('modelValue'))).not.toContain(
       true,
@@ -362,7 +362,7 @@ describe('OverlayAclSection — the org changes while the tab is open (#4248)', 
     await settle()
     expect(late.taken).toBe(true)
 
-    await w.setProps({ tenantId: ORG_B })
+    await w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
     await settle()
     late.release()
     await settle()
@@ -385,7 +385,7 @@ describe('OverlayAclSection — the org changes while the tab is open (#4248)', 
     await settle()
     expect(late.map((h) => h.taken)).toEqual([true, true, true, true, true])
 
-    await w.setProps({ tenantId: ORG_B })
+    await w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
     await settle()
     for (const h of late) h.release()
     await settle()
