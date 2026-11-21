@@ -182,7 +182,7 @@ The child's first statements, before it reads its verb's arguments or any file:
 So the child can do in the home what the person's account can do as its owner, and nothing through another group.
 
 Not through `sudo -u`, the form the worker's start (`macos_supervisor.rs:1346-1385`) and the package's `as_person`
-(`agents/roomlerd/packaging/macos/postinstall:237-239`) use: an enrollment's token and WireGuard key cross these
+(`agents/roomlerd/packaging/macos/postinstall:262-264`) use: an enrollment's token and WireGuard key cross these
 pipes, `sudo` records a command's input and output where it is set to, and it can pass the caller's `HOME` on.
 
 ### Which homes are people
@@ -210,11 +210,11 @@ with "nothing has changed" (exit 1).
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
-hold (the package's `sudo_line_fits`, `postinstall:260-266`, and its owner test, `:301`):
+hold (the package's `sudo_line_fits`, `postinstall:285-291`, and its owner test, `:326`):
 
 1. The home is the console person's (`console_uid()`, `one_row.rs:3568`).
 2. That person is an administrator: `/usr/sbin/dseditgroup -o checkmember -m <name> admin` exits 0
-   (`postinstall:261`), a question to the account database.
+   (`postinstall:286`), a question to the account database.
 3. The child reports that the home is an absolute path to a folder, not a link, and that `<H>/Library` is a folder
    of the person's, not a link.
 4. The child reports that the target is a folder (R1) or a regular file (R3) of uid 0, not a link.
@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3036`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3155`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:962`) and `folder_words` (`:1095`), with `r5_words` (`:1141`); `refusals` (`:1483`) says them.
 
 ### Root's records
@@ -271,7 +271,7 @@ under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was 
   `--revert`: each uid's folder, then `root.json`, then root's kept copy last, so a stop part-way leaves what the
   next `--revert` needs.
 - The records hold tokens and WireGuard keys, the same class as root's own file beside them. The uninstall's
-  `remove_paths /etc/roomler` (`scripts/install.sh:2074`) takes them along (D4).
+  `remove_paths /etc/roomler` (`scripts/install.sh:2087`) takes them along (D4).
 
 ### Root and the person's child
 
@@ -296,7 +296,7 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   plus one byte: a FIFO, a device or a huge file is an error, not a wait. Its writes are a temporary file in the same
   folder, `fsync`, `rename`, as `config::save` does. `put-back` makes the plist with its recorded mode less group
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
-  group or others can write, and the package sets 644 (`postinstall:335-336`). It writes the config with its
+  group or others can write, and the package sets 644 (`postinstall:360-361`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
   (`crates/agent-core/src/config.rs:4029-4045`): the same rules, no path, unknown keys noted from the text
@@ -435,7 +435,7 @@ Root copies back only its own kept copy, so a revert of an older Mac writes noth
 | Where its bytes are kept | `/etc/roomler/one-row/<uid>/com.roomler.agent.plist`, root's, 600, written by root from the child's `read`. It no longer moves into the person's folder, and root writes it with `write_root` (`one_row.rs:3455`) |
 | Who puts it back | the person's child, in `put-back`: a temporary file in `<L>`, `fsync`, `rename`, the mode as above. It makes `<L>` 0755 as the person when missing, and refuses (exit 4) where `<L>` is not writable |
 | What `launchctl bootstrap` loads | the file at `<P>`, which launchd opens by path in every form, the person's own login included. No process of ours running as root opens it: `<P>` is only an argument, built by one function, `bootstrap_argv`. Who sends it is D6 |
-| Precedent | the package's login-item file writes are the person's (`as_person`, `postinstall:237-239`, `:366`); its bootstrap is root's, by path (`replace_launchd_service`, `postinstall:145-163`, called at `:401` and `:486`) |
+| Precedent | the package's login-item file writes are the person's (`as_person`, `postinstall:262-264`, `:391`); its bootstrap is root's, by path (`replace_launchd_service`, `postinstall:145-163`, called at `:445` and `:530`) |
 
 Not chosen: leaving the plist in place and running `launchctl disable gui/<uid>/com.roomler.agent`. That keeps no
 file in the home, but every later `bootstrap` of that label (the package's, a two-row reinstall) fails while the job
@@ -478,11 +478,11 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
 | `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:100-104`, held by `flock`, `unix_acquire`, `:217-249`), so the second daemon is not refused as a second instance | write |
 | `agents/roomlerd/src/service.rs:2800-2832` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2830-2832`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
-| `scripts/install.sh:2036-2057` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1603-1611`) | remove |
-| `scripts/install.sh:2070-2077` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1651`) as root | remove |
-| `scripts/install.sh:1102` | `as_root grep` of the console person's `config.toml` | read |
-| `postinstall:145-163`, `:401`, `:486` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
-| `postinstall:262-265`, `:301` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
+| `scripts/install.sh:2049-2070` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1616-1624`) | remove |
+| `scripts/install.sh:2083-2090` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1664`) as root | remove |
+| `scripts/install.sh:1115` | `as_root grep` of the console person's `config.toml` | read |
+| `postinstall:145-163`, `:445`, `:530` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
+| `postinstall:287-290`, `:326` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:1196-1203` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
 | `agents/roomlerd/src/files.rs:5279-5289` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
@@ -569,12 +569,12 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2780`, its sequence at `:2808`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2899`, its sequence at `:2927`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:3036`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:3155`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:3093-3184`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:3212-3303`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:3-53` (the step table) and `one_row_home.rs:3-60`.
 - `docs/README.md`: the `installation.md` row names the rule.
@@ -620,7 +620,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - **D3. A folder whose owner has no account.** Recommended: left alone, and said; the child has no home to find.
   Fallback: migrate it as root, which breaks the rule.
 - **D4. Where root's records live.** Recommended: `/etc/roomler/one-row/`, beside root's kept copy; the uninstall
-  removes it with `/etc/roomler` (`scripts/install.sh:2074`). Fallback: `/var/db/roomler/one-row/`, which would keep
+  removes it with `/etc/roomler` (`scripts/install.sh:2087`). Fallback: `/var/db/roomler/one-row/`, which would keep
   tokens after an uninstall.
 - **D5. A revert with one failing person.** Recommended: go on, restart, exit 1, and resume on the next run.
   Fallback: stop at the first failure, as today.
@@ -647,7 +647,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for
   the daemons systemd starts; a root command typed through a `sudo` that keeps the caller's `HOME` is #3866's (the
   source gate's Linux rows). The uninstall's Linux arm
-  (`scripts/install.sh:1969-1978`) removes people's folders as root the same way, and is not in this FR.
+  (`scripts/install.sh:1982-1991`) removes people's folders as root the same way, and is not in this FR.
 
 ## Field log
 

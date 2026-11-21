@@ -340,7 +340,8 @@ next depends on it.
     `tarball installed`, `SucceededVerified`), and systemd restarted it onto the release.
   - The helper logged nothing that boot, and both of its units read `disabled`.
 - [x] **AC5**: `/etc/roomler/disable-auto-update` stops the helper, and removing it resumes updates (a round
-  trip, like `installer-smoke.yml`'s macOS one at `:1203-1252`). Field-verified on `wlab-kde` (§8).
+  trip, like `installer-smoke.yml`'s macOS one: its opt-out half at `:2703-2783`, its opt-in half at
+  `:2839-2861`). Field-verified on `wlab-kde` (§8).
   - STOP: the journal line `auto-update opted out — exiting`, on 2026-10-13. On 2026-10-14 it showed again for a
     wake from a non-root `roomlerd self-update`.
   - RESUME, on 2026-10-14 in the P3 run: with the marker removed, the next wake (a real push) installed 0.4.135.
