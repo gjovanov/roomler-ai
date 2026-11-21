@@ -230,7 +230,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2888`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:2930`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:962`) and `folder_words` (`:1095`), with `r5_words` (`:1141`); `refusals` (`:1483`) says them.
 
 ### Root's records
@@ -266,7 +266,7 @@ under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was 
   `--revert`: each uid's folder, then `root.json`, then root's kept copy last, so a stop part-way leaves what the
   next `--revert` needs.
 - The records hold tokens and WireGuard keys, the same class as root's own file beside them. The uninstall's
-  `remove_paths /etc/roomler` (`scripts/install.sh:1992`) takes them along (D4).
+  `remove_paths /etc/roomler` (`scripts/install.sh:2074`) takes them along (D4).
 
 ### Root and the person's child
 
@@ -466,9 +466,9 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
 | `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:100-104`, held by `flock`, `unix_acquire`, `:217-249`), so the second daemon is not refused as a second instance | write |
 | `agents/roomlerd/src/service.rs:2800-2832` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2830-2832`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
-| `scripts/install.sh:1954-1975` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1521-1529`) | remove |
-| `scripts/install.sh:1988-1995` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1569`) as root | remove |
-| `scripts/install.sh:1083` | `as_root grep` of the console person's `config.toml` | read |
+| `scripts/install.sh:2036-2057` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1603-1611`) | remove |
+| `scripts/install.sh:2070-2077` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1651`) as root | remove |
+| `scripts/install.sh:1102` | `as_root grep` of the console person's `config.toml` | read |
 | `postinstall:145-163`, `:401`, `:486` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:262-265`, `:301` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:1192-1199` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
@@ -556,7 +556,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2633`, its sequence at `:2661`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2674`, its sequence at `:2702`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:2713`): one-row's row, and
@@ -607,7 +607,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - **D3. A folder whose owner has no account.** Recommended: left alone, and said; the child has no home to find.
   Fallback: migrate it as root, which breaks the rule.
 - **D4. Where root's records live.** Recommended: `/etc/roomler/one-row/`, beside root's kept copy; the uninstall
-  removes it with `/etc/roomler` (`scripts/install.sh:1992`). Fallback: `/var/db/roomler/one-row/`, which would keep
+  removes it with `/etc/roomler` (`scripts/install.sh:2074`). Fallback: `/var/db/roomler/one-row/`, which would keep
   tokens after an uninstall.
 - **D5. A revert with one failing person.** Recommended: go on, restart, exit 1, and resume on the next run.
   Fallback: stop at the first failure, as today.
@@ -634,7 +634,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for
   the daemons systemd starts; a root command typed through a `sudo` that keeps the caller's `HOME` is #3866's (the
   source gate's Linux rows). The uninstall's Linux arm
-  (`scripts/install.sh:1887-1896`) removes people's folders as root the same way, and is not in this FR.
+  (`scripts/install.sh:1969-1978`) removes people's folders as root the same way, and is not in this FR.
 
 ## Field log
 

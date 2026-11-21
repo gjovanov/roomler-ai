@@ -308,6 +308,9 @@ for t in curl sudo systemctl installer launchctl uname hostname stat mktemp slee
     ln -sf "$S/standin" "$BIN/$t"
 done
 for t in dpkg apt-get; do ln -sf "$S/standin" "$DPKG/$t"; done
+# FR-141 P2 — `install`, which places a one-row Mac's root config: recorded and
+# never run, so the record holds the mode and the owner it places it with.
+ln -sf "$S/standin" "$BIN/install"
 # The daemon where the script runs it: the .deb's path, and the macOS bundle's.
 ln -sf "$S/standin" /usr/bin/roomlerd
 mkdir -p /Library/Roomler/roomlerd.app/Contents/MacOS
@@ -319,6 +322,9 @@ PID=..$S/running
 # What a privileged half takes with --config-from: the config its caller
 # enrolled in its own process (the stand-in daemon never reads it).
 printf 'agent_id = "check-agent"\n' >"$S/enrolled.toml"
+# FR-141 P2 — the same enrollment as HAS_CONFIG's earlier install: a Retry of
+# the wizard's one-row half finds its own config in place.
+printf 'agent_id = "check-earlier"\n' >"$S/earlier.toml"
 
 # The feed: compact JSON as the server writes it, newest release first. Every
 # asset is the same small file, so the digest checks out, and an asset's URL
@@ -452,9 +458,10 @@ lines() {
     got=$(grep -cF -- "$1" "$C/out.txt" || true)
     [ "$got" = "$2" ] || WHY="$WHY"$'\n'"    $got line(s) carry '$1', want $2"
 }
+# WANT_RC=<n> before done_case is the exit code the case wants (0 otherwise).
 done_case() {
     rc=$(cat "$C/rc")
-    [ "$rc" = 0 ] || WHY="$WHY"$'\n'"    exit code $rc, want 0"
+    [ "$rc" = "${WANT_RC:-0}" ] || WHY="$WHY"$'\n'"    exit code $rc, want ${WANT_RC:-0}"
     # Text, newline and tab only, on stdout and stderr alike: an ESC or any
     # other control byte there is what the alphabet is for. Bytes from 0x80
     # up stay allowed, as the script's own UTF-8 text.
@@ -750,6 +757,25 @@ for SH in $SHELLS; do
     AS_ROOT=1 HAS_CONFIG=1 READS='dpkg [-i]' \
         run deb-privileged/reads-stdin-dpkg Linux x86_64 1 normal "$new" 0 "${priv[@]}"
     says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    # FR-141 P2 — the setup wizard's one-row half, run as root: the root config
+    # the wizard enrolled placed before the one package run, no user half, and
+    # the package's install reading its stdin. A Retry finds its own config in
+    # place and keeps it. A root config that is another row's stops the half
+    # before any change, and names the person's command.
+    wiz=(--role daemon --privileged-steps --one-row --config-from "$S/enrolled.toml")
+    placed="==> placing the root config the wizard enrolled at /etc/roomler/config.toml (root-owned, 0600): this Mac's one row"
+    nouser="==> privileged steps done — a one-row Mac has no user half: its root service starts the screen worker"
+    AS_ROOT=1 run pkg-wizard-one-row/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$placed"; want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 READS='installer [-pkg]' run pkg-wizard-one-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$placed"; want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 run pkg-wizard-one-row-retry/normal Darwin arm64 0 normal "$new" 0 \
+        --role daemon --privileged-steps --one-row --config-from "$S/earlier.toml"
+    says agent-v0.4.221 0.4.221 0; lines "$placed" 0
+    want "==> the root config an earlier attempt placed is this one (/etc/roomler/config.toml): it stays"
+    want "$nouser"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 run pkg-wizard-one-row-own-row/normal Darwin arm64 0 normal "$new" 0 "${wiz[@]}"
+    lines "sudo roomlerd one-row" 1; lines "$placed" 0; lines "==> done." 0; WANT_RC=1 done_case
     # #3925 — a Mac given its root half as a second row (--daemon-token): that
     # half's enrollment, through sudo, reads its stdin.
     two=(--role daemon --token check-token --daemon-token check-token-2)

@@ -75,6 +75,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P3b | A secondary org's session is delegated, each worker reply goes to the org that asked, and the person's floor crosses to the daemon. | the same switch |
 | P3c | `sudo roomlerd one-row` migrates a two-row Mac; a person deletes the retired row through the ordinary route. | `--revert`, until that delete. Since FR-147 P1 ([FR-147](FR-147-root-out-of-homes-macos.md), #3834) root changes nothing in a home: each person's files change through that person's own process, and root keeps its records in `/etc/roomler/one-row/` |
 | P3d | `--one-row` at install: one token, one row. | `--daemon-token` keeps working (the two-row install stays reachable) |
+| P3e | The wizard's one-row form: on a Mac that is not enrolled yet, the recommended option pairs one half (`halves: 1`) or takes one pasted token, the root half enrolls as the Mac's one row with both switches, and no `--user-steps` kickstart runs. Built as [FR-141](FR-141-one-run-one-row.md) P2 (#4152). The wizard's switch flips first, the script's default after the same field read (FR-141 D2) | `wizard_macos_one_row` in `/api/setup/features`, default off: off = B2's two rows |
 
 ## P2 design — session delegation over LocalAPI
 
@@ -632,20 +633,20 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 ### P3d — one token at install
 
-`roomlerd enroll --one-row` writes both keys beside the enrollment, and `install.sh --role daemon --token <one> --one-row` enrolls the root half alone: the marker, the package, the enrollment with the overlay on, the LaunchAgent removed, the daemon kickstarted (`scripts/install.sh:886`, `:979`). `--pair` takes the same flag. The two-row commands stay as they are (`--daemon-token`, `scripts/install.sh:278`), so a person without admin rights keeps the per-user half alone, which is a one-row Mac with no mesh. The wizard's `halves: 2` (`docs/device-pairing.md:153`) and the dashboard's commands follow only when the default flips.
+`roomlerd enroll --one-row` writes both keys beside the enrollment, and `install.sh --role daemon --token <one> --one-row` enrolls the root half alone: the marker, the package, the enrollment with the overlay on, the LaunchAgent removed, the daemon kickstarted (`scripts/install.sh:905`, `:998`). `--pair` takes the same flag. The two-row commands stay as they are (`--daemon-token`, `scripts/install.sh:280`), so a person without admin rights keeps the per-user half alone, which is a one-row Mac with no mesh. The wizard's `halves: 2` (`docs/device-pairing.md:153`) and the dashboard's commands follow only when the default flips.
 
 **Built: `roomlerd enroll --one-row`** (`agents/roomlerd/src/app.rs:146`). It is refused off macOS and without root, beside the token check and so before the token is spent (`agents/roomlerd/src/app.rs:1759`, `:8804`). It sets both switches before the save, as `--overlay` does, so the daemon's first start is one row (`agents/roomlerd/src/app.rs:2969`, `:8833`). On a Mac the package has just installed, its LaunchAgent still has to go: running the package again removes it, because P2d's guard reads the switch. `install.sh --one-row` does that in the same command (below). The tests (`agents/roomlerd/src/app.rs:8839`) cover the flag, both refusals and the two keys it writes.
 
-**Built: `install.sh --one-row`** (`scripts/install.sh:227`, `:1008`). One token or one `--pair` approval, on a Mac that is not enrolled yet. The order differs from the design above in two places, both for the same reason: what removes the LaunchAgent is the package's own guard.
+**Built: `install.sh --one-row`** (`scripts/install.sh:229`, `:1027`). One token or one `--pair` approval, on a Mac that is not enrolled yet. The order differs from the design above in two places, both for the same reason: what removes the LaunchAgent is the package's own guard.
 
 | Step | What it does | Why there |
 |---|---|---|
 | The package | As a per-user install runs it: the LaunchAgent comes up as it always has | The binary has to exist before anything can ask it |
-| The check | The installed binary's `enroll --help` must list `--one-row` (`scripts/install.sh:1047`) | A release from before P3d stops here with the package installed, nothing enrolled, no marker and the token not spent |
-| The marker and the enrollment | The root half, enrolled with the overlay on and both switches (`scripts/install.sh:1069`) | The marker waits for the check, so a stop above requests no root half |
-| The package again | Its guard reads the switch from the root half's config, removes the LaunchAgent and its plist, and starts the root half (`scripts/install.sh:1075`) | The guard decides as it does at every update after, so the installer and the daemon cannot disagree about who owns the worker. Nothing kickstarts the daemon: the package starts it after the guard |
+| The check | The installed binary's `enroll --help` must list `--one-row` (`scripts/install.sh:1066`) | A release from before P3d stops here with the package installed, nothing enrolled, no marker and the token not spent |
+| The marker and the enrollment | The root half, enrolled with the overlay on and both switches (`scripts/install.sh:1088`) | The marker waits for the check, so a stop above requests no root half |
+| The package again | Its guard reads the switch from the root half's config, removes the LaunchAgent and its plist, and starts the root half (`scripts/install.sh:1094`) | The guard decides as it does at every update after, so the installer and the daemon cannot disagree about who owns the worker. Nothing kickstarts the daemon: the package starts it after the guard |
 
-A Mac whose root half is a row of its own stops before any change and is pointed to `sudo roomlerd one-row`, since enrolling over it would leave both rows; one that is one row already, both keys read the way the guard reads them, only updates its package and needs no token (`scripts/install.sh:1015`). It is refused, with a message that names the flag, off macOS, on the tunnel role, beside `--daemon-token`, with the halves the wizard runs, and with `--no-enroll` (`scripts/install.sh:287`). A person's enrollment left from an earlier install is ignored by the one row and nothing runs it any more, so the script says its row stays offline (`scripts/install.sh:1082`). On a one-row Mac the grant notice restarts the root half rather than a LaunchAgent that is gone (`scripts/install.sh:1114`). The wizard has no one-row control: FR-129's next phase decides. A unit test pins the check and the arguments against the binary's own help (`agents/roomlerd/src/app.rs:8893`), so a rename on either side fails CI rather than every one-row install.
+A Mac whose root half is a row of its own stops before any change and is pointed to `sudo roomlerd one-row`, since enrolling over it would leave both rows; one that is one row already, both keys read the way the guard reads them, only updates its package and needs no token (`scripts/install.sh:1034`). It is refused, with a message that names the flag, off macOS, on the tunnel role, beside `--daemon-token`, with the halves the wizard runs, and with `--no-enroll` (`scripts/install.sh:289`). A person's enrollment left from an earlier install is ignored by the one row and nothing runs it any more, so the script says its row stays offline (`scripts/install.sh:1101`). On a one-row Mac the grant notice restarts the root half rather than a LaunchAgent that is gone (`scripts/install.sh:1196`). The wizard has no one-row control: FR-129's next phase decides. A unit test pins the check and the arguments against the binary's own help (`agents/roomlerd/src/app.rs:8985`), so a rename on either side fails CI rather than every one-row install.
 
 Before it shipped, the macOS path ran under `dash` with stand-ins for `installer`, `launchctl`, `sudo` and `roomlerd`; the stand-in `installer` reads the guard's two conditions as the postinstall does. Of 18 cases, the script before the change passed 2: the two-row install, which is the control, and one refusal its unknown-flag error happened to satisfy. The change passed all 18. That proves the order, the refusals and the messages, not macOS. AC1's install half is the field read, done on released 0.4.201 with the script the server serves: a fresh tart Mac, one token, one row on its first start ([field log](#2026-11-05--p3d-on-released-04201-one-token-one-row)).
 
@@ -669,6 +670,7 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 | P3b | Secondary orgs, the routing, the floor | AC15, AC16 |
 | P3c | The command | AC5, AC12, AC17 |
 | P3d | `--one-row` | AC1 |
+| P3e ([FR-141](FR-141-one-run-one-row.md) P2, #4152) | The wizard's one-row form | P3e's criterion |
 
 Each is default-off, so none waits for the FR-63 read. All the field proof runs on throwaway tart Macs, one at a time, and a Mac's `roomler ssh` half of AC1 shares AC3's wait on the vmtest org's switch.
 
@@ -852,6 +854,9 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       *(2026-11-05, released 0.4.200, tart Mac. RED: before the switch-on, no line on the daemon's
       row came from the worker, and on the Mac's two-row layout that day none of its 510 did. GREEN: from the switch-on at 02:40:57Z, 159 lines marked
       `gui-worker` on the row, the first at the switch-on.)*
+- [ ] P3e: a fresh Mac set up through the wizard's recommended option, with the server's
+      `wizard_macos_one_row` on, is one row ([FR-141](FR-141-one-run-one-row.md) AC1 by pairing,
+      AC2 by a pasted token).
 
 ## Dead hypotheses — do not re-run these
 

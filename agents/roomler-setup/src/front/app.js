@@ -75,9 +75,12 @@ const ROLE_COPY = {
   macos: {
     // FR-129 B2: the per-user half, and — with "Join the overlay network"
     // ticked, the default — the root half beside it, a second device.
+    // FR-141 P2: where the server's one-row form is open on this Mac, the
+    // ticked box makes ONE device instead (descOneRow).
     "daemon-user": {
       title: "Be accessed — this Mac (recommended)",
       desc: "Screen sharing and remote control in your session, and the private network in a root service beside it, so this Mac joins as two devices. Asks for your password once. Untick “Join the overlay network” under Advanced options for screen sharing only.",
+      descOneRow: "Screen sharing, remote control and the private network, all on one device: a root service runs them and shares the screen of your session. Asks for your password once. Untick “Join the overlay network” under Advanced options for screen sharing only.",
       label: "This Mac",
     },
   },
@@ -159,6 +162,8 @@ const state = {
     approverName: null,     // the approver's display name (free text) …
     approverUsername: null, // … and their username (unique); null if older
     rootHalf: false,   // FR-129 B2: started for a Mac's two halves
+    oneRow: false,     // FR-141 P2: the start made this Mac ONE device
+                       // (PairStartView.oneRow, Rust's read, not a guess)
     error: null,       // a start that failed (network, refusal)
     hint: null,        // a poll that failed, shown under the countdown
                        // until the next poll answers
@@ -292,8 +297,18 @@ function applyDetectedFeatures() {
       server: a.featuresServer,
       daemonOffered: a.daemonOffered === true,
       answered: a.featuresAnswered !== false,
+      // FR-141 P2: the one-row form on this Mac for that server, and the
+      // note that names this Mac's own road when it is closed (Rust reads
+      // both; an older backend sends neither, which is closed and silent).
+      oneRowOpen: a.oneRowOpen === true,
+      oneRowNote: noteOf(a.oneRowNote),
     };
   }
+}
+
+// FR-141 P2 — a note Rust sent, or null: anything but a non-empty string is none.
+function noteOf(said) {
+  return typeof said === "string" && said !== "" ? said : null;
 }
 
 // FR-129 C — "could not ask" is not "switched off". A clean Linux or macOS
@@ -502,6 +517,29 @@ function wantsRootHalf() {
     && overlayChecked(state.role, state.overlayChoice) === true;
 }
 
+// FR-141 P2 — is the one-row form open on this Mac, for the Server page's
+// server? Rust read it: the server's switch, this Mac enrolled nowhere, and a
+// release that can make one device (`one_row_form::decide`).
+function oneRowOpen() {
+  const f = state.features;
+  return state.os === "macos" && !!f && f.server === state.server && f.oneRowOpen === true;
+}
+
+// FR-141 P2 — does this install make the Mac ONE device? The daemon card with
+// the box ticked, where the form is open. Mirrors `role::layout`, which
+// cmd_pair_start and cmd_install read again before anything is spent.
+function oneRowForm() {
+  return wantsRootHalf() && oneRowOpen();
+}
+
+// FR-141 P2 — why the form is closed on this Mac, for the Server page's
+// server (an enrolled Mac's own road, or a release too old), or null.
+function oneRowClosedNote() {
+  const f = state.features;
+  if (state.os !== "macos" || !f || f.server !== state.server || f.oneRowOpen === true) return null;
+  return noteOf(f.oneRowNote);
+}
+
 // FR-129 B2 — the root half's device name, as `role::root_half_name` makes it.
 function rootHalfName(device) {
   return `${device}-daemon`;
@@ -521,6 +559,10 @@ function overlayHint(os, role) {
   }
   if (os === "linux" && role === "daemon-user") {
     return "A per-user daemon joins the private network through a userspace stack (a SOCKS5 front on 127.0.0.1); the system service uses a TUN interface instead.";
+  }
+  if (os === "macos" && oneRowOpen()) {
+    // FR-141 P2: one device, the one-row form.
+    return "On this Mac one root service runs the private network beside the screen sharing, so with this ticked the Mac joins as one device. Untick it to install screen sharing only.";
   }
   if (os === "macos") {
     return "On a Mac the private network runs in a second, root service beside yours (it owns the mesh's interface), so with this ticked the Mac joins as two devices — one for the screen, one for the private network — and counts as two on the plan. Untick it to install screen sharing only.";
@@ -629,15 +671,24 @@ function renderWelcome() {
   oneRowNote.hidden = oneRowStop === null;
   oneRowNote.textContent = oneRowStop ?? "";
   const copy = ROLE_COPY[state.os] ?? ROLE_COPY.windows;
+  // FR-141 P2 — the Mac card says what its default (the box ticked) makes:
+  // one device where the one-row form is open; where it is closed for this
+  // Mac, the note under the card names its own road (Rust's words).
+  const oneRow = oneRowOpen();
   document.querySelectorAll("label.role-daemon").forEach((card) => {
     const role = card.dataset.role;
     card.hidden = !offered.has(role);
     const c = copy[role] ?? ROLE_COPY.windows[role];
     if (c) {
       document.getElementById(`role-title-${role}`).textContent = c.title;
-      document.getElementById(`role-desc-${role}`).textContent = c.desc;
+      document.getElementById(`role-desc-${role}`).textContent =
+        oneRow && c.descOneRow ? c.descOneRow : c.desc;
     }
   });
+  const closedNote = oneRowStop === null ? oneRowClosedNote() : null;
+  const formNote = document.getElementById("role-note-daemon-user");
+  formNote.hidden = closedNote === null;
+  formNote.textContent = closedNote ?? "";
   const note = document.getElementById("platform-note");
   note.hidden = a.supported;
   if (!a.supported) {
@@ -871,7 +922,14 @@ async function refreshFeatures() {
     view = { daemonOffered: false, answered: false };
   }
   if (server !== state.server) return;
-  state.features = { server, daemonOffered: view.daemonOffered === true, answered: view.answered !== false };
+  state.features = {
+    server,
+    daemonOffered: view.daemonOffered === true,
+    answered: view.answered !== false,
+    // FR-141 P2: the one-row form on this Mac, for this server.
+    oneRowOpen: view.oneRowOpen === true,
+    oneRowNote: noteOf(view.oneRowNote),
+  };
   renderServer();
 }
 
@@ -1060,7 +1118,9 @@ function renderToken() {
 
   // The paste path's role-specific hint (the whole page's lead before
   // FR-129; now the line under "I already have a token").
-  const rootHalf = wantsRootHalf();
+  // FR-141 P2: a one-row Mac takes ONE token, root's (rule 3): the second
+  // field is two rows' alone.
+  const rootHalf = wantsRootHalf() && !oneRowForm();
   // FR-129 C1: the dashboard's own names (Devices → Enroll → Device or
   // Tunnel client); the daemon is never called an agent here.
   document.getElementById("paste-lead").textContent = state.role === "tunnel-client"
@@ -1220,11 +1280,13 @@ async function startPairing() {
   p.approverName = null;
   p.approverUsername = null;
   p.opened = false;
+  p.oneRow = false;
   renderToken();
 
   const gen = p.gen;
   // FR-129 B2: a Mac adding the root half asks for both halves at once —
-  // one approval, two tokens.
+  // one approval, two tokens. FR-141 P2: unless Rust finds the one-row form
+  // open, when the same box makes one device from one token (view.oneRow).
   p.rootHalf = wantsRootHalf();
   let view;
   try {
@@ -1259,6 +1321,7 @@ async function startPairing() {
     return;
   }
   p.phase = "waiting";
+  p.oneRow = view.oneRow === true;
   p.userCode = view.userCode;
   p.uri = view.verificationUri;
   p.expiresAt = Date.now() + Math.max(0, view.expiresIn) * 1000;
@@ -1296,6 +1359,7 @@ async function cancelPairing() {
   p.hint = null;
   p.opened = false;
   p.rootHalf = false;
+  p.oneRow = false;
   try {
     await invoke("cmd_pair_cancel");
   } catch (err) {
@@ -1494,12 +1558,15 @@ function renderPairing() {
     // unique, so the person can tell their admin and their org from ones
     // merely named like them. An older server sends no identifiers, and the
     // wording then falls back to the names alone.
-    // FR-129 B2: and what joins — a Mac's two devices.
+    // FR-129 B2: and what joins — a Mac's two devices. FR-141 P2: or its
+    // one, as the pairing holds it.
     document.getElementById("pair-approved-text").textContent =
       `Approved by ${pairApproverLabel(p)} to join ${pairOrgLabel(p)}.` +
-      (p.rootHalf
-        ? ` This Mac joins as two devices: “${state.device}” for the screen and “${rootHalfName(state.device)}” for the private network.`
-        : "");
+      (p.oneRow
+        ? ` This Mac joins as one device, “${state.device}”, with its private network.`
+        : p.rootHalf
+          ? ` This Mac joins as two devices: “${state.device}” for the screen and “${rootHalfName(state.device)}” for the private network.`
+          : "");
   }
 
   document.getElementById("pair-ended").hidden = p.phase !== "ended";
@@ -1605,9 +1672,16 @@ async function runInstall() {
   // FR-129: a paired install names the org it was approved into.
   const paired = state.installMode === "paired";
   const into = paired && state.pair.orgName ? ` into ${pairOrgLabel(state.pair)}` : "";
-  // FR-129 B2: and a Mac's private network, as its own device.
+  // FR-129 B2: and a Mac's private network, as its own device. FR-141 P2: or
+  // as one device with it — the pairing's layout on the paired path, else the
+  // form this page showed, which Rust holds the install to (`oneRow` below).
   const rootHalf = wantsRootHalf();
-  const beside = rootHalf ? `, and its private network as “${rootHalfName(state.device)}”` : "";
+  const oneRow = rootHalf && (paired ? state.pair.oneRow === true : oneRowForm());
+  const beside = !rootHalf
+    ? ""
+    : oneRow
+      ? ", one device with its private network"
+      : `, and its private network as “${rootHalfName(state.device)}”`;
   document.getElementById("install-summary").textContent =
     `Installing the ${what} from ${state.server} as “${state.device}”${beside}${into}.`;
   renderInstall();
@@ -1632,15 +1706,19 @@ async function runInstall() {
   //    with the one the pairing delivered (usePaired) and forgets it on
   //    success; a failure keeps it for Retry. FR-129 B2: a pasted install
   //    that adds the macOS root half sends that half's own token too.
+  //    FR-141 P2: a one-row Mac sends its one token alone, and the form this
+  //    page showed: Rust refuses, before anything is spent, an install whose
+  //    fresh read would make the Mac otherwise.
   try {
     const report = await invoke("cmd_install", {
       role: state.role,
       server: state.server,
       token: paired ? "" : state.token,
-      rootToken: !paired && rootHalf ? state.rootToken : null,
+      rootToken: !paired && rootHalf && !oneRow ? state.rootToken : null,
       deviceName: state.device,
       advanced: gatherAdvanced(),
       usePaired: paired,
+      oneRow: !paired && rootHalf ? oneRow : null,
       onEvent: channel,
     });
     console.log("[runInstall] cmd_install returned:", report);
@@ -1877,7 +1955,10 @@ function renderDone() {
   } else {
     lead = "The Roomler daemon is installed and enrolled.";
     // FR-129 B2: a Mac's private network, as the second device it is.
-    if (done.rootHalf) {
+    // FR-141 P2: or a Mac made one device, its root service enrolled alone.
+    if (done.oneRow === true) {
+      lead += " This Mac joined as one device, with its private network, run by one root service.";
+    } else if (done.rootHalf) {
       lead += ` Its private network runs in the root half beside it, enrolled as its own device, “${done.rootHalf.name}”.`;
     }
     if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
