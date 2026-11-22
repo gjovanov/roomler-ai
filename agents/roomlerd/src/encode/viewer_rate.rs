@@ -297,11 +297,11 @@ pub fn unpack_age_arrival(raw: u64) -> Option<u16> {
 /// - **viewer** = paint age − arrival age: decode queue + decode + paint,
 ///   entirely inside the browser;
 /// - **sender** = the agent's own send-queue wait for the window
-///   (`send_wait_avg_ms`: enqueue → wire-complete), when the pump has it;
+///   (`send_wait_avg_ms`: enqueue → wire-complete), when the pump hands it;
 /// - **transit** = arrival age − sender: the network, the relay, the
 ///   receiver's socket — everything between the wire and the worker.
 ///
-/// A `sender` of `None` (a pump with no send-wait figure) leaves `transit`
+/// A `sender` of `None` (a pump that hands none) leaves `transit`
 /// as the whole arrival age, an upper bound. Saturating throughout: the
 /// three averages come from the same window but not the same frames.
 #[derive(Debug, Clone, Copy, PartialEq)]

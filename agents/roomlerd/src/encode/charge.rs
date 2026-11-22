@@ -14,11 +14,11 @@
 //! B4f bounded the charged gap at the interval the pump chose for the frame.
 //! B4g: where the budget acts (`on`, a relay session), an encode is charged its
 //! gap less the time the pump's capacity gate kept frames back since the last
-//! encode ([`GateClock`]: a full send channel, congested followers, the
-//! budget's hold), never less than that interval, or the gap where it is
-//! shorter: `max(gap - gated, min(gap, interval))` ([`Gate`]). A hold is never
-//! charged, so the hold stays the restoring force; a capture slower than the
-//! pump's target, jitter and an idle stretch are charged as they come, so the
+//! encode ([`GateClock`]: a full send channel, congested followers, the budget's
+//! hold, since FR-148 a drain pause), never less than that interval, or the gap
+//! where it is shorter: `max(gap - gated, min(gap, interval))` ([`Gate`]). A hold
+//! is never charged, so the hold stays the restoring force; a capture slower than
+//! the pump's target, jitter and an idle stretch are charged as they come, so the
 //! encoder spends its target at the rate the capture runs. Where the budget does
 //! not act (`off`, `shadow`, a direct session) there is no gate, and the pts is
 //! today's, byte for byte.
@@ -108,13 +108,15 @@ fn micros(d: Duration) -> i64 {
 
 /// FR-148 D51 B4g — the time the pump's capacity gate kept frames back since
 /// the last encode, for any of its reasons (a full send channel, congested
-/// followers, the in-flight budget's hold). A span runs from the first pass
-/// the gate skipped to the pass it let through, and spans add up until the
-/// encode takes them ([`Self::take`]).
+/// followers, the in-flight budget's hold; since FR-148 a drain pause,
+/// [`Self::paused`]). A span runs from the first pass the gate skipped to the
+/// pass it let through, and spans add up until the encode takes them ([`Self::take`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GateClock {
     since: Option<Instant>,
     gated: Duration,
+    /// When the gate last let a pass through.
+    passed_at: Option<Instant>,
 }
 
 impl GateClock {
@@ -128,6 +130,17 @@ impl GateClock {
     pub fn passed(&mut self, now: Instant) {
         if let Some(since) = self.since.take() {
             self.gated += now.saturating_duration_since(since);
+        }
+        self.passed_at = Some(now);
+    }
+
+    /// FR-148 — the pass the gate let through last was held after the gate
+    /// (FR-59 P4's drain pause), its capture included: it counts as a pass
+    /// the gate skipped from the instant the gate let it through, and the
+    /// next pass the gate lets through closes the span.
+    pub fn paused(&mut self) {
+        if let Some(at) = self.passed_at {
+            self.since.get_or_insert(at);
         }
     }
 
@@ -402,5 +415,52 @@ mod tests {
         assert_eq!(c.take(), Duration::ZERO, "an open span is not taken");
         c.passed(at(45));
         assert_eq!(c.take(), Duration::from_millis(5), "it closes later");
+    }
+
+    /// FR-148 (C16) — under `on`, a drain pause is gated. FR-59 P4's pause
+    /// holds a pass after the VP9-444 pump's gate has let it through, its
+    /// capture included, so the pass counts as one the gate skipped from the
+    /// instant the gate let it through ([`GateClock::paused`]), and the pass
+    /// the gate lets through after the pause closes the span. Passes as the
+    /// pump runs them on a 30 fps capture: the gate lets a pass through 10 ms
+    /// after the last one's capture (the encode, or the pause's sleep), and the
+    /// capture waits for its frame. An encode after a 300 ms pause, with no
+    /// pass the gate skipped, is charged the interval, where today it is
+    /// charged its gap; a span opened only where the pause sleeps would gate
+    /// 90 ms of the 300. With no gate (`off`, `shadow`, a direct session) it is
+    /// charged its gap, as today.
+    #[test]
+    fn under_on_a_drain_pause_is_gated() {
+        let t0 = Instant::now();
+        let at = |us_: i64| t0 + us(us_);
+        // Pass k's frame is captured at 100 ms + k intervals.
+        let captured = |k: i64| 100_000 + k * INTERVAL;
+        for (gate, want) in [(on(0), INTERVAL), (None, 10 * INTERVAL)] {
+            let mut clock = GateClock::default();
+            clock.passed(at(captured(0) - 20_000));
+            let first = charge(None, captured(0), at(captured(0)), gate);
+            let _ = clock.take();
+            // Passes 1 to 9: the pause holds each once its frame is captured.
+            for k in 1..=9 {
+                clock.passed(at(captured(k - 1) + 10_000));
+                clock.paused();
+            }
+            // Pass 10: the pause is over, and its frame is encoded.
+            clock.passed(at(captured(9) + 10_000));
+            let gated = clock.take();
+            let after = charge(
+                Some(first),
+                captured(10),
+                at(captured(10)),
+                gate.map(|g| Gate { gated, ..g }),
+            );
+            assert_eq!(
+                after.pts - first.pts,
+                want,
+                "{gate:?}: a gap of {} µs after the pause",
+                after.today - first.today
+            );
+            assert_eq!(gated, us(9 * INTERVAL), "the pause, from its first pass");
+        }
     }
 }
