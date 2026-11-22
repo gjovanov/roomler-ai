@@ -140,14 +140,47 @@ pub(crate) mod seams {
         }
     }
 
-    /// #4082 — one held placement's gate: shut until the test opens it.
-    struct PlacingGate {
+    /// #4082 — one held step's gate: shut until the test opens it.
+    struct StepGate {
         open: tokio::sync::watch::Sender<bool>,
         reached: std::sync::atomic::AtomicUsize,
     }
 
+    impl StepGate {
+        fn shut() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                open: tokio::sync::watch::Sender::new(false),
+                reached: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn reached(&self) -> usize {
+            self.reached.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn reached_within(&self, wait: std::time::Duration) -> bool {
+            let until = std::time::Instant::now() + wait;
+            while self.reached() == 0 && std::time::Instant::now() < until {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            self.reached() > 0
+        }
+
+        /// A step reached the gate: it waits there until the gate opens.
+        async fn pass(&self) {
+            self.reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut open = self.open.subscribe();
+            let _ = open.wait_for(|open| *open).await;
+        }
+
+        fn open(&self) {
+            self.open.send_replace(true);
+        }
+    }
+
     /// The folders an upload's end waits at, when it places a file into one.
-    static PLACING: Mutex<Vec<(PathBuf, std::sync::Arc<PlacingGate>)>> = Mutex::new(Vec::new());
+    static PLACING: Mutex<Vec<(PathBuf, std::sync::Arc<StepGate>)>> = Mutex::new(Vec::new());
 
     /// #4082 — a folder standing in for one whose upload's end takes long (a
     /// large file copied across to the person's folder or to another volume,
@@ -157,15 +190,12 @@ pub(crate) mod seams {
     /// it would have.
     pub(crate) struct HeldPlacing {
         at: PathBuf,
-        gate: std::sync::Arc<PlacingGate>,
+        gate: std::sync::Arc<StepGate>,
     }
 
     pub(crate) fn hold_placing(folder: &Path) -> HeldPlacing {
         let at = std::fs::canonicalize(folder).expect("a folder to hold");
-        let gate = std::sync::Arc::new(PlacingGate {
-            open: tokio::sync::watch::Sender::new(false),
-            reached: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let gate = StepGate::shut();
         let mut held = PLACING.lock().unwrap_or_else(|p| p.into_inner());
         held.push((at.clone(), gate.clone()));
         HeldPlacing { at, gate }
@@ -174,22 +204,18 @@ pub(crate) mod seams {
     impl HeldPlacing {
         /// How many ends began to wait at it.
         pub(crate) fn reached(&self) -> usize {
-            self.gate.reached.load(std::sync::atomic::Ordering::SeqCst)
+            self.gate.reached()
         }
 
         /// Whether an end began to wait at it within `wait`.
         pub(crate) async fn reached_within(&self, wait: std::time::Duration) -> bool {
-            let until = std::time::Instant::now() + wait;
-            while self.reached() == 0 && std::time::Instant::now() < until {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            self.reached() > 0
+            self.gate.reached_within(wait).await
         }
 
         /// The copy is done: every end waiting at it goes on, now and from
         /// now.
         pub(crate) fn release(&self) {
-            self.gate.open.send_replace(true);
+            self.gate.open();
         }
     }
 
@@ -197,7 +223,7 @@ pub(crate) mod seams {
         fn drop(&mut self) {
             self.release();
             let mut held = PLACING.lock().unwrap_or_else(|p| p.into_inner());
-            held.retain(|(at, _)| at != &self.at);
+            held.retain(|(at, gate)| at != &self.at || !std::sync::Arc::ptr_eq(gate, &self.gate));
         }
     }
 
@@ -209,11 +235,62 @@ pub(crate) mod seams {
             let held = PLACING.lock().unwrap_or_else(|p| p.into_inner());
             held.iter().find(|(f, _)| f == &at).map(|(_, g)| g.clone())
         };
-        let Some(gate) = gate else { return };
-        gate.reached
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut open = gate.open.subscribe();
-        let _ = open.wait_for(|open| *open).await;
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+    }
+
+    /// The downloads that wait before their first chunk, by id.
+    static SENDING: Mutex<Vec<(String, std::sync::Arc<StepGate>)>> = Mutex::new(Vec::new());
+
+    /// #4082 — a download whose bytes are still on their way (a large file
+    /// over a slow link): its pump has sent the offer, and waits before its
+    /// first chunk until the guard goes. Its stop token ends that wait, as it
+    /// ends every wait of the pump. A test never lets one go on into its
+    /// chunks: the test viewer reads a message of at most 65535 bytes, and a
+    /// chunk is 64 KiB.
+    pub(crate) struct HeldSending {
+        id: String,
+        gate: std::sync::Arc<StepGate>,
+    }
+
+    pub(crate) fn hold_sending(id: &str) -> HeldSending {
+        let gate = StepGate::shut();
+        let mut held = SENDING.lock().unwrap_or_else(|p| p.into_inner());
+        held.push((id.to_string(), gate.clone()));
+        HeldSending {
+            id: id.to_string(),
+            gate,
+        }
+    }
+
+    impl HeldSending {
+        /// Whether its pump began to wait within `wait`.
+        pub(crate) async fn reached_within(&self, wait: std::time::Duration) -> bool {
+            self.gate.reached_within(wait).await
+        }
+    }
+
+    impl Drop for HeldSending {
+        fn drop(&mut self) {
+            self.gate.open();
+            let mut held = SENDING.lock().unwrap_or_else(|p| p.into_inner());
+            held.retain(|(id, gate)| id != &self.id || !std::sync::Arc::ptr_eq(gate, &self.gate));
+        }
+    }
+
+    /// Where a download's pump sends its first chunk: waits while a test
+    /// holds that download.
+    pub(crate) async fn sending_waits(id: &str) {
+        let gate = {
+            let held = SENDING.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .find(|(held, _)| held == id)
+                .map(|(_, g)| g.clone())
+        };
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
     }
 
     /// What a stand-in answers for one thread: a test's own, as

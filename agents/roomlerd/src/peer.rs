@@ -13811,6 +13811,12 @@ async fn pump_outgoing_file<S: DownloadSink>(
     let stop = &offer.cancel;
 
     let mut file = or_stopped(stop, handler.open_outgoing(&offer.id)).await??;
+    #[cfg(test)]
+    or_stopped(
+        stop,
+        crate::files::drawer_edges::seams::sending_waits(&offer.id),
+    )
+    .await?;
     let mut buf = vec![0u8; CHUNK];
     let mut total: u64 = 0;
     let mut last_progress: u64 = 0;
@@ -18555,29 +18561,29 @@ mod upload_end_tests {
     /// AC1 — a download's `files:cancel` sent while an upload's end places its
     /// file is acted on at once: the download stops and the cancel is done
     /// with, while the end still waits. Red on master, where the read loop
-    /// read the cancel only once the end was done, and the download ran on.
+    /// read the cancel only once the end was done.
     #[tokio::test]
     async fn a_downloads_cancel_sent_during_an_uploads_end_is_acted_on_at_once() {
         let temp = tempfile::tempdir().expect("a temp dir");
         let dest = temp.path().join("dest");
         std::fs::create_dir(&dest).expect("a folder");
-        // Still on its way when it is cancelled: 512 MiB, made without
-        // writing them (never written, they read as zeros).
-        let big = temp.path().join("w42-big.bin");
-        std::fs::File::create(&big)
-            .and_then(|file| file.set_len(512 * 1024 * 1024))
-            .expect("a large file to download");
+        let wanted = temp.path().join("w42-wanted.bin");
+        std::fs::write(&wanted, bytes_of(1000)).expect("a file to download");
         let (dl, id) = (id_of("download"), id_of("cancel"));
         let payload = bytes_of(64 * 1024);
         let log = Logged::start(tracing::Level::INFO);
+        // Still on its way when it is cancelled: its pump has sent the offer
+        // and waits before its first chunk.
+        let sending = seams::hold_sending(&dl);
         let held = seams::hold_placing(&dest);
         let mut pair = served().await;
-        pair.ask(&json!({"t": "files:get", "id": dl, "path": big}))
+        pair.ask(&json!({"t": "files:get", "id": dl, "path": wanted}))
             .await;
         let (offer, _) = heard_until(&mut pair, Duration::from_secs(10), |f| {
             f["id"] == dl.as_str()
         })
         .await;
+        let on_its_way = sending.reached_within(Duration::from_secs(10)).await;
         upload(&pair, &id, &dest, &payload).await;
         let reached = held.reached_within(Duration::from_secs(10)).await;
         pair.ask(&json!({"t": "files:cancel", "id": dl})).await;
@@ -18603,6 +18609,7 @@ mod upload_end_tests {
             Some(json!("files:offer")),
             "the download began"
         );
+        assert!(on_its_way, "the download was not on its way");
         assert!(
             stopped,
             "the download did not stop within 2 s of its cancel, sent during an upload's end (#4082)"
