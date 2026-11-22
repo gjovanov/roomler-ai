@@ -1349,15 +1349,7 @@ pub async fn run(
                 // sentinel is primary-only; a secondary org's auth death
                 // is surfaced via the LocalAPI `OrgStatus` + logs.
                 if auth_failures == 3 && ctx.is_primary {
-                    let msg = "Roomler agent: re-enrollment required.\n\n\
-                              The server is rejecting this agent's token. \
-                              Either the device was removed or re-enrolled \
-                              elsewhere, or its token expired and could not \
-                              be renewed. Run:\n\n\
-                              \troomlerd re-enroll --token <new-jwt>\n\n\
-                              with a fresh enrollment JWT from the admin UI \
-                              to restore service.";
-                    match notify::raise_attention_with_reason(notify::REASON_AUTH, msg) {
+                    match notify::raise_attention_with_reason(notify::REASON_AUTH, AUTH_NOTICE) {
                         Ok(path) => warn!(
                             path = %path.display(),
                             "wrote needs-attention sentinel"
@@ -1406,13 +1398,7 @@ pub async fn run(
                 // systemd never restarts exit 7.
                 let after =
                     crate::service::Install::detect(remote_cfg.config_path()).after_removal();
-                let body = format!(
-                    "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
-                     The agent will not reconnect. Re-enrol with a fresh enrollment \
-                     JWT from the admin UI:\n\n\
-                     \troomlerd re-enroll --token <new-jwt>\n\n\
-                     {after}"
-                );
+                let body = goodbye_notice(reason, &message, after);
                 match notify::raise_attention_machine_aware_with_reason(
                     notify::REASON_GOODBYE,
                     &body,
@@ -1667,15 +1653,7 @@ pub(crate) fn replaced_backoff_for(displacements: usize) -> Duration {
 /// The ReplacedByNewer operator sentinel — written once per storm (at the
 /// 3rd displacement in the window), whether or not the legacy exit is on.
 fn write_replaced_sentinel(message: &str, displacements: usize) {
-    let body = format!(
-        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
-         This connection has been displaced {displacements} times in the current \
-         window — another process (different physical host with a copy of this \
-         config.toml, or a stale half-open connection through a TLS-inspecting \
-         middlebox) is using the same agent_id. The agent stays up and backs \
-         off; if this persists, stop the duplicate or re-enrol THIS host with \
-         a fresh enrollment JWT to mint a new agent_id."
-    );
+    let body = replaced_notice(message, displacements);
     match notify::raise_attention_machine_aware_with_reason(notify::REASON_DUPLICATE, &body) {
         Ok(path) => warn!(
             path = %path.display(),
@@ -1687,6 +1665,37 @@ fn write_replaced_sentinel(message: &str, displacements: usize) {
             "failed to write needs-attention sentinel for ReplacedByNewer escalation"
         ),
     }
+}
+
+/// FR-133 — what this loop's sentinels say, held here so a test reads each one whole.
+pub(crate) const AUTH_NOTICE: &str = "Roomler agent: re-enrollment required.\n\n\
+    The server is rejecting this agent's token. \
+    Either the device was removed or re-enrolled \
+    elsewhere, or its token expired and could not \
+    be renewed. Run:\n\n\
+    \troomlerd re-enroll --token <new-jwt>\n\n\
+    with a fresh enrollment JWT from the admin UI \
+    to restore service.";
+pub(crate) fn goodbye_notice(reason: AgentCloseReason, message: &str, after: &str) -> String {
+    let why = format!("{reason:?}");
+    format!(
+        "Roomler agent: server-side close — {why}.\n\n{message}\n\n\
+         The agent will not reconnect. Re-enrol with a fresh enrollment \
+         JWT from the admin UI:\n\n\
+         \troomlerd re-enroll --token <new-jwt>\n\n\
+         {after}"
+    )
+}
+pub(crate) fn replaced_notice(message: &str, displacements: usize) -> String {
+    format!(
+        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
+         This connection has been displaced {displacements} times in the current \
+         window — another process (different physical host with a copy of this \
+         config.toml, or a stale half-open connection through a TLS-inspecting \
+         middlebox) is using the same agent_id. The agent stays up and backs \
+         off; if this persists, stop the duplicate or re-enrol THIS host with \
+         a fresh enrollment JWT to mint a new agent_id."
+    )
 }
 
 /// #1750 — a SECONDARY org's loop ended because that org's server refuses this

@@ -5920,4 +5920,28 @@ mod enum_declared_values_tests {
             &[None, Some(true), Some(false)],
         );
     }
+
+    /// FR-133 — the companion's Settings page shows each key's description, so
+    /// a description names the daemon as a person reads it: `roomlerd`, "the
+    /// daemon" or "this device", never an agent. A wire name keeps its spelling
+    /// (`rc:agent.key_rotate` is what the server sends), as does a key or an
+    /// identifier (`agent_id`: `_` joins it to the word).
+    #[test]
+    fn no_description_calls_the_daemon_an_agent() {
+        let mut said = Vec::new();
+        for m in KEYS {
+            let prose = m.description.replace("rc:agent.", "rc:");
+            let lower = prose.to_ascii_lowercase();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let hit = lower.match_indices("agent").any(|(at, _)| {
+                let after = &lower[at + 5..];
+                let after = after.strip_prefix('s').unwrap_or(after);
+                !word(lower[..at].chars().next_back()) && !word(after.chars().next())
+            });
+            if hit {
+                said.push(m.key);
+            }
+        }
+        assert!(said.is_empty(), "these descriptions say agent: {said:?}");
+    }
 }
