@@ -1966,6 +1966,126 @@ in kbit/s is Δ`bytes_written` × 8 ÷ `window_ms`; AC13 asks under 300. Whether
 runtime takes QVBR on `low_power=1`, and what a still frame then costs, is owed that
 read on silicon.
 
+### After a hold: what each FFmpeg encoder spends (FR-148 O18)
+
+Under `inflight_budget = on` the in-flight budget holds frames on a relayed session
+([FR-148](fr/FR-148-path-measured-plan-follows.md) D51, B4). Both data-channel pumps run
+that gate before they capture: the FFmpeg pump re-polls it every 2 ms
+(`agents/roomlerd/src/peer.rs:8121-8206`) and captures after it (`:8253`), and its
+encoder stamps each frame with the capture's time (`encoder.rs:96-99`, `:2357-2362`), so
+a hold of H ms reaches the encoder as a pts gap of one interval plus H. libvpx, the
+VP9-444 pump's encoder, grants that gap: after a 500 ms hold its next three seconds
+carried 826, 500 and 411 kB against 389 kB for a second on time. That is why that pump
+charges libvpx each frame's gap less the time its gate held it, never less than the
+interval (`agents/roomlerd/src/encode/charge.rs:82`,
+[rate-control.md](rate-control.md#b4g-a-frame-is-charged-its-gap-less-the-time-the-gate-held-it-d51)).
+That charge does not reach the FFmpeg pump, so O18 asked what its encoders do with the
+same gap.
+
+**Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
+(`encoder.rs:4882-5296`) opens each encoder as a relayed session does (`new_preferred`
+with `constrained`, as `FfmpegDcCodec::open` does at
+`agents/roomlerd/src/peer.rs:5470-5473`; `hevc_nvenc`
+4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
+seconds at the frame interval, a 500 ms jump in the pts, three more seconds (`hold`);
+and the same frames with no jump (`interval`). The content is the libvpx cell's, a grey
+frame with a window of fresh noise on every frame, so the cap binds. On the dev box (RTX
+5090 Laptop + Radeon 610M, the vendored FFmpeg 9.0.1) every frame of the `hold` arm came
+out the size it is in the `interval` arm, on every encoder in every row: the gap moves
+no byte, so whatever these encoders budget by, it is not the pts. Each row ran twice,
+with the same bytes. The FFmpeg 9.0.1 command line, with the options the pump opens with
+and no roomler code, reads the same, and both vendors hand the gap back in their
+packets' pts (ffprobe reads 2.966667 s, then 3.500000 s), so it reached them. As a
+control, libvpx-vp9 at one-pass CBR on the same command line moves every frame after the
+gap and spends 1.95 times the on-time second in the first second after it.
+
+| Encoder | Row | On time (B) | The three seconds after (B) | `x_on_time` | Verdict | Command line, R1: on time → first second after |
+|---|---|---|---|---|---|---|
+| `h264_nvenc` | R1 | 418,021 | 417,646 · 418,270 · 418,125 | 1.00 | holds | 431,016 → 430,917, 1.00, holds |
+| `hevc_nvenc` | R1 | 412,461 | 390,402 · 390,657 · 390,650 | 0.95 | holds | 388,615 → 388,335, 1.00, holds |
+| `hevc_nvenc` 4:4:4 | R1 | 389,360 | 391,447 · 391,774 · 391,883 | 1.01 | holds | 406,452 → 406,644, 1.00, holds |
+| `av1_nvenc` | R1 | 434,611 | 409,449 · 400,553 · 399,497 | 0.94 | holds | 443,490 → 416,886, 0.94, holds |
+| `h264_amf` | R1 | 430,823 | 430,525 · 431,071 · 430,820 | 1.00 | holds | 439,653 → 439,547, 1.00, holds |
+| `hevc_amf` | R1 | 398,764 | 398,559 · 399,214 · 398,555 | 1.00 | holds | 417,465 → 416,510, 1.00, holds |
+| `av1_amf` | R1 | | | | not opened: AMF has no AV1 encoder on the 610M (`Encoder not found` at the open) | |
+| `h264_nvenc` | R2 | 267,792 | 274,652 · 270,910 · 277,934 | 1.03 | holds | |
+| `hevc_nvenc` | R2 | 275,044 | 274,207 · 275,857 · 267,706 | 1.00 | holds | |
+| `hevc_nvenc` 4:4:4 | R2 | 283,741 | 270,763 · 283,997 · 272,409 | 0.95 | holds | |
+| `av1_nvenc` | R2 | 270,979 | 261,999 · 262,196 · 261,690 | 0.97 | holds | |
+| `h264_amf` | R2 | 240,393 | 240,186 · 240,202 · 240,383 | 1.00 | holds | |
+| `hevc_amf` | R2 | 265,302 | 269,356 · 268,812 · 268,088 | 1.02 | holds | |
+| `hevc_nvenc` | R3 | 278,274 | 276,607 · 232,755 · 273,138 | 0.99 | holds | |
+| `hevc_amf` | R3 | 223,827 | 215,075 · 215,890 · 216,758 | 0.96 | holds | |
+| libvpx-vp9, the control | R1 | | | | | 370,816 → 721,384, 1.95, grants |
+
+R1 is 640×360 at 30 fps and 3 Mbit/s (a cap of 375,000 B a second) with a 200×120 noise
+window; R2 is 1280×720 at 30 fps and 2 Mbit/s (250,000 B) with a 400×240 window; R3 is R2
+at 60 fps. The hold is 500 ms in every row. `x_on_time` is the first second after the hold
+over the on-time second, and the verdicts take the libvpx cell's thresholds: `grants` at
+1.25 or more, `holds` at 1.10 or less. An `x` under 1 is the encoder settling, not the
+hold: the `interval` arm reads the same figure. The command line's noise is lavfi's, not
+the cell's, so its bytes differ from the cell's; its verdict and its two arms compare.
+
+What each encoder opened with, read back from its context and private options after the
+open:
+
+| | NVENC | AMF |
+|---|---|---|
+| Options (`encoder_options`, `encoder.rs:313-382`, `:438-452`) | `rc=vbr`, `cq=22` (H.264: 20), `preset=p4`, `tune=ll`, `rc-lookahead=0`, `bf=0`, `forced-idr=1`, `maxrate` the cap, `bufsize` 2×, `delay=0`; `profile=rext` for 4:4:4 | `rc=vbr_latency`, `qp_i` = `qp_p` = 22 (H.264: 20), `maxrate` the cap, `bufsize` 2×, `query_timeout=1` |
+| The context | `bit_rate` 0, `rc_max_rate` the cap, `rc_buffer_size` **0**, `framerate` fps/1, `time_base` 1/1000000, `gop` 64800, no B-frames | `bit_rate` = `rc_max_rate` = the cap, `rc_buffer_size` 2× the cap, initial occupancy ¾ of it; the same frame rate, time base and GOP |
+| HRD buffer | none from FFmpeg: its `cq` block zeroes `bit_rate` and the VBV after `bufsize` is mapped ([FR-31](fr/FR-31-opening-keyframe-budget.md), read in n8.1). 9.0.1 does the same: the command line writes `CPB properties: bitrate max/min/avg: 3000000/0/0 buffer size: 0` | 2× the cap |
+| Latency | a packet on every call from the first | the first packet one call late, then one a call |
+
+⚠️ `query_timeout` is not an option of FFmpeg 9.0.1's AMF encoders: `ffmpeg -h
+encoder=hevc_amf` lists none, and the cell reads it back as absent. The open goes through
+without it, and AMF runs at its default `async_depth` of 16; the latency above is what
+that gives.
+
+**What it leaves open.** `av1_amf` (no AV1 encoder on the 610M), QSV at QVBR, VAAPI,
+VideoToolbox, D3D12 and Vulkan are not measured here, and the cell refuses those families
+by name; QSV at constant bitrate sizes every frame by its configured rate (above). It is
+one host with one driver a vendor, fed CPU frames (`--features ffmpeg-encoder` alone). A
+`full-hw` session can hand the same encoder GPU-resident frames
+([FR-118](#gpu-resident-frames-the-input-path-fr-118)) with the same rate-control
+options, and that path is not measured here. Rows not measured here stay under O18's
+ruling.
+
+**Running it.** From an x64 Native Tools prompt (`vcvars64`), with the vendored FFmpeg
+staged under `C:\ffmpeg-pin`
+([FR-77 P0](#building-the-ffmpeg-backend-locally-on-windows-fr-77-p0)) and
+`LIBCLANG_PATH` set to your LLVM's `bin`:
+
+```bat
+@echo off
+set "PKG_CONFIG_PATH=C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig;C:\ffmpeg-pin\libvpx\lib\pkgconfig"
+set "PKG_CONFIG_ALLOW_SYSTEM_LIBS=1"
+set "PATH=C:\ffmpeg-pin\bin;%PATH%"
+set "CMAKE_POLICY_VERSION_MINIMUM=3.5"
+set "CARGO_BUILD_JOBS=2"
+rem o18_ runs R1, R2 and R3 in turn; o18_r2 runs one row.
+cargo test -p roomlerd --lib --features ffmpeg-encoder -- --ignored o18_ --nocapture --test-threads=1 --skip clipboard::
+```
+
+Each row is its own test (`o18_r1_640x360_at_30_fps_and_3_mbit`,
+`o18_r2_1280x720_at_30_fps_and_2_mbit`, `o18_r3_1280x720_at_60_fps_hevc`), and the cell
+reads no environment. Every row holds 500 ms, with a 200×120 noise window at 640×360
+scaled with the frame; R1 and R2 take every NVENC and AMF name and `hevc_nvenc` in 4:4:4
+too, R3 only `hevc_nvenc` and `hevc_amf`. Each encoder prints an `O18 open` line (the
+options, the context, the private options), an `O18 name=` line per arm, and a `summary`
+line whose `same_frames` counts the frames the two arms agree on. The command-line check,
+for `hevc_nvenc` (`hevc_amf`: `-rc vbr_latency -qp_i 22 -qp_p 22 -maxrate 3000000
+-bufsize 6000000 -b:v 3000000 -bf 0`; the `interval` arm drops `+gte(N,90)*0.5/TB`):
+
+```sh
+ffmpeg -f lavfi -i "color=c=0x282828:s=640x360:r=30[bg];color=c=0x808080:s=200x120:r=30,noise=alls=100:allf=t+u[n];[bg][n]overlay=220:120:shortest=1,format=nv12,setpts='N/30/TB+gte(N,90)*0.5/TB'[out0]" \
+  -frames:v 180 -c:v hevc_nvenc -rc vbr -cq 22 -preset p4 -tune ll -rc-lookahead 0 -bf 0 -forced-idr 1 \
+  -maxrate 3000000 -bufsize 6000000 -delay 0 -b:v 0 -g 64800 -fps_mode passthrough -enc_time_base 1:1000000 hold.nut
+ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,size -of csv=p=0 hold.nut
+```
+
+`-r` is left out: FFmpeg 9.0.1 refuses it beside `-fps_mode passthrough`, and the encoder
+takes the graph's 30 fps.
+
 ## Software encoders: the clock and 60 fps (FR-112)
 
 A host with no hardware encoder (an Asahi Mac, a Linux box without VAAPI) encodes in software: libvpx for VP9
