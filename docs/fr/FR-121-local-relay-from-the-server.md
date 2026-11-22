@@ -2,7 +2,7 @@
 
 **Issue:** [#2862](https://github.com/gjovanov/roomler-ai/issues/2862) · **Status:** P1 to P3 built and live
 (2026-10-25); P3b built (2026-10-28, #2774) and live (2026-10-29): AC8 and AC10 met, AC9 blocked because Chrome 156
-reaches neither relay on 127.0.0.1 from roomler.ai (§3.7); P0's Safari and Firefox, P4 and P5 open · **Owner:** the agent, the fleet module's Hub and the viewer
+reaches neither relay on 127.0.0.1 from roomler.ai (§3.7); P0's Safari and Firefox, P4 and P5 open · **Owner:** the agent, the fleet module's Hub and the viewer ·
 **Anchors:** master `a4d5f8e55` · **Found by:** [FR-119](FR-119-high-refresh-streaming.md) (#2670), on its first Windows run
 
 ## 1. Goal
