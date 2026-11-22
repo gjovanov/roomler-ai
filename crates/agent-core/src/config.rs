@@ -3614,6 +3614,10 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     let prev = prev_path(path);
     match load_copy(path, &prev, &err) {
         Ok(mut cfg) => {
+            #[cfg(all(windows, test))]
+            if let Some(f) = AFTER_THE_COPY_IS_READ.with(|it| it.borrow_mut().take()) {
+                f();
+            }
             if not_found(&err) {
                 tracing::error!(
                     path = %path.display(),
@@ -4757,6 +4761,18 @@ thread_local! {
     /// own machine tree, which [`machine_tree_of`] then never answers.
     static STAND_IN: std::cell::RefCell<Option<crate::machine_tree::MachineTree>> =
         const { std::cell::RefCell::new(None) };
+    /// Tests only: what runs once on this thread, after [`load`] has read the
+    /// copy it recovers from and before it writes anything: a stand-in for a
+    /// writer at that moment ([`after_the_copy_is_read`]).
+    static AFTER_THE_COPY_IS_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: run `f` once on this thread, between [`load`]'s read of the copy
+/// it recovers from and its first write.
+#[cfg(all(windows, test))]
+fn after_the_copy_is_read(f: impl FnOnce() + 'static) {
+    AFTER_THE_COPY_IS_READ.with(|it| *it.borrow_mut() = Some(Box::new(f)));
 }
 
 /// #3666 — what `roomlerd re-enroll` and `roomlerd org` ask before they
@@ -7902,26 +7918,43 @@ tenant_id = "tid2"
             super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
         }
 
-        /// What a start finds in each case: an enrolled copy only in the tree
-        /// that passes, and in every tree that fails a check, a copy it cannot
+        /// What a start finds in each case: an enrolled copy only in the trees
+        /// that pass, and in every tree that fails a check, a copy it cannot
         /// run on.
         fn want(case: MissingConfig) -> PreviousCopy {
             match case {
                 MissingConfig::NoCopy => PreviousCopy::Missing,
-                MissingConfig::Restorable => PreviousCopy::Enrolled,
+                MissingConfig::Restorable | MissingConfig::CopyAnAdministratorMayChange => {
+                    PreviousCopy::Enrolled
+                }
                 MissingConfig::CopyWithNoEnrollment => PreviousCopy::NoEnrollment,
                 MissingConfig::CopyInAnOpenFolder
                 | MissingConfig::CopyUnderAnotherAccountsParent
                 | MissingConfig::ReplaceRightOnTheParent
                 | MissingConfig::CopyAnotherAccountOwns
                 | MissingConfig::KeysAnotherAccountMayChange
-                | MissingConfig::CopyThatDoesNotLoad => PreviousCopy::Broken,
+                | MissingConfig::CopyThatDoesNotLoad
+                | MissingConfig::InheritOnlyFullControlOnTheParent
+                | MissingConfig::WriteOnTheParentWithoutReplace
+                | MissingConfig::KeyFileInheritsWrite => PreviousCopy::Broken,
             }
+        }
+
+        /// One tick of a host that waits, as the service host and the SYSTEM
+        /// worker's ladder run it on the machine config: the repair, then the
+        /// check, which finds no config.
+        fn tick(tree: &MachineTree) {
+            use crate::machine_tree::{Refusal, Switches, private_machine_config};
+            assert_eq!(
+                private_machine_config(tree, Switches::ON),
+                Err(Refusal::Absent)
+            );
         }
 
         /// #4176 — the copy a start reads for a missing machine config
         /// ([`previous_copy`], which `config_at_start` asks) passes the same
-        /// checks as the config would, and asking writes nothing.
+        /// checks as the config would, at the first tick of a host that waits
+        /// and at the next, and asking writes nothing.
         #[test]
         fn a_missing_machine_configs_copy_is_read_through_the_machines_checks() {
             if !elevated_or_skip("a missing machine config's copy") {
@@ -7932,9 +7965,15 @@ tenant_id = "tid2"
                 let root = tempfile::tempdir().unwrap();
                 let tree = missing_config(root.path(), case);
                 stand_in(&tree);
-                let got = previous_copy(&tree.config());
-                if got != want(case) {
-                    wrong.push(format!("{case:?}: {got:?}, want {:?}", want(case)));
+                for at in 0..2 {
+                    tick(&tree);
+                    let got = previous_copy(&tree.config());
+                    if got != want(case) {
+                        wrong.push(format!(
+                            "{case:?}, tick {at}: {got:?}, want {:?}",
+                            want(case)
+                        ));
+                    }
                 }
                 assert!(!tree.config().exists(), "{case:?}: nothing written");
             }
@@ -7944,7 +7983,8 @@ tenant_id = "tid2"
         /// #4176 — [`load`] restores a missing machine config only from a
         /// copy that passes: the file is written, sealed, and the chain
         /// passes. From any other copy nothing is written, and the load fails
-        /// on the live file's own read error.
+        /// on the live file's own read error. Each load follows a tick, as a
+        /// worker's start follows its ladder.
         #[test]
         fn a_missing_machine_config_is_restored_only_from_a_copy_that_passes() {
             if !elevated_or_skip("a missing machine config's restore") {
@@ -7955,8 +7995,9 @@ tenant_id = "tid2"
                 let root = tempfile::tempdir().unwrap();
                 let tree = missing_config(root.path(), case);
                 stand_in(&tree);
+                tick(&tree);
                 let loaded = load(&tree.config());
-                if case == MissingConfig::Restorable {
+                if case.restorable() {
                     let cfg = loaded.expect("restored");
                     assert!(cfg.has_primary_enrollment());
                     assert!(tree.config().exists(), "reinstated");
@@ -7973,6 +8014,101 @@ tenant_id = "tid2"
                 }
             }
             assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// The plaintext-URL line [`parse_raw`] says for a config it reads as
+        /// TLS.
+        const PLAINTEXT_LINE: &str = "a plaintext server URL in the config is read as TLS";
+
+        /// #4176 — a host that waits asks the copy at every tick, and that
+        /// ask says nothing of what the copy holds: a copy whose server URL
+        /// is plaintext is said once, by the restore, never once per tick.
+        #[test]
+        fn a_copy_with_a_plaintext_url_is_said_once_not_once_per_tick() {
+            if !elevated_or_skip("a copy with a plaintext URL") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let mut cfg = test_fixture();
+            cfg.server_url = "http://example.invalid".into();
+            std::fs::write(tree.prev(), toml::to_string(&cfg).unwrap()).unwrap();
+            stand_in(&tree);
+            let (ticks, guard) = captured();
+            for at in 0..4 {
+                tick(&tree);
+                assert_eq!(
+                    previous_copy(&tree.config()),
+                    PreviousCopy::Enrolled,
+                    "tick {at}"
+                );
+            }
+            let said = ticks.text();
+            drop(guard);
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 0, "{said}");
+            let (restore, _guard) = captured();
+            load(&tree.config()).expect("restored");
+            let said = restore.text();
+            assert_eq!(said.matches(PLAINTEXT_LINE).count(), 1, "{said}");
+        }
+
+        /// #4176 — a config written after the restore read the copy, and
+        /// before the restore puts its file in place, is never replaced: the
+        /// restore is dropped, and the config that was written is loaded.
+        #[test]
+        fn a_config_written_while_its_copy_is_restored_is_kept() {
+            if !elevated_or_skip("a config written during a restore") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            stand_in(&tree);
+            let mut newer = test_fixture();
+            newer.machine_name = "written meanwhile".into();
+            let text = toml::to_string_pretty(&newer).unwrap();
+            let (path, written) = (tree.config(), text.clone());
+            super::super::after_the_copy_is_read(move || {
+                // As an elevated save leaves it: sealed.
+                std::fs::write(&path, &written).unwrap();
+                set_dacl(&path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            });
+            let cfg = load(&tree.config()).expect("loaded");
+            assert_eq!(cfg.machine_name, "written meanwhile");
+            assert_eq!(
+                std::fs::read_to_string(tree.config()).unwrap(),
+                text,
+                "never replaced"
+            );
+            let left: Vec<_> = std::fs::read_dir(tree.folder())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".tmp."))
+                .collect();
+            assert!(left.is_empty(), "no temp file left: {left:?}");
+        }
+
+        /// #4176 — the keys this build does not know, which the restore
+        /// writes, come from the bytes the check judged: a change to the copy
+        /// after that read never reaches the restored config.
+        #[test]
+        fn the_restore_writes_the_unknown_keys_of_the_bytes_it_checked() {
+            if !elevated_or_skip("the restore's unknown keys") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let enrolled = toml::to_string(&test_fixture()).unwrap();
+            std::fs::write(tree.prev(), format!("future_key = \"checked\"\n{enrolled}")).unwrap();
+            stand_in(&tree);
+            let prev = tree.prev();
+            super::super::after_the_copy_is_read(move || {
+                std::fs::write(&prev, format!("future_key = \"later\"\n{enrolled}")).unwrap();
+            });
+            load(&tree.config()).expect("restored");
+            let text = std::fs::read_to_string(tree.config()).unwrap();
+            assert!(text.contains("future_key = \"checked\""), "{text}");
+            assert!(!text.contains("later"), "{text}");
         }
     }
 

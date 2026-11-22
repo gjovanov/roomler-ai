@@ -2829,10 +2829,23 @@ pub mod test_support {
         CopyThatDoesNotLoad,
         /// A copy that passes, and holds no enrollment.
         CopyWithNoEnrollment,
+        /// A machine folder and a copy that inherit, from a parent that does
+        /// not inherit, an inherit-only entry giving Users full control:
+        /// both were open as found, and the parent was closed.
+        InheritOnlyFullControlOnTheParent,
+        /// The same with an entry giving Users write, on the parent and
+        /// handed down, without the right to replace.
+        WriteOnTheParentWithoutReplace,
+        /// A key file that inherits, from the keys folder, an entry giving
+        /// Users write.
+        KeyFileInheritsWrite,
+        /// A copy that holds a write entry of an administrator's own account
+        /// (this elevated process's): answered as a config that holds one.
+        CopyAnAdministratorMayChange,
     }
 
     impl MissingConfig {
-        pub const ALL: [MissingConfig; 9] = [
+        pub const ALL: [MissingConfig; 13] = [
             MissingConfig::NoCopy,
             MissingConfig::Restorable,
             MissingConfig::CopyInAnOpenFolder,
@@ -2842,7 +2855,20 @@ pub mod test_support {
             MissingConfig::KeysAnotherAccountMayChange,
             MissingConfig::CopyThatDoesNotLoad,
             MissingConfig::CopyWithNoEnrollment,
+            MissingConfig::InheritOnlyFullControlOnTheParent,
+            MissingConfig::WriteOnTheParentWithoutReplace,
+            MissingConfig::KeyFileInheritsWrite,
+            MissingConfig::CopyAnAdministratorMayChange,
         ];
+
+        /// Whether a start restores the copy, after the host's ticks: the
+        /// sealed tree, and the copy an administrator's own entry is on.
+        pub fn restorable(self) -> bool {
+            matches!(
+                self,
+                MissingConfig::Restorable | MissingConfig::CopyAnAdministratorMayChange
+            )
+        }
     }
 
     /// An account that is neither SYSTEM nor an administrator, for an owner
@@ -2893,9 +2919,39 @@ pub mod test_support {
             MissingConfig::KeysAnotherAccountMayChange => {
                 assert!(icacls(&tree.keys(), &["/grant", "*S-1-5-32-546:(M)"]))
             }
+            MissingConfig::InheritOnlyFullControlOnTheParent => {
+                inheriting_copy(&tree, "(A;OICIIO;FA;;;BU)")
+            }
+            MissingConfig::WriteOnTheParentWithoutReplace => {
+                inheriting_copy(&tree, "(A;OICI;0x120116;;;BU)")
+            }
+            MissingConfig::KeyFileInheritsWrite => {
+                assert!(icacls(
+                    &tree.keys(),
+                    &["/grant", "*S-1-5-32-545:(OI)(IO)(W)"]
+                ));
+                let key = tree.keys().join("66f0c0ffee00000000000a01.json");
+                assert!(icacls(&key, &["/reset"]), "the key file inherits");
+            }
+            MissingConfig::CopyAnAdministratorMayChange => {
+                assert!(icacls(&tree.prev(), &["/grant", &format!("*{}:(M)", me())]))
+            }
             _ => {}
         }
         tree
+    }
+
+    /// The parent with `%ProgramData%`'s entries for SYSTEM, Administrators
+    /// and Users' read, and `entry`, not inheriting; the machine folder and
+    /// the copy set to inherit all they hold.
+    fn inheriting_copy(tree: &super::MachineTree, entry: &str) {
+        set_dacl(
+            tree.parent(),
+            &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU){entry}"),
+        );
+        for path in [tree.folder().to_path_buf(), tree.prev()] {
+            assert!(icacls(&path, &["/reset"]), "{} inherits", path.display());
+        }
     }
 
     /// #3737 — what runs once, the next time a reader or a deleter of the
@@ -3509,6 +3565,78 @@ mod tests {
                         .any(|a| a.sid == USERS && a.mask & 0x40 != 0 && a.flags & INHERITED == 0),
                     "tick {tick}: {kept:?}"
                 );
+            }
+        }
+
+        /// #4176 — while only a copy is there, R leaves the tree as it found
+        /// it unless the copy, the folder and the keys were the machine's as
+        /// found, inherited entries counted: an entry a cut of the parent or a
+        /// seal of a folder would rewrite below it stays, and the check
+        /// refuses the copy at this tick and the next.
+        #[test]
+        fn while_only_a_copy_is_there_a_tree_that_was_not_the_machines_is_left_as_found() {
+            if !elevated_or_skip("a copy in a tree that was not the machine's") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in [
+                MissingConfig::InheritOnlyFullControlOnTheParent,
+                MissingConfig::WriteOnTheParentWithoutReplace,
+                MissingConfig::KeyFileInheritsWrite,
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                let entries = [
+                    tree.parent().to_path_buf(),
+                    tree.folder().to_path_buf(),
+                    tree.prev(),
+                    tree.keys(),
+                    tree.keys().join("66f0c0ffee00000000000a01.json"),
+                ];
+                let found: Vec<String> = entries.iter().map(|p| sddl(p)).collect();
+                for tick in 0..2 {
+                    repair(&tree, false);
+                    let now: Vec<String> = entries.iter().map(|p| sddl(p)).collect();
+                    if now != found {
+                        wrong.push(format!("{case:?}, tick {tick}: {now:?}, found {found:?}"));
+                    }
+                    if read_machine_copy(&tree).is_ok() {
+                        wrong.push(format!("{case:?}, tick {tick}: the copy passed"));
+                    }
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4176 — an administrator's own write entry gets the same answer on
+        /// the copy of a missing config as on the config: with the repair on,
+        /// the entry is taken off and the check passes; with it off, the check
+        /// refuses it.
+        #[test]
+        fn an_administrators_entry_is_answered_alike_on_the_copy_and_on_the_config() {
+            if !elevated_or_skip("an administrator's entry on the copy") {
+                return;
+            }
+            for repair_on in [true, false] {
+                let switches = Switches {
+                    repair: repair_on,
+                    ..Switches::ON
+                };
+                let root = tempfile::tempdir().unwrap();
+                let tree = enrolled_tree(root.path());
+                assert!(icacls(
+                    &tree.config(),
+                    &["/grant", &format!("*{}:(M)", me())]
+                ));
+                let config = private_machine_config(&tree, switches).is_ok();
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), MissingConfig::CopyAnAdministratorMayChange);
+                assert_eq!(
+                    private_machine_config(&tree, switches),
+                    Err(Refusal::Absent)
+                );
+                let copy = matches!(read_machine_copy(&tree), Ok(Some(_)));
+                assert_eq!((copy, config), (repair_on, repair_on), "repair {repair_on}");
             }
         }
 
