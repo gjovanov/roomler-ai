@@ -4607,6 +4607,157 @@ mod tests {
         );
     }
 
+    // ── #3558: a grant id is honoured at most once ───────────────────────
+
+    /// Record a grant under a FIXED id, as a duplicated or replayed
+    /// `rc:ssh.grant` carries it. [`grant_for`] draws a fresh id on every
+    /// call, which is exactly what these cases must not do.
+    fn record_copy(grant_id: &str, line: &str) -> Result<(), super::GrantRejected> {
+        super::record_grant(
+            grant_id.to_string(),
+            line.to_string(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
+            now_ms() + 30_000,
+            0,
+        )
+    }
+
+    /// Whether a connection authenticating with `key` gets in. Unlike
+    /// [`connect`], a refusal is an answer here, not a failed test.
+    async fn admits(addr: std::net::SocketAddr, key: PrivateKey) -> bool {
+        let config = Arc::new(russh::client::Config::default());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut session = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .expect("ssh handshake");
+        let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+        session
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .expect("auth exchange")
+            .success()
+    }
+
+    /// #3558 — a grant delivered twice is held once. The copy is refused
+    /// while its id is pending, so the table holds one entry and the key opens
+    /// one session. Before the fix the copy was a second redeemable entry, and
+    /// a second connection with the same key got in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_same_grant_twice_is_held_once_and_admits_one_session() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(13);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-twice", &line).expect("the first copy is held");
+        let copy = record_copy("g-3558-twice", &line);
+        let held = super::pending_grants();
+
+        let _first = connect(addr, key.clone()).await;
+        assert!(
+            !admits(addr2, key).await,
+            "a second connection with the same key is refused after the first redeems"
+        );
+        assert_eq!(held, 1, "the table holds one entry for the two copies");
+        let refused = copy.expect_err("a copy whose id is pending is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a copy that arrives after its grant was redeemed is refused,
+    /// and the key opens nothing more. Before the fix redemption removed the
+    /// entry, so the copy was recorded as new, with a fresh window of its own
+    /// (#3511).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_redeemed_grant_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(14);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-redeemed", &line).expect("the grant is held");
+        let _first = connect(addr, key.clone()).await;
+        assert_eq!(
+            super::pending_grants(),
+            0,
+            "redeeming the grant consumed it"
+        );
+
+        let copy = record_copy("g-3558-redeemed", &line);
+        assert!(
+            !admits(addr2, key).await,
+            "a connection with the key is refused after its grant was redeemed"
+        );
+        let refused = copy.expect_err("a copy of a redeemed grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a second copy does not extend the first one's window. The copy
+    /// arrives while the first is pending and is refused, and it leaves the
+    /// first copy's deadline as it was. Once that deadline passes, nothing
+    /// admits the key. The deadline is driven as in
+    /// [`an_expired_grant_admits_nobody`]. Before the fix the copy was held
+    /// with a window from its OWN arrival, so the key outlived the first one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_copy_does_not_extend_the_first_ones_window() {
+        let _lock = grant_test().await;
+        let (key, line) = client_key(15);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-window", &line).expect("the first copy is held");
+        let deadline = super::GRANTS.lock().unwrap()[0].deadline;
+        let copy = record_copy("g-3558-window", &line);
+        assert_eq!(
+            super::GRANTS.lock().unwrap()[0].deadline,
+            deadline,
+            "the copy leaves the first copy's window as it was"
+        );
+
+        // The first copy's window ends. Entry 0 is the oldest: the first copy.
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert!(
+            !admits(addr, key).await,
+            "once the first copy's window ends, the key opens nothing"
+        );
+        assert!(copy.is_err(), "the copy was refused on arrival");
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// #3558 — a grant that timed out unredeemed is burned as well: a late
+    /// copy of it is refused, not given a fresh window from its own arrival.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copy_of_a_grant_that_expired_unredeemed_is_refused() {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(16);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        record_copy("g-3558-expired", &line).expect("the grant is held");
+        super::GRANTS.lock().unwrap()[0].deadline = std::time::Instant::now();
+        assert_eq!(super::pending_grants(), 0, "its window ended unredeemed");
+
+        let copy = record_copy("g-3558-expired", &line);
+        assert!(
+            !admits(addr, key).await,
+            "a late copy of an expired grant opens nothing"
+        );
+        let refused = copy.expect_err("a late copy of an expired grant is refused");
+        assert_eq!(refused.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
+    }
+
     // ── Resolution (A1) — the one place session entitlements are decided ──
 
     fn test_grant(
