@@ -842,9 +842,9 @@ reaches every viewer whatever their view says. Locked against a real worker by
 `crates/tests/src/conference_view_tests.rs:439`.
 
 **What "visible" is.** Each remote `VideoTile` runs an `IntersectionObserver` on its root
-(`ui/src/components/conference/VideoTile.vue:507`), which applies the clip of every
+(`ui/src/components/conference/VideoTile.vue:481`), which applies the clip of every
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
-unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
+unmount (`:527`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
 call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
@@ -861,7 +861,7 @@ declared viewer that never reported would have every camera paused.
 | tiled | `primary`, at most `tiledMaxTiles` (`useConferenceLayout.ts:306`), no scrolling | exactly the rendered remote tiles |
 | spotlight | the big tile, a 120 px filmstrip that scrolls sideways | the big tile plus the strip tiles inside the strip's viewport |
 | sidebar | the big tile, a 280 px column that scrolls | the same rule |
-| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows |
+| the mini view (another page of the app, `MiniConference.vue`) | up to three remote cameras in the app bar's widget, no `VideoTile` | exactly those three (the widget reports them itself; the per-key count tolerates its report overlapping a tile's during the page switch); the rest paused until the call page is back; audio flows, and the app shell's `CallAudio` plays every participant's, these three included (#3563) |
 
 A tile scrolled into view plays within a second: one debounce, one round trip, and the
 worker requests a key frame the moment a consumer resumes (`SimpleConsumer::UserOnResumed`
