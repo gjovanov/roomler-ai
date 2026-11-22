@@ -1,8 +1,8 @@
 # FR-152: A cold hub continues from its handoff — a prompt nobody typed starts a fresh context, not a full re-read
 
-**Issue:** [#4290](https://github.com/gjovanov/roomler-ai/issues/4290) · **Status:** spec, claimed 2026-11-22; no phase
-started. Builds on [FR-131](FR-131-hub-coordinator.md) (the hub) and [FR-136](FR-136-hub-process-hygiene.md) (hub-guard,
-the idle handoff and its gate). The engineering reference is
+**Issue:** [#4290](https://github.com/gjovanov/roomler-ai/issues/4290) · **Status:** spec, claimed 2026-11-22; D1
+decided the same day (allow); no phase started. Builds on [FR-131](FR-131-hub-coordinator.md) (the hub) and
+[FR-136](FR-136-hub-process-hygiene.md) (hub-guard, the idle handoff and its gate). The engineering reference is
 [`agent-hub.md` §12.4](../agent-hub.md#124-the-idle-handoff). Like FR-136, it changes the operator's tooling under
 `~/.claude/` and no product code, so the design names files and functions there rather than repository lines.
 
@@ -211,7 +211,7 @@ file, or `HUB_GUARD=off`, turns off the whole guard. `HUB_GUARD_COLD_MIN_K=0` al
 |---|---|---|---|
 | P0 | Prove the engine points (P0's questions) on throwaway sessions in the pty harness, at no model cost where a question allows | not started | — (nothing changes) |
 | P1 | The hub skill: the person-turn line, the handoff's newest block and its archive, `/hub resume <id> cold` with its three reads, a tick that resumes first, the note on schedules | not started | the skill's previous commit |
-| P2 | hub-guard 0.6.0, the `cold` part: the pure functions with their unit tests, the hook, the steps, the inbox, the toast and the `events.log` lines. **Starts only after the operator rules on D1.** | not started | the part `cold`; `HUB_GUARD_COLD_MIN_K=0`; the hub flag |
+| P2 | hub-guard 0.6.0, the `cold` part: the pure functions with their unit tests, the hook, the steps, the inbox, the toast and the `events.log` lines. **D1 decided 2026-11-22: allow.** | not started | the part `cold`; `HUB_GUARD_COLD_MIN_K=0`; the hub flag |
 | P3 | Field: a lab hub through each condition, with a seam that judges the cache cold sooner so that no cell waits an hour; then a live hub's next real cold prompt, and seven days of its `events.log` | not started | as P2 |
 | P4 | Docs: a §12 section of `agent-hub.md` with the flowchart, the conditions, the inbox and the kill switches; the FR-131 and FR-136 cross-links | not started | — |
 
@@ -242,7 +242,7 @@ file, or `HUB_GUARD=off`, turns off the whole guard. `HUB_GUARD_COLD_MIN_K=0` al
 
 | # | Decision | Recommendation |
 |---|---|---|
-| **D1** | hub-guard would `/clear` a hub coordinator by itself. Today `/clear` is the operator's own action, and the hub skill says the hub never clears itself. | Allow it in this one case: every condition above, a toast, an `events.log` line and the kill switches. The other way is hold only: drop a cold tick, keep a message in the inbox, tell the operator, and wait for the operator's `/clear` and `/hub resume`. That costs nothing, but the hub stops until the operator acts. |
+| **D1** | hub-guard would `/clear` a hub coordinator by itself. Today `/clear` is the operator's own action, and the hub skill says the hub never clears itself. | **Allow. Decided 2026-11-22 by the operator, as recommended:** in this one case only, with every condition above, a toast, an `events.log` line and the kill switches. The other way was hold only: drop a cold tick, keep a message in the inbox, tell the operator, and wait for the operator's `/clear` and `/hub resume`. It would cost nothing, but the hub would stop until the operator acted. |
 | D2 | The threshold for the re-read. | 150k, the same as Cache Keeper's hold. A fresh resume reaches about 150k after twenty requests. |
 | D3 | When is the handoff current enough? | When it was written after the last turn a person started had ended (condition 6). |
 | D4 | A tick schedule longer than an hour. | Keep it allowed, and say what it costs: with FR-152 each slow tick is a fresh resume; without it, each one re-reads the whole context. |
