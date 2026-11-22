@@ -485,7 +485,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `postinstall:287-290`, `:326` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:1196-1203` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
-| `agents/roomlerd/src/files.rs:5367-5377` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
+| `agents/roomlerd/src/files.rs:5492-5502` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
 | `agents/roomlerd/src/recording/folder.rs:160-164` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:250`) | write |
 | `agents/roomler-cli/src/config.rs:83-90` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:83-90`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:198`). Not established: whether that save leaves the person's file owned by root | write |
 
@@ -493,7 +493,7 @@ The source gate (`crates/agent-core/src/folder_gate.rs:291-357`) holds six of th
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
-`files.rs:5454-5458` is Linux's `own_home_and_downloads` and `:7784` is a test.
+`files.rs:5579-5583` is Linux's `own_home_and_downloads` and `:7909` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.

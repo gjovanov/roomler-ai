@@ -1527,6 +1527,50 @@ pub(crate) struct PartialEntry {
     pub(crate) who: FsAs,
 }
 
+/// #4082 — the uploads whose end is placing their file now, by id, on any
+/// channel. Their staging is what that placement reads, so a `files:resume`
+/// of one is refused and a `files:cancel` of one leaves it alone, on this
+/// channel or another (after a drop the viewer's next channel is another).
+/// A placement can copy a large file for minutes, off the channel's read
+/// loop, so both can arrive while it runs. Marked by
+/// [`FilesHandler::begin_end`] while the upload is taken out of its slot,
+/// and unmarked when its placement is over ([`Ending`]'s drop), however it
+/// ends.
+static ENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// #4082 — whether upload `id`'s end is placing its file now ([`ENDING`]).
+pub(crate) fn upload_ending(id: &str) -> bool {
+    ENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|ending| ending == id)
+}
+
+/// #4082 — one upload's mark in [`ENDING`], held for as long as its end runs.
+struct EndingMark(String);
+
+impl EndingMark {
+    fn new(id: &str) -> Self {
+        ENDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_string());
+        Self(id.to_string())
+    }
+}
+
+impl Drop for EndingMark {
+    fn drop(&mut self) {
+        let mut ending = ENDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = ending.iter().position(|id| id == &self.0) {
+            ending.swap_remove(at);
+        }
+    }
+}
+
 /// Test-only escape hatch — clears the partial registry between
 /// `cargo test` cases that touch the same global. Production code
 /// never calls this.
@@ -2701,13 +2745,31 @@ impl FilesHandler {
                     let parent_partial = partial_dir
                         .parent()
                         .expect("partial_dir has a parent by construction");
-                    std::fs::create_dir_all(parent_partial)
-                        .with_context(|| format!("creating {}", parent_partial.display()))?;
-                    set_hidden(parent_partial);
-                    // `create_dir`, never `_all`: this id's folder is made now,
-                    // or the begin fails — an existing one is never adopted.
-                    std::fs::create_dir(&partial_dir)
-                        .with_context(|| format!("creating {}", partial_dir.display()))?;
+                    // #4082 — twice at most, as `staging::stage`: an earlier
+                    // upload's end, placing its file beside this begin, removes
+                    // the staging folder once empty, and may do so between its
+                    // make here and the make of `<id>` in it.
+                    let mut tries = 2;
+                    loop {
+                        tries -= 1;
+                        std::fs::create_dir_all(parent_partial)
+                            .with_context(|| format!("creating {}", parent_partial.display()))?;
+                        set_hidden(parent_partial);
+                        #[cfg(test)]
+                        drawer_edges::seams::the_id_is_next(&target_dir);
+                        // `create_dir`, never `_all`: this id's folder is made
+                        // now, or the begin fails — an existing one is never
+                        // adopted.
+                        match std::fs::create_dir(&partial_dir) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries > 0 => {}
+                            made => {
+                                made.with_context(|| {
+                                    format!("creating {}", partial_dir.display())
+                                })?;
+                                break;
+                            }
+                        }
+                    }
 
                     // Write meta.json BEFORE opening the data file. If meta
                     // write fails the staging dir is left empty (cheap to clean).
@@ -2847,17 +2909,27 @@ impl FilesHandler {
         Ok(progress)
     }
 
-    /// Finalize the active incoming transfer. Flushes + fsyncs the
-    /// staging `data` file, renames it to a freshly-resolved unique
-    /// final path under `dest_dir`, removes the `.roomler-partial/
-    /// <id>/` dir + registry entry. Returns the *actual* final path
-    /// (may differ from the begin-time reservation per M4 fix).
+    /// Finalize the active incoming transfer: [`Self::begin_end`], then
+    /// [`Ending::place`]. Returns the *actual* final path (may differ from
+    /// the begin-time reservation per M4 fix).
     pub async fn end(&self, id: &str) -> Result<(PathBuf, u64)> {
+        self.begin_end(id).await?.place().await
+    }
+
+    /// #4082 — the first half of an upload's end, quick, on the channel's
+    /// read loop: upload `id` is taken out of this channel's slot and marked
+    /// as ending ([`upload_ending`]), so the next message read finds the slot
+    /// free (a begin is taken at once, D2-A) and the upload ending. The
+    /// placement, which can copy a large file for minutes, is
+    /// [`Ending::place`], run off the loop. Refused as before for an id that
+    /// is not one plain name, with no upload in flight, or for another upload
+    /// than the one in flight, which is not touched.
+    pub(crate) async fn begin_end(&self, id: &str) -> Result<Ending> {
         // #3688 — one plain name, as every entry checks first; the upload in
         // flight is not touched.
         transfer_id(id)?;
         let mut guard = self.incoming.lock().await;
-        let Some(mut state) = guard.take() else {
+        let Some(state) = guard.take() else {
             return Err(anyhow!("no active transfer to end"));
         };
         if state.id != id {
@@ -2869,6 +2941,38 @@ impl FilesHandler {
                 "files:end id={id} but active transfer is {wrong_id}"
             ));
         }
+        // Marked before the slot's lock goes: whatever is read next finds the
+        // upload ending, never merely gone from the slot.
+        let mark = EndingMark::new(id);
+        drop(guard);
+        Ok(Ending { state, _mark: mark })
+    }
+}
+
+/// #4082 — an upload taken out of its channel's slot by its `files:end`
+/// ([`FilesHandler::begin_end`]), to be placed off the channel's read loop
+/// ([`Ending::place`]). It holds what the placement needs and nothing of the
+/// channel: not the handler, not the channel itself.
+pub(crate) struct Ending {
+    state: IncomingTransfer,
+    _mark: EndingMark,
+}
+
+impl Ending {
+    /// The upload's id.
+    pub(crate) fn id(&self) -> &str {
+        &self.state.id
+    }
+
+    /// The second half of an upload's end. Flushes + fsyncs the staging
+    /// `data` file, places it at a freshly-resolved unique final path under
+    /// `dest_dir` (a rename, a copy across volumes, or a copy across to the
+    /// person, #3048), and removes the `.roomler-partial/<id>/` dir +
+    /// registry entry. Returns the *actual* final path (may differ from the
+    /// begin-time reservation per M4 fix). Until it returns, the upload stays
+    /// marked as ending and counts as a transfer the updater waits for.
+    pub(crate) async fn place(self) -> Result<(PathBuf, u64)> {
+        let Ending { mut state, _mark } = self;
         state.file.flush().await?;
         state.file.sync_all().await.ok();
         if state.received != state.expected {
@@ -2890,6 +2994,9 @@ impl FilesHandler {
         // commit_partial below would error and the caller surfaces
         // it. We could `drop(state.file)` explicitly for clarity:
         drop(state.file);
+        // #4082 — where a test holds the placement, as a long copy holds it.
+        #[cfg(test)]
+        drawer_edges::seams::placing_waits(&state.dest_dir).await;
 
         // M4 fix: re-run unique_path at rename time so an operator
         // who created a colliding file mid-upload doesn't make us
@@ -3164,10 +3271,19 @@ impl FilesHandler {
     /// browser's reconnect budget is exhausted. Returns true when an
     /// upload matched the id (caller logs this for audit clarity), and an
     /// error the viewer is sent for an id that is not one plain name (#3688).
+    /// #4082 — false, touching nothing, for an upload whose end is placing it
+    /// ([`upload_ending`]).
     pub async fn cancel_incoming(&self, id: &str) -> Result<bool> {
         // #3688 — one plain name, checked before anything is cleared or
         // removed.
         transfer_id(id)?;
+        // #4082 (D1-A) — an upload whose end is placing its file now: the
+        // placement cannot stop, and its staging is what it reads. Left alone,
+        // as before its end was taken off the read loop, when this cancel was
+        // read only once the end was done; its end answers it.
+        if upload_ending(id) {
+            return Ok(false);
+        }
         // First clear in-flight state if it matches.
         let mut cleared_state = false;
         let in_flight = {
@@ -3305,6 +3421,15 @@ impl FilesHandler {
     async fn resume_upload(&self, now: FsAs, id: &str, requested_offset: u64) -> Result<u64> {
         // #3688 — one plain name, checked before any partial is looked for.
         transfer_id(id)?;
+        // #4082 — an upload whose end is placing its file now, on this
+        // channel or another: refused before anything is looked up, and long
+        // before its staging, which that placement reads, could be truncated.
+        // Its end answers it.
+        if upload_ending(id) {
+            return Err(anyhow!(
+                "files:resume {id} but its end is placing the file now"
+            ));
+        }
         // Locate meta_path: registry first, then on-demand probe at
         // the canonical Downloads-rooted location for cross-restart
         // discovery survivors. Poison-tolerant — the HashMap has no
