@@ -160,9 +160,14 @@ pub struct Vp9Encoder {
     force_keyframe: bool,
     /// Most-recent bitrate target (as set by REMB/back-channel).
     target_bitrate: u32,
-    /// #3472 — the pts the last encode handed libvpx, and when it was handed:
-    /// a frame fed again is stamped from them ([`refed_pts`]).
-    last_pts: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
+    /// #3472 — the last encode's stamp: the pts handed libvpx, today's pts
+    /// for that frame, and when it was handed. A frame fed again is stamped
+    /// from them ([`crate::encode::charge::refed_pts`]).
+    last_pts: Option<crate::encode::charge::Stamp>,
+    /// FR-148 D51 B4f — the most an encode is charged
+    /// ([`crate::encode::charge::charge`]), from the pump while the in-flight
+    /// budget acts; `None`, today's pts, otherwise.
+    charge_most: Option<std::time::Duration>,
 }
 
 // `vpx_codec_ctx_t` contains raw `*const`/`*mut` pointers into
@@ -366,6 +371,7 @@ impl Vp9Encoder {
             force_keyframe: true, // first frame is always keyframe
             target_bitrate: DEFAULT_BITRATE_BPS,
             last_pts: None,
+            charge_most: None,
         };
         enc.apply_screen_content_controls();
         Ok(enc)
@@ -541,6 +547,14 @@ impl Vp9Encoder {
         }
     }
 
+    /// FR-148 D51 B4f — the most time each encode from now on is charged
+    /// (`encode::charge`): the pump's interval for its frames while the
+    /// in-flight budget acts, `None` (today's pts) otherwise. A new encoder
+    /// starts at `None`.
+    pub fn set_charge_most(&mut self, most: Option<std::time::Duration>) {
+        self.charge_most = most;
+    }
+
     /// The current `rc_max_quantizer` (0-63).
     pub fn max_quantizer(&self) -> u32 {
         self.cfg.rc_max_quantizer
@@ -710,8 +724,11 @@ impl Vp9Encoder {
             pts
         };
         // #3472 — a frame fed again (the pump's idle keepalive) carries its
-        // own time, not its first encode's.
-        let pts = refed_pts(self.last_pts, pts, now);
+        // own time, not its first encode's. FR-148 D51 B4f — and where the
+        // in-flight budget acts, the gap libvpx grants by is at most the
+        // pump's interval (`encode::charge`); else the pts is today's.
+        let stamp = crate::encode::charge::charge(self.last_pts, pts, now, self.charge_most);
+        let pts = stamp.pts;
         let duration: u64 = frame_duration_us as u64;
 
         let force_kf = self.force_keyframe || self.frame_idx == 0;
@@ -738,7 +755,7 @@ impl Vp9Encoder {
         if err != vpx::VPX_CODEC_OK {
             bail!("vp9-444: vpx_codec_encode failed: {err:?}");
         }
-        self.last_pts = Some((pts, now));
+        self.last_pts = Some(stamp);
 
         // P8 Phase 5 (QP telemetry, record-only) — the quantizer libvpx
         // actually used for THIS frame (its native qindex scale, not the
@@ -803,32 +820,6 @@ impl Vp9Encoder {
         }
         self.frame_idx += 1;
         Ok(out)
-    }
-}
-
-/// #3472 — the pts libvpx is handed for a frame whose own `pts` is not after
-/// the last one (`last`: that pts, and when it was handed). The pump's idle
-/// keepalive re-encodes its last frame: the same `Arc<Frame>`, so the same
-/// `monotonic_us`. libvpx's one-pass rate control reads its frame rate off
-/// the gaps between timestamps, so a repeated pts adds no time, yet each
-/// encode is still granted `target ÷ that rate`. The keepalive banked a
-/// capture's worth of budget and the next capture spent it: 2.0–2.4× the
-/// target in the field (2026-11-03, 11-04). Stamped with the last pts plus
-/// the time since the last encode, every encode carries its own time and
-/// the grants add up to the target. At least 1 µs later, so the pts stays
-/// strictly increasing whatever the clock reads.
-fn refed_pts(
-    last: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
-    pts: vpx::vpx_codec_pts_t,
-    now: std::time::Instant,
-) -> vpx::vpx_codec_pts_t {
-    match last {
-        Some((last_pts, at)) if pts <= last_pts => {
-            let since =
-                i64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(i64::MAX);
-            last_pts.saturating_add(since.max(1))
-        }
-        _ => pts,
     }
 }
 
@@ -1782,38 +1773,89 @@ mod tests {
         );
     }
 
-    /// #3472 — the stamp rule alone: a pts after the last one passes through;
-    /// one that is not (repeated or earlier) takes the last pts plus the time
-    /// since the last encode, and is never the last pts again.
+    /// FR-148 D51 B4f — libvpx grants by the pts it is handed. At 3 Mbit/s
+    /// and 30 fps, on a screen whose window changes on every capture, after a
+    /// 500 ms hold: with today's pts the gap is granted, and the second after
+    /// the hold spends more than a second on time does. The grant is spent
+    /// over the frames that follow, not in the first: libvpx lowers its
+    /// quantizer a few steps a frame. Charged at most the 33 ms interval
+    /// (`encode::charge`), the second after the hold is a second on time.
     #[test]
-    fn a_frame_fed_again_takes_the_time_since_the_last_encode() {
+    fn a_hold_charged_the_interval_is_not_granted() {
+        use crate::encode::VideoEncoder;
+        let (w, h) = (640u32, 360u32);
+        let mut seed = 0x0b4f_5eed_u64;
+        let mut frame = |t_us: u64| -> Frame {
+            let mut buf = vec![40u8; (w * h * 4) as usize];
+            for y in 120..240u32 {
+                for x in 220..420u32 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let i = ((y * w + x) * 4) as usize;
+                    buf[i..i + 3].copy_from_slice(&seed.to_le_bytes()[..3]);
+                }
+            }
+            Frame {
+                width: w,
+                height: h,
+                stride: w * 4,
+                pixel_format: PixelFormat::Bgra,
+                data: buf.into(),
+                monotonic_us: t_us,
+                monitor: 0,
+                damage: crate::capture::Damage::Unknown,
+                source: None,
+            }
+        };
         let t0 = std::time::Instant::now();
-        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
-        assert_eq!(
-            refed_pts(None, 5_000, at(0)),
-            5_000,
-            "a first frame keeps its pts"
+        let at = |us: u64| t0 + std::time::Duration::from_micros(us);
+        let size = |pkts: Vec<EncodedPacket>| pkts.iter().map(|p| p.data.len()).sum::<usize>();
+        // The third second on time, after a 2 s settle; then the hold, and
+        // three seconds on time after it, frame by frame.
+        let mut run = |most: Option<std::time::Duration>| -> (usize, Vec<usize>) {
+            let mut enc =
+                Vp9Encoder::new_with_fps_chroma(w, h, 30, Vp9Chroma::Yuv444).expect("encoder init");
+            VideoEncoder::set_bitrate(&mut enc, 3_000_000);
+            enc.set_charge_most(most);
+            let (mut t, mut on_time) = (1_000_u64, 0);
+            for i in 0..90 {
+                let n = size(enc.encode_at(&frame(t), at(t)).expect("encode"));
+                if i >= 60 {
+                    on_time += n;
+                }
+                t += 33_333;
+            }
+            t += 500_000;
+            let mut after = Vec::new();
+            for _ in 0..90 {
+                after.push(size(enc.encode_at(&frame(t), at(t)).expect("encode")));
+                t += 33_333;
+            }
+            (on_time, after)
+        };
+        let second = |v: &[usize], s: usize| v[30 * s..30 * (s + 1)].iter().sum::<usize>();
+        let seconds = |v: &[usize]| [second(v, 0), second(v, 1), second(v, 2)];
+        let (today_on_time, today_after) = run(None);
+        let (on_time, after) = run(Some(std::time::Duration::from_micros(33_333)));
+        println!(
+            "B4f libvpx: a second on time, today {today_on_time} B, charged the interval {on_time} B; \
+             the seconds after the hold, today {:?} B (its first frames {:?} B), charged the interval \
+             {:?} B (its first frames {:?} B)",
+            seconds(&today_after),
+            &today_after[..6],
+            seconds(&after),
+            &after[..6],
         );
-        let last = Some((5_000, at(0)));
-        assert_eq!(
-            refed_pts(last, 105_000, at(100)),
-            105_000,
-            "a later pts passes"
+        assert!(
+            second(&today_after, 0) * 4 >= today_on_time * 5,
+            "today the hold is granted: {:?} B after it against {today_on_time} B on time",
+            seconds(&today_after)
         );
-        assert_eq!(
-            refed_pts(last, 5_000, at(60)),
-            65_000,
-            "a repeat takes the 60 ms since"
-        );
-        assert_eq!(
-            refed_pts(last, 1_000, at(60)),
-            65_000,
-            "and so does an earlier pts"
-        );
-        assert_eq!(
-            refed_pts(last, 5_000, at(0)),
-            5_001,
-            "never the last pts again"
+        assert!(
+            second(&after, 0) * 10 <= on_time * 11,
+            "charged the interval: {:?} B after it against {on_time} B on time",
+            seconds(&after)
         );
     }
 }

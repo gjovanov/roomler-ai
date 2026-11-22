@@ -767,6 +767,22 @@ impl AgeLoop {
     /// session that begins congested — and therefore never sees a good
     /// window to learn from — is still caught.
     pub fn observe(&mut self, age_ms: u16, age_min_ms: u16, one_way_ms: u16) -> bool {
+        self.observe_within(age_ms, age_min_ms, one_way_ms, 0)
+    }
+
+    /// FR-148 D51 B4a-2 — [`Self::observe`] beside an envelope: the age, in
+    /// ms, that the in-flight budget's own queue may add under `on`, on a
+    /// relay session (S and the window's largest frame at the budget's
+    /// rate). Both thresholds move up by it, so a lag past the budget's
+    /// queue still fires and the budget's queue alone does not. The floor
+    /// learns as before. `observe` is this with an envelope of 0.
+    pub fn observe_within(
+        &mut self,
+        age_ms: u16,
+        age_min_ms: u16,
+        one_way_ms: u16,
+        envelope_ms: u16,
+    ) -> bool {
         if age_is_plausible(age_min_ms, one_way_ms) {
             self.ring[self.idx] = age_min_ms.max(1);
             self.idx = (self.idx + 1) % AGE_FLOOR_RING;
@@ -779,11 +795,12 @@ impl AgeLoop {
         // Fall back to the physical bound while nothing plausible has been
         // learned — never to the sample we just rejected.
         let floor = self.floor_ms().unwrap_or(one_way_ms.max(1));
-        let over_excess = age_ms.saturating_sub(floor) >= AGE_SLACK_MS;
+        let over_excess = age_ms.saturating_sub(floor) >= AGE_SLACK_MS.saturating_add(envelope_ms);
         let over_queued = age_ms
             >= one_way_ms
                 .saturating_mul(AGE_OVER_QUEUE_MULTIPLE)
-                .max(AGE_OVER_QUEUE_MIN_MS);
+                .max(AGE_OVER_QUEUE_MIN_MS)
+                .saturating_add(envelope_ms);
         self.over_streak = if over_excess || over_queued {
             self.over_streak.saturating_add(1)
         } else {

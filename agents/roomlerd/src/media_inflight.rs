@@ -375,6 +375,10 @@ struct Tick {
 struct Figure {
     first: u64,
     last: u64,
+    /// FR-148 D51 B4f (C11) — where the earliest of their windows started
+    /// (µs): a figure that started before the last change of pair or
+    /// association measured the old one, in part or in whole.
+    from: u64,
     bps: u64,
 }
 
@@ -592,6 +596,16 @@ pub struct Budget {
     /// that starts before it is no P3 capacity ([`Over::opening`]).
     measured: bool,
     first_measured: Option<u64>,
+    /// FR-148 D51 B4b — the last step's time (µs), and the last step that held
+    /// outside a still span ([`Self::held_lately`]).
+    stepped: u64,
+    open_hold: Option<u64>,
+    /// FR-148 D51 B4f (C11) — whether the figures since the last change of
+    /// pair or association gave the rate, and when that change was (µs). A
+    /// rate the old one's figures gave still sizes the budget, as the opening
+    /// rate does, but is no reading of the new one ([`Self::held_lately`]).
+    own: bool,
+    own_from: u64,
     /// The last step's budget, `out` and rate.
     last: (u64, u64, Option<u64>),
     /// FR-148 D48 — SCTP's fast retransmits and T3-rtx expiries at the last
@@ -689,6 +703,10 @@ impl Budget {
             still_now: false,
             measured: false,
             first_measured: None,
+            stepped: 0,
+            open_hold: None,
+            own: false,
+            own_from: 0,
             last: (0, 0, None),
             loss: None,
             loss_before: 0,
@@ -740,7 +758,11 @@ impl Budget {
             if self.ramp_sized(rate, &r.gauges) {
                 self.ramp_holds |= 1;
             }
+            if still.is_none() {
+                self.open_hold = Some(t);
+            }
         }
+        self.stepped = t;
         self.last = (budget, out, rate);
         self.loss = Some(
             self.loss_before
@@ -772,6 +794,25 @@ impl Budget {
     /// The least acknowledgement delay; `None` before the first SACK.
     pub fn least(&self) -> Option<Duration> {
         self.least
+    }
+
+    /// S, the queue the budget stands over the least.
+    pub fn slack(&self) -> Duration {
+        self.slack
+    }
+
+    /// FR-148 D51 B4b — a step held a frame outside a still span within
+    /// [`RATE_WINDOW`] of the last step, on this association: the link was
+    /// busy, so the rate is the link's. The governor bounds its target at that
+    /// rate while this holds, and takes it as its reading
+    /// (`RateGovernor::note_path_rate`). FR-148 D51 B4f (C11): only a rate
+    /// this pair's and this association's own figures gave; after a change of
+    /// either, nothing until they give one.
+    pub fn held_lately(&self) -> bool {
+        self.own
+            && self
+                .open_hold
+                .is_some_and(|h| self.stepped.saturating_sub(h) <= us(RATE_WINDOW))
     }
 
     /// How long the clock may stand still with bytes out before it is a stall
@@ -918,9 +959,11 @@ impl Budget {
 
     /// The selected candidate pair changed: the old path's least is no floor
     /// for the new one's, and its releases say nothing of the new carrier.
+    /// FR-148 D51 B4f (C11): nor is its rate the new one's reading.
     pub fn reset_least(&mut self) {
         self.least = None;
         self.forget_releases();
+        self.forget_reading();
     }
 
     /// A new association: its clock counts from 0 and its delays are its own.
@@ -942,7 +985,16 @@ impl Budget {
         self.still_now = false;
         self.measured = false;
         self.first_measured = None;
+        self.forget_reading();
         self.forget_releases();
+    }
+
+    /// FR-148 D51 B4f (C11) — the pair or the association changed: no hold so
+    /// far and no figure so far is the new one's reading.
+    fn forget_reading(&mut self) {
+        self.open_hold = None;
+        self.own = false;
+        self.own_from = self.stepped;
     }
 
     /// FR-148 D46 — the class of the releases goes with the least: the next
@@ -1103,7 +1155,7 @@ impl Budget {
             .filter(|&(first, end, _)| first < from.at && from.at <= end)
             .map_or((from.at, from.acked), |(first, _, count)| (first, count));
         let bps = acked.saturating_sub(base).saturating_mul(8_000_000) / t.saturating_sub(start);
-        self.add_figure(t, bps);
+        self.add_figure(t, start, bps);
         while self
             .figures
             .oldest()
@@ -1121,21 +1173,35 @@ impl Budget {
         // FR-148 D46 B2 — the figures gave it, or the application-limited
         // rule keeps one they gave; else the opening rate still stands in.
         self.measured = held || most >= opening.unwrap_or(0) || self.measured;
+        // FR-148 D51 B4f (C11) — the figures gave it: are they this pair's and
+        // this association's? Those since the last change hold the most. A
+        // rate the application-limited rule keeps stays whose it was.
+        if rate == most {
+            self.own = self
+                .figures
+                .iter()
+                .filter(|f| f.from >= self.own_from)
+                .map(|f| f.bps)
+                .max()
+                == Some(most);
+        }
         self.standing = Some(rate);
         Some(rate)
     }
 
-    fn add_figure(&mut self, t: u64, bps: u64) {
+    fn add_figure(&mut self, t: u64, from: u64, bps: u64) {
         if let Some(f) = self.figures.newest_mut()
             && t.saturating_sub(f.first) < us(GRAIN)
         {
             f.bps = f.bps.max(bps);
             f.last = t;
+            f.from = f.from.min(from);
             return;
         }
         self.figures.push(Figure {
             first: t,
             last: t,
+            from,
             bps,
         });
     }
@@ -1391,11 +1457,21 @@ impl Pass {
     }
 
     /// Whether the gate's skip calls the AIMD's decrease: never inside FR-35's
-    /// opener grace (`grace`), as today, and never for the budget's hold in a
-    /// still span (D46's no-decrease rule). A pass the send channel or a
-    /// follower shut decreases as today.
+    /// opener grace (`grace`), as today, and never for a hold that shut the
+    /// pass by itself (FR-148 D51 B4a-1: the budget owns the queue, so its hold
+    /// is no AIMD event; D46's no-decrease rule spared only one in a still
+    /// span). A pass the send channel or a follower shut decreases as today.
     pub fn decreases(&self, grace: bool) -> bool {
-        !grace && !self.stalled()
+        !grace && !self.held()
+    }
+
+    /// FR-148 D51 B4a-1 — whether the gate's skip is the budget's own hold,
+    /// which the governor hears as a capacity fact and not as a decrease:
+    /// outside FR-35's opener grace, a hold that shut the pass by itself
+    /// outside a still span. One in a still span, a stall of the carrier, is
+    /// neither (D46).
+    pub fn hears_hold(&self, grace: bool) -> bool {
+        !grace && self.held() && !self.stalled()
     }
 
     /// Whether the VP9-444 watermark arm sheds a frame `over` its mark: as
@@ -1407,7 +1483,7 @@ impl Pass {
 
 /// The opening rate a pump's step reads: the governor's applied rate, or
 /// before one is applied the rate the pump opened at; 0 when neither is known.
-fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
+pub(crate) fn opening(applied_bps: u32, open_at_bps: Option<u32>) -> u64 {
     let open = if applied_bps > 0 {
         applied_bps
     } else {
@@ -2820,7 +2896,9 @@ mod tests {
                     verdict.holds(),
                     "{what}, byte gate {byte_gate}"
                 );
-                assert!(pass.decreases(false), "{what}: no still span");
+                // FR-148 D51 B4a-1: the hold is heard, and decreases nothing.
+                assert_eq!(pass.decreases(false), !verdict.holds(), "{what}");
+                assert_eq!(pass.hears_hold(false), verdict.holds(), "{what}");
                 assert!(!pass.sheds(true), "{what}");
             }
         }
@@ -2861,9 +2939,12 @@ mod tests {
             let still = t >= 2_300;
             assert!(s.shut(&mut pass), "at {t} ms");
             assert_eq!(pass.stalled(), still, "at {t} ms");
-            assert_eq!(pass.decreases(false), !still, "at {t} ms");
+            // FR-148 D51 B4a-1: no hold decreases; one before the span is
+            // heard as the budget's, one in it is not.
+            assert!(!pass.decreases(false), "at {t} ms");
+            assert_eq!(pass.hears_hold(false), !still, "at {t} ms");
             assert!(
-                !pass.decreases(true),
+                !pass.decreases(true) && !pass.hears_hold(true),
                 "inside the opener's grace, at {t} ms"
             );
         }
@@ -2881,6 +2962,134 @@ mod tests {
         let w = s.take_window();
         assert_eq!(w.held, (18, 18));
         assert_eq!((w.acted, w.acted_stalled), ((17, 18), 11));
+    }
+
+    /// FR-148 D51 B4a-1 (C1) — a hold the budget acts on is no AIMD event.
+    /// Under `on`, on a relay session, over readings that hold while the clock
+    /// moves (no still span): each hold shuts its pass by itself and calls no
+    /// decrease; the governor hears it as the budget's hold, a capacity fact.
+    /// Inside FR-35's opener grace neither, as today. The budget reads each as
+    /// a hold of its own, outside a still span.
+    #[test]
+    fn an_acting_hold_is_no_aimd_event() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let mut acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        let mut s = on_with(b);
+        // 2 Mbit/s × (S + S) = 75 000 bytes, with 100 000 out, while the
+        // clock moves at 2 Mbit/s.
+        for t in (2_000..=4_000).step_by(50) {
+            let r = read(acked, wide(100_000, 0), 1_500_000);
+            let mut pass =
+                s.gate_reading(at(t0, t), r.acked_bytes, r.gauges, r.open_bps, true, false);
+            assert!(s.shut(&mut pass), "at {t} ms");
+            assert!(pass.held() && !pass.stalled(), "at {t} ms");
+            assert!(!pass.decreases(false), "no decrease, at {t} ms");
+            assert!(pass.hears_hold(false), "heard as the budget's, at {t} ms");
+            assert!(
+                !pass.decreases(true) && !pass.hears_hold(true),
+                "inside the opener's grace, at {t} ms"
+            );
+            assert!(s.budget().held_lately(), "at {t} ms");
+            acked += 2_000_000 / 8 * 50 / 1_000;
+        }
+        let w = s.take_window();
+        assert_eq!((w.acted, w.acted_stalled), ((41, 41), 0), "{w:?}");
+    }
+
+    /// FR-148 D51 B4a-1 — C1's companion: while the budget holds, a pass the
+    /// send channel or a follower shut before its term was asked decreases as
+    /// today, and is no hold of the budget's. So does every skip of a pass the
+    /// budget does not act on: shadow, and a direct session under `on`.
+    #[test]
+    fn a_channel_skip_under_on_still_decreases() {
+        let mut b = Budget::new();
+        let t0 = Instant::now();
+        let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 40_000);
+        let r = read(acked, wide(100_000, 0), 1_500_000);
+        let mut s = on_with(b.clone());
+        let pass = s.gate_reading(
+            at(t0, 2_000),
+            r.acked_bytes,
+            r.gauges,
+            r.open_bps,
+            true,
+            false,
+        );
+        assert!(pass.acts() && !pass.held(), "the channel shut it first");
+        assert!(pass.decreases(false) && !pass.hears_hold(false));
+        assert!(!pass.decreases(true) && !pass.hears_hold(true));
+        for (mode, constrained) in [(Mode::Shadow, true), (Mode::On, false)] {
+            let mut s = Shadow::for_pump(mode, true).unwrap();
+            s.budget = b.clone();
+            let mut pass = s.gate_reading(
+                at(t0, 2_000),
+                r.acked_bytes,
+                r.gauges,
+                r.open_bps,
+                constrained,
+                true,
+            );
+            assert!(
+                !pass.acts() && s.shut(&mut pass),
+                "{mode:?}: the byte gate shuts it"
+            );
+            assert!(pass.decreases(false) && !pass.hears_hold(false), "{mode:?}");
+        }
+    }
+
+    /// FR-148 D51 B4f (C11) — a reading belongs to the association and the
+    /// pair that measured it. What the governor reads from the acting budget,
+    /// for B4b's cap and B4b-2's reading alike (a hold lately and a measured
+    /// rate, as `RateGovernor::budget_held_bps` takes them), after the budget
+    /// held at 2 Mbit/s: (a) the selected pair changes, and the new one
+    /// carries 1 Mbit/s, held once a second. The standing 2 Mbit/s still
+    /// sizes the budget, as today, but is no reading. Backlogged on the new
+    /// pair, its own 1 Mbit/s reads. (b) The same over a new association, its
+    /// clock from 0.
+    #[test]
+    fn after_a_new_pair_or_association_nothing_reads_until_a_hold_there_reads_again() {
+        let reads = |b: &Budget| {
+            (b.held_lately() && b.rate_measured())
+                .then(|| b.rate_bps())
+                .flatten()
+        };
+        let t0 = Instant::now();
+        for new_association in [false, true] {
+            let mut b = Budget::new();
+            // Backlogged at 2 Mbit/s: 100 000 out over a budget of 75 000.
+            let acked = run(&mut b, t0, 0, 1_950, 0, 2_000_000, 100_000);
+            assert_eq!(reads(&b), Some(2_000_000), "{new_association}: it reads");
+            let mut acked = if new_association {
+                b.on_new_association();
+                0
+            } else {
+                b.reset_least();
+                acked
+            };
+            assert_eq!(reads(&b), None, "{new_association}: at the change");
+            for t in (2_000..=5_950).step_by(50) {
+                let out = if t % 1_000 == 0 { 100_000 } else { 1 };
+                b.step(at(t0, t), &read(acked, wide(out, 1), 1_500_000));
+                acked += 1_000_000 / 8 * 50 / 1_000;
+                assert_eq!(
+                    reads(&b),
+                    None,
+                    "{new_association}: held once a second, at {t} ms"
+                );
+            }
+            assert_eq!(
+                b.rate_bps(),
+                Some(2_000_000),
+                "{new_association}: the standing rate sizes the budget, as today"
+            );
+            run(&mut b, t0, 6_000, 7_500, acked, 1_000_000, 100_000);
+            assert_eq!(
+                reads(&b),
+                Some(1_000_000),
+                "{new_association}: a hold there reads again"
+            );
+        }
     }
 
     /// FR-148 D46 B3 — the budget acts only under `on`, on a constrained
@@ -2911,7 +3120,10 @@ mod tests {
                 assert_eq!(pass.acts(), acts, "{what}");
                 assert_eq!(pass.shuts(), acts || byte_gate, "{what}");
                 assert_eq!(pass.sheds(true), !acts, "{what}");
-                assert!(pass.decreases(false) && !pass.decreases(true), "{what}");
+                // FR-148 D51 B4a-1: an acting hold is heard, never decreases.
+                assert_eq!(pass.decreases(false), !acts, "{what}");
+                assert_eq!(pass.hears_hold(false), acts, "{what}");
+                assert!(!pass.decreases(true), "{what}");
                 let w = s.take_window();
                 assert_eq!(w.held, (u64::from(acts), u64::from(acts)), "{what}");
                 assert_eq!(w.acted, (0, u64::from(acts)), "{what}");
