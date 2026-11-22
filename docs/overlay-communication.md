@@ -1020,25 +1020,38 @@ why per-roll medians land on 7.5, 15 and 25 s.
 **Since the pre-pull** (2026-11-07, the second lever below), the image is on both nodes before the roll
 begins ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#ac4-the-rolls-since-the-pre-pull)):
 
-| Measure | Before the pre-pull | Since the pre-pull |
-|---|---|---|
-| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` |
-| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 |
-| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s |
-| `/derp` down, per socket | p50 7.6 s, p90 15.9 s (310 sockets, October) | p50 3.4 s, p90 3.7 s (156 sockets on eight promotes to 2026-11-16) |
-| Control socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (2026-11-02) | p50 3.5 s, p90 4.0 s (84 sockets, the same eight) |
+| Measure | Before the pre-pull | Since the pre-pull | Since, with `ws_flat_redial` on |
+|---|---|---|---|
+| A replacement starts | 5.1–5.9 s after its SIGTERM, 3–4 s of it the pull | 2 s after its SIGTERM, `Container image … already present on machine` | Unchanged: the switch acts on the device |
+| A whole roll, first SIGTERM to second Ready | 33.9 s | 25 s on 2026-11-07; 24–28 s on five promotes to 2026-11-16 | Unchanged |
+| Each wave, SIGTERM to Ready | 16.9 s and 17.1 s | 12 s and 13 s | Unchanged |
+| `/derp` down, per socket | p50 7.6 s, p90 15.9 s (310 sockets, October) | p50 3.4 s, p90 3.7 s (156 sockets on eight promotes to 2026-11-16) | p50 2.1 s, max 2.7 s (8 sockets on two hosts, two promotes of 2026-11-21) |
+| Control socket close to `control-WS reattached` | p50 7.8 s, p90 8.8 s (2026-11-02) | p50 3.5 s, p90 4.0 s (84 sockets, the same eight) | 1.9–2.9 s to the hello (8 sockets, the same two promotes). These hosts cannot log the reattach line, which follows the hello by 47 ms at most where it is logged |
 
 What is left of a wave is the old pod's exit, the scheduling and the start (about 2 s), then 10–12 s until
 Kubernetes marks the replacement Ready, which releases the second wave. That paces the roll, not the reattach:
 the front nginx sends to the node's address and never sees readiness, so a socket can land as soon as the
 binary listens. On the ladder it lands at the +3 s dial, as 80 of the 84 reattaches did, where it used to wait
-for +7 s.
+for +7 s. With the flat redial on, it lands within a second of the replacement listening
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#the-switch-on-half-2026-11-22)):
+
+```mermaid
+flowchart LR
+    C["socket cut"] --> D["first dial, about +1 s<br/>502: no process behind the pin"]
+    D --> Q{"ws_flat_redial on?"}
+    Q -- no --> L["the ladder's +3 s dial<br/>back at 3.1 s"]
+    Q -- yes --> F["a flat redial every 0.5 to 1 s<br/>while the answer is 502"]
+    F --> B["back at 1.9 to 2.9 s"]
+```
+
+The two hosts that ran it were back 1.9–2.9 s after their cut on two promotes, after one or two flat redials,
+where the same hosts took 3.1 s on the ladder and the same promotes' other hosts p50 3.4 s.
 
 **Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
 
 | Lever | What it changes | Switch |
 |---|---|---|
-| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200. With the pre-pull it has about 1 s a wave left to buy, and its field read (FR-28's AC3) is owed | `ws_flat_redial`, default OFF |
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder. In every agent since 0.4.200. With the pre-pull it had about 1 s a wave left to buy, and it bought most of it: 1.9–2.9 s with it on, against 3.1 s for the same hosts on the ladder (FR-28's AC3, read 2026-11-22) | `ws_flat_redial`, default OFF |
 | Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)). In force since 2026-11-07: a roll takes 25 s instead of 33.9 s (the table above) | The deploy repo's DaemonSet file |
 
 ⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
