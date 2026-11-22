@@ -4028,8 +4028,8 @@ async fn media_pump_vp9_444_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
-    // FR-148 D51 B4f — the charge bound last handed to `encoder` (`None` when new).
-    let mut charged_most: Option<Duration> = None;
+    // FR-148 D51 B4g — the time the capacity gate held frames back since the last encode.
+    let mut gate_clock = crate::encode::charge::GateClock::default();
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -4256,7 +4256,7 @@ async fn media_pump_vp9_444_dc(
     // loop). A SINGLE consumer keeps the 16 KiB chunk order intact (the browser
     // reassembler needs it). Depth is intentionally shallow so we stay
     // low-latency — under sustained congestion the pump sheds load rather than
-    // building a stale backlog.
+    // building a stale backlog. Each frame carries its hand-off instant (FR-148).
     const VP9_SEND_QUEUE_DEPTH: usize = 2; // shallower than FFmpeg's 4 — VP9-444 frames are large; minimise input head-of-line delay
     let send_depth = if constrained_transport {
         VP9_SEND_QUEUE_DEPTH
@@ -4267,7 +4267,7 @@ async fn media_pump_vp9_444_dc(
         // Input rides a SEPARATE DC, so a deeper video queue adds no input lag.
         8
     };
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
+    let (send_tx, mut send_rx) = mpsc::channel::<(std::time::Instant, Bytes)>(send_depth);
     // P8c — the rate governor owns this pump's AIMD (rc.171 — driven off
     // SEND-CHANNEL OCCUPANCY at the capacity gate, the real webrtc-rs
     // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
@@ -4293,6 +4293,7 @@ async fn media_pump_vp9_444_dc(
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         let budget_bytes = delivery.pump_count(); // FR-148 D46
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
@@ -4305,7 +4306,7 @@ async fn media_pump_vp9_444_dc(
             // (`encode::goodput`).
             while let Some(first) = send_rx.recv().await {
                 let mut next = Some(first);
-                while let Some(wire) = next.take() {
+                while let Some((enqueued_at, wire)) = next.take() {
                     let mut unsent = budget_bytes.unsent(wire.len()); // FR-148 D46
                     if let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let total = wire.len();
@@ -4346,6 +4347,7 @@ async fn media_pump_vp9_444_dc(
                                 ser_start.elapsed(),
                                 video_bytes_is_keyframe(&wire),
                             );
+                            send_wait.sent(enqueued_at, std::time::Instant::now()); // FR-148
                         }
                     }
                     next = send_rx.try_recv().ok();
@@ -4506,6 +4508,7 @@ async fn media_pump_vp9_444_dc(
         delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
         if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
+            gate_clock.skipped(std::time::Instant::now()); // FR-148 D51 B4g
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
             // backpressure signal. Drive the multiplicative decrease HERE,
@@ -4524,6 +4527,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
+        gate_clock.passed(std::time::Instant::now()); // FR-148 D51 B4g
         delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
@@ -4815,7 +4819,6 @@ async fn media_pump_vp9_444_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
-                    charged_most = None;
                     // Badge-truth — record the ACTUAL chroma for the
                     // `rc:video-info` retry block and (re)announce it.
                     chroma_wire = chroma.as_str();
@@ -4955,6 +4958,7 @@ async fn media_pump_vp9_444_dc(
         // Bounded sub-second, and NO forced keyframe on resume — a pause
         // loses no frames, so the delta chain survives it intact.
         if governor.draining(std::time::Instant::now()) {
+            gate_clock.paused(); // FR-148: under `on`, the pause is gated
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
@@ -5031,16 +5035,15 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
-        // FR-148 D51 B4f — where the budget acts, libvpx is charged at most the
-        // pump's interval for this frame (`RateGovernor::charge_most`): a wait
-        // past it is not granted. Elsewhere `None`, and the pts is today's.
-        let charge_most = governor.charge_most(target_fps);
-        if charge_most != charged_most {
-            enc.with(move |e| e.set_charge_most(charge_most)).await;
-            charged_most = charge_most;
-        }
+        // FR-148 D51 B4g — where the budget acts, libvpx is charged this frame's gap
+        // less the time the gate held frames back, never less than the interval
+        // (`RateGovernor::charge_interval`), on the encode's own message. Else today's pts.
+        let gated = gate_clock.take();
+        let gate = governor
+            .charge_interval(target_fps)
+            .map(|interval| crate::encode::charge::Gate { gated, interval });
         let encode_start = std::time::Instant::now();
-        let packets = match enc.encode(&frame).await {
+        let packets = match enc.encode_charged(&frame, gate).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(%session_id, %e, "VP9-444 encode error — pump exits");
@@ -5252,7 +5255,7 @@ async fn media_pump_vp9_444_dc(
             );
             let wire_len = wire.len() as u64;
             delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::Vp9444Dc); // FR-148 O10
-            match send_tx.try_send(wire) {
+            match send_tx.try_send((std::time::Instant::now(), wire)) {
                 Ok(()) => {
                     handed_bytes += wire_len;
                     delivery.on_handed(wire_len); // FR-148 D46
@@ -5335,6 +5338,7 @@ async fn media_pump_vp9_444_dc(
             // None = no report this window.
             let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
             let max_qp = (qp_n > 0).then_some(qp_max);
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms(); // FR-148
             info!(
                 %session_id,
                 target_fps,
@@ -5346,6 +5350,7 @@ async fn media_pump_vp9_444_dc(
                 settle_kf_suppressed,
                 avg_scale_ms,
                 avg_encode_ms,
+                send_wait_avg_ms, send_wait_max_ms,
                 paced_fps = ?governor.paced_software_fps(),
                 target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
@@ -5356,7 +5361,7 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
                 // FR-70 M0 — the fused age split by plane (transit is an
-                // upper bound here: this pump keeps no send-wait figure).
+                // upper bound here: this pump hands it no send wait).
                 age_split = ?governor.viewer_age_split(None),
                 // FR-71 T1a — which plane was the limiter last window (the
                 // verdict FR-79's gate reads; `evidence_rejected` below says
@@ -7098,20 +7103,16 @@ async fn media_pump_ffmpeg_dc(
     // against, resolved once like the line above (env/config are process-stable).
     let direct_lag_bound_ms = crate::encode::rate_profile::direct_queue_ms();
     // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
-    // enqueue→wire-complete per frame, accumulated by the send task and
-    // drained by the heartbeat. Sent frames only — a stale-dropped frame
-    // never rode the wire, and its wait would double-count the rebuild
-    // gap the epoch discard exists to erase.
-    let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // enqueue→wire-complete per frame of the frames that reached the wire,
+    // recorded by the send task in the delivery sampler's send wait (FR-148,
+    // `media_inflight::SendWait`, which both pumps keep) and drained by the
+    // heartbeat.
     // FR-71 T1a — per-viewer-window deltas of the sender-side counters, so the
     // governor's shadow classifier sees THIS window's sends, skips and waits
     // rather than the heartbeat's or the session's totals.
     let mut win_sent_last: u64 = 0;
     let mut win_skips_last: u64 = 0;
-    let mut win_sw_sum_last: u64 = 0;
-    let mut win_sw_frames_last: u64 = 0;
-    let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut win_send_wait = crate::media_inflight::SendWaitSince::default();
     // FR-35 P3 — the opener as a burst probe: bytes sent and the longest
     // queue-wait seen while the opening grace is on. Their ratio is the
     // pipe's burst drain rate — the one number that sizes a crisp opener —
@@ -7127,19 +7128,18 @@ async fn media_pump_ffmpeg_dc(
     let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // FR-74 P1b — the enqueue instant (µs since `head_wait_epoch`, +1 so 0
     // means "nothing at the head") of the frame the send task is writing
-    // RIGHT NOW. The completion-based waits above only learn about a frame
+    // RIGHT NOW. The completion-based send waits only learn about a frame
     // once it has left the wire, so on a stalled pipe they read stale-low
     // while the queue grows; this cell lets the gate see the live age of
     // the head frame instead. Cleared by the send task after each write.
     let send_head_enqueued_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let head_wait_epoch = std::time::Instant::now();
     // The gate's own view of the measured send wait: an EMA over the
-    // per-pass average of completed frames' waits (α = 0.3) — separate
-    // "last" cursors from the FR-71 window deltas so the two readers never
-    // race each other for the same counters.
+    // per-pass average of completed frames' waits (α = 0.3) — its own place
+    // in the send wait, apart from the FR-71 window's, so the two readers
+    // never race each other for the same counters.
     let mut direct_wait_ema_ms: f64 = 0.0;
-    let mut gate_sw_sum_last: u64 = 0;
-    let mut gate_sw_frames_last: u64 = 0;
+    let mut gate_send_wait = crate::media_inflight::SendWaitSince::default();
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -7304,9 +7304,7 @@ async fn media_pump_ffmpeg_dc(
         let send_errors = send_errors.clone();
         let inflight_bytes = inflight_bytes.clone();
         let send_epoch = send_epoch.clone();
-        let send_wait_us_sum = send_wait_us_sum.clone();
-        let send_wait_us_max = send_wait_us_max.clone();
-        let send_wait_frames = send_wait_frames.clone();
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         let send_stall_us = send_stall_us.clone();
         let send_head_enqueued_us = send_head_enqueued_us.clone();
         let opener_wait_us_max = opener_wait_us_max.clone();
@@ -7408,11 +7406,8 @@ async fn media_pump_ffmpeg_dc(
                             );
                             // P7 — queue-wait: enqueue→wire-complete. This is
                             // the transport-added latency the viewer feels;
-                            // the heartbeat drains it per window.
-                            let waited_us = enqueued_at.elapsed().as_micros() as u64;
-                            send_wait_us_sum.fetch_add(waited_us, Relaxed);
-                            send_wait_us_max.fetch_max(waited_us, Relaxed);
-                            send_wait_frames.fetch_add(1, Relaxed);
+                            // the pump's send wait keeps it (FR-148).
+                            let waited_us = send_wait.sent(enqueued_at, std::time::Instant::now());
                             send_stall_us.fetch_max(waited_us, Relaxed);
                             // FR-35 P3 — the opening burst as a probe.
                             if in_opener_grace.load(Relaxed) {
@@ -8043,17 +8038,8 @@ async fn media_pump_ffmpeg_dc(
         let (hard_budget, measured_wait_ms) = if constrained {
             (queue_budget, 0.0)
         } else {
-            {
-                let sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-                let frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-                let frames = frames_now.saturating_sub(gate_sw_frames_last);
-                if frames > 0 {
-                    let avg_ms =
-                        sum_now.saturating_sub(gate_sw_sum_last) as f64 / frames as f64 / 1000.0;
-                    direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
-                }
-                gate_sw_sum_last = sum_now;
-                gate_sw_frames_last = frames_now;
+            if let Some(avg_ms) = gate_send_wait.avg_ms(delivery.send_wait()) {
+                direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
             }
             let head = send_head_enqueued_us.load(std::sync::atomic::Ordering::Relaxed);
             let head_wait_ms = if head == 0 {
@@ -9270,23 +9256,18 @@ async fn media_pump_ffmpeg_dc(
         // FR-71 T1a — hand the governor this PASS's sender-side facts, every
         // pass, before it folds the viewer's report; it adds the passes up into
         // the window (FR-119 P2b-8), so the plane verdict reads both sides of
-        // the same window. Deltas against the running counters (the heartbeat
-        // swaps some of them, so it reads the totals, not swaps).
+        // the same window. Deltas against the running counters; the send wait's
+        // average from this reader's own place in it (FR-148). A heartbeat takes
+        // the send wait whole under that place, so the pass across one reads a
+        // saturated delta, as it did before; its longest is the heartbeat's so far.
         {
             let sent_now = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames = sw_frames_now.saturating_sub(win_sw_frames_last);
-            let sw_avg_ms = (sw_frames > 0).then(|| {
-                sw_sum_now.saturating_sub(win_sw_sum_last) as f64 / sw_frames as f64 / 1000.0
-            });
+            let sw_avg_ms = win_send_wait.avg_ms(delivery.send_wait());
             governor.note_window_sender(crate::encode::governor::WindowSenderStats {
                 inflight_bytes: inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 budget_bytes: queue_budget,
                 gate_skips: frames_skipped_backpressure.saturating_sub(win_skips_last) as u32,
-                send_wait_max_ms: send_wait_us_max.load(std::sync::atomic::Ordering::Relaxed)
-                    as f64
-                    / 1000.0,
+                send_wait_max_ms: delivery.send_wait().max_ms(),
                 send_wait_avg_ms: sw_avg_ms,
                 frames_sent: sent_now.saturating_sub(win_sent_last) as u32,
                 // FR-79 — the gate's first condition: was the agent's own loop
@@ -9305,8 +9286,6 @@ async fn media_pump_ffmpeg_dc(
             win_stalls_last = watch.stalls_total();
             win_sent_last = sent_now;
             win_skips_last = frames_skipped_backpressure;
-            win_sw_sum_last = sw_sum_now;
-            win_sw_frames_last = sw_frames_now;
         }
         let viewer_window = governor.tick_viewer_window(
             std::time::Instant::now(),
@@ -10037,15 +10016,8 @@ async fn media_pump_ffmpeg_dc(
             // for frames that reached the wire. THE drag-latency number the
             // byte gate exists to bound; read avg against max — a fat max
             // with a small avg is one IDR's transit, both fat is a standing
-            // queue.
-            let sw_frames = send_wait_frames.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let send_wait_avg_ms = send_wait_us_sum
-                .swap(0, std::sync::atomic::Ordering::Relaxed)
-                .checked_div(sw_frames)
-                .map(|us| us as f64 / 1000.0)
-                .unwrap_or(0.0);
-            let send_wait_max_ms =
-                send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            // queue. FR-148: the delivery sampler's send wait, taken whole.
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms();
             // FR-17 - read the LIVE channel, not a cached flag: the
             // handle can be replaced mid-session, and a stale copy
             // would mislabel exactly the window someone is measuring.

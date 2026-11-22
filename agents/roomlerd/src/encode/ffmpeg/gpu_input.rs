@@ -123,18 +123,18 @@ fn is_nvenc(name: &str) -> bool {
 }
 
 /// FR-118 P2-2 — the pool a `name` encoder opens on, or why it opens on CPU
-/// frames. Every gate is read here, at the open: the switch, the device the
-/// pump named (a GPU frame's), the cell, the denylist, the probe's proof
-/// (P2-3); then the pool itself, which fails on an adapter that is not the
-/// cell's (`adapter_mismatch`).
+/// frames. Every gate is read here, at the open: the switch (unset, the default
+/// list: FR-132 P2), the device the pump named (a GPU frame's), the cell, the
+/// denylist, the probe's proof (P2-3); then the pool itself, which fails on an
+/// adapter that is not the cell's (`adapter_mismatch`).
 pub(crate) fn plan(
     name: &str,
     chroma444: bool,
     width: u32,
     height: u32,
 ) -> Result<GpuInput, Refused> {
-    if !crate::capture::gpu_frame::zero_copy_enabled() {
-        return Err(Refused::because("switch_off"));
+    if let Err(reason) = crate::capture::zero_copy_admits(name) {
+        return Err(Refused::because(reason));
     }
     let Some(device) = super::gpu_hint::current() else {
         return Err(Refused::because("cpu_frames"));
@@ -1275,8 +1275,12 @@ mod tests {
             Ok(_) => "gpu",
             Err(refused) => refused.reason,
         };
-        assert_eq!(reason(Some(&warp), "hevc_qsv", false), "switch_off");
+        // FR-132 P2 — unset, the built-in list (empty) answers first.
+        assert_eq!(reason(Some(&warp), "hevc_qsv", false), "default_off");
         // SAFETY: serialised by LOCK; the guards restore both on drop.
+        unsafe { set("ZERO_COPY", "0") };
+        assert_eq!(reason(Some(&warp), "hevc_qsv", false), "switch_off");
+        // SAFETY: as above.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(reason(None, "hevc_qsv", false), "cpu_frames");
         assert_eq!(reason(Some(&warp), "hevc_amf", false), "no_gpu_cell");
@@ -1297,6 +1301,194 @@ mod tests {
         unsafe { set("ZERO_COPY_DENY", "av1_nvenc:gpu") };
         assert_eq!(reason(Some(&warp), "av1_nvenc", false), "denied");
         // The pools themselves, the gate after the proof, have their own tests.
+    }
+
+    /// A WARP device for the gates: WARP needs no adapter, and it refuses
+    /// VIDEO_SUPPORT, which no gate before the pool asks for.
+    fn gates_device() -> ID3D11Device {
+        let mut warp: Option<ID3D11Device> = None;
+        // SAFETY: valid out-params; WARP needs no adapter.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut warp),
+                None,
+                None,
+            )
+        }
+        .expect("a WARP device");
+        warp.expect("a WARP device")
+    }
+
+    /// The reason `plan` gives for `name` opened while the pump names
+    /// `named`, or `gpu`.
+    fn gate(named: Option<&ID3D11Device>, name: &str, chroma444: bool) -> &'static str {
+        match super::super::gpu_hint::opening_on(named.cloned(), || plan(name, chroma444, 64, 32)) {
+            Ok(_) => "gpu",
+            Err(refused) => refused.reason,
+        }
+    }
+
+    /// FR-132 P2, AC4's session half, the red-first pin. The default list ships
+    /// EMPTY, and with it and `zero_copy` unset every open goes as it goes with
+    /// the switch `off`, whatever device, cell, chroma or deny it meets: CPU
+    /// frames, refused at the first gate. Only the reason differs: `default_off`
+    /// ("not on by default yet"), never `switch_off` ("someone turned it off"),
+    /// which stays `off`'s alone.
+    #[test]
+    fn with_the_list_empty_an_unset_switch_opens_as_off_and_reads_default_off() {
+        use tunnel_core::env::test_env::{Saved, clear, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let warp = gates_device();
+        let names = [
+            "hevc_qsv",
+            "av1_qsv",
+            "h264_qsv",
+            "hevc_nvenc",
+            "av1_nvenc",
+            "h264_nvenc",
+            "vp9_qsv",
+            "hevc_amf",
+            "libvpx-vp9-444-sw",
+        ];
+        for deny in [None, Some("hevc_qsv:gpu,av1_nvenc:gpu")] {
+            // SAFETY: serialised by DENY_ENV_LOCK; the guards restore both.
+            match deny {
+                Some(list) => unsafe { set("ZERO_COPY_DENY", list) },
+                None => unsafe { clear("ZERO_COPY_DENY") },
+            }
+            for named in [None, Some(&warp)] {
+                for name in names {
+                    for chroma444 in [false, true] {
+                        let case = format!(
+                            "{name} chroma444={chroma444} device={} deny={deny:?}",
+                            named.is_some()
+                        );
+                        // SAFETY: as above.
+                        unsafe { set("ZERO_COPY", "0") };
+                        assert_eq!(gate(named, name, chroma444), "switch_off", "off: {case}");
+                        // SAFETY: as above.
+                        unsafe { clear("ZERO_COPY") };
+                        assert_eq!(
+                            gate(named, name, chroma444),
+                            "default_off",
+                            "unset: CPU frames at off's gate, with a reason of their own: {case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// FR-132 P2, AC4's session half with cells on the list: with the switch
+    /// unset, a listed cell meets every gate after the switch's exactly as it
+    /// does with the switch `on` (the device the pump named, the cell,
+    /// `zero_copy_deny`, the probe's proof), an unlisted one reads
+    /// `default_off`, and `off` refuses a listed cell too. Where an NVIDIA
+    /// adapter is, a listed cell the probe proved opens on GPU frames.
+    #[test]
+    fn with_a_list_an_unset_switch_opens_a_listed_cell_as_on_does() {
+        use tunnel_core::env::test_env::{Saved, clear, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let _child = Saved::cleared("CAPS_CHILD");
+        let warp = gates_device();
+        let listed = ["av1_qsv", "hevc_nvenc"];
+        let names = [
+            "hevc_qsv",
+            "av1_qsv",
+            "h264_qsv",
+            "hevc_nvenc",
+            "av1_nvenc",
+            "h264_nvenc",
+            "vp9_qsv",
+            "hevc_amf",
+        ];
+        crate::capture::with_default_cells(&listed, || {
+            for deny in [
+                None,
+                Some("av1_qsv:gpu"),
+                Some("av1_qsv:gpu,hevc_nvenc:gpu"),
+            ] {
+                // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+                match deny {
+                    Some(list) => unsafe { set("ZERO_COPY_DENY", list) },
+                    None => unsafe { clear("ZERO_COPY_DENY") },
+                }
+                for named in [None, Some(&warp)] {
+                    for name in names {
+                        for chroma444 in [false, true] {
+                            let case = format!(
+                                "{name} chroma444={chroma444} device={} deny={deny:?}",
+                                named.is_some()
+                            );
+                            // SAFETY: as above.
+                            unsafe { set("ZERO_COPY", "1") };
+                            let on = gate(named, name, chroma444);
+                            // SAFETY: as above.
+                            unsafe { set("ZERO_COPY", "0") };
+                            assert_eq!(gate(named, name, chroma444), "switch_off", "off: {case}");
+                            // SAFETY: as above.
+                            unsafe { clear("ZERO_COPY") };
+                            let unset = gate(named, name, chroma444);
+                            if listed.contains(&name) {
+                                assert_eq!(unset, on, "unset, listed, as on: {case}");
+                            } else {
+                                assert_eq!(unset, "default_off", "unset, unlisted: {case}");
+                            }
+                        }
+                    }
+                }
+            }
+            // The cells AC4 names, read out once each.
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu") };
+            assert_eq!(
+                gate(Some(&warp), "av1_qsv", false),
+                "denied",
+                "zero_copy_deny wins over the list"
+            );
+            // SAFETY: as above.
+            unsafe { clear("ZERO_COPY_DENY") };
+            assert_eq!(
+                gate(Some(&warp), "av1_qsv", false),
+                "unproven",
+                "the probe's proof binds a listed cell"
+            );
+            assert_eq!(gate(None, "av1_qsv", false), "cpu_frames");
+            assert_eq!(gate(Some(&warp), "hevc_qsv", false), "default_off");
+
+            // A listed, proven cell opens on GPU frames, on the device NVENC's
+            // forms are proven on. The test stands in for the probe child,
+            // whose open is the proof.
+            let Some(nvidia) = crate::capture::gpu_frame::device_on_vendor(0x10de) else {
+                eprintln!("no NVIDIA adapter here: the open itself is not tried");
+                return;
+            };
+            // SAFETY: as above.
+            unsafe { set("CAPS_CHILD", "1") };
+            assert_eq!(gate(Some(&nvidia), "hevc_nvenc", false), "gpu", "listed");
+            assert_eq!(
+                gate(Some(&nvidia), "h264_nvenc", false),
+                "default_off",
+                "unlisted"
+            );
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY", "1") };
+            assert_eq!(gate(Some(&nvidia), "h264_nvenc", false), "gpu", "on");
+        });
     }
 
     /// FR-118 P3 — the NVENC pool opens only on an NVIDIA device; elsewhere it

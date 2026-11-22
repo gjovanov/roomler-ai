@@ -465,8 +465,9 @@ const FIELDS = {
   queue: ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low', 'ack_ms'],
   loss: ['span_ms', 'stalled_ms', 'acked_bytes', 'loss', 'cwnd', 'pending_high'],
   // the model line (`emit_model`), with the floor's push-back (FR-148 D46 B2),
-  // the rule that last kept a reading out (D48) and the last fall (D50)
-  model: ['viewer_rx_bps', 'model_capacity_bps', 'model_floor_bps', 'model_floor_push_back', 'model_rule', 'model_fell'],
+  // the rule that last kept a reading out (D48), the last fall (D50) and the
+  // measured reading's source (D51 B4g: goodput, budget or arrival)
+  model: ['viewer_rx_bps', 'model_capacity_bps', 'model_floor_bps', 'model_floor_push_back', 'model_rule', 'model_fell', 'pipe_measured_by'],
   // open path (media_delivery.rs, FR-148 O10), in the order `emit_open` writes them
   open: ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'],
   // FR-148 P0: the target lines (peer.rs), after `a -> b bps`
@@ -1080,16 +1081,17 @@ function finishSession(s, windowEnd, nodes) {
         if (rx) model.lastRx = rx;
         if (rx && rx.bps !== undefined) model.maxRx = model.maxRx === null ? rx.bps : Math.max(model.maxRx, rx.bps);
         model.lastCap = mc;
-        // The row prints when a basis, the floor's push-back, the rule or the
-        // fall changes, and again when a rule or a fall starts anew: its
-        // start (the line's time less its age) moved (MODEL_ONSET_SLACK_MS).
+        // The row prints when a basis, the floor's push-back, the rule, the
+        // fall or the measured reading's source changes, and again when a
+        // rule or a fall starts anew: its start (the line's time less its age)
+        // moved (MODEL_ONSET_SLACK_MS).
         const rule = aged(f.model_rule);
         const fell = aged(f.model_fell);
         const startOf = (a) => (a && a.ageMs !== null ? r.t - a.ageMs : null);
         const moved = (a, b) => a !== null && b !== null && Math.abs(a - b) > MODEL_ONSET_SLACK_MS;
         const ruleAt = startOf(rule);
         const fellAt = startOf(fell);
-        const key = [rx ? rx.basis || rx.raw : null, mc ? mc.basis || mc.raw : null, text(f.model_floor_push_back), rule && rule.what, fell && fell.what].join('|');
+        const key = [rx ? rx.basis || rx.raw : null, mc ? mc.basis || mc.raw : null, text(f.model_floor_push_back), rule && rule.what, fell && fell.what, text(f.pipe_measured_by)].join('|');
         if (key !== lastModelKey || moved(ruleAt, lastRuleAt) || moved(fellAt, lastFellAt)) {
           lastModelKey = key;
           push(r.t, 'model', kvAll(f, FIELDS.model));
@@ -2001,7 +2003,7 @@ function selfTest() {
     // FR-148 D46 B2 and D48: the model line's push-back and rule, as
     // `emit_model` writes them (a fixed word; `<word>/<age>ms`, which `aged`
     // reads); D50's fall where the agent writes it (#4231), `<from>-><to>/<age>ms`.
-    for (const lit of ['model_floor_push_back = %PushedBy::word_of(v.model_floor_by),', 'model_rule = %RuledShown(v.model_ruled),', 'write!(f, "{}/{}ms", rule.word(), age.as_millis())']) check(`source: model line ${lit}`, md.includes(lit));
+    for (const lit of ['model_floor_push_back = %PushedBy::word_of(v.model_floor_by),', 'model_rule = %RuledShown(v.model_ruled),', 'write!(f, "{}/{}ms", rule.word(), age.as_millis())', 'pipe_measured_by = %MeasuredBy::word_of(v.measured_by),']) check(`source: model line ${lit}`, md.includes(lit));
     check('source: model_fell, where the agent writes it, as D50 writes it', !md.includes('model_fell') || md.includes('model_fell = %FellShown(v.model_fell),'));
     for (const k of FIELDS.model.filter((k) => k !== 'model_fell')) check(`source: model line field ${k}`, md.includes(`${k} = %`));
     const sc = fs.readFileSync(path.join(src, 'session_carrier.rs'), 'utf8');
@@ -2446,7 +2448,7 @@ function selfTest() {
         o,
       ),
     );
-  const mq = (sec, o) => raw(sec, ML, Object.assign({ session_id: sm, viewer_rx_bps: '2100000/backlogged/150ms', model_capacity_bps: 'None', model_floor_bps: '1000000/pushed-back/900ms', model_floor_push_back: 'p1', model_rule: '-', model_fell: '-' }, o));
+  const mq = (sec, o) => raw(sec, ML, Object.assign({ session_id: sm, viewer_rx_bps: '2100000/backlogged/150ms', model_capacity_bps: 'None', model_floor_bps: '1000000/pushed-back/900ms', model_floor_push_back: 'p1', model_rule: '-', model_fell: '-', pipe_measured_by: 'goodput' }, o));
   const agentLines = [
     raw(-30, said('connected'), { relay: 'central' }),
     raw(0, 'session carrier recorded (FR-102 P9c)', { session_id: sm, carrier: MESH_RELAY, relay_transport: 'none', local_typ: 'Host', remote_typ: 'Host' }),
@@ -2457,7 +2459,7 @@ function selfTest() {
     dq(22, sm, { cwnd: '(1228, 64000)', loss: '(0, 1)' }),
     mq(22.5, { model_rule: 'stall/400ms' }),
     dq(32, sm, { stalled_ms: 3000, delivery_samples: '(3, 0, 2)', cwnd: '(4912, 30000)' }),
-    mq(32.5, { model_rule: 'stall/10400ms' }),
+    mq(32.5, { model_rule: 'stall/10400ms', pipe_measured_by: 'budget' }),
     dq(42, sm, { cwnd: '(4912, 40000)', loss: '(2, 0)' }),
     mq(42.5, { model_rule: 'stall/1200ms' }),
     dq(52, sm, { stalled_ms: 4100, delivery_samples: '(1, 0, 4)', acked_bytes: 0, cwnd: '(1228, 9000)', loss: '(0, 3)' }),
@@ -2579,14 +2581,15 @@ function selfTest() {
     acl.filter((l) => /^\| (mesh relay[:( ]|\/derp|lines in no)/.test(l)).join(' | '),
   );
   const wantModel = [
-    `${at3(12.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=- model_fell=-`,
-    `${at3(22.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/400ms model_fell=-`,
-    `${at3(42.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/1200ms model_fell=-`,
-    `${at3(52.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/11200ms model_fell=2131000->1162000/61300ms`,
-    `${at3(410.5, 'model')}viewer_rx_bps=900000/backlogged/150ms model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=-`,
+    `${at3(12.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=- model_fell=- pipe_measured_by=goodput`,
+    `${at3(22.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/400ms model_fell=- pipe_measured_by=goodput`,
+    `${at3(32.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/10400ms model_fell=- pipe_measured_by=budget`,
+    `${at3(42.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/1200ms model_fell=- pipe_measured_by=goodput`,
+    `${at3(52.5, 'model')}viewer_rx_bps=2100000/backlogged/150ms model_capacity_bps=- model_floor_bps=1000000/pushed-back/900ms model_floor_push_back=p1 model_rule=stall/11200ms model_fell=2131000->1162000/61300ms pipe_measured_by=goodput`,
+    `${at3(410.5, 'model')}viewer_rx_bps=900000/backlogged/150ms model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=- pipe_measured_by=-`,
   ];
   check(
-    "model: the push-back, the rule and the fall print with the fields it printed; a row when one changes or starts anew, none for the same rule older; - where a line carries none",
+    "model: the push-back, the rule, the fall and the measured reading's source print with the fields it printed; a row when one changes or starts anew, none for the same rule older; - where a line carries none",
     acl.filter((l) => / {2}model {4}/.test(l)).join('\n') === wantModel.join('\n'),
     firstDiffOf(wantModel.join('\n'), acl.filter((l) => / {2}model {4}/.test(l)).join('\n')),
   );
@@ -2854,7 +2857,7 @@ function selfTest() {
     "queue, loss and relay transport: the delivery line's queue and loss fields and the carrier line's relay_transport leave as stored",
     FIELDS.queue.concat(FIELDS.loss).every((x) => asStored('delivery', x)) && asStored('carrier', 'relay_transport'),
   );
-  check("model: the floor's push-back, the rule and the fall leave as stored", ['model_floor_push_back', 'model_rule', 'model_fell'].every((x) => asStored('model', x)));
+  check("model: the floor's push-back, the rule, the fall and the measured reading's source leave as stored", ['model_floor_push_back', 'model_rule', 'model_fell', 'pipe_measured_by'].every((x) => asStored('model', x)));
   // FR-148 AC4: no relay address leaves. Neither /derp kind projects what
   // KEPT names, no kind projects `e`, and the counts leave as numbers only.
   check('KEPT: no /derp kind projects relay or e, and no kind e', Object.keys(KEPT).every((k) => KEPT[k].every((x) => !(x in thenOf(k)))) && projecting('e') === '');
@@ -2919,7 +2922,7 @@ function selfTest() {
     check(
       'one FIELDS entry: the row prints it',
       /^ {2}07:00:01\.000 {2}ice {6}relay=false local_typ=Host probe_extra=p1$/m.test(po) &&
-        /^ {2}07:00:02\.000 {2}model {4}viewer_rx_bps=- model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=- probe_extra=p2$/m.test(po),
+        /^ {2}07:00:02\.000 {2}model {4}viewer_rx_bps=- model_capacity_bps=- model_floor_bps=- model_floor_push_back=- model_rule=- model_fell=- pipe_measured_by=- probe_extra=p2$/m.test(po),
       (po.match(/^ {2}07:00:0[12].*$/gm) || []).join(' | '),
     );
   } finally {

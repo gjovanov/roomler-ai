@@ -370,7 +370,7 @@ holds, and DERP is the floor that connects a node when nothing else does.
 | key | where | default | effect |
 |---|---|---|---|
 | `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1091-1096`, `config_surface.rs:1266-1273`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
-| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1870`, `:1995-1997`) | `0` | bumped per rotation; presented on every join, shown in the grid |
+| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1873`, `:1998-2000`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch for the route | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 | `retired_key_mode` (P2) | the org's `overlay_networks` row, `GET/PUT /api/tenant/{tid}/overlay-retired-keys` (`MANAGE_AGENTS`; `crates/modules/network/src/routes/overlay_key.rs:353`, `:380`) | **`off`** | `warn` logs what it would refuse; `enforce` refuses a retired key at join and DERP and orders a device with the verb to rotate. Read per join and DERP registration — **no restart**, no live session disturbed. A stored value a build does not know reads `off`; a typo in the `PUT` is a 400 |
 
@@ -432,7 +432,7 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:934`, `:1127`, `:1156`, test `:8306`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4960-4964` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:934`, `:1127`, `:1156`, test `:8306`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4959-4963` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2810`, `:1020`; owner `network` (`:1997`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3111`, `:3145`, `:3170`, `:3201`, `:5562`, `:10525`, `:10540` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
@@ -444,9 +444,9 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:838-846` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6248-6390`, `:3532-3574`, `:3576-3597`, `:1441-1468` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1865-1870`, `:1995-1997`; `config_surface.rs:1266-1273` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:1091-1096`, `:1868-1873`, `:1998-2000`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1180-1194` |
-| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3224`, `:3242`, `:3964`, `:3212`, `:10560`, `:10822`; the node and network fields `:7027`, `:7269` |
+| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3224`, `:3242`, `:3964`, `:3212`, `:10560`, `:10842`; the node and network fields `:7027`, `:7269` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:791`, `:812`, `:861` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:380`; nest `crates/modules/network/src/lib.rs:555`, `:613` |

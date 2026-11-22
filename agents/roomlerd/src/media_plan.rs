@@ -239,15 +239,15 @@ impl Plan {
     }
 
     /// `form` is `gpu` or `cpu`. The arrow is a fall, or a climb back: a form
-    /// the session never had any other way (`switch_off`, `no_gpu_cell`) is
-    /// where it stands, not a step down from anywhere.
+    /// the session never had any other way (`switch_off`, `default_off`,
+    /// `no_gpu_cell`) is where it stands, not a step down from anywhere.
     fn input_form(&mut self, gpu: bool, reason: &'static str, at_ms: u64) {
         let was = self.input.as_ref().map(|i| i.form);
         let form = if gpu { "gpu" } else { "cpu" };
         match (was, gpu) {
             (Some("cpu"), true) => self.step("cpu", "gpu", "reopened", at_ms),
             (Some("gpu"), false) => self.step("gpu", "cpu", reason, at_ms),
-            (None, false) if !matches!(reason, "switch_off" | "no_gpu_cell") => {
+            (None, false) if !matches!(reason, "switch_off" | "default_off" | "no_gpu_cell") => {
                 self.step("gpu", "cpu", reason, at_ms)
             }
             _ => {}
@@ -666,10 +666,12 @@ mod tests {
     }
 
     /// §7.5: GPU form to CPU form with its reason. A session that never had a
-    /// GPU form to lose has no arrow: `switch_off` is the fleet's default.
+    /// GPU form to lose has no arrow: `switch_off` is an `off` host's,
+    /// `default_off` (FR-132 P2) a host's that left the switch unset, and
+    /// `no_gpu_cell` a cell's with no GPU form at all.
     #[test]
     fn a_fall_to_the_cpu_form_is_an_arrow_and_where_it_stands_is_not() {
-        for reason in ["switch_off", "no_gpu_cell"] {
+        for reason in ["switch_off", "default_off", "no_gpu_cell"] {
             let mut p = plan();
             p.input_form(false, reason, 1);
             assert!(p.ladder.is_empty(), "{reason}");

@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11086`](../agents/roomlerd/src/peer.rs#L11086)).
+control-channel arm sends the answer ([`peer.rs:11058`](../agents/roomlerd/src/peer.rs#L11058)).
 
 ### The answers
 
@@ -108,7 +108,7 @@ roomler config set display_match auto     # auto (default) | always | never
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2787`](../crates/agent-core/src/config.rs#L2787) `DisplayMatchPolicy`).
+  ([`config.rs:2790`](../crates/agent-core/src/config.rs#L2790) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -289,7 +289,7 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:303`](../agents/roomlerd/src/display_match.rs#L303)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
+  ([`scrap_backend.rs:289`](../agents/roomlerd/src/capture/scrap_backend.rs#L289)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
   the same display ([`virtual_desktop.rs:1712`](../agents/roomlerd/src/virtual_desktop.rs#L1712) `start_server`). An
@@ -403,7 +403,7 @@ sequenceDiagram
   with the tracker it shares with Windows, with no exception for the switch itself.
 - **The capture follows the mode.** A Mac's stream is a `CGDisplayStream` opened at a size, so after a switch it
   opens again, as X11's capturer does
-  ([`capture/scrap_backend.rs:334`](../agents/roomlerd/src/capture/scrap_backend.rs#L334)).
+  ([`capture/scrap_backend.rs:336`](../agents/roomlerd/src/capture/scrap_backend.rs#L336)).
 - **Off the main thread.** `CGDisplaySetDisplayMode` from a second thread switched the mode and returned 0
   (measured), so the switch does not wait on the AppKit pump.
 

@@ -84,8 +84,8 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
-   session and the pump awaits the packets (`thread.rs:392` `encode`, called at
-   `peer.rs:9677`). `block_in_place` remains the inline path, `media_thread = false`.
+   session and the pump awaits the packets (`thread.rs:417` `encode`, called at
+   `peer.rs:9656`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -107,7 +107,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:2173`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:2185`; consumed at
-`peer.rs:8227`, logged at `:10087`). FR-112 gave a software encoder a pace of its
+`peer.rs:8213`, logged at `:10059`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -152,7 +152,7 @@ built **without a wire-format change**: the 13-byte video header already carried
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3633` `clock_echo_json`, handled at
-  `:10960`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  `:11313`). The browser probes it every stats tick and keeps the **lowest-RTT**
   sample of the last 8 (`useRemoteControl.ts:7244` `CLOCK_RING`, `:7248`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
@@ -359,7 +359,7 @@ AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
 | `direct_queue_ms` | `ROOMLERD_DIRECT_QUEUE_MS` | 150 | direct send-queue lag bound (0 = off) |
 | `direct_hrd_pct` | `ROOMLERD_DIRECT_HRD_PCT` | 100 | direct HRD/VBV window (AV1 floored 200) |
 | `roomler-rc-input-gap` | — (localStorage) | 8 | pointer min-gap, ms (0–16) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | unset: the built-in default list, empty, so off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps. `on` takes every proven cell; unset only the default list's ([FR-132](fr/FR-132-zero-copy-by-default.md) P2) |
 
 The age pill needs agent ≥ 0.4.9 and a WebCodecs decode path (HEVC-over-DC or
 VP9-4:4:4); it is absent on the classic `<video>` path and on older agents.
