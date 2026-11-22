@@ -7753,6 +7753,97 @@ tenant_id = "tid2"
         }
     }
 
+    /// #4176 — a machine config that is missing is restored at a start only
+    /// from a copy that SYSTEM would trust as much as the config itself: the
+    /// machine tree's as-found rule and its check, with the copy in the
+    /// config's place. On trees made by `machine_tree::test_support`, never
+    /// the computer's own. They run on CI's elevated runner.
+    #[cfg(windows)]
+    mod machine_copy {
+        use super::*;
+        use crate::machine_tree::MachineTree;
+        use crate::machine_tree::test_support::*;
+
+        /// `tree` stands in for the computer's own machine tree on this
+        /// test's thread, as in `machine_merge_base`.
+        fn stand_in(tree: &MachineTree) {
+            super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
+        }
+
+        /// What a start finds in each case: an enrolled copy only in the tree
+        /// that passes, and in every tree that fails a check, a copy it cannot
+        /// run on.
+        fn want(case: MissingConfig) -> PreviousCopy {
+            match case {
+                MissingConfig::NoCopy => PreviousCopy::Missing,
+                MissingConfig::Restorable => PreviousCopy::Enrolled,
+                MissingConfig::CopyWithNoEnrollment => PreviousCopy::NoEnrollment,
+                MissingConfig::CopyInAnOpenFolder
+                | MissingConfig::CopyUnderAnotherAccountsParent
+                | MissingConfig::ReplaceRightOnTheParent
+                | MissingConfig::CopyAnotherAccountOwns
+                | MissingConfig::KeysAnotherAccountMayChange
+                | MissingConfig::CopyThatDoesNotLoad => PreviousCopy::Broken,
+            }
+        }
+
+        /// #4176 — the copy a start reads for a missing machine config
+        /// ([`previous_copy`], which `config_at_start` asks) passes the same
+        /// checks as the config would, and asking writes nothing.
+        #[test]
+        fn a_missing_machine_configs_copy_is_read_through_the_machines_checks() {
+            if !elevated_or_skip("a missing machine config's copy") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                let got = previous_copy(&tree.config());
+                if got != want(case) {
+                    wrong.push(format!("{case:?}: {got:?}, want {:?}", want(case)));
+                }
+                assert!(!tree.config().exists(), "{case:?}: nothing written");
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+
+        /// #4176 — [`load`] restores a missing machine config only from a
+        /// copy that passes: the file is written, sealed, and the chain
+        /// passes. From any other copy nothing is written, and the load fails
+        /// on the live file's own read error.
+        #[test]
+        fn a_missing_machine_config_is_restored_only_from_a_copy_that_passes() {
+            if !elevated_or_skip("a missing machine config's restore") {
+                return;
+            }
+            let mut wrong = Vec::new();
+            for case in MissingConfig::ALL {
+                let root = tempfile::tempdir().unwrap();
+                let tree = missing_config(root.path(), case);
+                stand_in(&tree);
+                let loaded = load(&tree.config());
+                if case == MissingConfig::Restorable {
+                    let cfg = loaded.expect("restored");
+                    assert!(cfg.has_primary_enrollment());
+                    assert!(tree.config().exists(), "reinstated");
+                    assert_eq!(crate::machine_tree::check(&tree), Ok(()));
+                    continue;
+                }
+                match loaded {
+                    Ok(_) => wrong.push(format!("{case:?}: restored")),
+                    Err(err) if !not_found(&err) => wrong.push(format!("{case:?}: {err:#}")),
+                    Err(_) => {}
+                }
+                if tree.config().exists() {
+                    wrong.push(format!("{case:?}: a config was written"));
+                }
+            }
+            assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+        }
+    }
+
     /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
     /// the file is closed to the reader, not damaged, and the wizard that read
     /// it as damaged told the person their settings were lost.

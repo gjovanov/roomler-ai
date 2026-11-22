@@ -2693,6 +2693,102 @@ pub mod test_support {
         tree
     }
 
+    /// #4176 — what a machine config that went missing can leave beside it:
+    /// the cases the service host, the SYSTEM worker's ladder and its start
+    /// must answer alike ([`missing_config`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MissingConfig {
+        /// No copy either.
+        NoCopy,
+        /// A copy holding an enrollment, in a tree an elevated save left: the
+        /// one case that is restored.
+        Restorable,
+        /// A sealed copy in a machine folder `%ProgramData%` still lets Users
+        /// add to: not the machine's as found.
+        CopyInAnOpenFolder,
+        /// The sealed tree under a parent another account owns (a person made
+        /// it): that account could have moved the folder in.
+        CopyUnderAnotherAccountsParent,
+        /// A replace right Users hold on the parent: not the machine's as
+        /// found, and kept for the check to refuse.
+        ReplaceRightOnTheParent,
+        /// A copy another account owns.
+        CopyAnotherAccountOwns,
+        /// A keys folder another account may change.
+        KeysAnotherAccountMayChange,
+        /// A copy that passes, and does not load.
+        CopyThatDoesNotLoad,
+        /// A copy that passes, and holds no enrollment.
+        CopyWithNoEnrollment,
+    }
+
+    impl MissingConfig {
+        pub const ALL: [MissingConfig; 9] = [
+            MissingConfig::NoCopy,
+            MissingConfig::Restorable,
+            MissingConfig::CopyInAnOpenFolder,
+            MissingConfig::CopyUnderAnotherAccountsParent,
+            MissingConfig::ReplaceRightOnTheParent,
+            MissingConfig::CopyAnotherAccountOwns,
+            MissingConfig::KeysAnotherAccountMayChange,
+            MissingConfig::CopyThatDoesNotLoad,
+            MissingConfig::CopyWithNoEnrollment,
+        ];
+    }
+
+    /// An account that is neither SYSTEM nor an administrator, for an owner
+    /// or an entry another account holds.
+    pub fn another_account() -> String {
+        local_guest().unwrap_or_else(|| USERS.to_string())
+    }
+
+    /// #4176 — a machine tree under `root` with no machine config, shaped as
+    /// `case` says. Each starts from what an elevated save leaves
+    /// ([`enrolled_tree`]) or from a waiting host's ([`waiting_tree`]), and
+    /// the copy's text is written into the file the save sealed, so it keeps
+    /// that owner and DACL.
+    pub fn missing_config(root: &Path, case: MissingConfig) -> super::MachineTree {
+        let enrolled = toml::to_string(&crate::config::test_fixture()).expect("an enrolled config");
+        if case == MissingConfig::CopyInAnOpenFolder {
+            // The copy itself as a save seals one, so only the folder fails.
+            let tree = waiting_tree(root);
+            std::fs::write(tree.prev(), &enrolled).expect("the copy");
+            set_dacl(&tree.prev(), "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            assert!(icacls(&tree.prev(), &["/setowner", "*S-1-5-32-544"]));
+            return tree;
+        }
+        let tree = enrolled_tree(root);
+        std::fs::remove_file(tree.config()).expect("the config goes");
+        let text = match case {
+            MissingConfig::CopyThatDoesNotLoad => "agent_token = \"broken\n".to_string(),
+            MissingConfig::CopyWithNoEnrollment => toml::to_string(
+                &crate::config::AgentConfig::for_person_with_no_enrollment("host")
+                    .expect("a config with no enrollment"),
+            )
+            .expect("its text"),
+            _ => enrolled,
+        };
+        std::fs::write(tree.prev(), text).expect("the copy");
+        let other = another_account();
+        match case {
+            MissingConfig::NoCopy => std::fs::remove_file(tree.prev()).expect("the copy goes"),
+            MissingConfig::CopyUnderAnotherAccountsParent => {
+                assert!(icacls(tree.parent(), &["/setowner", &format!("*{other}")]))
+            }
+            MissingConfig::ReplaceRightOnTheParent => {
+                assert!(icacls(tree.parent(), &["/grant", "*S-1-5-32-545:(DC)"]))
+            }
+            MissingConfig::CopyAnotherAccountOwns => {
+                assert!(icacls(&tree.prev(), &["/setowner", &format!("*{other}")]))
+            }
+            MissingConfig::KeysAnotherAccountMayChange => {
+                assert!(icacls(&tree.keys(), &["/grant", "*S-1-5-32-546:(M)"]))
+            }
+            _ => {}
+        }
+        tree
+    }
+
     /// #3737 — what runs once, the next time a reader or a deleter of the
     /// SYSTEM service's former anchor folder has checked the folder and not
     /// yet opened a file in it.
@@ -3283,6 +3379,61 @@ mod tests {
                     .any(|a| a.sid == USERS && a.mask & 0x40 != 0 && a.flags & INHERITED == 0),
                 "kept: {kept:?}"
             );
+        }
+
+        /// #4176 — the same while the folder holds only a copy a start would
+        /// restore: R keeps the replace right, so the copy is refused at this
+        /// tick and every one after. Cut, a later tick would read the parent
+        /// as closed and pass a folder moved in through it.
+        #[test]
+        fn a_replace_right_on_the_parent_is_kept_while_only_a_copy_is_there() {
+            if !elevated_or_skip("a replace right on the parent, a copy") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::ReplaceRightOnTheParent);
+            for tick in 0..2 {
+                repair(&tree, false);
+                let kept = read(tree.parent(), win::Kind::Dir).dacl.unwrap();
+                assert!(
+                    kept.iter()
+                        .any(|a| a.sid == USERS && a.mask & 0x40 != 0 && a.flags & INHERITED == 0),
+                    "tick {tick}: {kept:?}"
+                );
+            }
+        }
+
+        /// #4176 — with no config, R takes the machine folder for a copy that
+        /// was the machine's as found, as it does for a config: an
+        /// administrator's own entry on the folder (Explorer's prompt) is taken
+        /// off. A copy in a folder another account could add to leaves the
+        /// folder as it was.
+        #[test]
+        fn the_repair_takes_the_folder_of_a_copy_that_was_the_machines() {
+            if !elevated_or_skip("the folder of a copy") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::Restorable);
+            let me = me();
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", &format!("*{me}:(OI)(CI)F")]
+            ));
+            assert!(grants(tree.folder(), win::Kind::Dir, &me));
+            repair(&tree, false);
+            assert!(!grants(tree.folder(), win::Kind::Dir, &me), "taken off");
+            assert!(
+                sealed(&sddl(tree.folder()), true),
+                "{}",
+                sddl(tree.folder())
+            );
+
+            let root = tempfile::tempdir().unwrap();
+            let tree = missing_config(root.path(), MissingConfig::CopyInAnOpenFolder);
+            let folder = sddl(tree.folder());
+            repair(&tree, false);
+            assert_eq!(sddl(tree.folder()), folder, "left as it was");
         }
 
         /// #3666 — R seals a `.prev` only when it was closed as found: a copy

@@ -361,4 +361,76 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("config.toml.prev")]);
     }
+
+    /// What the SYSTEM worker's start reads for a missing machine config's
+    /// copy: [`config::previous_copy`] at the machine path.
+    #[cfg(target_os = "windows")]
+    fn worker_copy(tree: &roomler_node_core::machine_tree::MachineTree) -> PreviousCopy {
+        // RED STAND-IN: master's read at the machine path (`load_private_prev`):
+        // the copy's own owner and DACL, and nothing else.
+        match roomler_node_core::machine_tree::read_checked(&tree.prev(), 1 << 20) {
+            Ok(None) => PreviousCopy::Missing,
+            Err(_) => PreviousCopy::Broken,
+            Ok(Some(bytes)) => {
+                match config::parse_text(&String::from_utf8_lossy(&bytes), "the copy") {
+                    Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
+                    Ok(_) => PreviousCopy::NoEnrollment,
+                    Err(_) => PreviousCopy::Broken,
+                }
+            }
+        }
+    }
+
+    /// #4176 — the service host (`want_system_worker` over
+    /// `config_opens_in`), the SYSTEM worker's ladder (`rung`) and its start
+    /// ([`decide`]) answer alike in every case a missing machine config can
+    /// leave. Only a copy that passes the machine's checks and holds an
+    /// enrollment starts the SYSTEM worker, which restores it; in every other
+    /// case the host waits and the start would end with `NoConfig`. On trees
+    /// made by `machine_tree::test_support`, on CI's elevated runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_the_ladder_and_the_start_agree_on_a_missing_machine_config() {
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomler_node_core::machine_tree::{Refusal, Switches};
+        use roomlerd::win_service::supervisor::{config_opens_in, rung, want_system_worker};
+        if !elevated_or_skip("the host, the ladder and the start on a missing machine config") {
+            return;
+        }
+        let mut wrong = Vec::new();
+        for case in MissingConfig::ALL {
+            let root = tempfile::tempdir().expect("tempdir");
+            let tree = missing_config(root.path(), case);
+            let restorable = case == MissingConfig::Restorable;
+            let host =
+                want_system_worker(true, false, || config_opens_in(&tree, Switches::ON, None));
+            let ladder = rung(&tree, Switches::ON, &tree.config());
+            let start = decide(
+                tree.config().exists(),
+                false,
+                may_restore(Supervision::WindowsScm),
+                || worker_copy(&tree),
+            );
+            let want = (
+                restorable,
+                if restorable {
+                    Ok(())
+                } else {
+                    Err(Refusal::Absent)
+                },
+                if restorable {
+                    AtStart::Restore
+                } else {
+                    AtStart::NoConfig
+                },
+            );
+            if (host, ladder.clone(), start) != want {
+                wrong.push(format!(
+                    "{case:?}: host={host} ladder={ladder:?} start={start:?}, want {want:?}"
+                ));
+            }
+            assert!(!tree.config().exists(), "{case:?}: nothing written");
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    }
 }
