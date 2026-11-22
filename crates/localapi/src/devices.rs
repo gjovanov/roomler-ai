@@ -516,8 +516,8 @@ mod tests {
 
     /// The mesh payload is JSON the server builds by hand (`stats::to_payload`
     /// over aggregation rows), so it carries what the typed side would never
-    /// produce: a BSON `{"$date": …}` object for `last_seen_at`, explicit
-    /// `null`s for a relay qualifier or an RTT. This is its shape, verbatim.
+    /// produce: explicit `null`s for a relay qualifier or an RTT, and, from a
+    /// server before #4189, a BSON `{"$date": …}` for `last_seen_at`. Verbatim.
     #[test]
     fn mesh_view_parses_the_servers_hand_built_payload() {
         let body = r#"{

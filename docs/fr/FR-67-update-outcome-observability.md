@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:139-167`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:182`).
+InstallerFailed | Timeout`, `post_install.rs:144-172`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:187`).
 
 Measured on the fleet:
 
@@ -32,8 +32,8 @@ updates, and not one recorded an outcome.
 `Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2265`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:294`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:1139-1164`).
+(`post_install.rs:299`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:1440-1465`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -55,7 +55,7 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:258`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:263`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
 (`post_install.rs:85-86`, echoed at `:10`, `:124`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
@@ -124,8 +124,8 @@ flowchart LR
 | Piece | Where |
 |---|---|
 | The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:581`; `NodeStatus.last_install`, `:484` |
-| The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1450`), its pure half `summarize` (`:1469`) |
-| The startup line and its level | `log_at_startup` (`:1526`), `startup_level` (`:1510`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4337`) |
+| The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1751`), its pure half `summarize` (`:1770`) |
+| The startup line and its level | `log_at_startup` (`:1829`), `startup_level` (`:1813`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4337`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1063`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2955`), printed under `version` (`:2556`) |
 
@@ -189,7 +189,7 @@ sequenceDiagram
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:576`, `:1255`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5559`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3127`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3109`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:7189`, `:7205`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1742`): a 409 on one device (`:1789`), a `refused` row with its `refused_code` in a bulk (`:1921`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1793`): a 409 on one device (`:1840`), a `refused` row with its `refused_code` in a bulk (`:1972`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]
@@ -292,7 +292,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:665`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:675`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.

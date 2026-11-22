@@ -615,7 +615,7 @@ So the design is:
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:439`) vending one per
+  DerpConn` (`transport/derp.rs:281`), `DerpMux::conn_for` (`derp.rs:486`) vending one per
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:415`, `UdpRelayConn` `:564`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
@@ -688,13 +688,13 @@ evidence that justifies it.
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
 the counter was added without a reader"*. It has one now: the agent's `/derp` loop logs
-`stale_drops()` (`transport/derp.rs:426`) as `dropped_stale` whenever it moves
-(`agents/roomlerd/src/derp.rs:477`).
+the count `stale_drops()` reads (`transport/derp.rs:461`) as `dropped_stale` whenever it moves
+(`agents/roomlerd/src/derp.rs:521`, through `drops()` since FR-148 D52, on the drop line).
 
 | surface | addition |
 |---|---|
 | `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2232`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:885`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:924`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
 | `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2839-2853`). `roomler netcheck` prints no org-relay line |
 | relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
@@ -719,7 +719,7 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:158` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:439` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:281` (`impl RelayConn for DerpConn`) and `derp.rs:486` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1289` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
@@ -736,8 +736,8 @@ Verified against `origin/master`, 2026-08-28.
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
-`crates/agent-core/src/config_surface.rs:38-40`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:42`); getter + setter arms; and `env_bridge_bools` (`config.rs:3229`),
+`crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:1794`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

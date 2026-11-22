@@ -175,7 +175,7 @@ can prevent it:
 | `scripts/rc-shadow-report.sh` + `.cjs` | FR-63's shadow report and its verdict: the flip criterion's agreement, and FR-148's under-drive clause (per class, spent ≤ 1.25 × shadow in ≥ 90 % of the clean windows at the class's gate, 2 Mbit/s direct and 0.5 Mbit/s constrained, over ≥ 20 sessions), whose thresholds were published on 2026-11-02, before the seven-day read (`docs/rate-control.md`) | the same shape (`scripts/rc-shadow-report.sh:142`) |
 | `scripts/fr97-caps-census.sh` | FR-97's capability words by OS | on mars. The aggregation goes to the runner on stdin with `--db` (`scripts/fr97-caps-census.sh:78`). It no longer reads the app's database URL, which holds the password, from `roomler2` |
 | `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:539`). `--mars` ships itself and the runner in one `roomler ssh` |
-| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8). With `--timeline`, `scripts/rc-path-timeline.cjs`: one device's window, line by line (§8a) | the same shape (`scripts/rc-path-report.sh:217`). `--mars` ships both files and the runner in one `roomler ssh` |
+| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8). With `--timeline`, `scripts/rc-path-timeline.cjs`: one device's window, line by line (§8a) | the same shape (`scripts/rc-path-report.sh:236`). `--mars` ships both files and the runner in one `roomler ssh` |
 | By hand | the growth-observability field check, the `rc.connect` mining in `docs/remote-control.md`, the pairing audit in `docs/device-pairing.md` | `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` … `JS`, with `db` already open |
 
 ```bash
@@ -302,15 +302,19 @@ turn 7 days old.
 
 The report above folds the fleet into one row per session. `--timeline` reads the other way:
 one agent of one org over a window of at most 24 h, with every FR-148 line in time order, so a
-target move, a pipe state, a stall and the path memory's close can be read in sequence
-(`scripts/rc-path-timeline.cjs`). It gives field evidence for AC3, AC6 to AC8, AC13, AC22, AC23,
-O10 and O11, and judges none of them. Message texts and field names come from the call sites below, and
-the self-test checks each message's text against the agent's source.
+target move, a pipe state, a stall, a T3-rtx expiry, the mesh relay's drops and the path
+memory's close can be read in sequence (`scripts/rc-path-timeline.cjs`). It gives field evidence
+for AC3, AC4 (whether a drop on the relay path fires the mesh relay's T3-rtx expiries, and which
+drop: FR-148 D52), AC6 to AC8, AC13, AC22, AC23, O10 and O11, and judges none of them. Message
+texts and field names come from the call sites below, and the self-test checks each message's
+text against the agent's source.
 
 ```bash
-node scripts/rc-path-timeline.cjs --self-test     # 144 cases: every line kind, the counters, the relay transport and the standing queue, both generations of the memory lines, masking (in --rows too, and one last 4 hex taken twice), TRUNCATED, the query's shape, the window's forms, the wrapper's refusals
+node scripts/rc-path-timeline.cjs --self-test     # 310 cases: every line kind, the counters, the relay transport and the standing queue, why the target moved (every cause, its words read from the agent's source; a heartbeat's count; an older agent's lines with neither), the T3 lines and the /derp lines (their messages and fields read from derp.rs, 1,228 bytes and 25 s from the source, the pairing inside 25 s, outside it, before the line and across a reconnect, an older agent's line printing -), the drop line and the shed line it replaced, each cause, the viewer node's lines and a T3 line across which no count moved ("none moved"), the relay kept in the database (synthetic lines through the server's projection, evaluated, then --rows and the report; each layer alone; a leaky read caught; both nodes' reads), both generations of the memory lines, masking (in --rows too, and one last 4 hex taken twice), TRUNCATED, the query's shape, a field added in one place, the window's forms, the wrapper's refusals
 bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
      --from 2026-11-18T07:00:00Z --to 2026-11-18T18:15:00Z         # one device, one window
+bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
+     --from ISO --to ISO --viewer-agent HEX [--viewer-tenant HEX]   # and the viewer node's /derp lines
 bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
      --from ISO --to ISO --rows > rows.ndjson
 node scripts/rc-path-timeline.cjs --intervals rows.ndjson          # the same rows offline, every heartbeat interval
@@ -321,9 +325,11 @@ bash scripts/rc-path-report.sh --timeline --docker NAME --seed seed.ejson --tena
 |---|---|---|---|
 | Carrier | `session carrier recorded (FR-102 P9c)` (`agents/roomlerd/src/session_carrier.rs:474`), `per-session ICE path detected` (`agents/roomlerd/src/carrier_rank.rs:282`), `rc ICE: overlay …` (`agents/roomlerd/src/peer.rs:513`), `rc ICE: carrier rank (FR-148 P4)` and its 10 s line (`agents/roomlerd/src/rc_overlay.rs:359`, `:752`) | each line at its time, the carrier line with its `relay_transport`: what carries the agent's own TURN allocation (FR-148 P0); when the carrier was recorded, counted from the session's first line | AC22, AC23, O11 |
 | Encoder | `ffmpeg encoder opened (…)` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1702`), `FR-148: the QSV encoder opened at QVBR…` (`:3588`), `ffmpeg open_as_with rejected the quality options…` (`:2025`) | every open with its size, frame rate and cap, a later open as `REOPEN`, the QVBR open's rate and cap, each rejected option set | AC13 |
-| Rate | `FFmpeg DC pump heartbeat` and `VP9-444 DC pump heartbeat` (`agents/roomlerd/src/peer.rs:10359`, `:5394`) | the sent bit rate and frame rate from the cumulative `bytes_written` and `frames_sent`, per minute (each interval with `--intervals`). A counter that drops is a new pump or a reopen, and the interval across it is not rated. Every target move is its own row. So is every change of `pipe_state`, `readings_refuted` or `link_unoffered`, with `pipe_measured` | AC6, AC8 (the opening), AC22 (transit-stalled windows) |
-| Delivery | `path delivery (FR-148 P0, shadow, ≈10s)` and `path model (…)` (`agents/roomlerd/src/media_delivery.rs:88`, `:1211`) | each window with stalled time as a row, and each window with a queued sample as a `queue` row with its `queued`, `standing_ms`, `inflight`, `cwnd` and `rwnd_low`; the windows, the stalled ones, their share and the longest stall; the windows with a queued sample, the windows that carry the standing queue's fields, and the highest standing; `viewer_rx_bps` with its basis and age and `model_capacity_bps` with its basis, as a row where a basis changes | AC3, AC22, O11 |
-| Open path | `path open (FR-148 P0, O10)` (`agents/roomlerd/src/media_delivery.rs:1268`), once a pump at its first media write (`agents/roomlerd/src/peer.rs:5243`, `:9915`) | each line at its time with every field it carries; the session's first one in its summary, and the device's sessions counted by `open_path` | O10 |
+| Rate | `FFmpeg DC pump heartbeat` and `VP9-444 DC pump heartbeat` (`agents/roomlerd/src/peer.rs:10359`, `:5394`) | the sent bit rate and frame rate from the cumulative `bytes_written` and `frames_sent`, per minute (each interval with `--intervals`). A counter that drops is a new pump or a reopen, and the interval across it is not rated. Every change of `pipe_state`, `readings_refuted` or `link_unoffered` is its own row, with `pipe_measured` | AC6, AC8 (the opening), AC22 (transit-stalled windows) |
+| Target | `VP9-444 set_bitrate (AIMD)` and `VP9-444 AIMD decrease (DC buffer over high watermark)` (`agents/roomlerd/src/peer.rs:5024`, `:5206`), `FFmpeg DC pump set_bitrate (AIMD)` (`:9578`), the two lines where a held FFmpeg target goes to the encoder once the scene is quiet, `FFmpeg DC pump: deferred bitrate scheduled (background rebuild)` and `FFmpeg DC pump: deferred bitrate applied at quiet` (`:9618`, `:9631`), and each heartbeat's `target_moves` (`:5339`, `:10169`) | each move a target line hands out as its own row, `a -> b bps why=…`, with `why` as the line carries it ([Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)) and the FFmpeg line's `deferred`. A line from an agent before 0.4.230 carries no `why` and prints "(reason: not logged)". A change a heartbeat shows with no target line is its own row, with that heartbeat's `target_moves`; a held target landing prints as `held b bps …` with its `why`, and is no new move | FR-148 P0's move causes (#4161) |
+| Delivery | `path delivery (FR-148 P0, shadow, ≈10s)` and `path model (…)` (`agents/roomlerd/src/media_delivery.rs:88`, `:1306`) | each window with stalled time as a row, and each window with a queued sample as a `queue` row with its `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low` and `ack_ms` (`:1222`); each window with an SCTP loss or a one-packet window as a `loss` row with its `span_ms`, `stalled_ms`, `acked_bytes`, `loss` (fast retransmissions, T3-rtx expiries), `cwnd` and `pending_high` (`:1221`, `:1230`, `:1229`), with `; T3` when `loss` counts an expiry or `cwnd`'s low is one packet: 1,228 bytes, the vendored SCTP's MTU (`crates/vendored/webrtc-sctp/src/association/mod.rs:60`), which only a T3-rtx expiry sets the window to (`association_internal.rs:2466`); the windows, the stalled ones, their share and the longest stall; the windows with a queued sample, the windows that carry the standing queue's fields, and the highest standing; `viewer_rx_bps` with its basis and age, `model_capacity_bps` with its basis, `model_floor_push_back`, `model_rule` (`:1355`, `:1360`) and `model_fell` (FR-148 D50, #4231), as a row where a basis, the push-back, the rule or the fall changes, or a rule or a fall starts anew (its start, the line's time less its age, moves over 1 s) | AC3, AC4, AC22, O11 |
+| /derp | `overlay derp: carrier frames dropped (stale, full, backpressure, unrouted)` (`agents/roomlerd/src/derp.rs:255`, FR-148 D52), which the /derp WS owner's keepalive tick writes when any of its four counts moved (`DropLine::due`, `:232`; every 25 s from the connect: `:56`, `:457`, `:522`), and the line it replaced, `overlay derp: shed stale carrier frames (queue age bound)`, which an agent before D52 writes when its one count moved; the owner's lifecycle lines: `/derp WS connected + registered` (`:455`), `registration send failed` (`:443`), `suspend/resume detected` (`:484`), `no inbound frames within the RX deadline` with the agent itself frozen (`:499`) or the WS half-open (`:507`), `keepalive ping failed` (`:528`), `/derp WS closed` (`:594`), `/derp connect failed` (`:601`), `the load balancer has no pod for this org yet` (`:609`) and `/derp connect timed out` (`:615`) | each drop line as a `drops` row with the four counts, each the relay node's drops since its mux started (`dropped_stale`, `dropped_full`, `dropped_backpressure`, `dropped_unrouted`), and each count's move since the line before (`since_last` the stale count's, as on the shed line, then `full_since_last`, `backpressure_since_last` and `unrouted_since_last`); each shed line as a `shed` row with `dropped_stale` and `since_last`; each lifecycle line as a `derp` row with a state word (`connected`, `registration-failed`, `suspend-resume`, `frozen`, `half-open`, `ping-failed`, `closed`, `connect-failed`, `lb-no-pod`, `connect-timed-out`) and the counts it carries (`napped_s`, `silent_s`, `paused_s`, `wait_ms`, `left`). The lines name no session, so each prints in the session its time falls in. On the mesh relay (carrier `derp`) each T3 row says, for each node read, which line that told a move (a drop line with a count moved, or a shed line with `since_last` above 0) comes nearest: within 25 s after it, only before it inside its span, or `none moved`; which causes moved in it (`stale`, `full`, `backpressure`, `unrouted`); and whether a lifecycle line falls between. With `--viewer-agent` the viewer's node, the other end of the mesh relay pair, is read over the same window for its /derp lines only, and its rows print as `v.drops`, `v.shed` and `v.derp`; a T3 row across which no count moved on either node ends `no count moved on either node: a hold, or a loss below the overlay`. The relay node's name and a failed connect's error stay in the database (What leaves, below) | AC4 |
+| Open path | `path open (FR-148 P0, O10)` (`agents/roomlerd/src/media_delivery.rs:1397`), once a pump at its first media write (`agents/roomlerd/src/peer.rs:5243`, `:9915`) | each line at its time with every field it carries; the session's first one in its summary, and the device's sessions counted by `open_path` | O10 |
 | Path memory | `FR-148 P1 path memory: the pair's entry at the open` and `…: what the close wrote` (`agents/roomlerd/src/media_pair_memory.rs:48`, `:50`), `FR-148 P1 rate memory: …` (`agents/roomlerd/src/encode/rate_memory.rs:182`) | every field the line carries, as it is, so a field or a `why` value added later prints too. Both generations read. Release 0.4.225's close carries `samples_not_counted` only; #4029 adds the counted and set-aside counts and `taken_why`, and FR-148 D46 B2 `samples_counted_p1` and `samples_counted_p3` (`CLOSE_FIELDS`, `agents/roomlerd/src/media_pair_memory.rs:1419`) | AC7, O7 |
 | Keepalive | the heartbeat's `frames_keepalive` and `keepalive_bytes`, counted per window (`agents/roomlerd/src/media_window.rs:320` resets them) | frames, bytes, and bytes per frame beside `maxrate ÷ fps ÷ 8` | AC13 |
 
@@ -336,20 +342,20 @@ printed `undefined` and NaN for it.
 
 | Summary | Numbers |
 |---|---|
-| Per session | start, end and duration; the sent rate over the whole session, after its first 30 s and over its last 60 s; the frame rate; the opening target; the highest target; the share of time at the encoder's cap (`target_bps` equal to the heartbeat's `maxrate_bps`) and at 3 Mbit/s or more; the heartbeat windows by pipe state; the delivery windows with a queued sample, beside those that carry the standing queue's fields, and the highest standing (FR-148 P0); the open path, `ssthresh` and `rwnd` at the first write, from the session's first open line (a session with more says how many) |
-| Per device and window | sessions; sessions by carrier, from the agent's lines and from the server's record (`remote_sessions.carrier`); sessions with the carrier rank on that rode `turn` (AC22's "N of N"); stalled delivery windows and `transit-stalled` heartbeat windows over all sessions; path-memory closes by `wrote` and `why`; O7's counted samples by window state and each set-aside count, summed over the closes that carry them, beside the number of closes that do not; sessions by open path (O10): `cookie_echo`, `init_ack`, `unknown` and `unread`, beside the sessions with no open line |
+| Per session | start, end and duration; the sent rate over the whole session, after its first 30 s and over its last 60 s; the frame rate; the opening target; the highest target; the share of time at the encoder's cap (`target_bps` equal to the heartbeat's `maxrate_bps`) and at 3 Mbit/s or more; the moves on the target lines by `why` (`moves 4: increase(app-limited) 2, open 1, decrease(stall)+ceiling(plan) 1`), beside every move the heartbeats counted (`target_moves`) by `why` with the heartbeats that carry it, and the held targets landing beside the changes a heartbeat showed with no target line (FR-148 P0); the heartbeat windows by pipe state; the delivery windows with a queued sample, beside those that carry the standing queue's fields, and the highest standing (FR-148 P0); the open path, `ssthresh` and `rwnd` at the first write, from the session's first open line (a session with more says how many); on the mesh relay (carrier `derp`, FR-148 AC4): the delivery lines with a T3 and the T3 expiries counted, beside the lines that carry `loss`; the stalled lines with a T3, without one, and carrying neither `loss` nor `cwnd`; and the T3 lines by each node's nearest drop line with a count moved (or shed line with `since_last` above 0): within 25 s after, only before inside the line's span, or none moved, each with how many had a /derp lifecycle line between; the causes that moved in those lines, by node; and, with `--viewer-agent`, the T3 lines across which no count moved on either node |
+| Per device and window | sessions; sessions by carrier, from the agent's lines and from the server's record (`remote_sessions.carrier`); sessions with the carrier rank on that rode `turn` (AC22's "N of N"); stalled delivery windows and `transit-stalled` heartbeat windows over all sessions; path-memory closes by `wrote` and `why`; O7's counted samples by window state and each set-aside count, summed over the closes that carry them, beside the number of closes that do not; sessions by open path (O10): `cookie_echo`, `init_ack`, `unknown` and `unread`, beside the sessions with no open line; the same mesh-relay counts over every session on the mesh relay, with their delivery lines, their stalled ones and their `transit-stalled` heartbeat windows (FR-148 AC4); the /derp lines of every relay node, the agent's and the viewer node's apart: the drop and shed lines with each cause's moves summed, and the lifecycle lines by state |
 
 | Bound | What it is | Where |
 |---|---|---|
-| Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. The wrapper refuses anything else, and `--json`, before it looks at the target: an option given twice, and a window end that is not `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.sss]]` with `Z` or `+HH:MM` (JavaScript would read a time without a zone in the zone of the machine running the read). The read checks the same pattern, and every value bound for `--mars`'s remote command line is plain characters only | `scripts/rc-path-report.sh:160`, `:124`, `:168`, `scripts/rc-path-timeline.cjs:1077` |
-| Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:1090` |
-| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:872`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:945` |
-| Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date. A line whose batch was stored outside that range, uploaded over 10 min late or stamped by a clock over 10 min fast, is not read and leaves no mark, so the report's header prints the range read (`batches read: stored … -> …`) | `scripts/rc-path-timeline.cjs:896`, `:910`, `:808` |
-| Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group` | `scripts/rc-path-timeline.cjs:885` |
-| Time | `maxTimeMS` 240,000 | `scripts/rc-path-timeline.cjs:945` |
-| Rows | `$limit` of 60,000 + 1 by default (`--limit` up to 200,000, one bound in the wrapper and the read). A read that reaches it prints `TRUNCATED` at the top and bottom of the report, and in `--rows`. Rows come in the order their batches were stored, so the cut misses every batch stored after the last one read, and some of their lines can be older than the last time printed: narrow the window or raise `--limit` | `scripts/rc-path-timeline.cjs:941`, `:798`, `:1001` |
-| What leaves | named fields only, plus the two path-memory lines' fields minus every key that could name an address, a host or a person. `viewers` leaves only as a number: the rank line's count, never the overlay-auto line's list of viewer addresses. Ids and the memory's `key_id` print as their last 4 hex, in the report and in `--rows` alike; an id whose last 4 hex another id took earlier in the same read prints with `~2` after them, so two sessions never merge. Every printed line, and every string `--rows` prints, is scrubbed of addresses and 24-hex ids. So `--rows` carries the named fields masked and scrubbed, plus the window, the agent's last 4 hex, the limit and the server's carrier record, and its offline re-read renders byte for byte as the direct read | `scripts/rc-path-timeline.cjs:889`, `:932`, `:365`, `:970`, `:382` |
-| Carrier record | one `$group` by `carrier` over this agent's `remote_sessions` created in the window, on `agent_id_1_created_at_-1` (`crates/modules/remote/src/lib.rs:291`), `maxTimeMS` 30,000. That is tens of rows a day | `scripts/rc-path-timeline.cjs:955`, `:962` |
+| Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. With `--viewer-agent`, one more agent, the viewer's node, read for its /derp lines only, under `--viewer-tenant`'s org or else `--tenant`'s (a node uploads its lines under its primary enrollment). The wrapper refuses anything else, and `--json`, before it looks at the target: an option given twice, a `--viewer-agent` or `--viewer-tenant` that is not a 24-hex id, either one without `--timeline`, a `--viewer-tenant` without `--viewer-agent`, and a window end that is not `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.sss]]` with `Z` or `+HH:MM` (JavaScript would read a time without a zone in the zone of the machine running the read). The read checks the same, and refuses a viewer agent that is `--agent`, and every value bound for `--mars`'s remote command line is plain characters only | `scripts/rc-path-report.sh:176`, `:132`, `:187`, `:158`, `:179`, `:181`, `scripts/rc-path-timeline.cjs:1667` |
+| Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:1680` |
+| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:872`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at`. The viewer node's read is the same pipeline on its own org and agent, with the same hint, and `--explain` prints its plan apart | `scripts/rc-path-timeline.cjs:1525`, `:1716` |
+| Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date. A line whose batch was stored outside that range, uploaded over 10 min late or stamped by a clock over 10 min fast, is not read and leaves no mark, so the report's header prints the range read (`batches read: stored … -> …`) | `scripts/rc-path-timeline.cjs:1476`, `:1490`, `:1338` |
+| Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group`. The second `$project` picks each line's fields by its kind, a `$switch` on its message, one row at a time; the viewer node's read keeps only the /derp kinds in both | `scripts/rc-path-timeline.cjs:1462`, `:1467` |
+| Time | `maxTimeMS` 240,000, each read | `scripts/rc-path-timeline.cjs:1525` |
+| Rows | `$limit` of 60,000 + 1 by default (`--limit` up to 200,000, one bound in the wrapper and the read). A read that reaches it prints `TRUNCATED` at the top and bottom of the report, and in `--rows`. Rows come in the order their batches were stored, so the cut misses every batch stored after the last one read, and some of their lines can be older than the last time printed: narrow the window or raise `--limit`. The viewer node's read has the same `$limit` of its own, and its own `TRUNCATED` | `scripts/rc-path-timeline.cjs:1521`, `:1327`, `:1591` |
+| What leaves | a line's own kind's named fields only (`FIELDS`, by the row that prints them: a field added to a line kind is one entry there; `fieldsOf` adds the session's id). The read picks a line's fields by its message, as the fold picks its kind, so a field named for one kind never leaves from another kind's line. The /derp lines' `relay` (the drop line's, the shed line's and the lifecycle lines') names the relay node, a host, and a failed connect's `e` is an error text that can name the relay's address: both stay in the database (`KEPT`). The read is not built if either is named, every /derp field leaves only as a number, `--rows` keeps a line to its kind's fields again, and the self-test fails on each of these, and on a /derp line the agent writes with a field the reader neither names nor keeps. The viewer node's read takes its /derp lines only (`DERP_KINDS`), through the same projection, and `--rows` keeps its rows to those kinds again. The ICE line's `relay` leaves: it is a yes or no. The two path-memory lines leave their fields minus every key that could name an address, a host or a person. `viewers` leaves only as a number: the rank line's count, never the overlay-auto line's list of viewer addresses. `why` and `target_moves` leave as written: the agent builds both from fixed words and counts only (`agents/roomlerd/src/encode/aimd.rs:207`, `agents/roomlerd/src/encode/governor.rs:82`, `:129`), never an id, an address or free text, and the self-test fails when a line the timeline reads writes any other `why`. Ids and the memory's `key_id` print as their last 4 hex, in the report and in `--rows` alike; an id whose last 4 hex another id took earlier in the same read prints with `~2` after them, so two sessions never merge. Every printed line, and every string `--rows` prints, is scrubbed of addresses and 24-hex ids. So `--rows` carries the named fields masked and scrubbed, plus the window, the agent's last 4 hex, the limit and the server's carrier record, and its offline re-read renders byte for byte as the direct read | `scripts/rc-path-timeline.cjs:414`, `:492`, `:395`, `:1447`, `:1449`, `:1559`, `:1512`, `:635`, `:1554`, `:652`, `:2089`, `:327` |
+| Carrier record | one `$group` by `carrier` over this agent's `remote_sessions` created in the window, on `agent_id_1_created_at_-1` (`crates/modules/remote/src/lib.rs:291`), `maxTimeMS` 30,000. That is tens of rows a day | `scripts/rc-path-timeline.cjs:1535`, `:1542` |
 
 The estimate is for a ten-hour window with eight hours of FFmpeg sessions. That is about 14,400
 heartbeats (one every 2 s), 2,880 delivery and 2,880 model lines (one each every 10 s), 960
@@ -357,22 +363,65 @@ capture-timing lines (one every 30 s of capture) and a few dozen other lines a s
 21,200 rows. That is about 11 MB through `--rows` (about 600 bytes a heartbeat, 300 for the
 others), and a report of a few thousand lines. The documents examined are this agent's batches in
 the window, about 6,000 at ten a minute while a session runs, all through the index. A VP9-444
-pump doubles the heartbeats.
+pump doubles the heartbeats. The target lines add one for each move a pump writes a line for: an
+increase at most every 5 s, a ×0.85 at most every 500 ms and only while congested above the floor
+(`agents/roomlerd/src/encode/aimd.rs:96`, `:93`), and a bound's move when its number crosses the
+target, which a measured bound does at most once a window of about 1 s. A session that climbs and
+backs off writes a few a minute; even one a second for all eight hours adds 28,800 rows of about
+200 bytes, about 50,000 rows in all, under the default limit. The /derp lines add a drop line at
+most every 25 s per relay node while it drops (`agents/roomlerd/src/derp.rs:56`): 1,440 in the
+ten hours if it never stops, about 300 bytes each, and a few lifecycle lines a reconnect, about
+150 bytes each. That is about 51,500 rows with one relay node, still under the default limit.
+Picking a line's fields by its kind runs on the rows read, never on the documents examined, which
+do not change. `--viewer-agent` adds one more read, bounded the same way: that agent's batches in
+the window through the same index, its drop and lifecycle lines only, at most 1,440 a relay node
+in ten hours and a few a reconnect.
 
 What the lines cannot tell:
 
-- **Why a target moved.** The governor sets the applied target in `record_applied`
-  (`agents/roomlerd/src/encode/governor.rs:2213`). An agent with FR-148 P0's move causes writes
-  why on the pump's own target lines (`why`) and counts the moves in its heartbeat
-  (`target_moves`, [Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)),
-  but this read takes neither field yet and an older agent writes neither, so a move prints
-  "reason: not logged".
+- **Why a target moved, on an agent before 0.4.230.** Its target lines carry no `why` and its
+  heartbeats no `target_moves`, so its moves print "(reason: not logged)". From 0.4.230 each
+  target line says why ([Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)),
+  and each heartbeat counts every move the governor handed out since the heartbeat before it
+  (`record_applied`, `agents/roomlerd/src/encode/governor.rs:2216`; `take_moves`, `:2153`).
+- **When a move with no target line happened.** The pumps write a target line for only some
+  moves: the FFmpeg pump only when the number changed and not for the tick a rebuild's open runs
+  first, neither pump at the gate's skip, the FFmpeg pump not at a send overflow, and the VP9-444
+  pump writes a re-apply only with a quality change. Such a move is in the next heartbeat's
+  `target_moves`, with its `why` but not its time, and prints at that heartbeat when the target
+  there differs. So over a session read whole, the moves on its target lines are at most the
+  heartbeats' total, plus the moves after a pump's last heartbeat, unless a heartbeat line was
+  lost on upload.
 - **Which session owns a line that names none.** The encoder lines and the rate-memory line carry
   no session id. Such a line goes to the session whose lines span its time, from 10 s before the
   session's first line to 30 s after its last; when two sessions qualify, the later-started one
   wins. Otherwise it is counted as being in no session.
 - **Whether a session ended.** A session whose last line falls within 30 s of the window's end
   prints as open at the window's end.
+- **Which relay node a /derp line came from.** Its `relay` names the node (`central`, or a
+  regional relay's host) and stays in the database, so the lines of a device on two nodes read as
+  one device's, while each node counts and ticks its own drops.
+- **Whether a drop fired a T3.** A drop line tells the drops since the line before at the
+  keepalive tick after them: every 25 s from the /derp WS's connect, later when a blocked send
+  holds the tick up. A delivery line counts the T3 expiries of its ≈10 s. So the pairing says only
+  that a drop could have come first. A tick that falls between a drop and the delivery line's
+  write tells the drop before the line, and such a T3 line counts as "only before, inside the
+  line's span", apart from the 25 s after. The relay server's own drops (a frame for an
+  unregistered destination, or one a full destination queue refused) are in the relay's log,
+  the central relay's or a regional relay's
+  ([every drop on the relay path](overlay-communication.md#every-drop-on-the-relay-path-and-where-it-reports-fr-148-d52)),
+  and a lost SACK and a loss below the overlay are in no line.
+- **The viewer node's drops, without `--viewer-agent`.** An inbound drop on the viewer's node
+  (`backpressure`, `unrouted`), or an outbound one on its way back, is in no line the agent writes.
+  The viewer's node uploads its lines under its primary enrollment, so a node in another org than
+  the agent's is read with `--viewer-tenant`. An agent before D52 writes the shed line only: its
+  `full`, `backpressure` and `unrouted` drops are in no line.
+- **A T3 count, on an agent before 0.4.227.** Its delivery lines carry no `loss`, so its T3 lines
+  show only by the one-packet window, and their count prints `-`. A line whose samples were read
+  without SCTP's gauges carries neither `loss` nor `cwnd`, and its stall counts apart.
+- **The model's push-back, rule and fall, on an agent before FR-148 D46 B2, D48 (#4191) and D50
+  (#4231).** Its model lines carry no `model_floor_push_back`, `model_rule` or `model_fell`, which
+  print `-`, as the agent's own `-` (none yet) does.
 
 **Rehearsed, not run on production.** On 2026-11-18 a throwaway `mongo:7.0.45` held 624 invented
 batches (2,219 lines), with the indexes the fleet and remote modules declare on `agent_logs` and
@@ -385,3 +434,16 @@ lines the seed put in the window and none of the others, the late-stored line in
 0 rows, and `--rows`, with and without `--limit 100`, rendered offline byte for byte as the direct
 read, with no address and no 24-hex id in it. The seed was loaded with mongosh, not through
 `--seed`. The `--mars` branch has not run against production.
+
+**The kind-aware read, rehearsed on a real server (FR-148 AC4, 2026-11-21).** The self-test
+evaluates the read's two `$project` stages as the server would (`serverRows`,
+`scripts/rc-path-timeline.cjs:1717`) on synthetic agent lines, the /derp lines among them with a
+relay host, an IPv4 and an IPv6 relay address and a failed connect's error, and renders what comes
+back through `--rows` and the report. The same lines, with two lines the read must not take, went
+as 8 batches through `--seed` into a throwaway local mongo:7 (7.0.40). The server's rows, read
+before any cut of the client's, equal the self-test's evaluation row for row and field for field
+(11 rows). No relay host, address or error text was in them, in `--rows` or in the report, and
+`--explain` printed `PROJECTION_SIMPLE <- FETCH <- IXSCAN(tenant_id_1_agent_id_1_created_at_-1)`
+with no blocking SORT stage. That seed was written for the rehearsal: §8's seed
+(`rc-path-report.cjs --fixtures`) still has no /derp line and no `loss`, so a re-run needs them
+added to it. This read has not run against production.

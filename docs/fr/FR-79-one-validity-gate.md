@@ -207,7 +207,7 @@ relayed `h264_vaapi` session that never lost a byte to a slow path:
 5. Each wrote its own stand-in back with a fresh TTL: 3,322 → 2,989 → 2,690, five
    writes with no rise, so the key held itself low with nothing behind it.
 
-`the_jupiter_chain_replays_to_the_unit_with_the_switch_off` (`governor.rs:5130`) is
+`the_jupiter_chain_replays_to_the_unit_with_the_switch_off` (`governor.rs:5316`) is
 one driver through the real governor, and every number above is asserted to the
 unit: the target, the ceiling abandoned, the twelve rungs, and "3,322 → 2,989 →
 2,690", which is one seed rung plus half the gap. That arm stays, because it pins
@@ -281,7 +281,7 @@ since V4 a write moves an entry 10 % of the gap upward; at the band `stand_in_bp
 is `None`, so a long session writes nothing; P1's own field proof freed its pair
 through `stable_bps` (6,083,280), which (a) keeps; and on jupiter it moved the key
 DOWN, 3,322 → 2,989 → 2,690 over five writes with no rise.
-`a_poisoned_key_runs_out_or_a_measurement_lifts_it` (`governor.rs:5357`) holds the
+`a_poisoned_key_runs_out_or_a_measurement_lifts_it` (`governor.rs:5543`) holds the
 new behaviour: seven daily seeded sessions leave value and age alone, the seed is
 gone one second after the TTL, and a measuring session moves 3,322 → 102,989 at once.
 
@@ -540,7 +540,7 @@ own starvation.
 
   The fail-first cell is the 10-20 14:16 arc: prior 19,578, three gap windows,
   target 1.17 → 1.00 → 0.85 → 0.61 M. Two controls must stay green:
-  `a_transit_stall_above_the_measured_pipe_cuts_the_rate` (`governor.rs:3160`,
+  `a_transit_stall_above_the_measured_pipe_cuts_the_rate` (`governor.rs:3346`,
   where a measurement stands and the stall still cuts) and
   `finding_4_keeps_the_rate_with_the_validity_gate` (`sim.rs:2452`).
 

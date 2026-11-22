@@ -35,9 +35,9 @@ spec designs the whole of it and returns no option to him.
 
 | # | macOS says | Raised by | When |
 |---|---|---|---|
-| 1 | "Screen Recording" / "“roomlerd” would like to record this computer's screen and audio." [Open System Settings] [Deny] | the agent's start-up preflight (code: `agents/roomlerd/src/app.rs:3769-3801`, run at `:3961`; `CGRequestScreenCaptureAccess`, `crates/agent-core/src/tcc.rs:64-66`), which also opens the pane (`app.rs:3790`) | 51 s after the install's password (10 Nov); on 0.4.211 the alert and System Settings cover the wizard's Done page completely (11 Nov) |
-| 2 | the switch, then the password, then "“roomlerd” may not be able to record the contents of your screen until it is quit." [Quit & Reopen] [Later]; after Quit & Reopen, Finder: "The application “roomlerd” is not open anymore." [OK] | macOS; the restart is ours (`agents/roomlerd/src/macos_quit.rs:3-74`), Finder's error comes from LaunchServices' reopen, whose process leaves at once (`app.rs:3812`) | every first grant (2 Nov, 10 Nov, 11 Nov) |
-| 3 | "Device Control and Data Access" / "“roomlerd” would like to control this Mac and access your data." [Open System Settings] [Deny] | the relaunched agent's preflight (`app.rs:3771`); macOS 27's pane for Accessibility | 1 s after the relaunch, under Finder's false error (10 Nov); it stays on screen after the grant until answered (11 Nov) |
+| 1 | "Screen Recording" / "“roomlerd” would like to record this computer's screen and audio." [Open System Settings] [Deny] | the agent's start-up preflight (code: `agents/roomlerd/src/app.rs:3751-3783`, run at `:3943`; `CGRequestScreenCaptureAccess`, `crates/agent-core/src/tcc.rs:64-66`), which also opens the pane (`app.rs:3772`) | 51 s after the install's password (10 Nov); on 0.4.211 the alert and System Settings cover the wizard's Done page completely (11 Nov) |
+| 2 | the switch, then the password, then "“roomlerd” may not be able to record the contents of your screen until it is quit." [Quit & Reopen] [Later]; after Quit & Reopen, Finder: "The application “roomlerd” is not open anymore." [OK] | macOS; the restart is ours (`agents/roomlerd/src/macos_quit.rs:3-74`), Finder's error comes from LaunchServices' reopen, whose process leaves at once (`app.rs:3794`) | every first grant (2 Nov, 10 Nov, 11 Nov) |
+| 3 | "Device Control and Data Access" / "“roomlerd” would like to control this Mac and access your data." [Open System Settings] [Deny] | the relaunched agent's preflight (`app.rs:3753`); macOS 27's pane for Accessibility | 1 s after the relaunch, under Finder's false error (10 Nov); it stays on screen after the grant until answered (11 Nov) |
 | 4 | "“roomlerd” is requesting to bypass the system private window picker and directly access your screen and audio." [Allow] [Open System Settings] | the first capture of a session; nothing in our code handles it (#3240 row 3) | at the first remote session (2 Nov, 11 Nov); macOS's own record sets the next one 30 days later (11 Nov, read from replayd's file, not seen) |
 | 5 | "Allow “roomlerd” to find devices on local networks?" [Don't Allow] [Allow] | the session's network paths (below) | at the first remote session (2 Nov, 11 Nov) |
 
@@ -51,23 +51,23 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 
 - **The wizard** (code): one paragraph on Done, "One manual step remains: macOS grants Screen Recording and
   Accessibility by hand…", which also says to choose Quit & Reopen and to allow the local-network prompt
-  (`agents/roomler-setup/src/front/app.js:2028-2032`). No live state, no button, nothing about prompt 4. Field
+  (`agents/roomler-setup/src/front/app.js:1930-1934`). No live state, no button, nothing about prompt 4. Field
   (11 Nov, 0.4.211): it names "Accessibility", which macOS 27 calls "Device Control and Data Access", and it says
   the same after a re-install with both grants on.
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —
   the remote screen will be blank", "Accessibility — remote keyboard and mouse will do nothing"), an Open
   Settings button each, and Restart roomlerd (`agents/roomler-desktop/src/front/index.html:102-130`), re-read on
-  window focus (`overview.js:653-675`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2417-2424`,
+  window focus (`overview.js:656-678`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2402-2409`,
   `agents/roomlerd/src/localapi_state.rs:460-473`). Its Screen Recording read is not live: it stays false after
-  the grant until a restart (`crates/localapi/src/lib.rs:545-557`). No row for prompts 4 or 5, no stale state, no
+  the grant until a restart (`crates/localapi/src/lib.rs:500-512`). No row for prompts 4 or 5, no stale state, no
   "Allowed" state. For its first 30 s after the install it says "Not enrolled yet" (#3700).
 - **The Devices page** (code): "No screen access" and "No input access" chips (`ui/src/components/admin/agentCodecChips.ts:92-115`)
-  from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4449-4478`).
+  from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4450-4479`).
   Field (11 Nov): "No input access" 4 minutes after the Accessibility grant, gone after a restart; and in the
   item 9 session, typed input landed while the row said it had no input permission (#3240 row 8).
 - **The viewer** (code): on `rc:media-unavailable` with code `permission`, "This device cannot capture its
   screen." and the agent's sentence (`ui/src/views/remote/RemoteControl.vue:1394-1409`,
-  `agents/roomlerd/src/capture/mod.rs:897-901`, corrected for old agents by `ui/src/composables/macPermissionHint.ts:33-39`).
+  `agents/roomlerd/src/capture/mod.rs:786-790`, corrected for old agents by `ui/src/composables/macPermissionHint.ts:33-39`).
   No signal reaches the viewer for a missing input grant (code: no such message on the wire). Nothing about a
   prompt on the Mac's screen (field, 11 Nov).
 
@@ -80,9 +80,9 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an
-  existing grant" (`capture/mod.rs:900-901`).
+  existing grant" (`capture/mod.rs:789-790`).
 - Nothing of ours reads the stored grants. The one reset is the uninstall's, as root, while the bundle is there
-  (`scripts/install.sh:2027-2035`).
+  (`scripts/install.sh:1943-1951`).
 
 ### Bundle, signing and the network paths (code)
 
@@ -164,12 +164,12 @@ what is missing.
   that finds a grant it held before now refused, with the version or the macOS build changed, reads as stale.
 - **What the row says:** "On in System Settings, but macOS no longer accepts it. This can happen after an update."
   **One action, Repair:** `tccutil reset <service> com.roomler.agent` (through the root half as the uninstall does,
-  `install.sh:2032`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
+  `install.sh:2045`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
   again, which lists it in the pane, the person turns it on, and Roomler restarts it. Repair is never offered to a
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
   app's grants.
-- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:4026`), so after
+- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:4054`), so after
   our own update and after a macOS update without a separate trigger; and when a session's capture fails with
   `permission`.
 

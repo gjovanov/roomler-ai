@@ -155,7 +155,7 @@ sequenceDiagram
 
 - **Only onto a proven binary.** The file the command was started as, read before
   the install replaces it, must answer `--version` as the release just installed
-  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1160`).
+  (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1461`).
   Otherwise the service keeps its image: P2b's rule for the same question.
 - **The daemon's refusals stand** (FR-84 D3, `roomler restart`'s client,
   `agents/roomler-cli/src/localclient.rs:1651`): `local_restart_enabled = false`,
@@ -423,7 +423,7 @@ stateDiagram-v2
     Replaced --> Settled: unchanged for 2 min
     Settled --> Ignored: --version says the same release, or it does not run (asked again in 10 min)
     Settled --> Waiting: --version says another release
-    Waiting --> Waiting: a session, SSH, a transfer or a recording (up to 24 h) — or a network transition, or its own install in flight (never forced)
+    Waiting --> Waiting: a session, SSH, an exec run, a transfer or a recording (up to 24 h) — or a network transition, or its own install in flight (never forced)
     Waiting --> Restart: idle, or the 24 h ceiling cuts the work
     Restart --> [*]: graceful exit 9, and systemd starts the new binary
 ```
@@ -438,6 +438,10 @@ stateDiagram-v2
 - ⚠️ **An SSH session counts.** The likeliest replacement outside the helper is an
   admin's `apt upgrade` typed into a roomler SSH session on that device, so open
   SSH connections defer the restart like a remote-control session does.
+- **So does a Fleet RPC run** (#3429), for as long as it runs: 5 min at most. "Idle"
+  is one model, `Busy` (`agents/roomlerd/src/busy.rs`), and the periodic update
+  check reads it too, on every OS
+  ([installation.md](installation.md#an-update-waits-for-live-work-3429)).
 - **The restart is "Apply now"'s** (FR-84 D3): only under a supervisor that
   relaunches the process, rate-limited by the persisted record, and checked
   against systemd's own policy first. An orphan `roomlerd run` never exits for it.
@@ -551,9 +555,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3461`) | after every check that installs nothing; at the start after an update (`:3349`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3400`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4029`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3278`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3462`) | after every check that installs nothing; at the start after an update (`:3359`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3408`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4062`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3288`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
@@ -608,7 +612,7 @@ our stdin.
 | the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2367-2382`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2564`) |
 | the daemon's own package, not root | `pkexec`, then `sudo -n`, in front of the same `apt-get` | `/dev/null` |
 | the companion's package (`install_commands`, `agents/roomlerd/src/companion/package_sync.rs:138`) | `apt-get install -y --no-remove -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold <deb>`, with `INSTALL_ENV` | `/dev/null` (`run_bounded`) |
-| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
+| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
 | `install.sh`'s `deb_install` (#3926, [installation.md](installation.md)) | `dpkg --force-confold -i`, then `apt-get … -o Dpkg::Options::=--force-confold` | `/dev/null` |
 
 **What a person finds afterwards:** their file as they left it, a deleted one still deleted,

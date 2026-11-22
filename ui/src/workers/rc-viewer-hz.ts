@@ -76,7 +76,9 @@ function workerEnv(): HzEnv {
  *  never hears: that is what it hears from an older viewer too. A browser may also
  *  refuse rAF by throwing (the HTML spec's `NotSupportedError`), which reads the
  *  same. It must never throw at its caller, the decoder's `output`, where a throw
- *  costs the frame in hand. */
+ *  costs the frame in hand, nor out of its rAF callback (#4193). A report that
+ *  throws costs that one reading: it does not count as told, so the next burst
+ *  on the same screen reports it again. */
 export function startViewerHzBursts(report: (hz: number) => void, env: HzEnv = workerEnv()): void {
   const raf = env.raf
   if (!raf) return
@@ -97,8 +99,12 @@ export function startViewerHzBursts(report: (hz: number) => void, env: HzEnv = w
         return
       }
       if (told === null || Math.abs(hz - told) > VIEWER_HZ_SAME) {
-        told = hz
-        report(hz)
+        try {
+          report(hz)
+          told = hz
+        } catch {
+          /* `told` keeps the last reading told; nothing escapes the rAF callback */
+        }
       }
       env.later(burst, VIEWER_HZ_EVERY_MS)
     }

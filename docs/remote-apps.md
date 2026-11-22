@@ -199,8 +199,8 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4779`,
-`:2488` via `with_config_lists` `:3095`) — in the daemon, never in the
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4780`,
+`:2491` via `with_config_lists` `:3098`) — in the daemon, never in the
 caps-probe child (§4.3).
 
 | Tier / path | Hello `apps` on 0.4.102 | `rc:apps.list.reply` on 0.4.102 | Reason reached the screen? | After P6 |
@@ -525,12 +525,14 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3693`),
-not `load`, because `load` self-heals. When the live file is unreadable and its
-`.prev` copy loads, `load` promotes that copy back over it and logs
-*RECOVERED from the previous good copy* at ERROR. When no usable copy exists, it
-logs *the host must be re-enrolled* at ERROR and fails. A diagnostic must never
-write the device's config as a side effect of being run.
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3697`),
+not `load`, because `load` self-heals. When the live file is missing or unreadable and
+its `.prev` copy loads, `load` promotes that copy back over it, without the copy's run
+marks (#4157), and logs *RESTORED* or *RECOVERED from the previous good copy* at ERROR.
+When no usable copy exists, it logs that the host must be enrolled (again) or re-enrolled,
+at ERROR, and fails. A diagnostic must never write the device's config as a side effect of being run.
+Since #4157 a start restores a missing file the same way, except the macOS supervisor's enrolled worker, which
+ends with 78 as before: on a converted one-row Mac the person's `.prev` can hold the enrollment that moved to root (#4184).
 
 ## 9. Code map
 

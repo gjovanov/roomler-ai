@@ -4,7 +4,7 @@ license = "MPL-2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "The per-Machine MSI's custom actions that carry the Roomler service's Environment across a major upgrade (#3375)."
+description = "The per-Machine MSI's custom actions that carry the Roomler service's Environment across a major upgrade (#3375), and keep the files an install puts in place across the next boot (#4196)."
 
 # msiexec loads this DLL from the MSI's Binary table, on a machine that may have
 # no VC++ redistributable, so the release lane and installer-smoke build it with

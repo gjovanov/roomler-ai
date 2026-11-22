@@ -483,7 +483,7 @@ AC23's case, TURN blackholed: the hold ran to its bound, and the session opened 
 INFO per-session ICE path detected (adaptive bitrate) session_id=<id> relay=false local_typ=Host local_proto=Udp local_addr=100.64.0.12:50123 remote_typ=Relay remote_proto=Udp remote_addr=100.64.0.9:50200 waited_ms=0 opening=route route=mesh-relayed hold_ms=2500 hold_exit=bound
 ```
 
-`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:139`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
+`route` is the agent's read of the pair and, on the mesh, the overlay's carrier to the remote's peer, in the carrier record's words (`path_route`, `carrier_rank.rs:324`): `native` (off the mesh, no relay), `turn` (off the mesh, a relay at either end), `mesh-direct`, `mesh-relayed` (TURN or DERP), `mesh-org`, and `mesh-unknown` when the overlay cannot say. Under every other value the line is the one above, byte for byte (the cell `the_path_line_names_the_route_under_route_only`). The readers match it by its message and read its fields by name (`scripts/rc-path-report.cjs:357`, `rc-path-timeline.cjs:341`, `rc-shadow-report.cjs:124`), so the added fields change nothing for them. The carrier line keeps its words (D21); under `route` it decides "rides the overlay" by the same predicate ([§11.9](#119-the-carrier-a-session-rides-fr-102-p9c)).
 
 **The kill switch.** `rc_carrier_rank` back to `1`, `prio` or `0` (or `ROOMLERD_RC_CARRIER_RANK`), then a restart; it is read once per session. Under every value but `route` the agent gets no route rank, and every branch above is a no-op: the vnet cells `kill_switch_under_prio_and_1_every_pair_is_formed_and_nothing_is_held` and `kill_switch_under_prio_shapes_a_and_b_still_open_on_the_mesh` hold that.
 
@@ -3029,7 +3029,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    nothing or did not answer (#3967; `docs/desktop-companion.md` §10.8). An exec question reads it
    from `ensure_running_verdict` ([`:1181`](../agents/roomlerd/src/companion.rs#L1181)), an SSH
    question from `Companion::verdict` ([`:1458`](../agents/roomlerd/src/companion.rs#L1458)), in
-   `ask_here` ([`ssh.rs:2507`](../agents/roomlerd/src/ssh.rs#L2507)). `TrayVerdict::why_not_shown`
+   `ask_here` ([`ssh.rs:2687`](../agents/roomlerd/src/ssh.rs#L2687)). `TrayVerdict::why_not_shown`
    ([`companion.rs:1227`](../agents/roomlerd/src/companion.rs#L1227)) picks the closed road's
    sentence only where the tray was up with the question's marker to read, and FR-27's sentence
    otherwise. Until #4140 both causes were one `false` (`tray_up() && reaches_the_tray()`), so on a
@@ -3333,7 +3333,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3582`](../crates/localapi/src/lib.rs#L3582), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3621`](../crates/localapi/src/lib.rs#L3621), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -5259,7 +5259,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7031`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:7204`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -5270,7 +5270,7 @@ session not yet live, and an external one, end as before FR-138.
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
 on, on 2026-11-10, so no server rollback goes to an image built before `79cf1019b` (P1a, #3607). `AuditKind` gained its
 tolerant `Unknown` there (`crates/remote_control/src/models.rs:6824-6825`), and the session's audit listing reads a
-page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:160-161`; `session_audit`, `:168`): on an older
+page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:163-164`; `session_audit`, `:339`): on an older
 image one unknown kind fails the whole page, FR-137 S-B5's class. The row sets no floor. `RemoteSession` denies no
 unknown field (`crates/remote_control/src/models.rs:6048-6049`), so an older image ignores `attach_seq`, `detached_at`,
 `resume_by`, `stats_at` and `end_source`, and FR-138 added no `EndReason` and no phase. An `end_source` value from a
@@ -5523,7 +5523,7 @@ that costs: every server-visible stall in 90 d of `remote_audit` had aged past
 the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
-(`crates/modules/fleet/src/agent_log.rs:171`, mounted at
+(`crates/modules/fleet/src/agent_log.rs:207`, mounted at
 `crates/modules/fleet/src/lib.rs:544`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
@@ -5593,7 +5593,7 @@ dropped; `error_code` must match the server's snake_case vocabulary or it is
 recorded as `other`; `msg` is mark names and millisecond deltas. No URL, token,
 message text or hostname can enter the record — locked by
 `rcConnectTimingUpload.spec.ts`, and the exact JSON is locked to parse on the
-route by `browser_connect_timing_record_parses` (`agent_log.rs:459`), because a
+route by `browser_connect_timing_record_parses` (`agent_log.rs:494`), because a
 422 is swallowed like every other failure and would look like nobody connecting.
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
@@ -7070,7 +7070,7 @@ otherwise keep (§11.16). The reconnect is the same either way.
 | control WS RX deadline (`signaling.rs:2393`) | the keepalive's own due instant, which `tick()` returns (`:2336`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
 | control WS, a failed heartbeat send (`signaling.rs:2720`) or read (`:3387`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2337`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
 | the reconnect after any of them (`signaling.rs:1562`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
-| `/derp` RX deadline (`agents/roomlerd/src/derp.rs:445`) | the keepalive's due instant (`:432`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
+| `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3166`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:779`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
 
@@ -7363,7 +7363,7 @@ wedged.
 |---|---|---|
 | `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2030`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
-| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:629`) | until the next wedge moves it to `msi-wedged.prev.log` |
+| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:639`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
 The record's `note` in `last-install.json` names the kept copy.
 
@@ -7474,15 +7474,33 @@ own failure, although `should_record_supervisor_crash` leaves it out of
 the crash *reports* because the watchdog wrote its own.
 
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
-worker for an account with no config exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:147`](../agents/roomlerd/src/daemon_error.rs#L147)).
+worker for an account with no config, and no last good copy of one that
+holds an enrollment (#4157), exits `NO_ENROLLMENT_EXIT_CODE`
+(78, [`daemon_error.rs:153`](../agents/roomlerd/src/daemon_error.rs#L153)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. It ends before this bookkeeping, with no
 config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
 GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
 Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
-its reports. Only those two workers exit 78: every other `run` with no config
-still exits 1.
+its reports. Since FR-150 P2 so does the per-user task's daemon, whose
+launcher leaves on it. Only those three workers exit 78: every other `run`
+with no config still exits 1. The macOS supervisor's worker exits 78 even
+beside an enrolled copy, because it never restores at its start (#4157): on a
+converted one-row Mac the person's `config.toml.prev` can still hold the
+enrollment that moved to root (#4184). The other two restore a missing config
+from such a copy, and exit 78 only without one.
+
+**A restored config counts nowhere either** (#4157). When `config::load`
+restores a config from its last good copy (`config.toml.prev`), the live
+file missing or unreadable, it clears the copy's run marks first:
+`last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
+[`crates/agent-core/src/config.rs:4927`](../crates/agent-core/src/config.rs#L4927)).
+A save kept that copy while its run went on, so its mark says nothing of
+how the run ended. Before #4157 the copy kept the mark, and the start after
+a restore read the run before it as `Crashed` on the same boot, one step
+toward `should_rollback`. Since #4157 a start restores a missing config
+itself, so that start reads `Clean`. The crash count stays the copy's, and
+a crash of the run started on the restored config counts as any crash does.
 
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot

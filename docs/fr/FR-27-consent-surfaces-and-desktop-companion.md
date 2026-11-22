@@ -697,10 +697,10 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2268`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2302`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2318`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device
