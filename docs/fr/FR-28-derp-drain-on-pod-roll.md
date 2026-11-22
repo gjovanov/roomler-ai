@@ -18,7 +18,7 @@ This section is the status. "Where it stands (2026-10-31)" below is the read beh
 | P3, the pre-pull | In force since the promote of 2026-11-07 01:54Z | #3320 and the deploy repo's DaemonSet; #865, comment 6700791629 |
 | AC1, no delivery gap above 500 ms | Out of FR-28: the operator decided D1 on 2026-11-19 (A). The freeze that a `derp`-carried session sees through a roll is recorded at its measured size | ["D1, decided"](#d1-decided-ac1-stays-out-of-fr-28), below; [#865, comment 7014702138](https://github.com/gjovanov/roomler-ai/issues/865#issuecomment-7014702138) |
 | AC2, `hard-errored` disappears | Retired on 2026-11-02 | "The decision" |
-| AC3, reattach below about 4 s | **Met** (2026-11-22). With the switch on, 8 of 8 sockets on two hosts were back 1.93 to 2.87 s after their cut, on two rolls. The same hosts took 3.10 to 3.11 s on the ladder, and the same rolls' other hosts p50 3.39 and 3.45 s. The end point is the hello: these hosts cannot log `control-WS reattached`, which follows the hello by 47 ms at most where it is logged | [The switch-on half](#the-switch-on-half-2026-11-22); promote runs [44878921906](https://github.com/gjovanov/roomler-ai/actions/runs/44878921906) and [44932006872](https://github.com/gjovanov/roomler-ai/actions/runs/44932006872) |
+| AC3, reattach below about 4 s | **Met** (2026-11-22). With the switch on, 8 of 8 sockets on two hosts were back 1.93 to 2.87 s after their cut, on two rolls. The same hosts took 3.10 to 3.11 s on the ladder, and the same rolls' other hosts p50 3.39 and 3.45 s. The end point is the hello plus the agent's own reattach line, 0 to 1 ms after it: these hosts cannot log `control-WS reattached`, which follows the hello by 47 ms at most where it is logged | [The switch-on half](#the-switch-on-half-2026-11-22); promote runs [44878921906](https://github.com/gjovanov/roomler-ai/actions/runs/44878921906) and [44932006872](https://github.com/gjovanov/roomler-ai/actions/runs/44932006872) |
 | AC4, the rollout not slower | **Met**: 25 s on the first roll with the pre-pull, against 33.9 s | #865, comment 6700791629; "AC4: the rolls since the pre-pull" |
 | AC5, two hosts or more in one roll | **Met** (2026-11-22): two hosts with the switch on in each of two rolls, beside 18 and 17 hosts without it | [The switch-on half](#the-switch-on-half-2026-11-22) |
 | AC6, docs | **Met**: both halves are in `docs/overlay-communication.md` §6 and `docs/multi-pod-scale-out.md`, whose `docs/README.md` index rows exist | |
@@ -587,8 +587,9 @@ out. AC3 to AC6 keep their words.
       `ws_flat_redial` on, 8 of 8 sockets on two hosts were back 1.93 to 2.87 s after their cut on two rolls
       (promote runs [44878921906](https://github.com/gjovanov/roomler-ai/actions/runs/44878921906) and
       [44932006872](https://github.com/gjovanov/roomler-ai/actions/runs/44932006872)), against 3.10 to 3.11 s for
-      the same hosts on the ladder. The end point is the hello, because a packaged Linux daemon never logs
-      `control-WS reattached`; where it is logged, it follows the hello by 47 ms at most
+      the same hosts on the ladder. The end point is the hello plus the agent's own reattach line, 0 to 1 ms after
+      it, because a packaged Linux daemon never logs `control-WS reattached`. Where that line is logged, it follows
+      the hello by 47 ms at most; with that bound, these hosts reattached by about 2.92 s
       ([The switch-on half](#the-switch-on-half-2026-11-22)).
 - [x] No regression in rollout duration — the deploy must not get slower, since the
       whole reason pre-close draining was rejected is that surge is 0. **Met 2026-11-07:** 25 s from the first
