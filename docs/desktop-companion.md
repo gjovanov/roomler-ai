@@ -1070,11 +1070,11 @@ sequenceDiagram
 | The End arm | `handle_files_control` (`peer.rs:13326`, `:13331`, `:13340`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
 
 - **A cancel of the upload being placed does nothing to it** (`cancel_incoming`,
-  `agents/roomlerd/src/files.rs:3276`). The copy is one step that cannot stop, and its staging is
-  what it reads, so the cancel neither stops it nor removes the staging, and the end answers it,
-  once. The channel logs `files: cancel requested` with `ending=true`. So, as when the cancel was
-  read only after the copy, cancelling a row at 100% does not stop its file from landing. A
-  download's cancel in the same message acts at once.
+  `agents/roomlerd/src/files.rs:3276`): the copy is one step that cannot stop, and its staging is
+  what it reads, so the cancel neither stops it nor removes the staging; the end answers once. The
+  channel logs `files: cancel requested` with `ending=true`. Today's viewer sends no cancel for an
+  upload (`cancelUpload`, `ui/src/composables/useRemoteControl.ts:14065`, settles the row locally),
+  so a row cancelled at 100% still lands its file. A download's cancel acts at once.
 - **A begin during a placement is taken at once.** Its chunks are written as they come, and its own
   end waits in the lane for the earlier placement. The viewer sends its next begin as soon as a row
   settles, which a local cancel of a row at 100% does at once (`cancelUpload`,
