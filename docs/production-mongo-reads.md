@@ -383,7 +383,7 @@ What the lines cannot tell:
   heartbeats no `target_moves`, so its moves print "(reason: not logged)". From 0.4.230 each
   target line says why ([Why the target moved](rate-control.md#why-the-target-moved-fr-148-p0--every-move-of-the-live-target-says-why)),
   and each heartbeat counts every move the governor handed out since the heartbeat before it
-  (`record_applied`, `agents/roomlerd/src/encode/governor.rs:2216`; `take_moves`, `:2153`).
+  (`record_applied`, `agents/roomlerd/src/encode/governor.rs:2290`; `take_moves`, `:2227`).
 - **When a move with no target line happened.** The pumps write a target line for only some
   moves: the FFmpeg pump only when the number changed and not for the tick a rebuild's open runs
   first, neither pump at the gate's skip, the FFmpeg pump not at a send overflow, and the VP9-444

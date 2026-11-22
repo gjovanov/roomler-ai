@@ -226,7 +226,7 @@
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:523`, applied in `set_bitrate`, `encoder.rs:3024`).
+      (`coarsen_bitrate`, `encode/aimd.rs:527`, applied in `set_bitrate`, `encoder.rs:3024`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
@@ -252,7 +252,7 @@
     flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
     unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
     measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
-    the post-soak pass" in the code (`encode/governor.rs:1189`). Found on the way:
+    the post-soak pass" in the code (`encode/governor.rs:1254`). Found on the way:
     B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
     A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 
