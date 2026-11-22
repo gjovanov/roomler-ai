@@ -76,7 +76,7 @@ was rewritten on 2026-11-07 (#3531), and its anchors follow the code.
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
    built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:2050` (the per-mode window),
-   `models.rs:1336` (the doc-comment on the `PromptThenEmail` variant at `:1346`),
+   `models.rs:1341` (the doc-comment on the `PromptThenEmail` variant at `:1351`),
    `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 
 ### Desktop companion

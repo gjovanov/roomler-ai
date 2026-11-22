@@ -229,9 +229,14 @@ pub struct AgentCaps {
     /// * `upload`   — browser → host file uploads (the v1 default).
     /// * `download` — host → browser single-file downloads.
     /// * `download-folder` — host → browser folder zip streams.
+    /// * `resume`   — an interrupted upload resumes from the agent's
+    ///   accepted offset (`files:resume`, file-DC v3).
     /// * `browse`   — browser can navigate the host's filesystem
     ///   via `files:dir`. Conditional on the agent's
     ///   `enable_remote_browse` config flag.
+    /// * `dir-pages` — with `browse` (#4121): a listing too large for one
+    ///   message (64 KiB) reaches a viewer that sends `paged: true` in
+    ///   pages. Matched by equality, as every token here.
     ///
     /// Empty / unset (older agents) deserialises to `[]`; browsers
     /// that see an empty list fall back to `supports_file_transfer`

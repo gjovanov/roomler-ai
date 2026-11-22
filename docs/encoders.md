@@ -299,7 +299,7 @@ every other device, and a per-device override outlives an agent losing a cell. T
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
 and telling nobody (`agents/roomlerd/src/signaling.rs:3959`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:10381`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:10382`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:446`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -348,7 +348,7 @@ mistaken for the cell that was asked for.
 ### The stored choice: one value per pair (#3651)
 
 The two dropdowns are two axes, and the page stores one flat value for them, from
-one list: `RC_CODEC_CHOICES` (`ui/src/composables/useRemoteControl.ts:2410`). The
+one list: `RC_CODEC_CHOICES` (`ui/src/composables/useRemoteControl.ts:2411`). The
 type `RcCodecChoice` and the per-device allow-list both derive from it. Every pair the
 picker offers has a value of its own there, so a pair keeps its chroma through
 storage and a reload, except on AV1, which has one chroma in a session.
@@ -406,8 +406,8 @@ Two stores hold the choice:
 | per browser, the default of a device with no override of its own | the settings, in four keys: `roomler-rc-video-transport.v2`, `roomler-rc-vp9-chroma`, `roomler-rc-preferred-codec`, `roomler-rc-render-path` | by the picker's setter (`codecChoice`, `:8251`) | at page load: the dropdowns show `settingsToCodecChoice(transport, chroma)` (`:3962`), which reads an explicit chroma back on every transport that can carry it |
 
 The transport key's reader, `readStoredVideoTransport`
-(`ui/src/composables/useRemoteControl.ts:3066`), checks the stored value against the one
-list of transports, `RC_VIDEO_TRANSPORTS` (`ui/src/composables/useRemoteControl.ts:3023`).
+(`ui/src/composables/useRemoteControl.ts:3067`), checks the stored value against the one
+list of transports, `RC_VIDEO_TRANSPORTS` (`ui/src/composables/useRemoteControl.ts:3024`).
 The type `RcVideoTransport` derives from that list, as `RcCodecChoice` derives from
 `RC_CODEC_CHOICES`, so a transport added to the list is read back after a reload with
 no second edit. A value not in the list, or a page whose storage the browser refuses,
@@ -421,7 +421,7 @@ as transport `auto` on a device with no override of its own: the chroma, a key o
 own, survived, and the codec did not. #4101 stores nothing new. A stored
 `data-channel-h264` is the value every H.264 pick has written, and it now reads as
 itself, so after the upgrade such a device opens on H.264 instead of the auto rank. The
-key stays `roomler-rc-video-transport.v2` (`ui/src/composables/useRemoteControl.ts:3037`),
+key stays `roomler-rc-video-transport.v2` (`ui/src/composables/useRemoteControl.ts:3038`),
 because a new key would reset every stored pick.
 
 A page from before #3651 that reads what a newer page stored (a tab in a session does
@@ -786,7 +786,7 @@ something holds its pipe is a unit test with a real process on each OS.
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5129) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L5132) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -930,7 +930,7 @@ nothing has produced a stuck child in the field.
   child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
   in force stops offering them, as for a fault. A session starting beside a live one, or within that
   minute, can still open them.
-- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5150)). A session picks its codec and transport
+- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L5153)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
   waits minutes). So its offer reads both against the answer in force (`answer_now`, which never
   waits for a probe, #3439): what has gone is picked again by the
