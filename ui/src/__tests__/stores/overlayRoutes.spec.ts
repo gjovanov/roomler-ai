@@ -166,3 +166,39 @@ describe('mayEditMagicDns', () => {
     expect(s.magic_dns_domain).toBe('corp.example')
   })
 })
+
+// #4248 — the store holds one org's overlay nodes at a time, and knows which.
+describe('useOverlayRoutesStore: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it("a fetch for org B drops org A's nodes at once, and org A's late failure", async () => {
+    const store = useOverlayRoutesStore()
+    mockApi.get.mockResolvedValueOnce({ items: [mkNode({ id: 'na' })] })
+    await store.fetchNodes(ORG_A)
+    let failA!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((_, reject) => (failA = reject)))
+    const refreshA = store.fetchNodes(ORG_A)
+    // A refresh of the same org keeps what it shows while it loads.
+    expect(store.nodes.map((n) => n.id)).toEqual(['na'])
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = store.fetchNodes(ORG_B)
+    expect(store.nodes).toEqual([])
+    expect(store.nodesTenantId).toBe(ORG_B)
+
+    answerB({ items: [mkNode({ id: 'nb' })] })
+    await loadB
+    failA(new Error('boom'))
+    await refreshA
+    expect(store.nodes.map((n) => n.id)).toEqual(['nb'])
+    expect(store.error).toBeNull()
+    expect(store.loading).toBe(false)
+  })
+})

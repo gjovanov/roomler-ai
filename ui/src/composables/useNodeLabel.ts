@@ -50,13 +50,13 @@ export function useNodeLabel() {
     return c ? deviceLabel(c) : fallback
   }
 
-  /** Load what the labels read, once, when nobody has yet. The shell loads the
-   *  agents for its nav; tunnel clients only the Devices page does. */
+  /** Load what the labels read, when nobody has yet for this org. The shell
+   *  loads the agents for its nav; tunnel clients only the Devices page does.
+   *  A store that holds another org's rows reloads (#4248): an empty-list
+   *  check left the previous org's devices naming this org's nodes. */
   function ensureLoaded(tenantId: string, opts: { tunnels?: boolean } = {}) {
-    if (agentStore.agents.length === 0) void agentStore.fetchAgents(tenantId)
-    if (opts.tunnels && tunnelClientStore.clients.length === 0) {
-      void tunnelClientStore.fetchTunnelClients(tenantId)
-    }
+    void agentStore.ensureAgents(tenantId)
+    if (opts.tunnels) void tunnelClientStore.ensureTunnelClients(tenantId)
   }
 
   return { nodeLabel, agentLabel, clientLabel, ensureLoaded }

@@ -53,8 +53,24 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
   const total = ref(0)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4248 — which org `clients` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's clients never show (or fill a picker) under another org's page. */
+  const clientsTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it (the
+  // page moved on to another org) is dropped.
+  let seq = 0
+  // The latest fetch failed: `ensureTunnelClients` asks again.
+  let failed = false
 
   async function fetchTunnelClients(tenantId: string) {
+    const mySeq = ++seq
+    if (clientsTenantId.value !== null && clientsTenantId.value !== tenantId) {
+      clients.value = []
+      total.value = 0
+    }
+    clientsTenantId.value = tenantId
+    failed = false
     // ⚠️ The gate belongs HERE, not at each call site. `/tenant/…/tunnel-client`
     // is a `network`-module route, and a server that drops the module answers
     // 404 — correctly. Gating it per-caller was tried and leaked: the org
@@ -66,6 +82,7 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     if (!useCapabilitiesStore().has('network')) {
       clients.value = []
       total.value = 0
+      loading.value = false
       return
     }
     loading.value = true
@@ -77,15 +94,29 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
       const resp = await api.get<TunnelClientListResponse>(
         `/tenant/${tenantId}/tunnel-client?per_page=100`,
       )
+      if (mySeq !== seq) return
       clients.value = resp.items
       total.value = resp.total
     } catch (e) {
+      if (mySeq !== seq) return
+      failed = true
       error.value = (e as Error).message
       clients.value = []
       total.value = 0
     } finally {
-      loading.value = false
+      if (mySeq === seq) loading.value = false
     }
+  }
+
+  /** #4248 — the org's tunnel clients for a page that only names or picks
+   *  them, fetched only when the store does not hold them already (the Devices
+   *  page and the org dashboard load them). A store that holds another org's
+   *  clients, or whose last fetch failed, fetches; one that holds this org's
+   *  (or is loading them) does not. It replaces a check of an empty list,
+   *  which never reloaded a list holding another org's clients. */
+  function ensureTunnelClients(tenantId: string): Promise<void> {
+    if (clientsTenantId.value === tenantId && !failed) return Promise.resolve()
+    return fetchTunnelClients(tenantId)
   }
 
   async function issueEnrollmentToken(
@@ -148,7 +179,9 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     total,
     loading,
     error,
+    clientsTenantId,
     fetchTunnelClients,
+    ensureTunnelClients,
     issueEnrollmentToken,
     updateClient,
     deleteTunnelClient,

@@ -406,7 +406,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import {
   useOverlayAclStore,
   type OverlayAclMode,
@@ -678,5 +678,21 @@ async function refresh() {
   ])
 }
 
-refresh()
+// #4248 — the tab follows its org. The route reuses this section when only
+// the tenant id in the URL changes, so a load from setup alone kept the
+// previous org's rules, posture and pickers under the new org's URL. An editor
+// or a delete prompt open on the previous org's rule is closed: its save would
+// go to the new org.
+watch(
+  () => props.tenantId,
+  (_tenantId, previous) => {
+    if (previous !== undefined) {
+      editDialog.value = false
+      deleteDialog.value = false
+      deleteTarget.value = null
+    }
+    void refresh()
+  },
+  { immediate: true },
+)
 </script>
