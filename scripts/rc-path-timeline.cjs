@@ -1819,6 +1819,7 @@ const WHY_WORDS = [
   'ceiling(pipe)',
   'ceiling(learned)',
   'ceiling(arrival)',
+  'ceiling(budget)',
   'ceiling(opener)',
   'floor(area)',
   'floor(relief)',
@@ -2292,7 +2293,7 @@ function selfTest() {
   );
   // FR-148 P0: why the target moved. A VP9-444 session from 0.4.230 whose
   // target lines carry every cause there is, one each, a heartbeat after
-  // every fifth counting the five; an FFmpeg session with a folded why,
+  // every fifth and after the last, counting them; an FFmpeg session with a folded why,
   // `none`, `+more`, a held target landing both ways, a move no target line
   // printed and a count past the whys the governor keeps; and a session from
   // an agent before 0.4.230, whose lines carry neither `why` nor
@@ -2317,7 +2318,7 @@ function selfTest() {
     );
     wantV.push(`${row(sec)}${prev === null ? '' : prev + ' -> '}${bps} bps why=${w}`);
     since.push(`${w}:1`);
-    if (since.length === 5) {
+    if (since.length === 5 || i === WHY_WORDS.length - 1) {
       moved.push({ t: at(sec + 0.5), m: 'VP9-444 DC pump heartbeat (≈1s window)', f: { session_id: sv, codec_label: 'VP9-444', target_bps: bps, target_fps: 30, bytes_written: 400000 * (i + 1), frames_sent: 30 * (i + 1), target_moves: since.join(',') } });
       since = [];
     }
@@ -2365,12 +2366,12 @@ function selfTest() {
   const missing = wantV.filter((l) => !wl.includes(l));
   check('target: every why there is, on its own line, printed as the line carries it', missing.length === 0, missing.join(' | '));
   check('target: the watermark line takes its new target from new_target', wl.includes(wantV[WHY_WORDS.indexOf('decrease(overflow)')]), wantV[WHY_WORDS.indexOf('decrease(overflow)')]);
-  check('target: a row per move, nothing more, where every move has its line', targetRows(1).length === 20 && xv.summary.targetLines.unlined === 0, String(targetRows(1).length));
+  check('target: a row per move, nothing more, where every move has its line', targetRows(1).length === WHY_WORDS.length && xv.summary.targetLines.unlined === 0, String(targetRows(1).length));
   check('target: an old agent prints its three rows and no more', targetRows(3).length === 3, targetRows(3).join(' | '));
   check(
     'target: the session counts the moves by why, on the lines and in the heartbeats',
-    wl.includes(`| target moves on the target lines, by why | moves 20: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} |`) &&
-      wl.includes(`| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | moves 20: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} (4 of 4) |`),
+    wl.includes(`| target moves on the target lines, by why | moves ${WHY_WORDS.length}: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} |`) &&
+      wl.includes(`| the heartbeats' target_moves (every move since the heartbeat before), by why (heartbeats carrying it) | moves ${WHY_WORDS.length}: ${WHY_WORDS.map((w) => `${w} 1`).join(', ')} (${Math.ceil(WHY_WORDS.length / 5)} of ${Math.ceil(WHY_WORDS.length / 5)}) |`),
   );
   const wantF = [
     `${row(700.5)}2000000 bps why=open deferred=false`,

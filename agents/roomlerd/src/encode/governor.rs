@@ -2419,6 +2419,23 @@ impl RateGovernor {
             .map_or(0, |r| r.envelope_ms)
     }
 
+    /// FR-148 D51 B4f — the most time the pump charges its next encode
+    /// (`encode::charge`): while the budget acts, the interval it chose for
+    /// that frame, its capture interval at the rate it runs at (FR-112's
+    /// paced rate while in force, else `target_fps`) times the skip divisor.
+    /// `None` while the budget does not act: the pts is today's.
+    #[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+    pub fn charge_most(&self, target_fps: u32) -> Option<Duration> {
+        if !self.budget_acts() {
+            return None;
+        }
+        let fps = self.paced_software_fps().unwrap_or(target_fps).max(1);
+        let interval = 1_000_000 / u64::from(fps);
+        Some(Duration::from_micros(
+            interval.saturating_mul(u64::from(self.skip_divisor.max(1))),
+        ))
+    }
+
     /// FR-148 D51 B4b-2 — what the sender measured: the blocked-send goodput,
     /// or, while the budget acts, the budget's held rate in its place. Under
     /// `on` the budget keeps sends from blocking, so the goodput reads only
@@ -7951,6 +7968,7 @@ mod tests {
             Cause::Ceiling(CeilingSource::Pipe),
             Cause::Ceiling(CeilingSource::Learned),
             Cause::Ceiling(CeilingSource::Arrival),
+            Cause::Ceiling(CeilingSource::Budget),
             Cause::Ceiling(CeilingSource::Opener),
             Cause::Floor(FloorSource::Area),
             Cause::Floor(FloorSource::Relief),
@@ -7969,7 +7987,7 @@ mod tests {
             "open:2,increase(no-window):1,decrease(full):1,decrease(overflow):1,\
              decrease(stall):1,decrease(age):1,decrease(link):1,decrease(transit-stall):1,\
              hard-decrease:1,ceiling(plan):1,ceiling(pipe):1,ceiling(learned):1,\
-             ceiling(arrival):1,ceiling(opener):1,floor(area):1,floor(relief):1,more:2"
+             ceiling(arrival):1,ceiling(budget):1,ceiling(opener):1,floor(area):1,more:3"
         );
     }
 
@@ -8160,6 +8178,51 @@ mod tests {
         assert!(why.contains("decrease(age)"), "{why}");
     }
 
+    /// FR-148 D51 B4f (C9) — while the budget acts, the pump charges an
+    /// encode at most the interval it chose for the frame: its capture
+    /// interval at 30 fps; a divisor of 3 charges three of them; FR-112's
+    /// paced rate (40 fps on a 60 fps target) is the interval while in force.
+    /// A budget that does not act bounds nothing, whatever the divisor.
+    #[test]
+    fn under_on_the_charge_is_the_pumps_interval_times_the_divisor() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        assert_eq!(g.charge_most(30), None, "no step yet");
+        g.note_path_rate(acting(1_500_000, true, 200));
+        assert_eq!(g.charge_most(30), Some(Duration::from_micros(33_333)));
+        let w = g
+            .tick_viewer_window(
+                t0 + Duration::from_secs(2),
+                30,
+                || 0,
+                || 0,
+                || 0,
+                false,
+                |_| 3,
+                0,
+            )
+            .expect("window due");
+        assert_eq!(w.skip_divisor, 3);
+        assert_eq!(
+            g.charge_most(30),
+            Some(Duration::from_micros(3 * 33_333)),
+            "the divisor"
+        );
+        g.note_path_rate(crate::encode::pipe::PathRate {
+            acts: false,
+            ..acting(1_500_000, true, 200)
+        });
+        assert_eq!(g.charge_most(30), None, "not acting");
+        let mut g = gov(t0);
+        g.note_path_rate(acting(1_500_000, true, 200));
+        assert_eq!(g.pace_software(25.0, 60), Some(40));
+        assert_eq!(
+            g.charge_most(60),
+            Some(Duration::from_micros(25_000)),
+            "the paced rate"
+        );
+    }
+
     /// FR-148 D51 — the kill switch. `off` and `shadow` are today's paths byte
     /// for byte: with the budget not acting, nothing B4 adds is read. Two
     /// governors through the same 100,000 random events (frames at any send
@@ -8246,6 +8309,10 @@ mod tests {
                 "event {i}"
             );
             assert_eq!(a.prior_walk(), b.prior_walk(), "event {i}");
+            // FR-148 D51 B4f (C9): and the pump charges each encode today's
+            // pts (`encode::charge`), whatever the divisor and the rate.
+            let fps = 15 + (r % 46) as u32;
+            assert_eq!(a.charge_most(fps), None, "charge, event {i}");
         }
     }
 }

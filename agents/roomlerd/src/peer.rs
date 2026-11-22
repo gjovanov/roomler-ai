@@ -4028,6 +4028,8 @@ async fn media_pump_vp9_444_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // FR-148 D51 B4f — the charge bound last handed to `encoder` (`None` when new).
+    let mut charged_most: Option<Duration> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -4813,6 +4815,7 @@ async fn media_pump_vp9_444_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
+                    charged_most = None;
                     // Badge-truth — record the ACTUAL chroma for the
                     // `rc:video-info` retry block and (re)announce it.
                     chroma_wire = chroma.as_str();
@@ -5028,6 +5031,14 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
+        // FR-148 D51 B4f — where the budget acts, libvpx is charged at most the
+        // pump's interval for this frame (`RateGovernor::charge_most`): a wait
+        // past it is not granted. Elsewhere `None`, and the pts is today's.
+        let charge_most = governor.charge_most(target_fps);
+        if charge_most != charged_most {
+            enc.with(move |e| e.set_charge_most(charge_most)).await;
+            charged_most = charge_most;
+        }
         let encode_start = std::time::Instant::now();
         let packets = match enc.encode(&frame).await {
             Ok(p) => p,

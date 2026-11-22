@@ -8834,8 +8834,8 @@ pub(crate) mod shaped_link {
         /// what slice B3T measured. This one runs the pump's gate and its 2 ms
         /// retry, a 30 fps capture, the real governor (its AIMD, fps cap, age
         /// loop, link loop and drain) and an encoder that spends its target
-        /// as libvpx's rate control does, by the time since its last frame,
-        /// scaled by the content's swing. The agent's end writes through a
+        /// as libvpx's rate control does, by the gap between the pts the pump
+        /// hands it (`encode::charge`), scaled by the content's swing. The agent's end writes through a
         /// first hop that holds hundreds of KB ahead of the bottleneck, as the
         /// relay's socket does on a TURN-over-TCP path.
         mod closed_loop {
@@ -8860,9 +8860,10 @@ pub(crate) mod shaped_link {
             /// B3T's opening windows put hundreds of KB into it.
             const HOP: u64 = 512 * 1024;
             /// The encoder, libvpx's one-pass CBR on a relay. A delta gets the
-            /// target over the time since the last frame it encoded (the rate
-            /// control grants bits by timestamp: `encode::libvpx`,
-            /// `refed_pts`), up to its 1000 ms buffer (`rc_buf_sz`); a later
+            /// target over the gap between the pts it is handed and the last
+            /// one (the rate control grants bits by timestamp: `encode::libvpx`,
+            /// `encode::charge`, the capture's time, bounded by B4f where the
+            /// budget acts), up to its 1000 ms buffer (`rc_buf_sz`); a later
             /// keyframe gets 60/16 of a 30 fps frame (`kf_boost` at 30 fps).
             /// No floor: B3T and B3U's `on` runs sent at targets from 0.8 M to
             /// 1.5 M.
@@ -9149,6 +9150,14 @@ pub(crate) mod shaped_link {
                 log: Vec<(u64, String, u32, Option<u32>)>,
                 frames: Vec<(u64, u64, bool)>,
                 blocked: Vec<(u64, u64, u64)>,
+                /// FR-148 D51 B4f — C6's bar ([`Bar`]): each pass the budget's
+                /// hold shut (µs from `t0`), each hold's first such pass, each
+                /// hold the governor read as `decrease(full)`, and each pass a
+                /// drain paused.
+                held_at: Vec<u64>,
+                hold_began: Vec<u64>,
+                hold_cuts: Vec<u64>,
+                drained_at: Vec<u64>,
             }
 
             /// A frame in the viewer's worker: its write stamp, when its last
@@ -9278,27 +9287,45 @@ pub(crate) mod shaped_link {
                 // a stream opens on a keyframe, the session's first.
                 let (mut force_key, mut key_asked, mut first_key) = (false, true, true);
                 let mut taken: Option<u32> = None;
-                let mut last_encoded: Option<Instant> = None;
+                // The encoder's last stamp (`encode::charge`): it grants by
+                // the pts it is handed, as libvpx does.
+                let mut last_stamp: Option<crate::encode::charge::Stamp> = None;
                 let mut window_from = (Instant::now(), 0_u64);
                 // Where the last window left the held passes, the blocked
                 // writes and the encoded frames.
                 let mut window_marks = (0_u64, 0_usize, 0_usize);
+                // Whether the last pass was the budget's hold: a hold is the
+                // held passes in a row.
+                let mut was_held = false;
                 while Instant::now() < stop {
                     p.passes += 1;
                     delivery.gate_with(&mut governor, &clock, &gauges, true, false);
                     let full = send_tx.capacity() == 0;
                     if full || delivery.shuts() {
+                        let at = us(t0.elapsed());
                         if full {
                             p.full += 1;
                         } else {
                             p.holds += 1;
+                            p.held_at.push(at);
+                            if !was_held {
+                                p.hold_began.push(at);
+                            }
                         }
+                        was_held = !full;
                         delivery.note_gate(full, false);
                         let a = delivery.on_skip(false, |s| governor.on_gate_skip(s));
+                        if !full
+                            && a.as_ref()
+                                .is_some_and(|a| a.why.to_string().contains("decrease(full)"))
+                        {
+                            p.hold_cuts.push(at);
+                        }
                         note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
                         tokio::time::sleep(GATE_RETRY).await;
                         continue;
                     }
+                    was_held = false;
                     delivery.on_frame_with(&mut governor, &clock, &gauges);
                     // The capture: the newest frame not taken yet, or the next.
                     let newest = u32::try_from(
@@ -9397,6 +9424,7 @@ pub(crate) mod shaped_link {
                     }
                     if governor.draining(Instant::now()) {
                         p.drained += 1;
+                        p.drained_at.push(us(t0.elapsed()));
                         tokio::time::sleep(DRAIN_POLL).await;
                         continue;
                     }
@@ -9414,9 +9442,22 @@ pub(crate) mod shaped_link {
                     note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
                     tokio::time::sleep(ENCODE).await;
                     let key = std::mem::take(&mut force_key);
-                    let dt =
-                        last_encoded.map_or(CAPTURE, |l| captured.saturating_duration_since(l));
-                    last_encoded = Some(captured);
+                    // FR-148 D51 B4f — the pts the pump hands the encoder: the
+                    // capture's time, charged at most the pump's interval
+                    // where the budget acts (`RateGovernor::charge_most`), and
+                    // the gap granted is the gap between the pts handed.
+                    let pts = i64::try_from(us(captured.saturating_duration_since(start)))
+                        .unwrap_or(i64::MAX);
+                    let stamp = crate::encode::charge::charge(
+                        last_stamp,
+                        pts,
+                        Instant::now(),
+                        governor.charge_most(TARGET_FPS),
+                    );
+                    let dt = last_stamp.map_or(CAPTURE, |l| {
+                        Duration::from_micros(u64::try_from(stamp.pts - l.pts).unwrap_or(0))
+                    });
+                    last_stamp = Some(stamp);
                     let len = if captured < moves && !key {
                         STILL_DELTA
                     } else if key && std::mem::take(&mut first_key) {
@@ -9700,6 +9741,9 @@ pub(crate) mod shaped_link {
                 cap_fps: u64,
                 enc_fps: u64,
                 sent_fps: u64,
+                /// FR-148 D51 B4f — the frames sent in each whole second: the
+                /// median second's and the p10's.
+                sent_each: (u64, u64),
                 /// Windows whose divisor was 2 or more, of the windows.
                 divided: (usize, usize),
                 /// Frame transit, write to read, and a probe's round trip,
@@ -9743,6 +9787,13 @@ pub(crate) mod shaped_link {
                     *s = (*s).min(q / 1_000);
                 }
                 let mut leasts: Vec<u64> = least.values().copied().collect();
+                let mut each = vec![0_u64; usize::try_from(span / 1_000_000).unwrap_or(0)];
+                for &t in r.pumped.sent_at.iter().filter(|&&t| inside(t)) {
+                    let s = usize::try_from((t - from) / 1_000_000).unwrap_or(usize::MAX);
+                    if let Some(n) = each.get_mut(s) {
+                        *n += 1;
+                    }
+                }
                 Read {
                     rx_bps,
                     of_payload: rx_bps * 1_000 / payload_bps(),
@@ -9750,6 +9801,7 @@ pub(crate) mod shaped_link {
                     cap_fps: per_s(&r.pumped.captured_at),
                     enc_fps: per_s(&r.pumped.encoded_at),
                     sent_fps: per_s(&r.pumped.sent_at),
+                    sent_each: (quantile(&mut each, 50), quantile(&mut each, 10)),
                     divided: (
                         windows.iter().filter(|w| w.divisor >= 2).count(),
                         windows.len(),
@@ -10148,7 +10200,84 @@ pub(crate) mod shaped_link {
                 }
             }
 
-            fn print_gate(r: &LoopRun, g: &Gate, off: &Read) {
+            /// FR-148 D51 B4f — C6's bar over a stretch, from `from_us` to the
+            /// run's stop: the read, the budget's held passes and its holds,
+            /// the holds the governor read as `decrease(full)`, the windows a
+            /// drain ran in and the passes it paused, the link loop's cuts,
+            /// and the target's moves by their why.
+            #[derive(Debug, Clone)]
+            struct Bar {
+                from_us: u64,
+                read: Read,
+                held: usize,
+                holds: usize,
+                hold_cuts: usize,
+                drains: (usize, usize),
+                link_cuts: usize,
+                moves: BTreeMap<String, u32>,
+            }
+
+            /// The settled stretch's start: the opening reading's confidence
+            /// (`goodput::CONFIDENCE_TTL`) after the motion starts, µs from `t0`.
+            fn settled_from(r: &LoopRun) -> u64 {
+                r.from_us.saturating_sub(us(OPENING)) + us(crate::encode::goodput::CONFIDENCE_TTL)
+            }
+
+            fn bar(r: &LoopRun, from: u64) -> Bar {
+                let p = &r.pumped;
+                let inside = |t: &&u64| **t >= from;
+                let log = p.log.iter().filter(|m| m.0 >= from);
+                let mut moves: BTreeMap<String, u32> = BTreeMap::new();
+                for m in log.clone() {
+                    *moves.entry(m.1.clone()).or_default() += 1;
+                }
+                Bar {
+                    from_us: from,
+                    read: read_from(r, from),
+                    held: p.held_at.iter().filter(inside).count(),
+                    holds: p.hold_began.iter().filter(inside).count(),
+                    hold_cuts: p.hold_cuts.iter().filter(inside).count(),
+                    drains: (
+                        p.windows
+                            .iter()
+                            .filter(|w| w.t_us >= from && w.drain_ms.is_some())
+                            .count(),
+                        p.drained_at.iter().filter(inside).count(),
+                    ),
+                    link_cuts: log.filter(|m| m.1.contains("decrease(link)")).count(),
+                    moves,
+                }
+            }
+
+            fn bar_words(b: &Bar) -> String {
+                let x = &b.read;
+                format!(
+                    "bar from {} ms: fill {}.{:03} of payload ({} kbit/s), sent fps p50 {} p10 {}, transit \
+                     p95 {} ms, rtt p95 {} ms, held passes {} in {} holds, holds read as decrease(full) {}, \
+                     drain windows {} (passes paused {}), link cuts {}, moves {:?}",
+                    b.from_us / 1_000,
+                    x.of_payload / 1_000,
+                    x.of_payload % 1_000,
+                    kbps(x.rx_bps),
+                    x.sent_each.0,
+                    x.sent_each.1,
+                    x.transit.1,
+                    x.rtt.1,
+                    b.held,
+                    b.holds,
+                    b.hold_cuts,
+                    b.drains.0,
+                    b.drains.1,
+                    b.link_cuts,
+                    b.moves,
+                )
+            }
+
+            fn print_bar(r: &LoopRun, label: &str, b: &Bar) {
+                println!("B4c | {} | {} | {}", r.arm.word(), label, bar_words(b));
+            }
+
+            fn print_gate(r: &LoopRun, g: &Gate, off: &Read, bar: &Bar) {
                 let thousandths = |v: u64| format!("{}.{:03}", v / 1_000, v % 1_000);
                 let walk: Vec<String> = g
                     .walk
@@ -10165,7 +10294,7 @@ pub(crate) mod shaped_link {
                      to the relieved floor {}; target on the relieved floor in {} of {} windows, within an eighth of \
                      it in {}, target p50 {} kbit/s against the floor's {} | fill {} of payload ({} kbit/s), off {} | \
                      transit p95 {} ms | by heartbeat (30 frames): 2-5 carried {:?} kB, (hb, floor, avg) {:?}, \
-                     elevated {} of {} up to 32",
+                     elevated {} of {} up to 32 | {}",
                     r.arm.word(),
                     g.first,
                     g.anchored,
@@ -10197,6 +10326,7 @@ pub(crate) mod shaped_link {
                     g.beat_ages,
                     g.beat_elevated.0,
                     g.beat_elevated.1,
+                    bar_words(bar),
                 );
             }
 
@@ -10204,30 +10334,40 @@ pub(crate) mod shaped_link {
             /// today's law (`off`), on B3T's path with the closed-loop writer:
             /// `off` for `OFF_RUN`, `on` for `ON_RUN`, past the opening reading's
             /// confidence. It prints the trail step 1 of B4's gate reads
-            /// ([`gate`]). `on`, once settled: the fill is at least 0.92 of the
-            /// payload capacity and 0.95 of `off`'s, the divisor stays at 1 in at
-            /// least 0.9 of the windows, and the transit's p95 is under 300 ms.
-            /// `off`, the control: the fill is at least 0.95, over a standing
-            /// queue of more than 500 ms.
+            /// ([`gate`]) and B4f's bar ([`bar`]) on the gate line. `on`, over
+            /// the settled stretch after the opening reading's 60 s of
+            /// confidence ([`settled_from`]): the fill is at least 0.90 of the
+            /// payload capacity, the median second sends 24 frames or more, the
+            /// transit's p95 and the round trip's are under 300 ms, and no hold
+            /// reads as `decrease(full)`. `off`, the control: the fill is at
+            /// least 0.95, over a standing queue of more than 500 ms.
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, off and on"]
             async fn budget_on_with_the_pump_loop() {
                 let off = run_loop(Arm::Off, Duration::ZERO, OFF_RUN).await;
                 let x = read(&off);
                 print_loop(&off, &x);
+                print_bar(&off, "bar", &bar(&off, off.from_us));
                 let on = run_loop(Arm::On, Duration::ZERO, ON_RUN).await;
                 let y = read(&on);
                 print_loop(&on, &y);
+                print_bar(&on, "bar, the whole run", &bar(&on, 0));
+                let settled = bar(&on, settled_from(&on));
                 let g = gate(&on);
-                print_gate(&on, &g, &x);
+                print_gate(&on, &g, &x, &settled);
                 assert!(x.of_payload >= 950, "off: fill {x:?}");
                 assert!(x.least_ms > STANDING_MS, "off: no standing queue {x:?}");
+                let s = &settled.read;
+                assert!(s.of_payload >= 900, "on: fill {settled:?}");
+                assert!(s.sent_each.0 >= 24, "on: sent fps {settled:?}");
                 assert!(
-                    g.settled.of_payload >= 920 && g.settled.of_payload * 100 >= x.of_payload * 95,
-                    "on: the under-fill {g:?}"
+                    s.transit.1 < 300 && s.rtt.1 < 300,
+                    "on: transit and rtt {settled:?}"
                 );
-                assert!(y.divided.0 * 10 <= y.divided.1, "on: the divisor {y:?}");
-                assert!(y.transit.1 < 300, "on: transit {y:?}");
+                assert_eq!(
+                    settled.hold_cuts, 0,
+                    "on: a hold read as decrease(full) {settled:?}"
+                );
             }
 
             /// FR-148 D51 — the same two arms after 10 s of a still screen, so
