@@ -29,7 +29,9 @@
         <span class="mini-label">You</span>
       </div>
 
-      <!-- Remote streams (up to 3) -->
+      <!-- Remote streams (up to 3). Muted (#3563): pictures only — the call's
+           audio owner (CallAudio, in AppLayout) plays every participant,
+           the ones past these three included. -->
       <div
         v-for="[key, remote] in visibleStreams"
         :key="key"
@@ -38,6 +40,7 @@
         <video
           :ref="(el) => setRemoteVideoRef(key, el as HTMLVideoElement)"
           autoplay
+          muted
           playsinline
           class="mini-video"
           :class="{ 'active-speaker': conferenceStore.activeSpeakerKey === key }"
