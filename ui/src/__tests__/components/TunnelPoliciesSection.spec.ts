@@ -36,12 +36,14 @@ vi.mock('@/stores/agents', () => ({
   useAgentStore: () => ({
     agents: [{ id: ids.device, name: 'lab-01', display_name: 'Lab box' }],
     fetchAgents: vi.fn(),
+    ensureAgents: vi.fn(),
   }),
 }))
 vi.mock('@/stores/tunnelClients', () => ({
   useTunnelClientStore: () => ({
     clients: [{ id: ids.client, name: 'laptop-07', display_name: 'Field laptop' }],
     fetchTunnelClients: vi.fn(),
+    ensureTunnelClients: vi.fn(),
   }),
 }))
 vi.mock('@/stores/role', () => ({

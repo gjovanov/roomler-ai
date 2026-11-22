@@ -64,13 +64,13 @@ import { CAL_MAX_RTT_MS, createClockCalibration, storedClockCal, type ClockCalib
 /**
  * Remote-control session state machine driven from the controller browser.
  *
- * Lifecycle: idle Ã¢ÂÂ requesting Ã¢ÂÂ awaiting_consent Ã¢ÂÂ negotiating Ã¢ÂÂ connected
- *                                                                Ã¢ÂÂ error
- *                                                                Ã¢ÂÂ closed
+ * Lifecycle: idle → requesting → awaiting_consent → negotiating → connected
+ *                                                                ↘ error
+ *                                                                ↘ closed
  *
  * The composable owns one RTCPeerConnection per session. It uses the shared
  * WS connection (useWsStore) as the signalling transport and speaks the
- * `rc:*` protocol. See docs/remote-control.md ÃÂ§7.
+ * `rc:*` protocol. See docs/remote-control.md §7.
  */
 
 export type RcPhase =
@@ -173,7 +173,7 @@ import { ctrlAltDelFrames } from './ctrlAltDel'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
- * (250 ms / 500 ms / 1 s) are tuned for desktop-transition recovery Ã¢ÂÂ
+ * (250 ms / 500 ms / 1 s) are tuned for desktop-transition recovery —
  * a Win+L lock or a M3 SYSTEM-context capture handoff usually
  * resolves in well under a second, and a 2 s first-retry would leave
  * a visible black-frame window every time the user touches the lock
@@ -185,7 +185,7 @@ export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as cons
 
 /**
  * Steady-state retry delay used AFTER `RC_RECONNECT_LADDER_MS` is
- * exhausted. rc.23 Ã¢ÂÂ the DC stays "open" from the operator's POV by
+ * exhausted. rc.23 — the DC stays "open" from the operator's POV by
  * never surfacing a terminal "budget exhausted" state; the reconnect
  * loop keeps trying every `RC_RECONNECT_STEADY_MS` until the operator
  * cancels via the existing Cancel button or the upload completes via
@@ -246,13 +246,13 @@ export function deadAirNotice(streak: number, delayMs: number, planKnown: boolea
 }
 
 /**
- * S3 viewer resilience Ã¢ÂÂ detection constants. All exported so the
+ * S3 viewer resilience — detection constants. All exported so the
  * decision tables below are unit-lockable.
  *
  * - `RC_PC_DISCONNECTED_GRACE_MS`: how long the peer connection may sit
  *   in `'disconnected'` before we treat it as a failure and re-create
  *   the session. ICE flaps recover in ~1-2 s; a VPN flip on the host
- *   never does Ã¢ÂÂ 4 s separates the two without a visible false-positive
+ *   never does — 4 s separates the two without a visible false-positive
  *   window.
  * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'negotiating'` before the
  *   attempt is abandoned and the ladder advances. ICE legitimately
@@ -271,7 +271,7 @@ export function deadAirNotice(streak: number, delayMs: number, planKnown: boolea
  *   may legitimately take longer than any client-side number.
  * - Watchdog: ticks every `RC_WATCHDOG_TICK_MS` while connected. After
  *   `RC_STALL_PROBE_TICKS` ticks with zero media progress it sends ONE
- *   `rc:keyframe` probe Ã¢ÂÂ a static remote desktop legitimately produces
+ *   `rc:keyframe` probe — a static remote desktop legitimately produces
  *   no frames, so flat counters alone must NOT trigger a reconnect; a
  *   live agent answers the probe with an IDR within a tick. Only if the
  *   counters stay flat through `RC_STALL_FAIL_TICKS` (probe unanswered)
@@ -327,7 +327,7 @@ export const RC_STALL_FAIL_TICKS = 10
  * the session is still up but something is wrong. Priority order
  * (highest wins): transport_unstable (pc left 'connected'),
  * media_stalled (probe outstanding, no frames), signalling_offline
- * (WS down Ã¢ÂÂ media may still flow P2P, but no renegotiation is
+ * (WS down — media may still flow P2P, but no renegotiation is
  * possible).
  */
 export type RcDegradedReason =
@@ -341,7 +341,7 @@ export type RcDegradedReason =
  * displacement symptom; `error` covers transient agent-side failures.
  * Everything deliberate (hangups, denials, admin, idle) stays
  * terminal. Consent-loop note: a retry against a Prompt-mode org
- * device re-prompts its owner ONCE Ã¢ÂÂ an unanswered prompt ends in
+ * device re-prompts its owner ONCE — an unanswered prompt ends in
  * `consent_timeout`, which is terminal, so the loop self-limits.
  *
  * #2251 - one `error` is final: `limit: 'no_common_codec'`, the device finding
@@ -369,7 +369,7 @@ export function endedByHost(reason: unknown): boolean {
 
 /**
  * `rc:error` codes that advance the reconnect ladder instead of
- * killing it. Only honoured while a reconnect cycle is active Ã¢ÂÂ a
+ * killing it. Only honoured while a reconnect cycle is active — a
  * user-initiated first connect hitting `agent_offline` should fail
  * fast and honestly. `agent_busy`: the old session's slot hasn't
  * freed yet (max_simultaneous_sessions=1). `agent_offline`: agent WS
@@ -678,7 +678,7 @@ export function createAbandonedRequestRegistry(
 /** #1631 - module-level registry state; see `createAbandonedRequestRegistry`. */
 const ABANDONED_REQUESTS = new Map<string, AbandonedRequestEntry>()
 
-/** Stall decision table Ã¢ÂÂ see the constants docblock above. */
+/** Stall decision table — see the constants docblock above. */
 export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconnect' {
   if (stallTicks >= RC_STALL_FAIL_TICKS) return 'reconnect'
   if (stallTicks === RC_STALL_PROBE_TICKS) return 'probe'
@@ -977,7 +977,7 @@ export function idleSecondsLeft(endsAt: number | null, nowMs: number): number | 
   return Math.max(0, Math.ceil((endsAt - nowMs) / 1000))
 }
 
-/** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
+/** Degraded classification — pure so the priority order is testable. */
 export function classifyDegraded(inp: {
   pcState: string | null
   wsConnected: boolean
@@ -997,11 +997,11 @@ export function classifyDegraded(inp: {
  * value. Returns `null` for any non-JSON, non-string, or unknown
  * envelope shape so the caller can no-op silently. Recognised
  * variants:
- *   - `rc:host_locked` Ã¢ÂÂ boolean lock-state flip (agents 0.2.3+)
- *   - `rc:desktop_changed` Ã¢ÂÂ input desktop name (agents 0.3.0+
+ *   - `rc:host_locked` — boolean lock-state flip (agents 0.2.3+)
+ *   - `rc:desktop_changed` — input desktop name (agents 0.3.0+
  *     SYSTEM-context worker; emitted on `try_change_desktop`
  *     Switched). Powers the secondary "On Winlogon" chip.
- * Future agent Ã¢ÂÂ browser control messages (rc:cursor-shape,
+ * Future agent → browser control messages (rc:cursor-shape,
  * rc:dpi-change, ...) layer on the same parse-by-`t` switch.
  * Unknown `t` values fall through to `null` so older browsers
  * stay forward-compatible with newer agents.
@@ -1022,12 +1022,12 @@ export type RcLogsFetchReply = {
   error?: string
 }
 
-/** rc.87 Ã¢ÂÂ the agent's real encoder info, sent over the control DC
+/** rc.87 — the agent's real encoder info, sent over the control DC
  *  when a DC video pump opens its encoder. Lets the stats badge show
  *  the truth (e.g. "VP9 4:2:0 HW vp9_qsv") instead of the hardcoded
  *  "VP9 4:4:4 SW". `codec` is the negotiation vocabulary ("h265"/
  *  "vp9"); `chroma` is "yuv420"/"yuv444". `transport` (relay-escape) is
- *  "relay"/"direct" Ã¢ÂÂ WHICH ICE path this session took; the agent
+ *  "relay"/"direct" — WHICH ICE path this session took; the agent
  *  re-sends the message when the path changes mid-session. '' from
  *  agents older than the field. */
 /** FR-80 — the codec a WebCodecs configuration string names, for the status
@@ -1260,10 +1260,10 @@ export interface RcVideoInfo {
   hardware: boolean
   chroma: string
   transport: string
-  /** rc.199 Ã¢ÂÂ native (pre-downscale) capture dims. The viewer compares them
+  /** rc.199 — native (pre-downscale) capture dims. The viewer compares them
    *  against the decoded frame size to tell whether the stream is capped and,
-   *  by `transport`, why ("ÃÂ· relay-limited"). `0` when the agent didn't report
-   *  them (older agents) Ã¢ÂÂ the badge then omits the annotation. */
+   *  by `transport`, why ("· relay-limited"). `0` when the agent didn't report
+   *  them (older agents) — the badge then omits the annotation. */
   native_w: number
   native_h: number
   /** P5 — how many viewers share this encoded stream (agent-side
@@ -1502,7 +1502,7 @@ export interface PeerCursor {
   ts: number
 }
 
-/** rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts). The
+/** rc.NEXT — remote app selection & launch (virtual-desktop hosts). The
  *  agent enumerates windows on its desktop; the browser can focus one or
  *  launch a new allowlisted app. Rides the control DC (same request/reply
  *  pattern as rc:logs-fetch). See `agents/roomlerd/src/apps/`. */
@@ -1568,7 +1568,7 @@ export interface RcAppsListReply {
   unavailable?: RcAppsUnavailable
 }
 /** focus + launch share this shape. `window_id` is the new window on a
- *  successful launch (best-effort Ã¢ÂÂ may be absent). */
+ *  successful launch (best-effort — may be absent). */
 export interface RcAppsActionReply {
   ok: boolean
   window_id?: string
@@ -1884,7 +1884,7 @@ export function parseControlInbound(data: unknown): RcControlInbound {
     const state = parseDisplayMatchState(obj)
     return state ? { kind: 'display_match', state } : null
   }
-  // rc.227 Ã¢ÂÂ keyboard-layout snapshot from the agent (Windows hosts).
+  // rc.227 — keyboard-layout snapshot from the agent (Windows hosts).
   // Defensive filtering: malformed installed entries are dropped, a
   // missing list degrades to [] (chip still renders from the active
   // fields; the picker just has no options).
@@ -1910,7 +1910,7 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   return null
 }
 
-/** Pure builder for the `rc:layout.set` control-DC envelope Ã¢ÂÂ the
+/** Pure builder for the `rc:layout.set` control-DC envelope — the
  *  viewer's manual layout switch. `hkl` must be the opaque hex string
  *  the agent itself reported in `rc:layout.installed[].hkl`; anything
  *  else returns null (never sent). Exported so tests lock the wire
@@ -1924,7 +1924,7 @@ function strOrNull(v: unknown): string | null {
   return typeof v === 'string' ? v : null
 }
 
-/** Parse an `rc:apps.list.reply` body defensively Ã¢ÂÂ unknown/missing
+/** Parse an `rc:apps.list.reply` body defensively — unknown/missing
  *  fields degrade to safe empties (never throws) so version skew can't
  *  break the menu. Exported so the wire format is locked by tests. */
 export function parseAppsListReply(obj: Record<string, unknown>): RcAppsListReply {
@@ -2045,12 +2045,12 @@ export function appsLaunchWireMessage(
 
 /**
  * Pure helper: given the number of attempts already made (0-indexed
- * Ã¢ÂÂ i.e. `0` means the first retry hasn't fired yet), return the
- * delay before the next attempt. Always returns a positive delay Ã¢ÂÂ
+ * — i.e. `0` means the first retry hasn't fired yet), return the
+ * delay before the next attempt. Always returns a positive delay —
  * after `RC_RECONNECT_LADDER_MS` is exhausted, falls back to
  * `RC_RECONNECT_STEADY_MS` (8 s) forever. The operator cancels by
  * settling the in-flight transfer (Cancel button), tearing down the
- * session (Disconnect), or closing the page. rc.23 Ã¢ÂÂ was previously
+ * session (Disconnect), or closing the page. rc.23 — was previously
  * `null` after 6 attempts, which surfaced "budget exhausted" to the
  * field; field repro on the field-test host made it clear that operators on
  * corporate AV-protected hosts need indefinite retry.
@@ -2068,12 +2068,12 @@ export function nextReconnectDelayMs(attempt: number): number {
  *  double-clicks an entry in the files-browser drawer. Encodes two
  *  invariants that have each tripped a field bug:
  *
- *  1. **Roots view** (Drives on Windows / `/` on Unix) Ã¢ÂÂ `entry.name`
+ *  1. **Roots view** (Drives on Windows / `/` on Unix) — `entry.name`
  *     is already an absolute path (e.g. `C:\` or `/`). The composable
  *     MUST drive into it directly; concatenating with the localised
  *     "Drives" label produces bogus paths like `Drives/C:\` (rc.15
  *     field repro 2026-05-07).
- *  2. **Inside a verbatim drive root** (`\\?\C:\`) Ã¢ÂÂ `Path::parent()`
+ *  2. **Inside a verbatim drive root** (`\\?\C:\`) — `Path::parent()`
  *     in the agent returns `None`, so a `currentParent === null`
  *     proxy mis-classifies the verbatim drive root as roots-view.
  *     The drawer must use an EXPLICIT `isRootsView` flag, set only
@@ -2081,7 +2081,7 @@ export function nextReconnectDelayMs(attempt: number): number {
  *     empty / `~` — NOT `/`, see invariant 3). This helper
  *     takes that flag as input rather than re-deriving it
  *     (regression bug 2026-05-09: dbl-click `dev` after `C:\` shipped
- *     just `dev` to the agent Ã¢ÂÂ "canonicalising dev").
+ *     just `dev` to the agent → "canonicalising dev").
  *
  *  3. **`/` is a directory, not the roots view** (#2870). The roots view
  *     on a Unix host holds one entry, `/`, and this helper returns it
@@ -2091,7 +2091,7 @@ export function nextReconnectDelayMs(attempt: number): number {
  *     dbl-click asked for the roots again and the list never changed.
  *
  *  Path-separator heuristic: any drive-letter prefix or backslash in
- *  the current path Ã¢ÂÂ Windows; otherwise Unix. Trailing separator on
+ *  the current path → Windows; otherwise Unix. Trailing separator on
  *  the current path is detected so we don't double up.
  *
  *  Exported for unit-testing; the caller (RemoteControl.vue's
@@ -2158,7 +2158,7 @@ export interface RcStats {
  *  bitmaps keyed by the handle id the agent sent. RemoteControl.vue
  *  uses this to draw the real OS cursor over the video (replacing the
  *  synthetic initials badge for single-controller sessions). Undefined
- *  while the agent hasn't advertised Ã¢ÂÂ the view falls back to the
+ *  while the agent hasn't advertised — the view falls back to the
  *  initials badge. */
 export interface RcCursor {
   /** Current position in agent-source pixels. Null = hidden
@@ -2174,7 +2174,7 @@ export interface RcCursor {
       hotspotX: number
       hotspotY: number
       /** CSS `cursor` keyword when the agent identified this shape as a
-       *  standard system cursor ("text", "default", "pointer", Ã¢ÂÂ¦), so
+       *  standard system cursor ("text", "default", "pointer", …), so
        *  the view renders the viewer's native OS cursor instead of the
        *  bitmap. Absent for app-custom cursors. */
       css?: string
@@ -2185,7 +2185,7 @@ export interface RcCursor {
 /** Derive the CSS `cursor` keyword to apply to the video surface for
  *  the current remote cursor: the css of the shape referenced by the
  *  current position, or null when the cursor is hidden or the active
- *  shape is an app-custom bitmap (Ã¢ÂÂ the canvas overlay renders it). */
+ *  shape is an app-custom bitmap (→ the canvas overlay renders it). */
 export function remoteCursorCssFor(state: RcCursor): string | null {
   const pos = state.pos
   if (!pos) return null
@@ -2220,14 +2220,14 @@ function persistQuality(q: RcQuality) {
   try {
     globalThis.localStorage?.setItem(QUALITY_STORAGE_KEY, q)
   } catch {
-    /* best-effort Ã¢ÂÂ swallow quota / privacy-mode errors */
+    /* best-effort — swallow quota / privacy-mode errors */
   }
 }
 
 /** Persist key for the optional codec override. When the user forces a
  *  specific codec (H.265 or AV1) for an A/B comparison, we save it so
- *  the choice survives a page reload. `null` means no override Ã¢ÂÂ the
- *  agent picks from the full browserÃÂagent intersection. */
+ *  the choice survives a page reload. `null` means no override — the
+ *  agent picks from the full browser×agent intersection. */
 const PREFERRED_CODEC_STORAGE_KEY = 'roomler-rc-preferred-codec'
 
 /** Codec names that round-trip between `RTCRtpReceiver.getCapabilities`,
@@ -2242,7 +2242,7 @@ function readStoredPreferredCodec(): RcPreferredCodec | null {
       return raw
     }
   } catch {
-    /* privacy mode Ã¢ÂÂ treat as no override */
+    /* privacy mode → treat as no override */
   }
   return null
 }
@@ -2270,8 +2270,8 @@ export type RcScaleMode = 'adaptive' | 'original' | 'custom'
 /** Which capture/encode resolution the REMOTE agent should use.
  *  - `original`: the agent's native monitor resolution.
  *  - `fit`: the agent downscales to match the local viewer's stage
- *    dimensions ÃÂ devicePixelRatio (re-emitted on viewport resize).
- *  - `custom`: an explicit width ÃÂ height picked from a preset list or
+ *    dimensions × devicePixelRatio (re-emitted on viewport resize).
+ *  - `custom`: an explicit width × height picked from a preset list or
  *    typed in by the operator. */
 export type RcResolutionMode = 'original' | 'fit' | 'custom'
 
@@ -2282,11 +2282,11 @@ export interface RcResolutionSetting {
   height?: number
 }
 
-/** Per-agent localStorage prefix Ã¢ÂÂ resolution preferences should NOT
- *  bleed across machines (a "Fit to local at 1920ÃÂ1080" set for my
+/** Per-agent localStorage prefix — resolution preferences should NOT
+ *  bleed across machines (a "Fit to local at 1920×1080" set for my
  *  laptop monitor is wrong for my 4K desktop).
  *
- *  rc.190.1 Ã¢ÂÂ prefix bumped `:` Ã¢ÂÂ `.v2:` as a ONE-TIME migration to the
+ *  rc.190.1 — prefix bumped `:` → `.v2:` as a ONE-TIME migration to the
  *  new Fit default. Field 2026-07-16: prefs stored during the earlier
  *  debugging rounds (e.g. 'original' left on WINHOST-H) silently overrode
  *  the new default and kept a 4K panel streaming at native through a
@@ -2302,7 +2302,7 @@ function readStoredScaleMode(): RcScaleMode {
     const raw = globalThis.localStorage?.getItem(SCALE_MODE_STORAGE_KEY)
     if (raw === 'adaptive' || raw === 'original' || raw === 'custom') return raw
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   return 'adaptive'
 }
@@ -2323,7 +2323,7 @@ function readStoredScalePct(): number {
       if (Number.isFinite(n) && n >= 5 && n <= 1000) return n
     }
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   return 100
 }
@@ -2398,7 +2398,7 @@ function persistResolution(agentId: string, s: RcResolutionSetting) {
 /** Per-agent codec override (2026-07-28): an explicit Codec-picker choice on
  *  agent X sticks for X across sessions; "Auto" clears X's override so the
  *  global (per-browser) default applies again. Restored in `connect()` via
- *  the persist-FREE apply path Ã¢ÂÂ restoring through the `codecChoice` setter
+ *  the persist-FREE apply path — restoring through the `codecChoice` setter
  *  would rewrite the four GLOBAL keys and silently turn one agent's override
  *  into every agent's default. */
 export const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
@@ -2435,7 +2435,7 @@ export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
       return raw as RcCodecChoice
     }
   } catch {
-    /* privacy mode Ã¢ÂÂ no override */
+    /* privacy mode → no override */
   }
   return null
 }
@@ -2453,7 +2453,7 @@ export function persistCodecChoice(agentId: string, choice: RcCodecChoice | null
 }
 
 /** Pure decision core for the connect-time pick-vs-restore precedence
- *  (mirrors the rc.190 resolution guard) Ã¢ÂÂ unit-tested. Returns what
+ *  (mirrors the rc.190 resolution guard) — unit-tested. Returns what
  *  `connect()` should do: persist the fresh user pick, apply the stored
  *  override, or leave the global default alone. */
 export function codecConnectAction(
@@ -2467,7 +2467,7 @@ export function codecConnectAction(
 
 /** Translate an `RcResolutionSetting` into the exact JSON shape the
  *  agent's control-DC handler expects. Returns `null` when the
- *  setting is invalid (fit/custom with no dims) Ã¢ÂÂ the caller drops
+ *  setting is invalid (fit/custom with no dims) — the caller drops
  *  the send rather than emitting a half-formed message. Exported
  *  for tests so the wire format is locked. */
 export function resolutionWireMessage(
@@ -2487,12 +2487,12 @@ export function resolutionWireMessage(
   return { t: 'rc:resolution', mode: s.mode, width: w, height: h }
 }
 
-/** rc.188 Ã¢ÂÂ viewerÃ¢ÂÂagent sustainable-rate feedback. Each stats window the
+/** rc.188 — viewer→agent sustainable-rate feedback. Each stats window the
  *  active decode worker reports the fps it actually DECODED plus whether it
  *  dropped frames to a decode backlog; the agent's `ViewerRateController` folds
  *  this into a send-fps cap so it stops firehosing faster than THIS viewer can
- *  decode (which is what caused the freeze spiral: queue backs up Ã¢ÂÂ drop deltas
- *  Ã¢ÂÂ request a heavy IDR Ã¢ÂÂ even harder to decode Ã¢ÂÂ 1-2 s hang). Replaces the
+ *  decode (which is what caused the freeze spiral: queue backs up → drop deltas
+ *  → request a heavy IDR → even harder to decode → 1-2 s hang). Replaces the
  *  rc.187 auto-resolution ladder + the rc.184 keyframe-request-rate heuristic
  *  with one direct measured signal. Pure so the wire shape is unit-tested. */
 export function decodeStatWireMessage(
@@ -2653,7 +2653,7 @@ export function decodeErrorWireMessage(
  *    buffer for measurable latency savings. Chrome-only in practice;
  *    falls back to `video` when `RTCRtpScriptTransform` or
  *    `VideoDecoder` are unavailable. Takes effect on the next
- *    `connect()` Ã¢ÂÂ live sessions keep whatever path they started
+ *    `connect()` — live sessions keep whatever path they started
  *    with, since swapping receiver transforms mid-session tears
  *    down the decoder. */
 export type RcRenderPath = 'video' | 'webcodecs'
@@ -2665,7 +2665,7 @@ function readStoredRenderPath(): RcRenderPath {
     const raw = globalThis.localStorage?.getItem(RENDER_PATH_STORAGE_KEY)
     if (raw === 'webcodecs' || raw === 'video') return raw
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   return 'video'
 }
@@ -2678,14 +2678,14 @@ function persistRenderPath(p: RcRenderPath) {
   }
 }
 
-// P1 (Parsec-class plan) Ã¢ÂÂ viewer-pipeline diagnosis knobs. All localStorage,
+// P1 (Parsec-class plan) — viewer-pipeline diagnosis knobs. All localStorage,
 // all per-viewer, all live-flippable without a redeploy:
 //  - roomler-rc-ctx-mode: 2D-context A/B ('legacy' | 'opaque' |
-//    'opaque-desync'; default opaque-desync Ã¢ÂÂ alpha:false enables the opaque
+//    'opaque-desync'; default opaque-desync — alpha:false enables the opaque
 //    compositor fast path, desynchronized requests the low-latency swap
 //    chain).
 //  - roomler-rc-per-frame-msg=1: restore the legacy per-decoded-frame
-//    workerÃ¢ÂÂmain message + reactive increment (default OFF Ã¢ÂÂ it was ~60
+//    worker→main message + reactive increment (default OFF — it was ~60
 //    messages + 60 Vue triggers per second of pure overhead).
 //  - roomler-rc-diag-hud=1: render the per-hop diagnostics row in the HUD.
 const CTX_MODE_STORAGE_KEY = 'roomler-rc-ctx-mode'
@@ -2708,7 +2708,7 @@ export function storedPerFrameMsg(): boolean {
   }
 }
 
-// P6 (Parsec-class plan) Ã¢ÂÂ flow-control knobs for the field-tuning round.
+// P6 (Parsec-class plan) — flow-control knobs for the field-tuning round.
 // All localStorage, all default to today's baked values; proven values get
 // baked as the new defaults in a follow-up (one constant per field round):
 //  - roomler-rc-max-backlog-ms: worker decode backlog (ms) above which deltas
@@ -2746,7 +2746,7 @@ function legacyFramesToMs(raw: string | null): number | null {
 }
 
 /** Read the P6 flow-control knobs (pure + exported so the defaults and
- *  clamps are locked by unit tests). Read once per composable Ã¢ÂÂ a knob
+ *  clamps are locked by unit tests). Read once per composable — a knob
  *  change needs a page refresh, like every other `roomler-rc-*` knob. */
 export function storedFlowParams(): RcFlowParams {
   let mb: string | null = null
@@ -2761,7 +2761,7 @@ export function storedFlowParams(): RcFlowParams {
     sq = globalThis.localStorage?.getItem(LEGACY_STRUGGLE_QUEUE_STORAGE_KEY) ?? null
     sw = globalThis.localStorage?.getItem(STRUGGLE_WINDOWS_STORAGE_KEY) ?? null
   } catch {
-    /* privacy mode Ã¢ÂÂ defaults */
+    /* privacy mode → defaults */
   }
   return {
     maxBacklogMs: normalizeIntKnob(mb ?? legacyFramesToMs(mq), DEFAULT_MAX_BACKLOG_MS, 10, 2000),
@@ -2964,7 +2964,7 @@ export function storedH264Rtp(): boolean {
   }
 }
 
-/** P1 Ã¢ÂÂ one stats-window of per-hop pipeline diagnostics (worker hops + the
+/** P1 — one stats-window of per-hop pipeline diagnostics (worker hops + the
  *  main thread's long-task pressure). Consumed by the diag HUD. */
 export type RcDecodeDiag = {
   paint: HopWindow | null
@@ -2995,7 +2995,7 @@ export type RcDecodeDiag = {
 }
 
 /** Feature-detect WebCodecs + RTCRtpScriptTransform. Returns true only
- *  when both pieces are present Ã¢ÂÂ Firefox has VideoDecoder but exposes
+ *  when both pieces are present — Firefox has VideoDecoder but exposes
  *  insertable streams via a different API, so the toggle stays off
  *  there until we add that path too. Exported for vitest. */
 export function isWebCodecsSupported(): boolean {
@@ -3031,13 +3031,13 @@ export const RC_VIDEO_TRANSPORTS = [
 ] as const
 export type RcVideoTransport = (typeof RC_VIDEO_TRANSPORTS)[number]
 
-/** rc.190.1 Ã¢ÂÂ key bumped as a ONE-TIME migration to the new Auto
+/** rc.190.1 — key bumped as a ONE-TIME migration to the new Auto
  *  default (same rationale as the resolution-prefix bump: transports
  *  toggled during the earlier debugging rounds would silently block the
- *  HWÃÂHW auto-rank forever). Explicit picks made from now on persist. */
+ *  HW×HW auto-rank forever). Explicit picks made from now on persist. */
 const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport.v2'
 
-/** rc.62 Ã¢ÂÂ localStorage key for the per-browser VP9 chroma preference.
+/** rc.62 — localStorage key for the per-browser VP9 chroma preference.
  *  Recognised values: `'auto'` (let the agent decide via env var),
  *  `'yuv420'` (VP9 profile 0, ~30% lower bandwidth), `'yuv444'`
  *  (VP9 profile 1, sharpest text). Default `'auto'` keeps rc.61
@@ -3051,7 +3051,7 @@ function readStoredVp9Chroma(): Vp9ChromaPref {
     const raw = globalThis.localStorage?.getItem(VP9_CHROMA_STORAGE_KEY)
     if (raw === 'yuv420' || raw === 'yuv444' || raw === 'auto') return raw
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   return 'auto'
 }
@@ -3073,10 +3073,10 @@ function readStoredVideoTransport(): RcVideoTransport {
       return raw as RcVideoTransport
     }
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
-  // rc.190 Ã¢ÂÂ default is AUTO: rank the transports by what's HARDWARE on
-  // BOTH ends (agent hw_encoders ÃÂ viewer MediaCapabilities) at connect
+  // rc.190 — default is AUTO: rank the transports by what's HARDWARE on
+  // BOTH ends (agent hw_encoders × viewer MediaCapabilities) at connect
   // time. Users who explicitly picked a transport (any stored value,
   // incl. 'webrtc' written by a toggle) keep their choice.
   return 'auto'
@@ -3095,7 +3095,7 @@ function persistVideoTransport(t: RcVideoTransport) {
  *  transceiver at `connect()` time AND sets `audio_enabled: true` in
  *  the `rc:session.request` payload; the agent only attaches an Opus
  *  track when it *also* advertises `"opus"` in `AgentCaps.audio` and
- *  was built with the `audio` feature Ã¢ÂÂ otherwise it silently ignores
+ *  was built with the `audio` feature — otherwise it silently ignores
  *  the flag (graceful no-op). Default OFF so audio stays opt-in and no
  *  autoplay-with-sound prompt fires unless the user asked for it. */
 const AUDIO_ENABLED_STORAGE_KEY = 'roomler-rc-audio-enabled'
@@ -3107,7 +3107,7 @@ export function readStoredAudioEnabled(): boolean {
   try {
     return globalThis.localStorage?.getItem(AUDIO_ENABLED_STORAGE_KEY) === '1'
   } catch {
-    /* privacy mode Ã¢ÂÂ default OFF */
+    /* privacy mode → default OFF */
     return false
   }
 }
@@ -3125,7 +3125,7 @@ export function persistAudioEnabled(on: boolean) {
 /** Pure builder for the audio-related fields of an `rc:session.request`.
  *  Returns `{ audio_enabled: true }` only when the user opted in; an
  *  empty object otherwise so pre-audio agents get the silent-by-default
- *  behaviour (`#[serde(default)]` on the agent side Ã¢ÂÂ `false`).
+ *  behaviour (`#[serde(default)]` on the agent side → `false`).
  *  Exported so the field name + presence semantics are locked by a
  *  unit test. */
 export function audioRequestFields(audioEnabled: boolean): Record<string, unknown> {
@@ -3247,19 +3247,19 @@ export async function isHevcRextDecodeSupported(): Promise<boolean> {
  *
  *  `isHevcDecodeSupported()` (VideoDecoder.isConfigSupported) returns `true`
  *  even when the browser can only decode HEVC in SOFTWARE or via a HW path
- *  too slow for real-time Ã¢ÂÂ the comment above assumed "no SW fallback", but
+ *  too slow for real-time — the comment above assumed "no SW fallback", but
  *  the field disproved it: a weak Intel iGPU (Iris Xe) reports HEVC support,
- *  picks HEVC-over-DC, then its decode queue backs up at 1080p+/40fps Ã¢ÂÂ
- *  periodic keyframe-request spiral Ã¢ÂÂ the 1-2 s hang. The SAME viewer is
+ *  picks HEVC-over-DC, then its decode queue backs up at 1080p+/40fps →
+ *  periodic keyframe-request spiral → the 1-2 s hang. The SAME viewer is
  *  perfectly smooth on VP9 4:2:0 (universal fixed-function HW decode).
  *
  *  `MediaCapabilities.decodingInfo()` exposes the two signals that matter:
  *  `smooth` (can sustain the target framerate) + `powerEfficient` (uses
  *  fixed-function silicon, not the CPU / GPU shaders). We require BOTH at a
- *  representative 1920ÃÂ1200@60 before PREFERRING HEVC; otherwise the caller
+ *  representative 1920×1200@60 before PREFERRING HEVC; otherwise the caller
  *  falls back to VP9 4:2:0. Biasing toward VP9 is cheap (it's HW-decoded
  *  everywhere) and avoids the software-HEVC hang. Decoding is still probed
- *  via `isHevcDecodeSupported()` for the worker Ã¢ÂÂ this only gates the
+ *  via `isHevcDecodeSupported()` for the worker — this only gates the
  *  transport *preference*. */
 export async function isHevcHwDecodeSupported(): Promise<boolean> {
   const mc = (
@@ -3291,9 +3291,9 @@ export async function isHevcHwDecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.191 Ã¢ÂÂ wire shape for the display-match request (the agent switches
+/** rc.191 — wire shape for the display-match request (the agent switches
  *  its display to the largest mode fitting the viewer's stage, making the
- *  pixel chain 1:1 Ã¢ÂÂ see the agent's `display_match` module). `null` dims
+ *  pixel chain 1:1 — see the agent's `display_match` module). `null` dims
  *  = disable/restore. Pure + exported so the shape is test-locked. */
 export function displayMatchWireMessage(
   dims: { width: number; height: number } | null,
@@ -3330,17 +3330,17 @@ export class HeldRequest<T> {
   }
 }
 
-/** rc.190 Ã¢ÂÂ the AV1 codec string for the `data-channel-av1` transport.
- *  Main profile (0), seq_level_idx 13 = Level 5.1 (covers 4K@60 Ã¢ÂÂ the
+/** rc.190 — the AV1 codec string for the `data-channel-av1` transport.
+ *  Main profile (0), seq_level_idx 13 = Level 5.1 (covers 4K@60 — the
  *  HEVC L3.1 lesson: the declared level is a MAX, a smaller stream
  *  decodes fine under it, but a level BELOW the stream's resolution
  *  hard-rejects), Main tier, 8-bit. Shared by the probe + the decode
  *  worker `configure()` so they can't drift. */
 export const AV1_CODEC_STRING = 'av01.0.13M.08'
 
-/** rc.190 Ã¢ÂÂ feature-detect AV1 decode via WebCodecs. Chromium ships an
+/** rc.190 — feature-detect AV1 decode via WebCodecs. Chromium ships an
  *  in-tree dav1d SOFTWARE decoder, so unlike HEVC this is ~always true
- *  on Chrome Ã¢ÂÂ it gates the explicit user pick, not the auto-rank
+ *  on Chrome — it gates the explicit user pick, not the auto-rank
  *  (which requires `isAv1HwDecodeSupported`). */
 export async function isAv1DecodeSupported(): Promise<boolean> {
   const g = globalThis as unknown as {
@@ -3356,7 +3356,7 @@ export async function isAv1DecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.190 Ã¢ÂÂ HARDWARE-and-smooth AV1 decode probe (MediaCapabilities
+/** rc.190 — HARDWARE-and-smooth AV1 decode probe (MediaCapabilities
  *  `smooth` + `powerEfficient`, same contract as the HEVC HW probe).
  *  dav1d SW decode exists everywhere, so `powerEfficient` is what
  *  separates a Gen12-Iris-Xe/RTX/RDNA2 viewer (fixed-function AV1
@@ -3391,7 +3391,7 @@ export async function isAv1HwDecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.190 Ã¢ÂÂ HARDWARE-and-smooth VP9 profile-0 decode probe, for the
+/** rc.190 — HARDWARE-and-smooth VP9 profile-0 decode probe, for the
  *  auto-rank + the viewer-decode HUD badge. Profile 0 (4:2:0 8-bit) is
  *  the universally-HW-decoded VP9; profile 1 (4:4:4) is software
  *  everywhere and intentionally NOT probed here. */
@@ -3425,17 +3425,17 @@ export async function isVp9HwDecodeSupported(): Promise<boolean> {
   }
 }
 
-/** P2 (Parsec-class plan) Ã¢ÂÂ H.264-over-DC codec-string probe ladder.
- *  Declared-max levels (a smaller stream decodes under them Ã¢ÂÂ the rc.94
- *  HEVC L93Ã¢ÂÂL153 lesson): High@L5.2 (4K60), High@L5.1, High@L4.2. The
+/** P2 (Parsec-class plan) — H.264-over-DC codec-string probe ladder.
+ *  Declared-max levels (a smaller stream decodes under them — the rc.94
+ *  HEVC L93→L153 lesson): High@L5.2 (4K60), High@L5.1, High@L4.2. The
  *  agent ships Annex-B with in-band SPS/PPS; per the WebCodecs AVC
- *  registry an `avc1.*` config WITHOUT `description` means Annex-B Ã¢ÂÂ
+ *  registry an `avc1.*` config WITHOUT `description` means Annex-B —
  *  the same description-less contract the `hev1` path has shipped for
  *  months. */
 export const H264_DC_CODEC_CANDIDATES = ['avc1.640034', 'avc1.640033', 'avc1.64002A'] as const
 
-/** P2 Ã¢ÂÂ first Annex-B avc1 codec string this browser's VideoDecoder
- *  accepts, or null when none (Ã¢ÂÂ the caller stays on the RTP track). */
+/** P2 — first Annex-B avc1 codec string this browser's VideoDecoder
+ *  accepts, or null when none (→ the caller stays on the RTP track). */
 export async function isH264DcDecodeSupported(): Promise<string | null> {
   const g = globalThis as unknown as {
     VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
@@ -3478,7 +3478,7 @@ export async function isH264High444DecodeSupported(): Promise<string | null> {
   return null
 }
 
-/** P2 Ã¢ÂÂ HARDWARE-and-smooth H.264 decode probe (MediaCapabilities
+/** P2 — HARDWARE-and-smooth H.264 decode probe (MediaCapabilities
  *  `smooth` + `powerEfficient`, same contract as the HEVC/AV1 HW probes).
  *  H.264 HW decode is near-universal, but the gate keeps the auto-rank
  *  honest on exotic viewers. */
@@ -3568,11 +3568,11 @@ const probeAv1Dec = memoProbe(isAv1DecodeSupported)
 const probeHevcRext = memoProbe(isHevcRextDecodeSupported)
 const probeH264High444 = memoProbe(isH264High444DecodeSupported)
 
-/** rc.190 Ã¢ÂÂ inputs to the pure transport auto-rank. `agentTransports` /
+/** rc.190 — inputs to the pure transport auto-rank. `agentTransports` /
  *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
  *  probe truth); the `viewer*` bits are this browser's MediaCapabilities
  *  probes. P2 adds `viewerH264Hw` (HW decode AND an accepted Annex-B
- *  avc1 config Ã¢ÂÂ see `isH264DcDecodeSupported`). */
+ *  avc1 config — see `isH264DcDecodeSupported`). */
 export interface AutoTransportInputs {
   agentTransports: string[]
   agentHwEncoders: string[]
@@ -3626,23 +3626,23 @@ export interface AutoTransportInputs {
   agentVp9Hw444?: boolean
 }
 
-/** rc.190 Ã¢ÂÂ pure HWÃÂHW transport rank for `videoTransport === 'auto'`.
+/** rc.190 — pure HW×HW transport rank for `videoTransport === 'auto'`.
  *
- *  Field lesson (2026-07-16, WINHOST-H/DEVBOX Ã¢ÂÂ WINHOST-A): VP9 is
+ *  Field lesson (2026-07-16, WINHOST-H/DEVBOX → WINHOST-A): VP9 is
  *  software-ENCODED on almost every host (only Intel Gen11+ iGPUs have
  *  VP9 encode silicon; NVIDIA/AMD never shipped it), and HEVC/AV1 can be
- *  software-DECODED on the viewer Ã¢ÂÂ a codec is only smooth when it's
+ *  software-DECODED on the viewer — a codec is only smooth when it's
  *  hardware on BOTH ends. Rank:
- *    1. AV1-DC   Ã¢ÂÂ agent HW av1 encoder  ÃÂ viewer HW AV1 decode
- *    2. HEVC-DC  Ã¢ÂÂ agent HW hevc encoder ÃÂ viewer HW HEVC decode
- *    3. VP9-DC 4:2:0 Ã¢ÂÂ agent HW vp9 encoder (vp9_qsv) ÃÂ viewer HW VP9
- *    4. H264-DC  Ã¢ÂÂ agent HW h264 encoder ÃÂ viewer HW H.264 decode (P2:
- *       HWÃÂHW beats the SW-encode tier below on CPU cost and its Ã¢ÂÂ¤1920
+ *    1. AV1-DC   — agent HW av1 encoder  × viewer HW AV1 decode
+ *    2. HEVC-DC  — agent HW hevc encoder × viewer HW HEVC decode
+ *    3. VP9-DC 4:2:0 — agent HW vp9 encoder (vp9_qsv) × viewer HW VP9
+ *    4. H264-DC  — agent HW h264 encoder × viewer HW H.264 decode (P2:
+ *       HW×HW beats the SW-encode tier below on CPU cost and its ≤1920
  *       cap; H.264's poorer compression only matters on constrained
  *       links, which the relay clamps already govern)
- *    5. VP9-DC 4:2:0 Ã¢ÂÂ agent libvpx SW encode (the agent's rc.190 SW cap
- *       keeps it Ã¢ÂÂ¤1920 long edge) ÃÂ viewer HW VP9 decode
- *    6. webrtc   Ã¢ÂÂ the REMB-adaptive H.264 track (universal fallback)
+ *    5. VP9-DC 4:2:0 — agent libvpx SW encode (the agent's rc.190 SW cap
+ *       keeps it ≤1920 long edge) × viewer HW VP9 decode
+ *    6. webrtc   — the REMB-adaptive H.264 track (universal fallback)
  *  Returns the transport (null = webrtc) + a chroma override ('yuv420'
  *  for the VP9 picks so the fallback never lands on software-decoded
  *  profile 1). Exported for vitest.
@@ -3672,7 +3672,7 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   const hasHevcDc = agentOffersDcTransport('data-channel-hevc', t, enc)
   const hasVp9Dc = agentOffersDcTransport('data-channel-vp9-444', t, enc)
   const agentVp9Hw = enc.includes('ffmpeg-vp9_qsv')
-  // P2 Ã¢ÂÂ transport-advertisement ONLY (no hw_encoders fallback like AV1/HEVC:
+  // P2 — transport-advertisement ONLY (no hw_encoders fallback like AV1/HEVC:
   // `ffmpeg-h264_*` entries and the transport shipped in the same release, so
   // there are no older agent rows with the encoder but not the transport).
   const hasH264Dc = t.includes('data-channel-h264')
@@ -3774,7 +3774,7 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
     return {
       transport: 'data-channel-vp9-444',
       chromaOverride: 'yuv420',
-      reason: 'VP9 4:2:0: SW encode on agent (capped Ã¢ÂÂ¤1920) Ã¢ÂÂ no HWÃÂHW codec pair available',
+      reason: 'VP9 4:2:0: SW encode on agent (capped ≤1920) — no HW×HW codec pair available',
     }
   }
   // #2231 — a browser that decodes VP9 profile 0 but not profile 1 (Firefox's
@@ -3793,7 +3793,7 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   return { transport: null, chromaOverride: null, reason: 'webrtc H.264 fallback' }
 }
 
-/** rc.199 Ã¢ÂÂ the viewer "Priority" dial (`rc:priority` control message). A
+/** rc.199 — the viewer "Priority" dial (`rc:priority` control message). A
  *  per-session lever that trades resolution sharpness against motion
  *  smoothness; the agent reads it to resolve the relay resolution cap
  *  (balanced = link-physics cap on a relay, sharper = native override / the
@@ -3807,7 +3807,7 @@ function readStoredPriority(): RcPriority {
     const raw = globalThis.localStorage?.getItem(PRIORITY_STORAGE_KEY)
     if (raw === 'balanced' || raw === 'sharper' || raw === 'smoother') return raw
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   // 2026-08-02 operator default: Sharper (text fidelity over motion).
   return 'sharper'
@@ -3817,7 +3817,7 @@ function persistPriority(p: RcPriority) {
   try {
     globalThis.localStorage?.setItem(PRIORITY_STORAGE_KEY, p)
   } catch {
-    /* best-effort Ã¢ÂÂ swallow quota / privacy-mode errors */
+    /* best-effort — swallow quota / privacy-mode errors */
   }
 }
 
@@ -3852,7 +3852,7 @@ export function priorityWireMessage(mode: RcPriority): { t: 'rc:priority'; mode:
   return { t: 'rc:priority', mode }
 }
 
-/** rc.199 Ã¢ÂÂ the single "Codec" picker that replaces the four transport
+/** rc.199 — the single "Codec" picker that replaces the four transport
  *  toggle buttons + the codec-override + VP9-chroma dropdowns. Each choice
  *  maps to a full (transport, chroma, preferredCodec, renderPath) tuple so the
  *  picker fully determines the previously-scattered controls. */
@@ -3868,12 +3868,12 @@ export interface CodecChoiceSettings {
 /** Map a Codec-picker choice to the underlying settings. Pure + exported so
  *  the tests lock it. `renderPath` is auto-managed here (this is what lets us
  *  drop the old standalone WebCodecs toggle): everything uses the low-latency
- *  WebCodecs path. The DC transports decode via the workerÃ¢ÂÂcanvas regardless
+ *  WebCodecs path. The DC transports decode via the worker→canvas regardless
  *  of `renderPath`, so setting it for them is harmless and keeps the mapping
- *  total. `setRenderPath` clamps `webcodecs`Ã¢ÂÂ`video` on browsers without
+ *  total. `setRenderPath` clamps `webcodecs`→`video` on browsers without
  *  WebCodecs.
  *
- *  P2 Ã¢ÂÂ the explicit H.264 choice now maps to `data-channel-h264` (the same
+ *  P2 — the explicit H.264 choice now maps to `data-channel-h264` (the same
  *  reliable-DC + WebCodecs pipeline as the other three codecs; connect()
  *  falls back to the legacy RTP track when the agent doesn't advertise it or
  *  this browser rejects Annex-B avc1). `opts.h264Rtp` (localStorage
@@ -3987,12 +3987,12 @@ export function settingsToCodecChoice(
   }
 }
 
-/** loopback-TURN corp-relay (Phase 2 Ã¢ÂÂ plan
+/** loopback-TURN corp-relay (Phase 2 — plan
  *  `~/.claude/plans/roomler-loopback-turn-corp-relay.md`). The corp host's
  *  local enrolled agent hosts a TURN server (`tunnel-core::transport::
  *  turn_host::LocalTurnHost`) + a loopback HTTP endpoint that returns this
- *  descriptor. The browser Ã¢ÂÂ loopback is never firewall-blocked, unlike its
- *  direct/coturn UDP Ã¢ÂÂ probes the endpoint, uses `turn:127.0.0.1:{turn_port}`
+ *  descriptor. The browser — loopback is never firewall-blocked, unlike its
+ *  direct/coturn UDP — probes the endpoint, uses `turn:127.0.0.1:{turn_port}`
  *  as an ICE server, AND forwards the whole descriptor to the server so the Hub
  *  adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers. The
  *  media then relays through the local agent's overlay (WFP-permitted) instead
@@ -4400,15 +4400,15 @@ export function thisDevicesFromPick(
   return normalizeThisDevices(next.filter((v) => v !== '' && v !== 'none'))
 }
 
-/** 2026-07-24 decode-stall A/B Ã¢ÂÂ experimental override for the DC decode
+/** 2026-07-24 decode-stall A/B — experimental override for the DC decode
  *  workers' `VideoDecoder.hardwareAcceleration`. localStorage
  *  `roomler-rc-decode-pref`: `'software'` | `'hardware'` | unset
  *  (`no-preference`, today's behaviour). Field context: DEVBOX viewing WINHOST-A
- *  hits 3-5 s mid-session decoder stalls (Mbps > 0, decoded fps Ã¢ÂÂ 0, then a
- *  catch-up burst) on BOTH HEVC and VP9 with the agent proven healthy Ã¢ÂÂ
+ *  hits 3-5 s mid-session decoder stalls (Mbps > 0, decoded fps → 0, then a
+ *  catch-up burst) on BOTH HEVC and VP9 with the agent proven healthy —
  *  suspect Chrome's GPU-process decode on the hybrid-GPU laptop. Setting
  *  `'software'` A/Bs that theory on VP9/AV1 (HEVC has no SW decoder in
- *  Chromium Ã¢ÂÂ prefer-software there fails configure() and the existing
+ *  Chromium — prefer-software there fails configure() and the existing
  *  fallback path takes over). Pure + exported for tests. */
 export function storedDecodePref(): 'prefer-software' | 'prefer-hardware' | 'no-preference' {
   try {
@@ -4416,7 +4416,7 @@ export function storedDecodePref(): 'prefer-software' | 'prefer-hardware' | 'no-
     if (raw === 'software') return 'prefer-software'
     if (raw === 'hardware') return 'prefer-hardware'
   } catch {
-    /* privacy mode Ã¢ÂÂ default */
+    /* privacy mode → default */
   }
   return 'no-preference'
 }
@@ -4500,7 +4500,7 @@ export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
   }
 }
 
-/** rc.44 Ã¢ÂÂ clipboard chunking constants. The single-envelope
+/** rc.44 — clipboard chunking constants. The single-envelope
  *  `clipboard:write` shape sent a `text` field unbounded by length;
  *  on payloads >~50 KB this hit webrtc-rs's SCTP `max_message_size=
  *  65536` default and threw `failed to handle_inbound: ErrChunk`,
@@ -4551,15 +4551,15 @@ export function chunkClipboardText(text: string): string[] {
  *  [`CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES`] uses the legacy
  *  single-envelope `clipboard:write` for back-compat with older
  *  agents; above, splits into `clipboard:write-chunk` envelopes
- *  carrying a shared transaction id. Caller owns try/catch Ã¢ÂÂ this
+ *  carrying a shared transaction id. Caller owns try/catch — this
  *  function may throw if the DC closes mid-burst.
  *
- *  v2 Ã¢ÂÂ every envelope (single included) now carries an `id`; v2
+ *  v2 — every envelope (single included) now carries an `id`; v2
  *  agents reply `clipboard:write-ack {id}` once the OS clipboard
  *  write completes, which the caller can await via
  *  `awaitClipboardAck` to gate a deferred Ctrl+V. Old agents ignore
  *  the unknown field (no `deny_unknown_fields` on their serde enum).
- *  The text goes on the wire RAW Ã¢ÂÂ never canonicalized Ã¢ÂÂ because v1
+ *  The text goes on the wire RAW — never canonicalized — because v1
  *  agents write it to the OS clipboard verbatim (stripping CRLF here
  *  would regress Windows-host pastes through them; v2 agents
  *  normalize server-side). Returns the envelope count + the id. */
@@ -4591,7 +4591,7 @@ export function sendClipboardWriteOverDc(
     payload = new TextDecoder('utf-8').decode(bytes.subarray(0, end))
     // eslint-disable-next-line no-console
     console.warn(
-      `[rc] clipboard:write truncated from ${byteLen}B to ${end}B Ã¢ÂÂ agent rejects payloads above ${CLIPBOARD_MAX_BYTES}B`,
+      `[rc] clipboard:write truncated from ${byteLen}B to ${end}B — agent rejects payloads above ${CLIPBOARD_MAX_BYTES}B`,
     )
   }
   const chunks = chunkClipboardText(payload)
@@ -4609,26 +4609,26 @@ export function sendClipboardWriteOverDc(
   return { envelopes: chunks.length, id }
 }
 
-// Ã¢ÂÂÃ¢ÂÂ Clipboard protocol v2: auto-sync helpers Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+// ── Clipboard protocol v2: auto-sync helpers ────────────────────────────────
 
 /** Hard cap on a PNG clipboard image on the wire, both directions.
  *  Mirrors the agent's `CLIPBOARD_IMAGE_MAX_BYTES`. */
 export const CLIPBOARD_IMAGE_MAX_BYTES = 8 * 1024 * 1024
-/** Binary frame size for browser Ã¢ÂÂ agent image sends. Matches the
+/** Binary frame size for browser → agent image sends. Matches the
  *  files-DC upload pump: webrtc-rs's inbound SCTP `max_message_size`
  *  is 65536 and 64 KiB frames sat exactly on the boundary, so 16 KiB.
- *  (The agent sends 64 KiB frames the other way Ã¢ÂÂ Chrome's inbound
+ *  (The agent sends 64 KiB frames the other way — Chrome's inbound
  *  cap is 256 KiB.) */
 export const CLIPBOARD_IMG_FRAME_BYTES = 16 * 1024
 /** How long the deferred Ctrl+V waits for `clipboard:write-ack`
  *  before flushing anyway (agent wedged / reply lost). */
 export const CLIPBOARD_ACK_TIMEOUT_MS = 1000
-/** Focused-tab polling cadence for localÃ¢ÂÂremote text sync. Chrome has
+/** Focused-tab polling cadence for local→remote text sync. Chrome has
  *  no `clipboardchange` event in stable, so change detection is
- *  focus/visibility triggers + this poll. Text-only Ã¢ÂÂ image reads are
+ *  focus/visibility triggers + this poll. Text-only — image reads are
  *  event-driven (focus/paste) to avoid hashing megabytes per tick. */
 export const CLIPBOARD_SYNC_POLL_MS = 2000
-/** Throttle between consecutive localÃ¢ÂÂremote sync attempts. */
+/** Throttle between consecutive local→remote sync attempts. */
 const CLIPBOARD_SYNC_MIN_INTERVAL_MS = 300
 
 /** Whether a session's EFFECTIVE grant (`rc:session.created.permissions`)
@@ -4669,8 +4669,8 @@ export function dropClipboardChannel(channels: Record<string, RTCDataChannel>): 
   return true
 }
 
-/** Canonicalize text for HASHING (CRLF / lone CR Ã¢ÂÂ LF). Never applied
- *  to outbound wire text Ã¢ÂÂ see [`sendClipboardWriteOverDc`]. Both
+/** Canonicalize text for HASHING (CRLF / lone CR → LF). Never applied
+ *  to outbound wire text — see [`sendClipboardWriteOverDc`]. Both
  *  sides of the echo gate hash this canonical form; the agent's
  *  `host_to_wire` produces the same bytes. */
 export function normalizeClipboardText(text: string): string {
@@ -4679,7 +4679,7 @@ export function normalizeClipboardText(text: string): string {
 }
 
 /** FNV-1a 64 over raw bytes, as a 16-hex-digit string. Locks the same
- *  published vectors as the agent's `clipboard::fnv1a64` Ã¢ÂÂ echo
+ *  published vectors as the agent's `clipboard::fnv1a64` — echo
  *  suppression silently breaks if either side drifts. */
 export function hashClipboardBytes(bytes: Uint8Array): string {
   let h = 0xcbf29ce484222325n
@@ -4701,8 +4701,8 @@ export function hashClipboardText(text: string): string {
 /** Echo-suppression gate for bidirectional auto-sync. Remembers the
  *  hash of the last content APPLIED locally (came from the remote)
  *  and the last content PUSHED to the remote; either one re-surfacing
- *  as a local "change" is an echo and must not be re-pushed Ã¢ÂÂ else
- *  remote-change Ã¢ÂÂ local-write Ã¢ÂÂ local-"change" Ã¢ÂÂ push-back loops
+ *  as a local "change" is an echo and must not be re-pushed — else
+ *  remote-change → local-write → local-"change" → push-back loops
  *  forever. The agent holds the mirror-image gate (`SelfMarks`). */
 export interface ClipboardEchoGate {
   recordApplied(hash: string): void
@@ -4716,10 +4716,10 @@ export interface ClipboardEchoGate {
 
 export function createClipboardEchoGate(): ClipboardEchoGate {
   // Small rings, not single slots: one clipboard state can surface as
-  // SEVERAL hashes (v2.1 Ã¢ÂÂ an html payload is seen as its combined
+  // SEVERAL hashes (v2.1 — an html payload is seen as its combined
   // html+text hash by rich reads and as its plain-text-alt hash by
   // readText polling; both must be remembered or the poll re-pushes
-  // the alt forever). 4 is plenty: a state contributes Ã¢ÂÂ¤2 hashes and
+  // the alt forever). 4 is plenty: a state contributes ≤2 hashes and
   // anything older refers to overwritten clipboard content.
   const MAX = 4
   const applied: string[] = []
@@ -4803,10 +4803,10 @@ export function createHeldInputTracker(): HeldInputTracker {
   }
 }
 
-/** Build the wire frames for one browser Ã¢ÂÂ agent image transfer:
- *  a `clipboard:img-begin` JSON header, Ã¢ÂÂ¤16 KiB binary PNG frames,
+/** Build the wire frames for one browser → agent image transfer:
+ *  a `clipboard:img-begin` JSON header, ≤16 KiB binary PNG frames,
  *  and the `clipboard:img-end` trailer, all sharing one id. Exported
- *  for tests Ã¢ÂÂ the locked invariants are frame size Ã¢ÂÂ¤
+ *  for tests — the locked invariants are frame size ≤
  *  [`CLIPBOARD_IMG_FRAME_BYTES`], total bytes preserved, and the
  *  begin/end shapes the agent's `ClipboardIncoming` parses. */
 export function buildClipboardImageFrames(
@@ -4838,11 +4838,11 @@ export function buildClipboardImageFrames(
   }
 }
 
-/** v2.1 Ã¢ÂÂ cap on an html+text clipboard payload on the wire, both
+/** v2.1 — cap on an html+text clipboard payload on the wire, both
  *  directions. Mirrors the agent's `CLIPBOARD_HTML_MAX_BYTES`. */
 export const CLIPBOARD_HTML_MAX_BYTES = 4 * 1024 * 1024
 
-/** v2.1 Ã¢ÂÂ combined echo-gate hash for html clipboard content: FNV over
+/** v2.1 — combined echo-gate hash for html clipboard content: FNV over
  *  html bytes + 0x1F separator + canonical text bytes (mirrors the
  *  agent's `html_event_hash` construction; each side hashes its own
  *  reads, so only per-side self-consistency is load-bearing). */
@@ -4857,8 +4857,8 @@ export function hashClipboardHtml(html: string, text: string): string {
   return hashClipboardBytes(combined)
 }
 
-/** v2.1 Ã¢ÂÂ build the wire frames for one browser Ã¢ÂÂ agent html transfer:
- *  `clipboard:html-begin` header, Ã¢ÂÂ¤16 KiB binary frames (html UTF-8
+/** v2.1 — build the wire frames for one browser → agent html transfer:
+ *  `clipboard:html-begin` header, ≤16 KiB binary frames (html UTF-8
  *  bytes then the plain-text alt), `clipboard:html-end` trailer, one
  *  shared id. Returns null when the combined payload exceeds the cap.
  *  Exported for tests. */
@@ -4897,22 +4897,22 @@ export function buildClipboardHtmlFrames(
   }
 }
 
-/** v2.2 Ã¢ÂÂ cap on a NATIVE clipboard payload (RTF + html + text) on
+/** v2.2 — cap on a NATIVE clipboard payload (RTF + html + text) on
  *  the wire and through the bridge. Mirrors the agent's
  *  `CLIPBOARD_NATIVE_MAX_BYTES`. RTF hex-encodes embedded images at
- *  ~2ÃÂ their binary size, so real documents run to megabytes. */
+ *  ~2× their binary size, so real documents run to megabytes. */
 export const CLIPBOARD_NATIVE_MAX_BYTES = 16 * 1024 * 1024
 
-/** v2.2 Ã¢ÂÂ the loopback clipboard bridge on the VIEWER machine's own
+/** v2.2 — the loopback clipboard bridge on the VIEWER machine's own
  *  agent (same fixed port as the TURN probe; the `/rc-clipboard`
  *  routes are the bridge half). Only an enrolled local agent with the
- *  clipboard feature answers; everything else times out Ã¢ÂÂ graceful
+ *  clipboard feature answers; everything else times out → graceful
  *  fallback to the browser-reachable lanes. */
 export function clipboardBridgeUrl(port: number): string {
   return `http://127.0.0.1:${port}/rc-clipboard`
 }
 
-/** Uint8Array Ã¢ÂÂ base64 (chunked Ã¢ÂÂ a spread over megabytes of bytes
+/** Uint8Array → base64 (chunked — a spread over megabytes of bytes
  *  blows the arg-count/stack limit). Inverse of [`base64ToBytes`].
  *  Exported for tests. */
 export function bytesToBase64(bytes: Uint8Array): string {
@@ -4924,7 +4924,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin)
 }
 
-/** v2.2 Ã¢ÂÂ validate an untrusted bridge GET body into the native
+/** v2.2 — validate an untrusted bridge GET body into the native
  *  payload shape. Pure + exported for tests. */
 export function parseNativeClipPayload(
   raw: unknown,
@@ -4946,8 +4946,8 @@ export function parseNativeClipPayload(
   return { rtf, html, text }
 }
 
-/** v2.2 Ã¢ÂÂ build the wire frames for one browser Ã¢ÂÂ agent NATIVE
- *  transfer: `clipboard:native-begin` header, Ã¢ÂÂ¤16 KiB binary frames
+/** v2.2 — build the wire frames for one browser → agent NATIVE
+ *  transfer: `clipboard:native-begin` header, ≤16 KiB binary frames
  *  (rtf ++ html UTF-8 ++ text UTF-8), `clipboard:native-end` trailer.
  *  Null when the combined payload exceeds the cap. Exported for
  *  tests. */
@@ -4988,7 +4988,7 @@ export function buildClipboardNativeFrames(
   }
 }
 
-/** Clipboard auto-sync opt-out. Default ON Ã¢ÂÂ only an explicit '0'
+/** Clipboard auto-sync opt-out. Default ON — only an explicit '0'
  *  disables (the feature is the whole point of clipboard v2; users
  *  who want the old button-driven flow flip the Settings toggle). */
 const CLIPBOARD_AUTO_SYNC_STORAGE_KEY = 'roomler-rc-clipboard-auto'
@@ -5020,7 +5020,7 @@ function persistClipboardAutoSync(on: boolean) {
  *  `installWebCodecsTransform()` returns false immediately and the
  *  default `<video>` element renders normally.
  *
- *  Exported for tests. Tracked upstream Ã¢ÂÂ once a Chromium fix lands
+ *  Exported for tests. Tracked upstream — once a Chromium fix lands
  *  and ships, bump the upper bound or remove the gate entirely. */
 export function isChromeWithBrokenScriptTransform(): boolean {
   const nav = globalThis.navigator as
@@ -5050,7 +5050,7 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  must match the agent's `on_data_channel` arm at peer.rs:494. The
  *  channel is reliable + ordered because (a) SCTP is doing the
  *  reassembly anyway and (b) dropping a P-frame would force the
- *  worker to wait for the next IDR Ã¢ÂÂ far worse than a few ms of
+ *  worker to wait for the next IDR — far worse than a few ms of
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
 
@@ -5140,14 +5140,14 @@ export function shortCodecFromReceiver(
 
 /** Inspect the negotiated codec by reading the remote SDP answer.
  *  More reliable than `RTCRtpReceiver.getParameters()` at
- *  `pc.ontrack` time Ã¢ÂÂ Chrome populates that lazily and it's often
+ *  `pc.ontrack` time — Chrome populates that lazily and it's often
  *  empty on first read, which silently defaulted us to H.264 even
  *  when HEVC was negotiated. The SDP, in contrast, is fully settled
  *  by the time ontrack fires (it fires as a consequence of SRD).
  *
  *  Parses the first video m-line's first payload type, then finds
  *  the matching a=rtpmap entry. Returns `null` when nothing could
- *  be parsed Ã¢ÂÂ the caller falls back to the receiver-based detector.
+ *  be parsed — the caller falls back to the receiver-based detector.
  *  Exported for tests so the parse rule is locked. */
 export function codecFromSdp(sdp: string | null | undefined): RcPreferredCodec | null {
   if (!sdp) return null
@@ -5191,7 +5191,7 @@ export function codecFromSdp(sdp: string | null | undefined): RcPreferredCodec |
 /** Given the full set of browser-supported codecs and an optional
  *  override, return the list the agent should see in `browser_caps`.
  *  When `preferred` is set, only that codec (plus H.264 as a safety
- *  fallback if the browser has it) is forwarded Ã¢ÂÂ so the agent's
+ *  fallback if the browser has it) is forwarded — so the agent's
  *  `pick_best_codec` can only land on the preferred one, or fall back
  *  to H.264 if the agent itself lacks support. Exported for tests. */
 export function filterCapsByPreference(
@@ -5200,7 +5200,7 @@ export function filterCapsByPreference(
 ): string[] {
   if (preferred == null) return caps
   const out = caps.filter((c) => c === preferred)
-  // Always keep H.264 as a parachute Ã¢ÂÂ if the user forces AV1 but the
+  // Always keep H.264 as a parachute — if the user forces AV1 but the
   // agent on this host can't encode AV1, we want a working session
   // rather than a failed one.
   if (preferred !== 'h264' && caps.includes('h264')) {
@@ -5319,7 +5319,7 @@ export function useRemoteControl(
     return Array.isArray(files) && files.includes('resume')
   })
   /** Clipboard protocol-v2 capability gates (see AgentCaps.clipboard).
-   *  Empty on old agents Ã¢ÂÂ v1 button-driven text-only flow. */
+   *  Empty on old agents → v1 button-driven text-only flow. */
   const clipboardCaps: ComputedRef<string[]> = computed(() => {
     const c = agent?.value?.capabilities?.clipboard
     return Array.isArray(c) ? c : []
@@ -5338,15 +5338,15 @@ export function useRemoteControl(
   const supportsClipboardEvents = computed(() => clipboardCaps.value.includes('events'))
   const supportsClipboardImages = computed(() => clipboardCaps.value.includes('images'))
   const supportsClipboardHtml = computed(() => clipboardCaps.value.includes('html'))
-  /** v2.2 Ã¢ÂÂ the REMOTE agent can read/write RTF (embedded images).
+  /** v2.2 — the REMOTE agent can read/write RTF (embedded images).
    *  Needed for the full-fidelity path, but only usable when the
    *  VIEWER also has a local bridge (see `localClipboardBridge`). */
   const supportsClipboardNative = computed(() => clipboardCaps.value.includes('native'))
-  /** v2.2 Ã¢ÂÂ whether THIS machine's local agent exposes the loopback
+  /** v2.2 — whether THIS machine's local agent exposes the loopback
    *  clipboard bridge. Probed once per connect (loopback is never
    *  firewalled); null until probed, then true/false. When true, the
    *  viewer reads native RTF locally and ships it, and writes remote
-   *  RTF back to the local clipboard Ã¢ÂÂ the WordÃ¢ÂÂWord fidelity path. */
+   *  RTF back to the local clipboard — the Word↔Word fidelity path. */
   const localClipboardBridge = ref<boolean | null>(null)
   /** The discovery port the local Windows-native bridge answered on
    *  (a host with several agents binds distinct ports from the
@@ -5360,7 +5360,7 @@ export function useRemoteControl(
    * re-establish the same session against the same agent without
    * the operator hitting Connect again. `reconnectAttempt` is exposed
    * so the viewer can render "Reconnecting (3/6)..." in the toolbar
-   * Ã¢ÂÂ silent retries are confusing when an operator is watching the
+   * — silent retries are confusing when an operator is watching the
    * stream go dark. `reconnectTimer` is private; managed by
    * scheduleReconnect / cancelReconnect.
    */
@@ -5545,7 +5545,7 @@ export function useRemoteControl(
   const notice = ref<string | null>(null)
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
-  // Ã¢ÂÂÃ¢ÂÂ S3 viewer resilience state Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+  // ── S3 viewer resilience state ──────────────────────────────────
   /** Sub-connected health; null = fully healthy (or not connected). */
   const degraded = ref<RcDegradedReason | null>(null)
   /** Armed when pc hits 'disconnected'; fires scheduleReconnect if it
@@ -5771,7 +5771,7 @@ export function useRemoteControl(
    * pipeline death, WS displacement with a zombie peer, one-way
    * network failure). Progress = ANY of: inbound RTP bytes (classic
    * <video> + WebCodecs paths), VP9-444 DC frames, HEVC DC frames.
-   * Static desktops legitimately go flat Ã¢ÂÂ probe with rc:keyframe
+   * Static desktops legitimately go flat → probe with rc:keyframe
    * first (see nextStallAction) and only reconnect when the probe
    * goes unanswered.
    */
@@ -5791,7 +5791,7 @@ export function useRemoteControl(
       }
       // No hasMedia special-case: a session that reached 'connected'
       // but never produced a track/frame is just as dead as one that
-      // stalled mid-flight Ã¢ÂÂ both count ticks toward probe/reconnect.
+      // stalled mid-flight — both count ticks toward probe/reconnect.
       const advanced = mediaAdvanced(lastMediaProgress, cur, sessionDecodeRecover)
       lastMediaProgress = cur
       // Media actually moving is the ONLY proof this pair has a working
@@ -5831,10 +5831,10 @@ export function useRemoteControl(
       })
       const action = nextStallAction(stallTicks)
       if (action === 'probe') {
-        console.info('[rc] media stalled', stallTicks, 's Ã¢ÂÂ probing with rc:keyframe')
+        console.info('[rc] media stalled', stallTicks, 's — probing with rc:keyframe')
         requestKeyframe()
       } else if (action === 'reconnect') {
-        console.warn('[rc] media stalled', stallTicks, 's, keyframe probe unanswered Ã¢ÂÂ re-creating session')
+        console.warn('[rc] media stalled', stallTicks, 's, keyframe probe unanswered — re-creating session')
         scheduleReconnect()
       }
     }, RC_WATCHDOG_TICK_MS)
@@ -5868,10 +5868,10 @@ export function useRemoteControl(
   /** FR-108 — the device's answer to this session's latest display-match
    *  request; `null` until it answers (agents before FR-108 never do). */
   const displayMatchState = ref<DisplayMatchState | null>(null)
-  /** rc.227 Ã¢ÂÂ the remote host's keyboard-layout state, pushed by
+  /** rc.227 — the remote host's keyboard-layout state, pushed by
    *  Windows agents as `rc:layout` over the control DC (on change;
    *  first snapshot arrives with the first input event). Null on old
-   *  agents / non-Windows hosts Ã¢ÂÂ the layout chip + picker self-hide.
+   *  agents / non-Windows hosts — the layout chip + picker self-hide.
    *  `installed` entries are `(opaque 8-hex HKL, BCP-47 tag)`. */
   const remoteLayout = ref<{
     activeHkl: string
@@ -5888,7 +5888,7 @@ export function useRemoteControl(
 
   /** Engage the Keyboard Lock API (call on entering fullscreen).
    *  Resolves `true` when the lock took. Never awaited inline by the
-   *  fullscreenchange handler Ã¢ÂÂ a hung promise must degrade to legacy
+   *  fullscreenchange handler — a hung promise must degrade to legacy
    *  behavior, not block. */
   async function enableKeyboardLock(): Promise<boolean> {
     if (!isKeyboardLockSupported()) return false
@@ -5897,7 +5897,7 @@ export function useRemoteControl(
     }).keyboard
     try {
       // No args = capture ALL capturable keys, incl. Alt+Tab, Win,
-      // Ctrl+W, Escape. (Esc stays exitable via press-and-hold Ã¢ÂÂ
+      // Ctrl+W, Escape. (Esc stays exitable via press-and-hold —
       // browser-level gesture, not cancellable by pages.)
       await kb!.lock!()
       keyboardLockActive.value = true
@@ -5922,10 +5922,10 @@ export function useRemoteControl(
     }
     keyboardLockActive.value = false
   }
-  /** rc.87 Ã¢ÂÂ the agent's real encoder (codec/encoder/hardware/chroma),
+  /** rc.87 — the agent's real encoder (codec/encoder/hardware/chroma),
    *  reported over the control DC by the FFmpeg DC pump. Null until
    *  the agent sends `rc:video-info` (legacy track + libvpx paths
-   *  don't send it yet Ã¢ÂÂ badge falls back to a selection-derived
+   *  don't send it yet → badge falls back to a selection-derived
    *  label). The stats badge reads this for an honest readout. */
   const videoInfo = ref<RcVideoInfo | null>(null)
   /** FR-80 — set when the agent tells us it cannot capture; cleared on every
@@ -5995,14 +5995,14 @@ export function useRemoteControl(
    */
   const currentDesktop = ref<string>('Default')
   /**
-   * rc.23 Ã¢ÂÂ diagnostic surface for the `rc:logs-fetch` round-trip.
+   * rc.23 — diagnostic surface for the `rc:logs-fetch` round-trip.
    * `agentLogs` holds the last reply (or null if no fetch has run);
    * `agentLogsLoading` flips true while a request is in flight.
    * Operator drives via `fetchAgentLogs(linesCount)` from the UI.
    */
   const agentLogs = ref<RcLogsFetchReply | null>(null)
   const agentLogsLoading = ref(false)
-  // rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts).
+  // rc.NEXT — remote app selection & launch (virtual-desktop hosts).
   const remoteWindows = ref<RcWindowEntry[]>([])
   const launchableApps = ref<RcLaunchable[]>([])
   // FR-56 P2 - what the last listing could and could not enumerate. `null`
@@ -6014,7 +6014,7 @@ export function useRemoteControl(
    *  list reply's `supported` field, or flipped false by a request
    *  timeout (an agent too old to speak rc:apps.*). */
   const appsSupported = ref<boolean | null>(null)
-  /** idÃ¢ÂÂresolver map for interleaved list/focus/launch round-trips
+  /** id→resolver map for interleaved list/focus/launch round-trips
    *  (mirrors `pendingDirRequests`). */
   const pendingAppsRequests = new Map<
     string,
@@ -6036,7 +6036,7 @@ export function useRemoteControl(
     return `apps-${Date.now().toString(36)}-${nextAppsReqId++}`
   }
   /**
-   * Single-flight promise resolver Ã¢ÂÂ when set, the next
+   * Single-flight promise resolver — when set, the next
    * `rc:logs-fetch.reply` arriving over the control DC resolves it.
    * Set inside `fetchAgentLogs()`, cleared in the onmessage handler.
    * Subsequent rapid calls cancel the pending promise (reply may
@@ -6044,7 +6044,7 @@ export function useRemoteControl(
    */
   let pendingLogsResolver: ((reply: RcLogsFetchReply) => void) | null = null
   /**
-   * rc.24 Ã¢ÂÂ accumulator for the streamed `rc:logs-fetch.reply.{start,chunk,end}`
+   * rc.24 — accumulator for the streamed `rc:logs-fetch.reply.{start,chunk,end}`
    * envelope sequence. `null` outside of an active stream;
    * populated by the `start` handler and finalised by `end`. Only
    * one stream-in-flight at a time (single-flight, matched by
@@ -6063,7 +6063,7 @@ export function useRemoteControl(
   // flowing" oracle (fps/bitrate update on the RTP path AND every DC pump,
   // where inbound-rtp getStats is silent).
   ;(window as unknown as Record<string, unknown>).__roomler_remote_stats = stats
-  /** Remote cursor state. `pos` = null Ã¢ÂÂ hide the overlay + fall back
+  /** Remote cursor state. `pos` = null → hide the overlay + fall back
    *  to the initials badge. Shape bitmaps are cached so the canvas
    *  paint is just a `drawImage`. */
   const cursor = ref<RcCursor>({ pos: null, shapes: new Map() })
@@ -6071,14 +6071,14 @@ export function useRemoteControl(
    *  the agent over the `control` data channel whenever the user changes
    *  it *or* the channel first opens. */
   const quality = ref<RcQuality>(readStoredQuality())
-  /** rc.199 Ã¢ÂÂ the viewer "Priority" dial (per-session; persisted). Sent to the
+  /** rc.199 — the viewer "Priority" dial (per-session; persisted). Sent to the
    *  agent over the control DC on change and on channel open. Supersedes the
    *  old Quality dropdown in the UI (which only shadowed AIMD/REMB); the
    *  underlying `quality` ref + `rc:quality` sender are kept for back-compat. */
   const priority = ref<RcPriority>(readStoredPriority())
   /** loopback-TURN corp-relay (Phase 2; default ON since 2026-08-02). When on,
    *  `connect()` probes the local agent's loopback TURN and relays through it
-   *  if present Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
+   *  if present — bypasses the capped far-coturn relay on corp networks. */
   const localRelayEnabled = ref<boolean>(readStoredLocalRelay())
   /** FR-121 — the devices this browser runs on (see `readStoredThisDevices`). */
   const storedThisDevices = readStoredThisDevices()
@@ -6117,7 +6117,7 @@ export function useRemoteControl(
   const frameRateChoices = computed(() =>
     frameRateOptions(agent?.value?.capabilities?.video, hostRefreshHzOf(videoInfo.value)),
   )
-  /** Per-agent codec override bookkeeping Ã¢ÂÂ set in connect(), cleared in
+  /** Per-agent codec override bookkeeping — set in connect(), cleared in
    *  disconnect() so an idle post-session global pick can't silently write
    *  the last agent's override. */
   let codecAgentId: string | null = null
@@ -6126,7 +6126,7 @@ export function useRemoteControl(
    *  the legacy RTP track. Set per connect(); gates the RTP-track WebCodecs
    *  transform machinery, whose "webcodecs path skipped" warnings are
    *  misleading noise on DC sessions (the track is a dormant placeholder
-   *  there â the DC worker path IS WebCodecs; field 2026-07-28). */
+   *  there — the DC worker path IS WebCodecs; field 2026-07-28). */
   let sessionDcTransport: string | null = null
   /** FR-77 — the chroma format the current session's cell runs in, so a
    *  decode failure is remembered against the right cell (`hevc:yuv444`
@@ -6192,7 +6192,7 @@ export function useRemoteControl(
    *  reads on the plain RTP path lives inside it. */
   let benchSurface: HTMLElement | null = null
   const l4Uploader = createL4Uploader()
-  // rc.190 (A1) Ã¢ÂÂ true once the USER changed resolution this session, so
+  // rc.190 (A1) — true once the USER changed resolution this session, so
   // connect()'s per-agent restore doesn't clobber a pre-connect pick.
   let resolutionUserPickedThisSession = false
 
@@ -6213,7 +6213,7 @@ export function useRemoteControl(
    *  `audio_enabled: true` on the request; the received Opus track is
    *  played through a dedicated `<audio>` sink (the `<video>` element
    *  stays `muted` since video may travel over the DataChannel/canvas
-   *  path). Only takes effect on the next `connect()` Ã¢ÂÂ matching the
+   *  path). Only takes effect on the next `connect()` — matching the
    *  video-transport toggles. Graceful no-op when the agent doesn't
    *  advertise `"opus"`. */
   const audioEnabled = ref<boolean>(readStoredAudioEnabled())
@@ -6229,7 +6229,7 @@ export function useRemoteControl(
    *  calls `resumeAudioPlayback()`. Reset to false once playback
    *  succeeds or audio tears down. */
   const audioAutoplayBlocked = ref<boolean>(false)
-  /** rc.62 Ã¢ÂÂ VP9 chroma preference (per-browser, persisted). When set
+  /** rc.62 — VP9 chroma preference (per-browser, persisted). When set
    *  to `'yuv420'` or `'yuv444'` the value is sent as `chroma_pref` in
    *  the `rc:session.request` payload; the agent's VP9-444 encoder
    *  uses it instead of its `ROOMLERD_VP9_CHROMA` env var. When
@@ -6248,15 +6248,15 @@ export function useRemoteControl(
   // it eagerly lets the UI disable the toolbar toggle on browsers
   // that lack VP9 profile 1 support.
   void isVp9_444DecodeSupported().then((ok) => { vp9_444Supported.value = ok })
-  /** rc.190 Ã¢ÂÂ whether WebCodecs AV1 decode is available here (dav1d SW
+  /** rc.190 — whether WebCodecs AV1 decode is available here (dav1d SW
    *  ships in Chromium, so ~always true on Chrome). Gates the AV1
    *  toggle; the HW-vs-SW truth is `viewerDecodeHw` below. */
   const av1Supported = ref<boolean>(false)
   void isAv1DecodeSupported().then((ok) => { av1Supported.value = ok })
-  /** rc.190 Ã¢ÂÂ whether THIS viewer decodes the active session's codec in
+  /** rc.190 — whether THIS viewer decodes the active session's codec in
    *  hardware (MediaCapabilities `smooth && powerEfficient` at pick
    *  time). `null` = unknown / webrtc path. Surfaces the viewer half of
-   *  the HWÃÂHW story in the stats HUD, next to the agent-side
+   *  the HW×HW story in the stats HUD, next to the agent-side
    *  `hardware` flag from `rc:video-info`. */
   const viewerDecodeHw = ref<boolean | null>(null)
   /** Whether this browser actually supports the WebCodecs path. UI
@@ -6271,7 +6271,7 @@ export function useRemoteControl(
   /** Unified intrinsic dimensions of the rendered remote frame. Driven
    *  by `<video>.onresize` in classic mode and by worker `first-frame`
    *  messages in webcodecs mode. The view reads this for `custom`/`original`
-   *  scale styling + input coord math Ã¢ÂÂ one source of truth that works
+   *  scale styling + input coord math — one source of truth that works
    *  across both paths. */
   const mediaIntrinsicW = ref(0)
   const mediaIntrinsicH = ref(0)
@@ -6284,7 +6284,7 @@ export function useRemoteControl(
    *  Stays `false` when we fall back (HEVC, missing API, worker
    *  ctor failure, transferControlToOffscreen throw). The VIEW
    *  reads this (not the `renderPath` preference) to decide which
-   *  element to mount Ã¢ÂÂ so an HEVC session under renderPath='webcodecs'
+   *  element to mount — so an HEVC session under renderPath='webcodecs'
    *  correctly renders the `<video>` rather than a permanent black
    *  canvas. */
   const webcodecsActive = ref(false)
@@ -6368,7 +6368,7 @@ export function useRemoteControl(
 
   /** Whether HEVC decode is supported on this browser. Probe runs
    *  once on composable construction (and re-checks in connect()).
-   *  HEVC has NO software fallback in WebCodecs Ã¢ÂÂ Linux Chromium
+   *  HEVC has NO software fallback in WebCodecs — Linux Chromium
    *  and corporate-policy boxes return false here, and the connect
    *  path falls back to VP9-444-DC or webrtc. */
   const hevcSupported = ref<boolean>(false)
@@ -6402,12 +6402,12 @@ export function useRemoteControl(
     h264High444Supported.value = codec !== null
   })
 
-  /** P1 Ã¢ÂÂ latest per-hop diagnostics window from the active decode worker
+  /** P1 — latest per-hop diagnostics window from the active decode worker
    *  (null until the first stats window on a DC path). */
   const decodeDiag = ref<RcDecodeDiag | null>(null)
 
   let pc: RTCPeerConnection | null = null
-  /** Data channels we open proactively (per docs ÃÂ§5). Labels match the
+  /** Data channels we open proactively (per docs §5). Labels match the
    *  agent's expected routing: input/control/clipboard/files. */
   const channels: Record<string, RTCDataChannel> = {}
   // #2638 - a display-match request made before the control channel opened,
@@ -6453,21 +6453,21 @@ export function useRemoteControl(
 
   // ---- Clipboard v2: auto-sync engine ----------------------------------
   // Bidirectional clipboard sync without the manual toolbar buttons.
-  // Local Ã¢ÂÂ remote: focus/visibility/poll/paste triggers read the local
-  // clipboard and push changes over the DC. Remote Ã¢ÂÂ local: the agent
+  // Local → remote: focus/visibility/poll/paste triggers read the local
+  // clipboard and push changes over the DC. Remote → local: the agent
   // pushes clipboard:event / img streams after clipboard:subscribe.
   // The echo gate (+ the agent's SelfMarks) breaks the infinite loop
   // both directions independently.
   const clipboardAutoSyncEnabled = ref(readStoredClipboardAutoSync())
   /** Latched true when clipboard-read permission is DENIED (not on
-   *  transient focus races Ã¢ÂÂ see handleClipboardReadDenied). The view
+   *  transient focus races — see handleClipboardReadDenied). The view
    *  shows a one-shot snackbar + Settings hint; manual buttons keep
    *  working via their own gesture-anchored reads. */
   const clipboardSyncBlocked = ref(false)
   const clipboardEchoGate = createClipboardEchoGate()
 
-  /** Write-acks: id Ã¢ÂÂ settle. Resolved by clipboard:write-ack,
-   *  clipboard:error{id}, or the timeout Ã¢ÂÂ always resolves (void), the
+  /** Write-acks: id → settle. Resolved by clipboard:write-ack,
+   *  clipboard:error{id}, or the timeout — always resolves (void), the
    *  waiter just proceeds. */
   const pendingClipboardAcks = new Map<
     string,
@@ -6536,11 +6536,11 @@ export function useRemoteControl(
     | { kind: 'native'; rtf: Uint8Array<ArrayBuffer>; html: string; text: string }
   /** Latest remote change that arrived while this tab was unfocused
    *  (clipboard writes need document focus). Applied on refocus unless
-   *  the operator copied something new locally in the meantime Ã¢ÂÂ
+   *  the operator copied something new locally in the meantime —
    *  local wins then (last-writer-wins approximation, no clocks). */
   let pendingRemoteApply: RemoteClipContent | null = null
 
-  /** v2.2 Ã¢ÂÂ the full fidelity path is available only when the REMOTE
+  /** v2.2 — the full fidelity path is available only when the REMOTE
    *  agent speaks native AND THIS machine has a local bridge to reach
    *  its own RTF clipboard. */
   const canUseNativeClipboard = computed(
@@ -6574,9 +6574,9 @@ export function useRemoteControl(
           localClipboardBridgePort.value = port
           return
         }
-        // Reachable but not native (a non-Windows agent) Ã¢ÂÂ keep walking.
+        // Reachable but not native (a non-Windows agent) → keep walking.
       } catch {
-        // Nothing on this port (connection refused = fast) Ã¢ÂÂ next.
+        // Nothing on this port (connection refused = fast) → next.
       } finally {
         clearTimeout(timer)
       }
@@ -6638,7 +6638,7 @@ export function useRemoteControl(
   async function writeRemoteContentToLocalClipboard(content: RemoteClipContent): Promise<void> {
     try {
       if (content.kind === 'native') {
-        // v2.2 Ã¢ÂÂ full fidelity: write RTF (embedded images) to the
+        // v2.2 — full fidelity: write RTF (embedded images) to the
         // local clipboard via the bridge. Fall back to the html lane
         // if the bridge write fails.
         const ok = await writeLocalNativeClipboard(content)
@@ -6662,7 +6662,7 @@ export function useRemoteControl(
         await globalThis.navigator.clipboard.writeText(content.text)
         clipboardEchoGate.recordApplied(hashClipboardText(content.text))
       } else if (content.kind === 'html') {
-        // v2.1 Ã¢ÂÂ both formats in one ClipboardItem: rich-aware local
+        // v2.1 — both formats in one ClipboardItem: rich-aware local
         // paste targets take the html, plain editors the text alt.
         await globalThis.navigator.clipboard.write([
           new ClipboardItem({
@@ -6670,7 +6670,7 @@ export function useRemoteControl(
             'text/plain': new Blob([content.text], { type: 'text/plain' }),
           }),
         ])
-        // Read back Ã¢ÂÂ Chrome re-serializes CF_HTML on write; hash what
+        // Read back — Chrome re-serializes CF_HTML on write; hash what
         // a later local read will actually see so the echo gate holds.
         try {
           const items = await globalThis.navigator.clipboard.read()
@@ -6682,7 +6682,7 @@ export function useRemoteControl(
                 : ''
               clipboardEchoGate.recordApplied(hashClipboardHtml(backHtml, backText))
               // The text alt may surface alone via readText-based
-              // polling Ã¢ÂÂ record it too so it isn't re-pushed.
+              // polling — record it too so it isn't re-pushed.
               if (backText) clipboardEchoGate.recordPushed(hashClipboardText(backText))
               break
             }
@@ -6694,7 +6694,7 @@ export function useRemoteControl(
         await globalThis.navigator.clipboard.write([
           new ClipboardItem({ 'image/png': content.blob }),
         ])
-        // Chrome re-encodes PNGs on write Ã¢ÂÂ read back and hash what a
+        // Chrome re-encodes PNGs on write — read back and hash what a
         // later local read will actually see, else the echo gate
         // false-negatives and we push the image straight back.
         try {
@@ -6709,11 +6709,11 @@ export function useRemoteControl(
             }
           }
         } catch {
-          /* best-effort Ã¢ÂÂ the agent-side seq/self-marks still hold */
+          /* best-effort — the agent-side seq/self-marks still hold */
         }
       }
     } catch (e) {
-      // Focus lost between check and write, or permission denied Ã¢ÂÂ
+      // Focus lost between check and write, or permission denied —
       // drop; the next remote change re-pushes.
       console.debug('[rc] clipboard apply failed', e)
     }
@@ -6732,7 +6732,7 @@ export function useRemoteControl(
 
   function handleClipboardReadDenied(e: unknown) {
     // NotAllowedError also fires on focus races ("Document is not
-    // focused" Ã¢ÂÂ DevTools focus, window switch mid-await). Only latch
+    // focused" — DevTools focus, window switch mid-await). Only latch
     // the blocked state when the permission is truly denied.
     void (async () => {
       try {
@@ -6741,7 +6741,7 @@ export function useRemoteControl(
         })
         if (status.state === 'denied') clipboardSyncBlocked.value = true
       } catch {
-        /* permissions API unavailable Ã¢ÂÂ stay optimistic, retry later */
+        /* permissions API unavailable — stay optimistic, retry later */
       }
     })()
     console.debug('[rc] clipboard read blocked', e)
@@ -6758,7 +6758,7 @@ export function useRemoteControl(
     }
   }
 
-  /** v2.1 Ã¢ÂÂ stream pre-built rich frames (html or image) with SCTP
+  /** v2.1 — stream pre-built rich frames (html or image) with SCTP
    *  backpressure. Returns false when the DC dies mid-stream. */
   async function sendRichFramesOverDc(
     ch: RTCDataChannel,
@@ -6780,22 +6780,22 @@ export function useRemoteControl(
     }
   }
 
-  /** v2.2 Ã¢ÂÂ read the local machine's native RTF via the bridge and
+  /** v2.2 — read the local machine's native RTF via the bridge and
    *  push it as a native transfer (full fidelity, embedded images).
    *  Returns true when HANDLED (pushed or recognized as an echo);
-   *  false Ã¢ÂÂ the caller falls back to the html/text lanes. `textHash`
-   *  is the readText hash that triggered the sync Ã¢ÂÂ recorded so later
+   *  false → the caller falls back to the html/text lanes. `textHash`
+   *  is the readText hash that triggered the sync — recorded so later
    *  polls don't re-push the text alt. */
   async function pushLocalNativeToRemote(ch: RTCDataChannel, textHash: string): Promise<boolean> {
     const native = await readLocalNativeClipboard()
-    if (!native) return false // no RTF locally Ã¢ÂÂ html/text fallback
+    if (!native) return false // no RTF locally → html/text fallback
     const rtfHash = hashClipboardBytes(native.rtf)
     if (!clipboardEchoGate.shouldPush(rtfHash)) {
       clipboardEchoGate.recordPushed(textHash)
       return true
     }
     const built = buildClipboardNativeFrames(native.rtf, native.html, native.text)
-    if (!built) return false // oversized Ã¢ÂÂ html/text fallback
+    if (!built) return false // oversized → html/text fallback
     if (!(await sendRichFramesOverDc(ch, built))) return false
     clipboardEchoGate.recordPushed(rtfHash)
     clipboardEchoGate.recordPushed(textHash)
@@ -6809,9 +6809,9 @@ export function useRemoteControl(
     return true
   }
 
-  /** v2.1 Ã¢ÂÂ read the local clipboard's text/html (one clipboard.read())
+  /** v2.1 — read the local clipboard's text/html (one clipboard.read())
    *  and push it as an html transfer. Returns true when the change was
-   *  HANDLED (pushed, or recognized as an echo) Ã¢ÂÂ the caller then skips
+   *  HANDLED (pushed, or recognized as an echo) — the caller then skips
    *  the plain-text fallback. `textHash` is the readText-derived hash
    *  that triggered the sync; recorded alongside the combined hash so
    *  later readText polls don't re-push the text alt. */
@@ -6841,13 +6841,13 @@ export function useRemoteControl(
       const combinedHash = hashClipboardHtml(html, text)
       if (!clipboardEchoGate.shouldPush(combinedHash)) {
         // Known rich content (we applied or pushed it) resurfacing via
-        // a fresh readText hash Ã¢ÂÂ remember the alt so the caller and
+        // a fresh readText hash — remember the alt so the caller and
         // future polls stay quiet.
         clipboardEchoGate.recordPushed(textHash)
         return true
       }
       const built = buildClipboardHtmlFrames(html, text)
-      if (!built) return false // oversized html Ã¢ÂÂ plain-text fallback
+      if (!built) return false // oversized html → plain-text fallback
       if (!(await sendRichFramesOverDc(ch, built))) return false
       clipboardEchoGate.recordPushed(combinedHash)
       clipboardEchoGate.recordPushed(textHash)
@@ -6855,7 +6855,7 @@ export function useRemoteControl(
       trackClipboardWrite(textHash, built.id)
       return true
     }
-    return false // no html on the clipboard Ã¢ÂÂ plain-text fallback
+    return false // no html on the clipboard → plain-text fallback
   }
 
   async function pushLocalImageToRemote(ch: RTCDataChannel): Promise<boolean> {
@@ -6863,7 +6863,7 @@ export function useRemoteControl(
     try {
       items = await globalThis.navigator.clipboard.read()
     } catch (e) {
-      // DataError = clipboard holds no readable data (e.g. files) Ã¢ÂÂ
+      // DataError = clipboard holds no readable data (e.g. files) —
       // a transient skip, NOT a permission problem.
       if (e instanceof DOMException && e.name === 'NotAllowedError') {
         handleClipboardReadDenied(e)
@@ -6930,7 +6930,7 @@ export function useRemoteControl(
     lastClipboardSyncAttempt = now
     clipboardPushInFlight = true
     try {
-      // Focus-conflict rule: refocusing with a stashed remote change Ã¢ÂÂ
+      // Focus-conflict rule: refocusing with a stashed remote change —
       // local wins ONLY if the operator copied something new while
       // away (its hash is unknown to the gate); else the stash applies.
       const stashed = pendingRemoteApply
@@ -6945,14 +6945,14 @@ export function useRemoteControl(
       if (normalizeClipboardText(text) !== '') {
         const hash = hashClipboardText(text)
         if (clipboardEchoGate.shouldPush(hash)) {
-          // v2.2 Ã¢ÂÂ richest available: when both ends can do native and
+          // v2.2 — richest available: when both ends can do native and
           // this machine has a local bridge, ship RTF (embedded
           // images). One bridge GET per actual change, not per tick.
           if (canUseNativeClipboard.value && reason !== 'poll') {
             const handled = await pushLocalNativeToRemote(ch, hash)
             if (handled) return
           }
-          // v2.1 Ã¢ÂÂ new content detected via the cheap readText. Prefer
+          // v2.1 — new content detected via the cheap readText. Prefer
           // the RICH form when the agent takes html: one clipboard.read()
           // per actual change (not per poll tick).
           if (supportsClipboardHtml.value) {
@@ -6960,12 +6960,12 @@ export function useRemoteControl(
             if (handled) return
           }
           try {
-            // RAW text on the wire Ã¢ÂÂ see sendClipboardWriteOverDc.
+            // RAW text on the wire — see sendClipboardWriteOverDc.
             const { id } = sendClipboardWriteOverDc(ch, text)
             clipboardEchoGate.recordPushed(hash)
             trackClipboardWrite(hash, id)
           } catch {
-            /* DC hiccup Ã¢ÂÂ the next trigger retries */
+            /* DC hiccup — the next trigger retries */
           }
           return
         }
@@ -7003,7 +7003,7 @@ export function useRemoteControl(
                   ...(supportsClipboardImages.value ? ['image'] : []),
                   ...(supportsClipboardHtml.value ? ['html'] : []),
                   // Only ask for native events if we can actually apply
-                  // them (local bridge present) Ã¢ÂÂ else the remote would
+                  // them (local bridge present) — else the remote would
                   // ship megabytes of RTF we'd only downgrade to html.
                   ...(canUseNativeClipboard.value ? ['native'] : []),
                 ],
@@ -7090,7 +7090,7 @@ export function useRemoteControl(
   // it works for one transfer at a time but doesn't compose with
   // concurrent up + down or a queued multi-upload.
   //
-  // Each entry tracks a state (`pending` Ã¢ÂÂ `settled`); only the first
+  // Each entry tracks a state (`pending` → `settled`); only the first
   // transition wins, so a `files:cancel` racing a `files:complete` /
   // `files:eof` doesn't double-resolve the Promise.
   type UploadResolve = (result: { path: string; bytes: number }) => void
@@ -7152,7 +7152,7 @@ export function useRemoteControl(
    * replies during the resume handshake window. Separate from
    * `filesRegistry` because the resume wrapper needs the
    * resumed reply BEFORE the entry transitions back to `'pending'`
-   * Ã¢ÂÂ routing through `filesRegistry.get(id)` would race with the
+   * — routing through `filesRegistry.get(id)` would race with the
    * close-handler's `'pending-resume'` patch. Shape mirrors the
    * `pendingDirRequests` pattern used for `files:dir-list`.
    */
@@ -7221,12 +7221,12 @@ export function useRemoteControl(
   // derive a delta bitrate. Reset in teardown() so a fresh connection
   // doesn't see a stale byte counter.
   let statsTimer: ReturnType<typeof setInterval> | null = null
-  // rc.188 Ã¢ÂÂ viewer-rate feedback. The decode worker reports a CUMULATIVE
+  // rc.188 — viewer-rate feedback. The decode worker reports a CUMULATIVE
   // backlog-drop counter; we diff it per window to derive the per-window
   // `struggling` bit sent to the agent (see `sendDecodeStat`). Reset in
   // teardown so a fresh connection doesn't see a stale total.
   let lastBacklogDrops = 0
-  // P6 Ã¢ÂÂ flow-control knobs + the sustained-window struggle fold. One bad
+  // P6 — flow-control knobs + the sustained-window struggle fold. One bad
   // window no longer trips the agent's fps clamp (which costs ~20 s of lazy
   // recovery); the run must persist `struggleWindows` consecutive windows.
   const flowParams = storedFlowParams()
@@ -7309,7 +7309,7 @@ export function useRemoteControl(
   }
 
   // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
-  // and clicks are NOT coalesced Ã¢ÂÂ they're too meaningful to drop.
+  // and clicks are NOT coalesced — they're too meaningful to drop.
   let pendingMove: { x: number; y: number; mon: number } | null = null
   // FR-1 P6 — pointer cadence decoupled from rAF. The old
   // requestAnimationFrame coalescer tied mouse_move sends to the viewer's
@@ -7495,7 +7495,7 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify(msg))
     } catch {
-      /* channel may have closed between the check and send Ã¢ÂÂ drop */
+      /* channel may have closed between the check and send — drop */
     }
   }
 
@@ -7605,7 +7605,7 @@ export function useRemoteControl(
    *  `enigo.text()` invokes the OS Unicode-typing API, so emoji /
    *  CJK / accented Latin all round-trip without any HID-code
    *  mapping on the browser side. Safe to call when the input
-   *  channel isn't open Ã¢ÂÂ silent drop. */
+   *  channel isn't open — silent drop. */
   function sendKeyText(text: string) {
     if (!text) return
     sendInput({ t: 'key_text', text })
@@ -7618,7 +7618,7 @@ export function useRemoteControl(
    *  produces. Safe to call when the input channel isn't open.
    *
    *  `mods` bitfield: 0x01 = Ctrl, 0x02 = Shift, 0x04 = Alt,
-   *  0x08 = Meta/Win Ã¢ÂÂ matches `kbdCodeToHid` callers throughout
+   *  0x08 = Meta/Win — matches `kbdCodeToHid` callers throughout
    *  the codebase. */
   function sendKey(code: number, down: boolean, mods: number = 0) {
     sendInput({
@@ -7630,7 +7630,7 @@ export function useRemoteControl(
   }
 
   /**
-   * rc.23 Ã¢ÂÂ request a tail of the agent's log file over the control
+   * rc.23 — request a tail of the agent's log file over the control
    * DC. Sends `rc:logs-fetch { lines }` and awaits the matching
    * `rc:logs-fetch.reply`. Single-flight: a second call while one is
    * pending cancels the prior promise (the late reply is dropped).
@@ -7640,19 +7640,19 @@ export function useRemoteControl(
    * the message. Newer agents reply within ~50 ms for the default
    * 500-line tail; the 8 s timeout is generous for slow disks.
    */
-  // rc.23 hotfix #4 Ã¢ÂÂ default tail reduced 500 Ã¢ÂÂ 200 lines. The
-  // reply JSON for 500 lines could reach ~50Ã¢ÂÂ60 KB, very close to
+  // rc.23 hotfix #4 — default tail reduced 500 → 200 lines. The
+  // reply JSON for 500 lines could reach ~50–60 KB, very close to
   // webrtc-rs's SCTP `max_message_size` default of 65536. 200 lines
-  // Ã¢ÂÂ 25 KB, safe margin. Operator can still ask for up to 5000 via
-  // the UI line-count selector Ã¢ÂÂ the agent clamps anyway.
+  // ≈ 25 KB, safe margin. Operator can still ask for up to 5000 via
+  // the UI line-count selector — the agent clamps anyway.
   function fetchAgentLogs(lines = 200): Promise<RcLogsFetchReply> {
     return new Promise((resolve, reject) => {
       const ch = channels.control
       if (!ch || ch.readyState !== 'open') {
-        reject(new Error('control DC not open Ã¢ÂÂ not connected to agent'))
+        reject(new Error('control DC not open — not connected to agent'))
         return
       }
-      // Cancel any prior in-flight request Ã¢ÂÂ late reply is dropped.
+      // Cancel any prior in-flight request — late reply is dropped.
       const prevResolver = pendingLogsResolver
       if (prevResolver !== null) {
         // Resolve the prior promise with a synthetic error so its
@@ -7668,7 +7668,7 @@ export function useRemoteControl(
       // forever when the agent didn't respond (old agent unaware of
       // `rc:logs-fetch`, or DC half-open after a peer drop).
       let isActive = true
-      // rc.23 hotfix #2 Ã¢ÂÂ 30 s timeout (was 8 s). the field-test host field
+      // rc.23 hotfix #2 — 30 s timeout (was 8 s). the field-test host field
       // report: log fetch timing out even on rc.23 agent. Agent's
       // file read might be ESET-intercepted (the agent's tracing
       // log is itself a file that ESET scans on read). 8 s gave too
@@ -7681,7 +7681,7 @@ export function useRemoteControl(
         agentLogsLoading.value = false
         reject(
           new Error(
-            'rc:logs-fetch timed out after 30 s Ã¢ÂÂ agent might be on rc.22 or older, or its log read is being held by the AV scanner'
+            'rc:logs-fetch timed out after 30 s — agent might be on rc.22 or older, or its log read is being held by the AV scanner'
           )
         )
       }, 30000)
@@ -7695,7 +7695,7 @@ export function useRemoteControl(
       }
       try {
         const payload = JSON.stringify({ t: 'rc:logs-fetch', lines })
-        // rc.23 hotfix #4 Ã¢ÂÂ outbound trace so DevTools shows the
+        // rc.23 hotfix #4 — outbound trace so DevTools shows the
         // request actually went out. Paired with the inbound trace
         // on `channels.control.onmessage`, the field can verify
         // request-vs-reply round-trip status without an agent log.
@@ -7713,18 +7713,18 @@ export function useRemoteControl(
     })
   }
 
-  // Ã¢ÂÂÃ¢ÂÂ Remote app selection & launch (virtual-desktop hosts) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+  // ── Remote app selection & launch (virtual-desktop hosts) ──────────
   // All three ride the control DC (same request/reply shape as
   // rc:logs-fetch), id-correlated via `pendingAppsRequests`. The 10 s
   // timeout doubles as the old-agent detector: an agent that predates
-  // rc:apps.* never replies Ã¢ÂÂ `appsSupported` flips false Ã¢ÂÂ menu disables.
+  // rc:apps.* never replies → `appsSupported` flips false → menu disables.
   function sendAppsRequest<T extends RcAppsListReply | RcAppsActionReply>(
     msg: Record<string, unknown> | null,
     onTimeout?: () => void,
   ): Promise<T> {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') {
-      return Promise.reject(new Error('control DC not open Ã¢ÂÂ not connected to agent'))
+      return Promise.reject(new Error('control DC not open — not connected to agent'))
     }
     if (!msg || typeof msg.id !== 'string') {
       return Promise.reject(new Error('malformed apps request'))
@@ -7735,7 +7735,7 @@ export function useRemoteControl(
         if (pendingAppsRequests.delete(id)) {
           onTimeout?.()
           if (appsSupported.value === null) appsSupported.value = false
-          reject(new Error('apps request timed out (10 s) Ã¢ÂÂ agent may predate rc:apps.*'))
+          reject(new Error('apps request timed out (10 s) — agent may predate rc:apps.*'))
         }
       }, 10_000)
       pendingAppsRequests.set(id, {
@@ -7776,7 +7776,7 @@ export function useRemoteControl(
   }
 
   /** Send a `rc:quality` preference over the control channel. Safe to
-   *  call while the channel is closed Ã¢ÂÂ it's a no-op until open. Also
+   *  call while the channel is closed — it's a no-op until open. Also
    *  sent automatically when the channel first opens so the agent
    *  learns the restored preference without user interaction. */
   /** P6 — ask the agent's InputArbiter for the exclusive-mode floor. The
@@ -7874,11 +7874,11 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify({ t: 'rc:quality', quality: quality.value }))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
-  /** rc.130 Ã¢ÂÂ ask the agent to force an encoder keyframe (IDR). A decode
+  /** rc.130 — ask the agent to force an encoder keyframe (IDR). A decode
    *  worker fires this (its `request-keyframe` message) after it drops
    *  deltas to recover from a decode backlog and needs a fresh resync
    *  point. The agent min-gap-clamps it. No-op if the control channel
@@ -7886,18 +7886,18 @@ export function useRemoteControl(
   function requestKeyframe() {
     // The worker fires this after dropping deltas on a decode backlog; the agent
     // forces a fresh IDR so the decoder can resync. The viewer's sustainable-rate
-    // feedback (rc.188, `sendDecodeStat`) is what makes the agent slow down Ã¢ÂÂ
+    // feedback (rc.188, `sendDecodeStat`) is what makes the agent slow down —
     // this stays purely as the resync trigger.
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(JSON.stringify({ t: 'rc:keyframe' }))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
-  /** rc.188 Ã¢ÂÂ push the viewer's measured decode rate + a struggling bit to the
+  /** rc.188 — push the viewer's measured decode rate + a struggling bit to the
    *  agent over the control DC. Sent once per stats window from the active
    *  decode worker's `stats` message. No-op while the channel is closed. */
   function sendDecodeStat(
@@ -7917,11 +7917,11 @@ export function useRemoteControl(
         JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs)),
       )
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
-  /** rc.188 Ã¢ÂÂ fold one decode-worker `stats` message into the agent feedback.
+  /** rc.188 — fold one decode-worker `stats` message into the agent feedback.
    *  `framesDroppedBacklog` is a cumulative counter, so a positive delta since
    *  last window means the viewer dropped frames to a backlog THIS window; a
    *  decode queue > 1 means it's backing up even before it had to drop. Either
@@ -7954,7 +7954,7 @@ export function useRemoteControl(
     const backlogMs = typeof m.backlogMs === 'number' ? m.backlogMs : 0
     // A window is "bad" when we dropped frames to a backlog, OR the backlog is
     // sustained deep enough that we're about to (`isBadDecodeWindow`).
-    // P6 Ã¢ÂÂ the struggling bit needs a SUSTAINED run of bad windows (default
+    // P6 — the struggling bit needs a SUSTAINED run of bad windows (default
     // 2 consecutive; `roomler-rc-struggle-windows=1` restores the legacy
     // instantaneous rule). P1's field read showed a healthy viewer parks at
     // queue 0, so a single-window blip (a big IDR landing, a GPU hiccup) was
@@ -7997,7 +7997,7 @@ export function useRemoteControl(
 
   /** Update the controller's quality preference, persist it, and push
    *  the new value to the agent. No-ops (other than the persist) if the
-   *  control channel isn't open yet Ã¢ÂÂ the onopen handler will re-send. */
+   *  control channel isn't open yet — the onopen handler will re-send. */
   function setQuality(q: RcQuality) {
     quality.value = q
     persistQuality(q)
@@ -8005,7 +8005,7 @@ export function useRemoteControl(
   }
 
   /** Force a specific codec for the next session. Pass `null` to clear
-   *  the override. Takes effect on the next `connect()` Ã¢ÂÂ live sessions
+   *  the override. Takes effect on the next `connect()` — live sessions
    *  keep whatever SDP they negotiated at start. Persisted to
    *  localStorage so the preference survives a reload. */
   function setPreferredCodec(c: RcPreferredCodec | null) {
@@ -8013,7 +8013,7 @@ export function useRemoteControl(
     persistPreferredCodec(c)
   }
 
-  /** Update the stage render mode. Takes effect immediately Ã¢ÂÂ CSS
+  /** Update the stage render mode. Takes effect immediately — CSS
    *  bindings + input coordinate mapping both switch live. */
   function setScaleMode(m: RcScaleMode) {
     scaleMode.value = m
@@ -8031,7 +8031,7 @@ export function useRemoteControl(
   }
 
   /** Send the current resolution preference over the control DC.
-   *  Safe to call while the channel is closed Ã¢ÂÂ no-op until open; the
+   *  Safe to call while the channel is closed — no-op until open; the
    *  `channels.control.onopen` handler calls this automatically so a
    *  page reload re-emits the stored preference without user action. */
   function sendResolutionPreference() {
@@ -8042,11 +8042,11 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify(msg))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
-  /** rc.191 Ã¢ÂÂ send a display-match request over the control DC: the agent
+  /** rc.191 — send a display-match request over the control DC: the agent
    *  switches its display to the largest mode fitting `dims` (viewer stage
    *  in physical px) and restores on `null` / channel close. Held while
    *  the channel is not open yet, and sent from its `onopen` (#2638). */
@@ -8061,11 +8061,11 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify(displayMatchWireMessage(dims)))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
-  /** rc.227 Ã¢ÂÂ ask the agent to switch the HOST's active keyboard
+  /** rc.227 — ask the agent to switch the HOST's active keyboard
    *  layout (the Settings picker). `hkl` must come from
    *  `remoteLayout.installed[].hkl`. No explicit ack: the agent's
    *  re-sampled `rc:layout` push updates `remoteLayout`, and a
@@ -8078,7 +8078,7 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify(msg))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
@@ -8088,10 +8088,10 @@ export function useRemoteControl(
    *  choice survives reloads without bleeding across machines. */
   function setResolution(next: RcResolutionSetting) {
     resolution.value = next
-    // rc.190 (A1) Ã¢ÂÂ remember that the user picked THIS session. Before
+    // rc.190 (A1) — remember that the user picked THIS session. Before
     // this flag, a dropdown pick made BEFORE Connect was (a) never
     // persisted (`resolutionAgentId` is null until connect()) and then
-    // (b) CLOBBERED by connect()'s readStoredResolution restore Ã¢ÂÂ the
+    // (b) CLOBBERED by connect()'s readStoredResolution restore — the
     // field-reported "initial resolution selection doesn't work, I must
     // connect at original THEN change it" bug.
     resolutionUserPickedThisSession = true
@@ -8149,7 +8149,7 @@ export function useRemoteControl(
    *  from an agent without `fps-high`. */
   const frameRateAnswer = computed(() => frameRateAnswerOf(videoInfo.value))
 
-  /** Switch render path. Only takes effect on the next `connect()` Ã¢ÂÂ
+  /** Switch render path. Only takes effect on the next `connect()` —
    *  switching mid-session would require tearing down the receiver
    *  transform and replacing the DOM element the video paints into,
    *  which is more disruption than "reconnect to apply". Persisted
@@ -8164,7 +8164,7 @@ export function useRemoteControl(
   }
 
   /** Switch video transport. Only takes effect on the next `connect()`
-   *  Ã¢ÂÂ the choice is baked into the rc:session.request payload. If the
+   *  — the choice is baked into the rc:session.request payload. If the
    *  caller asks for `data-channel-vp9-444` but `vp9_444Supported` is
    *  false (older browser, or the async probe hasn't resolved yet),
    *  we still persist the preference so the toggle reflects the user
@@ -8176,7 +8176,7 @@ export function useRemoteControl(
   }
 
   /** Toggle opt-in host-audio reception. Only takes effect on the next
-   *  `connect()` Ã¢ÂÂ the choice is baked into the `recvonly` audio
+   *  `connect()` — the choice is baked into the `recvonly` audio
    *  transceiver + the request's `audio_enabled` field, both fixed at
    *  offer time. Persisted per-browser. */
   function setAudioEnabled(on: boolean) {
@@ -8194,8 +8194,8 @@ export function useRemoteControl(
     audioAutoplayBlocked.value = false
   }
 
-  /** rc.62 Ã¢ÂÂ switch VP9 chroma preference. Only takes effect on the
-   *  next `connect()` Ã¢ÂÂ the choice is baked into the
+  /** rc.62 — switch VP9 chroma preference. Only takes effect on the
+   *  next `connect()` — the choice is baked into the
    *  `rc:session.request.chroma_pref` field. Older agents that don't
    *  understand the field ignore it and fall back to their own
    *  `ROOMLERD_VP9_CHROMA` default (= no-op). */
@@ -8205,7 +8205,7 @@ export function useRemoteControl(
   }
 
   /** Send the current `rc:priority` dial over the control DC. Safe to call
-   *  while closed Ã¢ÂÂ no-op until open; the control `onopen` handler calls it so
+   *  while closed — no-op until open; the control `onopen` handler calls it so
    *  a reload re-emits the stored dial without user action. */
   function sendPriorityPreference() {
     const ch = channels.control
@@ -8213,12 +8213,12 @@ export function useRemoteControl(
     try {
       ch.send(JSON.stringify(priorityWireMessage(priority.value)))
     } catch {
-      /* channel closed between check and send Ã¢ÂÂ drop */
+      /* channel closed between check and send — drop */
     }
   }
 
   /** Update the Priority dial, persist it, and push it to the agent. Unlike
-   *  the codec/transport picks, this takes effect LIVE Ã¢ÂÂ the agent re-resolves
+   *  the codec/transport picks, this takes effect LIVE — the agent re-resolves
    *  the relay resolution cap on the next encoded frame. */
   function setPriority(p: RcPriority) {
     priority.value = p
@@ -8282,7 +8282,7 @@ export function useRemoteControl(
    *  arrives via `attachCanvasToWorker()`; once the canvas lands, it
    *  transfers control + the worker starts painting. Previously we
    *  waited for the canvas before installing the transform, which
-   *  looked like a race Ã¢ÂÂ some Chrome builds seem to lock frames
+   *  looked like a race — some Chrome builds seem to lock frames
    *  onto the default decoder when the transform is assigned after
    *  the track has already started producing. */
   function installWebCodecsTransform(receiver: RTCRtpReceiver): boolean {
@@ -8291,8 +8291,8 @@ export function useRemoteControl(
     }
     const TransformCtor = g.RTCRtpScriptTransform
     if (typeof TransformCtor !== 'function') return false
-    // Chrome (Ã¢ÂÂ¤ 131 at least) installs RTCRtpScriptTransform on an
-    // HEVC receiver without complaint but bypasses it Ã¢ÂÂ frames go
+    // Chrome (≤ 131 at least) installs RTCRtpScriptTransform on an
+    // HEVC receiver without complaint but bypasses it — frames go
     // straight to the default decoder and our TransformStream never
     // sees them. Observed 2026-04-24 on Intel UHD + real HEVC track:
     // `receiver.getStats()` showed framesReceived + framesDecoded
@@ -8305,11 +8305,11 @@ export function useRemoteControl(
     const codec = sdpCodec ?? receiverCodec
     if (codec === 'h265') {
       console.warn(
-        '[rc] webcodecs path skipped Ã¢ÂÂ Chrome does not forward HEVC frames to RTCRtpScriptTransform. Falling back to <video>. Use the Codec toolbar to force H.264 for a guaranteed WebCodecs path.',
+        '[rc] webcodecs path skipped — Chrome does not forward HEVC frames to RTCRtpScriptTransform. Falling back to <video>. Use the Codec toolbar to force H.264 for a guaranteed WebCodecs path.',
       )
       return false
     }
-    // rc.43 Ã¢ÂÂ Chrome 148+ regression: RTCRtpScriptTransform attaches +
+    // rc.43 — Chrome 148+ regression: RTCRtpScriptTransform attaches +
     // configure() reports success but encoded frames are never delivered
     // to the transformer's readable; the worker's 3 s watchdog catches it
     // and tears down, but Chrome also holds frames off the default path
@@ -8318,7 +8318,7 @@ export function useRemoteControl(
     // start.
     if (isChromeWithBrokenScriptTransform()) {
       console.warn(
-        '[rc] webcodecs path skipped Ã¢ÂÂ Chrome 148+ regressed RTCRtpScriptTransform frame delivery. Falling back to <video>. See useRemoteControl.ts::isChromeWithBrokenScriptTransform for details.',
+        '[rc] webcodecs path skipped — Chrome 148+ regressed RTCRtpScriptTransform frame delivery. Falling back to <video>. See useRemoteControl.ts::isChromeWithBrokenScriptTransform for details.',
       )
       return false
     }
@@ -8374,15 +8374,15 @@ export function useRemoteControl(
         console.info('[rc] webcodecs heartbeat', msg)
       } else if (msg.type === 'watchdog') {
         // Chrome's RTCRtpScriptTransform silently drops frames for
-        // some codec/version combos (HEVC Ã¢ÂÂ¤ Chrome 131, also H.264
+        // some codec/version combos (HEVC ≤ Chrome 131, also H.264
         // in some 2026-04-26 builds). The default decoder still gets
-        // the frames via our pipeThrough Ã¢ÂÂ writable, so the
-        // <video> element would render fine Ã¢ÂÂ we just need to swap
+        // the frames via our pipeThrough → writable, so the
+        // <video> element would render fine — we just need to swap
         // the DOM. Tear down the worker; webcodecsActive flips to
         // false; the view's `isWebCodecsRender` computed reverts;
         // Vue mounts <video> and the existing srcObject watcher
         // wires the stream. No reconnect needed.
-        console.warn('[rc] webcodecs watchdog fired Ã¢ÂÂ auto-fallback to <video>', msg)
+        console.warn('[rc] webcodecs watchdog fired — auto-fallback to <video>', msg)
         stopWebCodecsPath()
       } else if (
         msg.type === 'decoder-error'
@@ -8393,12 +8393,12 @@ export function useRemoteControl(
       ) {
         // FR-132 P1 — counted on the agent, before the fallback below.
         reportDecodeError('webcodecs', msg.type, msg.error, msg.codec ?? codec)
-        // rc.43 Ã¢ÂÂ pre-rc.43 we only logged. Decoder errors after a
+        // rc.43 — pre-rc.43 we only logged. Decoder errors after a
         // successful configure() (Chrome 148 VP9 profile-1 path,
         // mid-session codec change) would leave the canvas blank with
         // no recovery. Tear down so the view re-mounts <video> and the
         // standard RTP path takes over.
-        console.warn('[rc] webcodecs worker error Ã¢ÂÂ auto-fallback to <video>', msg)
+        console.warn('[rc] webcodecs worker error — auto-fallback to <video>', msg)
         stopWebCodecsPath()
       }
     }
@@ -8427,7 +8427,7 @@ export function useRemoteControl(
       attachCanvasToWorker(webcodecsCanvasEl.value)
     }
     // Kick a getStats diagnostic to confirm whether RTP is actually
-    // flowing to this receiver Ã¢ÂÂ if bytesReceived rises but the
+    // flowing to this receiver — if bytesReceived rises but the
     // worker never posts `first-encoded-frame`, Chrome is dropping
     // frames before the transform.
     scheduleInboundRtpDiagnostic(receiver)
@@ -8494,8 +8494,8 @@ export function useRemoteControl(
     webcodecsWorker = null
   }
 
-  // Ã¢ÂÂÃ¢ÂÂ 2026-07-24 freeze triangulation (round 3) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
-  // Field: 3-5 s video freezes with a SILENT console Ã¢ÂÂ the worker-side stall
+  // ── 2026-07-24 freeze triangulation (round 3) ─────────────────────────────
+  // Field: 3-5 s video freezes with a SILENT console — the worker-side stall
   // detector needs chunks to arrive to run at all, so silence is ambiguous
   // between "bytes stopped arriving" (network/SCTP) and "the main thread was
   // blocked so nothing was forwarded" (jank). These two detectors split that:
@@ -8553,7 +8553,7 @@ export function useRemoteControl(
     stopLongTaskObserver()
   }
 
-  // P1 Ã¢ÂÂ main-thread long-task accounting. Counts blocking tasks Ã¢ÂÂ¥50 ms
+  // P1 — main-thread long-task accounting. Counts blocking tasks ≥50 ms
   // while a DC path is active; snapshotted into `decodeDiag` on each worker
   // stats window so main-thread jank sits next to the worker's hop timings
   // (the number that decides whether the fps ceiling is main-thread-bound).
@@ -8573,7 +8573,7 @@ export function useRemoteControl(
       longTaskObserver.observe({ type: 'longtask', buffered: false })
       longTaskWindowStartMs = performance.now()
     } catch {
-      longTaskObserver = null // 'longtask' unsupported Ã¢ÂÂ diag shows zeros
+      longTaskObserver = null // 'longtask' unsupported — diag shows zeros
     }
   }
   function stopLongTaskObserver() {
@@ -8599,7 +8599,7 @@ export function useRemoteControl(
     return { perSec, msPerSec }
   }
 
-  /** P1 Ã¢ÂÂ fold one worker stats window into `decodeDiag` for the diag HUD. */
+  /** P1 — fold one worker stats window into `decodeDiag` for the diag HUD. */
   function updateDecodeDiag(m: {
     paint?: HopWindow
     fwd?: HopWindow
@@ -9067,7 +9067,7 @@ export function useRemoteControl(
         statsPrevBytes = snap.bytes
         statsPrevTsMs = snap.tsMs
       } catch {
-        /* getStats() can reject during teardown Ã¢ÂÂ just wait for next tick */
+        /* getStats() can reject during teardown — just wait for next tick */
       }
     }, STATS_POLL_MS)
   }
@@ -9090,13 +9090,13 @@ export function useRemoteControl(
     if (!Number.isFinite(id) || !Number.isFinite(w) || !Number.isFinite(h) || typeof b64 !== 'string') {
       return
     }
-    // Skip if we already have this shape cached Ã¢ÂÂ agent should only
+    // Skip if we already have this shape cached — agent should only
     // send it on change but defensive.
     if (cursor.value.shapes.has(id)) return
     try {
       const bgra = base64ToBytes(b64)
       if (bgra.length < w * h * 4) return
-      // Swizzle BGRA Ã¢ÂÂ RGBA for ImageData. Done in-place on a copy
+      // Swizzle BGRA → RGBA for ImageData. Done in-place on a copy
       // so the original buffer is reusable.
       const rgba = new Uint8ClampedArray(w * h * 4)
       for (let i = 0; i < w * h; i++) {
@@ -9115,7 +9115,7 @@ export function useRemoteControl(
       shapes.set(id, { bitmap, hotspotX: hx, hotspotY: hy, css: cssKw })
       cursor.value = { ...cursor.value, shapes }
     } catch {
-      /* decode failed Ã¢ÂÂ skip this shape update */
+      /* decode failed — skip this shape update */
     }
   }
 
@@ -9147,7 +9147,7 @@ export function useRemoteControl(
       rcUnsubs.push(ws.onRcMessage(t, h))
     }
     on('rc:session.created', (msg) => {
-      // Only accept while we actually have a request in flight Ã¢ÂÂ a
+      // Only accept while we actually have a request in flight — a
       // late/stale create must not resurrect an abandoned attempt.
       // (2026-08-05 winhost-a wedge) ...but don't LEAK a rejected create:
       // the server holds a live session pinned to the agent until someone
@@ -9483,7 +9483,7 @@ export function useRemoteControl(
       try {
         await pc.addIceCandidate(init)
       } catch {
-        /* ignore Ã¢ÂÂ happens on stale candidates during teardown */
+        /* ignore — happens on stale candidates during teardown */
       }
     })
     // FR-138 — the device's control socket dropped and the server keeps the
@@ -9502,7 +9502,7 @@ export function useRemoteControl(
     })
     on('rc:terminate', (msg) => {
       // While the ladder timer is pending every terminate refers to a
-      // session we already abandoned Ã¢ÂÂ ignore.
+      // session we already abandoned — ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       // FR-138 — the device's `rc:ended` may have said this end first.
@@ -9510,8 +9510,8 @@ export function useRemoteControl(
       // FR-138 — a held session's end, the answer to a rejoin included: the
       // hold's record says why, and the rest is today's.
       endHold(typeof msg.reason === 'string' ? msg.reason : 'terminate')
-      // Involuntary endings (agent WS displacement Ã¢ÂÂ the classic
-      // "host joined a VPN" symptom Ã¢ÂÂ or a transient agent error)
+      // Involuntary endings (agent WS displacement — the classic
+      // "host joined a VPN" symptom — or a transient agent error)
       // auto-re-create the session instead of dumping the operator
       // to a dead viewer. Deliberate endings stay terminal. And a session
       // this page already failed keeps its error (`terminateAction`).
@@ -9522,8 +9522,8 @@ export function useRemoteControl(
       })
       if (action === 'keep-error') return
       if (action === 'reconnect') {
-        console.info('[rc] session ended (', msg.reason, ') Ã¢ÂÂ auto-reconnecting')
-        // Server already ended the session Ã¢ÂÂ don't send a redundant
+        console.info('[rc] session ended (', msg.reason, ') — auto-reconnecting')
+        // Server already ended the session — don't send a redundant
         // terminate for it.
         scheduleReconnect({ notifyServer: false })
         return
@@ -9588,7 +9588,7 @@ export function useRemoteControl(
         scheduleReconnect({ notifyServer: false })
         return
       }
-      // Ladder pending Ã¢ÂÂ errors are stale fallout from the abandoned
+      // Ladder pending → errors are stale fallout from the abandoned
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
@@ -9643,9 +9643,9 @@ export function useRemoteControl(
       // Mid-ladder transients (agent_busy while the old slot frees,
       // agent_offline while the agent WS flaps back) advance the
       // ladder instead of killing it. First-connect errors still fail
-      // fast Ã¢ÂÂ reconnectAttempt is 0 outside a reconnect cycle.
+      // fast — reconnectAttempt is 0 outside a reconnect cycle.
       if (isRetryableRcErrorCode(msg.code) && reconnectAttempt.value > 0 && lastConnectArgs) {
-        console.info('[rc] transient signalling error (', msg.code, ') Ã¢ÂÂ retrying')
+        console.info('[rc] transient signalling error (', msg.code, ') — retrying')
         scheduleReconnect({ notifyServer: false })
         return
       }
@@ -9744,7 +9744,7 @@ export function useRemoteControl(
     if (connectTiming) logConnectTiming('retried')
     // Free the agent's session slot BEFORE retrying: a device allows two
     // sessions unless set to fewer (`rc_max_sessions`), and the agent only notices a
-    // dead peer on its own timeout Ã¢ÂÂ without this hangup the fresh
+    // dead peer on its own timeout — without this hangup the fresh
     // request bounces off `agent_busy` for many seconds. Skipped
     // (notifyServer: false) when the trigger was the server ending
     // the session itself.
@@ -9772,7 +9772,7 @@ export function useRemoteControl(
     if (!externalMode && sessionId.value && hold.resumable(sessionId.value)) replacesId = sessionId.value
     sessionId.value = null
     const attemptIdx = reconnectAttempt.value
-    // rc.23 Ã¢ÂÂ nextReconnectDelayMs always returns a positive delay
+    // rc.23 — nextReconnectDelayMs always returns a positive delay
     // now; the loop only exits when the operator clicks Disconnect
     // (which sets lastConnectArgs = null and falls into the failWith
     // above) or the peer transitions back to 'connected'. Removes
@@ -9962,7 +9962,7 @@ export function useRemoteControl(
   }
 
   // Signalling transport watch: the moment the WS comes back while a
-  // ladder timer is pending, retry immediately Ã¢ÂÂ the backoff exists to
+  // ladder timer is pending, retry immediately — the backoff exists to
   // pace attempts against a dead server, not to penalise a recovered
   // one. (Attempts fired while the WS is down send into the void and
   // get re-laddered by the signalling timeout, so this also shortens
@@ -9973,7 +9973,7 @@ export function useRemoteControl(
       if (s === 'connected' && phase.value === 'reconnecting' && reconnectTimer !== null) {
         clearTimeout(reconnectTimer)
         reconnectTimer = null
-        console.info('[rc] signalling restored Ã¢ÂÂ retrying immediately')
+        console.info('[rc] signalling restored — retrying immediately')
         fireReconnectAttempt()
       }
     },
@@ -10074,7 +10074,7 @@ export function useRemoteControl(
     localClipboardBridgePort.value = null
   }
 
-  // Phase 5 Ã¢ÂÂ admin break-glass reason for the NEXT `connect()`. The UI sets it
+  // Phase 5 — admin break-glass reason for the NEXT `connect()`. The UI sets it
   // (via a confirm dialog) before a forced session; `connect` reads it into the
   // `rc:session.request` and clears it. The server ignores it unless the caller
   // is a validated `ADMINISTRATOR`.
@@ -10117,7 +10117,7 @@ export function useRemoteControl(
     // the attempt it would have displaced is still the live one.
     const gen = ++connectGen
     // Capture the original call so a later 'failed' can replay it.
-    // Don't clobber on an isReconnect call Ã¢ÂÂ that path already has
+    // Don't clobber on an isReconnect call — that path already has
     // the right args from the original user click.
     if (!isReconnect) {
       lastConnectArgs = { agentId, permissions, orgId }
@@ -10129,7 +10129,7 @@ export function useRemoteControl(
       // New user-initiated connect - a later retry in THIS cycle must not
       // inherit "the session worked once" from the previous one.
       sessionEverPainted = false
-      // Fresh user-initiated connect Ã¢ÂÂ reset reconnect state.
+      // Fresh user-initiated connect → reset reconnect state.
       cancelReconnect()
     }
     error.value = null
@@ -10201,18 +10201,18 @@ export function useRemoteControl(
     // don't want a stale value from a different agent leaking in.
     resolutionAgentId = agentId
     if (resolutionUserPickedThisSession) {
-      // rc.190 (A1) Ã¢ÂÂ the user picked a resolution BEFORE connecting (the
+      // rc.190 (A1) — the user picked a resolution BEFORE connecting (the
       // dropdown next to Connect). Keep it, and persist it now that we
       // finally know which agent it belongs to. Pre-fix this line
       // unconditionally overwrote the pick with the stored value
-      // ('original' by old default) Ã¢ÂÂ the "initial resolution selection
+      // ('original' by old default) — the "initial resolution selection
       // in the dropdown doesn't work" field bug.
       persistResolution(agentId, resolution.value)
     } else {
       resolution.value = readStoredResolution(agentId)
     }
 
-    // Per-agent codec override Ã¢ÂÂ same shape as the resolution block above,
+    // Per-agent codec override — same shape as the resolution block above,
     // including its rc.190 guard: a pick made BEFORE connect wins over the
     // stored override (and is persisted now that the agent is known); the
     // restore path is persist-FREE so agent X's override never rewrites the
@@ -10241,14 +10241,14 @@ export function useRemoteControl(
     const allBrowserCaps = inspectBrowserVideoCodecs()
     const browserCaps = filterCapsByPreference(allBrowserCaps, preferredCodec.value)
     if (allBrowserCaps.length > 0) {
-      // Surface both lists in the console Ã¢ÂÂ useful when debugging
+      // Surface both lists in the console — useful when debugging
       // "why didn't H.265 negotiate" on a session. Shown as the raw
-      // browser list Ã¢ÂÂ© forced preference Ã¢ÂÂ sent list.
+      // browser list ∩ forced preference → sent list.
       console.info(
         '[rc] browser codecs:',
         allBrowserCaps.join(', '),
         preferredCodec.value ? `(forced ${preferredCodec.value})` : '',
-        'Ã¢ÂÂ sending to agent:',
+        '→ sending to agent:',
         browserCaps.join(', '),
       )
     }
@@ -10351,7 +10351,7 @@ export function useRemoteControl(
       // `remoteAudioStream` to a hidden <audio autoplay> element; if
       // the browser blocks autoplay-with-sound we flip
       // `audioAutoplayBlocked` so the view can offer a one-click unmute.
-      // Return early Ã¢ÂÂ none of the video/WebCodecs plumbing below
+      // Return early — none of the video/WebCodecs plumbing below
       // applies to an audio track.
       if (ev.track.kind === 'audio') {
         remoteAudioStream.value = new MediaStream([ev.track])
@@ -10362,13 +10362,13 @@ export function useRemoteControl(
       // restarts / renegotiations, leaving dead tracks attached to the
       // MediaStream; the <video> element would render the wrong one.
       // Current agent doesn't renegotiate, but if it ever does this
-      // would regress silently Ã¢ÂÂ replacement is idempotent for the
+      // would regress silently — replacement is idempotent for the
       // single-track case we have today.
       remoteStream.value = new MediaStream([ev.track])
       hasMedia.value = true
       // Try the WebCodecs bypass first when the user opted in AND the
       // browser supports it. If the canvas hasn't mounted yet (common
-      // Ã¢ÂÂ ontrack fires in 'negotiating' while the canvas is gated on
+      // — ontrack fires in 'negotiating' while the canvas is gated on
       // 'connected'), stash the receiver; the watcher on
       // webcodecsCanvasEl below picks it up as soon as the canvas
       // mounts.
@@ -10394,7 +10394,7 @@ export function useRemoteControl(
           receiver.jitterBufferTarget = 0
           receiver.playoutDelayHint = 0
         } catch { /* best-effort */ }
-        // Install the transform EAGERLY Ã¢ÂÂ canvas is attached later
+        // Install the transform EAGERLY — canvas is attached later
         // when it mounts. This gets Chrome's RTP pipeline routing
         // frames to our worker from the first packet; waiting for
         // the canvas mount (phase === 'connected') meant the default
@@ -10404,7 +10404,7 @@ export function useRemoteControl(
           return
         }
         // Install failed (no RTCRtpScriptTransform, worker throw,
-        // etc.) Ã¢ÂÂ fall through to classic <video> path.
+        // etc.) — fall through to classic <video> path.
       }
       // Tell the browser we care about latency, not playback smoothness.
       // Chromium enforces a soft ~80 ms floor regardless, but asking
@@ -10418,12 +10418,12 @@ export function useRemoteControl(
           playoutDelayHint?: number | null
         }
         receiver.jitterBufferTarget = 0
-        // Firefox + non-standard Chromium hint Ã¢ÂÂ belt-and-braces with
+        // Firefox + non-standard Chromium hint — belt-and-braces with
         // jitterBufferTarget. Same intent: "decode + display as fast
         // as possible; I'd rather see stutter than lag."
         receiver.playoutDelayHint = 0
       } catch {
-        // Best-effort Ã¢ÂÂ browser will use its own adaptive default.
+        // Best-effort — browser will use its own adaptive default.
       }
       // contentHint tells the compositor this is motion (not detail),
       // which switches Chrome's <video> internal smoothing off and
@@ -10441,7 +10441,7 @@ export function useRemoteControl(
       // routes it until the rejoin is answered, and the error a pod would
       // answer with is no news about this peer.
       if (hold.holding()) return
-      // Note: null candidate signals end-of-gather Ã¢ÂÂ skip it.
+      // Note: null candidate signals end-of-gather — skip it.
       if (!ev.candidate) return
       ws.sendRaw({
         t: 'rc:ice',
@@ -10473,7 +10473,7 @@ export function useRemoteControl(
         // which still gives a long-lived session that drops at hour 5 its
         // 250 ms first retry — that session had media.
         cancelReconnect({ keepAttempts: true })
-        // A recovered ICE flap lands back here Ã¢ÂÂ stand down the
+        // A recovered ICE flap lands back here — stand down the
         // sustained-'disconnected' fuse and the negotiation timeout,
         // and start watching media progress.
         clearPcDisconnectedTimer()
@@ -10489,7 +10489,7 @@ export function useRemoteControl(
           pcDisconnectedTimer = setTimeout(() => {
             pcDisconnectedTimer = null
             if (pc?.connectionState === 'disconnected') {
-              console.warn('[rc] peer sat in \'disconnected\' past grace Ã¢ÂÂ re-creating session')
+              console.warn('[rc] peer sat in \'disconnected\' past grace — re-creating session')
               scheduleReconnect()
             }
           }, RC_PC_DISCONNECTED_GRACE_MS)
@@ -10511,13 +10511,13 @@ export function useRemoteControl(
 
     // Declare we want to *receive* video from the agent. Without this line
     // the offer has no m=video section, so the agent's answer can't include
-    // one either Ã¢ÂÂ ontrack never fires and hasMedia stays false. See the
+    // one either — ontrack never fires and hasMedia stays false. See the
     // peer-side mirror in agents/roomlerd/src/peer.rs (add_track).
     pc.addTransceiver('video', { direction: 'recvonly' })
 
     // Opt-in host audio: declare a recvonly audio transceiver so the
     // offer carries an m=audio section the agent can answer with its
-    // Opus track. Only when the user asked for it Ã¢ÂÂ otherwise no audio
+    // Opus track. Only when the user asked for it — otherwise no audio
     // m-line is offered and the agent adds no audio track (mirrors the
     // `audio_enabled` request flag). The agent still gates on its own
     // `AgentCaps.audio` advertising `"opus"`, so this is a safe no-op
@@ -10526,7 +10526,7 @@ export function useRemoteControl(
       pc.addTransceiver('audio', { direction: 'recvonly' })
     }
 
-    // Create the four data channels up front per architecture doc ÃÂ§5.
+    // Create the four data channels up front per architecture doc §5.
     // Reliability profiles match the doc: unreliable+unordered for input,
     // reliable+ordered for everything else.
     channels.input = pc.createDataChannel('input', {
@@ -10544,15 +10544,15 @@ export function useRemoteControl(
     // stricter policy.
     channels.cursor = pc.createDataChannel('cursor', { ordered: true })
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
-    // v2 Ã¢ÂÂ the clipboard DC carries binary PNG frames; without an
+    // v2 — the clipboard DC carries binary PNG frames; without an
     // explicit binaryType some browsers deliver Blobs (the files DC
-    // defends both, the video DCs pin arraybuffer Ã¢ÂÂ same here).
+    // defends both, the video DCs pin arraybuffer — same here).
     channels.clipboard.binaryType = 'arraybuffer'
     channels.clipboard.onopen = () => {
       if (clipboardAutoSyncEnabled.value) {
-        // v2.2 Ã¢ÂÂ probe the local bridge FIRST (it decides whether we
+        // v2.2 — probe the local bridge FIRST (it decides whether we
         // ask the remote for native events), then subscribe + start
-        // the localÃ¢ÂÂremote triggers. The probe is a ~1.5 s loopback
+        // the local→remote triggers. The probe is a ~1.5 s loopback
         // fetch; subscribing after it means the `native` event opt-in
         // reflects real availability. Re-fires on the fresh DC after a
         // reconnect.
@@ -10585,7 +10585,7 @@ export function useRemoteControl(
     // (one active outgoing transfer at a time).
     channels.files.onmessage = (ev) => {
       if (typeof ev.data !== 'string') {
-        // Binary frame Ã¢ÂÂ route to the active download's writable
+        // Binary frame — route to the active download's writable
         // or Blob accumulator. If no active download, drop (would
         // be a protocol violation; agent shouldn't send binaries
         // without a preceding files:offer).
@@ -10598,7 +10598,7 @@ export function useRemoteControl(
         if (data instanceof ArrayBuffer) {
           appendDownloadChunk(entry, data)
         } else if (data instanceof Blob) {
-          // Async path; we don't await Ã¢ÂÂ entries are kept in arrival
+          // Async path; we don't await — entries are kept in arrival
           // order via the same await chain.
           void data.arrayBuffer().then((buf) => appendDownloadChunk(entry, buf))
         }
@@ -10616,7 +10616,7 @@ export function useRemoteControl(
         entries?: DirEntry[]
         bytes?: number
         message?: string
-        /** rc.19 files:resumed reply Ã¢ÂÂ server-authoritative offset
+        /** rc.19 files:resumed reply — server-authoritative offset
          *  the browser should re-pump from. */
         accepted_offset?: number
       }
@@ -10679,9 +10679,9 @@ export function useRemoteControl(
           patchTransfer(id, { t: 'bytes', bytes })
         }
       } else if (msg.t === 'files:resumed') {
-        // rc.19: agent Ã¢ÂÂ browser reply confirming the byte offset
+        // rc.19: agent → browser reply confirming the byte offset
         // from which to re-pump. Routed via pendingResumePromises
-        // (NOT filesRegistry) Ã¢ÂÂ the entry is currently in
+        // (NOT filesRegistry) — the entry is currently in
         // 'pending-resume' state and we hand control back to the
         // resume wrapper via this waiter.
         const waiter = pendingResumePromises.get(id)
@@ -10748,11 +10748,11 @@ export function useRemoteControl(
     // entries are deferred to 'pending-resume' state so the
     // `uploadOneResumable` wrapper can issue `files:resume` after
     // the WebRTC peer reconnects (handled by `scheduleReconnect`).
-    // Downloads still fail-fast Ã¢ÂÂ host Ã¢ÂÂ browser resume is future
+    // Downloads still fail-fast — host → browser resume is future
     // work.
     channels.files.onclose = () => {
       activeDownloadId = null
-      // Reject any in-flight resume handshakes Ã¢ÂÂ the new DC will
+      // Reject any in-flight resume handshakes — the new DC will
       // get a fresh waiter.
       for (const [id, w] of Array.from(pendingResumePromises.entries())) {
         clearTimeout(w.timer)
@@ -10764,7 +10764,7 @@ export function useRemoteControl(
         const entry = filesRegistry.get(id)
         if (!entry || entry.status === 'settled') continue
         if (entry.kind === 'upload' && supportsResume.value) {
-          // Defer settle Ã¢ÂÂ the uploadOneResumable wrapper is awaiting
+          // Defer settle — the uploadOneResumable wrapper is awaiting
           // the next `phase === 'connected'` and will issue
           // `files:resume`. Transition to 'pending-resume' so a
           // late files:complete on a stale DC can't double-settle.
@@ -10794,8 +10794,8 @@ export function useRemoteControl(
     // are keyed by the req_id we stamp on outbound `clipboard:read`
     // messages so interleaved reads resolve independently.
     const pendingClipboardReadChunks = new Map<number, string>()
-    // v2 Ã¢ÂÂ chunked change-event reassembly (keyed by event_id) and the
-    // inbound agentÃ¢ÂÂbrowser rich stream (image OR html Ã¢ÂÂ one at a
+    // v2 — chunked change-event reassembly (keyed by event_id) and the
+    // inbound agent→browser rich stream (image OR html — one at a
     // time; the agent serializes them). A 15 s inactivity timer drops
     // half streams.
     const pendingClipboardEventChunks = new Map<string, string>()
@@ -10827,7 +10827,7 @@ export function useRemoteControl(
       }, 15_000)
     }
     /** Resolve a completed rich stream: answer to a rich read (req_id)
-     *  or unsolicited change event Ã¢ÂÂ apply locally. */
+     *  or unsolicited change event → apply locally. */
     const finishInboundClipRich = (content: RemoteClipContent, reqId: number | null) => {
       if (reqId != null && content.kind !== 'text') {
         const rich = pendingClipboardRichReads.get(reqId)
@@ -10846,7 +10846,7 @@ export function useRemoteControl(
     }
     channels.clipboard.onmessage = (ev) => {
       if (typeof ev.data !== 'string') {
-        // v2 Ã¢ÂÂ binary frame for the announced inbound rich stream.
+        // v2 — binary frame for the announced inbound rich stream.
         if (!inboundClipRich) return
         const data = ev.data as ArrayBuffer | Blob
         const size = data instanceof Blob ? data.size : data.byteLength
@@ -11012,7 +11012,7 @@ export function useRemoteControl(
           const blob = new Blob(rich.chunks, { type: 'image/png' })
           finishInboundClipRich({ kind: 'image', blob, w: rich.w, h: rich.h }, rich.reqId)
         } else if (rich.kind === 'html') {
-          // html Ã¢ÂÂ decode the combined bytes and split at the declared
+          // html — decode the combined bytes and split at the declared
           // html length (both halves are UTF-8 strings).
           void new Blob(rich.chunks).arrayBuffer().then((buf) => {
             const bytes = new Uint8Array(buf)
@@ -11022,7 +11022,7 @@ export function useRemoteControl(
             finishInboundClipRich({ kind: 'html', html, text }, rich.reqId)
           })
         } else {
-          // native Ã¢ÂÂ split rtf ++ html ++ text at the declared lengths
+          // native — split rtf ++ html ++ text at the declared lengths
           // (rtf is raw bytes; html/text are UTF-8 strings).
           void new Blob(rich.chunks).arrayBuffer().then((buf) => {
             const bytes = new Uint8Array(buf) as Uint8Array<ArrayBuffer>
@@ -11045,7 +11045,7 @@ export function useRemoteControl(
         pendingClipboardReadChunks.delete(reqId)
         pending.resolve(typeof msg.text === 'string' ? msg.text : '')
       } else if (msg.t === 'clipboard:content-chunk') {
-        // rc.44 Ã¢ÂÂ chunked read reply. The agent splits long clipboard
+        // rc.44 — chunked read reply. The agent splits long clipboard
         // text into multiple envelopes, each carrying the same
         // `req_id`. Accumulate by req_id; resolve on `last: true`.
         const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
@@ -11056,8 +11056,8 @@ export function useRemoteControl(
         const acc = (pendingClipboardReadChunks.get(reqId) ?? '') + chunk
         // Defensive cap: don't let a buggy / malicious agent OOM us
         // by streaming endless chunks. The .length here is UTF-16
-        // code-unit count, which is Ã¢ÂÂ¤ the UTF-8 byte length for any
-        // input Ã¢ÂÂ so capping at CLIPBOARD_MAX_BYTES is conservative.
+        // code-unit count, which is ≤ the UTF-8 byte length for any
+        // input — so capping at CLIPBOARD_MAX_BYTES is conservative.
         if (acc.length > CLIPBOARD_MAX_BYTES) {
           clearTimeout(pending.timer)
           pendingClipboardReads.delete(reqId)
@@ -11075,7 +11075,7 @@ export function useRemoteControl(
           pending.resolve(acc)
         }
       } else if (msg.t === 'clipboard:error') {
-        // v2 Ã¢ÂÂ a failed id-stamped write settles its ack waiter (the
+        // v2 — a failed id-stamped write settles its ack waiter (the
         // deferred Ctrl+V flushes; pasting the old content beats
         // hanging the keystroke on a write that will never land).
         settleClipboardAck(msg.id)
@@ -11160,7 +11160,7 @@ export function useRemoteControl(
     }
 
     // Re-send the restored quality preference as soon as the control
-    // channel opens Ã¢ÂÂ otherwise the agent would stay at its default
+    // channel opens — otherwise the agent would stay at its default
     // after a page reload that had set a non-default preference.
     channels.control.onopen = () => {
       sendQualityPreference()
@@ -11169,7 +11169,7 @@ export function useRemoteControl(
       // channel opened (the per-connect re-send of the stored preference).
       const dm = heldDisplayMatch.take()
       if (dm) sendDisplayMatch(dm.value)
-      // rc.199 Ã¢ÂÂ re-emit the stored Priority dial so a reloaded session
+      // rc.199 — re-emit the stored Priority dial so a reloaded session
       // restores the operator's sharpness/smoothness choice without a click.
       sendPriorityPreference()
       // FR-119 P1 — re-ask for the stored frame rate (agents with fps-high only).
@@ -11180,19 +11180,19 @@ export function useRemoteControl(
     // The control DC closing while the session still reports
     // 'connected' means the transport died under us (SCTP teardown
     // races pc.connectionState by seconds in Chrome). Every other
-    // exit path Ã¢ÂÂ disconnect(), failWith(), scheduleReconnect() Ã¢ÂÂ
+    // exit path — disconnect(), failWith(), scheduleReconnect() —
     // moves `phase` off 'connected' BEFORE teardown closes the
     // channels, so this only fires on genuine mid-session death.
     channels.control.onclose = () => {
       if (phase.value === 'connected') {
-        console.warn('[rc] control channel closed mid-session Ã¢ÂÂ re-creating session')
+        console.warn('[rc] control channel closed mid-session — re-creating session')
         scheduleReconnect()
       }
     }
-    // Agent Ã¢ÂÂ browser control messages. Recognised:
-    //   - `rc:host_locked` (boolean) Ã¢ÂÂ the agent flips this on/off
+    // Agent → browser control messages. Recognised:
+    //   - `rc:host_locked` (boolean) — the agent flips this on/off
     //     as `lock_state.rs` observes desktop transitions (0.2.3+).
-    //   - `rc:desktop_changed` (string name) Ã¢ÂÂ the SYSTEM-context
+    //   - `rc:desktop_changed` (string name) — the SYSTEM-context
     //     worker emits this after every `try_change_desktop`
     //     Switched, so the viewer shows e.g. "On Winlogon" while
     //     the operator drives the lock screen (0.3.0+).
@@ -11204,7 +11204,7 @@ export function useRemoteControl(
     // must not end the session a redial opened since.
     const controlPc = pc
     channels.control.onmessage = (ev) => {
-      // rc.23 hotfix Ã¢ÂÂ trace every inbound control envelope to the
+      // rc.23 hotfix — trace every inbound control envelope to the
       // browser console so the field can see, via DevTools, exactly
       // which messages the agent is sending. Helps diagnose
       // "rc:logs-fetch.reply never arrived" reports without requiring
@@ -11212,7 +11212,7 @@ export function useRemoteControl(
       // working). Truncated to first 200 chars so a huge logs
       // payload doesn't blow up the console.
       //
-      // Uses `console.log` (not debug) intentionally Ã¢ÂÂ Chrome
+      // Uses `console.log` (not debug) intentionally — Chrome
       // DevTools' default level filter hides `debug` and the field
       // report 2026-05-13 was "no console logs at all" because of
       // that filter, not because the messages were absent.
@@ -11220,7 +11220,7 @@ export function useRemoteControl(
         // eslint-disable-next-line no-console
         console.log(
           '[rc:control] inbound:',
-          ev.data.length > 200 ? ev.data.slice(0, 200) + 'Ã¢ÂÂ¦' : ev.data
+          ev.data.length > 200 ? ev.data.slice(0, 200) + '…' : ev.data
         )
       }
       const parsed = parseControlInbound(ev.data)
@@ -11237,8 +11237,8 @@ export function useRemoteControl(
       } else if (parsed?.kind === 'desktop_changed') {
         currentDesktop.value = parsed.name
       } else if (parsed?.kind === 'layout') {
-        // rc.227 Ã¢ÂÂ keyboard-layout snapshot; drives the toolbar chip
-        // + the Settings picker. Old agents never send it Ã¢ÂÂ the ref
+        // rc.227 — keyboard-layout snapshot; drives the toolbar chip
+        // + the Settings picker. Old agents never send it → the ref
         // stays null and the UI self-hides.
         remoteLayout.value = {
           activeHkl: parsed.activeHkl,
@@ -11246,7 +11246,7 @@ export function useRemoteControl(
           installed: parsed.installed,
         }
       } else if (parsed?.kind === 'video_info') {
-        // rc.87 Ã¢ÂÂ the agent told us its real encoder. Drives the
+        // rc.87 — the agent told us its real encoder. Drives the
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
         videoInfo.value = parsed.info
         console.info('[rc] video-info', parsed.info)
@@ -11394,11 +11394,11 @@ export function useRemoteControl(
     // support keeps the UX boring rather than broken.
     sessionDcTransport = null
     let preferredTransport: RcVideoTransport | null = null
-    // rc.186 Ã¢ÂÂ set to 'yuv420' when we fall back from software-HEVC to VP9
+    // rc.186 — set to 'yuv420' when we fall back from software-HEVC to VP9
     // so the fallback lands on VP9 profile 0 (hardware-decoded), overriding
     // the user's chroma choice for the fallback session only.
     let chromaOverride: string | null = null
-    // P2 Ã¢ÂÂ the avc1 codec string the H.264-DC worker should configure with
+    // P2 — the avc1 codec string the H.264-DC worker should configure with
     // (probe-ladder result); null when H.264-DC isn't in play.
     let h264DcCodec: string | null = null
     // P7 — true when the hevc-444 pick passed BOTH Rext gates (browser
@@ -11431,7 +11431,7 @@ export function useRemoteControl(
       )
     }
     if (sessionTransport === 'auto') {
-      // rc.190 (A3) Ã¢ÂÂ HWÃÂHW auto-rank. A codec is only smooth when it's
+      // rc.190 (A3) — HW×HW auto-rank. A codec is only smooth when it's
       // hardware on BOTH ends (field: VP9 is SW-encoded on non-Intel
       // hosts; HEVC/AV1 can be SW-decoded on weak viewers). Cross the
       // agent's advertised encoders with this browser's MediaCapabilities
@@ -11483,7 +11483,7 @@ export function useRemoteControl(
         // when the RTP track has no H.264 for it.
         viewerVp9_420Decodable: vp9Dec420 && !failedDcTransports.has('data-channel-vp9-444'),
         viewerRtpH264: allBrowserCaps.length === 0 || allBrowserCaps.includes('h264'),
-        // P2Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
+        // P2— H.264-DC needs both the HW-smooth verdict AND an accepted
         // Annex-B avc1 config (the worker configures with the latter).
         viewerH264Hw: h264Hw && h264Codec !== null
           && !failedDcTransports.has('data-channel-h264'),
@@ -11519,14 +11519,14 @@ export function useRemoteControl(
               : pick.transport === 'data-channel-h264'
                 ? (h264_444Pick ? false : h264Hw)
                 : null
-      console.info(`[rc] auto transport Ã¢ÂÂ ${pick.transport ?? 'webrtc'} (${pick.reason})`)
+      console.info(`[rc] auto transport → ${pick.transport ?? 'webrtc'} (${pick.reason})`)
     } else if (sessionTransport === 'data-channel-h264') {
-      // P2 Ã¢ÂÂ explicit H.264 pick. Prefer the DC + WebCodecs pipeline when
+      // P2 — explicit H.264 pick. Prefer the DC + WebCodecs pipeline when
       // BOTH ends support it: the agent must advertise the transport (old
-      // agents don't Ã¢ÂÂ the legacy RTP track + <video> is exactly what they
+      // agents don't → the legacy RTP track + <video> is exactly what they
       // will send), and this browser must accept a description-less
       // Annex-B avc1 config (probe ladder). On either miss we stay on the
-      // RTP path silently Ã¢ÂÂ same behaviour as before P2.
+      // RTP path silently — same behaviour as before P2.
       const h264Caps = agent?.value?.capabilities
       const agentHasH264Dc = (h264Caps?.transports ?? []).includes('data-channel-h264')
       const codec = agentHasH264Dc ? await probeH264Dc() : null
@@ -11561,17 +11561,17 @@ export function useRemoteControl(
         }
       } else if (failedDcTransports.has('data-channel-h264')) {
         console.info(
-          '[rc] data-channel-h264 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
+          '[rc] data-channel-h264 dropped — its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
         )
       } else {
         console.info(
           agentHasH264Dc
-            ? '[rc] data-channel-h264 dropped Ã¢ÂÂ WebCodecs Annex-B avc1 decode unsupported here. Falling back to the RTP track.'
-            : '[rc] data-channel-h264 not advertised by this agent Ã¢ÂÂ using the legacy RTP track.',
+            ? '[rc] data-channel-h264 dropped — WebCodecs Annex-B avc1 decode unsupported here. Falling back to the RTP track.'
+            : '[rc] data-channel-h264 not advertised by this agent — using the legacy RTP track.',
         )
       }
     } else if (sessionTransport === 'data-channel-av1') {
-      // rc.190 Ã¢ÂÂ explicit AV1 pick. Chromium always has dav1d SW decode,
+      // rc.190 — explicit AV1 pick. Chromium always has dav1d SW decode,
       // so gate only on decodability; the badge surfaces HW vs SW truth.
       const decodable = av1Supported.value || (await probeAv1Dec())
       av1Supported.value = decodable
@@ -11580,11 +11580,11 @@ export function useRemoteControl(
         viewerDecodeHw.value = await isAv1HwDecodeSupported()
       } else if (failedDcTransports.has('data-channel-av1')) {
         console.info(
-          '[rc] data-channel-av1 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to webrtc.',
+          '[rc] data-channel-av1 dropped — its decoder failed on real bytes earlier this page. Falling back to webrtc.',
         )
       } else {
         console.info(
-          '[rc] preferred_transport=data-channel-av1 dropped Ã¢ÂÂ WebCodecs AV1 decode unsupported here. Falling back to webrtc.',
+          '[rc] preferred_transport=data-channel-av1 dropped — WebCodecs AV1 decode unsupported here. Falling back to webrtc.',
         )
       }
     } else if (sessionTransport === 'data-channel-vp9-444') {
@@ -11610,22 +11610,22 @@ export function useRemoteControl(
         }
       } else if (failedDcTransports.has('data-channel-vp9-444')) {
         console.info(
-          '[rc] data-channel-vp9-444 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to webrtc.',
+          '[rc] data-channel-vp9-444 dropped — its decoder failed on real bytes earlier this page. Falling back to webrtc.',
         )
       } else {
         console.info(
-          '[rc] preferred_transport=data-channel-vp9-444 dropped Ã¢ÂÂ VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
+          '[rc] preferred_transport=data-channel-vp9-444 dropped — VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
         )
       }
     } else if (sessionTransport === 'data-channel-hevc') {
-      // rc.78 Ã¢ÂÂ HEVC over DataChannel (Option B). rc.186 Ã¢ÂÂ require
+      // rc.78 — HEVC over DataChannel (Option B). rc.186 — require
       // HARDWARE + real-time-smooth decode, not just "decodable":
       // `isConfigSupported` returns true even for software / too-slow HEVC,
       // and a weak iGPU then hangs at 1080p+/40fps (field: Iris Xe backs up
-      // Ã¢ÂÂ keyframe spiral Ã¢ÂÂ 1-2 s hang, while VP9 4:2:0 is smooth on the
+      // → keyframe spiral → 1-2 s hang, while VP9 4:2:0 is smooth on the
       // same device). `isHevcHwDecodeSupported()` gates on MediaCapabilities
       // `smooth` + `powerEfficient`. On failure we fall back to VP9 4:2:0
-      // (profile 0 = universal fixed-function HW decode) Ã¢ÂÂ NOT VP9-444
+      // (profile 0 = universal fixed-function HW decode) — NOT VP9-444
       // (profile 1), which is ALSO software-decoded and would hang too.
       const decodable = hevcSupported.value || (await probeHevcDec())
       hevcSupported.value = decodable
@@ -11673,8 +11673,8 @@ export function useRemoteControl(
         if (fallback) {
           console.info(
             decodable
-              ? '[rc] data-channel-hevc dropped Ã¢ÂÂ HEVC decode is software / not real-time-smooth here (MediaCapabilities.smooth/powerEfficient). Falling back to VP9 4:2:0 (hardware).'
-              : '[rc] data-channel-hevc dropped Ã¢ÂÂ HEVC decode unsupported. Falling back to VP9 4:2:0.',
+              ? '[rc] data-channel-hevc dropped — HEVC decode is software / not real-time-smooth here (MediaCapabilities.smooth/powerEfficient). Falling back to VP9 4:2:0 (hardware).'
+              : '[rc] data-channel-hevc dropped — HEVC decode unsupported. Falling back to VP9 4:2:0.',
           )
           preferredTransport = 'data-channel-vp9-444'
           // Force 4:2:0 (VP9 profile 0, hardware-decoded); 4:4:4 (profile 1)
@@ -11850,11 +11850,11 @@ export function useRemoteControl(
             : 'yuv420'
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
-      // rc.62 Ã¢ÂÂ chroma_pref is only meaningful on the
-      // data-channel-vp9-444 transport (rc.190 narrowed the send to it Ã¢ÂÂ
+      // rc.62 — chroma_pref is only meaningful on the
+      // data-channel-vp9-444 transport (rc.190 narrowed the send to it —
       // HEVC/AV1 sessions are 4:2:0 by construction and ignore it). Omit
       // when the user picks `'auto'` (= let agent decide via its env
-      // var). rc.186 Ã¢ÂÂ a `chromaOverride` (from the software-HEVC Ã¢ÂÂ VP9
+      // var). rc.186 — a `chromaOverride` (from the software-HEVC → VP9
       // 4:2:0 fallback OR the rc.190 auto-rank) wins unconditionally so
       // the pick lands on the hardware-decoded profile 0 even if the
       // user left chroma on 'auto' or '4:4:4'.
@@ -11885,12 +11885,12 @@ export function useRemoteControl(
         requestPayload.chunk_framing = true
       }
     }
-    // Opt-in host audio Ã¢ÂÂ `audio_enabled: true` (omitted when off so
+    // Opt-in host audio → `audio_enabled: true` (omitted when off so
     // pre-audio agents/servers keep the silent-by-default behaviour via
     // `#[serde(default)]`). Field name locked by a unit test on
     // `audioRequestFields`.
     Object.assign(requestPayload, audioRequestFields(audioEnabled.value))
-    // Phase 5 Ã¢ÂÂ admin break-glass. A non-empty reason asks the server to skip
+    // Phase 5 — admin break-glass. A non-empty reason asks the server to skip
     // consent; it's honoured ONLY if the server validates the caller as an
     // ADMINISTRATOR who isn't the owner (a non-admin's value is ignored). One-
     // shot: cleared after send so a later normal Connect isn't a silent force.
@@ -11984,7 +11984,7 @@ export function useRemoteControl(
     // but a view that unmounts with no attempt live never armed one; this
     // is the belt for the DC-never-opened class below.
     disarmVisibilityTiming()
-    // Defensive Ã¢ÂÂ disconnect() closes the DC which stops the triggers
+    // Defensive — disconnect() closes the DC which stops the triggers
     // via onclose, but a DC that never opened has no onclose to fire.
     stopClipboardSyncTriggers()
   })
@@ -11992,15 +11992,15 @@ export function useRemoteControl(
   /**
    * Attach mouse/keyboard/wheel listeners to a surface element (typically
    * the video container). Coordinates sent to the agent are normalised in
-   * `[0,1]` per the architecture doc ÃÂ§6, so the agent can resolve them
+   * `[0,1]` per the architecture doc §6, so the agent can resolve them
    * against its current resolution.
    *
    * `options.onFilesPasted` is called when the operator hits Ctrl+V over
    * the viewer with files in their OS clipboard. The composable defers
    * the Ctrl+V keystroke until the `paste` event fires (a fraction of a
-   * millisecond later) and decides: files Ã¢ÂÂ call onFilesPasted, no
-   * keystroke forwarded; text Ã¢ÂÂ mirror to host clipboard via existing
-   * `setAgentClipboard` + emit deferred Ctrl+V; empty Ã¢ÂÂ emit deferred
+   * millisecond later) and decides: files → call onFilesPasted, no
+   * keystroke forwarded; text → mirror to host clipboard via existing
+   * `setAgentClipboard` + emit deferred Ctrl+V; empty → emit deferred
    * Ctrl+V as a fallback.
    *
    * Returns a detach function the caller should invoke before unmounting.
@@ -12019,8 +12019,8 @@ export function useRemoteControl(
        *  activation `@click` and navigated away. */
       focusAnchor?: HTMLElement
       /** Called after a Ctrl+C-over-viewer auto-mirror attempt.
-       *  `ok === true`  Ã¢ÂÂ text written to `navigator.clipboard` OK.
-       *  `ok === false` Ã¢ÂÂ browser refused `writeText` (no permission /
+       *  `ok === true`  → text written to `navigator.clipboard` OK.
+       *  `ok === false` → browser refused `writeText` (no permission /
        *  no user-gesture chain); caller shows a snackbar with the
        *  text + a manual Copy button so the operator can still get
        *  the content. */
@@ -12056,21 +12056,21 @@ export function useRemoteControl(
 
     /**
      * Returns [0,1]-normalised coordinates relative to the *visible video
-     * content* Ã¢ÂÂ not the outer .video-frame. The `<video>` uses
+     * content* — not the outer .video-frame. The `<video>` uses
      * `object-fit: contain`, which letterboxes the stream when the display
      * aspect ratio differs from the source (e.g. 2560x1600 viewport showing
      * a 3840x2160 agent). Without this correction, clicks land at the wrong
      * pixel on the remote, and clicks in the letterbox bars get clamped to
      * the edge instead of being ignored.
      */
-    // rc.57 Ã¢ÂÂ mouse-offset diagnostic counter. Logs the first 50
+    // rc.57 — mouse-offset diagnostic counter. Logs the first 50
     // pointer-derived normalisation calls of THIS session at INFO
     // level so we can verify that the browser-side intrinsic dims
     // (videoElement.videoWidth/Height after the agent's auto-downscale
     // rebuild) match what the agent expects. The Crystal-Clear-OFF
     // H.264 path on WINHOST-A still mis-positions and we suspect a
-    // race between the SDP-advertised native dims (1920ÃÂ1200) and
-    // the actual first frame (1280ÃÂ800 post-downscale) Ã¢ÂÂ this log
+    // race between the SDP-advertised native dims (1920×1200) and
+    // the actual first frame (1280×800 post-downscale) — this log
     // captures intrinsicW/H + renderRect + computed norm so a single
     // session reproduces the bug AND surfaces the root cause.
     //
@@ -12110,7 +12110,7 @@ export function useRemoteControl(
         ? mediaIntrinsicH.value
         : (video?.videoHeight ?? 0)
       // In `original` / `custom` scale modes the surface element is
-      // sized to its own intrinsic pixels (ÃÂ custom scale) Ã¢ÂÂ there's
+      // sized to its own intrinsic pixels (× custom scale) — there's
       // no letterboxing inside it, so map directly against its
       // bounding rect. In `adaptive` mode the element fills the stage
       // and `object-fit: contain` letterboxes internally, so we need
@@ -12146,17 +12146,17 @@ export function useRemoteControl(
         path = 'letterbox'
       }
 
-      // rc.57 Ã¢ÂÂ diagnostic dump (first 50 events of this session). Search
+      // rc.57 — diagnostic dump (first 50 events of this session). Search
       // browser console for `[rc] mouse-offset diag` to triage misposition
       // reports. Compare `intrinsicW/H` against the agent log's reported
       // capture width/height; mismatch identifies the auto-downscale race.
       if (mouseOffsetDiagCount < MOUSE_OFFSET_DIAG_LIMIT) {
         const seq = mouseOffsetDiagCount++
-        // rc.101 Ã¢ÂÂ log the canvas's ACTUAL rendered rect. `renderRect` is
+        // rc.101 — log the canvas's ACTUAL rendered rect. `renderRect` is
         // only computed in the direct (non-letterbox) path; in adaptive
         // letterbox mode it's null. If `canvasRectW/H` reads the backing-
-        // store size (e.g. 2560ÃÂ1600) instead of the frame size, the canvas
-        // isn't constrained to its container Ã¢ÂÂ CSS sizing bug (the rc.101
+        // store size (e.g. 2560×1600) instead of the frame size, the canvas
+        // isn't constrained to its container → CSS sizing bug (the rc.101
         // overflow symptom on NEO16). When constrained it should equal the
         // frame box (object-fit letterboxes the bitmap inside it).
         const elRect = renderEl?.getBoundingClientRect() ?? null
@@ -12404,25 +12404,25 @@ export function useRemoteControl(
              defence-in-depth */
         }
       } else if (document.activeElement instanceof HTMLElement) {
-        // No anchor given by caller Ã¢ÂÂ just blur. Active element ends
+        // No anchor given by caller — just blur. Active element ends
         // up on <body>; harmless.
         document.activeElement.blur()
       }
     }
     function onPointerLeave() { pointerInside = false }
 
-    // Phase 5 (file-DC v2) Ã¢ÂÂ deferred Ctrl+V over viewer.
+    // Phase 5 (file-DC v2) — deferred Ctrl+V over viewer.
     //
     // When the operator hits Ctrl+V with the pointer over the viewer,
     // we don't immediately forward the keystroke. The browser fires
     // a `paste` event microseconds later; we use that to decide:
-    //   - Files in clipboard  Ã¢ÂÂ upload them; the remote app does
+    //   - Files in clipboard  → upload them; the remote app does
     //     NOT receive a Ctrl+V keystroke (that wasn't the operator's
-    //     intent Ã¢ÂÂ they meant "upload these files").
-    //   - Text in clipboard   Ã¢ÂÂ mirror to the host clipboard via
+    //     intent — they meant "upload these files").
+    //   - Text in clipboard   → mirror to the host clipboard via
     //     the existing `clipboard:write` + emit the deferred Ctrl+V
     //     so the remote app's paste sees the right text.
-    //   - Empty clipboard     Ã¢ÂÂ emit the deferred Ctrl+V as a normal
+    //   - Empty clipboard     → emit the deferred Ctrl+V as a normal
     //     keystroke (operator intent unclear; preserve current
     //     behaviour).
     //
@@ -12730,10 +12730,10 @@ export function useRemoteControl(
      *  `writeText` is refused by the browser's user-gesture policy)
      *  the caller's `onClipboardMirrored(text, false)` fires so the
      *  parent component can surface a snackbar with a manual Copy
-     *  button Ã¢ÂÂ keeps the operator's intent reachable.
+     *  button — keeps the operator's intent reachable.
      */
     function scheduleClipboardMirror() {
-      // v2 Ã¢ÂÂ when change events are flowing, the agent pushes the
+      // v2 — when change events are flowing, the agent pushes the
       // fresh copy the instant its clipboard changes; the delayed
       // read-back mirror is redundant (and its writeText would fight
       // the event's own apply).
@@ -12747,7 +12747,7 @@ export function useRemoteControl(
       const delayMs = 25
       setTimeout(() => {
         // Fire-and-forget. We deliberately don't await in the
-        // keydown handler Ã¢ÂÂ the host needs to process Ctrl+C before
+        // keydown handler — the host needs to process Ctrl+C before
         // its clipboard reflects the copy.
         getAgentClipboard()
           .then(async (text: string) => {
@@ -12765,7 +12765,7 @@ export function useRemoteControl(
             options?.onClipboardMirrored?.(text, ok)
           })
           .catch(() => {
-            // Agent didn't respond, DC closed, etc. Ã¢ÂÂ silent drop;
+            // Agent didn't respond, DC closed, etc. — silent drop;
             // the operator's local clipboard stays unchanged, same
             // as pre-rc.18 behaviour.
           })
@@ -12860,7 +12860,7 @@ export function useRemoteControl(
       // formats so the remote app pastes formatting (tables, bold, web
       // images), ack-gated like text.
       const { text, html } = route
-      // v2.2 Ã¢ÂÂ full fidelity via the local bridge: read the machine's
+      // v2.2 — full fidelity via the local bridge: read the machine's
       // RTF (embedded images the paste event can't carry) and ship it,
       // ack-gated. Only when both ends support native AND a local
       // bridge is present; else fall through to html/text.
@@ -12895,7 +12895,7 @@ export function useRemoteControl(
                 sent = true
               }
             }
-            // Bridge had no RTF / oversized / failed Ã¢ÂÂ html fallback
+            // Bridge had no RTF / oversized / failed → html fallback
             // (still ack-gated) so the paste isn't downgraded to text.
             if (!sent && supportsClipboardHtml.value) {
               const built = buildClipboardHtmlFrames(html, text)
@@ -12946,7 +12946,7 @@ export function useRemoteControl(
             })()
             return
           }
-          // Oversized html Ã¢ÂÂ fall through to the plain-text path.
+          // Oversized html → fall through to the plain-text path.
         }
       }
       if (text) {
@@ -12966,8 +12966,8 @@ export function useRemoteControl(
             return
           }
           try {
-            // rc.44 Ã¢ÂÂ `sendClipboardWriteOverDc` picks the legacy
-            // single-envelope shape for Ã¢ÂÂ¤12 KB texts (back-compat
+            // rc.44 — `sendClipboardWriteOverDc` picks the legacy
+            // single-envelope shape for ≤12 KB texts (back-compat
             // with older agents) or splits into `clipboard:write-chunk`
             // envelopes for larger texts to stay under the SCTP
             // `max_message_size` ceiling.
@@ -12975,11 +12975,11 @@ export function useRemoteControl(
             clipboardEchoGate.recordPushed(hash)
             trackClipboardWrite(hash, id)
             if (supportsClipboardAck.value) {
-              // v2 Ã¢ÂÂ flush the deferred keystroke only after the agent
+              // v2 — flush the deferred keystroke only after the agent
               // confirms the OS clipboard write. Without this gate the
               // keystroke (unordered input DC) routinely beat the
               // write (ordered clipboard DC + worker-thread hop) and
-              // the remote app pasted the STALE clipboard Ã¢ÂÂ the field
+              // the remote app pasted the STALE clipboard — the field
               // -reported multiline corruption. The 50 ms empty-
               // clipboard timer must not fire in between: the ack
               // path owns the flush now.
@@ -12993,7 +12993,7 @@ export function useRemoteControl(
               return
             }
           } catch {
-            /* dropped Ã¢ÂÂ host clipboard stays unchanged but we still
+            /* dropped — host clipboard stays unchanged but we still
                forward the keystroke; remote app pastes whatever was
                there before. */
           }
@@ -13057,7 +13057,7 @@ export function useRemoteControl(
     surface.addEventListener('pointerleave', onPointerLeave)
     surface.addEventListener('wheel', onWheel, { passive: false })
     surface.addEventListener('contextmenu', onContextMenu)
-    // Paste handler must be on `window` (or a focusable surface) Ã¢ÂÂ
+    // Paste handler must be on `window` (or a focusable surface) —
     // attaching to `surface` only fires when surface itself is the
     // event target, which doesn't happen for keyboard-driven paste.
     // Window-level listener with our own pendingCtrlV gating means
@@ -13123,7 +13123,7 @@ export function useRemoteControl(
       relativeAutoSuppressed = false
       swallowedButton = null
       if (relativeSurface === surface) relativeSurface = null
-      // Same `capture: true` as the add Ã¢ÂÂ required for matching.
+      // Same `capture: true` as the add — required for matching.
       window.removeEventListener('keydown', onKeyDown, { capture: true })
       window.removeEventListener('keyup', onKeyUp, { capture: true })
       // Drop any in-flight deferral; otherwise its 50 ms timer would
@@ -13141,7 +13141,7 @@ export function useRemoteControl(
   }
 
   /** Send the browser's clipboard text to the agent's OS clipboard.
-   *  Fire-and-forget. Requires user gesture Ã¢ÂÂ `navigator.clipboard.
+   *  Fire-and-forget. Requires user gesture — `navigator.clipboard.
    *  readText()` throws in non-gesture contexts. Call from a button
    *  click handler. Resolves to `true` on best-effort send, `false`
    *  if the clipboard DC isn't open or reading the browser clipboard
@@ -13156,10 +13156,10 @@ export function useRemoteControl(
       return false
     }
     try {
-      // rc.44 Ã¢ÂÂ chunks large payloads to avoid SCTP `ErrChunk`.
+      // rc.44 — chunks large payloads to avoid SCTP `ErrChunk`.
       const { id } = sendClipboardWriteOverDc(ch, text)
       clipboardEchoGate.recordPushed(hashClipboardText(text))
-      // v2 Ã¢ÂÂ wait for the agent's write-ack so the button's success
+      // v2 — wait for the agent's write-ack so the button's success
       // toast reflects the OS clipboard actually being written (1 s
       // timeout fallback keeps old agents on the fire-and-forget
       // semantics).
@@ -13202,7 +13202,7 @@ export function useRemoteControl(
     })
   }
 
-  /** v2 Ã¢ÂÂ rich clipboard read: like [`getAgentClipboard`] but also
+  /** v2 — rich clipboard read: like [`getAgentClipboard`] but also
    *  accepts an IMAGE or HTML reply when the host clipboard holds one
    *  and the agent advertises the matching cap. Resolves with a tagged
    *  union; `{kind:'text', text:''}` means the host clipboard is
@@ -13275,7 +13275,7 @@ export function useRemoteControl(
    *  the SCTP buffer. Resolves with the final path + byte count
    *  reported by the agent. Rejects on agent error or DC close.
    *
-   *  Internal Ã¢ÂÂ the public surface is `uploadFiles(files)` (queue) and
+   *  Internal — the public surface is `uploadFiles(files)` (queue) and
    *  the back-compat `uploadFile(file)` shim. Reads agent replies via
    *  the persistent `files` DC listener registered at channel-create
    *  time (see `filesRegistry`). */
@@ -13299,7 +13299,7 @@ export function useRemoteControl(
   }
 
   /**
-   * Inner pump Ã¢ÂÂ sends raw chunks from `file.slice(startOffset)` over
+   * Inner pump — sends raw chunks from `file.slice(startOffset)` over
    * the LIVE `channels.files` DC (re-read every invocation, NOT
    * captured at construction). Throws a channel-closed sentinel when
    * the DC dies; caller handles retry via `uploadOneResumable`.
@@ -13315,10 +13315,10 @@ export function useRemoteControl(
     // `failed to handle_inbound: ErrChunk` warnings + silent drop on
     // the agent side. Sub-32-KiB files succeeded (single chunk fits
     // comfortably), 1 MiB files failed (16 chunks each at the
-    // boundary). Drop to 16 KiB Ã¢ÂÂ 4ÃÂ margin, well within both SCTP
+    // boundary). Drop to 16 KiB — 4× margin, well within both SCTP
     // implementations' guaranteed-unfragmented size + matches what
     // RustDesk + most browser-based file-transfer libraries use.
-    // The trade-off is ~3ÃÂ more send() calls per MB, but each
+    // The trade-off is ~3× more send() calls per MB, but each
     // call is sub-microsecond and the SCTP layer pipelines them.
     const CHUNK = 16 * 1024
     let offset = startOffset
@@ -13350,7 +13350,7 @@ export function useRemoteControl(
       const end = Math.min(offset + CHUNK, file.size)
       const slice = file.slice(offset, end)
       const buf = await slice.arrayBuffer()
-      // Re-read after the await Ã¢ÂÂ readyState can flip during the
+      // Re-read after the await — readyState can flip during the
       // ArrayBuffer materialisation.
       const ch2 = channels.files
       if (!ch2 || ch2.readyState !== 'open') {
@@ -13388,11 +13388,11 @@ export function useRemoteControl(
    */
   function waitForConnected(timeoutMs: number = 30_000): Promise<boolean> {
     if (phase.value === 'connected') return Promise.resolve(true)
-    // rc.23 Ã¢ÂÂ pass `Number.POSITIVE_INFINITY` to wait indefinitely
+    // rc.23 — pass `Number.POSITIVE_INFINITY` to wait indefinitely
     // for the next 'connected' transition. `setTimeout(fn, Infinity)`
     // is implementation-defined (most engines clamp to ~2^31-1 ms
-    // Ã¢ÂÂ 25 days) so we just skip the timer instead. The settle path
-    // is the phase watcher below Ã¢ÂÂ phases 'closed' / 'error' / 'idle'
+    // ≈ 25 days) so we just skip the timer instead. The settle path
+    // is the phase watcher below — phases 'closed' / 'error' / 'idle'
     // still resolve false so the caller can detect operator-cancel.
     return new Promise((resolve) => {
       const wantTimer = Number.isFinite(timeoutMs)
@@ -13421,18 +13421,18 @@ export function useRemoteControl(
   }
 
   /**
-   * rc.23 hotfix Ã¢ÂÂ wait for `channels.files` to be open. Necessary
+   * rc.23 hotfix — wait for `channels.files` to be open. Necessary
    * companion to {@link waitForConnected} for the resume loop:
    * `phase = 'connected'` only means the WebRTC PeerConnection is
    * up, not that the file DC has re-opened. When the agent drops
    * the file DC mid-transfer but keeps the peer alive (some failure
    * modes do this), `runOnce` throws "channel closed" synchronously,
    * `waitForConnected` returns true immediately, the loop re-enters,
-   * throws again Ã¢ÂÂ tight async loop that burns CPU and freezes the
+   * throws again — tight async loop that burns CPU and freezes the
    * tab. Field repro on the field-test host 2026-05-12 (CV.pdf upload + rc.23
-   * web on rc.23 agent Ã¢ÂÂ tab had to be killed).
+   * web on rc.23 agent → tab had to be killed).
    *
-   * `pollIntervalMs` defaults to 250 Ã¢ÂÂ cheap; the DC opens once per
+   * `pollIntervalMs` defaults to 250 — cheap; the DC opens once per
    * resume cycle so we don't pay a steady cost. `timeoutMs` defaults
    * to `Number.POSITIVE_INFINITY` so the loop matches the parent
    * "DC always stays open" contract; finite caps are useful only
@@ -13524,7 +13524,7 @@ export function useRemoteControl(
         status: 'queued',
       })
 
-      // Local error Ã¢ÂÂ settle the registry entry ourselves and reject.
+      // Local error → settle the registry entry ourselves and reject.
       // (Agent-side errors arrive via the persistent listener.)
       const localFail = (err: Error) => {
         const settled = settleEntry(id)
@@ -13561,8 +13561,8 @@ export function useRemoteControl(
 
       // rc.19: send `files:resume { id, offset }` and await the
       // matching `files:resumed { id, accepted_offset }` (or
-      // `files:error` Ã¢ÂÂ reject the waiter, wrapper falls back to a
-      // fresh `files:begin` with a NEW id). 10 s timeout Ã¢ÂÂ way more
+      // `files:error` → reject the waiter, wrapper falls back to a
+      // fresh `files:begin` with a NEW id). 10 s timeout — way more
       // than the agent's local lookup + truncate + reopen.
       function sendResume(ch: RTCDataChannel, offset: number): Promise<number> {
         return new Promise<number>((resolveResume, rejectResume) => {
@@ -13594,11 +13594,11 @@ export function useRemoteControl(
         try {
           ch.send(JSON.stringify({ t: 'files:cancel', id }))
         } catch {
-          /* DC closed between check and send Ã¢ÂÂ agent's 24h sweep cleans the partial */
+          /* DC closed between check and send — agent's 24h sweep cleans the partial */
         }
       }
 
-      // rc.23 Ã¢ÂÂ infinite retry. The DC effectively stays "open" from
+      // rc.23 — infinite retry. The DC effectively stays "open" from
       // the operator's POV: every drop triggers a resume on the next
       // 'connected' transition; the loop only exits when the operator
       // cancels via Cancel button (which settles the registry entry)
@@ -13625,7 +13625,7 @@ export function useRemoteControl(
         }
 
         if (attempt === 0) {
-          // First attempt Ã¢ÂÂ fresh begin.
+          // First attempt — fresh begin.
           if (!sendBegin(ch)) return
           // Transition the entry back to 'pending' (it might have been
           // 'pending-resume' if this is a fresh-id fallback after a
@@ -13658,7 +13658,7 @@ export function useRemoteControl(
         while (attempt < MAX_ATTEMPTS) {
           try {
             await runOnce()
-            return // success Ã¢ÂÂ listener resolves via files:complete
+            return // success — listener resolves via files:complete
           } catch (err) {
             const e = filesRegistry.get(id)
             if (!e || e.status === 'settled') return // settled by listener
@@ -13667,10 +13667,10 @@ export function useRemoteControl(
               localFail(err instanceof Error ? err : new Error(String(err)))
               return
             }
-            // Channel closed mid-flight with resume cap Ã¢ÂÂ wait for
+            // Channel closed mid-flight with resume cap — wait for
             // reconnect and retry.
             patchTransfer(id, { t: 'reconnect', detail: `attempt ${attempt + 1}` })
-            // rc.23 Ã¢ÂÂ wait forever for the peer to come back. The
+            // rc.23 — wait forever for the peer to come back. The
             // resume loop is the operator's "DC stays open" promise;
             // legacy 30 s timeout could fire while the agent was
             // being installer-restarted by msiexec (5-90 s window
@@ -13679,12 +13679,12 @@ export function useRemoteControl(
             // operator-cancel path.
             const e2 = filesRegistry.get(id)
             if (!e2 || e2.status === 'settled') return
-            // rc.23 hotfix Ã¢ÂÂ bound the retry rate to prevent a tight
+            // rc.23 hotfix — bound the retry rate to prevent a tight
             // async loop when the file DC is closed but the peer is
             // still 'connected'. Without this delay, `runOnce` throws
             // "channel closed" synchronously, `waitForConnected`
             // returns true immediately (phase already 'connected'),
-            // we retry, throw again Ã¢ÂÂ thousands of iterations per
+            // we retry, throw again — thousands of iterations per
             // second pin a CPU core and freeze the browser tab. Field
             // repro on the field-test host 2026-05-12 (CV.pdf upload). Backstop
             // delay also gives the agent breathing room to reopen
@@ -13694,7 +13694,7 @@ export function useRemoteControl(
                 ? RC_RECONNECT_LADDER_MS[attempt]
                 : RC_RECONNECT_STEADY_MS
             await new Promise((r) => setTimeout(r, backoffMs))
-            // Re-check settled after the sleep Ã¢ÂÂ operator may have
+            // Re-check settled after the sleep — operator may have
             // cancelled while we were waiting.
             const e3 = filesRegistry.get(id)
             if (!e3 || e3.status === 'settled') return
@@ -13710,7 +13710,7 @@ export function useRemoteControl(
               localFail(new Error('reconnect wait returned without connecting (defensive)'))
               return
             }
-            // rc.23 hotfix Ã¢ÂÂ also wait for the file DC to re-open.
+            // rc.23 hotfix — also wait for the file DC to re-open.
             // `phase === 'connected'` is necessary but not sufficient:
             // if the agent dropped just the file DC, the peer never
             // transitions, and `runOnce` would throw on entry without
@@ -13724,7 +13724,7 @@ export function useRemoteControl(
             attempt += 1
           }
         }
-        // MAX_ATTEMPTS is Infinity in rc.23 Ã¢ÂÂ this is unreachable but
+        // MAX_ATTEMPTS is Infinity in rc.23 — this is unreachable but
         // kept as a defensive surface so a future regression flips
         // MAX_ATTEMPTS without leaving the loop able to silently exit.
         sendCancelBestEffort()
@@ -13749,7 +13749,7 @@ export function useRemoteControl(
     return upload
   }
 
-  /** Public single-file upload Ã¢ÂÂ back-compat shim retained so existing
+  /** Public single-file upload — back-compat shim retained so existing
    *  E2E tests + 0.2.x call sites keep working. New code should call
    *  `uploadFiles([file])` directly. */
   function uploadFile(file: File): Promise<{ path: string; bytes: number }> {
@@ -13757,7 +13757,7 @@ export function useRemoteControl(
   }
 
   // --------------------------------------------------------------
-  // Downloads (host Ã¢ÂÂ browser) Ã¢ÂÂ Phase 2 of file-DC v2.
+  // Downloads (host → browser) — Phase 2 of file-DC v2.
 
   // Hard cap on the Blob fallback path (no showSaveFilePicker) so a
   // misbehaving server can't OOM the tab by streaming gigabytes of
@@ -13871,7 +13871,7 @@ export function useRemoteControl(
     const fallbackName = suggestedName ?? path.split(/[\\/]/).pop() ?? 'download.bin'
 
     // Try to open showSaveFilePicker FIRST (before any await past the
-    // user gesture) Ã¢ÂÂ browsers require this. If unavailable, fall
+    // user gesture) — browsers require this. If unavailable, fall
     // back to the Blob path; if the user cancels the picker, throw.
     let writable: SaveWritable | null = null
     let saveMode: DownloadEntry['saveMode'] = 'pending'
@@ -13889,7 +13889,7 @@ export function useRemoteControl(
         writable = await handle.createWritable()
         saveMode = 'stream'
       } catch (e) {
-        // User cancelled or picker errored Ã¢ÂÂ propagate as user-facing
+        // User cancelled or picker errored — propagate as user-facing
         // error so the UI can show "Download cancelled".
         throw e instanceof Error ? e : new Error(String(e))
       }
@@ -13935,7 +13935,7 @@ export function useRemoteControl(
   }
 
   /** Download an entire folder from the host as a streaming zip.
-   *  Same `files:offer` Ã¢ÂÂ binary chunks Ã¢ÂÂ `files:eof` envelope as
+   *  Same `files:offer` → binary chunks → `files:eof` envelope as
    *  `downloadFile`, but the agent zips on the fly with no temp
    *  disk and `size` arrives as `null` (unknown until end-of-stream).
    *
@@ -13962,7 +13962,7 @@ export function useRemoteControl(
       .showSaveFilePicker
     if (typeof showSavePicker !== 'function') {
       throw new Error(
-        'Folder downloads require Chrome / Edge (need streaming disk writes Ã¢ÂÂ Firefox / Safari fallback would OOM on large zips)'
+        'Folder downloads require Chrome / Edge (need streaming disk writes — Firefox / Safari fallback would OOM on large zips)'
       )
     }
     const id = `dlf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -14074,7 +14074,7 @@ export function useRemoteControl(
 
   /** Cancel a transfer regardless of direction. Convenience for the
    *  Transfers panel UI which doesn't need to know upload vs
-   *  download Ã¢ÂÂ it just calls `cancelTransfer(id)` per row. */
+   *  download — it just calls `cancelTransfer(id)` per row. */
   function cancelTransfer(id: string): void {
     const entry = filesRegistry.get(id)
     if (!entry) return
@@ -14093,14 +14093,14 @@ export function useRemoteControl(
    *  bytes (success) or an error message (failure), `cancelled` when
    *  the person cancelled it (#3726).
    *
-   *  Accepts either bare `File` items (flat upload Ã¢ÂÂ file lands in
-   *  Downloads/) or `{ file, relPath }` pairs (folder upload Ã¢ÂÂ agent
+   *  Accepts either bare `File` items (flat upload — file lands in
+   *  Downloads/) or `{ file, relPath }` pairs (folder upload — agent
    *  recreates the directory structure under Downloads/<root>/).
-   *  Mixing is allowed Ã¢ÂÂ useful when a drag&drop event has both
+   *  Mixing is allowed — useful when a drag&drop event has both
    *  individual files and one or more folders. */
   type UploadResult = UploadOutcome
   // `relPath` carries the folder-upload structure (file-DC v2.1).
-  // `destPath` is the path-targeted upload root (file-DC v2.2) Ã¢ÂÂ when
+  // `destPath` is the path-targeted upload root (file-DC v2.2) — when
   // set, the file lands under `<destPath>/`. The two stack: a folder
   // dropped onto a host directory recreates the source structure
   // under that target dir.
@@ -14176,7 +14176,7 @@ export function useRemoteControl(
       } else if (cur.isDirectory) {
         const dirEntry = cur as FileSystemDirectoryEntry
         const reader = dirEntry.createReader()
-        // readEntries pages Ã¢ÂÂ keep calling until it returns an empty array.
+        // readEntries pages — keep calling until it returns an empty array.
         let batch: FileSystemEntry[] = []
         do {
           batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
@@ -14257,7 +14257,7 @@ export function useRemoteControl(
     notePaint,
     lastTtffMs,
     /**
-     * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
+     * S3 — sub-connected health. Non-null while `phase ===
      * 'connected'` but something is off: 'transport_unstable' (pc
      * left 'connected'), 'media_stalled' (keyframe probe
      * outstanding), 'signalling_offline' (WS down; media may still
@@ -14295,7 +14295,7 @@ export function useRemoteControl(
     setTouchMode,
     /** FR-111 P3 — where the on-screen controls press. */
     touchControlsSink,
-    /** rc.87 Ã¢ÂÂ real encoder info from the agent (`rc:video-info`).
+    /** rc.87 — real encoder info from the agent (`rc:video-info`).
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */
     videoInfo,
@@ -14330,18 +14330,18 @@ export function useRemoteControl(
      */
     currentDesktop,
     /**
-     * rc.23 Ã¢ÂÂ diagnostic surface. `agentLogs` holds the last
+     * rc.23 — diagnostic surface. `agentLogs` holds the last
      * `rc:logs-fetch.reply` (null until first fetch); the UI renders
      * `lines` in a scrolling pre-block. `agentLogsLoading` flips
      * true while a request is in flight (drives a spinner).
-     * `fetchAgentLogs(linesCount)` triggers a new request Ã¢ÂÂ operator
+     * `fetchAgentLogs(linesCount)` triggers a new request — operator
      * calls this from a toolbar button or auto-fetches when the log
      * dialog opens.
      */
     agentLogs,
     agentLogsLoading,
     fetchAgentLogs,
-    // rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts).
+    // rc.NEXT — remote app selection & launch (virtual-desktop hosts).
     remoteWindows,
     launchableApps,
     appsCoverage,
@@ -14370,17 +14370,17 @@ export function useRemoteControl(
      *  per-session toggle the toolbar renders for mac hosts only. */
     hostIsMac,
     ctrlAsCmd,
-    /** rc.227 Ã¢ÂÂ remote keyboard-layout state (null on old agents /
+    /** rc.227 — remote keyboard-layout state (null on old agents /
      *  non-Windows hosts) + the manual switch sender. */
     remoteLayout,
     setRemoteLayout,
     sendClipboardToAgent,
     getAgentClipboard,
-    /** v2 Ã¢ÂÂ text-or-image read (falls back to text-only on old
+    /** v2 — text-or-image read (falls back to text-only on old
      *  agents). The Get-clipboard button uses this when the agent
      *  advertises the `images` cap. */
     getAgentClipboardRich,
-    /** v2 Ã¢ÂÂ clipboard auto-sync toggle (persisted; default ON) +
+    /** v2 — clipboard auto-sync toggle (persisted; default ON) +
      *  the permission-blocked latch the view surfaces as a snackbar. */
     clipboardAutoSyncEnabled,
     setClipboardAutoSyncEnabled,
@@ -14388,13 +14388,13 @@ export function useRemoteControl(
     supportsClipboardEvents,
     supportsClipboardImages,
     supportsClipboardHtml,
-    /** v2.2 Ã¢ÂÂ remote agent speaks RTF, and whether this machine has a
-     *  local bridge to reach its own RTF clipboard (the WordÃ¢ÂÂWord
+    /** v2.2 — remote agent speaks RTF, and whether this machine has a
+     *  local bridge to reach its own RTF clipboard (the Word↔Word
      *  full-fidelity path). `canUseNativeClipboard` = both true. */
     supportsClipboardNative,
     localClipboardBridge,
     canUseNativeClipboard,
-    /** v2.2 Ã¢ÂÂ write a native (RTF) payload to THIS machine's clipboard
+    /** v2.2 — write a native (RTF) payload to THIS machine's clipboard
      *  via the local bridge. Used by the manual Get button so the view
      *  doesn't need bridge access. Returns true on success. */
     writeLocalNativeClipboard,
@@ -14431,13 +14431,13 @@ export function useRemoteControl(
     mediaIntrinsicH,
     videoTransport,
     setVideoTransport,
-    /** rc.190 Ã¢ÂÂ WebCodecs AV1 decode availability (gates the AV1 toggle). */
+    /** rc.190 — WebCodecs AV1 decode availability (gates the AV1 toggle). */
     av1Supported,
-    /** rc.191 Ã¢ÂÂ display-match sender (agent switches its display mode to
+    /** rc.191 — display-match sender (agent switches its display mode to
      *  fit the viewer's stage; null restores). View owns the toggle. */
     sendDisplayMatch,
-    /** rc.190 Ã¢ÂÂ whether this viewer HW-decodes the active session's codec
-     *  (null = unknown / webrtc). The viewer half of the HWÃÂHW badge. */
+    /** rc.190 — whether this viewer HW-decodes the active session's codec
+     *  (null = unknown / webrtc). The viewer half of the HW×HW badge. */
     viewerDecodeHw,
     /** Opt-in "receive host audio" flag (per-browser, persisted).
      *  Drives the recvonly audio transceiver + `audio_enabled` request
@@ -14452,13 +14452,13 @@ export function useRemoteControl(
      *  click unmute affordance that calls `resumeAudioPlayback`. */
     audioAutoplayBlocked,
     resumeAudioPlayback,
-    /** rc.62 Ã¢ÂÂ user's VP9 chroma preference ('auto' | 'yuv420' |
+    /** rc.62 — user's VP9 chroma preference ('auto' | 'yuv420' |
      *  'yuv444'). Drives the `chroma_pref` field of
      *  `rc:session.request` AND the VP9 codec string the data-channel
      *  worker is given (`vp9DcCodec`). */
     vp9Chroma,
     setVp9Chroma,
-    /** rc.199 Ã¢ÂÂ the viewer "Priority" dial + its setter (live; sent over the
+    /** rc.199 — the viewer "Priority" dial + its setter (live; sent over the
      *  control DC). Balanced / Sharper (relay-cap override) / Smoother. */
     priority,
     setPriority,
@@ -14474,7 +14474,7 @@ export function useRemoteControl(
     codecChoice,
     /** loopback-TURN corp-relay opt-in (Phase 2, default OFF) + its setter.
      *  When on, `connect()` probes the local agent's loopback TURN and relays
-     *  through it Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
+     *  through it — bypasses the capped far-coturn relay on corp networks. */
     localRelayEnabled,
     setLocalRelayEnabled,
     thisDevices,
@@ -14494,13 +14494,13 @@ export function useRemoteControl(
     h264High444Supported,
     /** rc.78 — whether this browser decodes HEVC over the data channel. */
     hevcSupported,
-    /** P1 Ã¢ÂÂ per-hop pipeline diagnostics for the diag HUD
+    /** P1 — per-hop pipeline diagnostics for the diag HUD
      *  (localStorage roomler-rc-diag-hud=1). */
     decodeDiag,
   }
 }
 
-/** Small base64 Ã¢ÂÂ Uint8Array helper. atob + TextDecoder would work
+/** Small base64 → Uint8Array helper. atob + TextDecoder would work
  *  but base64 decodes to a binary string that atob(str).charCodeAt(i)
  *  handles correctly; use the direct loop. Exported for tests. */
 export function base64ToBytes(b64: string): Uint8Array {
@@ -14516,7 +14516,7 @@ export function base64ToBytes(b64: string): Uint8Array {
  * stripped to short names ("h264", "h265", "av1", "vp9", "vp8").
  *
  * Returns an empty array on browsers that don't expose
- * `getCapabilities` (older Safari/iOS) Ã¢ÂÂ the agent then falls back to
+ * `getCapabilities` (older Safari/iOS) — the agent then falls back to
  * H.264-only. Each codec is reported once even if the browser
  * advertises multiple profile-level-id variants of it.
  *
@@ -14539,7 +14539,7 @@ export function inspectBrowserVideoCodecs(): string[] {
     const name = mime.slice('video/'.length)
     // Filter to the codecs the agent's negotiation cares about.
     // RTX (retransmission), red (FEC), ulpfec, flexfec are RTP
-    // mechanism codecs Ã¢ÂÂ not what we'd negotiate as the primary
+    // mechanism codecs — not what we'd negotiate as the primary
     // video codec.
     if (['h264', 'h265', 'av1', 'vp9', 'vp8'].includes(name)) {
       seen.add(name)
@@ -14573,7 +14573,7 @@ export function extractStatsSnapshot(
   const codecMap = new Map<string, string>()
 
   report.forEach((raw) => {
-    // RTCStatsReport is typed loosely Ã¢ÂÂ narrow via `type`.
+    // RTCStatsReport is typed loosely — narrow via `type`.
     const s = raw as { type?: string } & Record<string, unknown>
     if (s.type === 'inbound-rtp' && (s as { kind?: string }).kind === 'video') {
       bytes = typeof s.bytesReceived === 'number' ? s.bytesReceived : 0
@@ -14587,7 +14587,7 @@ export function extractStatsSnapshot(
     }
   })
 
-  // mimeType shape: "video/H264" Ã¢ÂÂ strip the prefix for display.
+  // mimeType shape: "video/H264" → strip the prefix for display.
   const mime = codecMap.get(codecId) || ''
   const codec = mime.replace(/^video\//i, '')
 
@@ -14629,20 +14629,20 @@ function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forwa
  *     that the local browser would otherwise intercept (Ctrl+A select
  *     all, Ctrl+C/V/X clipboard, Ctrl+Z/Y undo/redo, Ctrl+F find,
  *     Ctrl+S save, Ctrl+P print, Ctrl+R reload). Outside the video
- *     the controller keeps normal browser UX Ã¢ÂÂ Ctrl+T to open a tab,
- *     Ctrl+W to close it, etc. Ã¢ÂÂ when NOT keyboard-locked.
+ *     the controller keeps normal browser UX — Ctrl+T to open a tab,
+ *     Ctrl+W to close it, etc. — when NOT keyboard-locked.
  *
- *  3. Locked fullscreen (`keyboardLocked` Ã¢ÂÂ the Keyboard Lock API is
+ *  3. Locked fullscreen (`keyboardLocked` — the Keyboard Lock API is
  *     active): suppress the local default for EVERY forwarded key so
  *     Alt+Tab / Win / Ctrl+W / Ctrl+T / F-keys act on the REMOTE.
- *     Escape is safe to suppress here Ã¢ÂÂ exiting fullscreen under
+ *     Escape is safe to suppress here — exiting fullscreen under
  *     Keyboard Lock is the browser's press-AND-HOLD gesture, which
  *     preventDefault cannot cancel; short Esc taps forward cleanly.
  *     IME events never reach this decision (`decideKeyAction` drops
  *     them first in `onKey`).
  *
  *  Ctrl+Alt+Del is reserved by the OS and cannot be intercepted by the
- *  browser Ã¢ÂÂ it's exposed via the dedicated toolbar button plus the
+ *  browser — it's exposed via the dedicated toolbar button plus the
  *  RDP-convention Ctrl+Alt+End chord (see [`isRemoteSasChord`]).
  *  Exported so unit tests can lock the policy. */
 export function shouldPreventDefault(
@@ -14672,7 +14672,7 @@ export function shouldPreventDefault(
  *  Ctrl+Alt+Del to the remote (the literal chord is OS-reserved and
  *  never reaches the page on Windows viewers; on Linux/macOS viewers
  *  it CAN arrive, so accept it too). AltGraph carve-out: German and
- *  other AltGr layouts report ctrlKey+altKey while typing Ã¢ÂÂ AltGr+End
+ *  other AltGr layouts report ctrlKey+altKey while typing — AltGr+End
  *  must not fire a SAS. Meta excluded so Win+Ctrl+Alt combos don't
  *  trigger. Exported for the spec's chord matrix. */
 export function isRemoteSasChord(
@@ -14748,7 +14748,7 @@ export function isViewerOwnInput(target: EventTarget | null, surface: Element | 
   }
 }
 
-/** Structural shape of the (Chromium-only) Keyboard Lock API Ã¢ÂÂ
+/** Structural shape of the (Chromium-only) Keyboard Lock API —
  *  lib.dom.d.ts doesn't ship it. */
 type KeyboardLockApi = {
   lock?: (keyCodes?: string[]) => Promise<void>
@@ -14778,12 +14778,12 @@ function kbdCodeToHid(code: string): number | null {
   // Letter row.
   if (code.startsWith('Key') && code.length === 4) {
     const ch = code.charCodeAt(3) - 'A'.charCodeAt(0)
-    if (ch >= 0 && ch <= 25) return 0x04 + ch // a..z Ã¢ÂÂ 0x04..0x1d
+    if (ch >= 0 && ch <= 25) return 0x04 + ch // a..z → 0x04..0x1d
   }
   // Digit row.
   if (code.startsWith('Digit') && code.length === 6) {
     const d = code.charCodeAt(5) - '0'.charCodeAt(0)
-    // HID: 1..9 Ã¢ÂÂ 0x1e..0x26, 0 Ã¢ÂÂ 0x27
+    // HID: 1..9 → 0x1e..0x26, 0 → 0x27
     if (d === 0) return 0x27
     if (d >= 1 && d <= 9) return 0x1e + d - 1
   }
@@ -14812,7 +14812,7 @@ function kbdCodeToHid(code: string): number | null {
   if (code === 'MetaRight') return 0xe7
   // Punctuation row. HID usages from "Keyboard/Keypad" Page (0x07).
   // These mostly reach the agent via KeyText now (printable + no
-  // chord Ã¢ÂÂ see onKey), but we still need HID codes for the chord
+  // chord — see onKey), but we still need HID codes for the chord
   // path: e.g. Ctrl+, in some IDEs binds to "settings", which only
   // works if we forward the keypress with the chord modifier rather
   // than typing a literal ','. Without these mappings, those chords
@@ -14847,7 +14847,7 @@ function kbdCodeToHid(code: string): number | null {
   if (code === 'NumpadDecimal') return 0x63
   if (code.startsWith('Numpad') && code.length === 7) {
     const d = code.charCodeAt(6) - '0'.charCodeAt(0)
-    // HID Numpad 1..9 Ã¢ÂÂ 0x59..0x61, Numpad 0 Ã¢ÂÂ 0x62.
+    // HID Numpad 1..9 → 0x59..0x61, Numpad 0 → 0x62.
     if (d === 0) return 0x62
     if (d >= 1 && d <= 9) return 0x59 + d - 1
   }
@@ -14879,7 +14879,7 @@ export function letterboxedNormalise(
   const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
 
   if (!videoWidth || !videoHeight || !frame.width || !frame.height) {
-    // No aspect ratio yet Ã¢ÂÂ fall back to frame-relative coords.
+    // No aspect ratio yet — fall back to frame-relative coords.
     const x = (clientX - frame.left) / Math.max(frame.width, 1)
     const y = (clientY - frame.top) / Math.max(frame.height, 1)
     return { x: clamp01(x), y: clamp01(y), insideVideo: true }
@@ -14913,14 +14913,14 @@ export function letterboxedNormalise(
 
 /**
  * Pure helper for `original` / `custom` scale modes where the `<video>`
- * element is rendered without letterboxing Ã¢ÂÂ at its intrinsic size or
+ * element is rendered without letterboxing — at its intrinsic size or
  * with a uniform CSS scale. Coordinates map directly against the
  * video element's bounding rect (which already includes scroll
  * offset and the custom CSS scale), normalised to `[0,1]` relative to
  * that rect.
  *
  * Unlike `letterboxedNormalise` this doesn't need to know the
- * intrinsic `videoWidth/videoHeight` Ã¢ÂÂ the bounding rect already
+ * intrinsic `videoWidth/videoHeight` — the bounding rect already
  * reflects the rendered size after scroll + scale, so a point at
  * normalised `(0.5, 0.5)` is always the middle of the remote frame.
  */
@@ -14951,14 +14951,14 @@ export function directVideoNormalise(
  * decision tree is unit-testable without standing up the full
  * composable.
  *
- * `text`  Ã¢ÂÂ printable single character with no real-chord modifiers
+ * `text`  — printable single character with no real-chord modifiers
  *           active. Forwarded to the agent as
- *           `InputMsg::KeyText { text }` Ã¢ÂÂ `enigo.text` Ã¢ÂÂ VK_PACKET on
+ *           `InputMsg::KeyText { text }` → `enigo.text` → VK_PACKET on
  *           Windows. Layout-agnostic on the remote.
- * `key`   Ã¢ÂÂ chord, named key (Enter/F1/ArrowUp), Tab, or any printable
+ * `key`   — chord, named key (Enter/F1/ArrowUp), Tab, or any printable
  *           release that already had its keydown emitted as `text`.
  *           Forwarded as `InputMsg::Key { code, down, mods }`.
- * `drop`  Ã¢ÂÂ IME composition events, printable keyup whose keydown was
+ * `drop`  — IME composition events, printable keyup whose keydown was
  *           already a `text` (the agent press+releases atomically),
  *           and unmapped codes.
  */
@@ -14972,7 +14972,7 @@ export type KeyDecision =
  * `KeyboardEvent`. Encapsulates:
  *   - IME composition guard (drop)
  *   - AltGr-aware "real chord" classification
- *   - Printable single-char Ã¢ÂÂ `KeyText` (layout-agnostic)
+ *   - Printable single-char → `KeyText` (layout-agnostic)
  *   - Tab carve-out (stays HID for focus traversal)
  *   - Suppress keyup for printable+nochord (matched keydown was atomic)
  *   - Fallback to HID via `kbdCodeToHid`
@@ -15006,7 +15006,7 @@ export function decideKeyAction(
     return { kind: 'text', text: ev.key }
   }
   if (!down && isPrintableSingleChar) {
-    // KeyText is press+release atomic on the agent Ã¢ÂÂ no release event.
+    // KeyText is press+release atomic on the agent — no release event.
     return { kind: 'drop' }
   }
 

@@ -128,3 +128,42 @@ describe('role store', () => {
     expect(store.colorHex(undefined)).toBeUndefined()
   })
 })
+
+// #4248 — the store holds one org's roles at a time, and knows which.
+describe('role store: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+
+  it("a fetch for org B drops org A's roles at once; a refresh of org A keeps them while it loads", async () => {
+    const store = useRoleStore()
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'ra' })])
+    await store.fetchRoles(ORG_A)
+
+    let again!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (again = r)))
+    const refreshA = store.fetchRoles(ORG_A)
+    expect(store.roles.map((r) => r.id)).toEqual(['ra'])
+    again([mkRole({ id: 'ra' })])
+    await refreshA
+
+    mockApi.get.mockReturnValueOnce(new Promise(() => {}))
+    void store.fetchRoles(ORG_B)
+    expect(store.roles).toEqual([])
+    expect(store.rolesTenantId).toBe(ORG_B)
+  })
+
+  it("org A's late failure lands on nothing: org B's roles stay, with no error", async () => {
+    const store = useRoleStore()
+    let failA!: (e: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((_, reject) => (failA = reject)))
+    const loadA = store.fetchRoles(ORG_A)
+    mockApi.get.mockResolvedValueOnce([mkRole({ id: 'rb', tenant_id: ORG_B })])
+    await store.fetchRoles(ORG_B)
+
+    failA(new Error('Missing MANAGE_ROLES permission'))
+    await loadA
+    expect(store.roles.map((r) => r.id)).toEqual(['rb'])
+    expect(store.error).toBeNull()
+    expect(store.loading).toBe(false)
+  })
+})

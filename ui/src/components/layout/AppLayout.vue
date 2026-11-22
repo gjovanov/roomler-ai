@@ -647,6 +647,11 @@
       <keyed-router-view />
     </v-main>
 
+    <!-- #3563 — the call's sound: every remote participant, whatever the
+         call page's layout renders, and while the mini view stands in for
+         it. Here, not on the call page: this layout is the parent of both. -->
+    <call-audio />
+
     <!-- FR-12 P2 — one mount point for spotlight tours. It lives here rather
          than in each page because a tour is STARTED from somewhere else (the
          Tutorial, via `?tour=`), and a component cannot mount itself into a
@@ -729,6 +734,7 @@ import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
+import CallAudio from '@/components/conference/CallAudio.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'

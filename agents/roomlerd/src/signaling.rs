@@ -603,12 +603,12 @@ async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
 /// not kept.
 pub(crate) const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
 
-/// A5 — a control-WS outage this long (or longer) triggers an immediate
-/// update check on reconnect: the standing fleet-heal path for an agent
-/// that missed a server-pushed `rc:agent.update` while its socket was
-/// wedged/split (the push rides this very WS). One hour matches "a broken
-/// agent should pick up the fixed build within minutes of recovering, not
-/// at the next periodic check".
+/// A5 — a control-WS outage this long (or longer) runs the update check at
+/// once on reconnect, through the periodic check's live-work gate (#4245):
+/// the fleet-heal path for an agent that missed a server-pushed
+/// `rc:agent.update` while its socket was wedged/split (the push rides this
+/// very WS). One hour matches "a broken agent should pick up the fixed build
+/// within minutes of recovering, not at the next periodic check".
 const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 
 /// #2221 — a connection that sent its hello and then ran this long proves the
@@ -776,11 +776,11 @@ impl OrgCtx {
             return;
         }
         if self.is_primary {
-            let fired = crate::updater::request_update_now(None);
+            let fired = crate::updater::request_update_recheck();
             info!(
                 down_mins = down_ms / 60_000,
                 update_check_fired = fired,
-                "control WS recovered after a long outage — requesting an immediate update check"
+                "control WS recovered after a long outage — requesting the update recheck"
             );
         } else {
             // The machine-wide updater is the primary's to drive; a
@@ -6094,7 +6094,17 @@ async fn handle_server_msg(
             via_service,
         } => {
             #[cfg(feature = "ssh-server")]
-            if via_service {
+            if via_service && !crate::ssh::first_sight_via_service(&grant_id) {
+                // #3558 — a copy of a grant this worker already handed on, or
+                // refused, answers nothing: a refusal could reach a wait the
+                // first copy's claim left open on another server instance
+                // (`first_sight_via_service`).
+                warn!(
+                    %grant_id, ?caller,
+                    "rc:ssh.grant already handed to the SYSTEM service (or refused); \
+                     this copy is dropped, no ack"
+                );
+            } else if via_service {
                 // FR-105 — a grant for this device's SYSTEM service never
                 // lands in the worker's table, where the worker's own server
                 // would honour it as the signed-in user. The service claims

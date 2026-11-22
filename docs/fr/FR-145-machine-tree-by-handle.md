@@ -460,7 +460,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
   reader reads (`app.rs:7490`) for no gain.
-- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1650-1652`). Options: in this FR; a design pass of
+- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1694-1696`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1480-1494`; the earlier anchor
@@ -481,7 +481,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 
 ## Out of scope
 
-- File-transfer staging (`files.rs:1650-1652` and its pipeline): its own design pass (D5).
+- File-transfer staging (`files.rs:1694-1696` and its pipeline): its own design pass (D5).
 - The person's own daemon's files in their profile, which stay as they are.
 - macOS and Linux.
 - Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1177`).

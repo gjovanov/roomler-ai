@@ -269,7 +269,7 @@ with every commit would reload every open tab after a server-only promote and re
 chunk with it.
 
 **When the page reads** (`createStaleBuildWatch`, `ui/src/utils/staleBuildWatch.ts:148`):
-at every `/ws` (re)connect, which the shell binds (`AppLayout.vue:770`); every 10 minutes
+at every `/ws` (re)connect, which the shell binds (`AppLayout.vue:776`); every 10 minutes
 while visible, and on becoming visible after that long; and once more 31 s after a first
 mismatch (`armConfirm`, `staleBuildWatch.ts:362`), so the second read does not wait 10
 minutes. A confirming read that teaches nothing (a 5xx mid-roll, a captive portal, a
@@ -306,7 +306,7 @@ ephemeral enrollment key `EnrollKeysSection.vue:179`, each shown once), an uploa
 anywhere on the page (`uploadsInProgress`, `api/client.ts:251`), and a remote session that
 ended within 5 minutes, or whose rating prompt is still up (`RC_ENDED_HOLD_MS`,
 `useRemoteControl.ts:469`). The call page counts as a call whatever the store says
-(`AppLayout.vue:772`): it leaves and rejoins on a pod roll and stays after the call ends, and a
+(`AppLayout.vue:778`): it leaves and rejoins on a pod roll and stays after the call ends, and a
 reload there asks "Reload site?".
 
 A quiet moment is the session or the call ending, the text sent, the dialog closed, a hold
@@ -394,6 +394,21 @@ read the list route page by page through `fetchAllPages` (`utils/allPages.ts`):
 100 rows a page, the server's cap, and at most 50 pages. Past that the tab says
 how many of how many it shows (#4188).
 
+Both tabs follow their org (#4248). The route reuses the two sections when only
+the org id in the URL changes, so each watches its `tenantId` prop, from the start
+and on every change, instead of loading once on mount. A change closes an editor
+or a delete prompt left open on the previous org's row, whose save would go to the
+new org (`components/admin/TunnelPoliciesSection.vue:832`,
+`components/admin/OverlayAclSection.vue:686`). The stores the tabs read (devices,
+tunnel clients, overlay nodes, roles, members and the two policy lists) hold one
+org's rows at a time and record which. A fetch for another org drops the rows at
+once, only the latest fetch writes, and a save answered for another org leaves the
+list alone (`stores/tunnelPolicies.ts:159-165`, `stores/overlayAcl.ts:78-84`). A
+page that only names or picks devices asks with `ensureAgents` or
+`ensureTunnelClients` (`stores/agents.ts:1036`, `stores/tunnelClients.ts:117`),
+which fetch unless the store already holds, or is loading, that org's rows. Never
+gate a fetch on an empty list: a list that holds another org's rows is not empty.
+
 ### The devices list's "needs a person" chips
 
 `AgentsSection` shows these in both its table and its cards. Each appears only when someone has to act, and
@@ -444,7 +459,7 @@ with no reason given:
 | cause | what the tile does | where else it shows |
 |---|---|---|
 | **The camera sends a black picture**: a covered lens, a closed privacy shutter, a camera-off key that blanks the sensor while the device stays attached | a notice over the picture, in text. Your own tile: *"Your camera is sending a black picture · Is the lens covered?"*. A peer's: *"Black picture from this camera · Its lens may be covered"*. A compact tile: *"Black picture"* | for YOUR camera only, a closable warning over the call (`call.blackPicture`): you are the one who can uncover it |
-| **The browser refused to start the tile** (its autoplay policy: audible playback before the page has had a gesture) | the picture plays muted at once, with *"Tap for sound"*; if even muted playback is refused, *"Tap to play"* | — the next click or key anywhere on the page brings the sound back |
+| **The browser refused to start the call's sound** (its autoplay policy: audible playback before the page has had a gesture) | nothing: since #3563 a tile shows the picture only and is always muted, so its picture starts at once; if even muted playback is refused, *"Tap to play"* | *"Tap for sound"*, once for the whole call (`CallAudio`, below); the next click or key anywhere on the page brings every participant's sound back |
 
 Found on 2026-10-26: a covered webcam on neo16 was reported as the *MacBook's* camera not working. Both devices
 were signed in to one account, so both tiles carried the same name, and nothing on screen said which picture was
@@ -477,55 +492,90 @@ flowchart TB
   viewer judges what it decodes, so an older client changes nothing for anyone.
 - ⚠️ **A camera that is OFF is not a covered camera.** A disabled track (your own camera turned off) still paints
   black at full size, so the tile's own `hasVideoTrack` stays true. Only `cameraTrackLive()`
-  (`VideoTile.vue:446`) stands between "camera off" and "lens covered": it requires the track to be `enabled`,
+  (`VideoTile.vue:420`) stands between "camera off" and "lens covered": it requires the track to be `enabled`,
   `live` and not `muted`. A peer's own word that their camera is off (FR-30's `videoPaused`) also wins: the avatar
   shows, never the notice. A shared screen is never judged, because a black slide is not a lens.
 - ⚠️ **A count per stream key, not a flag** (`composables/useBlackPictureTiles.ts:15`). Alone in a call with a
   floating self-view you are on two tiles at once. When someone joins, the spotlight tile unmounts and reports
   `false` while the floating one is still black, so a flag would drop your warning there. Each tile reports
-  changes only, and `false` on unmount if it was black (`VideoTile.vue:466`), so the count stays honest.
+  changes only, and `false` on unmount if it was black (`VideoTile.vue:440`), so the count stays honest.
+
+### Who plays the call's sound (#3563)
+
+A tile shows the picture only. Its `<video>` is always muted (`VideoTile.vue:30`), and so are the mini view's
+remote ones (`MiniConference.vue:43`). The call's sound belongs to **`CallAudio`**, mounted once in the app shell
+(`AppLayout.vue:653`): one hidden `<audio>` per remote stream key that carries audio (`CallAudio.vue:13-21`), for
+as long as the call lasts, whatever the layout renders. So a participant past the tile cap, one hidden by "Hide
+participants without video", and one beyond the mini view's three while the call page is away are all heard.
+
+- **In the shell, not on the call page.** `AppLayout` is the parent of both places a call shows: the call page
+  (`room-call` is its child route) and the nav drawer that holds `MiniConference`. `App.vue` would also survive
+  routes outside the shell, but it is in the entry chunk, which does not load the conference store
+  (mediasoup-client). A route outside the shell (`/invite/:code`, `/pair`) shows no tiles and plays nothing while
+  you are in a call, as before.
+- **The sinks follow `remoteStreams`** (`syncSinks`, `CallAudio.vue:77`). Each sink plays an audio-only
+  `MediaStream` of its key's live audio tracks, rebuilt only when that set changes: the store replaces a key's
+  stream whenever a consumer joins it, and the camera arriving after the microphone must not restart the sound. A
+  shared screen's audio has its own key. Your own stream (`localStream`) never gets a sink.
+- **A removed sink drops its source** (`bindSink`, `CallAudio.vue:113`): a leaver, the call's end, or the shell
+  unmounting sets `srcObject = null`. ⚠️ The owner never stops a track: the store owns the consumers' tracks, and
+  stopping one would silence the tiles and the speaker detection that read it.
+- FR-30's mute is unchanged: a paused producer sends nothing, and the tile's mic-off badge reads
+  `remoteAudioPaused` as before. The speaker detection still reads `remoteStreams` and never plays.
+- **Tests:** `CallAudio.spec.ts` (five streams and a layout that renders two; late tracks, leavers, the call's end;
+  a refused start), and `ui/e2e/conference-every-remote-heard.spec.ts`: six browsers, the viewer's tile cap at 4
+  and one camera-off peer hidden, every remote heard exactly once. It runs where the conference specs run, in the
+  app pod's `pwrunner` sidecar against a deployment.
 
 ### A refused start
 
 ```mermaid
 sequenceDiagram
-    participant T as VideoTile
+    participant C as CallAudio (one sink per remote stream key)
     participant B as browser
     participant P as the person
-    T->>B: play() (unmuted: a peer's tile carries their audio)
-    B-->>T: NotAllowedError (no gesture on the page yet)
-    T->>T: soundBlocked = true → :muted binds true
-    T->>B: play() again, muted
-    B-->>T: playing — the picture is on screen
-    T->>P: "Tap for sound" on the tile
+    C->>B: play() on a sink, unmuted
+    B-->>C: NotAllowedError (no gesture on the page yet)
+    C->>C: the sink joins blocked → :muted binds true
+    C->>B: play() again, muted
+    B-->>C: playing, silent (the speaker detection still reads it)
+    C->>P: "Tap for sound", once for the call
     P->>B: a click or a key anywhere on the page
-    Note over T: capture-phase listener, armed once
-    T->>T: soundBlocked = false → unmuted
-    T->>B: play() inside the gesture
-    B-->>T: playing with sound
+    Note over C: capture-phase listener, armed once
+    C->>C: blocked cleared → every refused sink unmuted
+    C->>B: play() on each, inside the gesture
+    B-->>C: playing with sound
 ```
 
-- `startPlayback()` (`VideoTile.vue:317`) replaces the two `play().catch(() => {})` calls that swallowed the
-  refusal. Before FR-124, a refused tile stayed black until its stream changed.
+- `startSink()` (`CallAudio.vue:134`) and the tile's `startPlayback()` (`VideoTile.vue:313`) replace the
+  `play().catch(() => {})` calls that swallowed the refusal. Before FR-124, a refused tile stayed black until its
+  stream changed. Since #3563 a tile is muted, so all it can still meet is a picture refused even muted: *"Tap to
+  play"*, and the next gesture starts it.
 - `AbortError` (a newer `srcObject` or `play()` took over) is not a refusal and is ignored. Anything else is
   logged with `console.warn` and never hidden.
-- ⚠️ **`:muted="isLocal || soundBlocked"`** (`VideoTile.vue:29`): a binding, not just an assignment, so a
-  re-render can't unmute the element behind the browser's back.
-- ⚠️ **`click`, not `pointerdown`** (`armGestureRetry`, `VideoTile.vue:368`): on a touch screen the activation
-  comes with the pointer's release, so a `play()` at `pointerdown` would be refused again. The listener sits in the
-  capture phase, so a click that a control stops on its way still counts, and it is removed once used and on
-  unmount.
+- ⚠️ **`:muted="blocked.has(sink.key)"`** (`CallAudio.vue:18`): a binding, not just an assignment, so a re-render
+  can't unmute a sink behind the browser's back. It is per sink: some browsers judge each new element, so a
+  participant who joins later can be refused while the others already play, and only that sink waits. A sink
+  created while the sound waits for a gesture starts muted and comes back with the same gesture. *"Tap for sound"*
+  shows while any sink waits, once for the call.
+- ⚠️ **`click`, not `pointerdown`** (`armGestureRetry`, `CallAudio.vue:180`, and the tile's own,
+  `VideoTile.vue:348`): on a touch screen the activation comes with the pointer's release, so a `play()` at
+  `pointerdown` would be refused again. The listener sits in the capture phase, so a click that a control stops on
+  its way still counts, and it is removed once used and on unmount.
 
 Not covered by FR-124: `MiniConference.vue`'s own `<video>` elements. They never call `play()`, and the mini view
 is reached only after a Join click. A related gap, read from the code and left for its own fix: remote audio plays
 only through a rendered tile, so a participant whose tile is hidden or past the tiled maximum is not heard.
+That gap is closed by #3563: the call plays every remote participant (above), and the mini view's `<video>`
+elements are muted.
 
 ## Everything else
 
 - **Chat**: TipTap v3 editor (markdown, mentions, emoji via emoji-mart, Giphy
   picker), threads, reactions, pins.
 - **Conference**: mediasoup-client composables + `VideoTile`, layout modes,
-  active-speaker tracking, PiP. A black tile says why (above).
+  active-speaker tracking, PiP. A black tile says why (above). The call's sound
+  is `CallAudio`'s, not the tiles' (above).
 - **Theming**: Vuetify light/dark with localStorage persistence.
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
