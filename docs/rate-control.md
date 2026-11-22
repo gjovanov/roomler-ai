@@ -4622,6 +4622,17 @@ holds SCTP's window sized; the two runs off AC2's bar are the fourth pass's path
 their capacity at 0.815 and 0.798 under every fold, each set by a no-loss P3 with no such
 hold.
 
+**On a quiet host** (2026-11-22, on master `61897906f`; FR-148 O16). Four passes of the four
+controls alone, each started only when two checks 30 s apart found no build on the box, and
+with none found while it ran, read **32 of 32** on the bar under `d50` and under `d48` (B2 as
+built 7 of 32, rules 1 to 3 alone 27 of 32): the misses above did not recur. At 0.4 Mbit/s on
+path C, FR-79's gate held 1 to 11 of the budget writers' 15 to 17 viewer windows invalid, and
+the floor ended in AC2's bracket on every run. The writer check's misses did recur: it missed
+on 2 of the 16 budget runs it asserts (0.941 on the 0.4 Mbit/s path C control, 0.942 on the
+2 Mbit/s path I control), while those runs delivered 108.7 and 45.9 times today's writer's
+fresh rate, and over all 32 budget-writer runs the read delivery spread from 0.941 to 1.118
+of today's writer's.
+
 **The pace.** When the floor came into AC2's bracket after the halving at 6 s, and stayed:
 
 | Law | Shallow: on for good | From (median) | Deep: on for good | From (median) |
