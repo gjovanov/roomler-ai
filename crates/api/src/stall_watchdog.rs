@@ -414,33 +414,44 @@ pub fn report_previous_dumps(dir: &Path) -> Vec<PathBuf> {
     reported
 }
 
-/// The stack-walk handler's install, behind a seam (#3564): the tests drive it
-/// with a cell of their own and a fake installer, and touch no signal state.
+/// The stack-walk handler's install, run once per process (#3564), behind a
+/// seam: the tests drive it with a cell of their own and a fake installer,
+/// and touch no signal state.
+///
+/// A check-then-act flag let two callers both pass the check, and the second
+/// then read the handler the first had just installed as someone else's. Now
+/// the install runs exactly once, a caller that arrives during it waits for
+/// it, and every caller gets its outcome. `io::Error` is not `Clone`, so the
+/// outcome keeps the error's kind and message, and each caller gets a fresh
+/// error built from them.
 #[cfg(any(target_os = "linux", test))]
 struct InstallCell {
-    installed: AtomicBool,
+    outcome: std::sync::OnceLock<Result<(), (std::io::ErrorKind, String)>>,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl InstallCell {
     const fn new() -> Self {
         Self {
-            installed: AtomicBool::new(false),
+            outcome: std::sync::OnceLock::new(),
         }
     }
 
     /// Has an install succeeded?
     fn is_installed(&self) -> bool {
-        self.installed.load(Ordering::Acquire)
+        matches!(self.outcome.get(), Some(Ok(())))
     }
 
+    /// Run `install` unless it already ran, and answer its outcome. The first
+    /// outcome, success or failure, is final.
     fn run(&self, install: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-        if self.is_installed() {
-            return Ok(());
+        match self
+            .outcome
+            .get_or_init(|| install().map_err(|e| (e.kind(), e.to_string())))
+        {
+            Ok(()) => Ok(()),
+            Err((kind, message)) => Err(std::io::Error::new(*kind, message.clone())),
         }
-        install()?;
-        self.installed.store(true, Ordering::Release);
-        Ok(())
     }
 }
 
@@ -475,6 +486,14 @@ mod linux {
         (request << 2) | phase
     }
 
+    /// The handler's one install for this process. Only `install_handler`
+    /// and `stack_of` read it; the signal handler never does.
+    ///
+    /// ⚠️ Its outcome is final for the whole process, failure included. So a
+    /// test that put a foreign handler on the real stack signal before the
+    /// first install would fail every later test in this binary that installs
+    /// it. The foreign-handler case is tested through the seam
+    /// (`tests::install_once`), never on the real signal: keep it there.
     static INSTALL: InstallCell = InstallCell::new();
     /// The thread asked to walk its stack. 0 = nobody.
     static TARGET: AtomicI32 = AtomicI32::new(0);
@@ -492,10 +511,13 @@ mod linux {
         libc::SIGRTMIN() + 5
     }
 
+    /// Install the stack-walk handler, once per process: every caller,
+    /// concurrent or later, gets the outcome of that one install.
     pub(super) fn install_handler() -> std::io::Result<()> {
         INSTALL.run(install_now)
     }
 
+    /// The install itself. Runs at most once, inside [`INSTALL`].
     fn install_now() -> std::io::Result<()> {
         // SAFETY: zeroed `sigaction`s are valid starting values; the first
         // call only reads the current action.
