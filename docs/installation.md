@@ -2207,7 +2207,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2113-2192`):
+exit code (`scripts/install.sh:2125-2204`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -2263,7 +2263,7 @@ flowchart TD
 
 | Rule | Where | Why |
 |---|---|---|
-| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2279` | the shell has read every byte before the first command runs |
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2291` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
 | The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
 | Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
@@ -2724,7 +2724,7 @@ The stop also says how to go on, in Terminal, naming only what works on that Mac
 | The Mac | The stop offers | Why |
 |---|---|---|
 | any one-row Mac | remove Roomler with `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --uninstall` ([Uninstall](#uninstall-every-platform)), then start Setup again | the road to a fresh enrollment, for example after the row was deleted (launchd starts the daemon again after its exit 7, so the stop can still show); it names no layout, since what Setup installs then is its own form's choice |
-| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:66-84`, `:3043-3048`); with no copy the revert says only "nothing to revert" (`:3078-3083`), so it is not offered there |
+| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:66-84`, `:3059-3064`); with no copy the revert says only "nothing to revert" (`:3094-3099`), so it is not offered there |
 
 A wizard started as root (`sudo` from Terminal, the only root road: it never
 elevates itself on a Mac, and the administrator prompt runs `install.sh`'s
@@ -2909,8 +2909,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7091`](../agents/roomlerd/src/signaling.rs#L7091)), built
-into the caps by one function ([`:7139`](../agents/roomlerd/src/signaling.rs#L7139)).
+`rc_*` floor ([`signaling.rs:7101`](../agents/roomlerd/src/signaling.rs#L7101)), built
+into the caps by one function ([`:7149`](../agents/roomlerd/src/signaling.rs#L7149)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
@@ -2951,7 +2951,7 @@ that person's own process: `roomlerd one-row-home <verb>`, the package's binary
 (`/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`), which root starts with the
 person's uid, primary gid and no other group, an empty environment and `/` as its folder,
 one per account in uid order, 30 s each, and which checks its own identity before it
-touches anything (`agents/roomlerd/src/one_row.rs:3357`,
+touches anything (`agents/roomlerd/src/one_row.rs:3373`,
 `agents/roomlerd/src/one_row_home.rs:3-60`). Root keeps its own copies and records in
 its own tree: `/etc/roomler/config.toml.pre-one-row` and `/etc/roomler/one-row/`
 (root:wheel 700, files 600: `root.json` and one folder per uid, its `record.json`
@@ -3214,7 +3214,7 @@ console user are skipped and every root row runs as on any install
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:627-630`, `:635`, `:735-738`, `:756`, `:764`, `:777`, `:656`, `:791` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
-| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3357`, `agents/roomlerd/src/one_row_home.rs:3-60` |
+| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3373`, `agents/roomlerd/src/one_row_home.rs:3-60` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:145` |
 
 - **`sudo roomlerd one-row` writes nothing in a home as root (FR-147).** A home whose
@@ -3292,7 +3292,7 @@ console user are skipped and every root row runs as on any install
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
     (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1152-1194`,
     started by `--revert` where that person's `read` reports them,
-    `agents/roomlerd/src/one_row.rs:2595`), the command stages first and
+    `agents/roomlerd/src/one_row.rs:2610`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
     sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
     '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
@@ -3757,14 +3757,16 @@ when one is needed (FR-27).
 An install restarts the daemon, and the restart ends what it serves: a
 remote-control session, an SSH connection, a Fleet RPC `exec` run, a file
 transfer, a recording. So the periodic check defers while any of them is live,
-on the budget transfers always had. It reads one model, `Busy`
-(`agents/roomlerd/src/busy.rs:30`), the same one the per-user Linux
-daemon's restart onto a replaced binary reads
+on the budget transfers always had, and so does the check a daemon runs early
+when its control socket comes back after an hour or more down (#4245). It
+reads one model, `Busy` (`agents/roomlerd/src/busy.rs:30`), the same one the
+per-user Linux daemon's restart onto a replaced binary reads
 ([linux-self-update.md](linux-self-update.md#the-per-user-daemon-onto-the-new-binary-p2b)).
 
 ```mermaid
 flowchart TD
     C["the periodic check is due"] --> B{"Busy, read now"}
+    O["the control socket is back<br/>after 1 h or more down"] --> B
     B -- "nothing live" --> I["check, and install a newer release"]
     B -- "live work, or the network<br/>moved in the last 10 min" --> D{"7 defers in a row already?"}
     D -- yes --> F["install anyway,<br/>with a warning that names the work"]
@@ -3776,7 +3778,7 @@ flowchart TD
 
 | What is live | What the periodic check does | Where |
 |---|---|---|
-| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3496` |
+| nothing | checks, and installs a newer release | `periodic_gate`, `agents/roomlerd/src/updater.rs:3580` |
 | a remote-control session, an SSH connection, a Fleet RPC run, a transfer or a recording | defers, and checks again in 1 h | `TRANSFER_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:77` |
 | only a network transition in the last 10 min | defers, and checks again in 2 min (R5b) | `NET_DEFER_RECHECK`, `agents/roomlerd/src/updater.rs:98` |
 | either, after 7 defers in a row | installs anyway, and warns what it cuts: a device that is never idle still takes a release about 7 h after it was due | `MAX_CONSECUTIVE_DEFERS`, `agents/roomlerd/src/updater.rs:84` |
@@ -3788,11 +3790,24 @@ flowchart TD
   (`agents/roomlerd/src/exec.rs:2347`); a command an SSH session runs
   belongs to that connection and is not counted twice. A transfer or a
   recording, as since rc.19 and FR-85 ([recording.md](recording.md)).
-- **An operator's push still installs at once.** `POST …/agent/update`
-  (`rc:agent.update`), and the check a daemon asks for when its control socket
-  comes back after a long outage, skip the gate and keep only the 5-min
-  install-storm cooldown. Each says what it cuts, in the daemon's log:
+- **Only an operator's push installs at once.** `POST …/agent/update`
+  (`rc:agent.update`) skips the gate and keeps only the 5-min install-storm
+  cooldown. It says what it cuts, in the daemon's log:
   `forced update proceeding despite: 1 remote-control session(s)`.
+- **The recheck after a long control-socket outage waits too (#4245).** A
+  daemon whose control socket comes back after an hour or more down checks for
+  an update at once, for a push it may have missed while the socket was down
+  (`UPDATE_RECHECK_AFTER_DOWN`, `agents/roomlerd/src/signaling.rs:612`). That
+  check is the periodic one run early: the same gate, the same cooldown, and
+  the same seven defers, so a recheck that defers spends one, and one at the
+  cap installs anyway as the timer's would. Until #4245 it took the push's way
+  and installed over whatever was live. No session of that organization
+  outlives an hour without its socket (FR-138 keeps one for 120 s at most), but
+  an SSH session on the mesh does, and so does a session another enrollment of
+  the daemon serves; and a long outage often ends on a network that just moved.
+  Each ask names who asked (`UpdateAsk`, `agents/roomlerd/src/updater.rs:3113`),
+  and one function picks the cycle's way (`cycle_arm`,
+  `agents/roomlerd/src/updater.rs:3649`).
 - **Only the process that installs is asked**, and it counts only what it
   serves itself:
 
@@ -3807,9 +3822,14 @@ flowchart TD
 
 - **What the log says.** Each defer: `auto-updater: deferring — live work a
   restart would cut, or the network just moved busy=1 remote-control session(s)
-  consecutive_defers=1 next_check_secs=3600`. Once the budget is spent:
-  `auto-updater: forcing update after 7 consecutive defers`, with the same
-  `busy=`.
+  consecutive_defers=1 next_check_secs=3600 cycle=periodic`, and
+  `cycle=outage_recheck` on a recheck after a long outage. Once the budget is
+  spent: `auto-updater: forcing update after 7 consecutive defers`, with the
+  same `busy=` and `cycle=`. The recheck starts with `control WS recovered
+  after a long outage — requesting the update recheck down_mins=61
+  update_check_fired=true`, and one inside the cooldown logs `auto-updater:
+  recheck suppressed by recent-install cooldown; the timer checks next
+  cycle=outage_recheck`.
 
 ### macOS: an update with nobody signed in (#3783)
 
@@ -3884,7 +3904,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3540`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3702`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.
@@ -3998,7 +4018,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 ### The order is the design
 
 `scripts/install.sh:1525` (the section) — `uninstall_linux` at `:1969`,
-`uninstall_macos` at `:2021`.
+`uninstall_macos` at `:2046`, `uninstall_stop_macos` at `:2006`.
 
 ```mermaid
 flowchart TD
@@ -4015,9 +4035,9 @@ flowchart TD
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1149`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`:1340`) |
-| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1078`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
-| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1806`) | `com.roomler.update` at once, or, while the process launchd runs for it has an `installer` child, once that child is gone (300 s at most; FR-151 P2), every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2006`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1735`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`remove_tarball_linux`, `:1905`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
 | 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,

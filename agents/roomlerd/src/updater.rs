@@ -3098,28 +3098,56 @@ pub(crate) fn resolve_check_interval_with(
     CHECK_INTERVAL
 }
 
-/// S1a — process-wide forced-update trigger. The WS handler
-/// (`rc:agent.update`) calls [`request_update_now`]; the periodic loop
-/// consumes the channel. A `OnceLock` (not a threaded parameter) so the
-/// signaling stack's signatures stay untouched — one updater per
-/// process makes the singleton honest.
-static UPDATE_TRIGGER: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<String>>> =
+/// S1a — process-wide update trigger. The WS handler (`rc:agent.update`)
+/// calls [`request_update_now`], and the signalling loop calls
+/// [`request_update_recheck`] when its control socket comes back after a long
+/// outage; the periodic loop consumes the channel. A `OnceLock` (not a
+/// threaded parameter) so the signaling stack's signatures stay untouched —
+/// one updater per process makes the singleton honest.
+static UPDATE_TRIGGER: std::sync::OnceLock<tokio::sync::mpsc::Sender<UpdateAsk>> =
     std::sync::OnceLock::new();
 
-/// Create the forced-update trigger channel and register its sender — for
-/// a daemon whose updater will run. Called once from `run_cmd`; the
-/// receiver goes to [`run_periodic`].
+/// #4245 — who asked for an update cycle out of turn: what the trigger
+/// channel carries. Only an operator's push skips the live-work gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateAsk {
+    /// An operator's push (`rc:agent.update`, [`request_update_now`]), with
+    /// its pin (`None` = the latest release). The one ask that skips the
+    /// live-work gate: the operator asked now, and the warning names what the
+    /// update cuts ([`forced_update_warning`]).
+    Operator(Option<String>),
+    /// The daemon's own recheck when its control socket comes back after a
+    /// long outage ([`request_update_recheck`]; `UPDATE_RECHECK_AFTER_DOWN` in
+    /// `signaling.rs`): the timer's cycle, run early. It goes through the
+    /// same gate, on the same defer budget.
+    OutageRecheck,
+}
+
+impl UpdateAsk {
+    /// The ask as a log line names it: the push by its frame, the recheck by
+    /// what started it. A recheck is never called `rc:agent.update`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            UpdateAsk::Operator(_) => "rc:agent.update",
+            UpdateAsk::OutageRecheck => "the update recheck after a long control-socket outage",
+        }
+    }
+}
+
+/// Create the update trigger channel and register its sender — for a daemon
+/// whose updater will run. Called once from `run_cmd`; the receiver goes to
+/// [`run_periodic`].
 ///
 /// ⚠️ #1689: with auto-update off, NOTHING is installed, so
-/// [`request_update_now`] reports `false` and its callers say so (the
-/// `rc:agent.update` arm warns the push was dropped). Installing it anyway
-/// with the receiver merely unused — the doc once promised it would be
-/// "simply dropped" — kept that receiver alive for the whole of `run_cmd`:
-/// every push queued into a channel nobody reads and reported delivered,
-/// while the device stayed where it was.
+/// [`request_update_now`] and [`request_update_recheck`] report `false` and
+/// their callers say so (the `rc:agent.update` arm warns the push was
+/// dropped). Installing it anyway with the receiver merely unused — the doc
+/// once promised it would be "simply dropped" — kept that receiver alive for
+/// the whole of `run_cmd`: every push queued into a channel nobody reads and
+/// reported delivered, while the device stayed where it was.
 pub fn install_update_trigger(
     auto_update_enabled: bool,
-) -> Option<tokio::sync::mpsc::Receiver<Option<String>>> {
+) -> Option<tokio::sync::mpsc::Receiver<UpdateAsk>> {
     if !auto_update_enabled {
         return None;
     }
@@ -3150,15 +3178,44 @@ pub(crate) fn update_mode_for(is_primary: bool, takes_triggers: bool) -> &'stati
     }
 }
 
-/// Request an immediate update cycle (server-pushed `rc:agent.update`).
+/// Request an immediate update cycle (server-pushed `rc:agent.update`): an
+/// operator's push, the one ask that skips the live-work gate.
 /// `pin` = optional release tag; `None` = latest. Returns `false` when
 /// nothing is listening (auto-update disabled, trigger not installed)
 /// or the small queue is full.
 pub fn request_update_now(pin: Option<String>) -> bool {
+    ask_for_update(UpdateAsk::Operator(pin))
+}
+
+/// #4245 — request the daemon's own update recheck, when its control socket
+/// comes back after a long outage: the periodic cycle, run early, through the
+/// live-work gate and on its defer budget. `false` as for
+/// [`request_update_now`].
+pub fn request_update_recheck() -> bool {
+    ask_for_update(UpdateAsk::OutageRecheck)
+}
+
+/// Queue `ask` on the trigger channel: `false` with no channel installed, or
+/// with its small queue full.
+fn ask_for_update(ask: UpdateAsk) -> bool {
+    #[cfg(test)]
+    if let Some(here) = TRIGGER_HERE.with(|t| t.borrow().clone()) {
+        return here.try_send(ask).is_ok();
+    }
     match UPDATE_TRIGGER.get() {
-        Some(tx) => tx.try_send(pin).is_ok(),
+        Some(tx) => tx.try_send(ask).is_ok(),
         None => false,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `Some(sender)` is the trigger channel on this thread, as
+    /// `busy::EXEC_RUNS_HERE` is the exec count: a test reads its own asks,
+    /// and never installs the process-wide [`UPDATE_TRIGGER`] (see
+    /// `a_disabled_updater_reports_a_push_undeliverable`).
+    static TRIGGER_HERE: std::cell::RefCell<Option<tokio::sync::mpsc::Sender<UpdateAsk>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Act on a check outcome: log, and on `UpdateReady` spawn the
@@ -3243,20 +3300,24 @@ fn act_on_outcome_with(
 /// spawns the installer and sends `true` on the shutdown channel so
 /// the rest of the agent tears down cleanly.
 ///
-/// `trigger_rx` (S1a) delivers operator-forced cycles pushed over the
-/// WS (`rc:agent.update`): those bypass the live-work gate (the operator
-/// asked NOW; a warn names the live work, #3429) but still honour the
-/// install-storm cooldown marker. `rc_sessions` is the daemon's registry.
+/// `trigger_rx` (S1a) delivers the asks that wake the loop early
+/// ([`UpdateAsk`], #4245), each through [`cycle_arm`]. An operator's push
+/// over the WS (`rc:agent.update`) bypasses the live-work gate (the operator
+/// asked NOW; a warn names the live work, #3429). The recheck after a long
+/// control-socket outage is the timer's cycle run early: the same gate, on
+/// the same defer budget. Both honour the install-storm cooldown marker.
+/// `rc_sessions` is the daemon's registry.
 pub async fn run_periodic(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     interval: Duration,
-    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
     // macOS: the agent processes install NOTHING — `com.roomler.update`
     // (the root update helper) owns check+download+verify+install, and this
-    // loop reduces to forwarding rc:agent.update triggers to its wake file.
+    // loop reduces to forwarding each ask (an rc:agent.update push, the
+    // outage recheck) to its wake file.
     // A runtime `cfg!` (not an attribute) so both bodies stay type-checked
     // on every platform.
     if cfg!(target_os = "macos") {
@@ -3363,7 +3424,8 @@ pub async fn run_periodic(
         // so the install fires soon after the gate clears instead of
         // waiting the full periodic interval again.
         let next_interval = defer_recheck.take().unwrap_or(interval);
-        let mut forced: Option<Option<String>> = None;
+        // What woke this cycle out of turn; `None` = the timer.
+        let mut ask: Option<UpdateAsk> = None;
         if !first || skip_first_check {
             tokio::select! {
                 _ = tokio::time::sleep(next_interval) => {},
@@ -3374,81 +3436,103 @@ pub async fn run_periodic(
                     // Sender lives in the process-wide OnceLock, so None
                     // (channel closed) is unreachable in practice; guard
                     // anyway so a closed channel can't hot-loop us.
-                    if let Some(pin) = maybe {
-                        forced = Some(pin);
+                    if let Some(woke) = maybe {
+                        ask = Some(woke);
                     }
                 },
             }
         }
         first = false;
 
-        // S1a — operator-forced cycle (rc:agent.update). Bypasses the
-        // live-work gate (explicit operator intent) but keeps the
-        // install-storm cooldown; a pinned tag skips the is-newer check
-        // (pin_version semantics — the admin chose the version).
-        if let Some(pin) = forced {
-            if recent_update_attempt(STARTUP_UPDATE_COOLDOWN) {
-                tracing::info!(
-                    "forced update suppressed by recent-install cooldown; try again shortly"
-                );
+        // #4245 — one arm per cycle, from what woke it ([`cycle_arm`]). An ask
+        // keeps the install-storm cooldown, whoever asked; only an operator's
+        // push skips the live-work gate. The cooldown marker is read for an
+        // ask only: the timer's carve-out is the skipped first check above.
+        let in_cooldown = ask.is_some() && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
+        let busy = crate::busy::now(&rc_sessions);
+        let cycle = cycle_name(ask.as_ref());
+        let arm = cycle_arm(ask.as_ref(), &busy, consecutive_defers, in_cooldown);
+        let defers_before = consecutive_defers;
+        consecutive_defers = arm.defers_after(consecutive_defers);
+        match arm {
+            CycleArm::Cooldown => {
+                if matches!(ask, Some(UpdateAsk::OutageRecheck)) {
+                    tracing::info!(
+                        %cycle,
+                        "auto-updater: recheck suppressed by recent-install cooldown; the timer checks next"
+                    );
+                } else {
+                    tracing::info!(
+                        "forced update suppressed by recent-install cooldown; try again shortly"
+                    );
+                }
                 continue;
             }
-            if let Some(warning) = forced_update_warning(&crate::busy::now(&rc_sessions)) {
-                tracing::warn!("{warning}");
+            // S1a — operator-forced cycle (rc:agent.update). Bypasses the
+            // live-work gate (explicit operator intent) but keeps the
+            // install-storm cooldown; a pinned tag skips the is-newer check
+            // (pin_version semantics — the admin chose the version).
+            CycleArm::Forced { pin, warning } => {
+                if let Some(warning) = warning {
+                    tracing::warn!("{warning}");
+                }
+                let outcome = match pin {
+                    Some(tag) => pin_version(&tag).await,
+                    None => check_once().await,
+                };
+                // FR-117 P1 — an operator's update moves the companion too: on a
+                // device whose daemon is already current, the companion lagging
+                // behind it is all there is to update.
+                #[cfg(target_os = "linux")]
+                if !matches!(outcome, CheckOutcome::UpdateReady { .. }) {
+                    crate::companion::sync_package().await;
+                }
+                let retry = recheck_after(&outcome, &mut transport_failures, interval);
+                if act_on_outcome(outcome, &shutdown_tx) {
+                    return;
+                }
+                schedule_transport_retry(&mut defer_recheck, retry, transport_failures);
+                continue;
             }
-            let outcome = match pin {
-                Some(tag) => pin_version(&tag).await,
-                None => check_once().await,
-            };
-            // FR-117 P1 — an operator's update moves the companion too: on a
-            // device whose daemon is already current, the companion lagging
-            // behind it is all there is to update.
-            #[cfg(target_os = "linux")]
-            if !matches!(outcome, CheckOutcome::UpdateReady { .. }) {
-                crate::companion::sync_package().await;
-            }
-            let retry = recheck_after(&outcome, &mut transport_failures, interval);
-            if act_on_outcome(outcome, &shutdown_tx) {
-                return;
-            }
-            schedule_transport_retry(&mut defer_recheck, retry, transport_failures);
-            continue;
-        }
-
-        // rc.19 gate, #3429: don't fire an installer over live work. The
-        // install restarts the daemon, which cuts every session, SSH
-        // connection, Fleet RPC run, transfer and recording it serves
-        // (`busy`). Skip the cycle while any is live, or the network just
-        // moved (R5b), unless we've deferred MAX_CONSECUTIVE_DEFERS times
-        // in a row (security-vs-uptime trade-off documented in the rc.19
-        // plan M3 fix).
-        let busy = crate::busy::now(&rc_sessions);
-        let (decision, recheck) = periodic_gate(&busy, consecutive_defers);
-        match decision {
-            DeferDecision::DeferOnce => {
-                consecutive_defers = consecutive_defers.saturating_add(1);
+            // rc.19 gate, #3429: don't fire an installer over live work. The
+            // install restarts the daemon, which cuts every session, SSH
+            // connection, Fleet RPC run, transfer and recording it serves
+            // (`busy`). Skip the cycle while any is live, or the network just
+            // moved (R5b), unless we've deferred MAX_CONSECUTIVE_DEFERS times
+            // in a row (security-vs-uptime trade-off documented in the rc.19
+            // plan M3 fix). The timer's cycle, and since #4245 the recheck
+            // after a long control-socket outage (`cycle`).
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                recheck,
+            } => {
                 defer_recheck = Some(recheck);
                 tracing::info!(
                     %busy,
                     consecutive_defers,
                     next_check_secs = recheck.as_secs(),
+                    %cycle,
                     "auto-updater: deferring — live work a restart would cut, or the network just moved"
                 );
                 continue;
             }
-            DeferDecision::ForceAfterDefers => {
+            CycleArm::Gated {
+                decision: DeferDecision::ForceAfterDefers,
+                ..
+            } => {
                 tracing::warn!(
                     %busy,
-                    consecutive_defers,
+                    consecutive_defers = defers_before,
+                    %cycle,
                     "auto-updater: forcing update after {} consecutive defers",
                     MAX_CONSECUTIVE_DEFERS
                 );
-                consecutive_defers = 0;
                 // Fall through to check_once.
             }
-            DeferDecision::Proceed => {
-                consecutive_defers = 0;
-            }
+            CycleArm::Gated {
+                decision: DeferDecision::Proceed,
+                ..
+            } => {}
         }
 
         let outcome = check_once().await;
@@ -3515,6 +3599,84 @@ pub(crate) fn periodic_gate(
 pub(crate) fn forced_update_warning(busy: &crate::busy::Busy) -> Option<String> {
     (busy.cuttable() || busy.unforceable())
         .then(|| format!("forced update proceeding despite: {busy}"))
+}
+
+/// #4245 — the arm one cycle of [`run_periodic`] takes ([`cycle_arm`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CycleArm {
+    /// An ask inside the install-storm cooldown ([`STARTUP_UPDATE_COOLDOWN`]):
+    /// nothing runs this cycle.
+    Cooldown,
+    /// An operator's push (S1a): a check now, live work or not, of `pin` when
+    /// it names a release. `warning` names what the update cuts.
+    Forced {
+        pin: Option<String>,
+        warning: Option<String>,
+    },
+    /// The live-work gate's verdict ([`periodic_gate`]). `DeferOnce` runs no
+    /// check and looks again after `recheck`; the other two check now.
+    Gated {
+        decision: DeferDecision,
+        recheck: Duration,
+    },
+}
+
+impl CycleArm {
+    /// The consecutive-defer count after this cycle: ONE budget, whichever
+    /// cycle spends it. A defer adds one, a check the gate let through
+    /// (forced at the cap or not) starts it again, and an operator's push or
+    /// a suppressed ask leaves it as it was.
+    pub(crate) fn defers_after(&self, consecutive_defers: u32) -> u32 {
+        match self {
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                ..
+            } => consecutive_defers.saturating_add(1),
+            CycleArm::Gated { .. } => 0,
+            CycleArm::Cooldown | CycleArm::Forced { .. } => consecutive_defers,
+        }
+    }
+}
+
+/// #4245 — which arm a cycle of [`run_periodic`] takes. `ask` is what woke
+/// it, `None` for the loop's own timer; `in_cooldown`, an install attempt
+/// younger than [`STARTUP_UPDATE_COOLDOWN`], suppresses an ask of either
+/// kind (the timer has its own carve-out, the skipped first check). Only an
+/// operator's push takes the forced arm. The recheck after a long
+/// control-socket outage is the timer's cycle run early: before #4245 it
+/// took the push's arm and installed over live work. Pure: the cells' entry,
+/// and the loop's.
+pub(crate) fn cycle_arm(
+    ask: Option<&UpdateAsk>,
+    busy: &crate::busy::Busy,
+    consecutive_defers: u32,
+    in_cooldown: bool,
+) -> CycleArm {
+    match ask {
+        Some(_) if in_cooldown => CycleArm::Cooldown,
+        // S1a — the operator asked NOW: the one ask the gate never holds.
+        Some(UpdateAsk::Operator(pin)) => CycleArm::Forced {
+            pin: pin.clone(),
+            warning: forced_update_warning(busy),
+        },
+        // The gate, on the one defer budget: a recheck that defers counts,
+        // and one at the cap forces, as the timer's cycle does.
+        Some(UpdateAsk::OutageRecheck) | None => {
+            let (decision, recheck) = periodic_gate(busy, consecutive_defers);
+            CycleArm::Gated { decision, recheck }
+        }
+    }
+}
+
+/// #4245 — the `cycle` the gate's log lines carry: `periodic` for the timer's
+/// own cycle, `outage_recheck` for the recheck after a long control-socket
+/// outage, which takes the same gate.
+fn cycle_name(ask: Option<&UpdateAsk>) -> &'static str {
+    match ask {
+        None => "periodic",
+        Some(UpdateAsk::OutageRecheck) => "outage_recheck",
+        Some(UpdateAsk::Operator(_)) => "operator_push",
+    }
 }
 
 // ─── macOS update half (`com.roomler.update` + `update-helper`) ──────────
@@ -3630,7 +3792,7 @@ const ENABLE_THE_HELPER: &str = "sudo systemctl enable --now roomler-update.time
 #[cfg(target_os = "linux")]
 async fn wait_for_the_helper(
     shutdown: tokio::sync::watch::Receiver<bool>,
-    trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
     interval: Duration,
 ) {
     tracing::warn!(
@@ -3657,27 +3819,27 @@ async fn wait_for_the_helper_with(
     helper_on: impl Fn() -> Option<PathBuf>,
     recheck: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
 ) {
     loop {
-        let pushed = tokio::select! {
+        let asked = tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { return; }
                 continue;
             }
-            _ = tokio::time::sleep(recheck) => false,
+            _ = tokio::time::sleep(recheck) => None,
             maybe = trigger_rx.recv() => {
                 // The sender lives in a process-wide OnceLock, so a closed
                 // channel is unreachable in practice; never hot-loop on one.
-                if maybe.is_none() { return; }
-                true
+                let Some(ask) = maybe else { return };
+                Some(ask.label())
             }
         };
         let Some(link) = helper_on() else {
-            if pushed {
+            if let Some(asked) = asked {
                 tracing::warn!(
                     how = ENABLE_THE_HELPER,
-                    "rc:agent.update received, but this daemon cannot install updates and the root \
+                    "{asked} received, but this daemon cannot install updates and the root \
                      update helper is not enabled"
                 );
             }
@@ -3687,11 +3849,11 @@ async fn wait_for_the_helper_with(
             enabled_by = %link.display(),
             "auto-updater: the root update helper is enabled now — handing updates to it"
         );
-        if pushed {
+        if let Some(asked) = asked {
             match queue_update_check_at(wake) {
                 Ok(()) => tracing::info!(
                     trigger = %wake.display(),
-                    "rc:agent.update queued for the root update helper (roomler-update.service); \
+                    "{asked} queued for the root update helper (roomler-update.service); \
                      watch `journalctl -u roomler-update.service`"
                 ),
                 Err(e) => tracing::warn!(error = %e, "could not write the update-helper wake file"),
@@ -3779,9 +3941,10 @@ pub(crate) fn queue_update_check_at(path: &std::path::Path) -> std::io::Result<(
 }
 
 /// The [`run_periodic`] body wherever a root update helper owns updates:
-/// forward every `rc:agent.update` trigger to the wake file and do nothing
-/// else. The periodic cadence lives in the helper's own schedule (the plist's
-/// `StartInterval` on macOS, `roomler-update.timer` on Linux) — ONE owner of
+/// forward every ask, an `rc:agent.update` push or the outage recheck
+/// ([`UpdateAsk`]), to the wake file and do nothing else. The periodic
+/// cadence lives in the helper's own schedule (the plist's `StartInterval` on
+/// macOS, `roomler-update.timer` on Linux) — ONE owner of
 /// "check+download+verify+install", zero in-process installs.
 ///
 /// Taken by every macOS agent, and from FR-96 P2a by a Linux per-user daemon
@@ -3790,7 +3953,7 @@ pub(crate) fn queue_update_check_at(path: &std::path::Path) -> std::io::Result<(
 /// type-checking in cross-platform CI lanes.
 async fn forward_triggers(
     shutdown: tokio::sync::watch::Receiver<bool>,
-    trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
 ) {
     forward_triggers_to(
         std::path::Path::new(update_trigger_path()),
@@ -3805,7 +3968,7 @@ async fn forward_triggers(
 async fn forward_triggers_to(
     wake: &std::path::Path,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
 ) {
     loop {
         tokio::select! {
@@ -3813,8 +3976,9 @@ async fn forward_triggers_to(
                 if *shutdown.borrow() { return; }
             }
             maybe = trigger_rx.recv() => {
-                let Some(pin) = maybe else { return };
-                if let Some(tag) = pin {
+                let Some(ask) = maybe else { return };
+                let asked = ask.label();
+                if let UpdateAsk::Operator(Some(tag)) = ask {
                     // Deliberate: pins do NOT cross the trigger boundary
                     // (see MACOS_UPDATE_TRIGGER — content is untrusted).
                     // The helper installs LATEST; a pinned downgrade is a
@@ -3841,12 +4005,12 @@ async fn forward_triggers_to(
                 match queue_update_check_at(wake) {
                     Ok(()) if cfg!(target_os = "macos") => tracing::info!(
                         trigger = %wake.display(),
-                        "rc:agent.update queued for the root update helper (com.roomler.update); \
+                        "{asked} queued for the root update helper (com.roomler.update); \
                          watch /var/log/roomler/update.log"
                     ),
                     Ok(()) => tracing::info!(
                         trigger = %wake.display(),
-                        "rc:agent.update queued for the root update helper (roomler-update.service); \
+                        "{asked} queued for the root update helper (roomler-update.service); \
                          watch `journalctl -u roomler-update.service`"
                     ),
                     Err(e) if cfg!(target_os = "macos") => tracing::warn!(
@@ -3862,7 +4026,7 @@ async fn forward_triggers_to(
                     Err(e) => tracing::warn!(
                         error = %e,
                         wake = %wake.display(),
-                        "could not write the update-helper wake file — the push waits for the \
+                        "could not write the update-helper wake file — the check waits for the \
                          helper's own timer (every 6 h). Read-only file system = this daemon's \
                          unit predates FR-96 P2a: re-run install.sh to refresh it"
                     ),
@@ -4355,6 +4519,10 @@ mod tests {
         assert!(
             !super::request_update_now(None),
             "a push to a daemon whose updater is off must report undeliverable"
+        );
+        assert!(
+            !super::request_update_recheck(),
+            "#4245: so must the recheck after a long control-socket outage"
         );
     }
 
@@ -5711,7 +5879,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn drained(tx: &tokio::sync::mpsc::Sender<Option<String>>) {
+    async fn drained(tx: &tokio::sync::mpsc::Sender<UpdateAsk>) {
         for _ in 0..200 {
             if tx.capacity() == tx.max_capacity() {
                 return;
@@ -5761,21 +5929,39 @@ mod tests {
             .await
         });
 
-        trigger_tx.send(None).await.expect("push");
+        trigger_tx
+            .send(UpdateAsk::Operator(None))
+            .await
+            .expect("push");
         drained(&trigger_tx).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!wake.exists(), "with the helper off, a push wakes nothing");
 
         on.store(true, std::sync::atomic::Ordering::SeqCst);
-        trigger_tx.send(None).await.expect("push");
+        trigger_tx
+            .send(UpdateAsk::Operator(None))
+            .await
+            .expect("push");
         assert!(
             appears_soon(&wake).await,
             "the push that finds the helper on is forwarded"
         );
 
         std::fs::remove_file(&wake).expect("the helper consumes it");
-        trigger_tx.send(None).await.expect("push");
+        trigger_tx
+            .send(UpdateAsk::Operator(None))
+            .await
+            .expect("push");
         assert!(appears_soon(&wake).await, "and so is every later one");
+
+        // #4245 — the recheck after a long control-socket outage wakes the
+        // helper as a push does.
+        std::fs::remove_file(&wake).expect("the helper consumes it");
+        trigger_tx
+            .send(UpdateAsk::OutageRecheck)
+            .await
+            .expect("recheck");
+        assert!(appears_soon(&wake).await, "a recheck is forwarded too");
 
         shutdown_tx.send(true).expect("shutdown");
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -5815,7 +6001,10 @@ mod tests {
             !wake.exists(),
             "the recheck hands over without inventing a wake"
         );
-        trigger_tx.send(None).await.expect("push");
+        trigger_tx
+            .send(UpdateAsk::Operator(None))
+            .await
+            .expect("push");
         assert!(appears_soon(&wake).await, "the next push is forwarded");
 
         shutdown_tx.send(true).expect("shutdown");
@@ -5827,9 +6016,12 @@ mod tests {
 
     /// A push, on a host whose helper owns updates, writes the wake file and
     /// nothing else — a pinned push too (the pin never crosses the boundary;
-    /// the helper installs the latest). The loop ends on shutdown.
+    /// the helper installs the latest). #4245 cell 8: the recheck after a long
+    /// control-socket outage writes it as a push does, and its line names the
+    /// recheck, never `rc:agent.update`. The loop ends on shutdown.
     #[tokio::test]
-    async fn a_forwarded_push_writes_the_wake_file_and_nothing_else() {
+    async fn a_forwarded_push_or_recheck_writes_the_wake_file_and_nothing_else() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
         let tmp = tempfile::tempdir().expect("tempdir");
         let wake = tmp.path().join("roomler-update-check");
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -5848,12 +6040,15 @@ mod tests {
             false
         }
 
-        trigger_tx.send(None).await.expect("push");
+        trigger_tx
+            .send(UpdateAsk::Operator(None))
+            .await
+            .expect("push");
         assert!(appears(&wake).await, "a push writes the wake file");
 
         std::fs::remove_file(&wake).expect("the helper consumes it");
         trigger_tx
-            .send(Some("agent-v0.4.1".to_string()))
+            .send(UpdateAsk::Operator(Some("agent-v0.4.1".to_string())))
             .await
             .expect("pinned push");
         assert!(
@@ -5861,11 +6056,39 @@ mod tests {
             "a pinned push still only wakes the helper"
         );
 
+        std::fs::remove_file(&wake).expect("the helper consumes it");
+        trigger_tx
+            .send(UpdateAsk::OutageRecheck)
+            .await
+            .expect("recheck");
+        assert!(
+            appears(&wake).await,
+            "a recheck writes the wake file as a push does"
+        );
+
         shutdown_tx.send(true).expect("shutdown");
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the forwarder ends on shutdown")
             .expect("no panic");
+
+        let text = log.text();
+        let queued: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("queued for the root update helper"))
+            .collect();
+        assert_eq!(queued.len(), 3, "one line a wake:\n{text}");
+        for push in &queued[..2] {
+            assert!(push.contains("rc:agent.update queued"), "{push}");
+        }
+        assert!(
+            queued[2].contains("the update recheck after a long control-socket outage queued"),
+            "{text}"
+        );
+        assert!(
+            !queued[2].contains("rc:agent.update"),
+            "a recheck is never called rc:agent.update: {text}"
+        );
     }
 
     /// FR-96 P3 — the words `install.sh` matches are the words this binary
@@ -7018,6 +7241,297 @@ mod tests {
             ..Busy::IDLE
         };
         assert_eq!(periodic_gate(&installing, 0).0, DeferDecision::Proceed);
+    }
+
+    // ---- #4245 — the recheck after a long control-socket outage waits too ----
+    //
+    // The recheck is the timer's cycle run early: `cycle_arm` decides it with
+    // `periodic_gate`, on the one defer budget, and only an operator's push
+    // takes the forced arm. Each cell decides from a `Busy` it builds or reads
+    // (as the #3429 cells above do), never through the process-wide trigger.
+
+    /// Cell 1 — an outage recheck with a remote-control session in the
+    /// daemon's registry: the gate defers it, rechecked in the hour, and no
+    /// check runs this cycle.
+    #[test]
+    fn an_outage_recheck_with_a_live_session_defers_by_the_hour() {
+        let busy = crate::busy::now(&one_live_session());
+        assert_eq!(busy.rc_sessions, 1, "{busy}");
+        assert_eq!(
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false),
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                recheck: TRANSFER_DEFER_RECHECK,
+            },
+            "{busy}"
+        );
+    }
+
+    /// Cell 2 — an open SSH connection defers it the same way. One on the
+    /// mesh needs no control socket, so it outlives any outage of it. Built,
+    /// not opened: the count is the process's, and other cells read it
+    /// (`a_live_ssh_connection_defers_the_periodic_update` reads a real one).
+    #[test]
+    fn an_outage_recheck_with_a_live_ssh_connection_defers() {
+        let busy = crate::busy::Busy {
+            ssh_connections: 1,
+            ..crate::busy::Busy::IDLE
+        };
+        assert_eq!(
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, 0, false),
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                recheck: TRANSFER_DEFER_RECHECK,
+            },
+            "{busy}"
+        );
+    }
+
+    /// Cell 3 — with nothing live the recheck proceeds through the gate: the
+    /// check runs at once, the fleet-heal the recheck is for.
+    #[test]
+    fn an_outage_recheck_with_nothing_live_proceeds() {
+        let arm = cycle_arm(
+            Some(&UpdateAsk::OutageRecheck),
+            &crate::busy::Busy::IDLE,
+            0,
+            false,
+        );
+        assert!(
+            matches!(
+                arm,
+                CycleArm::Gated {
+                    decision: DeferDecision::Proceed,
+                    ..
+                }
+            ),
+            "{arm:?}"
+        );
+    }
+
+    /// Cell 4 — one budget: timer cycles and outage rechecks, in turn, with a
+    /// session that stays, spend the same consecutive-defer count, and a
+    /// recheck at [`MAX_CONSECUTIVE_DEFERS`] forces as the timer's would.
+    #[test]
+    fn an_outage_recheck_at_the_cap_forces_on_the_one_budget() {
+        let busy = crate::busy::now(&one_live_session());
+        let recheck = UpdateAsk::OutageRecheck;
+        let mut defers = 0;
+        for cycle in 0..MAX_CONSECUTIVE_DEFERS {
+            let ask = (cycle % 2 == 1).then_some(&recheck);
+            let arm = cycle_arm(ask, &busy, defers, false);
+            assert!(
+                matches!(
+                    arm,
+                    CycleArm::Gated {
+                        decision: DeferDecision::DeferOnce,
+                        ..
+                    }
+                ),
+                "cycle {cycle} ({ask:?}) after {defers} defers: {arm:?} for {busy}"
+            );
+            defers = arm.defers_after(defers);
+        }
+        assert_eq!(
+            defers, MAX_CONSECUTIVE_DEFERS,
+            "each defer counts once, whichever cycle it was"
+        );
+        let at_cap = cycle_arm(Some(&recheck), &busy, defers, false);
+        assert_eq!(
+            at_cap,
+            CycleArm::Gated {
+                decision: DeferDecision::ForceAfterDefers,
+                recheck: TRANSFER_DEFER_RECHECK,
+            },
+            "{busy}"
+        );
+        assert_eq!(
+            at_cap.defers_after(defers),
+            0,
+            "a check the gate let through starts the budget again"
+        );
+    }
+
+    /// Cell 5 — an operator's push with a session live still takes the forced
+    /// arm, as before #4245, and its warning names the session. A pinned push
+    /// keeps its pin, at the cap too, and a push neither spends nor resets
+    /// the defer budget.
+    #[test]
+    fn an_operators_push_with_a_live_session_still_takes_the_forced_arm() {
+        let busy = crate::busy::now(&one_live_session());
+        let arm = cycle_arm(Some(&UpdateAsk::Operator(None)), &busy, 0, false);
+        let CycleArm::Forced {
+            pin: None,
+            warning: Some(warning),
+        } = &arm
+        else {
+            panic!("{arm:?} for {busy}");
+        };
+        assert!(warning.contains("1 remote-control session"), "{warning}");
+        let pinned = cycle_arm(
+            Some(&UpdateAsk::Operator(Some("agent-v0.4.1".into()))),
+            &busy,
+            MAX_CONSECUTIVE_DEFERS,
+            false,
+        );
+        assert!(
+            matches!(&pinned, CycleArm::Forced { pin: Some(tag), .. } if tag == "agent-v0.4.1"),
+            "{pinned:?}"
+        );
+        assert_eq!(
+            pinned.defers_after(3),
+            3,
+            "a push neither spends nor resets the budget"
+        );
+    }
+
+    /// Cell 6 — the long-outage path in `signaling.rs` asks for the recheck
+    /// kind, never the operator kind: `note_ws_up_and_maybe_recheck_update`
+    /// calls [`request_update_recheck`], and `request_update_now` is called
+    /// once in the signalling loop's code, by the `rc:agent.update` arm. Each
+    /// request function puts its own kind on the channel (this thread's).
+    #[test]
+    fn the_long_outage_path_asks_for_the_recheck_never_the_operator() {
+        let src = include_str!("signaling.rs").replace("\r\n", "\n");
+        let code = src.split("\nmod tests {").next().unwrap();
+        let start = code
+            .find("    fn note_ws_up_and_maybe_recheck_update(&self) {\n")
+            .expect("the long-outage path");
+        let body = &code[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("UPDATE_RECHECK_AFTER_DOWN"),
+            "not the long-outage path:\n{body}"
+        );
+        assert!(
+            !body.contains("request_update_now"),
+            "the long-outage path asks as the operator:\n{body}"
+        );
+        assert!(
+            body.contains("crate::updater::request_update_recheck()"),
+            "the long-outage path asks for no recheck:\n{body}"
+        );
+        assert_eq!(
+            code.matches("crate::updater::request_update_now(").count(),
+            1,
+            "only the rc:agent.update arm asks as the operator"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        TRIGGER_HERE.with(|t| *t.borrow_mut() = Some(tx));
+        let recheck_sent = request_update_recheck();
+        let push_sent = request_update_now(Some("agent-v0.4.1".into()));
+        TRIGGER_HERE.with(|t| *t.borrow_mut() = None);
+        assert!(recheck_sent && push_sent);
+        assert_eq!(rx.try_recv().ok(), Some(UpdateAsk::OutageRecheck));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(UpdateAsk::Operator(Some("agent-v0.4.1".into())))
+        );
+    }
+
+    /// Cell 7 — an outage recheck inside the install-storm cooldown is
+    /// suppressed, as it was when it took the forced arm, and so is a push;
+    /// neither touches the budget. The timer's own cycle never reads the flag:
+    /// its carve-out is the skipped first check.
+    #[test]
+    fn an_outage_recheck_inside_the_install_storm_cooldown_is_suppressed() {
+        let live = crate::busy::now(&one_live_session());
+        for busy in [crate::busy::Busy::IDLE, live] {
+            for ask in [UpdateAsk::OutageRecheck, UpdateAsk::Operator(None)] {
+                let arm = cycle_arm(Some(&ask), &busy, 2, true);
+                assert_eq!(arm, CycleArm::Cooldown, "{ask:?} with {busy}");
+                assert_eq!(arm.defers_after(2), 2, "{ask:?}");
+            }
+        }
+        assert!(
+            matches!(
+                cycle_arm(None, &crate::busy::Busy::IDLE, 0, true),
+                CycleArm::Gated {
+                    decision: DeferDecision::Proceed,
+                    ..
+                }
+            ),
+            "the timer's cycle is the gate's"
+        );
+    }
+
+    /// The recheck IS the timer's cycle, run early: outside the cooldown it
+    /// takes the timer's arm for every `Busy` and every count. R5b included:
+    /// a long outage often ends because the network moved, and a transition
+    /// alone defers the recheck two minutes, as it does the timer's cycle.
+    #[test]
+    fn an_outage_recheck_is_the_timers_cycle_run_early() {
+        use crate::busy::Busy;
+        let session = Busy {
+            rc_sessions: 1,
+            ..Busy::IDLE
+        };
+        let moved = Busy {
+            net_transition: true,
+            ..Busy::IDLE
+        };
+        let cases = [
+            Busy::IDLE,
+            session,
+            Busy {
+                ssh_connections: 1,
+                ..Busy::IDLE
+            },
+            Busy {
+                exec_runs: 1,
+                ..Busy::IDLE
+            },
+            Busy {
+                work: 1,
+                ..Busy::IDLE
+            },
+            moved,
+            Busy {
+                net_transition: true,
+                ..session
+            },
+            Busy {
+                install_in_flight: true,
+                ..Busy::IDLE
+            },
+        ];
+        for busy in cases {
+            for defers in [0, 1, MAX_CONSECUTIVE_DEFERS - 1, MAX_CONSECUTIVE_DEFERS] {
+                assert_eq!(
+                    cycle_arm(Some(&UpdateAsk::OutageRecheck), &busy, defers, false),
+                    cycle_arm(None, &busy, defers, false),
+                    "{busy} after {defers} defers"
+                );
+            }
+        }
+        assert_eq!(
+            cycle_arm(Some(&UpdateAsk::OutageRecheck), &moved, 0, false),
+            CycleArm::Gated {
+                decision: DeferDecision::DeferOnce,
+                recheck: NET_DEFER_RECHECK,
+            }
+        );
+    }
+
+    /// #4245 — the gate's lines say which cycle they decided, and no line
+    /// calls a recheck `rc:agent.update`.
+    #[test]
+    fn the_gate_lines_name_the_outage_recheck() {
+        assert_eq!(cycle_name(None), "periodic");
+        assert_eq!(
+            cycle_name(Some(&UpdateAsk::OutageRecheck)),
+            "outage_recheck"
+        );
+        assert_eq!(
+            cycle_name(Some(&UpdateAsk::Operator(None))),
+            "operator_push"
+        );
+        assert_eq!(
+            UpdateAsk::Operator(Some("agent-v0.4.1".into())).label(),
+            "rc:agent.update"
+        );
+        assert!(!UpdateAsk::OutageRecheck.label().contains("rc:agent.update"));
     }
 
     // ---- #1755 — a check that failed on the transport retries early ----

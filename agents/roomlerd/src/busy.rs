@@ -5,11 +5,11 @@
 //! (#3429, from FR-96 P2b).
 //!
 //! - **The periodic update check** ([`crate::updater::run_periodic`], every
-//!   OS) defers while any of it is live, on the budget transfers always had:
-//!   a recheck every hour, forced after
+//!   OS, and its early run after a long control-socket outage, #4245)
+//!   defers while any of it is live: a recheck every hour, forced after
 //!   [`MAX_CONSECUTIVE_DEFERS`](crate::updater::MAX_CONSECUTIVE_DEFERS)
-//!   defers in a row (`updater::periodic_gate`). An operator's push
-//!   still proceeds, and its warning names what it cuts.
+//!   defers in a row (`updater::periodic_gate`). Only an operator's push
+//!   skips it, and its warning names what it cuts.
 //! - **The replaced-binary restart** ([`crate::replaced_binary`], a per-user
 //!   Linux daemon) waits for it up to its 24 h ceiling.
 //!
