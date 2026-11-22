@@ -14,10 +14,12 @@
  *
  * Correct text puts neither U+00C2 nor U+00C3 before a character in
  * U+0080-U+00BF, so any line that does is damaged. Text damaged by ONE pass
- * can lack that pair (an em dash, E2 80 94, becomes U+00E2 U+0080 U+0094), but
- * it still holds C1 controls (U+0080-U+009F), and UI source has no use for
- * one. So a line holding a C1 control fails too. The patterns are written
- * with escapes, so this file never matches itself.
+ * can lack that pair: an em dash (E2 80 94) becomes U+00E2 U+0080 U+0094.
+ * It still holds a C1 control (U+0080-U+009F) whenever the character is in
+ * U+2000-U+27FF (dashes, arrows, math signs, box lines) or is an emoji
+ * (F0 9F ..), because one of its bytes is then in 80-9F. UI source has no
+ * use for a C1 control, so a line holding one fails too. The patterns are
+ * written with escapes, so this file never matches itself.
  */
 import { describe, expect, it } from 'vitest'
 import { readdirSync, readFileSync } from 'node:fs'
