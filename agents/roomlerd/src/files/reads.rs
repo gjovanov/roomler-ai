@@ -73,7 +73,8 @@ pub(super) const LISTING_BOUND: Duration = Duration::from_secs(super::DIR_LIST_T
 /// lookup's on Linux), its wait for the channel's lane, and its step. The
 /// viewer waits 5 s from its send, and 5 s after each page of a listing in
 /// pages (`ui/src/composables/remoteDirListing.ts`): 0.5 s for the way there
-/// and back if the read loop hands it on at once; an upload's end, run inline, can delay it.
+/// and back, since the read loop hands it on at once, during an upload's end
+/// too: that end's placement runs in the channel's placement lane (#4082).
 pub(super) const LISTING_ANSWERED_WITHIN: Duration = Duration::from_millis(4500);
 
 /// How many listings may wait on a channel's lane behind the step it runs.

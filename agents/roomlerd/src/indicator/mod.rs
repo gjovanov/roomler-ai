@@ -262,8 +262,16 @@ impl ViewerIndicator {
     ///
     /// Answers arrive on the `ConsentSender` given at construction, never by
     /// resolving consent here: the broker stays the single decision point.
-    pub fn show_prompt(&self, view: PromptView) -> bool {
-        self.inner.prompt(view)
+    ///
+    /// FR-149 P1 — on a one-row Mac's root daemon the screen worker's panel
+    /// is asked first ([`session_panel::chain`]), for [`session_panel::PANEL_WITHIN`]
+    /// at most, and this daemon's own panel only when the worker was not
+    /// asked. Everywhere else this is the daemon's own panel, at once, as
+    /// before. The answer carries `native` and the fields of the caller's
+    /// per-prompt line ([`session_panel::Prompted`]).
+    pub async fn show_prompt(&self, view: PromptView) -> session_panel::Prompted {
+        let own = view.clone();
+        session_panel::chain(&session_panel::TheRoad, &view, || self.inner.prompt(own)).await
     }
 
     /// FR-93 P6f — the last on-screen surface: the question as a desktop
@@ -331,7 +339,12 @@ impl ViewerIndicator {
 
     /// Take a consent prompt down — it was answered, timed out, or resolved
     /// somewhere else (the CLI, the companion, an emailed link). Idempotent.
+    /// FR-149 P1 — on the screen worker's panel too (`PanelHide`), when it
+    /// shows the question there.
     pub fn hide_prompt(&self, session_hex: &str) {
+        if let Some(host) = crate::consent_relay::one_row_host() {
+            host.hide_panel(session_hex);
+        }
         self.inner.dismiss(session_hex);
         #[cfg(all(target_os = "linux", feature = "portal-capture"))]
         if let Some(n) = &self.notify {
@@ -468,6 +481,11 @@ pub mod mac;
 /// served when the pump started. [`mac`] asks it; its cells run on every lane.
 #[cfg(any(test, all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub(crate) mod panel_gate;
+
+/// FR-149 P1 — a one-row Mac's root daemon asks its screen worker to show its
+/// consent questions on the person's own panel, and the chain that decides
+/// which panel shows one. Its cells run on every lane.
+pub(crate) mod session_panel;
 
 /// #4053 — whether another console session has started since a root process's
 /// panel came up, from the window server's notify(3) names, for [`panel_gate`].

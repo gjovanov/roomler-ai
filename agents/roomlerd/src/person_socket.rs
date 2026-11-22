@@ -763,6 +763,46 @@ pub async fn run(state: Arc<dyn LocalApiState>, shutdown: watch::Receiver<bool>)
     follow_the_seat(state, shutdown, Following::the_daemons()).await
 }
 
+/// FR-149 P1 — the person this root daemon's person socket serves now, and
+/// how that listener ended once it has: set by [`follow_the_seat`] each time
+/// it looks, read by [`serves`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static SERVED: std::sync::Mutex<Option<(u32, watch::Receiver<Option<Ended>>)>> =
+    std::sync::Mutex::new(None);
+
+/// FR-149 P1 — the person this root daemon's person socket serves now: the
+/// account its listener is for, while that listener serves. `None` with the
+/// socket off (`ROOMLERD_PERSON_SOCKET=0`), with nobody served, between a
+/// seat's change and the next listener, once a listener has ended, off a root
+/// daemon, and off Linux and macOS. A one-row Mac's root daemon asks its
+/// screen worker to show a question only for this person
+/// (`indicator::session_panel`), since an answer on that panel comes back
+/// over this socket, as the person's app's does.
+pub fn serves() -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let served = SERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        served
+            .as_ref()
+            .filter(|(_, ended)| ended.borrow().is_none() && ended.has_changed().is_ok())
+            .map(|(uid, _)| *uid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_served(listener: Option<&Listener>) {
+    *SERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        listener.map(|l| (l.uid, l.ended.clone()));
+}
+
 /// #3845 — how [`follow_the_seat`] follows the seat: the daemon's, or a
 /// test's, which looks more often and makes its sockets in a folder of its
 /// own.
@@ -913,6 +953,8 @@ async fn follow_the_seat(
                 }
             }
         }
+        // FR-149 P1 — who is served now, for the screen worker's panel.
+        set_served(current.as_ref());
         tokio::select! {
             _ = tokio::time::sleep(following.every) => {}
             // #2531 — a listener whose path no longer names it is looked
@@ -930,6 +972,7 @@ async fn follow_the_seat(
             }
         }
     }
+    set_served(None);
     if let Some(l) = current.take() {
         l.stop().await;
     }

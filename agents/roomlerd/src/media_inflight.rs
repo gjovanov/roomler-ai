@@ -1377,6 +1377,100 @@ impl Drop for Unsent<'_> {
     }
 }
 
+/// FR-148 — the send wait: each frame's time from its hand-off to the send
+/// channel to the moment SCTP took its last chunk, the latency the transport
+/// adds before a viewer can paint it. One measure per pump, owned by its
+/// delivery sampler and kept under every mode of the in-flight budget (beside
+/// [`PumpCount`], which counts nothing with the budget off). The send task
+/// records each frame that reached the wire ([`Self::sent`]); a frame whose
+/// send failed, or a stale or dropped one, never rode the wire and records
+/// nothing (a stale frame's wait would count the rebuild gap the FFmpeg
+/// pump's epoch discard exists to erase). Each reader drains its own window:
+/// the heartbeat takes it ([`Self::take`]), and a reader between heartbeats
+/// reads it from where it last read ([`SendWaitSince`]).
+#[derive(Debug, Default)]
+pub struct SendWait {
+    sum_us: AtomicU64,
+    max_us: AtomicU64,
+    frames: AtomicU64,
+}
+
+impl SendWait {
+    /// A frame handed to the send channel at `enqueued_at` whose last chunk
+    /// SCTP took at `now`: its wait, µs, recorded. Three relaxed atomics, no
+    /// lock: the send task calls it once per frame.
+    pub fn sent(&self, enqueued_at: Instant, now: Instant) -> u64 {
+        let us = now.saturating_duration_since(enqueued_at).as_micros() as u64;
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        us
+    }
+
+    /// The heartbeat's window, taken whole: the next one starts from nothing.
+    pub fn take(&self) -> SendWaitWindow {
+        let frames = self.frames.swap(0, Ordering::Relaxed);
+        let sum_us = self.sum_us.swap(0, Ordering::Relaxed);
+        let max_us = self.max_us.swap(0, Ordering::Relaxed);
+        SendWaitWindow {
+            frames,
+            sum_us,
+            max_us,
+        }
+    }
+
+    /// The longest wait in the heartbeat's window so far, ms.
+    pub fn max_ms(&self) -> f64 {
+        self.max_us.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+}
+
+/// A heartbeat's window of [`SendWait`]: the frames that reached the wire, the
+/// sum of their waits and the longest, µs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendWaitWindow {
+    pub frames: u64,
+    pub sum_us: u64,
+    pub max_us: u64,
+}
+
+impl SendWaitWindow {
+    /// The heartbeat's two fields, ms: `send_wait_avg_ms`, the window's average
+    /// in whole µs (0 with no frame), and `send_wait_max_ms`, its longest.
+    pub fn ms(&self) -> (f64, f64) {
+        let avg = self
+            .sum_us
+            .checked_div(self.frames)
+            .map(|us| us as f64 / 1000.0)
+            .unwrap_or(0.0);
+        (avg, self.max_us as f64 / 1000.0)
+    }
+}
+
+/// A reader of [`SendWait`] between heartbeats: where it last read the window's
+/// sum and frames. The heartbeat's take starts the window over under it, and
+/// the first read after a take is read against the old place, saturating: as
+/// the FFmpeg pump's two such readers (FR-71 T1a's sender window, FR-74 P1b's
+/// gate) have read since they were written.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendWaitSince {
+    sum_us: u64,
+    frames: u64,
+}
+
+impl SendWaitSince {
+    /// The average wait of the frames recorded since this reader last read, ms
+    /// (`None` with none), and its place moved to now.
+    pub fn avg_ms(&mut self, wait: &SendWait) -> Option<f64> {
+        let sum_us = wait.sum_us.load(Ordering::Relaxed);
+        let frames = wait.frames.load(Ordering::Relaxed);
+        let n = frames.saturating_sub(self.frames);
+        let avg = (n > 0).then(|| sum_us.saturating_sub(self.sum_us) as f64 / n as f64 / 1000.0);
+        *self = Self { sum_us, frames };
+        avg
+    }
+}
+
 /// Whether the selected candidate pair changed: a first pair is no change, and
 /// no pair (none selected, or none read) keeps the last.
 #[derive(Debug)]
@@ -2281,6 +2375,197 @@ mod tests {
         let off = PumpCount::default();
         let mut frame = off.unsent(16_384);
         frame.sent(16_384);
+    }
+
+    /// FR-148 (S1) — the send wait. Frames handed and taken by SCTP at known
+    /// instants give the window's sum, longest and count; a frame whose send
+    /// failed, or a stale or dropped one, is never recorded (the send task
+    /// records a frame only once its last chunk went:
+    /// `media_delivery::tests::both_pumps_measure_the_send_wait_once`), so it
+    /// counts nowhere. Each reader drains its own window: one between
+    /// heartbeats reads from where it last read, whatever another read, and
+    /// the heartbeat's take is whole after both read, and starts the next
+    /// window from nothing.
+    #[test]
+    fn the_send_wait_counts_the_frames_that_reached_the_wire_and_each_reader_drains_its_own_window()
+    {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let wait = SendWait::default();
+        let (mut a, mut b) = (SendWaitSince::default(), SendWaitSince::default());
+        assert_eq!(
+            wait.sent(at(0), at(20)),
+            20_000,
+            "handed at 0, on the wire at 20"
+        );
+        assert_eq!(a.avg_ms(&wait), Some(20.0), "a: the first frame");
+        assert_eq!(wait.sent(at(5), at(25)), 20_000);
+        // Handed at 12 ms, its send failed: the send task records nothing.
+        assert_eq!(wait.sent(at(10), at(40)), 30_000);
+        assert_eq!(a.avg_ms(&wait), Some(25.0), "a: the two since it read");
+        assert_eq!(
+            b.avg_ms(&wait),
+            Some(70_000.0 / 3.0 / 1000.0),
+            "b: all three, whatever a read"
+        );
+        assert_eq!(a.avg_ms(&wait), None, "a: nothing since");
+        assert_eq!(wait.max_ms(), 30.0, "the window's longest so far");
+        assert_eq!(
+            wait.take(),
+            SendWaitWindow {
+                frames: 3,
+                sum_us: 70_000,
+                max_us: 30_000
+            },
+            "the heartbeat's window, whole after both read"
+        );
+        assert_eq!(wait.take(), SendWaitWindow::default(), "taken");
+        assert_eq!(wait.max_ms(), 0.0, "the next window starts from nothing");
+        // A wire time the clock puts before the hand-off waited nothing.
+        assert_eq!(wait.sent(at(50), at(45)), 0);
+        assert_eq!(
+            wait.take(),
+            SendWaitWindow {
+                frames: 1,
+                sum_us: 0,
+                max_us: 0
+            }
+        );
+    }
+
+    /// FR-148 (S2) — the FFmpeg pump's readings hold. The same frames give
+    /// the heartbeat's `send_wait_avg_ms` and `send_wait_max_ms`, the sender
+    /// window's `send_wait_avg_ms` and `send_wait_max_ms` (FR-71 T1a) and the
+    /// direct gate's average (FR-74 P1b) that the pump's own three atomics
+    /// gave, read by today's arithmetic, kept here as the reference
+    /// (`peer.rs` at 16da4acc2): 100,000 events of frames, heartbeats and the
+    /// two readers' passes in any order, the passes that straddle a heartbeat
+    /// included, where a reader's deltas saturate against its old place and
+    /// the window's longest is the heartbeat's.
+    #[test]
+    fn the_ffmpeg_pump_s_send_wait_readings_hold() {
+        use std::sync::atomic::Ordering::Relaxed;
+        /// Today's: the pump's three atomics and its three readers.
+        #[derive(Default)]
+        struct Today {
+            sum: AtomicU64,
+            max: AtomicU64,
+            frames: AtomicU64,
+            win_sw_sum_last: u64,
+            win_sw_frames_last: u64,
+            gate_sw_sum_last: u64,
+            gate_sw_frames_last: u64,
+            direct_wait_ema_ms: f64,
+            /// Reads whose frame delta saturated across a heartbeat's swap.
+            straddled: u32,
+        }
+        impl Today {
+            fn sent(&self, waited_us: u64) {
+                self.sum.fetch_add(waited_us, Relaxed);
+                self.max.fetch_max(waited_us, Relaxed);
+                self.frames.fetch_add(1, Relaxed);
+            }
+            /// The heartbeat (`peer.rs:10041-10048`).
+            fn heartbeat(&self) -> (f64, f64) {
+                let sw_frames = self.frames.swap(0, Relaxed);
+                let send_wait_avg_ms = self
+                    .sum
+                    .swap(0, Relaxed)
+                    .checked_div(sw_frames)
+                    .map(|us| us as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                let send_wait_max_ms = self.max.swap(0, Relaxed) as f64 / 1000.0;
+                (send_wait_avg_ms, send_wait_max_ms)
+            }
+            /// The sender window's pass (`peer.rs:9277-9290`, `:9308-9309`):
+            /// (`send_wait_max_ms`, `send_wait_avg_ms`).
+            fn window(&mut self) -> (f64, Option<f64>) {
+                let sw_sum_now = self.sum.load(Relaxed);
+                let sw_frames_now = self.frames.load(Relaxed);
+                self.straddled += u32::from(sw_frames_now < self.win_sw_frames_last);
+                let sw_frames = sw_frames_now.saturating_sub(self.win_sw_frames_last);
+                let sw_avg_ms = (sw_frames > 0).then(|| {
+                    sw_sum_now.saturating_sub(self.win_sw_sum_last) as f64
+                        / sw_frames as f64
+                        / 1000.0
+                });
+                let send_wait_max_ms = self.max.load(Relaxed) as f64 / 1000.0;
+                self.win_sw_sum_last = sw_sum_now;
+                self.win_sw_frames_last = sw_frames_now;
+                (send_wait_max_ms, sw_avg_ms)
+            }
+            /// The direct gate's pass (`peer.rs:8046-8057`): its EMA.
+            fn gate(&mut self) -> f64 {
+                let sum_now = self.sum.load(Relaxed);
+                let frames_now = self.frames.load(Relaxed);
+                let frames = frames_now.saturating_sub(self.gate_sw_frames_last);
+                if frames > 0 {
+                    let avg_ms = sum_now.saturating_sub(self.gate_sw_sum_last) as f64
+                        / frames as f64
+                        / 1000.0;
+                    self.direct_wait_ema_ms = 0.7 * self.direct_wait_ema_ms + 0.3 * avg_ms;
+                }
+                self.gate_sw_sum_last = sum_now;
+                self.gate_sw_frames_last = frames_now;
+                self.direct_wait_ema_ms
+            }
+        }
+        let mut today = Today::default();
+        let t0 = Instant::now();
+        let wait = SendWait::default();
+        let (mut window, mut gate) = (SendWaitSince::default(), SendWaitSince::default());
+        let mut ema = 0.0_f64;
+        let (mut clock, mut beats, mut sent) = (0_u64, 0_u32, 0_u32);
+        let mut state = 0x0053_2a17_u64;
+        for i in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state % 16 {
+                // A frame reaches the wire: mostly tens of ms, one in fifty up
+                // to 1.2 s.
+                0..=9 => {
+                    let waited = if (state >> 8).is_multiple_of(50) {
+                        (state >> 16) % 1_200_000
+                    } else {
+                        (state >> 16) % 40_000
+                    };
+                    clock += 1 + (state >> 40) % 40_000;
+                    let handed = t0 + Duration::from_micros(clock);
+                    let on_wire = handed + Duration::from_micros(waited);
+                    assert_eq!(wait.sent(handed, on_wire), waited, "event {i}");
+                    today.sent(waited);
+                    sent += 1;
+                }
+                // The sender window's pass: the average from its place, and
+                // the heartbeat window's longest.
+                10..=12 => {
+                    let avg = window.avg_ms(&wait);
+                    assert_eq!((wait.max_ms(), avg), today.window(), "event {i}");
+                }
+                // The direct gate's pass.
+                13 | 14 => {
+                    if let Some(avg_ms) = gate.avg_ms(&wait) {
+                        ema = 0.7 * ema + 0.3 * avg_ms;
+                    }
+                    assert_eq!(ema, today.gate(), "event {i}");
+                }
+                // The heartbeat.
+                _ => {
+                    assert_eq!(wait.take().ms(), today.heartbeat(), "event {i}");
+                    beats += 1;
+                }
+            }
+        }
+        assert!(
+            sent > 50_000 && beats > 5_000,
+            "{sent} frames, {beats} heartbeats"
+        );
+        assert!(
+            today.straddled > 1_000,
+            "{} window passes straddled a heartbeat",
+            today.straddled
+        );
     }
 
     /// FR-148 D46's stall classifier: busy at 2 Mbit/s with 40 000 bytes in

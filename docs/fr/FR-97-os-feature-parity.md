@@ -208,7 +208,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2705`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:1756`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -225,7 +225,7 @@ prevent, and the guard re-asserts it on every tick.
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:1917`).
+  although every agent row has one (`models.rs:1374`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:3067`). A client accepts any peer whose fanned routes hold `/0`
@@ -319,7 +319,7 @@ and the consent chain's fallbacks.
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:189-194`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:298`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:194`), from 0.4.149 | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1896`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:1374`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -360,14 +360,14 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:187-230`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:4923`, `tun.rs:3364-3369` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:4954`, `crates/tunnel-core/src/overlay/tun.rs:4157-4158`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:1623`, `tun.rs:3364-3369` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:1863` (gone from master with FR-137), `crates/tunnel-core/src/overlay/tun.rs:4157-4158`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
 | W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:316`), `crates/tunnel-core/src/overlay/mod.rs:95`, `crates/tunnel-core/src/overlay/tun.rs:4982`, `:5079`, `:5508`, `agents/roomlerd/src/app.rs:5527` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:11087`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:9535`, `:9558`, `:9575`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.
@@ -458,7 +458,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4018`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4049`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:2963`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone kept image events (`clipboard.rs:817-822` before P3e-3a); since P3e-3a a Linux X11 session keeps them too, behind its change gate (`agents/roomlerd/src/clipboard.rs:1076`), and since P2e-1 a Mac, behind its change count (`agents/roomlerd/src/encode/caps.rs:2815`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
@@ -732,7 +732,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1453-1519`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:4473`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:4515`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
@@ -745,7 +745,7 @@ test of the SIGKILL property itself.
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
   on the main thread, which `viewer-indicator-macos` gives to AppKit for the daemon's life (P2b's release set has it),
-  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:149`), run by the
+  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:204`), run by the
   pump on its next pass. The list is the selectable keyboard sources (the input menu's); the token is the source ID's
   hash; the tag is BCP-47 for a layout the table knows, else the source's own name. Offered wherever the switch is
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says
@@ -1057,7 +1057,7 @@ test of the SIGKILL property itself.
     save and ignored. `docs/hive.md` §8 (*On Windows*) described it at master `7106d588d`, and the doc left
     master with Hive.
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`app.rs:3768-3783`):
+  reaches (`app.rs:3772-3787`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:1024`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -1081,10 +1081,10 @@ model on Windows, so the three agree on what the mode means.
 (`exec.rs:819`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_account`, `companion.rs:5026`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_account`, `companion.rs:5012`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
-  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:2196`),
+  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:2200`),
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).

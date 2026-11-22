@@ -1,6 +1,6 @@
 # FR-149: The macOS consent panel drawn from the person's session, so it survives reboots and log-outs
 
-**Issue:** [#4054](https://github.com/gjovanov/roomler-ai/issues/4054) · **Status:** claimed 2026-11-19. Nothing built yet. P0 is read (0.4.228, 2026-11-20; field log), P1 (one-row Mac) comes next, and D1–D4 await the operator
+**Issue:** [#4054](https://github.com/gjovanov/roomler-ai/issues/4054) · **Status:** claimed 2026-11-19. P0 is read (0.4.228, 2026-11-20; field log). P1 (one-row Mac) is built (2026-11-20), and its cells C4–C10 wait for a release (P4). The operator decided D1–D4 on 2026-11-20 (Decisions)
 **Builds on:** [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (the prompt-surface chain), [FR-43](FR-43-macos-single-enrollment.md) (the one-row Mac, its screen worker and the delegation channel), #3864 and #3967 (the app's road over the person socket), #4053 and its fix #4063 (the gate on the panel)
 **Related:** #3999 (the screen a panel opens on, fixed by #4094), #3845 (the seat asked again at an answer), #3962 (telling the viewer at once), #4000 (a window runs from the request)
 
@@ -154,8 +154,8 @@ at the window's end). FR-149 puts the session panel first:
 
 | # | Surface | Asked when | Its answer |
 |---|---|---|---|
-| 1 | the session panel | the switch is on; a session process holds the panel's road (one row: the attached worker said `consent-panel`; two rows: D1); that process's person owns `/dev/console` when the question is asked; the root daemon's person socket serves that person | `shown`: `native=true`, `panel=session`. `busy`, `not_up`, or no answer within `PANEL_WITHIN`: the app (3), never the root daemon's own panel |
-| 2 | the root daemon's own panel (D2) | the session panel was not asked; #4063's gate reads `Shows`; the panel shows nothing | as on master: `native=true`, `panel=root` |
+| 1 | the session panel | the switch is on; a session process holds the panel's road (one row: the attached worker said `consent-panel`; two rows: D1); that process's person owns `/dev/console` when the question is asked; the root daemon's person socket serves that person; the root daemon's own panel shows no other question (P1) | `shown`: `native=true`, `panel=session`. `busy`, `not_up`, or no answer within `PANEL_WITHIN`: the app (3), never the root daemon's own panel |
+| 2 | the root daemon's own panel (D2) | the session panel was not asked, and shows no other of the root daemon's questions (P1); #4063's gate reads `Shows`; the panel shows nothing | as on master: `native=true`, `panel=root` |
 | 3 | the app | master's road and verdict (#3864, #3967; `reaches_the_tray`, `agents/roomlerd/src/companion.rs:2384`) | `companion` |
 | 4 | the floor | none of the above | `no_prompt_surface` at the window's end |
 
@@ -165,7 +165,12 @@ not show it a second time (`signaling.rs:4349-4359`).
 **At most one panel on the screen.** Two overlapping Approve/Deny panels is how someone approves the wrong thing
 (`mac.rs:193-194`). One process draws every panel question for the person at the console: the session process shows
 its own questions and the root daemon's, one at a time. The root daemon's own panel is a candidate only when no
-session process holds the road, so a session panel that is busy or silent never leads to a second panel.
+session process holds the road, so a session panel that is busy or silent never leads to a second panel. P1 holds the
+rule across questions too (`session_panel::chain`): while the root daemon's own panel shows a question, the session
+panel is not asked (`session_panel=not_asked why=root_panel_busy`), and while the session panel shows one of the root
+daemon's questions, the root daemon's own panel is not tried. Either way the question takes the road of one asked
+while the panel is busy: the app. The first can happen when a worker attaches while the root daemon's panel, after a
+restart with someone signed in (#4063's L3), shows a question asked before the attach.
 
 ### One-row Mac: the screen worker hosts the panel
 
@@ -240,12 +245,24 @@ and exec callers are the org's WS loop itself (#4063's table). #4063 already has
 The session panel's answer takes the probe's place and never adds to it, since a question whose session panel was
 asked does not go on to the root daemon's panel. So `show_prompt` becomes async, bounded by `PANEL_WITHIN`, and the
 worst wait stays #4063's. Whether P1 also moves the ask onto the question's own task, so that the WS loop waits for
-none of it (#4000), is settled in its review. The window is not touched: it runs from the request (`expires_at`,
+none of it (#4000), is settled in its review. P1 keeps it in `show_prompt`: each caller writes the question's marker
+once `native` is known, so an ask moved off that path would mark the question before the panel's word, either for the
+app, which would then show a question the panel shows too, or as `native` with a rewrite, which leaves it on no
+surface until the rewrite. The window is not touched: it runs from the request (`expires_at`,
 `signaling.rs:4341`), and the panel counts down to that end. An SSH or a recording question waits for the companion's
 start (3 s, `COMPANION_START_BUDGET`, `signaling.rs:341`) and the road (1 s) before its window starts, and that wait
 must stay under the hub's 5 s grace (`CONSENT_VERDICT_GRACE`, `crates/remote_control/src/consent.rs:149`). With the
 session panel in front it is at most 4.5 s, and the compile-time assertion that keeps it under the grace
 (`companion.rs:1302-1312`) grows to include `PANEL_WITHIN`.
+
+**A worker that does not answer (review F4).** Ruled 2026-11-21: accepted as built, and documented here. P1's
+`PANEL_WITHIN` bounds the wait at 500 ms over all states, the same bound as master's probe (`PROBE_WAIT`,
+`agents/roomlerd/src/indicator/mac.rs:791`). The extra wait comes only in a degraded state, a worker that said
+`consent-panel` and then does not answer, where master's refused or ended panel answered at once. A consent question
+waits on a person, so up to 500 ms before it moves to the app is small beside that. Each question is asked again,
+which lets the panel come back by itself
+(`indicator::session_panel::tests::after_no_answer_the_next_question_is_asked_again`); a silent state with a way back
+would add a state, and its failure modes, for little gain.
 
 **Old and new together.** The worker is the root daemon's own binary, started by it, and an update restarts both. A
 worker that does not say `consent-panel` is never asked, and the root daemon follows master's chain. A newer worker
@@ -286,6 +303,35 @@ of the person back at the console (C6).
 C6's second question needs B's worker to host the panel, and P0 read that false on master: a worker decides its panel
 once, when its signalling loop builds its indicator, and B's worker decided before its main loop ran (Evidence, P0's
 read on 0.4.228), so P1 must close that gap.
+
+**How P1 closes it: the main loop's promise.** The flag that told `Inner::new` whether the main loop runs was set only
+after the loop's first AppKit calls, so it answered two questions with one bit: may a panel be built, and may a
+question be taken. P1 splits it (`indicator::panel_gate::MainLoop`):
+
+| Step | Who | What it opens |
+|---|---|---|
+| promised | `main`, on the main thread, before it starts the daemon's thread (`indicator::mac::promise_main_loop`) | building the panel: `Inner::new` keeps a panel built before the loop pumps, where master refused it for the process's life |
+| pumping | `run_main_loop`, after `finishLaunching` and the panel's first reads (#4053's start probe, the console session), just before its first pass | taking a question: `prompt` and the worker's `show_root_question` read it at each question, never once; the panel's "available" line or #4053's WARN is said then, once, for a panel built before |
+
+- **The refusal does not outlive the loop's start.** A question before the first pass is answered as a taken panel's
+  (`false`, so the app), and each question after it reads the flag again; nothing is decided at build time but the
+  build.
+- **Nothing new waits on the signalling path.** The promise is a store before the daemon's thread exists, and a read
+  is an atomic load. No question, and no `ViewerIndicator`, waits for the loop.
+- **No busy loop.** Nothing polls for the flag: the pump's first pass is where the main thread arrives anyway.
+- **Only the panel build.** A build without `viewer-indicator-macos` never promises and never builds a panel, and a
+  CLI call or a test never runs the loop, so `on_main` still answers `None` there (it reads the pumping flag, as
+  before).
+
+The leads P0 named beside it share no such gap: the indicator built by `companion.rs`'s portal-capture test is a
+Linux test's, and `privacy.rs`'s `curtain_smoke` builds one on a Mac too, but its `ViewerIndicator::new` never fails
+on a Mac and the smoke never asks a question. The pin is
+`indicator::panel_gate::tests::a_panel_built_before_the_main_loop_pumps_takes_questions_once_it_does`, a stood-in for
+the two flags that runs on every lane. It proves `MainLoop`'s order alone: a panel may be built on the promise, a
+question is taken only once the loop pumps, and that is read at each question, never once. It does not drive the real
+order (`main`'s promise before the daemon's thread, the signalling loop's `ViewerIndicator::new` while the loop has
+not pumped, `run_main_loop`'s first pass), since each needs AppKit's main thread, which no CI lane runs: only the lab
+reads it (C5, and C6's second question).
 
 ### Two-row Mac: the per-user half, or the app (D1)
 
@@ -403,18 +449,28 @@ P1, unit tests with stood-in readers, so they run on every lane:
 | `delegate::tests::the_panel_word_is_kept_by_equality` | `consent-panel` is kept and a near miss dropped; a worker without it is never asked |
 | `indicator::session_panel::tests::native_comes_only_from_the_session_processs_word` | `shown` gives `native`; `busy`, `not_up`, silence, no worker, no word, the switch off, and a person socket not served give no `native` from the session panel |
 | `indicator::session_panel::tests::only_the_person_at_the_console_is_asked` | a session process whose person does not own `/dev/console` at the question is not asked (`session_panel=not_asked why=not_at_the_console`), whatever it said before |
-| `indicator::session_panel::tests::a_busy_or_silent_session_panel_never_leads_to_a_second_panel` | the root daemon's own panel is not tried once the session panel was asked |
+| `indicator::session_panel::tests::a_busy_or_silent_session_panel_never_leads_to_a_second_panel` | the root daemon's own panel is not tried once the session panel was asked; across questions, the session panel is not asked while the root daemon's own panel shows another, and the root daemon's own is not tried while the session panel shows another |
 | `indicator::session_panel::tests::a_late_shown_is_taken_down` | a `PanelTold` saying `shown` after its wait gets a `PanelHide` |
 | `indicator::session_panel::tests::a_session_processs_word_never_decides_a_question` | the invariant: no `PanelTold` or `ConsentPanelTold`, in any state, decides or ends a question; only an answer past the person socket's gates decides one |
 | `indicator::session_panel::tests::a_channel_ended_after_shown_sends_the_question_to_the_app` | by D4: a channel that ends after `shown` marks the question for the app for its remaining time |
 | `indicator::session_panel::tests::an_answer_for_a_decided_question_is_refused` | by D4: once the prompt's look has decided a question, a later answer for its id is refused, on the session panel's road as on the app's |
-| `localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road` | the worker's click on a root daemon's question goes to the root half; a click on its own question stays local; a click after the window is refused |
+| `localapi_state::tests::a_session_panel_click_on_the_roots_question_takes_the_apps_road` | the worker's click on a root daemon's question goes to the root half; a click on its own question stays local; a click after the window is refused. Since the review: each click takes the road `consent_relay::panel_road` chooses (F6), and a refused one tells the root daemon its panel no longer shows the question (F1) |
+| `indicator::panel_gate::tests::a_panel_built_before_the_main_loop_pumps_takes_questions_once_it_does` | P0's C2 gap, closed (P1): a panel built on `main`'s promise, before the loop pumps, takes no question until the loop's first pass and every question from then on; with no promise and no loop (a CLI call, a test) none is built. It pins `MainLoop`'s order, not the order on AppKit's main thread (C2's design above) |
+| `indicator::session_panel::tests::a_refused_click_moves_the_question_to_the_app_while_it_is_asked` | review F1: the worker's unasked `not_up` for a question on the panel's books moves it to the app (`companion`, its deadline kept), starts the app once, and decides nothing |
+| `indicator::session_panel::tests::a_refused_click_for_an_ended_question_changes_nothing`, `…::a_not_up_for_a_question_off_the_panels_books_changes_nothing` | review F1: the word for a question that ended, or that the panel did not show, moves nothing and starts nothing |
+| `indicator::session_panel::tests::a_question_moved_to_the_app_at_the_channels_end_starts_the_app` | review F2: D4's move starts the app once for each question still asked, and never for one that ended |
+| `indicator::session_panel::tests::a_channel_that_ends_before_the_marker_is_written_leaves_the_question_with_the_app` | review F3: a channel that ends between `shown` and the caller's marker write still leaves the question with the app |
+| `indicator::session_panel::tests::after_no_answer_the_next_question_is_asked_again` | review F4: after a silent worker, the next question is asked again, and shown once the worker answers |
+| `indicator::session_panel::tests::a_stalled_panel_does_not_stop_the_frame_loop`, `…::a_show_that_ends_after_its_attach_leaves_nothing_on_the_panel` | review F5: while a show waits for a stalled main thread, a `PanelHide` and a ping pass; a show that ends after its attach leaves nothing on the panel |
 | the LocalAPI's `tests::person_may_is_exactly_the_safety_surface`, and `localapi_state::tests::another_accounts_per_user_half_gets_no_root_questions` | unchanged, and passing |
 
 The agent's tests run in "Agent tests (vp9-444, overlay, kernel TUN)", step "Test agent under vp9-444"; in "Windows
 agent unit tests", step "Agent unit tests on Windows (the whole --lib suite)"; and in "macOS overlay compile check",
 step "cargo check + test the agent's Mac-only units", whose list of modules (`.github/workflows/ci.yml:1659-1662`)
-gains `indicator::session_panel::`. The worker's AppKit side compiles in "cargo check agent (viewer-indicator-macos —
+gains `indicator::session_panel::`. That module compiles in every build, with no feature of its own, so the step's
+features reach it as they are. P1's three cells in other modules join that list by name (the two `delegate::tests::`
+and the `localapi_state::tests::` rows above), and the C2 cell is `indicator::panel_gate::`'s, already in it. The worker's AppKit
+side compiles in "cargo check agent (viewer-indicator-macos —
 the AppKit panel + the main-thread swap)". The LocalAPI's run on a Mac in "cargo test the LocalAPI on a real Mac
 (#3736)" (`ci.yml:1718-1719`), where P2 adds the person-socket verbs' tests: `person_may` updated, an offer taken only
 from the socket's own person on the connection that holds its `consent_relaying`, an offer that lives as long as its
@@ -446,6 +502,7 @@ home, and uploads on its own row.
 | C7 | P1 | one row | lock the screen; a viewer asks; unlock within the window | the ask logs `native=true panel=session` while the screen is locked; the question is on the session panel after the unlock, as #4063's L4 reads for the root daemon's panel, and is answered there |
 | C8 | P1 | one row | viewer 2 asks while the session panel shows viewer 1's question | viewer 2's shows in the app, `native=false companion=Some(true) session_panel=busy`; never a second panel; both are answered |
 | C9 | P1 | one row | after a reboot, end the worker; a viewer asks before the new one attaches, and again after | first the app or the floor (`session_panel=not_asked why=no_worker`), never `native=true`; then the panel |
+| C9b | P1 | one row | a viewer asks; while the session panel shows it, stop the root daemon (`kill -STOP`), click Approve, wait 6 s (past `DECIDE_WITHIN`), and let it go on (`kill -CONT`) | the worker's log says the answer was not taken, then `the root daemon is told that this panel no longer shows its question` with `told=true`. The waited click is never read: the worker closed its connection when `DECIDE_WITHIN` ran out, and after the `CONT` the root daemon's person socket drops it before a byte, since a Mac's `peer_cred` answers `ENOTCONN` for a caller that left (#4203's `PersonDrop::Gone`, logged at debug: `a caller closed its connection before it was read`). The panel's word moves the question: `the screen worker's panel no longer shows the question; it goes to the person's app` with `moved=true`, and the app starts. The person answers it again in the app, within its window; it ends there, never on a second panel and never on no surface. The move with no waited click is the unit cells' (`a_refused_click_moves_the_question_to_the_app_while_it_is_asked`) |
 | C10 | P1 | one row | `ROOMLERD_SESSION_PANEL=0` for the root daemon; reboot; ask. Then `ROOMLERD_PERSON_SOCKET=0` alone; ask | the first follows master's chain with #4063's gate (the app); the second logs `session_panel=not_asked why=person_socket` and follows master's chain from there |
 | C11 | P2 | two rows | reboot, sign in; an exec or SSH question for the `-daemon` row; Approve, then Deny | on the per-user half's panel (`native=true panel=session`); both outcomes |
 | C12 | P2 | two rows | log out, log in, then as C11 | as C11 |
@@ -461,16 +518,19 @@ home, and uploads on its own row.
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C3 on the first release with #4063 (its lab cells are written for 0.4.228): the session processes' panels, read before anything is built | read only | done 2026-11-20 (field log) |
-| P1 | one row: the frames and the word on the delegation channel; the root daemon's session-panel ask in `show_prompt` (async, `PANEL_WITHIN`), after its read of `/dev/console`'s owner; the worker's handling, with its click through the app's road; the panel in a worker whose main loop starts after its signalling loop has built its indicator, which master leaves without a panel for its life (P0's C2 read, Evidence); the take-down; the logs; the switch; the tests above | `ROOMLERD_SESSION_PANEL=0` on the root daemon: master's chain with #4063's gate | not started; after P0's read |
-| P2 | two rows, by D1: the per-user half's offer and its verbs on the person socket, or the app's word | the same switch on the root half; the verbs are additive, and an older root half refuses them | not started; waits for D1 |
-| P3 | the root daemon's own panel, by D2 | kept: nothing to switch. Removed: `ROOMLERD_ROOT_PANEL=1` restores it for one release | waits for D2, after P4's one-row read |
+| P1 | one row: the frames and the word on the delegation channel; the root daemon's session-panel ask in `show_prompt` (async, `PANEL_WITHIN`), after its read of `/dev/console`'s owner; the worker's handling, with its click through the app's road; the panel in a worker whose main loop starts after its signalling loop has built its indicator, which master leaves without a panel for its life (P0's C2 read, Evidence); the take-down; the logs; the switch; the tests above. The review's fixes (2026-11-21): a click the root half refused is said to the root daemon, which moves the question to the app (F1); D4's move and that one start the app (F2); the caller's marker write reads the panel's books after it (F3); the worker shows a question off its frame loop, and builds the panel with no lock held (F5) | `ROOMLERD_SESSION_PANEL=0` on the root daemon: master's chain with #4063's gate | built 2026-11-20, with its tests and docs; the review's fixes 2026-11-21; C4–C10 (C9b among them) wait for P4 |
+| P2 | two rows, by D1: the per-user half's offer and its verbs on the person socket | the same switch on the root half; the verbs are additive, and an older root half refuses them | not started; D1 decided (the per-user half) |
+| P3 | the root daemon's own panel, by D2 | kept: nothing to switch. Removed: `ROOMLERD_ROOT_PANEL=1` restores it for one release | D2 decided (kept); asked again with P4's one-row read |
 | P4 | the field read: C4–C10 (C4b among them) with P1's candidate, C11–C16 with P2's, C17 and C18 with P3's, then C4–C8 and C11–C14 on a released build | read only | not started |
-| Docs | the docs below, each in the pull request of the phase it describes | none | not started |
+| Docs | the docs below, each in the pull request of the phase it describes | none | P1's written with P1 |
 
 - **P0 leaves** the facts P1 builds on: whether each session process's panel is served after a reboot, a log-out, a
   fast user switch and a lock, and #4063's L9 on a two-row Mac. Acceptance: AC1.
 - **P1 leaves working by itself**: a one-row Mac's questions on the person's own panel after a reboot and after a
-  log-out, with no restart of the root daemon. A two-row Mac is unchanged. Acceptance: AC2 to AC6.
+  log-out, with no restart of the root daemon. A two-row Mac is unchanged. Acceptance: AC2 to AC6. D4's second case
+  holds in either order (review F3, 2026-11-21): a channel that ends between the worker's `shown` and the caller's
+  first write of the question's marker found no marker to rewrite, and that write now reads the panel's books after
+  it and moves the question to the app itself (`docs/desktop-companion.md` §10.8.3).
 - **P2 leaves working**: a two-row Mac's root-half questions on the panel too, or what D1 says instead. Acceptance:
   AC7.
 - **P3 leaves**: the root daemon's own panel where D2 puts it. Acceptance: AC8.
@@ -513,26 +573,32 @@ The docs:
   the sections above in `docs/desktop-companion.md` and `docs/remote-control.md`, the rule and the module docs,
   linked from `docs/README.md`.
 
-## Open decisions
+## Decisions
 
-D1–D4 each carry a recommendation and await the operator. The macOS lab's review of this spec agreed with D1, D2 and
-D3, and with D4's first case.
+The operator decided D1–D4 on 2026-11-20, each as recommended
+([#4054, the operator's comment](https://github.com/gjovanov/roomler-ai/issues/4054#issuecomment-7045443260)). The
+macOS lab's review of this spec had agreed with D1, D2 and D3, and with D4's first case. Each recommendation's text is
+kept below as it was decided.
 
-- **D1. Which process hosts the panel on a two-row Mac.** Recommended: the per-user half, through a long-poll on the
+- **D1. Which process hosts the panel on a two-row Mac.** Decided 2026-11-20: the per-user half (P2's work; P1
+  leaves a two-row Mac as master has it). Recommended: the per-user half, through a long-poll on the
   root half's person socket (Design, the two-row table). Fallback: the app, with its costs. Either is measured against
   the baseline: the root half's questions in the app, as #4053 leaves them.
-- **D2. Whether the root daemon's own panel stays.** Recommended: it stays as the second choice while #4063's gate
+- **D2. Whether the root daemon's own panel stays.** Decided 2026-11-20: it stays as the chain's second row, and P1
+  removes nothing. Recommended: it stays as the second choice while #4063's gate
   reads `Shows` and no session process holds the road (an older worker, the switch off, the person socket off), until
   P4's one-row read; D2 is then asked again with that read. Fallback: remove it in P3, so that the root daemon never
   draws, and a question with no session panel goes to the app.
-- **D3. How an answer is bound to the panel.** Recommended: (a) the person socket's gates, the same as for the app's
+- **D3. How an answer is bound to the panel.** Decided 2026-11-20: (a), and P1 adds no verb that decides a question.
+  Recommended: (a) the person socket's gates, the same as for the app's
   answers, so that FR-149 adds no answerer. (b) On one row, the panel's answer could cross the delegation channel
   instead, and the root daemon could refuse a person-socket answer from anyone but root for a question on the session
   panel. That binds the answer to the worker the root daemon started, but a process of the person's account can still
   end the worker, so that the next question goes to the app and is answered there; it buys little for a second answer
   road. (c) The person socket could check its caller's code signature, from the caller's audit token, for the app's
   answers too: its own issue if wanted, not this FR's.
-- **D4. A question whose session panel is not seen, or goes away, before it is answered.** Recommended, in two cases:
+- **D4. A question whose session panel is not seen, or goes away, before it is answered.** Decided 2026-11-20: both
+  cases, and P1 tests both. Recommended, in two cases:
   - **A panel that is up but not seen** (a locked screen, a display asleep, the screen saver): the question waits on
     the panel for the rest of its window, as one on the root daemon's panel or in the app does today.
   - **A channel that ends after `shown`** (a worker that crashed, its window gone with it; a log-out; a worker stopped
@@ -542,6 +608,13 @@ D3, and with D4's first case.
 
   Fallback: every such question waits out its window, as a question on the root daemon's panel does today when that
   panel goes.
+
+  Built in P1, with the review's fixes (2026-11-21): the move starts the app, by the start a question whose surface
+  is the app makes from the outset (`companion::start_for_prompt`), best-effort and once a question (F2). A click the
+  root half refused leaves its question on no panel, since the panel clears it at the click: the worker says so with
+  a `not_up` the root daemon did not ask for, and the root daemon moves the question as at a channel's end, only
+  while its broker asks it and it is on the panel's books, never back onto the panel (F1). A channel that ends before
+  the caller writes the question's marker is caught by that write (F3).
 
 ## Out of scope
 
@@ -566,3 +639,6 @@ D3, and with D4's first case.
 | 2026-11-20 | P0, C2, the same Mac: log out and in twice; lock for about a minute; a fast user switch to a second account and back | each new worker `available` (`=131`, `=90`); while locked, `/dev/console` stayed the person's and the worker's pid did not change; after the switch back, the person's new worker `available` (`=172`). The second account's worker, started on the switch, had no panel (`error=the AppKit main loop is not running`), and that account had no app: not as expected. The cause, a worker that decides its panel before its main loop runs, is in Evidence, and P1 closes it |
 | 2026-11-20 | P0, C3, a two-row Mac: boot and sign in, then log out and in; a fast user switch away and back; lock, the person's row asks, unlock | the per-user half `available` (`=40`, then `=96`); after the switch back its row's next question on its panel (`native=true`), approved in 5.0 s; the question asked while locked on the panel behind the lock screen, then on the per-user panel after the unlock, and allowed. As the spec expects |
 | 2026-11-20 | P0's read folded in | P0 done, AC1 ticked. Evidence has the read and C2's cause, read in the code at master `bdddcd0b2`; Design names the gap C6 meets, and P1's row the item that closes it. No decision, criterion or cell changed |
+| 2026-11-20 | the operator decided D1–D4, each as recommended (#4054) | Open decisions became Decisions, each recommendation's text kept; P2's and P3's rows follow D1 and D2. No criterion or cell changed |
+| 2026-11-20 | P1 built, with its tests and docs, in one pull request | Design gains the main loop's promise (how P1 closes C2), one panel across questions (`why=root_panel_busy`), and the reason P1 keeps the ask in `show_prompt`; the Tests table gains the C2 cell. C4–C10 wait for a release (P4) |
+| 2026-11-21 | the review of P1's pull request, F1–F7, fixed in that pull request | D4's built note gains the refused click's move (F1), the app's start (F2) and the marker write that reads the panel's books (F3), so D4's second case holds in either order; the P1 row and "P1 leaves" say so; the Tests table gains eight cells (F1–F5), and its C2 cell says what it pins and what only the lab reads (F6); Lab cells gain C9b. No decision or criterion changed |

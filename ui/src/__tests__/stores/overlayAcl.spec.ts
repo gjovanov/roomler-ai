@@ -222,3 +222,78 @@ describe('overlayAcl store: an org with more rules than one page holds', () => {
     expect(store.loading).toBe(false)
   })
 })
+
+// #4248 — the store holds one org's rules and posture at a time, and knows
+// which. TENANT_ID is org A.
+describe('overlayAcl store: one org at a time (#4248)', () => {
+  const ORG_B = '69a1dbbad2000f26adc875cf'
+  const answer = (ids: string[], mode: 'off' | 'warn' | 'enforce') => ({
+    items: ids.map((id) => mkPolicy({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    mode,
+  })
+
+  it("a fetch for org B drops org A's rules and posture at once, and org A's late answer", async () => {
+    const store = useOverlayAclStore()
+    mockApi.get.mockResolvedValueOnce(answer(['pa'], 'enforce'))
+    await store.fetchPolicies(TENANT_ID)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = store.fetchPolicies(TENANT_ID)
+    // A refresh of the same org keeps what it shows while it loads.
+    expect(store.policies.map((p) => p.id)).toEqual(['pa'])
+    expect(store.mode).toBe('enforce')
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = store.fetchPolicies(ORG_B)
+    expect(store.policies).toEqual([])
+    expect(store.total).toBe(0)
+    expect(store.mode).toBe('off')
+    expect(store.policiesTenantId).toBe(ORG_B)
+
+    answerB(answer(['pb'], 'warn'))
+    await loadB
+    lateA(answer(['pa', 'pa2'], 'enforce'))
+    await refreshA
+    expect(store.policies.map((p) => p.id)).toEqual(['pb'])
+    expect(store.mode).toBe('warn')
+    expect(store.loading).toBe(false)
+  })
+
+  it("a save, a delete or a posture change answered for org A leaves org B's as they are", async () => {
+    const store = useOverlayAclStore()
+    mockApi.get.mockResolvedValueOnce(answer(['pb'], 'warn'))
+    await store.fetchPolicies(ORG_B)
+    const pb = store.policies[0]
+    const nameB = pb.name
+
+    mockApi.post.mockResolvedValueOnce(mkPolicy({ id: 'pa' }))
+    await store.createPolicy(TENANT_ID, {
+      name: 'from org A',
+      enabled: true,
+      sources: [{ kind: 'all_nodes' }],
+      via: [{ kind: 'all_nodes' }],
+      destinations: [],
+    })
+    mockApi.put.mockResolvedValueOnce(mkPolicy({ id: 'pb', name: 'renamed in org A' }))
+    await store.updatePolicy(TENANT_ID, 'pb', {
+      name: 'renamed in org A',
+      enabled: true,
+      sources: pb.sources,
+      via: pb.via,
+      destinations: pb.destinations,
+    })
+    mockApi.delete.mockResolvedValueOnce({ deleted: true })
+    await store.deletePolicy(TENANT_ID, 'pb')
+    mockApi.put.mockResolvedValueOnce({ mode: 'enforce' })
+    await store.setMode(TENANT_ID, 'enforce')
+
+    expect(store.policies.map((p) => p.id)).toEqual(['pb'])
+    expect(store.policies[0].name).toBe(nameB)
+    expect(store.total).toBe(1)
+    expect(store.mode).toBe('warn')
+  })
+})

@@ -165,7 +165,7 @@ record's file. Two topologies split roles:
   would report as `NEVER REPORTED` had a SystemContext worker read it.
   ⚠️ **Under SystemContext the worker and its watcher log apart.** The
   worker takes the `service-logs` role (S1b,
-  `agents/roomlerd/src/app.rs:1626`). The watcher it spawns has none and
+  `agents/roomlerd/src/app.rs:1630`). The watcher it spawns has none and
   writes the record into SYSTEM's profile. Read on a per-machine guest, a
   real self-update from candidate 0.4.220 to 0.4.221 left the record
   `InProgress` in SYSTEM's profile past the clean-run threshold, with no
@@ -204,7 +204,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1829`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4309`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4313`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher
@@ -212,7 +212,7 @@ $ roomler status
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
   /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
-  (`post_install_watch_cmd`, `app.rs:2599`), which journald captured on a
+  (`post_install_watch_cmd`, `app.rs:2603`), which journald captured on a
   systemd host, beside the watcher's `post-install watcher started` tracing
   line on its stderr. This is the line the P7 field log read on 2026-10-19
   and the rows of §7 read on 10-26; it was the only reader before P3.
@@ -258,7 +258,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7189`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7240`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries

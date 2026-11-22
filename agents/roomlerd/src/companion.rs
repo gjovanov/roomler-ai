@@ -1371,8 +1371,12 @@ async fn verdict_for_a_question() -> TrayVerdict {
 // (crates/remote_control/src/consent.rs:149) past the window it announced for
 // the agent's verdict, so this wait stays under it: longer, and the hub's
 // backstop would answer a bare timeout first, throwing away the agent's reason.
+// FR-149 P1 — and before it, on a one-row Mac's root daemon, the wait for the
+// screen worker's word on its panel (`PANEL_WITHIN`), which a question that
+// goes on to the app waits out first.
 const _: () = assert!(
-    crate::signaling::COMPANION_START_BUDGET.as_millis()
+    crate::indicator::session_panel::PANEL_WITHIN.as_millis()
+        + crate::signaling::COMPANION_START_BUDGET.as_millis()
         + crate::consent_relay::RELAY_WITHIN.as_millis()
         < roomler_ai_remote_control::consent::CONSENT_VERDICT_GRACE.as_millis()
 );
@@ -3148,7 +3152,7 @@ mod tray_start_tests {
             rt.block_on(asking(StandIn::new(host_steps(host)), async move {
                 // The loop's side.
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("f6"))),
                     mark_up: None,
@@ -3208,7 +3212,7 @@ mod tray_start_tests {
             };
             rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("h8"))),
                     mark_up: None,
@@ -3310,7 +3314,7 @@ mod tray_start_tests {
             let stood = StandIn::new(host_steps(&works)).on_two_rows(road);
             rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("j9"))),
                     mark_up: None,
@@ -3424,7 +3428,7 @@ mod tray_start_tests {
             let asked = Instant::now();
             let reason = rt.block_on(asking(stood, async move {
                 let surfaces = crate::signaling::RcSurfaces {
-                    native: false,
+                    shown: crate::indicator::session_panel::Prompted::plain(false),
                     marker: true,
                     behind: Some((start_for_prompt().await, rc_view("m3"))),
                     mark_up: None,
@@ -3512,7 +3516,7 @@ mod tray_start_tests {
                 StandIn::new(host_steps(&host)),
                 walk::asking(walking, async move {
                     let surfaces = crate::signaling::RcSurfaces {
-                        native: false,
+                        shown: crate::indicator::session_panel::Prompted::plain(false),
                         marker: true,
                         behind: Some((start_for_prompt().await, rc_view("g7"))),
                         mark_up: None,
@@ -4285,7 +4289,13 @@ mod tray_start_tests {
         let words_at_the_windows_end = |host: &Host, marker: bool| {
             let ind = ind.clone();
             rt.block_on(asking(StandIn::new(host_steps(host)), async move {
-                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                let shown = crate::signaling::exec_surfaces_up(
+                    marker,
+                    &ind,
+                    exec_view("k1"),
+                    crate::indicator::session_panel::Prompted::plain(false),
+                )
+                .await;
                 crate::signaling::exec_refusal(Decision::Timeout, shown)
             }))
         };
@@ -4444,7 +4454,13 @@ mod tray_start_tests {
         let words_at_the_windows_end = |stood: StandIn, marker: bool| {
             let ind = ind.clone();
             rt.block_on(asking(stood, async move {
-                let shown = crate::signaling::exec_surfaces_up(marker, &ind, exec_view("q4")).await;
+                let shown = crate::signaling::exec_surfaces_up(
+                    marker,
+                    &ind,
+                    exec_view("q4"),
+                    crate::indicator::session_panel::Prompted::plain(false),
+                )
+                .await;
                 crate::signaling::exec_refusal(Decision::Timeout, shown)
             }))
         };
