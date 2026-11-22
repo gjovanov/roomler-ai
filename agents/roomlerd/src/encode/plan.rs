@@ -36,7 +36,7 @@
 //!
 //! The producer reads FACTS and emits DECISIONS. What stays with the loop,
 //! deliberately: the bytes in flight, the send-wait EMA (`direct_wait_ema_ms`
-//! and its `gate_sw_*` cursors — a running MEASUREMENT of the loop's own
+//! and its `gate_send_wait` place — a running MEASUREMENT of the loop's own
 //! queue, which only reads like a decision), the live age of the frame on the
 //! wire, and the captured frame's own dims. What the plan owns: the budget
 //! triple, the cadence, the geometry, the target.
