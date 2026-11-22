@@ -1436,8 +1436,8 @@ const KEYS: &[KeyMeta] = &[
         group: Group::RemoteDesktop,
         tier: Tier::Advanced,
         live: false,
-        kind: "enum:0|prio|1",
-        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio` or `1`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
+        kind: "enum:0|prio|1|route",
+        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio`, `1` or `route`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. `route` (D49) is `1` with the pair's route as the rank's unit instead of a candidate: a pair rides the mesh when its local candidate is ranked last or either end sits on a mesh address. Unless the link is direct, no pair is formed from a local candidate off the mesh to a remote one on it while the session has a local candidate or a TURN URL on the mesh, and the agent holds its pairs on the mesh while a relay off the mesh can still come, 2.5 s at most. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
     },
     KeyMeta {
         key: "path_model",
@@ -2288,11 +2288,13 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // later on a device nobody is looking at.
         "power_policy" => {
             let v = value.unwrap_or("never").trim().to_ascii_lowercase();
-            if !matches!(v.as_str(), "never" | "on-ac" | "on_ac" | "ac" | "always") {
-                return Err(format!(
-                    "power_policy must be one of never | on-ac | always (got {v:?})"
-                ));
-            }
+            // `on_ac` and `ac` spell the declared `on-ac` and are stored as
+            // typed: the power keeper reads all three as one policy.
+            let declared = match v.as_str() {
+                "on_ac" | "ac" => "on-ac",
+                other => other,
+            };
+            check_declared(key, declared)?;
             cfg.power_policy = v;
         }
         // FR-84 D6 — clearing returns to ON, the built-in default.
@@ -2316,11 +2318,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "external_consent_mode" => {
             cfg.external_consent_mode = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
-                Some(v @ ("prompt" | "auto")) => Some(v.to_string()),
                 Some(v) => {
-                    return Err(format!(
-                        "external_consent_mode must be prompt | auto (got {v:?})"
-                    ));
+                    check_declared(key, v)?;
+                    Some(v.to_string())
                 }
             }
         }
@@ -2423,18 +2423,23 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
         }
         "encoder_preference" => {
-            cfg.encoder_preference = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-                None | Some("") | Some("auto") => EncoderPreferenceChoice::Auto,
-                Some("hardware") | Some("hw") | Some("mf") => EncoderPreferenceChoice::Hardware,
-                Some("software") | Some("sw") | Some("openh264") => {
-                    EncoderPreferenceChoice::Software
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "encoder_preference must be auto|hardware|software (got {other:?})"
-                    ));
-                }
-            }
+            let v = value
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            // Blank clears to `auto`; `hw` and `mf` spell `hardware`, and `sw`
+            // and `openh264` spell `software`.
+            let declared = match v.as_str() {
+                "" => "auto",
+                "hw" | "mf" => "hardware",
+                "sw" | "openh264" => "software",
+                other => other,
+            };
+            check_declared(key, declared)?;
+            cfg.encoder_preference = match declared {
+                "hardware" => EncoderPreferenceChoice::Hardware,
+                "software" => EncoderPreferenceChoice::Software,
+                _ => EncoderPreferenceChoice::Auto,
+            };
         }
         "update_check_interval_h" => {
             cfg.update_check_interval_h = match value.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2731,42 +2736,13 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
-        "rc_carrier_rank" => {
-            cfg.rc_carrier_rank = match value.map(|s| s.trim().to_ascii_lowercase()) {
-                None => None,
-                Some(v) if v.is_empty() || v == "0" => None,
-                Some(v) if v == "prio" || v == "1" => Some(v),
-                Some(v) => {
-                    return Err(format!("rc_carrier_rank must be 0, prio or 1 (got {v:?})"));
-                }
-            }
-        }
+        "rc_carrier_rank" => cfg.rc_carrier_rank = parse_declared(key, value, Some("0"))?,
         // `shadow` is stored, not cleared: a device taken back to it stays
         // there when the default changes (D28).
-        "path_model" => {
-            cfg.path_model = match value.map(|s| s.trim().to_ascii_lowercase()) {
-                None => None,
-                Some(v) if v.is_empty() => None,
-                Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
-                Some(v) => {
-                    return Err(format!("path_model must be off, shadow or on (got {v:?})"));
-                }
-            }
-        }
+        "path_model" => cfg.path_model = parse_declared(key, value, None)?,
         // FR-148 D46 — as `path_model`: each word is stored, so a device set
         // to `off` stays off when the default moves.
-        "inflight_budget" => {
-            cfg.inflight_budget = match value.map(|s| s.trim().to_ascii_lowercase()) {
-                None => None,
-                Some(v) if v.is_empty() => None,
-                Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
-                Some(v) => {
-                    return Err(format!(
-                        "inflight_budget must be off, shadow or on (got {v:?})"
-                    ));
-                }
-            }
-        }
+        "inflight_budget" => cfg.inflight_budget = parse_declared(key, value, None)?,
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
@@ -2797,17 +2773,17 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "scale_threads" => cfg.scale_threads = parse_u32_range(key, value, 1, 8)?,
         "ice_follow_renomination" => {
-            cfg.ice_follow_renomination =
-                match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-                    None | Some("") | Some("auto") => None,
-                    Some("always") => Some(true),
-                    Some("never") => Some(false),
-                    Some(other) => {
-                        return Err(format!(
-                            "ice_follow_renomination must be auto|always|never (got {other:?})"
-                        ));
-                    }
-                }
+            let v = value
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            // Blank clears, as `auto` does.
+            let declared = if v.is_empty() { "auto" } else { v.as_str() };
+            check_declared(key, declared)?;
+            cfg.ice_follow_renomination = match declared {
+                "always" => Some(true),
+                "never" => Some(false),
+                _ => None,
+            };
         }
         "ice_warm_standby" => cfg.ice_warm_standby = parse_tribool(value)?,
         "ice_overlay_host_deprioritize" => {
@@ -2909,16 +2885,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 }
             }
         }
-        "qsv_rate_mode" => {
-            cfg.qsv_rate_mode = match value.map(|s| s.trim().to_ascii_lowercase()) {
-                None => None,
-                Some(v) if v.is_empty() || v == "cbr" => None,
-                Some(v) if v == "qvbr" => Some(v),
-                Some(v) => {
-                    return Err(format!("qsv_rate_mode must be cbr or qvbr (got {v:?})"));
-                }
-            }
-        }
+        "qsv_rate_mode" => cfg.qsv_rate_mode = parse_declared(key, value, Some("cbr"))?,
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -2936,6 +2903,113 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         other => return Err(format!("unknown or non-editable config key {other:?}")),
     }
     Ok(())
+}
+
+/// FR-148 — the values an `enum:` key's registry entry declares
+/// (`kind: "enum:a|b|c"`), in declared order: the one list of them. The
+/// desktop offers them, the setter takes them, and the daemon pins each one
+/// against the parser that reads the key (`pin_declared_values`). Until
+/// 0.4.232 every setter arm listed its values again, and `rc_carrier_rank`
+/// refused D49's `route`, which the daemon reads. `None` = not an `enum:` key.
+pub fn declared_values(key: &str) -> Option<Vec<&'static str>> {
+    KEYS.iter()
+        .find(|m| m.key == key)?
+        .kind
+        .strip_prefix("enum:")
+        .map(|values| values.split('|').collect())
+}
+
+/// FR-148 — the one check of an `enum:` key's setter arm: `v` must be a
+/// value the key's entry declares, and a refusal names every declared value.
+/// An arm first maps its other spellings, and the blank it clears, onto the
+/// declared value they mean.
+fn check_declared(key: &str, v: &str) -> Result<(), String> {
+    let declared = declared_values(key).unwrap_or_default();
+    if declared.contains(&v) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key} must be one of {} (got {v:?})",
+            declared.join(" | ")
+        ))
+    }
+}
+
+/// FR-148 — the setter arm of an `enum:` key stored as its word: trimmed
+/// and lowercased, a declared word is stored, and blank or the `clears`
+/// word clears the key, so it reads its default.
+fn parse_declared(
+    key: &str,
+    value: Option<&str>,
+    clears: Option<&str>,
+) -> Result<Option<String>, String> {
+    match value.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(None),
+        Some(v) if v.is_empty() || clears == Some(v.as_str()) => Ok(None),
+        Some(v) => {
+            check_declared(key, &v)?;
+            Ok(Some(v))
+        }
+    }
+}
+
+/// FR-148 — the pin between `key`'s declared values and the parser that
+/// reads the key, for that parser's own tests: here, and in `roomlerd`
+/// through the `test-fixtures` feature. `read` is the parser, fed the way a
+/// device feeds it from a config the setter wrote; `modes` is every value it
+/// returns, listed by the caller through a match without a wildcard. It
+/// panics, naming the value, unless both directions hold:
+/// - every declared value is taken by the setter and reads as one of
+///   `modes`, no two as the same one, so the default is read from one
+///   declared value only, the one that names it;
+/// - every one of `modes` is read from a declared value.
+///
+/// So a value a parser learns stays unsettable no longer than a test run,
+/// and a declared value the daemon reads as the default fails too.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn pin_declared_values<M>(key: &str, read: impl Fn(&AgentConfig) -> M, modes: &[M])
+where
+    M: Copy + PartialEq + std::fmt::Debug,
+{
+    let declared = declared_values(key).unwrap_or_else(|| panic!("{key} is not an `enum:` key"));
+    let default = read(&crate::config::test_fixture());
+    assert!(
+        modes.contains(&default),
+        "{key}: the default reads as {default:?}, which is not one of {modes:?}"
+    );
+    let mut cleared = crate::config::test_fixture();
+    apply(&mut cleared, key, None).unwrap_or_else(|e| panic!("{key}: a clear is refused: {e}"));
+    assert_eq!(
+        read(&cleared),
+        default,
+        "{key}: a cleared key must read as the default"
+    );
+    let mut read_as: Vec<(&str, M)> = Vec::new();
+    for value in declared {
+        let mut cfg = crate::config::test_fixture();
+        if let Err(e) = apply(&mut cfg, key, Some(value)) {
+            panic!("{key}: the setter refuses {value:?}, which the entry declares: {e}");
+        }
+        let mode = read(&cfg);
+        assert!(
+            modes.contains(&mode),
+            "{key}: {value:?} reads as {mode:?}, which is not one of {modes:?}"
+        );
+        if let Some((other, _)) = read_as.iter().find(|(_, m)| *m == mode) {
+            panic!(
+                "{key}: {value:?} and {other:?} both read as {mode:?}: the daemon does not read \
+                 one of them as what it means"
+            );
+        }
+        read_as.push((value, mode));
+    }
+    for mode in modes {
+        assert!(
+            read_as.iter().any(|(_, m)| m == mode),
+            "{key}: no declared value reads as {mode:?}; the entry's `enum:` kind must declare \
+             one (declared: {read_as:?})"
+        );
+    }
 }
 
 /// P7 — shared bounded-u32 parse for the plain numeric keys: empty clears
@@ -5150,10 +5224,10 @@ mod tests {
         }
     }
 
-    /// FR-148 P4 — `rc_carrier_rank`: `prio` and `1` are stored, `0` and
-    /// blank clear the key (off), and anything else is refused rather than
-    /// stored and read as `0` without a word. It reaches the daemon's env
-    /// fallbacks under the switch's own name.
+    /// FR-148 P4 — `rc_carrier_rank`: `prio`, `1` and (D49) `route` are
+    /// stored, `0` and blank clear the key (off), and anything else is refused
+    /// rather than stored and read as `0` without a word. It reaches the
+    /// daemon's env fallbacks under the switch's own name.
     #[test]
     fn rc_carrier_rank_set_echo_clear_and_validate() {
         let mut cfg = crate::config::test_fixture();
@@ -5171,6 +5245,19 @@ mod tests {
                 .get("RC_CARRIER_RANK")
                 .map(String::as_str),
             Some("1")
+        );
+        // D49 — the value 0.4.231's daemon read and its setter refused.
+        apply(&mut cfg, "rc_carrier_rank", Some(" Route ")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank.as_deref(), Some("route"));
+        assert_eq!(
+            entry_for(&cfg, "rc_carrier_rank").unwrap().value.as_deref(),
+            Some("route")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("RC_CARRIER_RANK")
+                .map(String::as_str),
+            Some("route")
         );
         apply(&mut cfg, "rc_carrier_rank", Some("0")).unwrap();
         assert_eq!(cfg.rc_carrier_rank, None, "0 is the default");
@@ -5748,6 +5835,89 @@ mod external_access_surface_tests {
         assert_eq!(
             cfg.external_max_permissions, None,
             "clears: defer to the org"
+        );
+    }
+}
+
+#[cfg(test)]
+mod enum_declared_values_tests {
+    use super::{
+        EncoderPreferenceChoice, KEYS, apply, current_value, declared_values, pin_declared_values,
+    };
+
+    /// FR-148 — an `enum:` key's entry is the setter's one list of its
+    /// values: every declared value is taken, and anything else is refused
+    /// with the declared values named, writing nothing. Until 0.4.232 each
+    /// arm listed its values again, and `rc_carrier_rank` refused D49's `route`.
+    #[test]
+    fn every_enum_key_takes_exactly_its_declared_values() {
+        let enum_keys: Vec<&str> = KEYS
+            .iter()
+            .filter(|m| m.kind.starts_with("enum:"))
+            .map(|m| m.key)
+            .collect();
+        assert!(!enum_keys.is_empty());
+        for key in enum_keys {
+            let declared = declared_values(key).expect("an enum key declares its values");
+            assert!(
+                declared.len() >= 2 && declared.iter().all(|v| !v.is_empty()),
+                "{key}: {declared:?}"
+            );
+            for v in &declared {
+                let mut cfg = crate::config::test_fixture();
+                if let Err(e) = apply(&mut cfg, key, Some(v)) {
+                    panic!("{key}: the declared {v:?} is refused: {e}");
+                }
+            }
+            let mut cfg = crate::config::test_fixture();
+            let before = current_value(&cfg, key);
+            assert_eq!(
+                apply(&mut cfg, key, Some("no-such-value")),
+                Err(format!(
+                    "{key} must be one of {} (got \"no-such-value\")",
+                    declared.join(" | ")
+                ))
+            );
+            assert_eq!(
+                current_value(&cfg, key),
+                before,
+                "{key}: refused, unwritten"
+            );
+        }
+        assert_eq!(declared_values("overlay_enabled"), None, "a bool key");
+        assert_eq!(declared_values("no_such_key"), None);
+    }
+
+    /// FR-148 — `encoder_preference`'s parser is the setter itself: it
+    /// writes the typed field the daemon matches on (`app.rs`,
+    /// `resolve_encoder_preference`). So its pin is here: every declared value
+    /// sets a choice of its own, and every choice is declared.
+    #[test]
+    fn encoder_preference_declares_every_choice() {
+        // No wildcard: a new choice fails to compile here until it is listed.
+        let choices = [
+            EncoderPreferenceChoice::Auto,
+            EncoderPreferenceChoice::Hardware,
+            EncoderPreferenceChoice::Software,
+        ]
+        .map(|c| match c {
+            EncoderPreferenceChoice::Auto
+            | EncoderPreferenceChoice::Hardware
+            | EncoderPreferenceChoice::Software => c,
+        });
+        pin_declared_values("encoder_preference", |cfg| cfg.encoder_preference, &choices);
+    }
+
+    /// FR-148 — so is `ice_follow_renomination`'s: the setter writes the
+    /// field the daemon hands the vendored ICE agent as `1`, `0` or nothing
+    /// (`ROOMLER_ICE_FOLLOW_RENOMINATION`). Every declared value sets a state
+    /// of its own, and every state is declared.
+    #[test]
+    fn ice_follow_renomination_declares_every_state() {
+        pin_declared_values(
+            "ice_follow_renomination",
+            |cfg| cfg.ice_follow_renomination,
+            &[None, Some(true), Some(false)],
         );
     }
 }

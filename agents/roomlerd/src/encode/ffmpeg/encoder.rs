@@ -4547,6 +4547,29 @@ mod tests {
         }
     }
 
+    /// FR-148 — `qsv_rate_mode`'s declared values against this parser,
+    /// fed through the config fallback as `QsvRateOpen::plan` reads it: each
+    /// declared value reads as a mode of its own, and each mode is declared
+    /// (`config_surface::pin_declared_values`). The match has no wildcard, so
+    /// a new mode fails to compile here until it is listed.
+    #[test]
+    fn qsv_rate_mode_declares_every_mode_the_open_reads() {
+        let modes = [QsvRateMode::Cbr, QsvRateMode::Qvbr].map(|m| match m {
+            QsvRateMode::Cbr | QsvRateMode::Qvbr => m,
+        });
+        crate::config_surface::pin_declared_values(
+            "qsv_rate_mode",
+            |cfg| {
+                QsvRateMode::parse(
+                    crate::config::env_fallbacks(cfg)
+                        .remove("QSV_RATE_MODE")
+                        .as_deref(),
+                )
+            },
+            &modes,
+        );
+    }
+
     /// The parameters with the switch on. An HEVC or H.264 QSV open asks for
     /// 0.9 × its cap under `maxrate` at the cap, `global_quality` kept, and
     /// `select_rc_mode` reads only `rc_max_rate == bit_rate` as constant bitrate

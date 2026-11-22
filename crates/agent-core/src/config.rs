@@ -1206,11 +1206,11 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
-    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio` or
-    /// `1`. With it on, a remote-desktop session whose mesh link to the
-    /// viewer is not direct ranks its mesh candidates below every relay; `1`
-    /// also marks them ` network-cost 999`. Env `ROOMLERD_RC_CARRIER_RANK`,
-    /// read once per session. Local only. Temporary: FR-148 P5 deletes it.
+    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio`, `1` or `route`.
+    /// On, a remote-desktop session whose mesh link to the viewer is not direct ranks its
+    /// mesh candidates below every relay; `1` also marks them ` network-cost 999`, and
+    /// `route` (D49) is `1`, ranking pairs by their route. Env `ROOMLERD_RC_CARRIER_RANK`, read
+    /// once per session. Local only. Temporary: FR-148 P5 deletes it.
     #[serde(default)]
     pub rc_carrier_rank: Option<String>,
     /// FR-148 P1 — the path model's switch: `off`, `shadow` (unset; the
