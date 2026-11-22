@@ -30,7 +30,7 @@ The loopback-TURN corp relay (`agents/roomlerd/src/rc_local_turn.rs`) hosts a sm
 overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), with fallback ports from `:41989`
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
 viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7819`,
-called at `:9224`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3811`) and
+called at `:9223`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3811`) and
 forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `crates/remote_control/src/signaling.rs:2018`). The Hub stores it
 on the session (`crates/modules/fleet/src/hub.rs:2032`) and hands the remote agent `turn:<overlay>:<port>` with the
 offer (`forward_offer`, `:2223`, the relay at `:2263`), only for an overlay address (`is_overlay_relay_ip`, `:66`) and
