@@ -271,7 +271,7 @@ under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was 
   `--revert`: each uid's folder, then `root.json`, then root's kept copy last, so a stop part-way leaves what the
   next `--revert` needs.
 - The records hold tokens and WireGuard keys, the same class as root's own file beside them. The uninstall's
-  `remove_paths /etc/roomler` (`scripts/install.sh:2087`) takes them along (D4).
+  `remove_paths /etc/roomler` (`scripts/install.sh:2099`) takes them along (D4).
 
 ### Root and the person's child
 
@@ -490,8 +490,8 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
 | `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:100-104`, held by `flock`, `unix_acquire`, `:217-249`), so the second daemon is not refused as a second instance | write |
 | `agents/roomlerd/src/service.rs:2800-2832` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2830-2832`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
-| `scripts/install.sh:2049-2070` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1616-1624`) | remove |
-| `scripts/install.sh:2083-2090` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1664`) as root | remove |
+| `scripts/install.sh:2061-2082` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1616-1624`) | remove |
+| `scripts/install.sh:2095-2102` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1664`) as root | remove |
 | `scripts/install.sh:1115` | `as_root grep` of the console person's `config.toml` | read |
 | `postinstall:145-163`, `:445`, `:530` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:287-290`, `:326` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
@@ -633,7 +633,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - **D3. A folder whose owner has no account.** Recommended: left alone, and said; the child has no home to find.
   Fallback: migrate it as root, which breaks the rule.
 - **D4. Where root's records live.** Recommended: `/etc/roomler/one-row/`, beside root's kept copy; the uninstall
-  removes it with `/etc/roomler` (`scripts/install.sh:2087`). Fallback: `/var/db/roomler/one-row/`, which would keep
+  removes it with `/etc/roomler` (`scripts/install.sh:2099`). Fallback: `/var/db/roomler/one-row/`, which would keep
   tokens after an uninstall.
 - **D5. A revert with one failing person.** Recommended: go on, restart, exit 1, and resume on the next run.
   Fallback: stop at the first failure, as today.

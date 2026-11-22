@@ -2207,7 +2207,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2113-2192`):
+exit code (`scripts/install.sh:2125-2204`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -2263,7 +2263,7 @@ flowchart TD
 
 | Rule | Where | Why |
 |---|---|---|
-| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2279` | the shell has read every byte before the first command runs |
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2291` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
 | The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
 | Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
@@ -4018,7 +4018,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 ### The order is the design
 
 `scripts/install.sh:1525` (the section) — `uninstall_linux` at `:1969`,
-`uninstall_macos` at `:2021`.
+`uninstall_macos` at `:2046`, `uninstall_stop_macos` at `:2006`.
 
 ```mermaid
 flowchart TD
@@ -4035,9 +4035,9 @@ flowchart TD
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1149`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`:1340`) |
-| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1078`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
-| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1806`) | `com.roomler.update` at once, or, while the process launchd runs for it has an `installer` child, once that child is gone (300 s at most; FR-151 P2), every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2006`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1735`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`remove_tarball_linux`, `:1905`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
 | 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
