@@ -6409,6 +6409,22 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
         // /etc/roomler/disable-auto-update (`updater::OPT_OUT_MARKERS`). P5a missed
         // this string, so "Apply update" in the companion pointed at a log that no
         // longer exists on any Mac it had migrated. docs/fr/FR-46
+        //
+        // FR-151 — first the person's own ask, recorded by the daemon behind
+        // this account's OWN socket (never the system one, so it can never land
+        // in a root daemon); the helper then installs over this person's own
+        // sessions, never over the system daemon's SSH connections, runs,
+        // transfers or recording. With nobody serving that socket the wake
+        // below is a plain one, and the helper's usual wait applies.
+        let recorded = match tunnel_core::localapi::own_socket_path() {
+            Some(path) => tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut client = tunnel_core::localapi::connect_unix_at(path).await?;
+                client.ask_for_update().await
+            })
+            .await
+            .is_ok_and(|asked| asked.is_ok()),
+            None => false,
+        };
         return match updater::queue_update_check() {
             Ok(()) => {
                 println!(
@@ -6417,6 +6433,14 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
                      (If this Mac set /etc/roomler/disable-auto-update, updates are manual:\n\
                       sudo installer -pkg <pkg> -target /)"
                 );
+                if recorded {
+                    println!(
+                        "Your ask is recorded: the update installs now over your own sessions, \
+                         and waits for this Mac's SSH connections, runs, transfers and recordings."
+                    );
+                } else {
+                    println!("The update installs when nothing on this Mac is in use.");
+                }
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(e).context(format!(

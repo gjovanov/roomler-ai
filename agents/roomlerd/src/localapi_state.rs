@@ -1099,13 +1099,37 @@ impl LocalApiState for DaemonState {
     }
 
     fn live_work(&self) -> Option<tunnel_core::localapi::LiveWorkInfo> {
-        // The seam (FR-151 P1, commit 1): nothing live, no ask recorded.
-        let _ = (&self.rc_sessions, &self.asks);
-        Some(tunnel_core::localapi::LiveWorkInfo::default())
+        // FR-151 — what an install that restarts this daemon would cut, as
+        // its own update gate reads it (`busy::now`), and the newest ask it
+        // recorded. A shape without signalling has no session registry, and
+        // so no sessions: its other work is still counted.
+        let busy = match &self.rc_sessions {
+            Some(sessions) => crate::busy::now(sessions),
+            None => crate::busy::now(&crate::rc_sessions::RcSessionRegistry::new()),
+        };
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Some(tunnel_core::localapi::LiveWorkInfo {
+            rc_sessions: count(busy.rc_sessions),
+            ssh_connections: count(busy.ssh_connections),
+            exec_runs: count(busy.exec_runs),
+            work: count(busy.work),
+            net_transition: busy.net_transition,
+            ask_age_secs: self.asks.age_secs(std::time::SystemTime::now()),
+        })
     }
 
     fn ask_for_update(&self) -> Result<(), String> {
-        // The seam: answered, and nothing recorded.
+        // FR-151 — only the person's own daemon records the person's ask: a
+        // root daemon's record lets an update install over everything, so a
+        // root daemon's record is only ever an operator's push.
+        if self.privileged {
+            return Err(
+                "this daemon runs as root and records no person's ask for an \
+                        update; ask the daemon of your own account"
+                    .into(),
+            );
+        }
+        self.asks.record(crate::updater::AskedBy::Person);
         Ok(())
     }
 
@@ -3032,6 +3056,63 @@ pub(crate) mod tests {
         )
     }
 
+    /// FR-151 D1 — `live_work` counts this daemon's own sessions and answers
+    /// the age of the newest ask it recorded: none recorded, no age; one that
+    /// reads as made later than now (the clock went back), no age either.
+    #[test]
+    fn live_work_counts_the_registry_and_the_ask() {
+        let sessions = crate::rc_sessions::RcSessionRegistry::new();
+        let (kill, _orders) = tokio::sync::mpsc::channel(1);
+        sessions.insert(
+            bson::oid::ObjectId::new(),
+            "viewer".into(),
+            "VIEW".into(),
+            String::new(),
+            kill,
+        );
+        let book = Arc::new(crate::updater::AskBook::default());
+        let st = half(consent_broker("fr151-d1"))
+            .with_rc_sessions(sessions)
+            .with_ask_book(book.clone());
+        let before = st.live_work().expect("the daemon reports live work");
+        assert_eq!(before.rc_sessions, 1);
+        assert_eq!(before.ask_age_secs, None);
+        let now = std::time::SystemTime::now();
+        book.record_at(
+            crate::updater::AskedBy::Operator { pin: None },
+            now - std::time::Duration::from_secs(30),
+        );
+        let after = st.live_work().expect("live work");
+        assert!(matches!(after.ask_age_secs, Some(30..=32)), "{after:?}");
+        book.record_at(
+            crate::updater::AskedBy::Person,
+            now + std::time::Duration::from_secs(600),
+        );
+        assert_eq!(st.live_work().expect("live work").ask_age_secs, None);
+    }
+
+    /// FR-151 D2 — a daemon that runs as root records no person's ask, so a
+    /// root daemon's record is only ever an operator's push; a person's own
+    /// daemon records it, and answers its age.
+    #[test]
+    fn a_root_daemon_records_no_persons_ask() {
+        let book = Arc::new(crate::updater::AskBook::default());
+        let root = half(consent_broker("fr151-d2r"))
+            .with_ask_book(book.clone())
+            .with_privileged(true);
+        assert!(root.ask_for_update().is_err());
+        assert_eq!(book.newest(), None, "nothing recorded");
+        let person = half(consent_broker("fr151-d2p"))
+            .with_ask_book(book.clone())
+            .with_privileged(false);
+        assert_eq!(person.ask_for_update(), Ok(()));
+        assert_eq!(
+            book.newest().map(|ask| ask.by),
+            Some(crate::updater::AskedBy::Person)
+        );
+        let age = person.live_work().expect("live work").ask_age_secs;
+        assert!(matches!(age, Some(0..=2)), "{age:?}");
+    }
     /// A question the companion is to show, on `broker`.
     pub(crate) fn ask_on(
         broker: &crate::consent::ConsentBroker,

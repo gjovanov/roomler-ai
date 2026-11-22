@@ -206,13 +206,13 @@ with "nothing has changed" (exit 1).
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
 | R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:638-763`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1061`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4014`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4016`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
 hold (the package's `sudo_line_fits`, `postinstall:285-291`, and its owner test, `:326`):
 
-1. The home is the console person's (`console_uid()`, `one_row.rs:3601`).
+1. The home is the console person's (`console_uid()`, `one_row.rs:3611`).
 2. That person is an administrator: `/usr/sbin/dseditgroup -o checkmember -m <name> admin` exits 0
    (`postinstall:286`), a question to the account database.
 3. The child reports that the home is an absolute path to a folder, not a link, and that `<H>/Library` is a folder
@@ -236,7 +236,7 @@ That section is `docs/installation.md:3196`; P1 adds one-row's row to it. The li
 ### Root's records
 
 Each file is written as a temporary file in the same folder, `fsync`, `rename`, then an `fsync` of the folder.
-The macOS host's `write_root` (`one_row.rs:3488`) does this for every `RootFile`, which `root_path` (`:145`) maps
+The macOS host's `write_root` (`one_row.rs:3505`) does this for every `RootFile`, which `root_path` (`:145`) maps
 under `/etc/roomler` or `/var/log/roomler` only. Before P1 root's kept copy was written in place, at its final name.
 
 | Path | Owner, mode | Holds |
@@ -444,7 +444,7 @@ Root copies back only its own kept copy, so a revert of an older Mac writes noth
 | Question | Answer |
 |---|---|
 | Who takes it away | root boots the job out by label; the person's child removes `<P>` in `convert`, after checking its bytes |
-| Where its bytes are kept | `/etc/roomler/one-row/<uid>/com.roomler.agent.plist`, root's, 600, written by root from the child's `read`. It no longer moves into the person's folder, and root writes it with `write_root` (`one_row.rs:3488`) |
+| Where its bytes are kept | `/etc/roomler/one-row/<uid>/com.roomler.agent.plist`, root's, 600, written by root from the child's `read`. It no longer moves into the person's folder, and root writes it with `write_root` (`one_row.rs:3505`) |
 | Who puts it back | the person's child, in `put-back`: a temporary file in `<L>`, `fsync`, `rename`, the mode as above. It makes `<L>` 0755 as the person when missing, and refuses (exit 4) where `<L>` is not writable |
 | What `launchctl bootstrap` loads | the file at `<P>`, which launchd opens by path in every form, the person's own login included. No process of ours running as root opens it: `<P>` is only an argument, built by one function, `bootstrap_argv`. Who sends it is D6 |
 | Precedent | the package's login-item file writes are the person's (`as_person`, `postinstall:262-264`, `:391`); its bootstrap is root's, by path (`replace_launchd_service`, `postinstall:145-163`, called at `:445` and `:530`) |
@@ -589,7 +589,7 @@ The docs:
   what D8 decides.
 - `docs/installation.md`, where the give-up's line is described (`:3253-3344`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
-- The module docs: `one_row.rs:3-53` (the step table) and `one_row_home.rs:3-60`.
+- The module docs: `one_row.rs:3-53` (the step table) and `one_row_home.rs:3-61`.
 - `docs/README.md`: the `installation.md` row names the rule.
 
 ## Acceptance criteria

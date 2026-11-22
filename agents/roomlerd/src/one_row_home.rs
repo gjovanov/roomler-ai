@@ -423,9 +423,21 @@ pub async fn read_live_work<F>(ask: F, bound: std::time::Duration) -> LiveWorkAn
 where
     F: std::future::Future<Output = io::Result<tunnel_core::localapi::LiveWorkInfo>>,
 {
-    // The seam (FR-151 P1, commit 1): the child answers zeros.
-    let _ = (ask, bound);
-    LiveWorkAnswer::Answered(tunnel_core::localapi::LiveWorkInfo::default().into())
+    match tokio::time::timeout(bound, ask).await {
+        Ok(Ok(info)) => LiveWorkAnswer::Answered(info.into()),
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            LiveWorkAnswer::NotRunning
+        }
+        Ok(Err(e)) if tunnel_core::localapi::is_unknown_verb(&e.to_string()) => {
+            LiveWorkAnswer::Older
+        }
+        Ok(Err(_)) | Err(_) => LiveWorkAnswer::NoAnswer,
+    }
 }
 
 /// What is at a path, as `lstat` says.
@@ -583,7 +595,14 @@ impl Reply {
         if answers.iter().any(|(has, wanted)| has != wanted) {
             return Err(format!("the reply does not answer `{}` alone", verb.word()));
         }
-        // The seam (FR-151 P1, commit 1): no bound on a `live-work` answer.
+        if let Some(LiveWorkAnswer::Answered(c)) = reply.live_work {
+            let counts = [c.rc_sessions, c.ssh_connections, c.exec_runs, c.work];
+            if counts.iter().any(|&n| n > LIVE_WORK_MAX_COUNT)
+                || c.ask_age_secs.is_some_and(|age| age > LIVE_WORK_MAX_AGE)
+            {
+                return Err("the `live-work` answer is out of its bounds".to_string());
+            }
+        }
         Ok(reply)
     }
 }
@@ -1420,8 +1439,37 @@ impl Me for RealMe {
 /// where root starts no child.
 #[cfg(unix)]
 fn child_socket_path() -> Option<PathBuf> {
-    // The seam (FR-151 P1, commit 1): the child asks no socket.
-    None
+    #[cfg(target_os = "macos")]
+    {
+        tunnel_core::localapi::own_socket_path_in(darwin_user_temp_dir()?, None)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// FR-151 — `confstr(_CS_DARWIN_USER_TEMP_DIR)`: this account's own temp
+/// folder (`/var/folders/…/T/`), from the system, never from `TMPDIR`.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = vec![0u8; 1024];
+    // SAFETY: confstr writes at most `buf.len()` bytes, its NUL included, into
+    // the buffer it is given, and returns the length it needs (NUL included),
+    // or 0 on an error.
+    let needed = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if needed == 0 || needed > buf.len() {
+        return None;
+    }
+    buf.truncate(needed - 1);
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
 }
 
 /// `getgroups`: the kernel's list for this process.
@@ -3210,5 +3258,192 @@ mod tests {
             assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
             assert_eq!(mode(&at.plist), 0o644, "0644 when no mode was recorded");
         }
+    }
+
+    // ── FR-151: `live-work` ─────────────────────────────────────────────
+
+    fn live(rc: u32, ask: Option<u64>) -> io::Result<tunnel_core::localapi::LiveWorkInfo> {
+        Ok(tunnel_core::localapi::LiveWorkInfo {
+            rc_sessions: rc,
+            ssh_connections: 1,
+            exec_runs: 0,
+            work: 3,
+            net_transition: true,
+            ask_age_secs: ask,
+        })
+    }
+
+    /// H1 — a daemon older than FR-151 answers "unknown variant": `older`.
+    #[tokio::test]
+    async fn live_work_reads_an_unknown_verb_as_older() {
+        let answer = read_live_work(
+            async {
+                Err(io::Error::other(
+                    "localapi error: bad request: unknown variant `live_work`, expected one of `status`",
+                ))
+            },
+            crate::helper_gate::ASK_TIMEOUT,
+        )
+        .await;
+        assert_eq!(answer, LiveWorkAnswer::Older);
+    }
+
+    /// H2 — no socket, or one nobody serves, is a daemon that is not running;
+    /// a socket it may not use is not an answer.
+    #[tokio::test]
+    async fn live_work_reads_a_missing_or_refused_socket_as_not_running() {
+        for (kind, want) in [
+            (io::ErrorKind::NotFound, LiveWorkAnswer::NotRunning),
+            (io::ErrorKind::ConnectionRefused, LiveWorkAnswer::NotRunning),
+            (io::ErrorKind::PermissionDenied, LiveWorkAnswer::NoAnswer),
+            (io::ErrorKind::UnexpectedEof, LiveWorkAnswer::NoAnswer),
+        ] {
+            let answer = read_live_work(
+                async move { Err(io::Error::from(kind)) },
+                crate::helper_gate::ASK_TIMEOUT,
+            )
+            .await;
+            assert_eq!(answer, want, "{kind:?}");
+        }
+    }
+
+    /// H3 — a daemon that never answers is `no_answer` within the bound.
+    #[tokio::test(start_paused = true)]
+    async fn live_work_reads_silence_as_no_answer() {
+        let started = tokio::time::Instant::now();
+        let answer = read_live_work(std::future::pending(), crate::helper_gate::ASK_TIMEOUT).await;
+        assert_eq!(answer, LiveWorkAnswer::NoAnswer);
+        assert_eq!(started.elapsed(), crate::helper_gate::ASK_TIMEOUT);
+    }
+
+    /// H4 — the counts and the ask's age reach root as the daemon said them,
+    /// and the child asks its daemon only after every check of itself, with
+    /// no file read or written.
+    #[tokio::test]
+    async fn live_work_carries_the_counts_and_the_ask() {
+        let answer =
+            read_live_work(async { live(2, Some(7)) }, crate::helper_gate::ASK_TIMEOUT).await;
+        let want = LiveWorkCounts {
+            rc_sessions: 2,
+            ssh_connections: 1,
+            exec_runs: 0,
+            work: 3,
+            net_transition: true,
+            ask_age_secs: Some(7),
+        };
+        assert_eq!(answer, LiveWorkAnswer::Answered(want));
+        assert_eq!(
+            answer.reading(),
+            crate::helper_gate::Reading::Answered(live(2, Some(7)).unwrap())
+        );
+
+        let mut me = FakeMe::new();
+        let mut fs = FakeFs::new();
+        let out = run_with(line(Verb::LiveWork), &mut me, &mut fs);
+        assert_eq!(out.exit, Exit::Done);
+        assert_eq!(
+            *me.asked.borrow(),
+            ["umask", "creds", "root", "home", "live_work"],
+            "every check of itself first, and no stdin"
+        );
+        assert!(
+            fs.calls.borrow().is_empty(),
+            "no file: {:?}",
+            fs.calls.borrow()
+        );
+        let reply = Reply::parse(&out.stdout, UID, GID, Verb::LiveWork).expect("parses");
+        assert_eq!(reply.live_work, Some(me.live_work()));
+    }
+
+    /// H5 — root reads a `live-work` reply that answers that verb alone, with
+    /// every count and the age inside their bounds.
+    #[test]
+    fn a_reply_answers_live_work_alone_within_bounds() {
+        let reply = |live_work: Option<LiveWorkAnswer>, read: bool| {
+            let mut r = Reply {
+                v: FORMAT,
+                version: VERSION.to_string(),
+                uid: UID,
+                gid: GID,
+                groups: vec![GID],
+                read: None,
+                convert: None,
+                put_back: None,
+                put_back_legacy: None,
+                live_work,
+            };
+            if read {
+                let (fs, at) = a_home();
+                r.read = Some(super::read(&at, &fs));
+            }
+            serde_json::to_vec(&r).unwrap()
+        };
+        let counts = LiveWorkCounts {
+            rc_sessions: LIVE_WORK_MAX_COUNT,
+            ssh_connections: 0,
+            exec_runs: 0,
+            work: 0,
+            net_transition: false,
+            ask_age_secs: Some(LIVE_WORK_MAX_AGE),
+        };
+        let ok = reply(Some(LiveWorkAnswer::Answered(counts)), false);
+        assert!(Reply::parse(&ok, UID, GID, Verb::LiveWork).is_ok());
+        for word in [
+            LiveWorkAnswer::NotRunning,
+            LiveWorkAnswer::Older,
+            LiveWorkAnswer::NoAnswer,
+        ] {
+            assert!(Reply::parse(&reply(Some(word), false), UID, GID, Verb::LiveWork).is_ok());
+        }
+        let over = |c: LiveWorkCounts| reply(Some(LiveWorkAnswer::Answered(c)), false);
+        for (what, bad) in [
+            (
+                "a count over the bound",
+                over(LiveWorkCounts {
+                    work: LIVE_WORK_MAX_COUNT + 1,
+                    ..counts
+                }),
+            ),
+            (
+                "an age over a day",
+                over(LiveWorkCounts {
+                    ask_age_secs: Some(LIVE_WORK_MAX_AGE + 1),
+                    ..counts
+                }),
+            ),
+            ("no answer at all", reply(None, false)),
+            (
+                "another verb's answer beside it",
+                reply(Some(LiveWorkAnswer::Older), true),
+            ),
+        ] {
+            assert!(
+                Reply::parse(&bad, UID, GID, Verb::LiveWork).is_err(),
+                "{what}"
+            );
+        }
+        assert!(
+            Reply::parse(&ok, UID, GID, Verb::Read).is_err(),
+            "a `live-work` answer is no `read`"
+        );
+        let unknown = String::from_utf8(ok)
+            .unwrap()
+            .replace("\"rc_sessions\"", "\"x\":1,\"rc_sessions\"");
+        assert!(Reply::parse(unknown.as_bytes(), UID, GID, Verb::LiveWork).is_err());
+    }
+
+    /// H6 — the child finds its daemon's socket where the daemon binds it,
+    /// in the folder `confstr(_CS_DARWIN_USER_TEMP_DIR)` names, reading no
+    /// environment.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_the_childs_socket_is_the_daemons() {
+        let path = child_socket_path().expect("this account has a private temp folder");
+        let folder = darwin_user_temp_dir().expect("confstr names one");
+        assert_eq!(
+            Some(path.clone()),
+            tunnel_core::localapi::own_socket_path_in(folder, None)
+        );
+        assert!(path.ends_with("roomler/roomler.sock"), "{}", path.display());
     }
 }

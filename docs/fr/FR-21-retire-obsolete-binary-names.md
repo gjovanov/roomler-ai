@@ -49,7 +49,7 @@ the field is still on the old segment, silently, at the next update:
 | `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:84` | the takeover install cannot find the running service to retire; two services, or none |
 | `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:417` | the pre-rename scheduled task survives forever → two daemons |
 | legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:430,427,555`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
-| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
+| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:371` | the vacated install dir is never swept |
 | `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
 | **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:489` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
 
@@ -143,7 +143,7 @@ Anything a deployed host — or a deployed *operator runbook* — already depend
   people's shell history.
 - residual on-disk paths not yet behind `appdirs` (§5).
 - the HTTP `user_agent("roomler-agent/…")` sent by the updater
-  (`agents/roomlerd/src/updater.rs:534,616,818`). It is **recorded** into device/session
+  (`agents/roomlerd/src/updater.rs:536,618,820`). It is **recorded** into device/session
   telemetry at `crates/api/src/ws/handler.rs:69` — confirm nothing *dispatches* on it before
   changing it, because changing it also changes what historical rows mean.
 
@@ -487,7 +487,7 @@ whole of it.
 
 - **Published GitHub release assets.** Already-published names are immutable. The updater's
   pickers key on extension + arch + the `-permachine-` infix, **not** on the `roomler-agent-`
-  prefix (`agents/roomlerd/src/updater.rs:230-301`) — verified, not assumed. This is why P2
+  prefix (`agents/roomlerd/src/updater.rs:230-303`) — verified, not assumed. This is why P2
   is low-risk and why no asset rename is forced.
 - The `ROOMLER__` **server** config prefix — a different product surface, not a retired name.
 - `roomler-setup`'s own naming, including the UAC lib-naming rule (`wizard_app` / `wizard_shared`
