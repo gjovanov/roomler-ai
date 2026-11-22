@@ -75,7 +75,7 @@ use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::governor::{GateSkip, RateGovernor};
-use crate::encode::pipe::{Fall, PathNumber, PathRate, PathView, PushedBy, Ruled};
+use crate::encode::pipe::{Fall, MeasuredBy, PathNumber, PathRate, PathView, PushedBy, Ruled};
 use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
@@ -1495,6 +1495,10 @@ pub fn emit_model(session_id: ObjectId, v: &PathView) {
         goodput_bps = %Shown(v.goodput),
         pipe_belief = %belief,
         pipe_measured = %Shown(v.measured),
+        // FR-148 D51 B4g — which reading that is: `goodput`, `budget` (under
+        // `on`, its held rate in the goodput's place, the same basis) or
+        // `arrival`; `-` with none.
+        pipe_measured_by = %MeasuredBy::word_of(v.measured_by),
         prior_bps = %Shown(v.prior),
         learned_ceiling_bps = %Shown(v.learned_ceiling),
         slow_link_floor_bps = %Shown(v.slow_link_floor),
@@ -2889,6 +2893,53 @@ mod tests {
         );
     }
 
+    /// FR-148 D51 B4g — the VP9-444 pump times its capacity gate and hands
+    /// that time to the encode, read from `peer.rs` as compiled: a skipped
+    /// pass opens the gate clock's span in the gate's arm; the pass the gate
+    /// lets through closes it, before the step; and the pump's one encode
+    /// takes it with the interval, on the encode's own call, with no other
+    /// call handing the encoder a charge.
+    #[test]
+    fn the_vp9_pump_hands_the_encode_the_time_its_gate_held() {
+        const PEER_RS: &str = include_str!("peer.rs");
+        const GATE: &str =
+            "if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {";
+        let src = PEER_RS.replace("\r\n", "\n");
+        let rest = &src[src
+            .find("async fn media_pump_vp9_444_dc(")
+            .expect("the pump")..];
+        let vp9 = &rest[..rest.find("\n}\n").expect("the pump's end")];
+        let at = vp9.find(GATE).expect("the capacity gate");
+        let arm = &vp9[at..];
+        let arm = &arm[..arm.find("continue;").expect("the arm's continue")];
+        for (call, n) in [
+            ("gate_clock.skipped(", 1),
+            ("gate_clock.passed(", 1),
+            ("gate_clock.take()", 1),
+            (".encode_charged(&frame, gate)", 1),
+            ("enc.encode(", 0),
+            ("charge_most", 0),
+        ] {
+            assert_eq!(vp9.matches(call).count(), n, "{call}");
+        }
+        assert!(
+            arm.contains("gate_clock.skipped("),
+            "a skipped pass, in the arm"
+        );
+        let passed = vp9.find("gate_clock.passed(").unwrap();
+        let step = vp9
+            .find("delivery.on_frame(&pc, &mut governor);")
+            .expect("the step");
+        assert!(
+            at < passed && passed < step,
+            "the pass through, before the step"
+        );
+        assert!(
+            vp9.find("gate_clock.take()").unwrap() < vp9.find(".encode_charged(").unwrap(),
+            "taken for the encode"
+        );
+    }
+
     /// FR-148 D46 B2 — a sample read with gauges: `standing_ms` over the
     /// session's least (`None`: it does not count), 2 s long.
     fn read_sample(class: Class, kbps: u64, standing_ms: Option<u64>) -> Sample {
@@ -3745,6 +3796,7 @@ mod tests {
             goodput,
             belief: (floor, floor, goodput),
             measured: goodput,
+            measured_by: Some(MeasuredBy::Goodput),
             prior: n(1_162_000, Basis::Assumed, 800),
             learned_ceiling: n(0, Basis::Assumed, 312_400),
             slow_link_floor: n(987_700, Basis::Backlogged, 800),
@@ -3798,6 +3850,7 @@ mod tests {
             "pipe_belief=(1399272/app-limited/41300ms, 1399272/app-limited/41300ms, \
              1162000/backlogged/800ms)",
             "pipe_measured=1162000/backlogged/800ms",
+            "pipe_measured_by=goodput",
             "prior_bps=1162000/assumed/800ms",
             "learned_ceiling_bps=0/assumed/312400ms",
             "slow_link_floor_bps=987700/backlogged/800ms",
@@ -3825,6 +3878,7 @@ mod tests {
             "goodput_bps=None",
             "pipe_belief=(1399272/app-limited/101300ms, 1399272/app-limited/101300ms, None)",
             "pipe_measured=None",
+            "pipe_measured_by=-",
             "prior_bps=None",
             "viewer_rx_bps=9120/app-limited/600ms",
             "model_capacity_bps=None",
@@ -3868,6 +3922,29 @@ mod tests {
             let want = format!("model_rule={word}/1250ms");
             assert!(out.contains(&want), "{want:?} is not in {out:?}");
             assert_eq!(out.matches("model_rule=").count(), 1, "{out:?}");
+        }
+    }
+
+    /// FR-148 D51 B4g (C15) — the line names the measured reading's source,
+    /// right after it: `goodput`, `budget` (under `on`, where the budget's
+    /// held rate stands in the goodput's place with the same basis) or
+    /// `arrival`; `-` with no reading (`the_model_line_names_its_fields`).
+    #[test]
+    fn the_model_line_names_the_measured_source() {
+        for (by, word) in [
+            (Some(MeasuredBy::Goodput), "goodput"),
+            (Some(MeasuredBy::Budget), "budget"),
+            (Some(MeasuredBy::Arrival), "arrival"),
+            (None, "-"),
+        ] {
+            let view = PathView {
+                measured_by: by,
+                ..busy_view()
+            };
+            let out = logged(|| emit_model(sid(), &view));
+            let want = format!("pipe_measured=1162000/backlogged/800ms pipe_measured_by={word} ");
+            assert!(out.contains(&want), "{want:?} is not in {out:?}");
+            assert_eq!(out.matches("pipe_measured_by=").count(), 1, "{out:?}");
         }
     }
 
@@ -8907,6 +8984,10 @@ pub(crate) mod shaped_link {
             /// The capture's frame interval: 30 fps, the pump's target.
             const CAPTURE: Duration = Duration::from_nanos(1_000_000_000 / 30);
             const TARGET_FPS: u32 = 30;
+            /// FR-148 D51 B4g (C6s) — a capture slower than the pump's target:
+            /// 20 fps on its 30, with no FR-112 pacing, as a GPO-locked laptop,
+            /// a Wayland portal or a software encoder runs in the field.
+            const SLOW_CAPTURE: Duration = Duration::from_nanos(1_000_000_000 / 20);
             /// The relay's ceiling: `encode::relay_max_bps`'s default.
             const RELAY_CEILING: u32 = 3_000_000;
             /// The pump's send channel on a relay, its gate's retry, and its
@@ -9158,6 +9239,10 @@ pub(crate) mod shaped_link {
                 hold_began: Vec<u64>,
                 hold_cuts: Vec<u64>,
                 drained_at: Vec<u64>,
+                /// FR-148 D51 B4g — each encode (µs from `t0`), the time the
+                /// capacity gate kept frames back since the encode before it
+                /// (`encode::charge::GateClock`) and the gap it was charged, µs.
+                charged: Vec<(u64, u64, u64)>,
             }
 
             /// A frame in the viewer's worker: its write stamp, when its last
@@ -9206,9 +9291,12 @@ pub(crate) mod shaped_link {
             /// tick, the encode, the watermark arm and the send channel; and the
             /// send task behind it, one frame at a time into SCTP. Until `moves`
             /// the screen is still: a delta is `STILL_DELTA` whatever the target.
+            /// The capture delivers a frame every `capture` (`CAPTURE`, or
+            /// C6s's `SLOW_CAPTURE`) against the pump's `TARGET_FPS`.
             #[allow(clippy::too_many_arguments)] // one pump's handles; a struct would only rename them
             async fn pump(
                 arm: Arm,
+                capture: Duration,
                 t0: Instant,
                 start: Instant,
                 moves: Instant,
@@ -9290,6 +9378,13 @@ pub(crate) mod shaped_link {
                 // The encoder's last stamp (`encode::charge`): it grants by
                 // the pts it is handed, as libvpx does.
                 let mut last_stamp: Option<crate::encode::charge::Stamp> = None;
+                // FR-148 D51 B4g — the time the gate kept frames back since the
+                // last encode, measured as the pump measures it.
+                let mut gate_clock = crate::encode::charge::GateClock::default();
+                // The capture's frames a second, for the content's swing.
+                let per_s = u64::try_from(Duration::from_secs(1).as_nanos() / capture.as_nanos())
+                    .unwrap_or(1)
+                    .max(1);
                 let mut window_from = (Instant::now(), 0_u64);
                 // Where the last window left the held passes, the blocked
                 // writes and the encoded frames.
@@ -9302,6 +9397,7 @@ pub(crate) mod shaped_link {
                     delivery.gate_with(&mut governor, &clock, &gauges, true, false);
                     let full = send_tx.capacity() == 0;
                     if full || delivery.shuts() {
+                        gate_clock.skipped(Instant::now());
                         let at = us(t0.elapsed());
                         if full {
                             p.full += 1;
@@ -9326,23 +9422,24 @@ pub(crate) mod shaped_link {
                         continue;
                     }
                     was_held = false;
+                    gate_clock.passed(Instant::now());
                     delivery.on_frame_with(&mut governor, &clock, &gauges);
                     // The capture: the newest frame not taken yet, or the next.
                     let newest = u32::try_from(
                         Instant::now().saturating_duration_since(start).as_nanos()
-                            / CAPTURE.as_nanos(),
+                            / capture.as_nanos(),
                     )
                     .unwrap_or(u32::MAX);
                     let k = match taken {
                         Some(t) if t >= newest => {
-                            let due = start + CAPTURE * (t + 1);
+                            let due = start + capture * (t + 1);
                             tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                             t + 1
                         }
                         _ => newest,
                     };
                     taken = Some(k);
-                    let captured = start + CAPTURE * k;
+                    let captured = start + capture * k;
                     p.captured_at.push(us(t0.elapsed()));
                     let forced = std::mem::take(&mut key_asked);
                     force_key |= forced;
@@ -9442,31 +9539,33 @@ pub(crate) mod shaped_link {
                     note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
                     tokio::time::sleep(ENCODE).await;
                     let key = std::mem::take(&mut force_key);
-                    // FR-148 D51 B4f — the pts the pump hands the encoder: the
-                    // capture's time, charged at most the pump's interval
-                    // where the budget acts (`RateGovernor::charge_most`), and
-                    // the gap granted is the gap between the pts handed.
+                    // FR-148 D51 B4f, B4g — the pts the pump hands the
+                    // encoder: the capture's time, charged where the budget
+                    // acts its gap less the time gated, never less than the
+                    // pump's interval (`RateGovernor::charge_interval`); the
+                    // gap granted is the gap between the pts handed.
                     let pts = i64::try_from(us(captured.saturating_duration_since(start)))
                         .unwrap_or(i64::MAX);
-                    let stamp = crate::encode::charge::charge(
-                        last_stamp,
-                        pts,
-                        Instant::now(),
-                        governor.charge_most(TARGET_FPS),
-                    );
-                    let dt = last_stamp.map_or(CAPTURE, |l| {
+                    let gated = gate_clock.take();
+                    let gate = governor
+                        .charge_interval(TARGET_FPS)
+                        .map(|interval| crate::encode::charge::Gate { gated, interval });
+                    let stamp =
+                        crate::encode::charge::charge(last_stamp, pts, Instant::now(), gate);
+                    let dt = last_stamp.map_or(capture, |l| {
                         Duration::from_micros(u64::try_from(stamp.pts - l.pts).unwrap_or(0))
                     });
                     last_stamp = Some(stamp);
+                    p.charged.push((us(t0.elapsed()), us(gated), us(dt)));
                     let len = if captured < moves && !key {
                         STILL_DELTA
                     } else if key && std::mem::take(&mut first_key) {
                         OPENING_KEY
                     } else if key {
-                        let s = swing(u64::from(k) / u64::from(TARGET_FPS));
+                        let s = swing(u64::from(k) / per_s);
                         frame_len(target, dt, Some(LATER_KEY), s)
                     } else {
-                        let s = swing(u64::from(k) / u64::from(TARGET_FPS));
+                        let s = swing(u64::from(k) / per_s);
                         frame_len(target, dt, None, s).min(DELTA_MOST)
                     };
                     p.encoded_at.push(us(t0.elapsed()));
@@ -9650,8 +9749,14 @@ pub(crate) mod shaped_link {
             /// One arm on B3T's path: `still` of a still screen, then `run` of
             /// motion, whose first `OPENING` the figures leave out. The agent's
             /// end writes through the relay's socket (`HOP`), and its
-            /// direction stalls as the relay's TCP does (`RELAY_STALLS`).
-            async fn run_loop(arm: Arm, still: Duration, run: Duration) -> LoopRun {
+            /// direction stalls as the relay's TCP does (`RELAY_STALLS`). The
+            /// capture delivers a frame every `capture`.
+            async fn run_loop(
+                arm: Arm,
+                still: Duration,
+                run: Duration,
+                capture: Duration,
+            ) -> LoopRun {
                 let _turn = TURN.lock().await;
                 #[cfg(target_os = "windows")]
                 let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
@@ -9680,6 +9785,7 @@ pub(crate) mod shaped_link {
                 let stop = moves + run;
                 let pumping = tokio::spawn(pump(
                     arm,
+                    capture,
                     t0,
                     start,
                     moves,
@@ -10215,6 +10321,10 @@ pub(crate) mod shaped_link {
                 drains: (usize, usize),
                 link_cuts: usize,
                 moves: BTreeMap<String, u32>,
+                /// FR-148 D51 B4g — per encode: the time gated since the encode
+                /// before it (mean, p95) and the gap charged (mean), µs.
+                gated_us: (u64, u64),
+                charged_us: u64,
             }
 
             /// The settled stretch's start: the opening reading's confidence
@@ -10231,7 +10341,13 @@ pub(crate) mod shaped_link {
                 for m in log.clone() {
                     *moves.entry(m.1.clone()).or_default() += 1;
                 }
+                let encodes: Vec<&(u64, u64, u64)> =
+                    p.charged.iter().filter(|c| c.0 >= from).collect();
+                let n = (encodes.len() as u64).max(1);
+                let mut gated: Vec<u64> = encodes.iter().map(|c| c.1).collect();
                 Bar {
+                    gated_us: (gated.iter().sum::<u64>() / n, quantile(&mut gated, 95)),
+                    charged_us: encodes.iter().map(|c| c.2).sum::<u64>() / n,
                     from_us: from,
                     read: read_from(r, from),
                     held: p.held_at.iter().filter(inside).count(),
@@ -10251,10 +10367,12 @@ pub(crate) mod shaped_link {
 
             fn bar_words(b: &Bar) -> String {
                 let x = &b.read;
+                let ms = |us: u64| format!("{}.{}", us / 1_000, us % 1_000 / 100);
                 format!(
                     "bar from {} ms: fill {}.{:03} of payload ({} kbit/s), sent fps p50 {} p10 {}, transit \
                      p95 {} ms, rtt p95 {} ms, held passes {} in {} holds, holds read as decrease(full) {}, \
-                     drain windows {} (passes paused {}), link cuts {}, moves {:?}",
+                     drain windows {} (passes paused {}), link cuts {}, gated per encode mean {} ms p95 {} ms, \
+                     charged per encode mean {} ms, moves {:?}",
                     b.from_us / 1_000,
                     x.of_payload / 1_000,
                     x.of_payload % 1_000,
@@ -10269,6 +10387,9 @@ pub(crate) mod shaped_link {
                     b.drains.0,
                     b.drains.1,
                     b.link_cuts,
+                    ms(b.gated_us.0),
+                    ms(b.gated_us.1),
+                    ms(b.charged_us),
                     b.moves,
                 )
             }
@@ -10344,11 +10465,11 @@ pub(crate) mod shaped_link {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, off and on"]
             async fn budget_on_with_the_pump_loop() {
-                let off = run_loop(Arm::Off, Duration::ZERO, OFF_RUN).await;
+                let off = run_loop(Arm::Off, Duration::ZERO, OFF_RUN, CAPTURE).await;
                 let x = read(&off);
                 print_loop(&off, &x);
                 print_bar(&off, "bar", &bar(&off, off.from_us));
-                let on = run_loop(Arm::On, Duration::ZERO, ON_RUN).await;
+                let on = run_loop(Arm::On, Duration::ZERO, ON_RUN, CAPTURE).await;
                 let y = read(&on);
                 print_loop(&on, &y);
                 print_bar(&on, "bar, the whole run", &bar(&on, 0));
@@ -10370,6 +10491,31 @@ pub(crate) mod shaped_link {
                 );
             }
 
+            /// FR-148 D51 B4g (C6s) — the closed loop under `on` with a capture
+            /// slower than the pump's target: 20 fps on its 30 (`SLOW_CAPTURE`),
+            /// with no FR-112 pacing, for `ON_RUN`. Over the settled stretch
+            /// ([`settled_from`]): the fill is at least 0.90 of the payload, the
+            /// median second sends 18 frames or more, and the transit's p95 and
+            /// the round trip's are under 300 ms. B4f charged each 50 ms frame
+            /// the 33 ms interval, and the fill fell to 0.76 of the payload.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, a slow capture under on"]
+            async fn budget_on_with_a_slow_capture() {
+                let on = run_loop(Arm::On, Duration::ZERO, ON_RUN, SLOW_CAPTURE).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                print_bar(&on, "slow capture, bar, the whole run", &bar(&on, 0));
+                let settled = bar(&on, settled_from(&on));
+                print_bar(&on, "slow capture, bar", &settled);
+                let s = &settled.read;
+                assert!(s.of_payload >= 900, "on: fill {settled:?}");
+                assert!(s.sent_each.0 >= 18, "on: sent fps {settled:?}");
+                assert!(
+                    s.transit.1 < 300 && s.rtt.1 < 300,
+                    "on: transit and rtt {settled:?}"
+                );
+            }
+
             /// FR-148 D51 — the same two arms after 10 s of a still screen, so
             /// the age loop's floor and the viewer's clock probe learn an empty
             /// queue before anything moves. A probe of the swing's start: it
@@ -10378,10 +10524,10 @@ pub(crate) mod shaped_link {
             #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path after a still opening"]
             async fn budget_on_after_a_still_opening() {
                 const STILL: Duration = Duration::from_secs(10);
-                let off = run_loop(Arm::Off, STILL, RUN).await;
+                let off = run_loop(Arm::Off, STILL, RUN, CAPTURE).await;
                 let x = read(&off);
                 print_loop(&off, &x);
-                let on = run_loop(Arm::On, STILL, RUN).await;
+                let on = run_loop(Arm::On, STILL, RUN, CAPTURE).await;
                 let y = read(&on);
                 print_loop(&on, &y);
                 assert!(

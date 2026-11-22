@@ -958,6 +958,37 @@ impl PushedBy {
     }
 }
 
+/// FR-148 D51 B4g — the reading the measured number is (`pipe_measured`,
+/// `RateGovernor::path_view`). The `path model` line says which, because the
+/// basis cannot: under `on` the budget's held rate stands where the goodput
+/// stood, and both read the sender backlogged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasuredBy {
+    /// The blocked-send goodput, where the budget does not act.
+    Goodput,
+    /// The in-flight budget's held rate, where it acts (`on`, a relay
+    /// session).
+    Budget,
+    /// The viewer's held arrival rate, where it is the lower.
+    Arrival,
+}
+
+impl MeasuredBy {
+    /// The word the line writes.
+    pub fn word(self) -> &'static str {
+        match self {
+            MeasuredBy::Goodput => "goodput",
+            MeasuredBy::Budget => "budget",
+            MeasuredBy::Arrival => "arrival",
+        }
+    }
+
+    /// `goodput`, `budget`, `arrival`, or `-` for no reading.
+    pub fn word_of(by: Option<Self>) -> &'static str {
+        by.map_or("-", Self::word)
+    }
+}
+
 /// The reading that set the model's floor.
 #[derive(Debug, Clone, Copy)]
 struct Held {
@@ -1195,6 +1226,8 @@ pub struct PathView {
     pub belief: (Option<PathNumber>, Option<PathNumber>, Option<PathNumber>),
     /// `pipe_measured`: the reading a stall is judged against.
     pub measured: Option<PathNumber>,
+    /// FR-148 D51 B4g — `pipe_measured_by`: which reading `measured` is.
+    pub measured_by: Option<MeasuredBy>,
     /// `prior_bps`: the stand-in.
     pub prior: Option<PathNumber>,
     /// `learned_ceiling_bps`: `0` is the nominal start, assumed.

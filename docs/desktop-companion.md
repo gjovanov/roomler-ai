@@ -959,7 +959,7 @@ sequenceDiagram
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:322`, from the channel's
   `on_close`, `agents/roomlerd/src/peer.rs:13095`; `end_session`). An answer already being sent
   races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13412`, through
-  `or_stopped`, `:13891`): after a network drop a send can park for good on a channel that still
+  `or_stopped`, `:13977`): after a network drop a send can park for good on a channel that still
   reads open (#1730), and the task kept the channel and its handler for as long as the agent ran.
 - **One listing step at a time per channel** (the folder lane, `reads::Lane`). A step on a blocking thread
   cannot be cancelled, so a share that stops answering keeps its thread, and a timeout frees the
