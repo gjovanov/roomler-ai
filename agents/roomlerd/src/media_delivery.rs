@@ -74,9 +74,9 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
-use crate::encode::governor::RateGovernor;
-use crate::encode::pipe::{Fall, PathNumber, PathRate, PathView, PushedBy, Ruled};
-use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, Shadow, WindowReport};
+use crate::encode::governor::{GateSkip, RateGovernor};
+use crate::encode::pipe::{Fall, MeasuredBy, PathNumber, PathRate, PathView, PushedBy, Ruled};
+use crate::media_inflight::{Bound, Budget, Over, Pass, PumpCount, SendWait, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -345,7 +345,66 @@ pub fn path_rate(s: &Shadow) -> Option<PathRate> {
         bps: b.rate_bps().map(|r| u32::try_from(r).unwrap_or(u32::MAX)),
         measured: b.rate_measured(),
         loss: b.loss()?,
+        ..PathRate::default()
     })
+}
+
+/// FR-148 D51 B4a-2 — the most the envelope's frame term adds to S, ms.
+pub const ENVELOPE_FRAME_MAX_MS: u64 = 100;
+
+/// FR-148 D51 B4a-2 — the budget's envelope, ms: S, and `frame` bytes at the
+/// budget's rate, that term at most [`ENVELOPE_FRAME_MAX_MS`] (all of it while
+/// no rate is known). Age within it is the queue the budget itself stands:
+/// S over the least, and a frame admitted just under the budget.
+pub fn envelope_ms(slack: Duration, frame: u64, rate_bps: Option<u64>) -> u16 {
+    let term = match rate_bps {
+        Some(r) if r > 0 => (frame.saturating_mul(8_000) / r).min(ENVELOPE_FRAME_MAX_MS),
+        _ => ENVELOPE_FRAME_MAX_MS,
+    };
+    let slack = u64::try_from(slack.as_millis()).unwrap_or(u64::MAX);
+    u16::try_from(slack.saturating_add(term)).unwrap_or(u16::MAX)
+}
+
+/// FR-148 D51 B4a-2 — the largest frame handed to the send channel over the
+/// last second at least: two one-second buckets, the older let go as the one
+/// after the newer starts.
+#[derive(Debug, Default, Clone, Copy)]
+struct Largest {
+    at: Option<Instant>,
+    newer: u64,
+    older: u64,
+}
+
+impl Largest {
+    const SPAN: Duration = Duration::from_secs(1);
+
+    fn note(&mut self, now: Instant, len: u64) {
+        match self.at {
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN => {}
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN * 2 => {
+                (self.older, self.newer) = (self.newer, 0);
+                self.at = Some(at + Self::SPAN);
+            }
+            _ => {
+                *self = Self {
+                    at: Some(now),
+                    ..Self::default()
+                }
+            }
+        }
+        self.newer = self.newer.max(len);
+    }
+
+    /// Bytes: the largest of the last second and the one before it.
+    fn bytes(&self, now: Instant) -> u64 {
+        match self.at {
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN => {
+                self.newer.max(self.older)
+            }
+            Some(at) if now.saturating_duration_since(at) < Self::SPAN * 2 => self.newer,
+            _ => 0,
+        }
+    }
 }
 
 /// FR-148 D46 B2 — a sample's push-back (D46 item 10), or `None`:
@@ -608,6 +667,11 @@ pub struct DeliverySampler {
     /// said which mode acted (`None` before it first said).
     pass: Pass,
     said: Option<bool>,
+    /// FR-148 D51 B4a-2 — the largest frame handed lately, for the budget's
+    /// envelope ([`envelope_ms`]). Nothing with the budget off.
+    largest: Largest,
+    /// FR-148 — the pump's send wait, kept under every mode ([`Self::send_wait`]).
+    send_wait: std::sync::Arc<SendWait>,
 }
 
 impl DeliverySampler {
@@ -644,6 +708,8 @@ impl DeliverySampler {
             waiting: VecDeque::new(),
             pass: Pass::default(),
             said: None,
+            largest: Largest::default(),
+            send_wait: std::sync::Arc::default(),
         }
     }
 
@@ -961,6 +1027,37 @@ impl DeliverySampler {
             b.on_frame(pc, governor.applied_bps(), governor.open_at_bps());
             b.take_mark()
         });
+        self.framed(governor, marked);
+    }
+
+    /// [`Self::on_frame`] on the association's own handles, as the tcp_shape
+    /// harness's closed-loop writer holds them (FR-148 D51 B4c).
+    #[cfg(test)]
+    pub(crate) fn on_frame_with(
+        &mut self,
+        governor: &mut RateGovernor,
+        clock: &DeliveryClock,
+        gauges: &GaugeReader,
+    ) {
+        if self.pass.acts() {
+            return;
+        }
+        let open = crate::media_inflight::opening(governor.applied_bps(), governor.open_at_bps());
+        let marked = self.budget.as_mut().is_some_and(|b| {
+            b.on_frame_with(
+                Instant::now(),
+                open,
+                || Some(clock.clone()),
+                || Some(gauges.clone()),
+            );
+            b.take_mark()
+        });
+        self.framed(governor, marked);
+    }
+
+    /// The step's end: a stall it marked goes to the governor's shadow model
+    /// and drops the push-backs inside their settle, and its rate follows.
+    fn framed(&mut self, governor: &mut RateGovernor, marked: bool) {
         if marked {
             governor.note_path_stall();
             self.on_mark(Instant::now());
@@ -971,11 +1068,23 @@ impl DeliverySampler {
     /// FR-148 D48 — the budget's last step, to the governor's shadow model:
     /// its rate, whether this association's figures gave it, and SCTP's loss
     /// count ([`path_rate`]). Off, or before the association's first step,
-    /// nothing.
+    /// nothing. FR-148 D51: while the budget acts, also that it acts, whether
+    /// it held lately outside a still span (B4b), and its envelope (B4a-2).
     fn note_path_rate(&self, governor: &mut RateGovernor) {
-        if let Some(rate) = self.budget.as_deref().and_then(path_rate) {
-            governor.note_path_rate(rate);
+        let Some(shadow) = self.budget.as_deref() else {
+            return;
+        };
+        let Some(mut rate) = path_rate(shadow) else {
+            return;
+        };
+        if self.pass.acts() {
+            let b = shadow.budget();
+            rate.acts = true;
+            rate.held = b.held_lately();
+            rate.envelope_ms =
+                envelope_ms(b.slack(), self.largest.bytes(Instant::now()), b.rate_bps());
         }
+        governor.note_path_rate(rate);
     }
 
     /// FR-148 D46 B1 — at the pumps' 5 s re-check of the transport: a new
@@ -1028,6 +1137,38 @@ impl DeliverySampler {
             ),
             None => Pass::today(byte_gate),
         };
+        self.gate_pass(governor, session_id, pass);
+    }
+
+    /// [`Self::gate`] on the association's own handles, as the tcp_shape
+    /// harness's closed-loop writer holds them (FR-148 D51 B4c).
+    #[cfg(test)]
+    pub(crate) fn gate_with(
+        &mut self,
+        governor: &mut RateGovernor,
+        clock: &DeliveryClock,
+        gauges: &GaugeReader,
+        constrained: bool,
+        byte_gate: bool,
+    ) {
+        let open = crate::media_inflight::opening(governor.applied_bps(), governor.open_at_bps());
+        let pass = match self.budget.as_mut() {
+            Some(b) => b.gate_with(
+                Instant::now(),
+                open,
+                || Some(clock.clone()),
+                || Some(gauges.clone()),
+                constrained,
+                byte_gate,
+            ),
+            None => Pass::today(byte_gate),
+        };
+        self.gate_pass(governor, ObjectId::from_bytes([0; 12]), pass);
+    }
+
+    /// The gate's end: the pass is kept for the gate's terms, a stall the
+    /// acting budget marked goes to the governor, and an acting step's rate.
+    fn gate_pass(&mut self, governor: &mut RateGovernor, session_id: ObjectId, pass: Pass) {
         if self.gated(Instant::now(), session_id, pass) {
             governor.note_path_stall();
         }
@@ -1067,18 +1208,18 @@ impl DeliverySampler {
         }
     }
 
-    /// FR-148 D46 B3 — the gate's skip: `decrease` (the governor's
-    /// `on_backpressure_skip`, at the time it is given) runs unless FR-35's
-    /// opener grace is open (`grace`), or the pass is the budget's hold in a
-    /// still span, a stall of the carrier (D46's no-decrease rule). Anything
-    /// else decreases as today.
-    pub fn on_skip<T>(
-        &self,
-        grace: bool,
-        decrease: impl FnOnce(Instant) -> Option<T>,
-    ) -> Option<T> {
+    /// FR-148 D46 B3 — the gate's skip, handed to `skip` (the governor's
+    /// [`RateGovernor::on_gate_skip`]) as the pass classes it, at the time it
+    /// is given. Nothing inside FR-35's opener grace (`grace`), or for the
+    /// budget's hold in a still span, a stall of the carrier (D46's
+    /// no-decrease rule). FR-148 D51 B4a-1: the budget's own hold under `on`
+    /// is [`GateSkip::BudgetHold`], no AIMD event. Anything else is
+    /// [`GateSkip::Backpressure`], the decrease, as today.
+    pub fn on_skip<T>(&self, grace: bool, skip: impl FnOnce(GateSkip) -> Option<T>) -> Option<T> {
         if self.pass.decreases(grace) {
-            decrease(Instant::now())
+            skip(GateSkip::Backpressure(Instant::now()))
+        } else if self.pass.hears_hold(grace) {
+            skip(GateSkip::BudgetHold(Instant::now()))
         } else {
             None
         }
@@ -1109,10 +1250,12 @@ impl DeliverySampler {
     }
 
     /// FR-148 D46 B1 — a frame entered the send channel: its bytes are the
-    /// pump's own until SCTP takes them.
-    pub fn on_handed(&self, len: u64) {
+    /// pump's own until SCTP takes them. FR-148 D51 B4a-2: its size counts
+    /// toward the budget's envelope.
+    pub fn on_handed(&mut self, len: u64) {
         if let Some(b) = self.budget.as_ref() {
             b.on_handed(len);
+            self.largest.note(Instant::now(), len);
         }
     }
 
@@ -1123,6 +1266,14 @@ impl DeliverySampler {
             .as_deref()
             .map(Shadow::pump_count)
             .unwrap_or_default()
+    }
+
+    /// FR-148 — the pump's send wait, under every mode: the send task's handle
+    /// records each frame that reached the wire, and each reader drains its
+    /// own window of it (the heartbeat takes it; the FFmpeg pump's sender
+    /// window and direct gate read it from where they last read).
+    pub fn send_wait(&self) -> &std::sync::Arc<SendWait> {
+        &self.send_wait
     }
 
     /// FR-148 D46 B3 — [`Self::gate`] on one frame's reading, as
@@ -1355,6 +1506,10 @@ pub fn emit_model(session_id: ObjectId, v: &PathView) {
         goodput_bps = %Shown(v.goodput),
         pipe_belief = %belief,
         pipe_measured = %Shown(v.measured),
+        // FR-148 D51 B4g — which reading that is: `goodput`, `budget` (under
+        // `on`, its held rate in the goodput's place, the same basis) or
+        // `arrival`; `-` with none.
+        pipe_measured_by = %MeasuredBy::word_of(v.measured_by),
         prior_bps = %Shown(v.prior),
         learned_ceiling_bps = %Shown(v.learned_ceiling),
         slow_link_floor_bps = %Shown(v.slow_link_floor),
@@ -2112,6 +2267,8 @@ mod tests {
     struct Passes {
         skipped: u64,
         decreases: u64,
+        /// FR-148 D51 B4a-1 — skips the governor heard as the budget's hold.
+        heard: u64,
         marked: u64,
         shed: u64,
         went: u64,
@@ -2133,8 +2290,11 @@ mod tests {
         if f.full || s.shuts() {
             n.skipped += 1;
             s.note_gate(f.full, f.byte_gate);
-            let _ = s.on_skip(f.grace, |_| {
-                n.decreases += 1;
+            let _ = s.on_skip(f.grace, |skip| {
+                match skip {
+                    GateSkip::Backpressure(_) => n.decreases += 1,
+                    GateSkip::BudgetHold(_) => n.heard += 1,
+                }
                 Some(())
             });
             return;
@@ -2201,13 +2361,14 @@ mod tests {
     }
 
     /// FR-148 D46 B3 — the hold. Under `on`, on a relay session, over a deep
-    /// queue's readings: each pass the budget holds skips before capture with
-    /// one decrease call (FR-35's grace closed) and no keyframe asked, the
-    /// watermark arm (which asks one) sheds no frame that went, and the line
-    /// counts the holds that acted beside the passes the budget was asked
-    /// about, and the watermark's firings.
+    /// queue's readings: each pass the budget holds skips before capture,
+    /// heard once by the governor as the budget's hold and never as a
+    /// decrease (D51 B4a-1; B3 called one each, FR-35's grace closed), with
+    /// no keyframe asked, the watermark arm (which asks one) sheds no frame
+    /// that went, and the line counts the holds that acted beside the passes
+    /// the budget was asked about, and the watermark's firings.
     #[test]
-    fn under_on_the_budget_s_hold_skips_a_relay_pass_and_decreases_once_per_hold() {
+    fn under_on_the_budget_s_hold_skips_a_relay_pass_and_is_heard_once_per_hold() {
         let t0 = Instant::now();
         let mut s = DeliverySampler::new(true).with_budget_on();
         let mut n = Passes::default();
@@ -2230,7 +2391,7 @@ mod tests {
             n,
             Passes {
                 skipped: 200,
-                decreases: 200,
+                heard: 200,
                 went: 100,
                 ..Passes::default()
             }
@@ -2242,10 +2403,11 @@ mod tests {
 
     /// FR-148 D46 B3 — the no-decrease rule through the sampler. Under `on`, on
     /// a relay session, the clock stands still for a second with the megabyte
-    /// out: each hold skips its pass, and from the least and S on (210 ms)
-    /// none calls a decrease; the gate marks the stall for the governor at
-    /// those steps, as the shadow's step does after the gate; the line counts
-    /// the stalled holds apart.
+    /// out: each hold skips its pass, and none calls a decrease (D51 B4a-1:
+    /// a hold before the still span is heard as the budget's; B3 decreased
+    /// on it); from the least and S on (210 ms) none is heard either, the
+    /// gate marks the stall for the governor at those steps, as the shadow's
+    /// step does after the gate, and the line counts the stalled holds apart.
     #[test]
     fn under_on_a_stall_hold_calls_no_decrease_and_marks_the_stall() {
         let t0 = Instant::now();
@@ -2264,7 +2426,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases, n.marked), (60, 60, 0), "{n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard, n.marked),
+            (60, 0, 60, 0),
+            "{n:?}"
+        );
         // From 2 s the clock stands at its count then.
         let (stood, _) = deep_frame(60);
         for frame in 60..90u64 {
@@ -2278,10 +2444,82 @@ mod tests {
             );
         }
         // Frames 60 to 66 hold before the span is 210 ms old, 67 to 89 in it.
-        assert_eq!((n.skipped, n.decreases, n.marked), (90, 67, 23), "{n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard, n.marked),
+            (90, 0, 67, 23),
+            "{n:?}"
+        );
         assert_eq!((n.shed, n.went), (0, 0));
         let w = s.budget_mut().unwrap().take_window();
         assert_eq!((w.acted, w.acted_stalled), ((90, 90), 23), "{w:?}");
+    }
+
+    /// FR-148 D51 B4a-1 (C2) — the budget's holds leave the target and the
+    /// learned ceiling alone. Under `on`, on a relay session, 10 s of passes
+    /// 2 ms apart, each an acting hold while the clock moves (2 Mbit/s
+    /// acknowledged, a megabyte out), each skip handed to the governor as the
+    /// pump hands it, at the pass's time. The governor hears every one: the
+    /// opener's ramp would end on it. None is a full-channel sample, so when a
+    /// frame next reaches the encoder its target and the learned ceiling are
+    /// the ones the holds found.
+    #[test]
+    fn budget_holds_leave_the_target_and_the_learned_ceiling_alone() {
+        let t0 = Instant::now();
+        let mut s = DeliverySampler::new(true).with_budget_on();
+        let mut governor = RateGovernor::new(
+            30,
+            2,
+            crate::encode::governor::GovernorFlags::default(),
+            8_000_000,
+            None,
+            t0,
+        );
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let opened = governor
+            .pre_encode_tick(3_000_000, floor, true, 2, t0)
+            .expect("the opening")
+            .bps;
+        let learned = governor.learned_ceiling_bps();
+        let g = Gauges {
+            max_payload: 1_200,
+            cwnd: 1_048_576,
+            ssthresh: 1_048_576,
+            rwnd: 131_072,
+            inflight_bytes: 1_000_000,
+            pending_bytes: 131_072,
+            ack_delay: Some(Duration::from_millis(60)),
+            ack_delay_min: Some(Duration::from_millis(60)),
+            ..Gauges::default()
+        };
+        let (mut held, mut moved) = (0u32, 0u32);
+        for ms in (0..10_000u64).step_by(2) {
+            let now = at(t0, ms);
+            // 2 Mbit/s: 250 bytes a millisecond.
+            let _ = s.gate_reading(now, ms * 250, g, 2_000_000, true, false);
+            assert!(s.shuts(), "at {ms} ms: the budget holds");
+            held += 1;
+            let skip = s.on_skip(false, |skip| {
+                let at_pass = match skip {
+                    GateSkip::Backpressure(_) => GateSkip::Backpressure(now),
+                    GateSkip::BudgetHold(_) => GateSkip::BudgetHold(now),
+                };
+                governor.on_gate_skip(at_pass)
+            });
+            moved += u32::from(skip.is_some());
+        }
+        assert_eq!(held, 5_000);
+        assert!(governor.slow_start_congested(), "the holds were heard");
+        let next = governor.pre_encode_tick(3_000_000, floor, true, 2, at(t0, 10_000));
+        assert_eq!(
+            (moved, next.map(|a| a.bps), governor.applied_bps()),
+            (0, None, opened),
+            "no hold moved the target"
+        );
+        assert_eq!(
+            governor.learned_ceiling_bps(),
+            learned,
+            "nor the learned ceiling"
+        );
     }
 
     /// FR-148 D46 B3 — a direct session under `on` computes the budget as
@@ -2443,9 +2681,10 @@ mod tests {
 
     /// FR-148 D46 B3 — FR-35's opener grace under `on`: on a relay session the
     /// budget's holds inside the grace skip their passes and call no decrease,
-    /// as today's skips there do; once the grace is over each hold decreases
-    /// once. The pumps hand the grace to the same call (`peer.rs`, pinned by
-    /// `both_pumps_gate_on_the_budget_s_pass`).
+    /// as today's skips there do, nor are they heard as the budget's; once
+    /// the grace is over each hold is heard once, and still calls no decrease
+    /// (D51 B4a-1; B3 decreased once). The pumps hand the grace to the same
+    /// call (`peer.rs`, pinned by `both_pumps_gate_on_the_budget_s_pass`).
     #[test]
     fn fr35_s_opener_grace_keeps_the_aimd_through_the_budget_s_holds_under_on() {
         let t0 = Instant::now();
@@ -2465,7 +2704,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases), (60, 0), "inside the grace: {n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard),
+            (60, 0, 0),
+            "inside the grace: {n:?}"
+        );
         let after = Facts {
             grace: false,
             ..grace
@@ -2479,7 +2722,11 @@ mod tests {
                 &mut n,
             );
         }
-        assert_eq!((n.skipped, n.decreases), (120, 60), "after it: {n:?}");
+        assert_eq!(
+            (n.skipped, n.decreases, n.heard),
+            (120, 0, 60),
+            "after it: {n:?}"
+        );
         let w = s.budget_mut().unwrap().take_window();
         assert_eq!(w.acted, (120, 120));
     }
@@ -2593,13 +2840,13 @@ mod tests {
                 "VP9-444",
                 &vp9,
                 "delivery.gate(&pc, &mut governor, session_id, constrained_transport, false);",
-                "delivery.on_skip(false, |t| governor.on_backpressure_skip(t))",
+                "delivery.on_skip(false, |s| governor.on_gate_skip(s))",
             ),
             (
                 "FFmpeg",
                 &ffmpeg,
                 "delivery.gate(&pc, &mut governor, session_id, constrained, byte_gate);",
-                "delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t))",
+                "delivery.on_skip(in_grace, |s| governor.on_gate_skip(s))",
             ),
         ] {
             assert_eq!(body.matches("delivery.gate(").count(), 1, "{name}");
@@ -2621,9 +2868,14 @@ mod tests {
                 "{name}: the arm asks no keyframe"
             );
             assert_eq!(
-                body.matches("on_backpressure_skip(").count(),
+                body.matches("on_gate_skip(").count(),
                 1,
-                "{name}: one decrease at the gate, the budget's"
+                "{name}: one skip at the gate, the budget's"
+            );
+            assert_eq!(
+                body.matches("on_backpressure_skip(").count(),
+                0,
+                "{name}: the decrease goes through the budget's skip (FR-148 D51 B4a-1)"
             );
             assert!(body[at..].contains(STEP), "{name}: the step after the gate");
         }
@@ -2650,6 +2902,218 @@ mod tests {
             1,
             "set once, at its let"
         );
+    }
+
+    /// FR-148 D51 B4g — the VP9-444 pump times its capacity gate and hands
+    /// that time to the encode, read from `peer.rs` as compiled: a skipped
+    /// pass opens the gate clock's span in the gate's arm; the pass the gate
+    /// lets through closes it, before the step; a pass FR-59 P4's drain pause
+    /// holds after it counts as skipped, in the pause's arm (FR-148); and the
+    /// pump's one encode takes it with the interval, on the encode's own call,
+    /// with no other call handing the encoder a charge.
+    #[test]
+    fn the_vp9_pump_hands_the_encode_the_time_its_gate_held() {
+        const PEER_RS: &str = include_str!("peer.rs");
+        const GATE: &str =
+            "if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {";
+        let src = PEER_RS.replace("\r\n", "\n");
+        let rest = &src[src
+            .find("async fn media_pump_vp9_444_dc(")
+            .expect("the pump")..];
+        let vp9 = &rest[..rest.find("\n}\n").expect("the pump's end")];
+        let at = vp9.find(GATE).expect("the capacity gate");
+        let arm = &vp9[at..];
+        let arm = &arm[..arm.find("continue;").expect("the arm's continue")];
+        for (call, n) in [
+            ("gate_clock.skipped(", 1),
+            ("gate_clock.passed(", 1),
+            ("gate_clock.paused()", 1),
+            ("gate_clock.take()", 1),
+            (".encode_charged(&frame, gate)", 1),
+            ("enc.encode(", 0),
+            ("charge_most", 0),
+        ] {
+            assert_eq!(vp9.matches(call).count(), n, "{call}");
+        }
+        assert!(
+            arm.contains("gate_clock.skipped("),
+            "a skipped pass, in the arm"
+        );
+        let passed = vp9.find("gate_clock.passed(").unwrap();
+        let step = vp9
+            .find("delivery.on_frame(&pc, &mut governor);")
+            .expect("the step");
+        assert!(
+            at < passed && passed < step,
+            "the pass through, before the step"
+        );
+        let drain = vp9
+            .find("if governor.draining(std::time::Instant::now()) {")
+            .expect("the drain pause");
+        let pause = &vp9[drain..];
+        let pause = &pause[..pause.find("continue;").expect("the pause's continue")];
+        assert!(
+            passed < drain && pause.contains("gate_clock.paused()"),
+            "a pass the drain pause holds, in the pause's arm, after the pass through"
+        );
+        assert!(
+            vp9.find("gate_clock.take()").unwrap() < vp9.find(".encode_charged(").unwrap(),
+            "taken for the encode"
+        );
+    }
+
+    /// The body of `async fn <name>(` in `peer.rs` as compiled, to its closing
+    /// brace at column 0, with `\n` line ends.
+    fn peer_fn(name: &str) -> String {
+        const PEER_RS: &str = include_str!("peer.rs");
+        let src = PEER_RS.replace("\r\n", "\n");
+        let head = format!("async fn {name}(");
+        assert_eq!(src.matches(&head).count(), 1, "one {head:?} in peer.rs");
+        let rest = &src[src.find(&head).unwrap()..];
+        rest[..rest.find("\n}\n").expect("the fn's end")].to_owned()
+    }
+
+    /// FR-148 — both pumps measure the send wait once, in the measure their
+    /// delivery sampler owns (`media_inflight::SendWait`), read from
+    /// `peer.rs` as compiled. Each send task takes the sampler's handle, its
+    /// channel carries each frame's hand-off instant, and it records a frame
+    /// once, after the frame's chunk loop, in the arm of a frame that reached
+    /// the wire: a failed send, a stale or dropped frame records nothing. The
+    /// FFmpeg pump's own atomics and cursors are gone, and its two readers
+    /// between heartbeats each read from a place of their own. The VP9-444
+    /// pump's governor gets nothing new: no sender window, and an age split
+    /// handed no send wait, as before.
+    #[test]
+    fn both_pumps_measure_the_send_wait_once() {
+        let vp9 = peer_fn("media_pump_vp9_444_dc");
+        let ffmpeg = peer_fn("media_pump_ffmpeg_dc");
+        for (name, body, channel, frame, hand_off) in [
+            (
+                "VP9-444",
+                &vp9,
+                "mpsc::channel::<(std::time::Instant, Bytes)>(send_depth)",
+                "while let Some((enqueued_at, wire)) = next.take() {",
+                "send_tx.try_send((std::time::Instant::now(), wire))",
+            ),
+            (
+                "FFmpeg",
+                &ffmpeg,
+                "channel::<(u64, std::time::Instant, bytes::Bytes)>(ffmpeg_send_depth)",
+                "while let Some((epoch, enqueued_at, wire)) = next.take() {",
+                "std::time::Instant::now(),\n                wire,\n            ))",
+            ),
+        ] {
+            for (call, n) in [
+                (channel, 1),
+                (frame, 1),
+                (hand_off, 1),
+                ("Arc::clone(delivery.send_wait())", 1),
+                ("send_wait.sent(enqueued_at, std::time::Instant::now())", 1),
+                ("send_wait.sent(", 1),
+            ] {
+                assert_eq!(body.matches(call).count(), n, "{name}: {call}");
+            }
+            let task = &body[body.find(frame).unwrap()..];
+            let chunks = task.find("while off < total {").expect("the chunk loop");
+            let ok = task
+                .find("if ok {")
+                .expect("the arm of a frame on the wire");
+            let indent = &task[task[..ok].rfind('\n').unwrap() + 1..ok];
+            let end = ok + task[ok..].find(&format!("\n{indent}}}\n")).unwrap();
+            let sent = task.find("send_wait.sent(").unwrap();
+            assert!(
+                chunks < ok && ok < sent && sent < end,
+                "{name}: recorded once the frame's last chunk went, in the arm of a frame on the wire"
+            );
+        }
+        for gone in [
+            "send_wait_us_sum",
+            "send_wait_us_max",
+            "send_wait_frames",
+            "win_sw_sum_last",
+            "win_sw_frames_last",
+            "gate_sw_sum_last",
+            "gate_sw_frames_last",
+        ] {
+            assert!(!ffmpeg.contains(gone), "FFmpeg: {gone} retired");
+        }
+        assert_eq!(
+            ffmpeg
+                .matches("crate::media_inflight::SendWaitSince::default()")
+                .count(),
+            2,
+            "FFmpeg: the sender window's and the direct gate's places"
+        );
+        for read in [
+            "gate_send_wait.avg_ms(delivery.send_wait())",
+            "win_send_wait.avg_ms(delivery.send_wait())",
+            "send_wait_max_ms: delivery.send_wait().max_ms(),",
+        ] {
+            assert_eq!(ffmpeg.matches(read).count(), 1, "FFmpeg: {read}");
+        }
+        assert!(
+            !vp9.contains("SendWaitSince"),
+            "VP9-444: one reader, its heartbeat"
+        );
+        assert!(
+            !vp9.contains("note_window_sender("),
+            "VP9-444: no sender window"
+        );
+        assert!(
+            vp9.contains("age_split = ?governor.viewer_age_split(None),"),
+            "VP9-444: the age split as before"
+        );
+    }
+
+    /// FR-148 (S3) — the VP9-444 heartbeat prints the send wait as the FFmpeg
+    /// one does: `send_wait_avg_ms` and `send_wait_max_ms`, with the same
+    /// names, units and meaning, over its own window. Neither line has a
+    /// format test, so this reads the piece that formats the two fields
+    /// (`SendWaitWindow::ms`: the window's average in whole µs, as ms, 0 with
+    /// no frame, and its longest, ms) and, from `peer.rs` as compiled, that
+    /// each heartbeat takes its window from the pump's measure through that
+    /// piece, once, and prints both fields on its line.
+    #[test]
+    fn the_vp9_heartbeat_prints_the_send_wait_as_the_ffmpeg_one_does() {
+        use crate::media_inflight::SendWaitWindow;
+        let window = |frames, sum_us, max_us| SendWaitWindow {
+            frames,
+            sum_us,
+            max_us,
+        };
+        assert_eq!(window(3, 70_000, 30_000).ms(), (23.333, 30.0));
+        assert_eq!(
+            window(2, 1_001, 1_000).ms(),
+            (0.5, 1.0),
+            "the average in whole µs"
+        );
+        assert_eq!(window(0, 0, 0).ms(), (0.0, 0.0), "no frame");
+        const TAKE: &str =
+            "let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms();";
+        for (pump, line) in [
+            (
+                "media_pump_vp9_444_dc",
+                "\"VP9-444 DC pump heartbeat (≈1s window)\"",
+            ),
+            (
+                "media_pump_ffmpeg_dc",
+                "\"FFmpeg DC pump heartbeat (≈2s window)\"",
+            ),
+        ] {
+            let body = peer_fn(pump);
+            assert_eq!(body.matches(line).count(), 1, "{pump}: its heartbeat line");
+            let end = body.find(line).unwrap();
+            let start = body[..end].rfind("info!(").expect("the line's info!");
+            assert!(
+                body[start..end].contains("send_wait_avg_ms, send_wait_max_ms,"),
+                "{pump}: the two fields on its heartbeat line"
+            );
+            assert_eq!(body.matches(TAKE).count(), 1, "{pump}: {TAKE}");
+            assert!(
+                body.find(TAKE).unwrap() < start,
+                "{pump}: taken for its line"
+            );
+        }
     }
 
     /// FR-148 D46 B2 — a sample read with gauges: `standing_ms` over the
@@ -3508,6 +3972,7 @@ mod tests {
             goodput,
             belief: (floor, floor, goodput),
             measured: goodput,
+            measured_by: Some(MeasuredBy::Goodput),
             prior: n(1_162_000, Basis::Assumed, 800),
             learned_ceiling: n(0, Basis::Assumed, 312_400),
             slow_link_floor: n(987_700, Basis::Backlogged, 800),
@@ -3561,6 +4026,7 @@ mod tests {
             "pipe_belief=(1399272/app-limited/41300ms, 1399272/app-limited/41300ms, \
              1162000/backlogged/800ms)",
             "pipe_measured=1162000/backlogged/800ms",
+            "pipe_measured_by=goodput",
             "prior_bps=1162000/assumed/800ms",
             "learned_ceiling_bps=0/assumed/312400ms",
             "slow_link_floor_bps=987700/backlogged/800ms",
@@ -3588,6 +4054,7 @@ mod tests {
             "goodput_bps=None",
             "pipe_belief=(1399272/app-limited/101300ms, 1399272/app-limited/101300ms, None)",
             "pipe_measured=None",
+            "pipe_measured_by=-",
             "prior_bps=None",
             "viewer_rx_bps=9120/app-limited/600ms",
             "model_capacity_bps=None",
@@ -3631,6 +4098,29 @@ mod tests {
             let want = format!("model_rule={word}/1250ms");
             assert!(out.contains(&want), "{want:?} is not in {out:?}");
             assert_eq!(out.matches("model_rule=").count(), 1, "{out:?}");
+        }
+    }
+
+    /// FR-148 D51 B4g (C15) — the line names the measured reading's source,
+    /// right after it: `goodput`, `budget` (under `on`, where the budget's
+    /// held rate stands in the goodput's place with the same basis) or
+    /// `arrival`; `-` with no reading (`the_model_line_names_its_fields`).
+    #[test]
+    fn the_model_line_names_the_measured_source() {
+        for (by, word) in [
+            (Some(MeasuredBy::Goodput), "goodput"),
+            (Some(MeasuredBy::Budget), "budget"),
+            (Some(MeasuredBy::Arrival), "arrival"),
+            (None, "-"),
+        ] {
+            let view = PathView {
+                measured_by: by,
+                ..busy_view()
+            };
+            let out = logged(|| emit_model(sid(), &view));
+            let want = format!("pipe_measured=1162000/backlogged/800ms pipe_measured_by={word} ");
+            assert!(out.contains(&want), "{want:?} is not in {out:?}");
+            assert_eq!(out.matches("pipe_measured_by=").count(), 1, "{out:?}");
         }
     }
 
@@ -4071,6 +4561,12 @@ pub(crate) mod shaped_link {
         /// at or after this instant goes at this rate: a path whose capacity
         /// falls for real.
         step: Option<(Instant, u64)>,
+        /// FR-148 D51 — the first hop's buffer, bytes: a relay's socket ahead
+        /// of the bottleneck, which takes a write at once while it holds less
+        /// than this. A packet that would take what waits for the wire past it
+        /// waits for room, as a socket write blocks, and is never dropped.
+        /// `None`: no first hop.
+        hop: Option<u64>,
     }
 
     /// FR-148 D46 — a link's outages: from `t0 + every` on, one every `every`,
@@ -4128,6 +4624,14 @@ pub(crate) mod shaped_link {
             *next_free = start + wire;
             let _ = self.due.send((start + wire + self.one_way, b.to_vec()));
         }
+
+        /// FR-148 D51 — the bytes waiting for the wire at `now`.
+        fn backlog(&self, now: Instant) -> u64 {
+            let next_free = *self.next_free.lock().unwrap();
+            let ns = u64::try_from(next_free.saturating_duration_since(now).as_nanos())
+                .unwrap_or(u64::MAX);
+            ns.saturating_mul(self.bps) / 8_000_000_000
+        }
     }
 
     /// One end: it sends through its own shaper and receives what the other
@@ -4149,6 +4653,13 @@ pub(crate) mod shaped_link {
         /// The packets this end's queue dropped at its tail.
         pub(crate) fn tail_drops(&self) -> u64 {
             self.out.tail_drops.load(Ordering::Relaxed)
+        }
+
+        /// FR-148 D51 — this end's packets go through a first hop that holds
+        /// `bytes` ahead of its bottleneck ([`Shaper::hop`]).
+        pub(crate) fn with_hop(mut self, bytes: u64) -> Self {
+            self.out.hop = Some(bytes);
+            self
         }
     }
 
@@ -4276,6 +4787,7 @@ pub(crate) mod shaped_link {
             tail_drops: AtomicU64::new(0),
             outages: None,
             step: None,
+            hop: None,
         };
         (shaper, inbox_rx)
     }
@@ -4311,6 +4823,7 @@ pub(crate) mod shaped_link {
             tail_drops: AtomicU64::new(0),
             outages: Some(outages),
             step: None,
+            hop: None,
         };
         (shaper, inbox_rx)
     }
@@ -4396,6 +4909,18 @@ pub(crate) mod shaped_link {
             Ok((self.recv(buf).await?, self.remote))
         }
         async fn send(&self, b: &[u8]) -> UResult<usize> {
+            // FR-148 D51 — a full first hop holds the write until the
+            // bottleneck has taken enough of what waits.
+            if let Some(hop) = self.out.hop {
+                loop {
+                    let want = self.out.backlog(Instant::now()) + b.len() as u64;
+                    if want <= hop {
+                        break;
+                    }
+                    let ns = (want - hop).saturating_mul(8_000_000_000) / self.out.bps;
+                    tokio::time::sleep(Duration::from_nanos(ns.max(100_000))).await;
+                }
+            }
             self.out.send(b);
             Ok(b.len())
         }
@@ -5276,13 +5801,18 @@ pub(crate) mod shaped_link {
         }
 
         /// One message the viewer read: when it arrived and when it was
-        /// written (microseconds from the cell's start), and its length.
+        /// written (microseconds from the cell's start), and its length. A
+        /// frame sent in pieces is one arrival, at its last piece.
         #[derive(Debug, Clone, Copy)]
         struct Arrival {
             at_us: u64,
             sent_us: u64,
             len: u64,
         }
+
+        /// FR-148 D51 — the mark in a message's tenth byte that more pieces of
+        /// its frame follow. The fixed writer's messages carry its fill there.
+        const MORE: u8 = 0xfe;
 
         fn transit_ms(x: &Arrival) -> u64 {
             x.at_us.saturating_sub(x.sent_us) / 1000
@@ -5770,6 +6300,7 @@ pub(crate) mod shaped_link {
                 bps: (s.rate_bps > 0).then(|| u32::try_from(s.rate_bps).unwrap_or(u32::MAX)),
                 measured: s.measured,
                 loss: s.fast_rtx + s.t3,
+                ..PathRate::default()
             }
         }
 
@@ -6713,6 +7244,7 @@ pub(crate) mod shaped_link {
                 tail_drops: AtomicU64::new(0),
                 outages: None,
                 step: None,
+                hop: None,
             };
             let (b_out, a_inbox) = direction(bps, RTT / 2, queue, 0, None);
             let (a, b): (SocketAddr, SocketAddr) = (
@@ -6844,13 +7376,20 @@ pub(crate) mod shaped_link {
                         // The slow viewer's next free read: never faster than
                         // its rate, and no catching up after a wait.
                         let mut free = Instant::now();
+                        // FR-148 D51 — a frame sent in pieces: the bytes of its
+                        // pieces marked `MORE`, logged with its last.
+                        let mut pieces = 0_u64;
                         while let Ok(n @ 8..) = stream.read(&mut buf).await {
                             let at = Instant::now();
+                            if n >= 10 && buf[9] == MORE {
+                                pieces += n as u64;
+                                continue;
+                            }
                             let sent_us = u64::from_le_bytes(buf[..8].try_into().unwrap());
                             log.lock().unwrap().push(Arrival {
                                 at_us: us(at.saturating_duration_since(t0)),
                                 sent_us,
-                                len: n as u64,
+                                len: std::mem::take(&mut pieces) + n as u64,
                             });
                             if let Some((bps, _)) = slow {
                                 free = free.max(at)
@@ -8538,6 +9077,1680 @@ pub(crate) mod shaped_link {
                 s[3].1,
                 s[2].1
             );
+        }
+
+        /// FR-148 D51 B4c — the closed-loop writer: the VP9-444 pump's own loop
+        /// on a relay session (`peer.rs`, `media_pump_vp9_444_dc`), run on the
+        /// shaped link against a viewer that reports as the browser does. The
+        /// fixed writer above offers a constant, so it cannot show a sender
+        /// that swings its own offer when the budget's queue appears, which is
+        /// what slice B3T measured. This one runs the pump's gate and its 2 ms
+        /// retry, a 30 fps capture, the real governor (its AIMD, fps cap, age
+        /// loop, link loop and drain) and an encoder that spends its target
+        /// as libvpx's rate control does, by the gap between the pts the pump
+        /// hands it (`encode::charge`), scaled by the content's swing. The agent's end writes through a
+        /// first hop that holds hundreds of KB ahead of the bottleneck, as the
+        /// relay's socket does on a TURN-over-TCP path.
+        mod closed_loop {
+            use std::collections::BTreeMap;
+
+            use super::*;
+            use crate::encode::governor::{AppliedBitrate, GovernorFlags, RateGovernor};
+            use crate::encode::viewer_rate::{self, ViewerFeedback};
+
+            /// The lab path B3T ran on: 2 Mbit/s on the wire, of which SCTP's
+            /// payload got E_sat = 0.8137 at saturation (the loaded `off` runs'
+            /// mean E_measured), so the link carries C_sat of payload.
+            const WIRE_BPS: u64 = 2_000_000;
+            const E_SAT: (u64, u64) = (8_137, 10_000);
+            /// cap.awk's modeled E for T: AC32's C, the lab's reported fill.
+            const E_MODEL: (u64, u64) = (8_869, 10_000);
+            /// T's base round trip: `on`'s median, 23-43 ms, is an empty queue.
+            const BASE_RTT: Duration = Duration::from_millis(30);
+            /// The relay's socket ahead of the bottleneck (T is TURN over
+            /// TCP): the first hop takes a write at once while it holds less
+            /// than this, and a write past it waits, as a socket write does.
+            /// B3T's opening windows put hundreds of KB into it.
+            const HOP: u64 = 512 * 1024;
+            /// The encoder, libvpx's one-pass CBR on a relay. A delta gets the
+            /// target over the gap between the pts it is handed and the last
+            /// one (the rate control grants bits by timestamp: `encode::libvpx`,
+            /// `encode::charge`, the capture's time, bounded by B4f where the
+            /// budget acts), up to its 1000 ms buffer (`rc_buf_sz`); a later
+            /// keyframe gets 60/16 of a 30 fps frame (`kf_boost` at 30 fps).
+            /// No floor: B3T and B3U's `on` runs sent at targets from 0.8 M to
+            /// 1.5 M.
+            const GAP_MOST: Duration = Duration::from_secs(1);
+            const LATER_KEY: Duration = Duration::from_micros(125_000);
+            /// The most a delta carries, bytes, whatever the rate control
+            /// grants: the content at the finest quantizer the one-pass CBR
+            /// reaches. B3T's `on` runs, held to a few frames a second in the
+            /// opening, carried 0.84-1.16 MB in each of heartbeats 2-5 (30
+            /// frames each).
+            const DELTA_MOST: usize = 40_000;
+            /// The opening burst: a session's first keyframe, bytes. Its size
+            /// is the screen's at the opening quantizer, not the 250 ms of
+            /// target the rate control asks of it. Window 1 of every `on` run
+            /// of B3T, B3U and B3A carried 1.29-1.56 MB in 29 frames, and
+            /// SCTP's slow start times the write of a keyframe this size at
+            /// 3.3-3.7 Mbit/s, the opening reading of B3T's.
+            const OPENING_KEY: usize = 800_000;
+            /// The relay's TCP: what waited behind a lost segment reaches the
+            /// viewer at once when the retransmission does, while the link
+            /// carries on ([`Noise`]: a stall of up to `stall`, one every
+            /// `stall_every` on average, on the agent's direction). B3T's
+            /// ages swing: the learned floor sits at 9-78 ms while a window's
+            /// average reaches 460 ms.
+            const RELAY_STALLS: Noise = Noise {
+                seed: 0x7c9_5ea1_1b4d_0051,
+                jitter: Duration::from_millis(1),
+                stall: Duration::from_millis(400),
+                stall_every: Duration::from_secs(3),
+            };
+            /// The content's swing: each second of capture scales its frames by
+            /// a split log-normal draw whose p10, p50 and p90 are what the `on`
+            /// runs of B3T and B3U sent against the target (0.94-0.98,
+            /// 1.03-1.05, 1.14-1.18), seeded so that every run meets the same
+            /// content.
+            const SWING: (f64, f64, f64) = (0.96, 1.04, 1.16);
+            const SWING_SEED: u64 = 0x4234_5eed_0b4c_d051;
+            /// One encode, and one decode in the viewer's worker.
+            const ENCODE: Duration = Duration::from_millis(10);
+            const DECODE: Duration = Duration::from_millis(6);
+            /// The capture's frame interval: 30 fps, the pump's target.
+            const CAPTURE: Duration = Duration::from_nanos(1_000_000_000 / 30);
+            const TARGET_FPS: u32 = 30;
+            /// FR-148 D51 B4g (C6s) — a capture slower than the pump's target:
+            /// 20 fps on its 30, with no FR-112 pacing, as a GPO-locked laptop,
+            /// a Wayland portal or a software encoder runs in the field.
+            const SLOW_CAPTURE: Duration = Duration::from_nanos(1_000_000_000 / 20);
+            /// The relay's ceiling: `encode::relay_max_bps`'s default.
+            const RELAY_CEILING: u32 = 3_000_000;
+            /// The pump's send channel on a relay, its gate's retry, and its
+            /// poll while a drain pauses production (`peer.rs`).
+            const SEND_DEPTH: usize = 2;
+            const GATE_RETRY: Duration = Duration::from_millis(2);
+            const DRAIN_POLL: Duration = Duration::from_millis(10);
+            /// The browser's decode-backlog rule (`rc-hop-stats.ts`): a window
+            /// whose mean backlog is over this is bad, and this many bad windows
+            /// in a row report the struggling bit.
+            const STRUGGLE_MS: u64 = 33;
+            const STRUGGLE_WINDOWS: u32 = 2;
+            /// The viewer keeps its clock probe's least round trip of the last
+            /// eight (`useRemoteControl.ts`, `CLOCK_RING`).
+            const PROBE_RING: usize = 8;
+            /// The run, and the opening its figures leave out.
+            const RUN: Duration = Duration::from_secs(60);
+            const OPENING: Duration = Duration::from_secs(5);
+            /// FR-148 D51 — the gate's runs. `on` runs past the opening
+            /// reading's 60 s of confidence (`goodput::CONFIDENCE_TTL`), the
+            /// prior's walk to the band and a stretch on the floor it leaves;
+            /// `off`, the control, long enough for its fill and its queue.
+            const ON_RUN: Duration = Duration::from_secs(240);
+            const OFF_RUN: Duration = Duration::from_secs(90);
+            /// FR-148 D51 — the stretch the gate reads `on`'s fill over: from
+            /// the prior's crossing to the run's stop, or, with no crossing,
+            /// its last `SETTLED` seconds.
+            const SETTLED: Duration = Duration::from_secs(60);
+            /// A still screen's delta, bytes: what a desktop sends before
+            /// anything on it moves.
+            const STILL_DELTA: usize = 1_000;
+            /// The send task's message (`peer.rs`, `SCTP_CHUNK_SIZE`): SCTP
+            /// refuses a message over 64 KiB, so a frame goes in pieces. A
+            /// remainder under `LEAST_MESSAGE` rides with the piece before it,
+            /// so every message carries the stamp, the key bit and the mark.
+            const SCTP_CHUNK: usize = 16 * 1024;
+            const LEAST_MESSAGE: usize = 16;
+            /// The `off` control's standing queue: each second's least.
+            const STANDING_MS: u64 = 500;
+
+            /// Which law the pump runs: today's (`off`: the VP9-444 watermark arm
+            /// sheds a frame over 256 KiB buffered) or the budget acting (`on`).
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            enum Arm {
+                Off,
+                On,
+            }
+
+            impl Arm {
+                fn word(self) -> &'static str {
+                    match self {
+                        Arm::Off => "off",
+                        Arm::On => "on",
+                    }
+                }
+            }
+
+            /// The shaped link's packet rate, which carries C_sat of payload.
+            fn packet_bps() -> u64 {
+                WIRE_BPS * E_SAT.0 / E_SAT.1 * PACKET / PAYLOAD
+            }
+
+            /// The link's payload capacity (C_sat), and AC32's C.
+            fn payload_bps() -> u64 {
+                packet_bps() * PAYLOAD / PACKET
+            }
+
+            fn c_bps() -> u64 {
+                WIRE_BPS * E_MODEL.0 / E_MODEL.1
+            }
+
+            /// B3T's path, the agent's end first: [`shaped`]'s link with the
+            /// relay's stalls ([`RELAY_STALLS`]) on the agent's direction.
+            fn relayed() -> (ShapedConn, ShapedConn) {
+                let (a_out, b_inbox) =
+                    direction(packet_bps(), BASE_RTT / 2, DEEP, 0, Some(RELAY_STALLS));
+                let (b_out, a_inbox) = direction(packet_bps(), BASE_RTT / 2, DEEP, 0, None);
+                let (a, b): (SocketAddr, SocketAddr) = (
+                    "10.0.0.1:5000".parse().unwrap(),
+                    "10.0.0.2:5000".parse().unwrap(),
+                );
+                (
+                    ShapedConn {
+                        out: a_out,
+                        inbox: Mutex::new(a_inbox),
+                        local: a,
+                        remote: b,
+                    },
+                    ShapedConn {
+                        out: b_out,
+                        inbox: Mutex::new(b_inbox),
+                        local: b,
+                        remote: a,
+                    },
+                )
+            }
+
+            /// How long a byte written now waits for the far end: the link's
+            /// queue and SCTP's own pending bytes ahead of it.
+            fn queued(link: &ShapedConn, gauges: &GaugeReader) -> u64 {
+                us(queue_now(link)) + gauges.peek().pending_bytes * 8_000_000 / packet_bps()
+            }
+
+            /// The frame the encoder makes at `target_bps`, `gap` after the last
+            /// frame it encoded, in a second whose content swings by `swing`:
+            /// bytes. A later keyframe spends `key` of the target instead.
+            fn frame_len(
+                target_bps: u32,
+                gap: Duration,
+                key: Option<Duration>,
+                swing: f64,
+            ) -> usize {
+                let span = key.unwrap_or(gap.min(GAP_MOST));
+                let bits = f64::from(target_bps) * span.as_secs_f64() * swing;
+                ((bits / 8.0) as usize).max(16)
+            }
+
+            /// The content's swing in capture second `s` (`SWING`).
+            fn swing(s: u64) -> f64 {
+                const Z90: f64 = 1.281_551_565_5;
+                let mut state = SWING_SEED ^ s.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let unit = |state: &mut u64| (draw(state) >> 11) as f64 / (1_u64 << 53) as f64;
+                let (u1, u2) = (unit(&mut state).max(1e-12), unit(&mut state));
+                // Box-Muller: a standard normal from two uniform draws.
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                let (lo, mid, hi) = SWING;
+                let sigma = if z < 0.0 {
+                    (mid / lo).ln()
+                } else {
+                    (hi / mid).ln()
+                } / Z90;
+                mid * (z * sigma).exp()
+            }
+
+            /// One governor window, as the pump's `viewer-rate fps cap` line
+            /// carries it (µs from `t0`).
+            #[derive(Debug, Clone, Copy)]
+            struct Win {
+                t_us: u64,
+                divisor: u32,
+                cap_fps: u32,
+                reported_fps: u32,
+                struggling: bool,
+                age: Option<(u16, u16)>,
+                floor: Option<u16>,
+                age_over: bool,
+                link_congested: bool,
+                drain_ms: Option<u32>,
+                target_bps: u32,
+                /// What the window's fold left behind, for FR-59's relief: the
+                /// bytes written over the window (the governor's `sent_bps`),
+                /// the plane verdict, the measured pipe and the stand-in, the
+                /// floor in force, and the link loop's running counts (windows
+                /// the validity gate rejected, congested, congested but not
+                /// offered) with its depth estimate.
+                sent_bps: u64,
+                state: &'static str,
+                measured_bps: Option<u32>,
+                prior_bps: Option<u32>,
+                relieved_bps: Option<u32>,
+                rejected: u32,
+                congested: u32,
+                unoffered: u32,
+                depth_ms: i32,
+                /// FR-148 D51 — the trail: the blocked-send goodput reading in
+                /// force and the windows its estimator has folded, the prior's
+                /// base and net steps, the budget's held passes in the window,
+                /// the window's blocked writes (count, bytes, µs) and the frames
+                /// encoded in it (count, bytes).
+                reading_bps: Option<u32>,
+                folded: u64,
+                base_bps: Option<u32>,
+                steps: i32,
+                holds: u64,
+                blocked: (u64, u64, u64),
+                encoded: (u64, u64),
+                /// The association at the window: the budget (bytes), its rate
+                /// and least, and SCTP's gauges.
+                sctp: Sctp,
+            }
+
+            /// The budget and SCTP's gauges, as a window reads them.
+            #[derive(Debug, Clone, Copy, Default)]
+            struct Sctp {
+                budget: u64,
+                rate_bps: Option<u64>,
+                least_ms: Option<u64>,
+                cwnd: u32,
+                ssthresh: u32,
+                inflight: u64,
+                pending: u64,
+                fast_retransmits: u64,
+                t3_expiries: u64,
+            }
+
+            impl Win {
+                /// The age LEVEL the prior reads as push-back: the average
+                /// `viewer_rate::AGE_SLACK_MS` or more over the learned floor,
+                /// or over half the probe's round trip (`half_rtt`) while none
+                /// is learned, as the governor reads it (its floor reads 0
+                /// then).
+                fn elevated(&self, half_rtt: u16) -> bool {
+                    let Some((avg, _)) = self.age else {
+                        return false;
+                    };
+                    let floor = self.floor.filter(|&f| f > 0).unwrap_or(half_rtt.max(1));
+                    avg.saturating_sub(floor) >= viewer_rate::AGE_SLACK_MS
+                }
+            }
+
+            /// What the pump did, pass by pass.
+            #[derive(Debug, Default)]
+            struct Pumped {
+                passes: u64,
+                /// Passes the budget's hold shut by itself, and the send
+                /// channel's full ones.
+                holds: u64,
+                full: u64,
+                drained: u64,
+                /// Captured frames the divisor discarded.
+                divided: u64,
+                keys: u64,
+                /// Encoded frames the watermark arm shed, and the frames a full
+                /// send channel refused.
+                shed: u64,
+                refused: u64,
+                /// When each frame was captured, encoded and handed to the
+                /// send channel (µs from `t0`).
+                captured_at: Vec<u64>,
+                encoded_at: Vec<u64>,
+                sent_at: Vec<u64>,
+                /// The applied moves by their why, and the target over time.
+                moves: BTreeMap<String, u32>,
+                targets: Vec<(u64, u32)>,
+                windows: Vec<Win>,
+                /// FR-148 D51 — each applied move (µs from `t0`, its why, the
+                /// target it set, FR-59's relieved floor then), each encoded
+                /// frame (µs, bytes, keyframe) and each write that blocked for
+                /// `goodput::MIN_BLOCKED_SEND` or more (µs at its end, bytes,
+                /// µs blocked).
+                log: Vec<(u64, String, u32, Option<u32>)>,
+                frames: Vec<(u64, u64, bool)>,
+                blocked: Vec<(u64, u64, u64)>,
+                /// FR-148 D51 B4f — C6's bar ([`Bar`]): each pass the budget's
+                /// hold shut (µs from `t0`), each hold's first such pass, each
+                /// hold the governor read as `decrease(full)`, and each pass a
+                /// drain paused.
+                held_at: Vec<u64>,
+                hold_began: Vec<u64>,
+                hold_cuts: Vec<u64>,
+                drained_at: Vec<u64>,
+                /// FR-148 D51 B4g — each encode (µs from `t0`), the time the
+                /// capacity gate kept frames back since the encode before it
+                /// (`encode::charge::GateClock`) and the gap it was charged, µs.
+                charged: Vec<(u64, u64, u64)>,
+                /// FR-148 — each heartbeat's take of the send wait (µs from
+                /// `t0`, its window), every 30 frames encoded, as the pump's.
+                send_waits: Vec<(u64, crate::media_inflight::SendWaitWindow)>,
+            }
+
+            /// A frame in the viewer's worker: its write stamp, when its last
+            /// byte arrived and when it painted, µs from `t0`.
+            #[derive(Debug, Clone, Copy)]
+            struct Painted {
+                stamp: u64,
+                arrival: u64,
+                paint: u64,
+            }
+
+            /// One window as the browser reported it.
+            #[derive(Debug, Clone, Copy)]
+            struct Seen {
+                t_us: u64,
+                fps: u32,
+                backlog_ms: u64,
+                struggling: bool,
+                age: Option<(u16, u16)>,
+                arrival_ms: u16,
+                probe_rtt_ms: u16,
+                rx_bps: u32,
+                queue_ms: Option<i64>,
+            }
+
+            fn note(
+                p: &mut Pumped,
+                t0: Instant,
+                target: &mut u32,
+                a: Option<AppliedBitrate>,
+                floor: Option<u32>,
+            ) {
+                if let Some(a) = a {
+                    let why = a.why.to_string();
+                    *p.moves.entry(why.clone()).or_default() += 1;
+                    *target = a.bps;
+                    p.targets.push((us(t0.elapsed()), a.bps));
+                    p.log.push((us(t0.elapsed()), why, a.bps, floor));
+                }
+            }
+
+            /// The pump: `peer.rs`'s VP9-444 loop on a relay, pass by pass. The
+            /// budget's gate and the capacity gate, the 2 ms retry with the
+            /// skip's decrease through the pass, the budget's step, the newest
+            /// capture, the viewer window, the drain, the divisor, the governor's
+            /// tick, the encode, the watermark arm and the send channel; and the
+            /// send task behind it, one frame at a time into SCTP, with each
+            /// frame's send wait and the heartbeat's take of it. Until `moves`
+            /// the screen is still: a delta is `STILL_DELTA` whatever the target.
+            /// The capture delivers a frame every `capture` (`CAPTURE`, or
+            /// C6s's `SLOW_CAPTURE`) against the pump's `TARGET_FPS`.
+            #[allow(clippy::too_many_arguments)] // one pump's handles; a struct would only rename them
+            async fn pump(
+                arm: Arm,
+                capture: Duration,
+                t0: Instant,
+                start: Instant,
+                moves: Instant,
+                stop: Instant,
+                stream: Arc<webrtc::sctp::stream::Stream>,
+                clock: DeliveryClock,
+                gauges: GaugeReader,
+                feedback: Arc<ViewerFeedback>,
+                written: Arc<AtomicU64>,
+            ) -> Pumped {
+                let mut governor = RateGovernor::new(
+                    TARGET_FPS,
+                    SEND_DEPTH,
+                    GovernorFlags::default(),
+                    0,
+                    None,
+                    Instant::now(),
+                );
+                let mut delivery = match arm {
+                    Arm::Off => DeliverySampler::new(true),
+                    Arm::On => DeliverySampler::new(true).with_budget_on(),
+                };
+                let (send_tx, mut send_rx) = mpsc::channel::<(Instant, Bytes)>(SEND_DEPTH);
+                let blocked: Arc<StdMutex<Vec<(u64, u64, u64)>>> = Arc::default();
+                let sender = {
+                    let stream = Arc::clone(&stream);
+                    let count = delivery.pump_count();
+                    let send_wait = Arc::clone(delivery.send_wait());
+                    let written = Arc::clone(&written);
+                    let sink = governor.goodput_sink();
+                    let blocked = Arc::clone(&blocked);
+                    // As the pump's send task: the frame goes in 16 KiB
+                    // messages, each released from the budget's count as it is
+                    // written, and the frame's whole write is one goodput
+                    // sample. Each message carries the frame's stamp; all but
+                    // the last are marked `MORE`, and the viewer logs the frame
+                    // when its last message arrives. A frame whose last
+                    // message went records its send wait (FR-148).
+                    tokio::spawn(async move {
+                        'frames: while let Some((enqueued_at, frame)) = send_rx.recv().await {
+                            let total = frame.len();
+                            let mut unsent = count.unsent(total);
+                            let began = Instant::now();
+                            let mut off = 0;
+                            while off < total {
+                                let end = (off + SCTP_CHUNK).min(total);
+                                let end = if total - end < LEAST_MESSAGE {
+                                    total
+                                } else {
+                                    end
+                                };
+                                let mut message = frame[off..end].to_vec();
+                                message[..9].copy_from_slice(&frame[..9]);
+                                message[9] = if end < total { MORE } else { frame[9] };
+                                if stream.write(&Bytes::from(message)).await.is_err() {
+                                    break 'frames;
+                                }
+                                unsent.sent(end - off);
+                                off = end;
+                            }
+                            send_wait.sent(enqueued_at, Instant::now());
+                            written.fetch_add(total as u64, Ordering::Relaxed);
+                            let took = began.elapsed();
+                            sink.record_frame(total as u64, took, frame[8] == 1);
+                            if took >= crate::encode::goodput::MIN_BLOCKED_SEND {
+                                blocked.lock().unwrap().push((
+                                    us(t0.elapsed()),
+                                    total as u64,
+                                    us(took),
+                                ));
+                            }
+                        }
+                    })
+                };
+                let floor_bps = crate::encode::area_min_bitrate_bps(1920, 1080, true);
+                let mut p = Pumped::default();
+                let mut target = 0_u32;
+                // libvpx's pending keyframe, and the pump's `keyframe_requested`:
+                // a stream opens on a keyframe, the session's first.
+                let (mut force_key, mut key_asked, mut first_key) = (false, true, true);
+                let mut taken: Option<u32> = None;
+                // The encoder's last stamp (`encode::charge`): it grants by
+                // the pts it is handed, as libvpx does.
+                let mut last_stamp: Option<crate::encode::charge::Stamp> = None;
+                // FR-148 D51 B4g — the time the gate kept frames back since the
+                // last encode, measured as the pump measures it.
+                let mut gate_clock = crate::encode::charge::GateClock::default();
+                // The capture's frames a second, for the content's swing.
+                let per_s = u64::try_from(Duration::from_secs(1).as_nanos() / capture.as_nanos())
+                    .unwrap_or(1)
+                    .max(1);
+                let mut window_from = (Instant::now(), 0_u64);
+                // Where the last window left the held passes, the blocked
+                // writes and the encoded frames.
+                let mut window_marks = (0_u64, 0_usize, 0_usize);
+                // Whether the last pass was the budget's hold: a hold is the
+                // held passes in a row.
+                let mut was_held = false;
+                while Instant::now() < stop {
+                    p.passes += 1;
+                    delivery.gate_with(&mut governor, &clock, &gauges, true, false);
+                    let full = send_tx.capacity() == 0;
+                    if full || delivery.shuts() {
+                        gate_clock.skipped(Instant::now());
+                        let at = us(t0.elapsed());
+                        if full {
+                            p.full += 1;
+                        } else {
+                            p.holds += 1;
+                            p.held_at.push(at);
+                            if !was_held {
+                                p.hold_began.push(at);
+                            }
+                        }
+                        was_held = !full;
+                        delivery.note_gate(full, false);
+                        let a = delivery.on_skip(false, |s| governor.on_gate_skip(s));
+                        if !full
+                            && a.as_ref()
+                                .is_some_and(|a| a.why.to_string().contains("decrease(full)"))
+                        {
+                            p.hold_cuts.push(at);
+                        }
+                        note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
+                        tokio::time::sleep(GATE_RETRY).await;
+                        continue;
+                    }
+                    was_held = false;
+                    gate_clock.passed(Instant::now());
+                    delivery.on_frame_with(&mut governor, &clock, &gauges);
+                    // The capture: the newest frame not taken yet, or the next.
+                    let newest = u32::try_from(
+                        Instant::now().saturating_duration_since(start).as_nanos()
+                            / capture.as_nanos(),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let k = match taken {
+                        Some(t) if t >= newest => {
+                            let due = start + capture * (t + 1);
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                            t + 1
+                        }
+                        _ => newest,
+                    };
+                    taken = Some(k);
+                    let captured = start + capture * k;
+                    p.captured_at.push(us(t0.elapsed()));
+                    let forced = std::mem::take(&mut key_asked);
+                    force_key |= forced;
+                    if let Some(vw) = governor.tick_viewer_window(
+                        Instant::now(),
+                        TARGET_FPS,
+                        || feedback.take_report(),
+                        || feedback.take_age(),
+                        || feedback.take_link(),
+                        true,
+                        |own| own,
+                        written.load(Ordering::Relaxed),
+                    ) {
+                        let now = Instant::now();
+                        let bytes = written.load(Ordering::Relaxed);
+                        let ms = now.duration_since(window_from.0).as_millis().max(1) as u64;
+                        let sent_bps = bytes.saturating_sub(window_from.1) * 8_000 / ms;
+                        window_from = (now, bytes);
+                        let (congested, _, depth_ms) = governor.link_stats();
+                        let (base_bps, steps) = governor.prior_walk();
+                        let blocked_now = blocked.lock().unwrap().clone();
+                        let in_window = &blocked_now[window_marks.1.min(blocked_now.len())..];
+                        let frames_in = &p.frames[window_marks.2..];
+                        let w_blocked = (
+                            in_window.len() as u64,
+                            in_window.iter().map(|b| b.1).sum(),
+                            in_window.iter().map(|b| b.2).sum(),
+                        );
+                        let w_encoded =
+                            (frames_in.len() as u64, frames_in.iter().map(|f| f.1).sum());
+                        let w_holds = p.holds - window_marks.0;
+                        window_marks = (p.holds, blocked_now.len(), p.frames.len());
+                        let g = gauges.peek();
+                        let budget = delivery.budget_mut().map(|s| {
+                            let b = s.budget();
+                            (b.last_budget(), b.rate_bps(), b.least())
+                        });
+                        let sctp = Sctp {
+                            budget: budget.map_or(0, |b| b.0),
+                            rate_bps: budget.and_then(|b| b.1),
+                            least_ms: budget.and_then(|b| b.2).map(|l| l.as_millis() as u64),
+                            cwnd: g.cwnd,
+                            ssthresh: g.ssthresh,
+                            inflight: g.inflight_bytes,
+                            pending: g.pending_bytes,
+                            fast_retransmits: g.fast_retransmits,
+                            t3_expiries: g.t3_expiries,
+                        };
+                        p.windows.push(Win {
+                            t_us: us(t0.elapsed()),
+                            divisor: vw.skip_divisor,
+                            cap_fps: vw.cap_fps,
+                            reported_fps: vw.reported_fps,
+                            struggling: vw.struggling,
+                            age: vw.age_ms,
+                            floor: governor.viewer_age().map(|(_, f)| f),
+                            age_over: vw.age_over,
+                            link_congested: vw.link_congested,
+                            drain_ms: vw.drain_for_ms,
+                            target_bps: governor.applied_bps(),
+                            sent_bps,
+                            state: governor.pipe_state().map_or("none", |s| s.as_str()),
+                            measured_bps: governor.measured_bps(now, true),
+                            prior_bps: governor.prior_bps(),
+                            relieved_bps: governor.relieved_floor_bps(),
+                            rejected: governor.evidence_rejected().iter().sum(),
+                            congested,
+                            unoffered: governor.link_unoffered(),
+                            depth_ms,
+                            reading_bps: governor.blocked_send_bps(now),
+                            folded: governor.goodput_samples().0,
+                            base_bps,
+                            steps,
+                            holds: w_holds,
+                            blocked: w_blocked,
+                            encoded: w_encoded,
+                            sctp,
+                        });
+                    }
+                    if governor.draining(Instant::now()) {
+                        gate_clock.paused();
+                        p.drained += 1;
+                        p.drained_at.push(us(t0.elapsed()));
+                        tokio::time::sleep(DRAIN_POLL).await;
+                        continue;
+                    }
+                    if governor.should_skip_delta_frame(forced) {
+                        p.divided += 1;
+                        continue;
+                    }
+                    let a = governor.pre_encode_tick(
+                        RELAY_CEILING,
+                        floor_bps,
+                        true,
+                        send_tx.capacity(),
+                        Instant::now(),
+                    );
+                    note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
+                    tokio::time::sleep(ENCODE).await;
+                    let key = std::mem::take(&mut force_key);
+                    // FR-148 D51 B4f, B4g — the pts the pump hands the
+                    // encoder: the capture's time, charged where the budget
+                    // acts its gap less the time gated, never less than the
+                    // pump's interval (`RateGovernor::charge_interval`); the
+                    // gap granted is the gap between the pts handed.
+                    let pts = i64::try_from(us(captured.saturating_duration_since(start)))
+                        .unwrap_or(i64::MAX);
+                    let gated = gate_clock.take();
+                    let gate = governor
+                        .charge_interval(TARGET_FPS)
+                        .map(|interval| crate::encode::charge::Gate { gated, interval });
+                    let stamp =
+                        crate::encode::charge::charge(last_stamp, pts, Instant::now(), gate);
+                    let dt = last_stamp.map_or(capture, |l| {
+                        Duration::from_micros(u64::try_from(stamp.pts - l.pts).unwrap_or(0))
+                    });
+                    last_stamp = Some(stamp);
+                    p.charged.push((us(t0.elapsed()), us(gated), us(dt)));
+                    let len = if captured < moves && !key {
+                        STILL_DELTA
+                    } else if key && std::mem::take(&mut first_key) {
+                        OPENING_KEY
+                    } else if key {
+                        let s = swing(u64::from(k) / per_s);
+                        frame_len(target, dt, Some(LATER_KEY), s)
+                    } else {
+                        let s = swing(u64::from(k) / per_s);
+                        frame_len(target, dt, None, s).min(DELTA_MOST)
+                    };
+                    p.encoded_at.push(us(t0.elapsed()));
+                    p.frames.push((us(t0.elapsed()), len as u64, key));
+                    p.keys += u64::from(key);
+                    if delivery.sheds(stream.buffered_amount() as u64 > OVERFLOW) {
+                        let a = governor.on_send_overflow(Instant::now());
+                        note(&mut p, t0, &mut target, a, governor.relieved_floor_bps());
+                        p.shed += 1;
+                        delivery.note_watermark();
+                        key_asked = true;
+                        continue;
+                    }
+                    let mut frame = vec![0x6b_u8; len];
+                    frame[..8].copy_from_slice(&us(t0.elapsed()).to_le_bytes());
+                    frame[8] = u8::from(key);
+                    match send_tx.try_send((Instant::now(), Bytes::from(frame))) {
+                        Ok(()) => {
+                            delivery.on_handed(len as u64);
+                            p.sent_at.push(us(t0.elapsed()));
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            p.refused += 1;
+                            delivery.note_full();
+                            key_asked = true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                    if p.frames.len().is_multiple_of(30) {
+                        let window = delivery.send_wait().take();
+                        p.send_waits.push((us(t0.elapsed()), window));
+                    }
+                }
+                drop(send_tx);
+                let _ = tokio::time::timeout(Duration::from_secs(5), sender).await;
+                p.blocked = blocked.lock().unwrap().clone();
+                p
+            }
+
+            /// The browser: decodes each frame as it arrives, paints it when
+            /// decoded, sends a clock probe on every stats tick and keeps the
+            /// least round trip of the last eight, whose echo waited behind
+            /// the queue (so the age it maps is low by half that queue), and at
+            /// each tick (a second, at its own phase) reports what
+            /// `rc-dc-worker.ts` and `decodeStatWireMessage` report, a one-way
+            /// trip later.
+            async fn browser(
+                t0: Instant,
+                start: Instant,
+                stop: Instant,
+                arrivals: Arc<StdMutex<Vec<Arrival>>>,
+                link: Arc<ShapedConn>,
+                gauges: GaugeReader,
+                feedback: Arc<ViewerFeedback>,
+            ) -> Vec<Seen> {
+                let mut seen = Vec::new();
+                let mut next = 0;
+                let mut decoder_free = 0_u64;
+                let mut decoding: VecDeque<Painted> = VecDeque::new();
+                let mut probes: VecDeque<(u64, u64)> = VecDeque::new();
+                let mut last_painted: Option<(u64, u64)> = None;
+                let mut bad = 0;
+                let mut tick = start + Duration::from_millis(500);
+                let mut prev = us(start.saturating_duration_since(t0));
+                while tick < stop {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(tick)).await;
+                    let now = us(t0.elapsed());
+                    let queue = queued(&link, &gauges);
+                    probes.push_back((us(BASE_RTT) + queue, queue));
+                    if probes.len() > PROBE_RING {
+                        probes.pop_front();
+                    }
+                    let best = probes
+                        .iter()
+                        .copied()
+                        .min_by_key(|p| p.0)
+                        .unwrap_or_default();
+                    let mut rx = 0;
+                    {
+                        let log = arrivals.lock().unwrap();
+                        for x in &log[next..] {
+                            decoder_free = x.at_us.max(decoder_free) + us(DECODE);
+                            decoding.push_back(Painted {
+                                stamp: x.sent_us,
+                                arrival: x.at_us,
+                                paint: decoder_free,
+                            });
+                            rx += x.len;
+                        }
+                        next = log.len();
+                    }
+                    let mut painted = Vec::new();
+                    while decoding.front().is_some_and(|f| f.paint <= now) {
+                        painted.extend(decoding.pop_front());
+                    }
+                    let span = now.saturating_sub(prev).max(1);
+                    prev = now;
+                    let n = painted.len() as u64;
+                    let fps = u32::try_from((n * 1_000_000 + span / 2) / span).unwrap_or(u32::MAX);
+                    let backlog_ms =
+                        painted.iter().map(|f| f.paint - f.arrival).sum::<u64>() / n.max(1) / 1_000;
+                    bad = if n > 0 && backlog_ms > STRUGGLE_MS {
+                        bad + 1
+                    } else {
+                        0
+                    };
+                    let struggling = bad >= STRUGGLE_WINDOWS;
+                    // The probe's offset is low by half the queue its echo met.
+                    let skew = best.1 / 2;
+                    let age =
+                        |at: u64, stamp: u64| at.saturating_sub(stamp).saturating_sub(skew) / 1_000;
+                    let ms16 = |v: u64| u16::try_from(v).unwrap_or(u16::MAX);
+                    let ages: Vec<u64> = painted.iter().map(|f| age(f.paint, f.stamp)).collect();
+                    let age_pair = (n > 0).then(|| {
+                        (
+                            ms16(ages.iter().sum::<u64>() / n),
+                            ms16(ages.iter().copied().min().unwrap_or(0)),
+                        )
+                    });
+                    let arrival_ms = ms16(
+                        painted.iter().map(|f| age(f.arrival, f.stamp)).sum::<u64>() / n.max(1),
+                    )
+                    .max(1);
+                    // `QueueDrift` at paint: each frame against the one before,
+                    // the last window's last frame included.
+                    let mut drift: Option<i64> = None;
+                    for f in &painted {
+                        if let Some((stamp, paint)) = last_painted {
+                            let wire = f.stamp as i64 - stamp as i64;
+                            let arrived = f.paint as i64 - paint as i64;
+                            if wire > 0 && wire <= 5_000_000 && (0..=5_000_000).contains(&arrived) {
+                                *drift.get_or_insert(0) +=
+                                    (arrived - wire).clamp(-1_000_000, 1_000_000);
+                            }
+                        }
+                        last_painted = Some((f.stamp, f.paint));
+                    }
+                    let queue_ms = drift.map(|d| d / 1_000);
+                    let rx_bps = u32::try_from(rx * 8_000_000 / span).unwrap_or(u32::MAX);
+                    let probe_rtt_ms = ms16(best.0 / 1_000);
+                    seen.push(Seen {
+                        t_us: now,
+                        fps,
+                        backlog_ms,
+                        struggling,
+                        age: age_pair,
+                        arrival_ms,
+                        probe_rtt_ms,
+                        rx_bps,
+                        queue_ms,
+                    });
+                    tokio::time::sleep(BASE_RTT / 2).await;
+                    feedback.store_report(viewer_rate::pack_report(fps, struggling));
+                    if let Some((avg, min)) = age_pair {
+                        feedback.store_age(viewer_rate::pack_age_with_arrival(
+                            avg,
+                            min,
+                            probe_rtt_ms,
+                            arrival_ms,
+                        ));
+                    }
+                    if let Some(q) = queue_ms {
+                        let q = i16::try_from(q.clamp(i16::MIN.into(), i16::MAX.into())).unwrap();
+                        feedback.store_link(viewer_rate::pack_link(rx_bps, q));
+                    }
+                    tick += SAMPLE;
+                }
+                seen
+            }
+
+            #[derive(Debug)]
+            struct LoopRun {
+                arm: Arm,
+                /// Where the figures start (the opening's end) and the run's
+                /// stop, µs from `t0`.
+                from_us: u64,
+                stop_us: u64,
+                pumped: Pumped,
+                seen: Vec<Seen>,
+                arrivals: Vec<Arrival>,
+                /// The queue a byte written then would wait behind, every poll.
+                queue_at: Vec<(u64, u64)>,
+            }
+
+            /// One arm on B3T's path: `still` of a still screen, then `run` of
+            /// motion, whose first `OPENING` the figures leave out. The agent's
+            /// end writes through the relay's socket (`HOP`), and its
+            /// direction stalls as the relay's TCP does (`RELAY_STALLS`). The
+            /// capture delivers a frame every `capture`.
+            async fn run_loop(
+                arm: Arm,
+                still: Duration,
+                run: Duration,
+                capture: Duration,
+            ) -> LoopRun {
+                let _turn = TURN.lock().await;
+                #[cfg(target_os = "windows")]
+                let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
+                let t0 = Instant::now();
+                let (a, b) = relayed();
+                let a = Arc::new(a.with_hop(HOP));
+                let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
+                let (agent, viewer) = pair_timed(
+                    a.clone(),
+                    Arc::new(b),
+                    OpenPath::InitAck,
+                    t0,
+                    Arc::clone(&arrivals),
+                    None,
+                )
+                .await;
+                let stream = agent
+                    .open_stream(1, PayloadProtocolIdentifier::Binary)
+                    .await
+                    .unwrap();
+                let (clock, gauges) = (agent.delivery_clock(), agent.gauges());
+                let feedback = Arc::new(ViewerFeedback::new());
+                let written = Arc::new(AtomicU64::new(0));
+                let start = Instant::now();
+                let moves = start + still;
+                let stop = moves + run;
+                let pumping = tokio::spawn(pump(
+                    arm,
+                    capture,
+                    t0,
+                    start,
+                    moves,
+                    stop,
+                    Arc::clone(&stream),
+                    clock,
+                    gauges.clone(),
+                    Arc::clone(&feedback),
+                    Arc::clone(&written),
+                ));
+                let viewing = tokio::spawn(browser(
+                    t0,
+                    start,
+                    stop,
+                    Arc::clone(&arrivals),
+                    Arc::clone(&a),
+                    gauges.clone(),
+                    Arc::clone(&feedback),
+                ));
+                let mut queue_at = Vec::new();
+                while Instant::now() < stop {
+                    queue_at.push((us(t0.elapsed()), queued(&a, &gauges)));
+                    tokio::time::sleep(POLL).await;
+                }
+                let pumped = pumping.await.unwrap();
+                let seen = viewing.await.unwrap();
+                let arrivals = arrivals.lock().unwrap().clone();
+                let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
+                LoopRun {
+                    arm,
+                    from_us: us((moves + OPENING).saturating_duration_since(t0)),
+                    stop_us: us(stop.saturating_duration_since(t0)),
+                    pumped,
+                    seen,
+                    arrivals,
+                    queue_at,
+                }
+            }
+
+            /// The `q`-th percentile of `v`, sorted in place; 0 for none.
+            fn quantile(v: &mut [u64], q: usize) -> u64 {
+                if v.is_empty() {
+                    return 0;
+                }
+                v.sort_unstable();
+                v[(v.len() - 1) * q / 100]
+            }
+
+            /// What a run reads from its opening's end to its stop.
+            #[derive(Debug, Clone, Copy)]
+            struct Read {
+                /// Delivered payload, bit/s, and its share of the payload
+                /// capacity (C_sat) and of AC32's C, thousandths.
+                rx_bps: u64,
+                of_payload: u64,
+                of_c: u64,
+                /// Frames captured, encoded and sent a second, tenths.
+                cap_fps: u64,
+                enc_fps: u64,
+                sent_fps: u64,
+                /// FR-148 D51 B4f — the frames sent in each whole second: the
+                /// median second's and the p10's.
+                sent_each: (u64, u64),
+                /// Windows whose divisor was 2 or more, of the windows.
+                divided: (usize, usize),
+                /// Frame transit, write to read, and a probe's round trip,
+                /// base and queue: median and p95, ms.
+                transit: (u64, u64),
+                rtt: (u64, u64),
+                /// Seconds whose queue never fell under `STANDING_MS`, of the
+                /// seconds; the median second's least queue, ms.
+                standing: (usize, usize),
+                least_ms: u64,
+            }
+
+            fn read(r: &LoopRun) -> Read {
+                read_from(r, r.from_us)
+            }
+
+            /// [`read`] from `from`, µs from `t0`, to the run's stop.
+            fn read_from(r: &LoopRun, from: u64) -> Read {
+                let to = r.stop_us;
+                let span = to.saturating_sub(from).max(1);
+                let inside = |t: u64| t >= from && t < to;
+                let got: Vec<&Arrival> = r.arrivals.iter().filter(|x| inside(x.at_us)).collect();
+                let rx_bps = got.iter().map(|x| x.len).sum::<u64>() * 8_000_000 / span;
+                let per_s =
+                    |v: &[u64]| v.iter().filter(|&&t| inside(t)).count() as u64 * 10_000_000 / span;
+                let windows: Vec<&Win> =
+                    r.pumped.windows.iter().filter(|w| inside(w.t_us)).collect();
+                let mut transit: Vec<u64> = got
+                    .iter()
+                    .map(|x| x.at_us.saturating_sub(x.sent_us) / 1_000)
+                    .collect();
+                let mut rtt: Vec<u64> = r
+                    .queue_at
+                    .iter()
+                    .filter(|q| inside(q.0))
+                    .map(|q| (us(BASE_RTT) + q.1) / 1_000)
+                    .collect();
+                let mut least: BTreeMap<u64, u64> = BTreeMap::new();
+                for &(t, q) in r.queue_at.iter().filter(|q| inside(q.0)) {
+                    let s = least.entry((t - from) / 1_000_000).or_insert(u64::MAX);
+                    *s = (*s).min(q / 1_000);
+                }
+                let mut leasts: Vec<u64> = least.values().copied().collect();
+                let mut each = vec![0_u64; usize::try_from(span / 1_000_000).unwrap_or(0)];
+                for &t in r.pumped.sent_at.iter().filter(|&&t| inside(t)) {
+                    let s = usize::try_from((t - from) / 1_000_000).unwrap_or(usize::MAX);
+                    if let Some(n) = each.get_mut(s) {
+                        *n += 1;
+                    }
+                }
+                Read {
+                    rx_bps,
+                    of_payload: rx_bps * 1_000 / payload_bps(),
+                    of_c: rx_bps * 1_000 / c_bps(),
+                    cap_fps: per_s(&r.pumped.captured_at),
+                    enc_fps: per_s(&r.pumped.encoded_at),
+                    sent_fps: per_s(&r.pumped.sent_at),
+                    sent_each: (quantile(&mut each, 50), quantile(&mut each, 10)),
+                    divided: (
+                        windows.iter().filter(|w| w.divisor >= 2).count(),
+                        windows.len(),
+                    ),
+                    transit: (quantile(&mut transit, 50), quantile(&mut transit, 95)),
+                    rtt: (quantile(&mut rtt, 50), quantile(&mut rtt, 95)),
+                    standing: (
+                        leasts.iter().filter(|&&q| q > STANDING_MS).count(),
+                        leasts.len(),
+                    ),
+                    least_ms: quantile(&mut leasts, 50),
+                }
+            }
+
+            fn print_loop(r: &LoopRun, x: &Read) {
+                let p = &r.pumped;
+                let thousandths = |v: u64| format!("{}.{:03}", v / 1_000, v % 1_000);
+                let tenths = |v: u64| format!("{}.{}", v / 10, v % 10);
+                println!(
+                    "B4c | {} | payload {} kbit/s, C {} kbit/s | delivered {} kbit/s = {} of payload, \
+                     {} of C | captured {} fps, encoded {} fps, sent {} fps, discarded {} /s | divisor >= 2 in {} of \
+                     {} windows | transit p50 {} / p95 {} ms | rtt p50 {} / p95 {} ms | standing {} of {} \
+                     s, least queue median {} ms",
+                    r.arm.word(),
+                    kbps(payload_bps()),
+                    kbps(c_bps()),
+                    kbps(x.rx_bps),
+                    thousandths(x.of_payload),
+                    thousandths(x.of_c),
+                    tenths(x.cap_fps),
+                    tenths(x.enc_fps),
+                    tenths(x.sent_fps),
+                    tenths(x.cap_fps.saturating_sub(x.enc_fps)),
+                    x.divided.0,
+                    x.divided.1,
+                    x.transit.0,
+                    x.transit.1,
+                    x.rtt.0,
+                    x.rtt.1,
+                    x.standing.0,
+                    x.standing.1,
+                    x.least_ms,
+                );
+                let windows = || p.windows.iter().filter(|w| w.t_us >= r.from_us);
+                println!(
+                    "B4c | {} | passes {}, holds {}, channel full {}, drained {}, divided {}, keys {}, \
+                     shed {}, refused {} | age_over {} windows, link congested {}, drains {}, struggling \
+                     {} | moves {:?}",
+                    r.arm.word(),
+                    p.passes,
+                    p.holds,
+                    p.full,
+                    p.drained,
+                    p.divided,
+                    p.keys,
+                    p.shed,
+                    p.refused,
+                    windows().filter(|w| w.age_over).count(),
+                    windows().filter(|w| w.link_congested).count(),
+                    windows().filter(|w| w.drain_ms.is_some()).count(),
+                    windows().filter(|w| w.struggling).count(),
+                    p.moves,
+                );
+                // FR-59's relief, read the way step 1 of B4's gate reads it: how
+                // many windows ran on a relieved floor and with a measured pipe,
+                // the target sitting on that floor, and the floor's median
+                // against the delivered rate.
+                let mut floors: Vec<u64> = windows()
+                    .filter_map(|w| w.relieved_bps.map(u64::from))
+                    .collect();
+                let mut states: BTreeMap<&str, usize> = BTreeMap::new();
+                for w in windows() {
+                    *states.entry(w.state).or_default() += 1;
+                }
+                let last = p.windows.last();
+                println!(
+                    "B4c | {} | relieved floor in {} of {} windows, measured pipe in {}, prior in {}, target \
+                     on the relieved floor in {} | floor median {} kbit/s = {} of delivered | states {:?} | \
+                     rejected {}, link congested {}, congested but not offered {}",
+                    r.arm.word(),
+                    floors.len(),
+                    windows().count(),
+                    windows().filter(|w| w.measured_bps.is_some()).count(),
+                    windows().filter(|w| w.prior_bps.is_some()).count(),
+                    windows()
+                        .filter(|w| w.relieved_bps == Some(w.target_bps))
+                        .count(),
+                    kbps(quantile(&mut floors, 50)),
+                    thousandths(quantile(&mut floors, 50) * 1_000 / x.rx_bps.max(1)),
+                    states,
+                    last.map_or(0, |w| w.rejected),
+                    last.map_or(0, |w| w.congested),
+                    last.map_or(0, |w| w.unoffered),
+                );
+                // FR-148 D51 — the encoder against its target, window by
+                // window, after the opening: what the lab's (e) reads.
+                let mut ratio: Vec<u64> = windows()
+                    .filter(|w| w.target_bps > 0)
+                    .map(|w| w.sent_bps * 1_000 / u64::from(w.target_bps))
+                    .collect();
+                let mut fps: Vec<u64> = windows().map(|w| w.encoded.0).collect();
+                println!(
+                    "B4c | {} | encoder: sent/target p10/p50/p90 {}/{}/{} over {} windows, frames a window \
+                     p50 {}",
+                    r.arm.word(),
+                    thousandths(quantile(&mut ratio, 10)),
+                    thousandths(quantile(&mut ratio, 50)),
+                    thousandths(quantile(&mut ratio, 90)),
+                    ratio.len(),
+                    quantile(&mut fps, 50),
+                );
+                // FR-148 D51 — the trail, one line a window: the reading in
+                // force (and the windows folded), the measured pipe, the prior
+                // (stand-in, base, steps), FR-59's floor and the target, the age
+                // (average / learned floor, `E` for elevated), the budget's held
+                // passes, the blocked writes, what was encoded and sent, and the
+                // window's verdict.
+                let k = |v: Option<u32>| v.map_or("-".to_string(), |v| (v / 1_000).to_string());
+                for w in &p.windows {
+                    let s = r.seen.iter().rev().find(|s| s.t_us <= w.t_us);
+                    let (bn, bb, bus) = w.blocked;
+                    let c = &w.sctp;
+                    println!(
+                        "B4c | {} | t {:>6} ms | read {:>4} ({}) meas {:>4} | prior {:>4} base {:>4} steps {:>3} | \
+                         floor {:>4} target {:>4} | age {:?}/{:?}{} | holds {:>4} | blocked {} {} kB {} kbit/s | \
+                         encoded {} {} kB, sent {} kbit/s, rx {} kbit/s, fps {} | {}{}{}{} div {} | cap {}/{} fps, \
+                         depth {} ms | viewer: backlog {} ms{}, age {:?}, arrival {} ms, probe {} ms, queue {:?} ms \
+                         | sctp: budget {} kB rate {:?} least {:?} ms cwnd {} kB ssthresh {} kB inflight {} kB \
+                         pending {} kB frtx {} t3 {}",
+                        r.arm.word(),
+                        w.t_us / 1_000,
+                        k(w.reading_bps),
+                        w.folded,
+                        k(w.measured_bps),
+                        k(w.prior_bps),
+                        k(w.base_bps),
+                        w.steps,
+                        k(w.relieved_bps),
+                        w.target_bps / 1_000,
+                        w.age.map(|a| a.0),
+                        w.floor,
+                        if w.elevated(half_rtt(r, w)) { " E" } else { "" },
+                        w.holds,
+                        bn,
+                        bb / 1_000,
+                        (bb * 8_000).checked_div(bus).unwrap_or(0),
+                        w.encoded.0,
+                        w.encoded.1 / 1_000,
+                        w.sent_bps / 1_000,
+                        s.map_or(0, |s| u64::from(s.rx_bps) / 1_000),
+                        s.map_or(0, |s| s.fps),
+                        w.state,
+                        if w.age_over { " AGE_OVER" } else { "" },
+                        if w.link_congested { " LINK" } else { "" },
+                        w.drain_ms
+                            .map(|d| format!(" DRAIN {d}"))
+                            .unwrap_or_default(),
+                        w.divisor,
+                        w.cap_fps,
+                        w.reported_fps,
+                        w.depth_ms,
+                        s.map_or(0, |s| s.backlog_ms),
+                        if s.is_some_and(|s| s.struggling) {
+                            " STRUGGLING"
+                        } else {
+                            ""
+                        },
+                        s.and_then(|s| s.age),
+                        s.map_or(0, |s| s.arrival_ms),
+                        s.map_or(0, |s| s.probe_rtt_ms),
+                        s.and_then(|s| s.queue_ms),
+                        c.budget / 1_000,
+                        c.rate_bps.map(|r| r / 1_000),
+                        c.least_ms,
+                        c.cwnd / 1_000,
+                        c.ssthresh / 1_000,
+                        c.inflight / 1_000,
+                        c.pending / 1_000,
+                        c.fast_retransmits,
+                        c.t3_expiries,
+                    );
+                }
+            }
+
+            /// Half the clock probe's round trip the viewer had reported by
+            /// window `w`: the floor the governor falls back to.
+            fn half_rtt(r: &LoopRun, w: &Win) -> u16 {
+                r.seen
+                    .iter()
+                    .rev()
+                    .find(|s| s.t_us <= w.t_us)
+                    .map_or(0, |s| s.probe_rtt_ms / 2)
+            }
+
+            /// FR-148 D51 — what step 1 of B4's gate reads off a run, in the
+            /// order the lab's fixed point runs: (a) the opening's goodput
+            /// reading and the prior anchored on it, (b) whether another reading
+            /// followed, (c) the prior's walk down to the band, (d) the cuts to
+            /// the relieved floor after it, and the fill.
+            #[derive(Debug, Clone)]
+            struct Gate {
+                /// (a): the first window with a reading in force, µs, and the
+                /// reading; whether the prior's base took it.
+                first: Option<(u64, u32)>,
+                anchored: bool,
+                /// (b): windows after the first that folded another goodput
+                /// window, and the window the reading lapsed in, µs.
+                refolded: usize,
+                lapsed: Option<u64>,
+                /// (c): the steps down after the lapse (µs, steps, the stand-in
+                /// then); the first window with a stand-in under the band (µs,
+                /// stand-in, base, steps); elevated windows in the first 32 and
+                /// over the run.
+                walk: Vec<(u64, i32, Option<u32>)>,
+                crossing: Option<(u64, u32, Option<u32>, i32)>,
+                elevated: (usize, usize, usize),
+                /// The learned age floor and the average at windows 10 and 30.
+                ages: [(Option<u16>, Option<u16>); 2],
+                /// (d): after the crossing, `decrease(full)` moves, those that
+                /// set the target on the relieved floor, and the windows whose
+                /// target sat on that floor, of the windows; the target's
+                /// median there, kbit/s.
+                full_cuts: usize,
+                to_floor: usize,
+                on_floor: (usize, usize),
+                target_p50: u64,
+                /// The relieved floor's median there, kbit/s, and the windows
+                /// whose target sat within the AIMD's step under the band
+                /// (`aimd`'s `AI_SLOW_BAND_DIVISOR`, an eighth) of that floor.
+                floor_p50: u64,
+                near_floor: usize,
+                /// The stretch the fill is read over, µs from `t0`, and the read.
+                from_us: u64,
+                settled: Read,
+                /// The opening: the first 29 frames' bytes, and the first
+                /// window's encoded bytes and blocked writes.
+                first_frames: u64,
+                first_window: (u64, (u64, u64, u64)),
+                /// As the lab's heartbeats read it (one every 30 encoded
+                /// frames, the pump's `frames_encoded`): the bytes of
+                /// heartbeats 2-5, the learned floor and the average age at
+                /// heartbeats 2, 5, 10, 20 and 30, and the heartbeats up to 32
+                /// whose age was elevated, of those with an age.
+                beats: [u64; 4],
+                beat_ages: [(u32, Option<u16>, Option<u16>); 5],
+                beat_elevated: (usize, usize),
+            }
+
+            /// When heartbeat `k` (1-based) fired: at the encode of the
+            /// 30k-th frame, µs from `t0`.
+            fn beat_at(r: &LoopRun, k: usize) -> Option<u64> {
+                r.pumped.frames.get(30 * k - 1).map(|f| f.0)
+            }
+
+            /// The governor's last window at or before `t`, µs from `t0`.
+            fn window_at(r: &LoopRun, t: u64) -> Option<&Win> {
+                r.pumped.windows.iter().rev().find(|w| w.t_us <= t)
+            }
+
+            fn gate(r: &LoopRun) -> Gate {
+                let ws = &r.pumped.windows;
+                let first = ws.iter().find_map(|w| w.reading_bps.map(|v| (w.t_us, v)));
+                let first_at = first.map(|(t, _)| t);
+                let anchored = first.is_some_and(|(t, v)| {
+                    ws.iter()
+                        .filter(|w| w.t_us >= t)
+                        .take(2)
+                        .any(|w| w.base_bps == Some(v))
+                });
+                let after =
+                    |t: Option<u64>| ws.iter().filter(move |w| t.is_some_and(|t| w.t_us > t));
+                let folded_at_first = first_at
+                    .and_then(|t| ws.iter().find(|w| w.t_us == t))
+                    .map_or(0, |w| w.folded);
+                let refolded = after(first_at)
+                    .scan(folded_at_first, |last, w| {
+                        let more = w.folded > *last;
+                        *last = w.folded;
+                        Some(more)
+                    })
+                    .filter(|m| *m)
+                    .count();
+                let lapsed = after(first_at)
+                    .find(|w| w.reading_bps.is_none())
+                    .map(|w| w.t_us);
+                let mut walk = Vec::new();
+                let mut last_steps = 0;
+                for w in after(lapsed.map(|t| t.saturating_sub(1))) {
+                    if w.steps < last_steps {
+                        walk.push((w.t_us, w.steps, w.prior_bps));
+                    }
+                    last_steps = w.steps;
+                }
+                let crossing = after(lapsed.map(|t| t.saturating_sub(1)))
+                    .find(|w| w.prior_bps.is_some())
+                    .map(|w| (w.t_us, w.prior_bps.unwrap_or(0), w.base_bps, w.steps));
+                let up = |w: &&Win| w.elevated(half_rtt(r, w));
+                let elevated = (
+                    ws.iter().take(32).filter(up).count(),
+                    ws.iter().filter(up).count(),
+                    ws.len(),
+                );
+                let age_at = |i: usize| {
+                    ws.get(i)
+                        .map_or((None, None), |w| (w.floor, w.age.map(|a| a.0)))
+                };
+                let from_us = crossing.map_or(r.stop_us.saturating_sub(us(SETTLED)), |(t, ..)| t);
+                let log_after = r.pumped.log.iter().filter(|m| m.0 >= from_us);
+                let full_cuts = log_after
+                    .clone()
+                    .filter(|m| m.1.contains("decrease(full)"))
+                    .count();
+                let to_floor = log_after
+                    .filter(|m| m.1.contains("decrease(full)") && m.3 == Some(m.2))
+                    .count();
+                let settled_ws: Vec<&Win> = ws.iter().filter(|w| w.t_us >= from_us).collect();
+                let on_floor = (
+                    settled_ws
+                        .iter()
+                        .filter(|w| w.relieved_bps == Some(w.target_bps))
+                        .count(),
+                    settled_ws.len(),
+                );
+                let mut targets: Vec<u64> =
+                    settled_ws.iter().map(|w| u64::from(w.target_bps)).collect();
+                let mut floors: Vec<u64> = settled_ws
+                    .iter()
+                    .filter_map(|w| w.relieved_bps.map(u64::from))
+                    .collect();
+                let near_floor = settled_ws
+                    .iter()
+                    .filter(|w| {
+                        w.relieved_bps
+                            .is_some_and(|f| u64::from(w.target_bps) * 8 <= u64::from(f) * 9)
+                    })
+                    .count();
+                let first_frames = r.pumped.frames.iter().take(29).map(|f| f.1).sum();
+                let first_window = ws
+                    .first()
+                    .map_or((0, (0, 0, 0)), |w| (w.encoded.1, w.blocked));
+                let frames = &r.pumped.frames;
+                let beat_bytes = |k: usize| {
+                    frames
+                        .iter()
+                        .skip(30 * k - 31)
+                        .take(30)
+                        .map(|f| f.1)
+                        .sum::<u64>()
+                };
+                let beats = [beat_bytes(2), beat_bytes(3), beat_bytes(4), beat_bytes(5)];
+                let beat_age = |k: usize| {
+                    let w = beat_at(r, k).and_then(|t| window_at(r, t));
+                    (
+                        k as u32,
+                        w.and_then(|w| w.floor),
+                        w.and_then(|w| w.age.map(|a| a.0)),
+                    )
+                };
+                let beat_ages = [
+                    beat_age(2),
+                    beat_age(5),
+                    beat_age(10),
+                    beat_age(20),
+                    beat_age(30),
+                ];
+                let beat_windows: Vec<&Win> = (1..=32)
+                    .filter_map(|k| beat_at(r, k).and_then(|t| window_at(r, t)))
+                    .filter(|w| w.age.is_some())
+                    .collect();
+                let beat_elevated = (
+                    beat_windows.iter().filter(|w| up(w)).count(),
+                    beat_windows.len(),
+                );
+                Gate {
+                    first,
+                    anchored,
+                    refolded,
+                    lapsed,
+                    walk,
+                    crossing,
+                    elevated,
+                    ages: [age_at(9), age_at(29)],
+                    full_cuts,
+                    to_floor,
+                    on_floor,
+                    target_p50: quantile(&mut targets, 50),
+                    floor_p50: quantile(&mut floors, 50),
+                    near_floor,
+                    from_us,
+                    settled: read_from(r, from_us),
+                    first_frames,
+                    first_window,
+                    beats,
+                    beat_ages,
+                    beat_elevated,
+                }
+            }
+
+            /// FR-148 D51 B4f — C6's bar over a stretch, from `from_us` to the
+            /// run's stop: the read, the budget's held passes and its holds,
+            /// the holds the governor read as `decrease(full)`, the windows a
+            /// drain ran in and the passes it paused, the link loop's cuts,
+            /// and the target's moves by their why.
+            #[derive(Debug, Clone)]
+            struct Bar {
+                from_us: u64,
+                read: Read,
+                held: usize,
+                holds: usize,
+                hold_cuts: usize,
+                drains: (usize, usize),
+                link_cuts: usize,
+                moves: BTreeMap<String, u32>,
+                /// FR-148 D51 B4g — per encode: the time gated since the encode
+                /// before it (mean, p95) and the gap charged (mean), µs.
+                gated_us: (u64, u64),
+                charged_us: u64,
+                /// FR-148 — the VP9-444 heartbeat's send wait over the stretch:
+                /// its windows, `send_wait_avg_ms` p50 and p95, and
+                /// `send_wait_max_ms` p50, p95 and the longest, µs.
+                send_wait: (usize, (u64, u64), (u64, u64, u64)),
+            }
+
+            /// The settled stretch's start: the opening reading's confidence
+            /// (`goodput::CONFIDENCE_TTL`) after the motion starts, µs from `t0`.
+            fn settled_from(r: &LoopRun) -> u64 {
+                r.from_us.saturating_sub(us(OPENING)) + us(crate::encode::goodput::CONFIDENCE_TTL)
+            }
+
+            fn bar(r: &LoopRun, from: u64) -> Bar {
+                let p = &r.pumped;
+                let inside = |t: &&u64| **t >= from;
+                let log = p.log.iter().filter(|m| m.0 >= from);
+                let mut moves: BTreeMap<String, u32> = BTreeMap::new();
+                for m in log.clone() {
+                    *moves.entry(m.1.clone()).or_default() += 1;
+                }
+                let encodes: Vec<&(u64, u64, u64)> =
+                    p.charged.iter().filter(|c| c.0 >= from).collect();
+                let n = (encodes.len() as u64).max(1);
+                let mut gated: Vec<u64> = encodes.iter().map(|c| c.1).collect();
+                let waits: Vec<_> = p.send_waits.iter().filter(|w| w.0 >= from).collect();
+                // The heartbeat's two fields, µs: the average in whole µs, 0
+                // with no frame, and the longest.
+                let mut avgs: Vec<u64> = waits
+                    .iter()
+                    .map(|w| w.1.sum_us.checked_div(w.1.frames).unwrap_or(0))
+                    .collect();
+                let mut maxes: Vec<u64> = waits.iter().map(|w| w.1.max_us).collect();
+                Bar {
+                    gated_us: (gated.iter().sum::<u64>() / n, quantile(&mut gated, 95)),
+                    charged_us: encodes.iter().map(|c| c.2).sum::<u64>() / n,
+                    send_wait: (
+                        waits.len(),
+                        (quantile(&mut avgs, 50), quantile(&mut avgs, 95)),
+                        (
+                            quantile(&mut maxes, 50),
+                            quantile(&mut maxes, 95),
+                            maxes.iter().copied().max().unwrap_or(0),
+                        ),
+                    ),
+                    from_us: from,
+                    read: read_from(r, from),
+                    held: p.held_at.iter().filter(inside).count(),
+                    holds: p.hold_began.iter().filter(inside).count(),
+                    hold_cuts: p.hold_cuts.iter().filter(inside).count(),
+                    drains: (
+                        p.windows
+                            .iter()
+                            .filter(|w| w.t_us >= from && w.drain_ms.is_some())
+                            .count(),
+                        p.drained_at.iter().filter(inside).count(),
+                    ),
+                    link_cuts: log.filter(|m| m.1.contains("decrease(link)")).count(),
+                    moves,
+                }
+            }
+
+            fn bar_words(b: &Bar) -> String {
+                let x = &b.read;
+                let ms = |us: u64| format!("{}.{}", us / 1_000, us % 1_000 / 100);
+                format!(
+                    "bar from {} ms: fill {}.{:03} of payload ({} kbit/s), sent fps p50 {} p10 {}, transit \
+                     p95 {} ms, rtt p95 {} ms, held passes {} in {} holds, holds read as decrease(full) {}, \
+                     drain windows {} (passes paused {}), link cuts {}, gated per encode mean {} ms p95 {} ms, \
+                     charged per encode mean {} ms, heartbeat send_wait_avg_ms p50 {} p95 {}, send_wait_max_ms \
+                     p50 {} p95 {} longest {} ({} heartbeats), moves {:?}",
+                    b.from_us / 1_000,
+                    x.of_payload / 1_000,
+                    x.of_payload % 1_000,
+                    kbps(x.rx_bps),
+                    x.sent_each.0,
+                    x.sent_each.1,
+                    x.transit.1,
+                    x.rtt.1,
+                    b.held,
+                    b.holds,
+                    b.hold_cuts,
+                    b.drains.0,
+                    b.drains.1,
+                    b.link_cuts,
+                    ms(b.gated_us.0),
+                    ms(b.gated_us.1),
+                    ms(b.charged_us),
+                    ms(b.send_wait.1.0),
+                    ms(b.send_wait.1.1),
+                    ms(b.send_wait.2.0),
+                    ms(b.send_wait.2.1),
+                    ms(b.send_wait.2.2),
+                    b.send_wait.0,
+                    b.moves,
+                )
+            }
+
+            fn print_bar(r: &LoopRun, label: &str, b: &Bar) {
+                println!("B4c | {} | {} | {}", r.arm.word(), label, bar_words(b));
+            }
+
+            fn print_gate(r: &LoopRun, g: &Gate, off: &Read, bar: &Bar) {
+                let thousandths = |v: u64| format!("{}.{:03}", v / 1_000, v % 1_000);
+                let walk: Vec<String> = g
+                    .walk
+                    .iter()
+                    .map(|(t, s, p)| {
+                        format!("{}s:{}:{}", t / 1_000_000, s, p.map_or(0, |p| p / 1_000))
+                    })
+                    .collect();
+                println!(
+                    "B4c | {} | gate | (a) first reading {:?} anchored {} | opening: first 29 frames {} kB, first \
+                     window {} kB with {:?} blocked (n, bytes, µs) | (b) windows folding another reading after it {}, \
+                     lapsed at {:?} ms | (c) steps down {:?}; crossing {:?}; elevated {} of the first 32, {} of {} \
+                     windows; age floor/avg at window 10 {:?}, at 30 {:?} | (d) from {} ms: decrease(full) {}, of them \
+                     to the relieved floor {}; target on the relieved floor in {} of {} windows, within an eighth of \
+                     it in {}, target p50 {} kbit/s against the floor's {} | fill {} of payload ({} kbit/s), off {} | \
+                     transit p95 {} ms | by heartbeat (30 frames): 2-5 carried {:?} kB, (hb, floor, avg) {:?}, \
+                     elevated {} of {} up to 32 | {}",
+                    r.arm.word(),
+                    g.first,
+                    g.anchored,
+                    g.first_frames / 1_000,
+                    g.first_window.0 / 1_000,
+                    g.first_window.1,
+                    g.refolded,
+                    g.lapsed.map(|t| t / 1_000),
+                    walk,
+                    g.crossing,
+                    g.elevated.0,
+                    g.elevated.1,
+                    g.elevated.2,
+                    g.ages[0],
+                    g.ages[1],
+                    g.from_us / 1_000,
+                    g.full_cuts,
+                    g.to_floor,
+                    g.on_floor.0,
+                    g.on_floor.1,
+                    g.near_floor,
+                    g.target_p50 / 1_000,
+                    g.floor_p50 / 1_000,
+                    thousandths(g.settled.of_payload),
+                    kbps(g.settled.rx_bps),
+                    thousandths(off.of_payload),
+                    g.settled.transit.1,
+                    g.beats.map(|b| b / 1_000),
+                    g.beat_ages,
+                    g.beat_elevated.0,
+                    g.beat_elevated.1,
+                    bar_words(bar),
+                );
+            }
+
+            /// FR-148 D51 C6 — the budget `on` with the pump's own loop, against
+            /// today's law (`off`), on B3T's path with the closed-loop writer:
+            /// `off` for `OFF_RUN`, `on` for `ON_RUN`, past the opening reading's
+            /// confidence. It prints the trail step 1 of B4's gate reads
+            /// ([`gate`]) and B4f's bar ([`bar`]) on the gate line. `on`, over
+            /// the settled stretch after the opening reading's 60 s of
+            /// confidence ([`settled_from`]): the fill is at least 0.90 of the
+            /// payload capacity, the median second sends 24 frames or more, the
+            /// transit's p95 and the round trip's are under 300 ms, and no hold
+            /// reads as `decrease(full)`. `off`, the control: the fill is at
+            /// least 0.95, over a standing queue of more than 500 ms.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, off and on"]
+            async fn budget_on_with_the_pump_loop() {
+                let off = run_loop(Arm::Off, Duration::ZERO, OFF_RUN, CAPTURE).await;
+                let x = read(&off);
+                print_loop(&off, &x);
+                print_bar(&off, "bar", &bar(&off, off.from_us));
+                let on = run_loop(Arm::On, Duration::ZERO, ON_RUN, CAPTURE).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                print_bar(&on, "bar, the whole run", &bar(&on, 0));
+                let settled = bar(&on, settled_from(&on));
+                let g = gate(&on);
+                print_gate(&on, &g, &x, &settled);
+                assert!(x.of_payload >= 950, "off: fill {x:?}");
+                assert!(x.least_ms > STANDING_MS, "off: no standing queue {x:?}");
+                let s = &settled.read;
+                assert!(s.of_payload >= 900, "on: fill {settled:?}");
+                assert!(s.sent_each.0 >= 24, "on: sent fps {settled:?}");
+                assert!(
+                    s.transit.1 < 300 && s.rtt.1 < 300,
+                    "on: transit and rtt {settled:?}"
+                );
+                assert_eq!(
+                    settled.hold_cuts, 0,
+                    "on: a hold read as decrease(full) {settled:?}"
+                );
+            }
+
+            /// FR-148 D51 B4g (C6s) — the closed loop under `on` with a capture
+            /// slower than the pump's target: 20 fps on its 30 (`SLOW_CAPTURE`),
+            /// with no FR-112 pacing, for `ON_RUN`. Over the settled stretch
+            /// ([`settled_from`]): the fill is at least 0.90 of the payload, the
+            /// median second sends 18 frames or more, and the transit's p95 and
+            /// the round trip's are under 300 ms. B4f charged each 50 ms frame
+            /// the 33 ms interval, and the fill fell to 0.76 of the payload.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path, a slow capture under on"]
+            async fn budget_on_with_a_slow_capture() {
+                let on = run_loop(Arm::On, Duration::ZERO, ON_RUN, SLOW_CAPTURE).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                print_bar(&on, "slow capture, bar, the whole run", &bar(&on, 0));
+                let settled = bar(&on, settled_from(&on));
+                print_bar(&on, "slow capture, bar", &settled);
+                let s = &settled.read;
+                assert!(s.of_payload >= 900, "on: fill {settled:?}");
+                assert!(s.sent_each.0 >= 18, "on: sent fps {settled:?}");
+                assert!(
+                    s.transit.1 < 300 && s.rtt.1 < 300,
+                    "on: transit and rtt {settled:?}"
+                );
+            }
+
+            /// FR-148 D51 — the same two arms after 10 s of a still screen, so
+            /// the age loop's floor and the viewer's clock probe learn an empty
+            /// queue before anything moves. A probe of the swing's start: it
+            /// prints, and asserts only that the run read.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the pump's own loop on B3T's path after a still opening"]
+            async fn budget_on_after_a_still_opening() {
+                const STILL: Duration = Duration::from_secs(10);
+                let off = run_loop(Arm::Off, STILL, RUN, CAPTURE).await;
+                let x = read(&off);
+                print_loop(&off, &x);
+                let on = run_loop(Arm::On, STILL, RUN, CAPTURE).await;
+                let y = read(&on);
+                print_loop(&on, &y);
+                assert!(
+                    x.divided.1 > 0 && y.divided.1 > 0,
+                    "no windows: {x:?} {y:?}"
+                );
+            }
         }
     }
 }

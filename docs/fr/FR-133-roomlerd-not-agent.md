@@ -34,7 +34,7 @@ approximate, wire/identity names excluded):
 | the docs site | `ui/docs/content` | ~237 lines |
 
 FR-46 already classified the MSI's display identity as "renaming breaks upgrade detection — its
-own program" (`docs/fr/FR-46-eradicate-the-retired-agent-name.md:276`). Measured on master:
+own program" (`docs/fr/FR-46-eradicate-the-retired-agent-name.md:383`). Measured on master:
 Windows Installer matches an upgrade by its UpgradeCode, and `install_detect` keys on the
 UpgradeCode's registry presence, so neither reads the ProductName. What does read it is
 `scripts/install.ps1`: the post-install check (`:279`) and `-Uninstall` (`:453`) find the product by

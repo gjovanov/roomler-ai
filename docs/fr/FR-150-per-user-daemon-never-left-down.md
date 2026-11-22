@@ -1,6 +1,6 @@
 # FR-150: A per-user daemon is never left down by its own update or by a crash
 
-**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a merged (#4135), its cells read on candidates the same day; P1b merged (#4159), its cells read on candidates the same day; P2 in review (#4199), its cells to come on candidates
+**Issue:** [#4128](https://github.com/gjovanov/roomler-ai/issues/4128) · **Status:** claimed 2026-11-20; P0 read on a lab guest the same day; P1a merged (#4135, `e4160fa1c`), its cells read on candidates the same day; P1b merged (#4159, `29214ffc4`), its cells read on candidates the same day; P2 merged (#4199, `3cad49ba3`), its cells to come on candidates
 **Absorbs:** [#3507](https://github.com/gjovanov/roomler-ai/issues/3507) (the update path) and [#3295](https://github.com/gjovanov/roomler-ai/issues/3295) (the crash path), with the 2026-11-08 triage's re-spec of both
 **Builds on:** #3292 and #3296 (the launcher `roomlerdw.exe` and the one-shot time triggers), #3801 and #3852 (each account's own task, `Roomler-<SID>`), #3230 (the per-Machine MSI's steps write a record), #3289 and #3323 (a Windows crash loop raises `rollback_failed` and stays up), #3302 and #3345 (the install record), [FR-67](FR-67-update-outcome-observability.md) (#1267, the install verdict)
 **Related:** #3535 (two daemons on one host: closed as not planned, out of scope), #3509, #3340
@@ -293,7 +293,7 @@ Before P2, `roomlerdw.exe` waited for the daemon once and left with its code. P2
 - **An install in flight.** The launcher must not touch the data tree (`.claude/rules/installers.md`), so the daemon
   decides. A `run --supervisor task` that starts while the update-attempt marker is fresh (`updater.rs:230-256`; the
   MSI's `service stop --for-upgrade` touches it too) and Windows Installer's execution mutex, `Global\_MSIExecute`, is
-  held exits 75 before it takes the lock (`app.rs:3955-3956`, `daemon_error.rs:244-298`). Its stderr goes to the
+  held exits 75 before it takes the lock (`app.rs:3956-3957`, `daemon_error.rs:244-298`). Its stderr goes to the
   person's log under the task (`app.rs:1652-1657`), so the log says why. Neither sign alone is enough: the marker stays
   fresh for ten minutes after an install that has ended, and any install on the machine holds the mutex. No other code
   in the tree is 75, and no Windows status is
@@ -406,11 +406,11 @@ it (C5c).
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
 | P0 | C1–C6 on a lab guest, read before P1a is built | read only | **read** on 2026-11-20, with C1b–C6d and the standard account's C3c (field log) |
-| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | merged (#4135); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
-| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | merged (#4159); C11 and C12 GREEN on candidates (field log) |
-| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | in review (#4199), after P1a; its cells to come on candidates built from P1b and P2 (C14b needs both) |
+| P1a | the task's own descriptor, its repair and `Roomler start-<SID>`; the per-user steps' record; the start WARN and `service status`; their tests | `ROOMLERD_TASK_SD=0` | merged (#4135, `e4160fa1c`); C7 RED on the release; C7, C7b, C8, C9 and C10 GREEN on candidates, C7 and C8 on its head's A3 and B3 (field log) |
+| P1b | the watcher's relaunch ladder; the record's `daemon` field; their tests | `ROOMLERD_WATCHER_RELAUNCH=0` | merged (#4159, `29214ffc4`); C11 and C12 GREEN on candidates (field log) |
+| P2 | the launcher's loop and its ends; exit 78 for the task's `run` with no config; the install-in-flight end; their tests | `ROOMLERDW_SUPERVISE=0` | merged (#4199, `3cad49ba3`); its cells to come on candidates built from P1b and P2 (C14b needs both) |
 | Field | each phase's cells on its candidates, then C19 on the release | read only | P1a's and P1b's cells read on candidates (field log); P2's cells and C19 to come |
-| Docs | each phase's docs in its own pull request | none | P1a's merged in #4135 and P1b's in #4159; P2's in review in #4199 |
+| Docs | each phase's docs in its own pull request | none | P1a's merged in #4135, P1b's in #4159 and P2's in #4199 |
 
 - **P1a leaves working by itself**: no new task is registered that its account cannot replace, a self-update over
   one that was still brings the daemon back, a registration that is refused says so in the person's log, and an
@@ -461,8 +461,17 @@ The docs:
 - [ ] **AC7** (#3295 RED then GREEN, P2): C13 fails on the current release and passes on the candidate: a per-user
   daemon that crashes is back online within a minute, with no window and no sign-in.
 - [ ] **AC8** (P2): C14–C18 and C14b pass, and a real crash loop still ends in #3289's handling.
-- [ ] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
-  shown failing on master first.
+- [x] **AC9** (tests): the tests above pass in CI on the lanes that build them, and those over master's behaviour are
+  shown failing on master first. Green on each phase's final head: #4135 at `409c6e839`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44900865689)), #4159 at `ea2636212`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44909372642)) and #4199 at `9bf2719c3`
+  ([run](https://github.com/gjovanov/roomler-ai/actions/runs/44914023040)). The tests over master's code failed with
+  master's lines put back: P1a's three, `the_task_names_its_own_descriptor`,
+  `a_refused_replace_leaves_a_start_of_the_accounts_own` and `an_elevated_install_registers_a_locked_task_again`, at
+  `dba74677c` on master ([#4135's comment](https://github.com/gjovanov/roomler-ai/pull/4135#issuecomment-7067926396)),
+  and P2's three ([#4199's comment](https://github.com/gjovanov/roomler-ai/pull/4199#issuecomment-7055246347)). P1a's
+  other tests pin master's own behaviour (the switch, the fake's model of #3507) or run over the code P1a adds, and
+  P1b's run over the code P1b adds: the relaunch ladder over its seam, and the record's new field.
 - [ ] **AC10** (the update path stays whole): C19 passes.
 - [ ] **AC11** — Docs updated in house style (tables, the watcher's ladder as a mermaid flow, `file:line` anchors):
   the sections above in `docs/installation.md`, the rule and the module docs, linked from `docs/README.md`.
@@ -529,3 +538,4 @@ recommendation is now the decision.
 | 2026-11-20 | C7b and C9 on A3: 0.4.228 installed per-user from an elevated prompt, then self-updated to A3 | as on A: A3's `service install` was refused, logged `installer step failed` with the task and the repair, and registered `Roomler start-<SID>`, whose first one-shot started the daemon 61 s after the old one stopped. The start WARN and `service status`'s `Note:` named the elevated owner and the repair, and the row came online on A3 |
 | 2026-11-20 | Before C8a: A3 removed from a normal prompt over the task 0.4.228 had registered elevated | its `service uninstall` failed with `Access is denied`, logged as `ERROR installer step failed: roomlerd service uninstall exit_code=1 … schtasks /Delete failed`, and the task stayed behind until an elevated delete. A known limit, not a cell failure (Lab cells) |
 | 2026-11-20 | C8 GREEN on A3 and B3, from an administrator's filtered token (C8a) and from a standard account signed in at the console (C8b, a local user in Users only, its token at medium): 0.4.227 installed per-user, then self-updated to the released 0.4.228 (the control), to A3 and to B3 | every hop was back at the new version's first one-shot, 60 s after its install, the release's too. On the hops to A3 and to B3, `service stop --for-upgrade` and `service install` exited 0 with no ERROR, while the release's own MSI log still reads `StopOldDaemon returned actual error code 1 but will be translated to success`. Each task stayed the account's own, `Limited`, with full access for it, `service status` read `Auto-start: installed`, and both rows came online on B3. C8b's 0.4.227 was installed before its enrollment, so its task had no one-shots (they are added only for an enrolled account), and its daemon first ran at the hop's `service start` |
+| 2026-11-21 | AC9's P1a RED, natively on Windows at `dba74677c` on master, with master's lines put back in `definitions` (the task as `render_task_xml` renders it) and in `user_task::register` (one `create`, with no repair and no start task) | 3 of the 12 roomlerd tests of #4135's table failed: `the_task_names_its_own_descriptor` (`left: 0, right: 1`), `a_refused_replace_leaves_a_start_of_the_accounts_own` (the refusal reads `Access is denied` and nothing more) and `an_elevated_install_registers_a_locked_task_again` (one `create`, and the locked task never deleted and registered again). The other nine passed, as tests of master's own behaviour or of code P1a adds. Restored, all 12 pass ([#4135's comment](https://github.com/gjovanov/roomler-ai/pull/4135#issuecomment-7067926396)) |

@@ -295,9 +295,24 @@ pub async fn read_here(
     if !features.one_row_offered(os) {
         return Err(Closed::NotOffered);
     }
-    let root_config = !ours && crate::unix_daemon::system_config_path().is_file();
+    let root_config = !ours && root_config_seen(&crate::unix_daemon::system_config_path());
     decide_here(os, true, root_config, person_config_here())?;
     decide_release(&release_for(server).await)
+}
+
+/// R1's read of root's config at `path`: whether it counts as there.
+///
+/// FR-141 P2's follow-up (F5) — only "no such file" reads as absent. Any
+/// other answer (a folder this person may not search, a path through a file,
+/// an I/O error) is a Mac R1 cannot tell about, so it counts as enrolled and
+/// closes the form, as R3 reads a person's config it cannot read
+/// ([`PersonConfig::Unreadable`]). `is_file()` read every error as "not
+/// enrolled", and the one token was then spent on a Mac that may be enrolled.
+pub fn root_config_seen(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Read the form for one page or command: on this host, for `server`, asked
@@ -521,6 +536,27 @@ mod tests {
 
         std::fs::write(before.join("config.toml"), "not = [toml").unwrap();
         assert_eq!(person_config_in(home.path()), PersonConfig::Unreadable);
+    }
+
+    /// FR-141 P2's follow-up (F5) — R1 counts root's config as absent only
+    /// when there is no such file. Any other answer is a Mac it cannot tell
+    /// about, which closes the form, as R3 reads a person's config it cannot
+    /// read: before, a folder this person may not search read as "not
+    /// enrolled", and the token was spent on an enrolled Mac. Unix only: the
+    /// error below is the one a Mac gives (a path through a file, ENOTDIR,
+    /// which root gets too), and Windows gives "not found" for it.
+    #[cfg(unix)]
+    #[test]
+    fn r1_reads_an_error_as_enrolled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        assert!(!root_config_seen(&config), "no such file: absent");
+        std::fs::write(&config, "agent_id = \"root\"\n").unwrap();
+        assert!(root_config_seen(&config), "there");
+        let through_a_file = config.join("config.toml");
+        let err = std::fs::metadata(&through_a_file).expect_err("not a folder");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(root_config_seen(&through_a_file), "an error: enrolled");
     }
 
     /// The release is the first in the server's order with the macOS package,

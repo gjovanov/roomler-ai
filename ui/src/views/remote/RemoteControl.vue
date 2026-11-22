@@ -2501,6 +2501,9 @@
       <div v-if="dirError" class="pa-3 text-error text-caption">
         {{ dirError }}
       </div>
+      <div v-else-if="dirCapped" class="pa-3 text-caption text-medium-emphasis" data-testid="files-capped">
+        {{ dirEntries.length.toLocaleString() }} of this folder's entries are shown; it holds more.
+      </div>
       <v-progress-linear v-if="dirLoading" indeterminate />
       <v-list density="compact" class="pa-0">
         <v-list-item
@@ -2609,6 +2612,7 @@ import {
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import { offersBreakGlass } from '@/composables/breakGlass'
+import { createLatest } from '@/composables/remoteDirListing'
 import {
   PICKER_CHROMAS,
   PICKER_CODECS,
@@ -3310,6 +3314,8 @@ async function copyAgentLog() {
 const filesDrawer = ref(false)
 const dirLoading = ref(false)
 const dirError = ref<string | null>(null)
+// The folder held more entries than the agent lists (#4121).
+const dirCapped = ref(false)
 const dirEntries = ref<{ name: string; is_dir: boolean; size: number | null; mtime_unix: number | null }[]>([])
 const currentDirPath = ref('')
 const currentParent = ref<string | null>(null)
@@ -3326,8 +3332,11 @@ const isRootsView = ref(false)
 const dirPathInput = ref('')
 const selectedDirEntries = ref<Set<string>>(new Set())
 let lastSelectedDirIndex: number | null = null
+// Which navigation's answer may still change the drawer (#4121).
+const dirNavigations = createLatest()
 
 async function navigateTo(path: string) {
+  const isCurrent = dirNavigations.begin()
   dirLoading.value = true
   dirError.value = null
   selectedDirEntries.value = new Set()
@@ -3338,16 +3347,20 @@ async function navigateTo(path: string) {
   const requestingRoots = isRootsRequest(path)
   try {
     const listing = await rc.listDir(path)
+    if (!isCurrent()) return
     currentDirPath.value = listing.path
     currentParent.value = listing.parent
     isRootsView.value = requestingRoots
     dirPathInput.value = listing.path
     dirEntries.value = listing.entries
+    dirCapped.value = listing.capped === true
   } catch (e) {
+    if (!isCurrent()) return
     dirError.value = (e as Error).message
     dirEntries.value = []
+    dirCapped.value = false
   } finally {
-    dirLoading.value = false
+    if (isCurrent()) dirLoading.value = false
   }
 }
 
