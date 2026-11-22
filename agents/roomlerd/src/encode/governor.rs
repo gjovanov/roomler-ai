@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use super::aimd::{AimdController, Cause, Causes, CeilingSource, Congestion, FloorSource};
 use super::encode_pressure::{DownscaleTier, EncodePressure};
 use super::goodput::{GoodputEstimator, GoodputSink};
-use super::pipe::{Basis, PathNumber, PathView};
+use super::pipe::{Basis, MeasuredBy, PathNumber, PathView};
 use super::viewer_rate::{self, ViewerRateController};
 
 /// A bitrate target the pump must apply to the live encoder
@@ -2321,6 +2321,7 @@ impl RateGovernor {
         };
         let prior = self.prior_tagged().map(number);
         let model = self.belief.model();
+        let measured = self.measured_tagged(now, tags.constrained);
         PathView {
             goodput: self.goodput_tagged(now).map(number),
             belief: (
@@ -2328,7 +2329,8 @@ impl RateGovernor {
                 self.belief.floor_number(now),
                 self.belief.capacity_number(now),
             ),
-            measured: self.measured_tagged(now, tags.constrained).map(number),
+            measured: measured.map(|(bps, tag, _)| number((bps, tag))),
+            measured_by: measured.map(|(_, _, by)| by),
             prior,
             learned_ceiling: Some(number((self.learner.learned_bps(), tags.learned.1))),
             slow_link_floor: self
@@ -2419,13 +2421,13 @@ impl RateGovernor {
             .map_or(0, |r| r.envelope_ms)
     }
 
-    /// FR-148 D51 B4f — the most time the pump charges its next encode
-    /// (`encode::charge`): while the budget acts, the interval it chose for
-    /// that frame, its capture interval at the rate it runs at (FR-112's
-    /// paced rate while in force, else `target_fps`) times the skip divisor.
-    /// `None` while the budget does not act: the pts is today's.
+    /// FR-148 D51 B4f, B4g — the interval the pump chose for its next encode,
+    /// the least it is charged where it waited at the gate (`encode::charge`):
+    /// while the budget acts, its capture interval at the rate it runs at
+    /// (FR-112's paced rate while in force, else `target_fps`) times the skip
+    /// divisor. `None` while the budget does not act: the pts is today's.
     #[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
-    pub fn charge_most(&self, target_fps: u32) -> Option<Duration> {
+    pub fn charge_interval(&self, target_fps: u32) -> Option<Duration> {
         if !self.budget_acts() {
             return None;
         }
@@ -2468,18 +2470,27 @@ impl RateGovernor {
 
     /// [`Self::measured_bps`], tagged: the sender's tag ([`Self::sent_tagged`])
     /// or the held arrival rate's, whichever reading it is (the sender's on a
-    /// tie).
-    fn measured_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag)> {
+    /// tie). FR-148 D51 B4g — with its source: the sender's is the goodput's,
+    /// or the budget's held rate while the budget acts, under the same basis.
+    fn measured_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag, MeasuredBy)> {
         if !constrained {
             return None;
         }
         let link = match self.link_rx_bps {
-            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => {
-                Some((rx, Tag::measured(self.path.link_rx, at)))
-            }
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some((
+                rx,
+                Tag::measured(self.path.link_rx, at),
+                MeasuredBy::Arrival,
+            )),
             _ => None,
         };
-        match (self.sent_tagged(now), link) {
+        let sender = if self.budget_acts() {
+            MeasuredBy::Budget
+        } else {
+            MeasuredBy::Goodput
+        };
+        let sent = self.sent_tagged(now).map(|(bps, tag)| (bps, tag, sender));
+        match (sent, link) {
             (Some(g), Some(l)) => Some(if g.0 <= l.0 { g } else { l }),
             (g, l) => g.or(l),
         }
@@ -2491,6 +2502,7 @@ impl RateGovernor {
             return None;
         }
         self.measured_tagged(now, constrained)
+            .map(|(bps, tag, _)| (bps, tag))
             .or_else(|| self.prior_tagged())
     }
 
@@ -8187,9 +8199,9 @@ mod tests {
     fn under_on_the_charge_is_the_pumps_interval_times_the_divisor() {
         let t0 = Instant::now();
         let mut g = gov(t0);
-        assert_eq!(g.charge_most(30), None, "no step yet");
+        assert_eq!(g.charge_interval(30), None, "no step yet");
         g.note_path_rate(acting(1_500_000, true, 200));
-        assert_eq!(g.charge_most(30), Some(Duration::from_micros(33_333)));
+        assert_eq!(g.charge_interval(30), Some(Duration::from_micros(33_333)));
         let w = g
             .tick_viewer_window(
                 t0 + Duration::from_secs(2),
@@ -8204,7 +8216,7 @@ mod tests {
             .expect("window due");
         assert_eq!(w.skip_divisor, 3);
         assert_eq!(
-            g.charge_most(30),
+            g.charge_interval(30),
             Some(Duration::from_micros(3 * 33_333)),
             "the divisor"
         );
@@ -8212,12 +8224,12 @@ mod tests {
             acts: false,
             ..acting(1_500_000, true, 200)
         });
-        assert_eq!(g.charge_most(30), None, "not acting");
+        assert_eq!(g.charge_interval(30), None, "not acting");
         let mut g = gov(t0);
         g.note_path_rate(acting(1_500_000, true, 200));
         assert_eq!(g.pace_software(25.0, 60), Some(40));
         assert_eq!(
-            g.charge_most(60),
+            g.charge_interval(60),
             Some(Duration::from_micros(25_000)),
             "the paced rate"
         );
@@ -8312,7 +8324,69 @@ mod tests {
             // FR-148 D51 B4f (C9): and the pump charges each encode today's
             // pts (`encode::charge`), whatever the divisor and the rate.
             let fps = 15 + (r % 46) as u32;
-            assert_eq!(a.charge_most(fps), None, "charge, event {i}");
+            assert_eq!(a.charge_interval(fps), None, "charge, event {i}");
         }
+    }
+
+    /// FR-148 D51 B4g (C15) — the measured reading names its source. With no
+    /// reading, none. With the budget not acting, the blocked-send goodput.
+    /// Under `on`, the budget acting and holding, its held rate: its basis is
+    /// the goodput's (`backlogged`), so only the source tells them apart. The
+    /// held arrival rate where it is the lower, the budget's again where it
+    /// is not; and none while the budget acts without holding, the goodput
+    /// not read in its place.
+    #[test]
+    fn the_measured_reading_names_its_source() {
+        use crate::encode::pipe::PathRate;
+        let start = Instant::now();
+        let t1 = start + Duration::from_secs(2);
+        let source = |g: &RateGovernor| {
+            let v = g.path_view(t1, None);
+            (v.measured.map(|n| (n.bps, n.word())), v.measured_by)
+        };
+        let mut g = gov(start);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        assert_eq!(source(&g), (None, None), "no reading");
+        // A relayed keyframe blocked: the goodput folds.
+        let mut g = gov(start);
+        g.goodput_sink()
+            .record_frame(625_000, Duration::from_millis(900), true);
+        g.note_window_sender(t2_sender(2));
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        let goodput = g.blocked_send_bps(t1).expect("the goodput folded");
+        g.note_path_rate(PathRate {
+            acts: false,
+            ..acting(1_400_000, true, 200)
+        });
+        let backlogged = |bps: u32| Some((bps, "backlogged"));
+        assert_eq!(
+            source(&g),
+            (backlogged(goodput), Some(MeasuredBy::Goodput)),
+            "the budget does not act"
+        );
+        g.note_path_rate(acting(1_400_000, true, 200));
+        assert_eq!(
+            source(&g),
+            (backlogged(1_400_000), Some(MeasuredBy::Budget)),
+            "the budget acts and held"
+        );
+        g.link_rx_bps = Some((1_000_000, t1));
+        g.path.link_rx = Basis::AppLimited;
+        assert_eq!(
+            source(&g),
+            (Some((1_000_000, "app-limited")), Some(MeasuredBy::Arrival)),
+            "the arrival rate is the lower"
+        );
+        g.link_rx_bps = Some((2_000_000, t1));
+        assert_eq!(
+            source(&g),
+            (backlogged(1_400_000), Some(MeasuredBy::Budget)),
+            "the arrival rate is not"
+        );
+        g.link_rx_bps = None;
+        g.note_path_rate(acting(1_400_000, false, 200));
+        assert_eq!(source(&g), (None, None), "the budget acts, no hold");
     }
 }
