@@ -80,12 +80,12 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
    stays up (`encoder.rs:3395` `convert_pool`) — byte-identical output (even-row
    cuts, chroma pairs never straddle a band boundary). Band count is
    `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2317`
-   `convert_bands`, `:2325` `band_cuts`; `mod.rs:660` `par_convert_enabled`).
+   `convert_bands`, `:2325` `band_cuts`; `mod.rs:665` `par_convert_enabled`).
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
    session and the pump awaits the packets (`thread.rs:392` `encode`, called at
-   `peer.rs:9666`). `block_in_place` remains the inline path, `media_thread = false`.
+   `peer.rs:9677`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -104,10 +104,10 @@ paced       = Some(quantized)  if quantized + 5 ≤ target_fps   // engage ≥5 
 
 floored at `FPS_PACE_MIN = 15` (`encode_pressure.rs:139` — below that the cure is
 a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
-masked at 1.0 (`governor.rs:2099`): the pixels-bound HW encode time never
+masked at 1.0 (`governor.rs:2173`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
-reads `governor.paced_fps()` each loop (`governor.rs:2111`; consumed at
-`peer.rs:8216`, logged at `:10076`). FR-112 gave a software encoder a pace of its
+reads `governor.paced_fps()` each loop (`governor.rs:2185`; consumed at
+`peer.rs:8227`, logged at `:10087`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives

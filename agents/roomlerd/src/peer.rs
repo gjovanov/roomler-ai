@@ -4028,6 +4028,8 @@ async fn media_pump_vp9_444_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // FR-148 D51 B4f — the charge bound last handed to `encoder` (`None` when new).
+    let mut charged_most: Option<Duration> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -4514,7 +4516,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
+            if let Some(applied) = delivery.on_skip(false, |s| governor.on_gate_skip(s))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -4813,6 +4815,7 @@ async fn media_pump_vp9_444_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
+                    charged_most = None;
                     // Badge-truth — record the ACTUAL chroma for the
                     // `rc:video-info` retry block and (re)announce it.
                     chroma_wire = chroma.as_str();
@@ -5028,6 +5031,14 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
+        // FR-148 D51 B4f — where the budget acts, libvpx is charged at most the
+        // pump's interval for this frame (`RateGovernor::charge_most`): a wait
+        // past it is not granted. Elsewhere `None`, and the pts is today's.
+        let charge_most = governor.charge_most(target_fps);
+        if charge_most != charged_most {
+            enc.with(move |e| e.set_charge_most(charge_most)).await;
+            charged_most = charge_most;
+        }
         let encode_start = std::time::Instant::now();
         let packets = match enc.encode(&frame).await {
             Ok(p) => p,
@@ -8165,10 +8176,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            // FR-148 D46 B3, D51 B4a-1 — nor, under `on`, is the budget's own hold.
             let in_grace = constrained && !opener_grace_done;
             grace_bp_skips += u32::from(in_grace);
-            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
+            let bp_applied = delivery.on_skip(in_grace, |s| governor.on_gate_skip(s));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
