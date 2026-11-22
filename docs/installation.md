@@ -163,7 +163,7 @@ panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
 in a person's words (`label_existing`, `orchestrator_agent.rs:1883`,
-`orchestrator_unix.rs:1388`; `orchestrator_tunnel.rs:412`), for example
+`orchestrator_unix.rs:1577`; `orchestrator_tunnel.rs:412`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4023`, `crates/agent-core/src/config.rs:4515`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4024`, `crates/agent-core/src/config.rs:4522`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,17 +576,17 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3585`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3651`, `:3659`), and the load fails. Each line is worded for what happened to the live file (below) |
-| `config::read_if_present` (`:3690`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3588`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3658`, `:3666`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`:3697`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
-A start never restores a missing file, because `run` checks for the file before it loads it. With
-no `config.toml`, an enrolled device's start stops with *"no config found"*
-(`agents/roomlerd/src/app.rs:3949-3954`) before the load (`:4017`); its service manager starts it
-again, and it stops again. An unenrolled one-row Mac's screen worker passes that check and writes
-the person a new file with no enrollment instead (`:3969-3981`). Only a process that loads the
-configuration once the file is gone restores it: a command such as `roomlerd org ls`, or a daemon
-or worker that was already running, the next time it loads the file. Whether a start should
-restore one is the open #4157.
+A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
+loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
+line and without its run marks, so the next start counts no crash (`agents/roomlerd/src/app/config_at_start.rs:39`,
+`agents/roomlerd/src/app.rs:3949-3955`). With no copy, or one that does not load or holds no enrollment, it stops with
+*"no config found"* before the lock, as before. An unenrolled one-row Mac's screen worker never restores at its start: it writes the
+person a new file with no enrollment (`agents/roomlerd/src/app.rs:4005-4017`). Nor does the macOS supervisor's enrolled worker
+(`run --supervised` without `--unenrolled`): it ends as before, with exit 78, because a converted one-row Mac's person `config.toml.prev` can still hold the enrollment that moved to root (#4184).
+So removing `config.toml` alone does not make a device forget its enrollment: remove `config.toml.prev` too. A Windows SystemContext install with its machine config missing still waits (#4176).
 
 ```mermaid
 flowchart TD
@@ -597,8 +597,8 @@ flowchart TD
     T -->|"yes"| OK["the config"]
     T -->|"no"| V{"config.toml.prev parses?"}
     V -->|"yes"| W{"was the live file there?<br/>(the read's own error)"}
-    W -->|"no — NotFound"| RM["promoted to live<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
-    W -->|"yes"| R["promoted to live<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
+    W -->|"no — NotFound"| RM["promoted to live, run marks cleared<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
+    W -->|"yes"| R["promoted to live, run marks cleared<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
     V -->|"no"| X{"was the live file there?<br/>(the read's own error)"}
     X -->|"no — NotFound"| EM["the load fails<br/>ERROR 'config missing … must be enrolled (again)'<br/>— believe it"]
     X -->|"yes"| E["the load fails<br/>ERROR 'config unreadable … must be re-enrolled'<br/>— believe it"]
@@ -609,10 +609,10 @@ host now runs on an older config, and that must never look like a normal boot.
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3619` |
-| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3627` |
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3622` |
+| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3630` |
 
-"Not there" is read off the read's own error (`not_found`, `:3859`), never off an `exists()`
+"Not there" is read off the read's own error (`not_found`, `:3863`), never off an `exists()`
 that could race the read, and a parse error is never read as missing. Before #4058 a live file
 that a person or a test had removed took the second line, which named a truncation that never
 happened.
@@ -625,8 +625,8 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3651` |
-| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3659` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3658` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3666` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
 enrolled where `roomlerd org ls` ran, was told its config was unreadable.
@@ -652,9 +652,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
-(`record_clean_run_at`, `:2570`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4467`). Each save
+`crates/agent-core/src/config.rs:2623`, `:2645`), at the clean-run promotion
+(`record_clean_run_at`, `:2632`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4474`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -666,7 +666,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4287`):
+ignores (`serialise_for`, `:4291`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -692,14 +692,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:4093`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4097`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2882`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:4161`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:4145`), never one read off the entry on disk. A newer build's
+`:4165`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4149`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -720,11 +720,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4239`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4243`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4433`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4437`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -902,7 +902,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4802`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4809`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -2207,7 +2207,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2100-2179`):
+exit code (`scripts/install.sh:2113-2192`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -2263,7 +2263,7 @@ flowchart TD
 
 | Rule | Where | Why |
 |---|---|---|
-| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2266` | the shell has read every byte before the first command runs |
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2279` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
 | The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
 | Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
@@ -2332,7 +2332,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1570`), and the wizard's root half is the same code:
+`scripts/install.sh:1583`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -2364,7 +2364,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1304`, #2472).
+(`scripts/install.sh:1317`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -2733,6 +2733,27 @@ socket, `/var/run/roomler/roomler.sock`, the root daemon's own, with the same
 root-only connect, the same bound and the same reading. A person with no person
 socket asks nothing; it never falls back to the system socket.
 
+**The two-row half never folds into a one-row root config.** The guard believes only a
+root daemon that answers, so three Macs read as unknown to it: a one-row attempt the
+wizard left half-placed (its package run failed, then the window was closed), a one-row
+Mac removed with `--uninstall --keep-config`, and a live one-row Mac whose daemon did not
+answer within the 3 s. B2's two-row install used to run over each: its marker and package
+run started root as the Mac's one row and removed the per-user LaunchAgent the second row
+needs, its fold kept both switches, and the Done page said two devices. Now the two-row
+half (`--privileged-steps --config-from`) reads root's config as root before its marker
+and its package run, and when both switches are on it stops with nothing changed, naming
+the two roads (`scripts/install.sh:898-909`):
+
+| To | Run in Terminal |
+|---|---|
+| finish the Mac as one row | `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --role daemon --one-row`: with no token it installs the package only, and the package's guard starts root's service |
+| remove it | `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --uninstall` ([Uninstall](#uninstall-every-platform)), then start Setup again |
+
+The wizard says a Retry will not help, keeps nothing, and names the `<name>-daemon` device
+the enrollment before the steps made, to delete if it stays offline once the Mac is
+finished or removed. The terminal's two-row install (`--daemon-token`) and the wizard's
+screen-only install do not have this check yet (FR-141's open notes).
+
 **One device from the wizard (FR-141 P2, behind a switch).** With the server's
 `wizard_macos_one_row` on (`ROOMLER__SETUP__WIZARD_MACOS_ONE_ROW`, default off; the
 wizard reads only a JSON `true` as on), the daemon card with "Join the overlay network"
@@ -2758,9 +2779,15 @@ folders as the person and stops, with nothing enrolled, if one is not theirs to 
 runs `install.sh --privileged-steps --one-row --config-from FILE`. That places root's
 config before the one package run, whose guard removes the LaunchAgent and starts root's
 service (`install_macos_one_row_half`). No person's enrollment and no user half run, so
-nothing starts a LaunchAgent beside the worker (#4092). A cancel or a failure after the
-enroll keeps the config for Retry, which never posts the token twice. Unticked, the card
-installs the per-user half alone, as before.
+nothing starts a LaunchAgent beside the worker (#4092). The token is spent at that enroll,
+before the dialog. A cancel at the dialog, or a failure of the steps it runs, keeps the
+enrollment for a Retry in the same window, which never posts the token twice, and the page
+says so: closing the window drops it, and the next install needs a new token. A Cancel
+while the steps run cannot stop them, and they are the whole install, so the run ends as
+done, with a warning that says so. When the half refuses (root's config is another
+enrollment's one row, or a row of its own), it changes nothing and nothing is kept: the
+page says a Retry will not help, names the device that enrollment made, to delete, and
+gives the road. Unticked, the card installs the per-user half alone, as before.
 
 Closed, the ticked box makes B2's two rows, as before. While the switch is on, the page
 says why under the card:
@@ -2895,6 +2922,17 @@ The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11
 ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
 and the default flips only on the operator's word. It doesn't give one row alone: the
 switch leaves a person's enrollment in their file, so their row stays.
+
+On a supervised Mac with a person signed in, the package's lines in `/var/log/install.log`
+say the way back. On two rows that is the per-user LaunchAgent: set
+`macos_supervise_gui_worker` false and run the installer again. A one-row Mac holds no
+per-user enrollment, so there that road would leave nothing serving the screen, and the
+package names the real way out instead (FR-141 P2's follow-up,
+`agents/roomlerd/packaging/macos/postinstall:412-432`):
+`sudo roomlerd one-row --revert` on a Mac that command made one row (its copy
+`/etc/roomler/config.toml.pre-one-row` is there), and otherwise the uninstall,
+`curl -fsSL <server>/api/setup/install.sh | sh -s -- --uninstall`, with the server from
+root's config when it is a plain URL and `<your server>` when it is not.
 
 **The migration (FR-43 P3c).** `sudo roomlerd one-row` makes a two-row Mac one row. It
 says its plan first and asks: `--dry-run` stops after the plan, and `--yes` goes ahead
@@ -3164,17 +3202,17 @@ login items in `~/Library/LaunchAgents`, is made, written and removed by that
 person's own account, so the system applies that account's rights and nothing
 more. With nobody signed in at the console, the three rows that act for the
 console user are skipped and every root row runs as on any install
-(`agents/roomlerd/packaging/macos/postinstall:532-543`, #3783; see
+(`agents/roomlerd/packaging/macos/postinstall:576-587`, #3783; see
 [an update with nobody signed in](#macos-an-update-with-nobody-signed-in-3783)).
 
 | Step | Writes as | Where | Anchor |
 |---|---|---|---|
 | Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:38-41`, `:56-66` |
 | Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:84-113` |
-| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:237-353`, `:389`, `:479` |
-| Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:366` |
+| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:262-378`, `:433`, `:523` |
+| Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:391` |
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
-| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
+| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:627-630`, `:635`, `:735-738`, `:756`, `:764`, `:777`, `:656`, `:791` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
 | `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3357`, `agents/roomlerd/src/one_row_home.rs:3-60` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:145` |
@@ -3190,7 +3228,7 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4011`). The
+  its owner and its mode (`agents/roomlerd/src/app.rs:3909`, `:4012`). The
   macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
   (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std
@@ -3320,12 +3358,12 @@ console user are skipped and every root row runs as on any install
   `~/Library/LaunchAgents` itself: when that folder is the reason (a link, not a
   folder, missing and the person's account could not make it, or another
   account's), the message says which
-  (`agents/roomlerd/packaging/macos/postinstall:277-310`). A home that `dscl`
+  (`agents/roomlerd/packaging/macos/postinstall:302-335`). A home that `dscl`
   did not give as an absolute path is named as the reason instead, never the
   folder its path would land on.
 - **A command is printed only for an administrator's own home.** The script
   prints a `sudo` line for a folder only when root's tests and reads find all of
-  this (`agents/roomlerd/packaging/macos/postinstall:260-266`): the person at the
+  this (`agents/roomlerd/packaging/macos/postinstall:285-291`): the person at the
   console is a member of `admin` (`dseditgroup -o checkmember`), so that person
   runs it for themselves; the home is an absolute path to a real folder, not a
   link; and its `Library` is a real folder of the person's own, not a link. The
@@ -3543,7 +3581,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3707`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2705`).
+back to the version that is running (`crates/agent-core/src/config.rs:2708`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -3780,7 +3818,7 @@ The update helper (`com.roomler.update`, a root LaunchDaemon) runs
 while the Mac sits at the login window: a server, a lab Mac, a laptop after a
 restart. The package's post-install script then takes one of two roads, chosen
 once by the owner of `/dev/console`
-(`agents/roomlerd/packaging/macos/postinstall:532-543`). Only the person's half
+(`agents/roomlerd/packaging/macos/postinstall:576-587`). Only the person's half
 differs. The root daemon and the update helper go through the same lines on both
 roads. Until #3783 the road with nobody signed in ended the script at that
 point, so each such update put the new version on disk while the root daemon
@@ -3803,9 +3841,9 @@ flowchart TD
 
 | | A person signed in | Nobody signed in |
 |---|---|---|
-| The person's login items and menu-bar app | written as that person and reloaded (`postinstall:223-508`) | not touched. The items an earlier install placed in `~/Library/LaunchAgents` load at the next sign-in (`RunAtLoad`: `com.roomler.agent.plist:31-32`, `com.roomler.desktop.plist:32-33`) and start the bundle on disk, this version, with the plists that earlier install wrote |
-| The root daemon (opt-in, `/etc/roomler/enable-daemon`) | reloaded: a new pid on the new version (`postinstall:579-622`) | the same lines |
-| The update helper (default on; `/etc/roomler/disable-auto-update` opts out) | re-armed by its state (`postinstall:687-744`), or removed when opted out and idle (`postinstall:745-789`) | the same lines |
+| The person's login items and menu-bar app | written as that person and reloaded (`postinstall:248-552`) | not touched. The items an earlier install placed in `~/Library/LaunchAgents` load at the next sign-in (`RunAtLoad`: `com.roomler.agent.plist:31-32`, `com.roomler.desktop.plist:32-33`) and start the bundle on disk, this version, with the plists that earlier install wrote |
+| The root daemon (opt-in, `/etc/roomler/enable-daemon`) | reloaded: a new pid on the new version (`postinstall:623-666`) | the same lines |
+| The update helper (default on; `/etc/roomler/disable-auto-update` opts out) | re-armed by its state (`postinstall:731-788`), or removed when opted out and idle (`postinstall:789-833`) | the same lines |
 | `install.log` says | `roomlerd installed and started for <person>` | `NO GUI session is logged in`, what was not touched, and what waits for a sign-in |
 
 The root daemon is replaced by `replace_launchd_service`
@@ -3819,7 +3857,7 @@ does). Before #3783's review the wait gave up at 15 s, so a daemon that hung on
 shutdown was still leaving when the bootstraps ran out, and stayed unloaded.
 
 The update helper's state is read once, by `read_update_helper`
-(`postinstall:664-681`), and only one reading lets the script boot it out:
+(`postinstall:708-725`), and only one reading lets the script boot it out:
 
 | Reading | launchctl answered | The helper wanted (the default) | Opted out |
 |---|---|---|---|
@@ -3861,7 +3899,7 @@ Two things #3783 did not change:
 - **A daemon bootstrap that fails five times** leaves the daemon unloaded, on
   both roads. `install.log` says `WARNING: daemon bootstrap failed after retries`
   with launchd's error and the command that starts it by hand
-  (`postinstall:592-593`). An old daemon that was still leaving after the wait
+  (`postinstall:636-637`). An old daemon that was still leaving after the wait
   is gone by the next boot, and launchd loads the plist then (`RunAtLoad`,
   `com.roomler.daemon.plist:42-43`). A service or plist that launchd refuses is
   refused at boot too, so a boot does not cure it: the owner reads the error in
@@ -3959,7 +3997,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1512` (the section) — `uninstall_linux` at `:1956`,
+`scripts/install.sh:1525` (the section) — `uninstall_linux` at `:1969`,
 `uninstall_macos` at `:2021`.
 
 ```mermaid

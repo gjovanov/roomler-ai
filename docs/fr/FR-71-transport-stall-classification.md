@@ -357,7 +357,7 @@ The docs for the classifier live with the gate's, as the section it feeds:
       clean episodes cut** — 55 drops of exactly ×0.85 (×0.72 where two fell in
       one heartbeat) on gap or split windows with nothing sender-side — every one
       on a session whose prior stood at 0.02–0.8 M. The mover is V5's
-      `stall_is_ours` (`governor.rs:1154`): it compares `desired` with `pipe_bps`
+      `stall_is_ours` (`governor.rs:1219`): it compares `desired` with `pipe_bps`
       (`:607`), whose last source is the prior's stand-in (`:613`), and on every
       window it fires on it pushes that prior back with no measurement attached
       (`:1377`, `RatePrior::on_window(None, true)`: one step down per two dirty

@@ -172,7 +172,7 @@ flowchart TB
     the slave (`pty/unix.rs:282`).
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
     guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-27`, `:353-379`),
-    used today by exec (`exec.rs:2437-2442`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
+    used today by exec (`exec.rs:2434-2439`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
     (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:3043`, `:3056`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
     The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:3374-3377`), so it holds
@@ -336,7 +336,7 @@ and D6 are open.
   the system card serves today), then the X11 desktops refused with `x11_not_enabled`. Cost: those desktops wait a
   phase.
   Sharpened by P0: a worker reaches those desktops, but they are refused because their lock is not reported to
-  logind (`capture/mod.rs:1255`), and a worker does not change that. They need a lock signal of their own first.
+  logind (`capture/mod.rs:1366`), and a worker does not change that. They need a lock signal of their own first.
 - **D2. What the system card says until this ships** is FR-141's D3.
 - **D3. AC2's and AC3's bar. Decided 2026-11-11, as recommended:** per-user parity, which on Wayland is the
   clipboard alone, and the layout read without a switch on GNOME. Cost: AC2 is reworded; Wayland layout and

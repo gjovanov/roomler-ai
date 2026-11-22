@@ -229,9 +229,14 @@ pub struct AgentCaps {
     /// * `upload`   — browser → host file uploads (the v1 default).
     /// * `download` — host → browser single-file downloads.
     /// * `download-folder` — host → browser folder zip streams.
+    /// * `resume`   — an interrupted upload resumes from the agent's
+    ///   accepted offset (`files:resume`, file-DC v3).
     /// * `browse`   — browser can navigate the host's filesystem
     ///   via `files:dir`. Conditional on the agent's
     ///   `enable_remote_browse` config flag.
+    /// * `dir-pages` — with `browse` (#4121): a listing too large for one
+    ///   message (64 KiB) reaches a viewer that sends `paged: true` in
+    ///   pages. Matched by equality, as every token here.
     ///
     /// Empty / unset (older agents) deserialises to `[]`; browsers
     /// that see an empty list fall back to `supports_file_transfer`
@@ -10792,6 +10797,26 @@ mod session_video_tests {
             ..reading()
         };
         assert!(at_the_limit.checked().is_some());
+    }
+
+    /// FR-132 P2 — the server holds no list of reasons. `default_off`, which
+    /// an agent sends from P2 on, is kept as it came, on the row and on the
+    /// wire, and so is a reason some later agent adds: a new reason never
+    /// waits for a server to ship first.
+    #[test]
+    fn a_reason_this_server_never_listed_is_kept_as_it_came() {
+        for reason in ["switch_off", "default_off", "a_reason_from_a_later_agent"] {
+            let r = SessionVideo {
+                input_reason: Some(reason.into()),
+                ..reading()
+            };
+            assert_eq!(r.clone().checked(), Some(r.clone()), "{reason}");
+            let row: SessionVideo = bson::from_document(bson::to_document(&r).unwrap()).unwrap();
+            assert_eq!(row, r, "{reason}");
+            let wire: SessionVideo =
+                serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+            assert_eq!(wire, r, "{reason}");
+        }
     }
 
     /// GPU input's missing reason stays absent on the row and on the wire.

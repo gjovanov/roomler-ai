@@ -41,6 +41,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
 
 use crate::capture::Frame;
+use crate::encode::charge::Gate;
 
 /// Properties of a built encoder that the pump reads synchronously and often.
 /// Stable for the encoder's lifetime (an adoption keeps dims and backend, or
@@ -73,6 +74,18 @@ pub trait EncoderOps: Send + 'static {
     const INLINE_BLOCK_IN_PLACE: bool = true;
 
     fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<crate::encode::EncodedPacket>>;
+    /// FR-148 D51 B4g — the encode, with the time the pump charges it where
+    /// the in-flight budget acts (`encode::charge::Gate`; `None` elsewhere).
+    /// An encoder that does not grant by the pts it is handed has nothing to
+    /// charge: [`Self::encode_sync`], as today (the FFmpeg encoders).
+    fn encode_charged(
+        &mut self,
+        frame: &Frame,
+        gate: Option<Gate>,
+    ) -> Result<Vec<crate::encode::EncodedPacket>> {
+        let _ = gate;
+        self.encode_sync(frame)
+    }
     fn set_bitrate(&mut self, bps: u32);
     fn request_keyframe(&mut self);
     /// `true` = adopted (the previous encoder is gone); `false` = refused
@@ -104,8 +117,11 @@ pub trait EncoderOps: Send + 'static {
 }
 
 enum Cmd<E: EncoderOps> {
+    /// The frame, and the time it is charged (FR-148 D51 B4g): the charge
+    /// rides the encode's own message, so it costs the thread no other.
     Encode(
         Arc<Frame>,
+        Option<Gate>,
         oneshot::Sender<Result<Vec<crate::encode::EncodedPacket>>>,
     ),
     /// Replies with the maxrate after the move, so the handle's mirror is
@@ -215,8 +231,17 @@ impl<E: EncoderOps> EncoderThread<E> {
     }
 
     pub async fn encode(&self, frame: Arc<Frame>) -> Result<Vec<crate::encode::EncodedPacket>> {
+        self.encode_charged(frame, None).await
+    }
+
+    /// FR-148 D51 B4g — [`Self::encode`] with the time the frame is charged.
+    pub async fn encode_charged(
+        &self,
+        frame: Arc<Frame>,
+        gate: Option<Gate>,
+    ) -> Result<Vec<crate::encode::EncodedPacket>> {
         let (tx, rx) = oneshot::channel();
-        self.ask(Cmd::Encode(frame, tx), rx).await?
+        self.ask(Cmd::Encode(frame, gate, tx), rx).await?
     }
 
     pub async fn set_bitrate(&mut self, bps: u32) -> Result<()> {
@@ -288,8 +313,8 @@ impl<E: EncoderOps> Drop for EncoderThread<E> {
 fn serve<E: EncoderOps>(mut enc: E, rx: Receiver<Cmd<E>>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::Encode(frame, reply) => {
-                let _ = reply.send(enc.encode_sync(&frame));
+            Cmd::Encode(frame, gate, reply) => {
+                let _ = reply.send(enc.encode_charged(&frame, gate));
             }
             Cmd::SetBitrate(bps, reply) => {
                 enc.set_bitrate(bps);
@@ -393,15 +418,26 @@ impl<E: EncoderOps> EncoderHandle<E> {
         &mut self,
         frame: &Arc<Frame>,
     ) -> Result<Vec<crate::encode::EncodedPacket>> {
+        self.encode_charged(frame, None).await
+    }
+
+    /// FR-148 D51 B4g — [`Self::encode`] with the time the frame is charged
+    /// (`encode::charge`), on the same call: the VP9-444 pump's, where the
+    /// in-flight budget acts.
+    pub async fn encode_charged(
+        &mut self,
+        frame: &Arc<Frame>,
+        gate: Option<Gate>,
+    ) -> Result<Vec<crate::encode::EncodedPacket>> {
         match self {
             Self::Inline(e) => {
                 if E::INLINE_BLOCK_IN_PLACE {
-                    tokio::task::block_in_place(|| e.encode_sync(frame))
+                    tokio::task::block_in_place(|| e.encode_charged(frame, gate))
                 } else {
-                    e.encode_sync(frame)
+                    e.encode_charged(frame, gate)
                 }
             }
-            Self::Threaded(t) => t.encode(frame.clone()).await,
+            Self::Threaded(t) => t.encode_charged(frame.clone(), gate).await,
         }
     }
 

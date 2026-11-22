@@ -1,8 +1,9 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
-P1b on production since 2026-11-03 and P1c released in 0.4.199 the same day (§4); the decisions taken 2026-10-30, 2026-10-31 and 2026-11-02 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
-remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
+P1b on production since 2026-11-03 and P1c released in 0.4.199 the same day; P2 built in
+[#4226](https://github.com/gjovanov/roomler-ai/pull/4226), unreleased (§4); the decisions taken 2026-10-30, 2026-10-31 and 2026-11-02 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1; the §3c note, master `a91dea171` + P2 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
 probe, `encoder_cells_deny`), [FR-119](FR-119-high-refresh-streaming.md) (`fps_deny`, the second pushable denylist)
@@ -145,6 +146,60 @@ today's readback bytes (FR-118 AC2). That costs what the CPU path costs already.
 The list ships **empty**, so P2 alone changes nothing a session does. A test pins that: with the list empty and
 `zero_copy` unset, every input form matches `off`'s, and only the reason differs.
 
+As built ([#4226](https://github.com/gjovanov/roomler-ai/pull/4226), anchors at master `a91dea171` + P2), every
+reader of the switch goes through one of two gates, and with the list empty a session does exactly what it did:
+
+- **One reading, three values** (`ZeroCopy`, `agents/roomlerd/src/capture/mod.rs:109`): `capture::zero_copy()`
+  (`:116`) is `On` for `1`, `true`, `yes` or `on`, `Unset` when the knob is absent or blank (as a blank config value
+  is), and `Off` for any other value, as before P2 (`:123`). The yes-or-no reader is gone, so no caller can read
+  unset as either.
+- **The list** is `capture::DEFAULT_CELLS` (`:144`): whole encoder names, compared by equality, shipped empty.
+- **One gate for both entry points** (`zero_copy_admits`, `:186`): on admits every cell, off refuses with
+  `switch_off`, and unset admits a listed cell and refuses the rest with `default_off`. The probe's GPU candidates
+  read it per cell (`agents/roomlerd/src/encode/caps.rs:1803`, VideoToolbox's `:1829`), and a session's open reads
+  it first, where the switch was (`agents/roomlerd/src/encode/ffmpeg/gpu_input.rs:136`,
+  `agents/roomlerd/src/encode/ffmpeg/vt_input.rs:150`). Every gate after it is unchanged, so a listed cell meets the
+  capture's device, the cell, `zero_copy_deny`, the proof and the pool as a cell turned on by hand does.
+- **The capture rule** (`zero_copy_capture`, `agents/roomlerd/src/capture/mod.rs:200`): on delivers GPU frames, off
+  does not, and unset does only when one of the proven GPU-input cells of the backend the capture's frames go to is
+  listed. On Windows those are `gpu_frame::preferred_cells` (`agents/roomlerd/src/capture/gpu_frame.rs:83`), the
+  proven cells of the first backend in the cascades' order that has one: the backend whose vendor `capture_adapter`
+  already picks for WGC. WGC (`agents/roomlerd/src/capture/wgc_backend.rs:541`) and the DXGI arm
+  (`agents/roomlerd/src/system_context/dxgi_direct.rs:540`) both read `gpu_frame::gpu_frames_at_open`
+  (`agents/roomlerd/src/capture/gpu_frame.rs:98`), and macOS's arm reads every proven cell, all of them
+  VideoToolbox's (`agents/roomlerd/src/capture/scrap_backend.rs:140-141`).
+- **P2's reading of this section's second paragraph.** "The first proven GPU-input cell in cascade order is listed"
+  is built as "a proven GPU-input cell of the first backend in cascade order is listed". The cascades order
+  backends, not cells, and a capture opens before the session's codec is known, so a single first cell would make
+  P3's flip of `av1_qsv` do nothing on every QSV host that proved `hevc_qsv` too. The two readings are identical
+  while the list is empty. It is the operator's to rule on before P3; the paragraph and §6 stand as written until
+  then.
+- **The proven list moved into `capture`** (`agents/roomlerd/src/capture/mod.rs:213`) from `gpu_frame.rs`, so that
+  macOS's capture reads it: `caps::install_gpu_input` installs it on Windows and, new, on macOS
+  (`agents/roomlerd/src/encode/caps.rs:3794`, `:3806`).
+- **`default_off` stands where it is** in the agent's media plan, as `switch_off` does
+  (`agents/roomlerd/src/media_plan.rs:250`): an unset host's sessions draw no GPU-to-CPU arrow they never had.
+- **Every reader of the reason takes a string**: the heartbeat line (`agents/roomlerd/src/peer.rs:10178`),
+  `rc:session.stats` into the server's `SessionVideo.input_reason` (`crates/remote_control/src/models.rs:5965`),
+  whose only check is the name rule (`:6032`), and the viewer's media plan (`ui/src/composables/mediaPlan.ts:57`).
+  No server had to ship first.
+- **A fleet read across the release that carries P2 counts both reasons.** Before it an unset host read
+  `switch_off`; from it, it reads `default_off`, and `switch_off` is an `off` host's alone. A read that keys on
+  `switch_off`, as AC1's did, counts `default_off` beside it from that release.
+- **A flip** (P3 to P5) adds its cell to `DEFAULT_CELLS`, a row to the table in
+  [`encoders.md`](../encoders.md#the-default-list-fr-132-p2), and its words to the `zero_copy` key's description
+  (`crates/agent-core/src/config_surface.rs`, `crates/agent-core/src/config.rs`), which say the list is empty for now.
+- **A precondition for P3.** The DXGI arm's device is on the primary output's adapter, not `capture_adapter`'s, and
+  the arm reads the same rule. On a host whose panel is on Intel while NVENC is proven, a listed QSV cell gets CPU
+  frames on that arm until an NVENC cell is listed too. That is exact while the list is empty, and P3 settles the
+  arm's adapter before it lists any QSV cell.
+- **The macOS arms are compiled only by a release build.** No PR lane builds `ffmpeg-encoder` on macOS, so
+  `vt_input.rs` and caps.rs's macOS arms were checked by reading, and #4226 merges after a candidate release build of
+  its head compiles them.
+
+Tests: [encoders.md § The default list](../encoders.md#the-default-list-fr-132-p2) names them, and
+[`remote-control.md` §5.1f](../remote-control.md#51f-the-frame-stays-on-the-gpu-fr-118) the reasons a session reports.
+
 ### 3d. A canary week per cell, then its flip (P3–P5)
 
 For each cell, its canary hosts (open decision 2) set `zero_copy = on` locally and run for 7 days. That week is read
@@ -174,11 +229,11 @@ the flip on every host that runs the cell, canary or not.
 | P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release. **On production since 2026-11-03** (`hosted-20261103-5f12695`); AC8's field half in §8 |
 | P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | **built** ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)) and **released in 0.4.199** (2026-11-03); AC9's field half is read on it |
 | P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | **built** ([#3284](https://github.com/gjovanov/roomler-ai/pull/3284)): the server half rides a promote and the agent half the next release, and each is harmless without the other: an older agent sends no reading, and an older server ignores the field. The reading lands in `remote_sessions.video` ([`remote-control.md`](../remote-control.md) §11.12) |
-| P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
+| P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | **built** ([#4226](https://github.com/gjovanov/roomler-ai/pull/4226)), unreleased: the reading, the empty list and `default_off` at the probe, a session's open and a capture's open, with AC4's cells as tests; as-built note in 3c. From the release that carries it, an unset host reads `default_off` where it read `switch_off` |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first). `hevc_qsv` and `h264_qsv` also wait for decision 9 | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
 | P5 | VideoToolbox: the same | the same | not started |
-| P6 | Docs: the default per cell and each flip in `docs/encoders.md`, the pushable deny list in `docs/remote-config.md`, `docs/remote-control.md` §5.1f | — | not started |
+| P6 | Docs: the default per cell and each flip in `docs/encoders.md`, the pushable deny list in `docs/remote-config.md`, `docs/remote-control.md` §5.1f | — | P2's share written in [#4226](https://github.com/gjovanov/roomler-ai/pull/4226): the default list (empty) in `docs/encoders.md`, the reasons a session reports in `docs/remote-control.md` §5.1f; each flip adds its row |
 
 ## 5. Acceptance criteria
 

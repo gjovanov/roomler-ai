@@ -160,9 +160,12 @@ pub struct Vp9Encoder {
     force_keyframe: bool,
     /// Most-recent bitrate target (as set by REMB/back-channel).
     target_bitrate: u32,
-    /// #3472 — the pts the last encode handed libvpx, and when it was handed:
-    /// a frame fed again is stamped from them ([`refed_pts`]).
-    last_pts: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
+    /// #3472 — the last encode's stamp: the pts handed libvpx, today's pts
+    /// for that frame, and when it was handed. A frame fed again is stamped
+    /// from them ([`crate::encode::charge::refed_pts`]); FR-148 D51 B4g, and
+    /// a frame the pump gated is charged from them
+    /// ([`crate::encode::charge::charge`]).
+    last_pts: Option<crate::encode::charge::Stamp>,
 }
 
 // `vpx_codec_ctx_t` contains raw `*const`/`*mut` pointers into
@@ -634,14 +637,21 @@ impl Vp9Encoder {
     /// the packet drain. The `VideoEncoder::encode` below is this behind an
     /// `Arc`; the encoder thread calls it directly.
     pub(crate) fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
-        self.encode_at(frame, std::time::Instant::now())
+        self.encode_at(frame, std::time::Instant::now(), None)
     }
 
     /// [`Self::encode_sync`] at `now`, the moment the frame reaches the
     /// encoder: the clock a frame fed again takes its pts from (#3472). The
     /// tests pass a simulated one, so the pump's 60 ms keepalive is 60 ms
-    /// however fast the encode runs.
-    fn encode_at(&mut self, frame: &Frame, now: std::time::Instant) -> Result<Vec<EncodedPacket>> {
+    /// however fast the encode runs. FR-148 D51 B4g: `gate` is the time the
+    /// pump charges the frame where the in-flight budget acts
+    /// (`encode::charge`), `None` elsewhere.
+    fn encode_at(
+        &mut self,
+        frame: &Frame,
+        now: std::time::Instant,
+        gate: Option<crate::encode::charge::Gate>,
+    ) -> Result<Vec<EncodedPacket>> {
         if frame.pixel_format != PixelFormat::Bgra {
             bail!("vp9-444: expected BGRA input, got {:?}", frame.pixel_format);
         }
@@ -710,8 +720,12 @@ impl Vp9Encoder {
             pts
         };
         // #3472 — a frame fed again (the pump's idle keepalive) carries its
-        // own time, not its first encode's.
-        let pts = refed_pts(self.last_pts, pts, now);
+        // own time, not its first encode's. FR-148 D51 B4g — and where the
+        // in-flight budget acts, the gap libvpx grants by is the gap less the
+        // time the pump's gate held frames back, never less than its interval
+        // (`encode::charge`); else the pts is today's.
+        let stamp = crate::encode::charge::charge(self.last_pts, pts, now, gate);
+        let pts = stamp.pts;
         let duration: u64 = frame_duration_us as u64;
 
         let force_kf = self.force_keyframe || self.frame_idx == 0;
@@ -738,7 +752,7 @@ impl Vp9Encoder {
         if err != vpx::VPX_CODEC_OK {
             bail!("vp9-444: vpx_codec_encode failed: {err:?}");
         }
-        self.last_pts = Some((pts, now));
+        self.last_pts = Some(stamp);
 
         // P8 Phase 5 (QP telemetry, record-only) — the quantizer libvpx
         // actually used for THIS frame (its native qindex scale, not the
@@ -806,32 +820,6 @@ impl Vp9Encoder {
     }
 }
 
-/// #3472 — the pts libvpx is handed for a frame whose own `pts` is not after
-/// the last one (`last`: that pts, and when it was handed). The pump's idle
-/// keepalive re-encodes its last frame: the same `Arc<Frame>`, so the same
-/// `monotonic_us`. libvpx's one-pass rate control reads its frame rate off
-/// the gaps between timestamps, so a repeated pts adds no time, yet each
-/// encode is still granted `target ÷ that rate`. The keepalive banked a
-/// capture's worth of budget and the next capture spent it: 2.0–2.4× the
-/// target in the field (2026-11-03, 11-04). Stamped with the last pts plus
-/// the time since the last encode, every encode carries its own time and
-/// the grants add up to the target. At least 1 µs later, so the pts stays
-/// strictly increasing whatever the clock reads.
-fn refed_pts(
-    last: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
-    pts: vpx::vpx_codec_pts_t,
-    now: std::time::Instant,
-) -> vpx::vpx_codec_pts_t {
-    match last {
-        Some((last_pts, at)) if pts <= last_pts => {
-            let since =
-                i64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(i64::MAX);
-            last_pts.saturating_add(since.max(1))
-        }
-        _ => pts,
-    }
-}
-
 /// FR-70 M1b — what the encoder thread needs from libvpx. No background
 /// rebuild exists for this backend, so the rebuild types are uninhabited and
 /// `adopt_rebuilt` can never be called; the pump's `set_speed` rides
@@ -850,6 +838,15 @@ impl crate::encode::thread::EncoderOps for Vp9Encoder {
 
     fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
         Vp9Encoder::encode_sync(self, frame)
+    }
+    // FR-148 D51 B4g — libvpx grants by the pts it is handed, so the pump's
+    // charge reaches it with the frame (`encode::charge`).
+    fn encode_charged(
+        &mut self,
+        frame: &Frame,
+        gate: Option<crate::encode::charge::Gate>,
+    ) -> Result<Vec<EncodedPacket>> {
+        self.encode_at(frame, std::time::Instant::now(), gate)
     }
     fn set_bitrate(&mut self, bps: u32) {
         VideoEncoder::set_bitrate(self, bps)
@@ -1669,7 +1666,7 @@ mod tests {
         while t_us < end_us {
             let measured = t_us >= warm_us;
             let frame = window_frame(t_us);
-            let pkts = enc.encode_at(&frame, at(t_us)).expect("encode");
+            let pkts = enc.encode_at(&frame, at(t_us), None).expect("encode");
             if measured {
                 periods += 1;
                 real_n += 1;
@@ -1684,11 +1681,11 @@ mod tests {
                     break;
                 }
                 let pkts = if ka == Ka::Repeat {
-                    enc.encode_at(&frame, at(t_ka))
+                    enc.encode_at(&frame, at(t_ka), None)
                 } else {
                     let mut f = frame.clone();
                     f.monotonic_us = t_ka;
-                    enc.encode_at(&f, at(t_ka))
+                    enc.encode_at(&f, at(t_ka), None)
                 }
                 .expect("encode");
                 if measured {
@@ -1782,39 +1779,160 @@ mod tests {
         );
     }
 
-    /// #3472 — the stamp rule alone: a pts after the last one passes through;
-    /// one that is not (repeated or earlier) takes the last pts plus the time
-    /// since the last encode, and is never the last pts again.
+    /// FR-148 D51 B4f, B4g — the frames of the two cells below: 640x360, a
+    /// window of 200x120 that changes on every capture, stamped `t_us`.
+    fn changing_window(seed: &mut u64, t_us: u64) -> Frame {
+        let (w, h) = (640u32, 360u32);
+        let mut buf = vec![40u8; (w * h * 4) as usize];
+        for y in 120..240u32 {
+            for x in 220..420u32 {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                let i = ((y * w + x) * 4) as usize;
+                buf[i..i + 3].copy_from_slice(&seed.to_le_bytes()[..3]);
+            }
+        }
+        Frame {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixel_format: PixelFormat::Bgra,
+            data: buf.into(),
+            monotonic_us: t_us,
+            monitor: 0,
+            damage: crate::capture::Damage::Unknown,
+            source: None,
+        }
+    }
+
+    /// The pump's charge at 30 fps where the budget acts, `gated` µs gated.
+    fn gate_at_30(gated: u64) -> Option<crate::encode::charge::Gate> {
+        Some(crate::encode::charge::Gate {
+            gated: std::time::Duration::from_micros(gated),
+            interval: std::time::Duration::from_micros(33_333),
+        })
+    }
+
+    /// FR-148 D51 B4f, B4g — libvpx grants by the pts it is handed. At
+    /// 3 Mbit/s and 30 fps, on a screen whose window changes on every
+    /// capture, after a 500 ms hold: with today's pts the gap is granted, and
+    /// the second after the hold spends more than a second on time does. The
+    /// grant is spent over the frames that follow, not in the first: libvpx
+    /// lowers its quantizer a few steps a frame. With the hold gated
+    /// (`encode::charge`), the frame after it is charged the 33 ms interval,
+    /// and the second after the hold is a second on time.
     #[test]
-    fn a_frame_fed_again_takes_the_time_since_the_last_encode() {
+    fn a_hold_charged_the_interval_is_not_granted() {
+        use crate::encode::VideoEncoder;
+        let mut seed = 0x0b4f_5eed_u64;
         let t0 = std::time::Instant::now();
-        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
-        assert_eq!(
-            refed_pts(None, 5_000, at(0)),
-            5_000,
-            "a first frame keeps its pts"
+        let at = |us: u64| t0 + std::time::Duration::from_micros(us);
+        let size = |pkts: Vec<EncodedPacket>| pkts.iter().map(|p| p.data.len()).sum::<usize>();
+        // The third second on time, after a 2 s settle; then the hold, and
+        // three seconds on time after it, frame by frame.
+        let mut run = |gated: bool| -> (usize, Vec<usize>) {
+            let gate = |held: u64| if gated { gate_at_30(held) } else { None };
+            let mut enc = Vp9Encoder::new_with_fps_chroma(640, 360, 30, Vp9Chroma::Yuv444)
+                .expect("encoder init");
+            VideoEncoder::set_bitrate(&mut enc, 3_000_000);
+            let (mut t, mut on_time) = (1_000_u64, 0);
+            for i in 0..90 {
+                let frame = changing_window(&mut seed, t);
+                let n = size(enc.encode_at(&frame, at(t), gate(0)).expect("encode"));
+                if i >= 60 {
+                    on_time += n;
+                }
+                t += 33_333;
+            }
+            t += 500_000;
+            let mut after = Vec::new();
+            for i in 0..90 {
+                let frame = changing_window(&mut seed, t);
+                let held = if i == 0 { 500_000 } else { 0 };
+                after.push(size(
+                    enc.encode_at(&frame, at(t), gate(held)).expect("encode"),
+                ));
+                t += 33_333;
+            }
+            (on_time, after)
+        };
+        let second = |v: &[usize], s: usize| v[30 * s..30 * (s + 1)].iter().sum::<usize>();
+        let seconds = |v: &[usize]| [second(v, 0), second(v, 1), second(v, 2)];
+        let (today_on_time, today_after) = run(false);
+        let (on_time, after) = run(true);
+        println!(
+            "B4g libvpx: a second on time, today {today_on_time} B, the hold gated {on_time} B; \
+             the seconds after the hold, today {:?} B (its first frames {:?} B), the hold gated \
+             {:?} B (its first frames {:?} B)",
+            seconds(&today_after),
+            &today_after[..6],
+            seconds(&after),
+            &after[..6],
         );
-        let last = Some((5_000, at(0)));
-        assert_eq!(
-            refed_pts(last, 105_000, at(100)),
-            105_000,
-            "a later pts passes"
+        assert!(
+            second(&today_after, 0) * 4 >= today_on_time * 5,
+            "today the hold is granted: {:?} B after it against {today_on_time} B on time",
+            seconds(&today_after)
         );
-        assert_eq!(
-            refed_pts(last, 5_000, at(60)),
-            65_000,
-            "a repeat takes the 60 ms since"
+        assert!(
+            second(&after, 0) * 10 <= on_time * 11,
+            "the hold gated: {:?} B after it against {on_time} B on time",
+            seconds(&after)
         );
-        assert_eq!(
-            refed_pts(last, 1_000, at(60)),
-            65_000,
-            "and so does an earlier pts"
+    }
+
+    /// FR-148 D51 B4g — a capture slower than the pump's target: 20 fps on a
+    /// 30 fps encoder at 3 Mbit/s (375,000 B a second), on the same screen,
+    /// with no hold. With today's pts libvpx is granted each 50 ms gap. Where
+    /// the budget acts and nothing was gated, the encode is charged its gap
+    /// (`encode::charge`), and each of the three seconds after a 2 s settle
+    /// carries about a second's target; B4f charged each frame the 33 ms
+    /// interval, and libvpx spent about two thirds of it.
+    #[test]
+    fn a_slow_capture_charged_its_gaps_spends_its_target() {
+        use crate::encode::VideoEncoder;
+        const TARGET: usize = 3_000_000 / 8;
+        let mut seed = 0x0b4f_5eed_u64;
+        let t0 = std::time::Instant::now();
+        let at = |us: u64| t0 + std::time::Duration::from_micros(us);
+        let size = |pkts: Vec<EncodedPacket>| pkts.iter().map(|p| p.data.len()).sum::<usize>();
+        // Five seconds at 20 fps, frame by frame.
+        let mut run = |gate: Option<crate::encode::charge::Gate>| -> Vec<usize> {
+            let mut enc = Vp9Encoder::new_with_fps_chroma(640, 360, 30, Vp9Chroma::Yuv444)
+                .expect("encoder init");
+            VideoEncoder::set_bitrate(&mut enc, 3_000_000);
+            let mut t = 1_000_u64;
+            let mut sizes = Vec::new();
+            for _ in 0..100 {
+                let frame = changing_window(&mut seed, t);
+                sizes.push(size(enc.encode_at(&frame, at(t), gate).expect("encode")));
+                t += 50_000;
+            }
+            sizes
+        };
+        let second = |v: &[usize], s: usize| v[20 * s..20 * (s + 1)].iter().sum::<usize>();
+        let seconds = |v: &[usize]| [0, 1, 2, 3, 4].map(|s| second(v, s));
+        let of_target =
+            |v: &[usize]| seconds(v).map(|b| format!("{:.2}", b as f64 / TARGET as f64));
+        let today = run(None);
+        let charged = run(gate_at_30(0));
+        println!(
+            "B4g libvpx, 20 fps on 30: each second against its target ({TARGET} B), today {:?} B {:?}, \
+             charged where the budget acts {:?} B {:?}",
+            seconds(&today),
+            of_target(&today),
+            seconds(&charged),
+            of_target(&charged),
         );
-        assert_eq!(
-            refed_pts(last, 5_000, at(0)),
-            5_001,
-            "never the last pts again"
-        );
+        for s in 2..5 {
+            let b = second(&charged, s);
+            assert!(
+                (TARGET * 85 / 100..=TARGET * 115 / 100).contains(&b),
+                "second {s}: {b} B against {TARGET} B, {:?}",
+                of_target(&charged)
+            );
+        }
     }
 }
 

@@ -134,6 +134,22 @@ pub enum ExternalConsent {
     Auto,
 }
 
+impl ExternalConsent {
+    /// `external_consent_mode` as this device reads it at each external
+    /// session request (`imp::admit_session`): unset, blank or `prompt` asks,
+    /// `auto` does not. Anything else is a refusal, never a fallback: `auto`
+    /// is the one value that skips a human, and a typo must not be what
+    /// decides that. FR-148 took it out of `admit_session`, unchanged, so the
+    /// key's declared values are pinned against it (`config_enum_pins`).
+    pub fn parse(mode: Option<&str>) -> Result<Self, &'static str> {
+        match mode.map(str::trim) {
+            None | Some("") | Some("prompt") => Ok(Self::Prompt),
+            Some("auto") => Ok(Self::Auto),
+            Some(_) => Err("external_consent_mode is neither prompt nor auto"),
+        }
+    }
+}
+
 /// An external session this device admitted, on its own terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Admitted {
@@ -437,11 +453,7 @@ mod imp {
         };
         // An unreadable mode is a refusal, never a fallback: `auto` is the one
         // value that skips a human, and a typo must not be what decides that.
-        let consent = match terms.consent_mode.as_deref().map(str::trim) {
-            None | Some("") | Some("prompt") => ExternalConsent::Prompt,
-            Some("auto") => ExternalConsent::Auto,
-            Some(_) => return Err("external_consent_mode is neither prompt nor auto"),
-        };
+        let consent = ExternalConsent::parse(terms.consent_mode.as_deref())?;
         let permissions = match terms
             .max_permissions
             .as_deref()
