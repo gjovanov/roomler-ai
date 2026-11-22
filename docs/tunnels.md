@@ -677,8 +677,8 @@ notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10701`) was lost, and not
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5820`), and no such word could arrive. So it asked
-for a keyframe 6 s after the last picture and built a new connection at 10 s (`:320-322`,
-`:681-683`): 15.5 s after the lock. The new connection showed "Host locked".
+for a keyframe 6 s after the last picture and built a new connection at 10 s (`:321-323`,
+`:682-684`): 15.5 s after the lock. The new connection showed "Host locked".
 
 **The defect needs three things at once**, which is why it was rare, and why a one-way test
 never shows it:

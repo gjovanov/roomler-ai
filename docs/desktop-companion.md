@@ -824,9 +824,9 @@ flowchart TD
 | Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:282-334`), chosen by `fs_as_for` (`:420`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
 | How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
 | Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:832`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:8624`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:11181`): never the machine-global folder |
-| The staging | `stager_for` (`:2410`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
-| The end | `place_across` (`:2964`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
-| A resume | `resume_incoming_as` (`:3217`), `PartialMeta::person_sid` (`:1570`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
+| The staging | `stager_for` (`:2485`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
+| The end | `place_across` (`:3039`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
+| A resume | `resume_incoming_as` (`:3292`), `PartialMeta::person_sid` (`:1570`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
 
 - **A locked screen keeps its user**, so a file sent then lands in their Downloads.
 - **Nobody signed in** (before sign-in, after sign-out): the upload is refused with the reason
@@ -950,7 +950,7 @@ sequenceDiagram
 
 - **The read loop never awaits a listing.** The files channel's message handler hands `files:dir`
   to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13382`, from the arm at
-  `:13324`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
+  `:13330`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
   chunks never wait behind a share: the channel's worst-case hold for a listing is none. It used to
   be awaited inline, and webrtc-rs reads a channel's next message only once the handler of the last
   one returns. A later listing's answer can now come before an earlier one's; the viewer matches
@@ -959,7 +959,7 @@ sequenceDiagram
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:322`, from the channel's
   `on_close`, `agents/roomlerd/src/peer.rs:13084`; `end_session`). An answer already being sent
   races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13401`, through
-  `or_stopped`, `:13891`): after a network drop a send can park for good on a channel that still
+  `or_stopped`, `:13966`): after a network drop a send can park for good on a channel that still
   reads open (#1730), and the task kept the channel and its handler for as long as the agent ran.
 - **One listing step at a time per channel** (the folder lane, `reads::Lane`). A step on a blocking thread
   cannot be cancelled, so a share that stops answering keeps its thread, and a timeout frees the
