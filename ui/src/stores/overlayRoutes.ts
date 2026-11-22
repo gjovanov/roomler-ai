@@ -80,8 +80,18 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
   const nodes = ref<OverlayNode[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4248 — which org `nodes` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's nodes never show (or fill a picker) under another org's page. */
+  const nodesTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it (the
+  // page moved on to another org) is dropped.
+  let seq = 0
 
   async function fetchNodes(tenantId: string) {
+    const mySeq = ++seq
+    if (nodesTenantId.value !== null && nodesTenantId.value !== tenantId) nodes.value = []
+    nodesTenantId.value = tenantId
     // `/tenant/…/overlay-node` is a `network`-module route; a profile that
     // drops the module answers 404. Guarded in the STORE for the same reason
     // as `tunnelClients.fetchTunnelClients` — a per-caller gate leaks the
@@ -89,6 +99,7 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     // server answers, so it is inert before first paint. (FR-75, #1447.)
     if (!useCapabilitiesStore().has('network')) {
       nodes.value = []
+      loading.value = false
       return
     }
     loading.value = true
@@ -97,12 +108,14 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
       const resp = await api.get<OverlayNodeListResponse>(
         `/tenant/${tenantId}/overlay-node`,
       )
+      if (mySeq !== seq) return
       nodes.value = resp.items
     } catch (e) {
+      if (mySeq !== seq) return
       error.value = (e as Error).message
       nodes.value = []
     } finally {
-      loading.value = false
+      if (mySeq === seq) loading.value = false
     }
   }
 
@@ -179,6 +192,7 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     nodes,
     loading,
     error,
+    nodesTenantId,
     fetchNodes,
     setApprovedRoutes,
     setExitNode,

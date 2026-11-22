@@ -986,8 +986,24 @@ export const useAgentStore = defineStore('agents', () => {
   const total = ref(0)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** #4248 — which org `agents` describes: the org of the latest list fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's devices never show (or fill a picker) under another org's page. */
+  const agentsTenantId = ref<string | null>(null)
+  // Only the latest list fetch writes: the answer for an org asked before it
+  // (the page moved on to another org) is dropped.
+  let listSeq = 0
+  // The latest list fetch failed: `ensureAgents` asks again.
+  let listFailed = false
 
   async function fetchAgents(tenantId: string) {
+    const mySeq = ++listSeq
+    if (agentsTenantId.value !== null && agentsTenantId.value !== tenantId) {
+      agents.value = []
+      total.value = 0
+    }
+    agentsTenantId.value = tenantId
+    listFailed = false
     loading.value = true
     error.value = null
     try {
@@ -997,15 +1013,29 @@ export const useAgentStore = defineStore('agents', () => {
       // agents the rich-store lookups degrade again; the unified /device
       // endpoint is the paginated path for that scale.
       const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
+      if (mySeq !== listSeq) return
       agents.value = resp.items
       total.value = resp.total
     } catch (e) {
+      if (mySeq !== listSeq) return
+      listFailed = true
       error.value = (e as Error).message
       agents.value = []
       total.value = 0
     } finally {
-      loading.value = false
+      if (mySeq === listSeq) loading.value = false
     }
+  }
+
+  /** #4248 — the org's devices for a page that only names or picks them,
+   *  fetched only when the store does not hold them already: the shell loads
+   *  them for its nav, and the Devices page with its grid. A store that holds
+   *  another org's devices, or whose last fetch failed, fetches; one that holds
+   *  this org's (or is loading them) does not. It replaces a check of an empty
+   *  list, which never reloaded a list holding another org's devices. */
+  function ensureAgents(tenantId: string): Promise<void> {
+    if (agentsTenantId.value === tenantId && !listFailed) return Promise.resolve()
+    return fetchAgents(tenantId)
   }
 
   /** FR-106 — the agent releases, newest first, each with its publish time:
@@ -1983,8 +2013,10 @@ export const useAgentStore = defineStore('agents', () => {
     total,
     loading,
     error,
+    agentsTenantId,
     releases,
     fetchAgents,
+    ensureAgents,
     fetchAgent,
     fetchReleases,
     applyPresence,

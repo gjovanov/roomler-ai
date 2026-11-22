@@ -126,3 +126,88 @@ describe('useTunnelClientStore', () => {
     expect(store.total).toBe(2)
   })
 })
+
+// #4248 — the store holds one org's tunnel clients at a time, and knows
+// which. A page that only names or picks them asks with
+// `ensureTunnelClients`, which fetches only when the store does not hold that
+// org's clients.
+describe('useTunnelClientStore: one org at a time (#4248)', () => {
+  const ORG_A = 'org_a'
+  const ORG_B = 'org_b'
+  const listOf = (ids: string[]) => ({
+    items: ids.map((id) => mkClient({ id })),
+    total: ids.length,
+    page: 1,
+    per_page: 100,
+    total_pages: 1,
+  })
+  const asked = () => mockApi.get.mock.calls.map((c) => c[0])
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it("asked for org B while holding org A's: one fetch, for org B", async () => {
+    const store = useTunnelClientStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await store.fetchTunnelClients(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['b1']))
+    await store.ensureTunnelClients(ORG_B)
+    expect(asked()).toEqual([
+      `/tenant/${ORG_A}/tunnel-client?per_page=100`,
+      `/tenant/${ORG_B}/tunnel-client?per_page=100`,
+    ])
+    expect(store.clients.map((c) => c.id)).toEqual(['b1'])
+    expect(store.clientsTenantId).toBe(ORG_B)
+  })
+
+  it("asked for org A while holding org A's, or loading them: no fetch", async () => {
+    const store = useTunnelClientStore()
+    let answer!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answer = r)))
+    const first = store.fetchTunnelClients(ORG_A)
+    await store.ensureTunnelClients(ORG_A)
+    answer(listOf(['a1']))
+    await first
+    await store.ensureTunnelClients(ORG_A)
+    expect(asked()).toEqual([`/tenant/${ORG_A}/tunnel-client?per_page=100`])
+    expect(store.clients.map((c) => c.id)).toEqual(['a1'])
+  })
+
+  it('asked again after a failed fetch: fetches', async () => {
+    const store = useTunnelClientStore()
+    mockApi.get.mockRejectedValueOnce(new Error('boom'))
+    await store.fetchTunnelClients(ORG_A)
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await store.ensureTunnelClients(ORG_A)
+    expect(mockApi.get).toHaveBeenCalledTimes(2)
+    expect(store.clients.map((c) => c.id)).toEqual(['a1'])
+    expect(store.error).toBeNull()
+  })
+
+  it("a fetch for org B drops org A's clients at once, and org A's late answer", async () => {
+    const store = useTunnelClientStore()
+    mockApi.get.mockResolvedValueOnce(listOf(['a1']))
+    await store.fetchTunnelClients(ORG_A)
+    let lateA!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (lateA = r)))
+    const refreshA = store.fetchTunnelClients(ORG_A)
+    // A refresh of the same org keeps what it shows while it loads.
+    expect(store.clients.map((c) => c.id)).toEqual(['a1'])
+
+    let answerB!: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => (answerB = r)))
+    const loadB = store.fetchTunnelClients(ORG_B)
+    expect(store.clients).toEqual([])
+    expect(store.total).toBe(0)
+
+    answerB(listOf(['b1']))
+    await loadB
+    lateA(listOf(['a1', 'a2']))
+    await refreshA
+    expect(store.clients.map((c) => c.id)).toEqual(['b1'])
+    expect(store.total).toBe(1)
+    expect(store.loading).toBe(false)
+  })
+})

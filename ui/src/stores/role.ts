@@ -23,17 +23,30 @@ export const useRoleStore = defineStore('roles', () => {
   // List-level error surface (sibling-store convention); dialog-level save
   // errors stay local to the section so the dialog can stay open.
   const error = ref<string | null>(null)
+  /** #4248 — which org `roles` describes: the org of the latest fetch,
+   *  answered or not. A fetch for another org drops the rows first, so one
+   *  org's roles never show (or fill a picker) under another org's page. */
+  const rolesTenantId = ref<string | null>(null)
+  // Only the latest fetch writes: the answer for an org asked before it (the
+  // page moved on to another org) is dropped.
+  let seq = 0
 
   async function fetchRoles(tenantId: string) {
+    const mySeq = ++seq
+    if (rolesTenantId.value !== null && rolesTenantId.value !== tenantId) roles.value = []
+    rolesTenantId.value = tenantId
     loading.value = true
     error.value = null
     try {
-      roles.value = await api.get<Role[]>(`/tenant/${tenantId}/role`)
+      const list = await api.get<Role[]>(`/tenant/${tenantId}/role`)
+      if (mySeq !== seq) return
+      roles.value = list
     } catch (e) {
+      if (mySeq !== seq) return
       error.value = (e as Error).message
       roles.value = []
     } finally {
-      loading.value = false
+      if (mySeq === seq) loading.value = false
     }
   }
 
@@ -79,6 +92,7 @@ export const useRoleStore = defineStore('roles', () => {
     roles,
     loading,
     error,
+    rolesTenantId,
     fetchRoles,
     createRole,
     updateRole,
