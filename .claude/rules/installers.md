@@ -214,8 +214,12 @@ fallback needs. `StopOldDaemon` is the upgrade's, from the NEW product, with `--
 records an update attempt first: ⚠️ a plain stop during an upgrade deletes an ephemeral device (#1683,
 `docs/ephemeral-nodes.md`).
 ⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
-`0xC000013A` (a crash stays down, #3295). What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
-`service install` adds when a config exists. A repeating trigger would cover a crash too, and was
+`0xC000013A`. The launcher the task runs is, since FR-150 P2 (#3295): `roomlerdw.exe` starts a daemon that
+crashed, or whose start failed, again with the service supervisor's backoff, and leaves on the deliberate ends
+(0, 7, 8, 9, 75, 78, or the session ending), which stay down (`end_of`, `agents/roomlerdw/src/ends.rs`). It
+supervises only the exact `run --supervisor task`, compared by equality, and `ROOMLERDW_SUPERVISE=0` turns it
+off. What brings a device back after a self-update is the one-shot `<TimeTrigger>`s `service install` adds when a
+config exists, and since FR-150 P1b the watcher's ladder. A repeating trigger would cover a crash too, and was
 rejected: it fires inside the installer's window on the old files, and needs a latch for
 `service stop` and for a removed row.
 
