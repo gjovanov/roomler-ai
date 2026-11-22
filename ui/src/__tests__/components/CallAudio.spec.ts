@@ -138,8 +138,13 @@ function mountCall(rendered: string[]) {
   return mount(Call, { global: { plugins: [vuetify] } })
 }
 
+/** The mounted page's root. `VueWrapper.element` is typed `any`. */
+function root(w: VueWrapper): HTMLElement {
+  return w.element as HTMLElement
+}
+
 function mediaElements(w: VueWrapper): HTMLMediaElement[] {
-  return [...w.element.querySelectorAll<HTMLMediaElement>('audio, video')]
+  return [...root(w).querySelectorAll<HTMLMediaElement>('audio, video')]
 }
 
 /** Every element on the page that plays this track out loud. */
@@ -151,7 +156,7 @@ function audibleOf(w: VueWrapper, t: { id: string }): HTMLMediaElement[] {
 }
 
 function sinks(w: VueWrapper): HTMLAudioElement[] {
-  return [...w.element.querySelectorAll<HTMLAudioElement>('audio[data-stream-key]')]
+  return [...root(w).querySelectorAll<HTMLAudioElement>('audio[data-stream-key]')]
 }
 
 function sinkKeys(w: VueWrapper): string[] {
@@ -206,7 +211,7 @@ describe('CallAudio — every remote participant is heard, whatever the layout r
       expect(players[0].dataset.userId).toBe(`u-${k}`)
     }
     // The two rendered tiles show pictures only.
-    const tiles = [...w.element.querySelectorAll<HTMLVideoElement>('video[data-stream-key]')]
+    const tiles = [...root(w).querySelectorAll<HTMLVideoElement>('video[data-stream-key]')]
     expect(tiles.map((t) => t.dataset.streamKey).sort()).toEqual(['c1', 'c2'])
     for (const t of tiles) expect(t.muted, `the ${t.dataset.streamKey} tile is muted`).toBe(true)
     w.unmount()
