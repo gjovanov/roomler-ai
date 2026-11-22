@@ -4490,7 +4490,20 @@ mod mac_gate {
             );
             return Ok(Ended::Done);
         }
-        let newer = match probe_once().await {
+        // SIGTERM ends the cycle at every await before `installer(8)`: once the
+        // gate has polled `stop`, the handler holds SIGTERM for the whole run,
+        // so nothing else would end a probe or a download that it reaches.
+        let probed = tokio::select! {
+            biased;
+            _ = stop.as_mut() => {
+                tracing::info!(
+                    "update-helper: SIGTERM while checking; exiting without installing"
+                );
+                return Ok(Ended::Done);
+            }
+            probed = probe_once() => probed,
+        };
+        let newer = match probed {
             Ok(newer) => newer,
             Err(CheckOutcome::UpToDate { current, latest }) => {
                 tracing::info!(%current, %latest, "update-helper: up to date");
@@ -4539,7 +4552,17 @@ mod mac_gate {
                 forced: true,
             }
         };
-        let (current, latest, installer_path) = match download_newer(newer).await {
+        let downloaded = tokio::select! {
+            biased;
+            _ = stop.as_mut() => {
+                tracing::info!(
+                    "update-helper: SIGTERM while downloading; exiting without installing"
+                );
+                return Ok(Ended::Done);
+            }
+            downloaded = download_newer(newer) => downloaded,
+        };
+        let (current, latest, installer_path) = match downloaded {
             CheckOutcome::UpdateReady {
                 current,
                 latest,
@@ -4584,6 +4607,13 @@ mod mac_gate {
         } = &arm
         {
             tracing::warn!("update-helper: {warning}");
+        }
+        // One last look before `installer(8)`: a SIGTERM after the last await
+        // (a forced install reads no half after its download) ends it too.
+        if futures::FutureExt::now_or_never(stop.as_mut()).is_some() {
+            tracing::info!("update-helper: SIGTERM before installing; exiting without installing");
+            let _ = std::fs::remove_file(&installer_path);
+            return Ok(Ended::Done);
         }
         // The budget resets just before `installer(8)` is spawned.
         save(budget, gate::budget_for(&arm, *budget), path);
