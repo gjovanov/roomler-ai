@@ -155,7 +155,7 @@ under 0.4 s after its container started.
 backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:50`, `:618`): 3.4 s in one roll,
 7.5–7.7 s in ten, 15.2–15.8 s in two, 25.9 s in one. A replacement that listens just after a step
 waits for the next one. The control WS doubles the same way, up to 60 s
-(`agents/roomlerd/src/signaling.rs:1594`).
+(`agents/roomlerd/src/signaling.rs:1580`).
 
 A device in two orgs holds one socket per org, each pinned by its own tenant, so it can lose a
 socket in each wave. That accounts for the 6–8 hosts per roll that log two closes: on the roll of
@@ -258,7 +258,7 @@ flowchart TD
 | A major network change (only the control socket listens for one) | Restarts at 1 s | Back to 30 |
 
 The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:75`) with its allowance and wait (`:48`, `:53`), the
-control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1573`, `:1290`), and `/derp`'s
+control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1559`, `:1290`), and `/derp`'s
 (`agents/roomlerd/src/derp.rs:604`, `:598`). Regional relays keep their ladder
 (`agents/roomlerd/src/derp.rs:381`): no pod rolls under one.
 
