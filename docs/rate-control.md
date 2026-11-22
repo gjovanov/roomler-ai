@@ -4846,11 +4846,14 @@ rate does. With no change of either, `own` is `rate_measured` and nothing else m
 base (`:1899`), and the pts is the capture's time (`:97`, `:2359-2362`). QSV's rate
 control is measured: its CBR frames were each exactly target ÷ fps ÷ 8 bytes
 (`docs/plans/rate-control-architecture.md:36-37`), so it budgets by the configured rate,
-never by the pts gap, and a hold there is not granted. NVENC and VAAPI carry the pts
-through untouched (`encoder.rs:90-93`; VAAPI's driver is handed none) and are given the
-frame rate their rate control budgets by, so B4f has nothing to bound there either.
-AMF and VideoToolbox rescale the pts to their own clocks (the same lines), and whether
-their rate control reads the gaps is not measured: they are the edge.
+never by the pts gap, and a hold there is not granted. NVENC and AMF are measured too
+(FR-148 O18, [encoders.md](encoders.md#after-a-hold-what-each-ffmpeg-encoder-spends-fr-148-o18)):
+a 500 ms jump in the pts moves no byte of any frame of `h264_nvenc`, `hevc_nvenc` (4:2:0
+and 4:4:4), `av1_nvenc`, `h264_amf` or `hevc_amf`, so none grants a hold and B4f has
+nothing to bound there either. VAAPI's driver is handed no pts, and VideoToolbox
+rescales it to its own clock (`encoder.rs:90-93`), but neither is measured, nor are
+`av1_amf`, QSV at QVBR (`qsv_rate_mode`), D3D12 and Vulkan: they are the edge, and `on`
+reaches no device whose cascade picks one.
 
 **B4f's cells**, each red before B4f and green with it, except the guards:
 

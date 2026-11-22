@@ -1975,14 +1975,17 @@ that gate before they capture: the FFmpeg pump re-polls it every 2 ms
 encoder stamps each frame with the capture's time (`encoder.rs:96-99`, `:2357-2362`), so
 a hold of H ms reaches the encoder as a pts gap of one interval plus H. libvpx, the
 VP9-444 pump's encoder, grants that gap: after a 500 ms hold its next three seconds
-carried 826, 500 and 411 kB against 389 kB for a second on time, which is why B4f charges
-that pump's encodes at most the interval (`agents/roomlerd/src/encode/charge.rs:67`,
-[rate-control.md](rate-control.md#b4f-a-hold-is-never-charged-to-the-encoder-d51)). B4f
-does not reach the FFmpeg pump, so O18 asked what its encoders do with the same gap.
+carried 826, 500 and 411 kB against 389 kB for a second on time. That is why that pump
+charges libvpx each frame's gap less the time its gate held it, never less than the
+interval (`agents/roomlerd/src/encode/charge.rs:82`,
+[rate-control.md](rate-control.md#b4g-a-frame-is-charged-its-gap-less-the-time-the-gate-held-it-d51)).
+That charge does not reach the FFmpeg pump, so O18 asked what its encoders do with the
+same gap.
 
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
 (`encoder.rs:4882-5257`) opens each encoder as a relayed session does (`new_preferred`
-with `constrained`, as `FfmpegDcCodec::open` does at `peer.rs:5470-5473`; `hevc_nvenc`
+with `constrained`, as `FfmpegDcCodec::open` does at
+`agents/roomlerd/src/peer.rs:5470-5473`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
 seconds at the frame interval, a 500 ms jump in the pts, three more seconds (`hold`);
 and the same frames with no jump (`interval`). The content is the libvpx cell's, a grey
