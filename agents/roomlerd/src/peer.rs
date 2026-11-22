@@ -17713,7 +17713,9 @@ mod refused_upload_tests {
     /// The frames the viewer hears before the answer to `probe`: an end for an
     /// upload this channel never began, which is always answered. One channel,
     /// in order, so by then every frame sent before the probe has had its
-    /// answer, if it gets one.
+    /// answer, if it gets one, but an upload's end that was taken: its answer
+    /// comes from the channel's placement lane once the file is placed, and
+    /// can come after the probe's (#4082).
     async fn heard_before(pair: &mut Pair, probe: &str) -> Vec<Value> {
         pair.ask(&json!({"t": "files:end", "id": probe})).await;
         let mut before = Vec::new();
@@ -17814,7 +17816,12 @@ mod refused_upload_tests {
             .await
             .expect("the chunk went out");
         pair.ask(&json!({"t": "files:end", "id": id})).await;
-        let heard = heard_before(&mut pair, "never-begun").await;
+        let mut heard = heard_before(&mut pair, "never-begun").await;
+        // #4082 — the taken end is answered by the placement lane, and may be
+        // heard after the probe's answer.
+        if !heard.iter().any(|f| f["t"] == "files:complete") {
+            heard.extend(pair.heard(1).await);
+        }
         pair.close().await;
 
         let kinds: Vec<&str> = heard.iter().filter_map(|f| f["t"].as_str()).collect();
