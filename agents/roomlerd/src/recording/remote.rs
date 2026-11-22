@@ -1547,7 +1547,10 @@ impl Handler {
             org: self.ctx.org.clone(),
             expires_at: Instant::now() + window,
         };
-        let native = self.ctx.indicator.show_prompt(view.clone());
+        // FR-149 P1 — the screen worker's panel first on a one-row Mac's root
+        // daemon, `PANEL_WITHIN` at most.
+        let on_screen = self.ctx.indicator.show_prompt(view.clone()).await;
+        let native = on_screen.native;
         let mut prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Record,
             asked_by: name,
@@ -1565,7 +1568,13 @@ impl Handler {
         // The marker is written either way (`roomlerd consent --list` shows a
         // natively-prompted question too); without it the companion has
         // nothing to render, so it is part of "could anyone be asked".
-        let marker = match self.ctx.consent.write_prompt(&prompt_id, &prompt) {
+        // FR-149 P1 — and read on the session panel's books after it.
+        let marker = match crate::indicator::session_panel::write_marker(
+            &self.ctx.consent,
+            &prompt_id,
+            &prompt,
+            &on_screen,
+        ) {
             Ok(_) => true,
             Err(e) => {
                 warn!(%e, native, "record: could not write the .pending consent marker");
@@ -1591,7 +1600,12 @@ impl Handler {
                 }
             }
         }
-        info!(session = %self.ctx.session_id, native, notified, have_surface, "consent prompt surface (record)");
+        info!(
+            session = %self.ctx.session_id, native, panel = on_screen.panel(),
+            session_panel = on_screen.session_panel(), why = on_screen.why(), notified,
+            have_surface,
+            "consent prompt surface (record)"
+        );
         let decision = asking.await;
         self.ctx.indicator.hide_prompt(&prompt_id);
         if let Ok(mut p) = self.prompt.lock() {

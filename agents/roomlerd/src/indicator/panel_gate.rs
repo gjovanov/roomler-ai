@@ -455,11 +455,88 @@ fn say_the_seat(was: u32, now: Seat) {
     );
 }
 
+/// FR-149 P1 (C2) — where the AppKit main loop stands, for the panel
+/// ([`super::mac`]): `main` promised it (`mac::promise_main_loop`, before it
+/// starts the daemon's thread and hands its own to AppKit), and it pumps
+/// (`run_main_loop`, once its first reads are made).
+///
+/// P0 read the gap on 0.4.228: a panel was built only once the loop pumped,
+/// and the daemon's signalling loop, on its own thread, could build it first.
+/// That refusal was kept for the process's life, so a screen worker whose
+/// loop started late showed no question at all. Now the promise builds the
+/// panel, and the loop's first pass opens it: a question before that goes to
+/// the person's app, and none after it does for this reason. Nothing waits
+/// for the loop, and nothing polls it: each question reads the flags once.
+#[derive(Debug, Default)]
+pub(crate) struct MainLoop {
+    promised: AtomicBool,
+    pumping: AtomicBool,
+}
+
+impl MainLoop {
+    pub(crate) const fn new() -> Self {
+        Self {
+            promised: AtomicBool::new(false),
+            pumping: AtomicBool::new(false),
+        }
+    }
+
+    /// `main` will hand the main thread to AppKit.
+    pub(crate) fn promise(&self) {
+        self.promised.store(true, Ordering::SeqCst);
+    }
+
+    /// The loop pumps: its first reads are made.
+    pub(crate) fn pumps(&self) {
+        self.pumping.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a panel can be built now: the loop pumps, or `main` promised
+    /// it. Neither in a process that never hands its main thread over (a CLI
+    /// call, a test), which keeps the refusal it always had.
+    pub(crate) fn builds_a_panel(&self) -> bool {
+        self.promised.load(Ordering::SeqCst) || self.pumping.load(Ordering::SeqCst)
+    }
+
+    /// Whether the panel takes a question now: only while the loop pumps,
+    /// since a question parked before then would wait for a pass that has
+    /// not come. Read at each question, never kept.
+    pub(crate) fn takes_a_question(&self) -> bool {
+        self.pumping.load(Ordering::SeqCst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::peer::files_log_tests::Logged;
     use std::cell::Cell;
+
+    /// FR-149 P1 (C2) — a panel built after `main`'s promise and before the
+    /// loop pumps takes no question until the loop's first pass, and every
+    /// question from then on: the refusal does not outlive the loop's start.
+    /// Without the promise (a CLI call, a test) no panel is built, as before.
+    #[test]
+    fn a_panel_built_before_the_main_loop_pumps_takes_questions_once_it_does() {
+        let early = MainLoop::new();
+        assert!(!early.builds_a_panel(), "no promise, no loop: no panel");
+        early.promise();
+        assert!(early.builds_a_panel(), "the promise builds the panel");
+        assert!(
+            !early.takes_a_question(),
+            "before the loop pumps, a question goes to the app"
+        );
+        early.pumps();
+        for question in 0..3 {
+            assert!(
+                early.takes_a_question(),
+                "question {question} after the loop's start"
+            );
+        }
+        let unpromised = MainLoop::new();
+        unpromised.pumps();
+        assert!(unpromised.builds_a_panel() && unpromised.takes_a_question());
+    }
 
     /// The two reads, stood in: what each answers now, and how often each
     /// was made.
@@ -906,8 +983,8 @@ mod tests {
     /// cannot reach the screen takes the road of one it does not take
     /// because another question is up. Each caller marks it for the person's
     /// app (`surface: if native { Native } else { Companion }`: remote
-    /// control at `signaling.rs:4373`, exec at `:5898`, SSH at `ssh.rs:2664`,
-    /// a recording at `recording/remote.rs:1559`), and on a one-row Mac the
+    /// control at `signaling.rs:4408`, exec at `:5943`, SSH at `ssh.rs:2668`,
+    /// a recording at `recording/remote.rs:1562`), and on a one-row Mac the
     /// app reads the root daemon's questions over the root daemon's relay
     /// (#3864). Here the root daemon's own LocalAPI answers the relay, so a
     /// `false` from each of the gate's verdicts is followed, beside a taken

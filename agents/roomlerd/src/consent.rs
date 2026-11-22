@@ -1138,6 +1138,47 @@ impl ConsentBroker {
         }
         self.write_pending(session_hex, &body).map(|_| true)
     }
+
+    /// FR-149 P1, D4 — a question the screen worker's panel showed, whose
+    /// channel then ended: its marker says `companion` from now on, so the
+    /// person's app shows it for the rest of its window. The marker is
+    /// rewritten as it stands, its deadline (`expires_at_ms`) kept, only while
+    /// the question is on the books and under their lock, as
+    /// [`Self::write_prompt_while_asking`] does. `Ok(false)` = the question
+    /// had ended, had no marker to rewrite, or was the app's already (two
+    /// moves of one question, the channel's end and its caller's write, move
+    /// it, and start the app, once).
+    pub fn to_the_companion_while_asking(&self, session_hex: &str) -> Result<bool> {
+        let mut books = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !books.asking.contains_key(session_hex) {
+            return Ok(false);
+        }
+        let body = match self.inner.sentinel_dir.as_ref() {
+            None => books.marks.get(session_hex).cloned(),
+            Some(_) => self
+                .pending_path(session_hex)
+                .and_then(|p| std::fs::read_to_string(p).ok()),
+        };
+        let Some(mut marker) = body
+            .and_then(|b| serde_json::from_str::<tunnel_core::localapi::ConsentRequest>(&b).ok())
+        else {
+            return Ok(false);
+        };
+        if marker.surface == PromptSurface::Companion.wire() {
+            return Ok(false);
+        }
+        marker.surface = PromptSurface::Companion.wire().to_string();
+        let body = serde_json::to_string(&marker)?;
+        if self.inner.sentinel_dir.is_none() {
+            books.marks.insert(session_hex.to_string(), body);
+            return Ok(true);
+        }
+        self.write_pending(session_hex, &body).map(|_| true)
+    }
 }
 
 #[cfg(test)]

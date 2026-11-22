@@ -458,7 +458,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4018`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:140`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:4049`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:2963`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone kept image events (`clipboard.rs:817-822` before P3e-3a); since P3e-3a a Linux X11 session keeps them too, behind its change gate (`agents/roomlerd/src/clipboard.rs:1076`), and since P2e-1 a Mac, behind its change count (`agents/roomlerd/src/encode/caps.rs:2815`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
@@ -732,7 +732,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1453-1519`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:4473`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:4515`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
@@ -745,7 +745,7 @@ test of the SIGKILL property itself.
   `rc:layout` and `rc:layout.set` with the Windows and X11 modules' snapshot, watch and switch, so the peer's emitter,
   its control-DC send and the arbiter's `LayoutSet` arm are now built for all three. Text Input Sources must be called
   on the main thread, which `viewer-indicator-macos` gives to AppKit for the daemon's life (P2b's release set has it),
-  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:149`), run by the
+  so every call is queued there: `indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:204`), run by the
   pump on its next pass. The list is the selectable keyboard sources (the input menu's); the token is the source ID's
   hash; the tag is BCP-47 for a layout the table knows, else the source's own name. Offered wherever the switch is
   on, not asked of the process's own session, for the same reason as P2e-1: on a supervised Mac the root daemon says
@@ -1057,7 +1057,7 @@ test of the SIGKILL property itself.
     save and ignored. `docs/hive.md` §8 (*On Windows*) described it at master `7106d588d`, and the doc left
     master with Hive.
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`app.rs:3768-3783`):
+  reaches (`app.rs:3772-3787`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:1024`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -1081,10 +1081,10 @@ model on Windows, so the three agree on what the mode means.
 (`exec.rs:819`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_account`, `companion.rs:4996`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_account`, `companion.rs:5012`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
-  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:2196`),
+  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:2200`),
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).
