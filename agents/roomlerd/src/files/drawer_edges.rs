@@ -293,6 +293,37 @@ pub(crate) mod seams {
         }
     }
 
+    /// What a begin runs, once, after it has made (or opened) the staging
+    /// folder beside the folder it uploads into and before it makes its own
+    /// `<id>` in it: by that folder's path.
+    type IdNext = (PathBuf, Box<dyn FnOnce() + Send>);
+
+    static ID_NEXT: Mutex<Vec<IdNext>> = Mutex::new(Vec::new());
+
+    /// #4082 — once a begin into `folder` has made its staging folder, and
+    /// before it makes its `<id>` there, `step` runs on the begin's thread:
+    /// another upload's end, placing its file beside this begin, removes
+    /// that staging folder once empty, between the two.
+    pub(crate) fn before_the_id(folder: &Path, step: impl FnOnce() + Send + 'static) {
+        let at = std::fs::canonicalize(folder).expect("a folder to upload into");
+        let mut next = ID_NEXT.lock().unwrap_or_else(|p| p.into_inner());
+        next.push((at, Box::new(step)));
+    }
+
+    /// Where a begin into `folder` makes its `<id>`: runs what a test set
+    /// with [`before_the_id`], once.
+    pub(crate) fn the_id_is_next(folder: &Path) {
+        let at = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+        let step = {
+            let mut next = ID_NEXT.lock().unwrap_or_else(|p| p.into_inner());
+            let found = next.iter().position(|(f, _)| f == &at);
+            found.map(|i| next.remove(i).1)
+        };
+        if let Some(step) = step {
+            step();
+        }
+    }
+
     /// What a stand-in answers for one thread: a test's own, as
     /// `stand_in::reader` keeps it.
     #[cfg(windows)]

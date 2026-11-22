@@ -13096,16 +13096,20 @@ pub fn attach_files_handler(
         })
     }));
     let handler_for_end = handler.clone();
+    // #4082 — where an upload's end places its file, off the read loop. Its
+    // sender lives in the message callback below, and goes with it.
+    let placements = spawn_placement_lane(&dc, handler.listings_closed(), session_id);
     dc.on_message(Box::new(move |msg| {
         let dc = dc_for_handler.clone();
         let handler = handler.clone();
+        let placements = placements.clone();
         Box::pin(async move {
             // FR-101 P4b-2 — every message the controller sends here (an
             // upload's chunks, a request to browse or download) is activity
             // for the session's idle limit.
             crate::session_telemetry::counters(session_id).note_transfer();
             if msg.is_string {
-                handle_files_control(dc, handler, session_id, &msg.data).await;
+                handle_files_control(dc, handler, session_id, &placements, &msg.data).await;
             } else {
                 handle_files_chunk(dc, handler, session_id, &msg.data).await;
             }
@@ -13159,10 +13163,104 @@ fn on_session_end<F, Fut>(
     });
 }
 
+/// #4082 — a files channel's placement lane: the uploads whose end its read
+/// loop took out of the slot ([`crate::files::FilesHandler::begin_end`]),
+/// each placed in a task of its own ([`crate::files::Ending::place`]), one
+/// at a time, in the order their ends arrived. A begin read while an end
+/// places is taken at once, and its own end waits here for the earlier
+/// placement (D2-A), so their answers keep their order. Each is answered by
+/// [`answer_upload_end`].
+///
+/// ⚠️ The lane holds no channel and no handler: the channel only weakly, its
+/// end by `over` (the channel's close or the session's end). Its sender lives
+/// in the channel's message callback, which [`on_session_end`] lets go, and
+/// the lane ends once the placements queued by then are done. A placement is
+/// never stopped part way: its file lands whole, as when the read loop ran
+/// it, and only its answer is dropped.
+fn spawn_placement_lane(
+    dc: &Arc<RTCDataChannel>,
+    over: tokio_util::sync::CancellationToken,
+    session_id: bson::oid::ObjectId,
+) -> mpsc::UnboundedSender<crate::files::Ending> {
+    let (lane, mut endings) = mpsc::unbounded_channel::<crate::files::Ending>();
+    let dc = Arc::downgrade(dc);
+    tokio::spawn(async move {
+        while let Some(ending) = endings.recv().await {
+            let id = ending.id().to_string();
+            // A task of its own: a panic there is this upload's error, and
+            // the lane goes on to the next.
+            let placed = tokio::spawn(ending.place())
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("placing the file stopped: {e}")));
+            answer_upload_end(&dc, &over, session_id, &id, placed).await;
+        }
+    });
+    lane
+}
+
+/// #4082 — an upload's one answer, from its placement lane: `files:complete`,
+/// or the end's `files:error`, in the words the read loop sent them. Logged,
+/// and the file noted for the session's audit while it keeps its counters
+/// (FR-101 P3; none are made for a session that is over). Sent only while the
+/// channel lives, never after its close or its session's end, and the send
+/// races that end ([`or_stopped`]).
+async fn answer_upload_end(
+    dc: &std::sync::Weak<RTCDataChannel>,
+    over: &tokio_util::sync::CancellationToken,
+    session_id: bson::oid::ObjectId,
+    id: &str,
+    placed: anyhow::Result<(std::path::PathBuf, u64)>,
+) {
+    match &placed {
+        Ok((path, bytes)) => {
+            info!(%session_id, %id, bytes, path = ?path, "files: complete");
+            // FR-101 P3 — the audit gets the name's hash, never the name.
+            if let Some(counters) = crate::session_telemetry::peek(session_id) {
+                counters.note_file(
+                    TransferDirection::ToHost,
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default(),
+                    *bytes,
+                );
+            }
+        }
+        Err(e) => warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed"),
+    }
+    let dc = dc
+        .upgrade()
+        .filter(|dc| !over.is_cancelled() && !channel_gone(dc.ready_state()));
+    let Some(dc) = dc else {
+        debug!(%session_id, %id, "files: the end's answer is not sent: its channel closed, or its session ended");
+        return;
+    };
+    match placed {
+        Ok((path, bytes)) => {
+            let path_str = path.to_string_lossy();
+            let complete = crate::files::FilesOutgoing::Complete {
+                id,
+                path: &path_str,
+                bytes,
+            };
+            let _ = or_stopped(over, send_files_json(&dc, &complete)).await;
+        }
+        Err(e) => {
+            let message = format!("{e}");
+            let error = crate::files::FilesOutgoing::Error {
+                id,
+                message: &message,
+            };
+            let _ = or_stopped(over, send_files_json(&dc, &error)).await;
+        }
+    }
+}
+
 async fn handle_files_control(
     dc: Arc<RTCDataChannel>,
     handler: crate::files::FilesHandler,
     session_id: bson::oid::ObjectId,
+    placements: &mpsc::UnboundedSender<crate::files::Ending>,
     data: &[u8],
 ) {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -13228,28 +13326,33 @@ async fn handle_files_control(
         crate::files::FilesIncoming::End { id } if handler.refused_at_begin(&id) => {
             debug!(%session_id, ?id, "files: the end of an upload whose begin was refused is dropped");
         }
-        crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
-            Ok((path, bytes)) => {
-                info!(%session_id, %id, bytes, path = ?path, "files: complete");
-                // FR-101 P3 — the audit gets the name's hash, never the name.
-                crate::session_telemetry::counters(session_id).note_file(
-                    TransferDirection::ToHost,
-                    &path
-                        .file_name()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_default(),
-                    bytes,
-                );
-                let path_str = path.to_string_lossy();
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Complete {
-                        id: &id,
-                        path: &path_str,
-                        bytes,
-                    },
-                )
-                .await;
+        // #4082 — another end of an upload whose end is placing it now: that
+        // end answers it, once, and its staging is left to it.
+        crate::files::FilesIncoming::End { id } if crate::files::upload_ending(&id) => {
+            debug!(%session_id, ?id, "files: another end of an upload being placed is dropped");
+        }
+        // #4082 — the upload leaves the channel's slot here, at once, and its
+        // file is placed in the channel's placement lane, which answers it
+        // ([`spawn_placement_lane`]). This loop never waits for a placement,
+        // which can copy a large file for minutes, so whatever comes behind
+        // the end is read at once: a listing, a download's cancel, the next
+        // upload's begin.
+        crate::files::FilesIncoming::End { id } => match handler.begin_end(&id).await {
+            Ok(ending) => {
+                if placements.send(ending).is_err() {
+                    // Never while this callback lives, which holds the lane's
+                    // sender. The upload's staging stays for a resume, as an
+                    // abort leaves it.
+                    warn!(%session_id, ?id, "files: end failed — the placement lane is gone");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: "the upload's end could not be placed; resume it",
+                        },
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed");
@@ -13297,12 +13400,16 @@ async fn handle_files_control(
             // upload only when its resume loop gives up, which since
             // rc.23's endless retry it never does.
             let out_cancelled = handler.cancel_outgoing(&id).await;
+            // #4082 (D1-A) — an upload whose end is placing it is left to
+            // that end: it is not stopped, and its staging is not removed
+            // (`cancel_incoming`). This line says so.
+            let ending = crate::files::upload_ending(&id);
             // #3688 — an upload's id is one plain name
             // (`files::transfer_id`): any other is refused, and the viewer
             // told, as at files:begin and files:resume.
             match handler.cancel_incoming(&id).await {
                 Ok(in_cancelled) => info!(
-                    %session_id, %id, out_cancelled, in_cancelled,
+                    %session_id, %id, out_cancelled, in_cancelled, ending,
                     "files: cancel requested"
                 ),
                 Err(e) => {
@@ -17399,6 +17506,12 @@ mod files_channel_tests {
             got
         }
 
+        /// #4082 — the session ends, and the peers stay up until
+        /// [`Self::close`].
+        pub(super) fn end_session(&self) {
+            self.session_end.cancel();
+        }
+
         /// The session ends, and both peers are closed: a peer that is only
         /// dropped frees nothing (its sockets belong to its ICE agent's tasks).
         pub(super) async fn close(self) {
@@ -18625,5 +18738,402 @@ mod upload_end_tests {
             "the cancelled download ran to its end"
         );
         assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// Every frame for `id` the viewer hears within `wait`.
+    async fn more_for(pair: &mut Pair, id: &str, wait: Duration) -> Vec<Value> {
+        let (_, heard) = heard_until(pair, wait, |_| false).await;
+        heard.into_iter().filter(|f| f["id"] == id).collect()
+    }
+
+    /// Upload `id`'s staged `data` beside `dest`, while its end has not
+    /// placed it: how many bytes it holds.
+    fn staged(dest: &std::path::Path, id: &str) -> Option<u64> {
+        let data = dest.join(".roomler-partial").join(id).join("data");
+        std::fs::metadata(data).ok().map(|m| m.len())
+    }
+
+    /// Invariant 2 — an upload's end is answered once its placement is done,
+    /// never before, and once: `files:complete` with today's fields, and
+    /// nothing more for that upload.
+    #[tokio::test]
+    async fn an_uploads_end_is_answered_once_when_its_placement_is_done() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("once");
+        let payload = bytes_of(200 * 1024 + 11);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&id)).await;
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(early.is_none(), "answered before its placement: {early:?}");
+        let keys: std::collections::BTreeSet<&str> = answer
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let today: std::collections::BTreeSet<&str> = ["bytes", "id", "path", "t"].into();
+        assert_eq!(keys, today, "{answer:?}");
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 2 — an end that fails in its placement lane (a short upload)
+    /// is answered once, with today's words.
+    #[tokio::test]
+    async fn a_short_upload_is_answered_once_with_todays_words() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("short");
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "w42.bin", "size": 102_400, "dest_path": temp.path()}))
+            .await;
+        for chunk in bytes_of(65_536).chunks(16 * 1024) {
+            pair.viewer
+                .send(&Bytes::copy_from_slice(chunk))
+                .await
+                .expect("the chunk went out");
+        }
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert_eq!(
+            answer,
+            Some(json!({
+                "t": "files:error",
+                "id": id,
+                "message": "short transfer: received 65536 of 102400 bytes",
+            }))
+        );
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 3 (D2-A) — a begin read while an earlier end places its file
+    /// is taken at once, and its chunks land; its own end waits for the
+    /// earlier placement (into another folder, so only the channel makes it
+    /// wait), and both answers come in order, both files whole.
+    #[tokio::test]
+    async fn a_begin_during_an_end_is_taken_at_once_and_its_end_waits_for_the_earlier() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (into_one, into_two) = (temp.path().join("one"), temp.path().join("two"));
+        for folder in [&into_one, &into_two] {
+            std::fs::create_dir(folder).expect("a folder");
+        }
+        let (first, second) = (id_of("first"), id_of("second"));
+        let (one, two) = (bytes_of(100 * 1024), bytes_of(300 * 1024 + 3));
+        let held = seams::hold_placing(&into_one);
+        let mut pair = served().await;
+        upload(&pair, &first, &into_one, &one).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        upload(&pair, &second, &into_two, &two).await;
+        let (accepted, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == second.as_str() && f["t"] == "files:accepted"
+        })
+        .await;
+        let (progress, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == second.as_str() && f["t"] == "files:progress"
+        })
+        .await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&second)).await;
+        held.release();
+        let done = |f: &Value| f["t"] == "files:complete" || f["t"] == "files:error";
+        let (a, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        let (b, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        pair.close().await;
+        assert!(reached, "the first end never reached its placement");
+        assert!(
+            accepted.is_some(),
+            "a begin read during an end was not answered within 5 s"
+        );
+        assert!(
+            progress.is_some(),
+            "its chunks were not received during the earlier end"
+        );
+        assert!(
+            early.is_none(),
+            "its end was answered before the earlier placement was done: {early:?}"
+        );
+        assert_whole(a.as_ref(), &first, &one);
+        assert_whole(b.as_ref(), &second, &two);
+    }
+
+    /// Invariant 3 (D2-A) — the staging folder an end removes once empty,
+    /// racing a begin into the same folder that has made that staging folder
+    /// and not yet its own `<id>` in it: the begin makes it again and
+    /// succeeds, and both files land whole.
+    #[tokio::test]
+    async fn a_begin_into_the_same_folder_survives_the_end_removing_its_staging() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).expect("a folder");
+        let staging = dest.join(".roomler-partial");
+        let (first, second) = (id_of("same-first"), id_of("same-second"));
+        let (one, two) = (bytes_of(90 * 1024), bytes_of(40 * 1024 + 7));
+        let held = Arc::new(seams::hold_placing(&dest));
+        let mut pair = served().await;
+        upload(&pair, &first, &dest, &one).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let (release, folder) = (held.clone(), staging.clone());
+        // The second begin, between its two makes: the first end goes on, and
+        // removes the staging folder once its own `<id>` is out of it.
+        seams::before_the_id(&dest, move || {
+            release.release();
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while folder.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = gone_tx.send(!folder.exists());
+        });
+        upload(&pair, &second, &dest, &two).await;
+        let done = |f: &Value| f["t"] == "files:complete" || f["t"] == "files:error";
+        let (a, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        let (b, _) = heard_until(&mut pair, Duration::from_secs(20), done).await;
+        pair.close().await;
+        assert!(reached, "the first end never reached its placement");
+        assert_eq!(
+            gone_rx.try_recv().ok(),
+            Some(true),
+            "the staging folder was not removed between the second begin's two makes"
+        );
+        assert_whole(a.as_ref(), &first, &one);
+        assert_whole(b.as_ref(), &second, &two);
+        assert!(!staging.exists(), "the staging folder is left behind");
+    }
+
+    /// D1-A — a `files:cancel` of the upload whose end is placing it leaves
+    /// it to that end: its staging stays while the placement reads it, the
+    /// file lands whole, and its one answer is the end's.
+    #[tokio::test]
+    async fn a_cancel_of_the_ending_upload_leaves_it_to_its_end() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("cancel-ending");
+        let payload = bytes_of(200 * 1024);
+        let log = Logged::start(tracing::Level::INFO);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:cancel", "id": id})).await;
+        let left = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: cancel requested")
+                && line.contains(&id)
+                && line.contains("in_cancelled=false")
+                && line.contains("ending=true")
+        })
+        .await;
+        let still_staged = staged(temp.path(), &id);
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(
+            left,
+            "the cancel was not read and left to the end within 5 s"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// A `files:resume` of the upload whose end is placing it is refused at
+    /// once, before its staging is touched; the file then lands whole.
+    #[tokio::test]
+    async fn a_resume_of_the_ending_upload_is_refused_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("resume-ending");
+        let payload = bytes_of(600 * 1024);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:resume", "id": id, "offset": 0}))
+            .await;
+        let (refused, _) = heard_until(&mut pair, Duration::from_secs(5), |f| {
+            f["id"] == id.as_str() && f["t"] == "files:error"
+        })
+        .await;
+        let still_staged = staged(temp.path(), &id);
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert_eq!(
+            refused,
+            Some(json!({
+                "t": "files:error",
+                "id": id,
+                "message": format!("files:resume {id} but its end is placing the file now"),
+            })),
+            "the resume's answer, within 5 s"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// Another `files:end` of the upload whose end is placing it gets no
+    /// answer of its own: the upload is answered once.
+    #[tokio::test]
+    async fn another_end_of_the_ending_upload_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("end-twice");
+        let payload = bytes_of(70 * 1024);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let (early, _) = heard_until(&mut pair, Duration::from_secs(1), answers(&id)).await;
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        let more = more_for(&mut pair, &id, Duration::from_secs(1)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(early.is_none(), "the other end was answered: {early:?}");
+        assert_whole(answer.as_ref(), &id, &payload);
+        assert!(more.is_empty(), "more for the upload: {more:?}");
+    }
+
+    /// Invariant 4 — the session ends while an upload's end places its file:
+    /// the placement goes on and the file lands whole, its staging and its
+    /// entry in the registry go as on any end, and its answer is not sent,
+    /// though the channel is still up.
+    #[tokio::test]
+    async fn an_end_placing_when_its_session_ends_lands_whole_and_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("session-ends");
+        let payload = bytes_of(300 * 1024);
+        let log = Logged::start(tracing::Level::DEBUG);
+        let held = seams::hold_placing(temp.path());
+        let mut pair = served().await;
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.end_session();
+        // The session's teardown runs at once (`on_session_end`): by now the
+        // channel's handler has ended its session.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        held.release();
+        let placed = temp.path().join("w42.bin");
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(placed.exists() && staged(temp.path(), &id).is_none())
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: complete") && line.contains(&id)
+        })
+        .await;
+        let not_sent = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: the end's answer is not sent") && line.contains(&id)
+        })
+        .await;
+        let (answer, _) = heard_until(&mut pair, Duration::from_millis(500), answers(&id)).await;
+        let up = pair.viewer.ready_state();
+        pair.close().await;
+        let text = log.text();
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(completed, "the placement did not finish: {text}");
+        assert!(not_sent, "its answer was not dropped: {text}");
+        assert_eq!(
+            up,
+            RTCDataChannelState::Open,
+            "the channel went down before the answer could be sent"
+        );
+        assert!(
+            answer.is_none(),
+            "answered after its session ended: {answer:?}"
+        );
+        assert_eq!(
+            std::fs::read(&placed).expect("the file landed"),
+            payload,
+            "the file, whole"
+        );
+        assert!(
+            !temp.path().join(".roomler-partial").exists(),
+            "its staging is left behind"
+        );
+        let registered = crate::files::PARTIAL_REGISTRY
+            .lock()
+            .map(|r| r.contains_key(&id))
+            .unwrap_or(false);
+        assert!(!registered, "its entry is left in the registry");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("files: answer not sent") && line.contains(&id)),
+            "an answer was sent on the closed channel: {text}"
+        );
+    }
+
+    /// Condition 1 — after a drop the viewer's next channel is another one.
+    /// While an upload's end places its file, a resume of it on another
+    /// channel is refused and a cancel of it there leaves it alone: its
+    /// staging is untouched, and the file lands whole.
+    #[tokio::test]
+    async fn another_channel_leaves_an_ending_upload_to_its_end() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().to_string_lossy().into_owned();
+        let id = id_of("elsewhere");
+        let payload = bytes_of(600 * 1024);
+        let here = crate::files::FilesHandler::new();
+        let elsewhere = crate::files::FilesHandler::new();
+        here.begin(
+            id.clone(),
+            "w42.bin".into(),
+            payload.len() as u64,
+            None,
+            Some(dest.as_str()),
+        )
+        .await
+        .expect("the upload begun");
+        for chunk in payload.chunks(64 * 1024) {
+            here.chunk(chunk).await.expect("a chunk written");
+        }
+        let ending = here.begin_end(&id).await.expect("its end begun");
+        let resumed = elsewhere.resume_incoming(&id, 0).await;
+        let cancelled = elsewhere.cancel_incoming(&id).await;
+        let still_staged = staged(temp.path(), &id);
+        let placed = ending.place().await;
+        let resumed_after = elsewhere.resume_incoming(&id, 0).await;
+        let refusal = resumed.expect_err("a resume elsewhere is refused");
+        assert_eq!(
+            refusal.to_string(),
+            format!("files:resume {id} but its end is placing the file now")
+        );
+        assert!(
+            matches!(cancelled, Ok(false)),
+            "a cancel elsewhere touched it: {cancelled:?}"
+        );
+        assert_eq!(
+            still_staged,
+            Some(payload.len() as u64),
+            "the staging the placement reads"
+        );
+        let (path, bytes) = placed.expect("the file placed");
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(path).expect("the file landed"), payload);
+        assert!(
+            !resumed_after
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("is placing the file now")),
+            "still refused as ending once placed: {resumed_after:?}"
+        );
     }
 }
