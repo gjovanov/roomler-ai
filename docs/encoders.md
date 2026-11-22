@@ -1983,7 +1983,7 @@ That charge does not reach the FFmpeg pump, so O18 asked what its encoders do wi
 same gap.
 
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
-(`encoder.rs:4882-5257`) opens each encoder as a relayed session does (`new_preferred`
+(`encoder.rs:4882-5296`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
 `agents/roomlerd/src/peer.rs:5470-5473`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
@@ -2062,16 +2062,15 @@ set "PKG_CONFIG_ALLOW_SYSTEM_LIBS=1"
 set "PATH=C:\ffmpeg-pin\bin;%PATH%"
 set "CMAKE_POLICY_VERSION_MINIMUM=3.5"
 set "CARGO_BUILD_JOBS=2"
-rem R1 is the defaults. R2: O18_DIMS=1280x720 and O18_TARGET=2000000.
-rem R3: R2 with O18_FPS=60, O18_NAMES=hevc_nvenc,hevc_amf and O18_444=0.
-set "O18_DIMS=1280x720"
-set "O18_TARGET=2000000"
+rem o18_ runs R1, R2 and R3 in turn; o18_r2 runs one row.
 cargo test -p roomlerd --lib --features ffmpeg-encoder -- --ignored o18_ --nocapture --test-threads=1 --skip clipboard::
 ```
 
-The other knobs are `O18_NAMES` (NVENC and AMF names, comma-separated), `O18_HOLD_MS`
-(500), `O18_444` (1: `hevc_nvenc` in 4:4:4 too) and `O18_WINDOW` (`200x120` at
-640×360, scaled with the frame, or `full`). Each encoder prints an `O18 open` line (the
+Each row is its own test (`o18_r1_640x360_at_30_fps_and_3_mbit`,
+`o18_r2_1280x720_at_30_fps_and_2_mbit`, `o18_r3_1280x720_at_60_fps_hevc`), and the cell
+reads no environment. Every row holds 500 ms, with a 200×120 noise window at 640×360
+scaled with the frame; R1 and R2 take every NVENC and AMF name and `hevc_nvenc` in 4:4:4
+too, R3 only `hevc_nvenc` and `hevc_amf`. Each encoder prints an `O18 open` line (the
 options, the context, the private options), an `O18 name=` line per arm, and a `summary`
 line whose `same_frames` counts the frames the two arms agree on. The command-line check,
 for `hevc_nvenc` (`hevc_amf`: `-rc vbr_latency -qp_i 22 -qp_p 22 -maxrate 3000000

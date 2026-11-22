@@ -4903,22 +4903,20 @@ mod tests {
     /// after the hold over the on-time second, and the verdict takes the
     /// libvpx cell's two thresholds: `grants` at 1.25 or more, `holds` at 1.10
     /// or less, `between` otherwise. `cap_binds=no` (the on-time second spent
-    /// under 0.85 of the cap) means the line says nothing: widen the window.
+    /// under 0.85 of the cap) means the line says nothing: that row needs a
+    /// wider noise window.
     ///
-    /// Knobs: `O18_NAMES` (`h264_nvenc,hevc_nvenc,av1_nvenc,h264_amf,hevc_amf,av1_amf`;
-    /// NVENC and AMF only, any other family is refused by name), `O18_DIMS`
-    /// (`640x360`), `O18_FPS` (30), `O18_TARGET` (3000000, the cap),
-    /// `O18_HOLD_MS` (500), `O18_444` (1: `hevc_nvenc` in 4:4:4 as well),
-    /// `O18_WINDOW` (`200x120` at 640x360, scaled with the frame, or `full`).
-    /// On a host with the GPU:
+    /// Each row is its own test ([`O18Row`]), so a row is run by name and reads
+    /// no environment: every row holds 500 ms, and its noise window is 200x120
+    /// at 640x360, scaled with the frame. NVENC and AMF only: any other family
+    /// is refused by name. On a host with the GPU (`o18_` runs the three rows
+    /// in turn, `o18_r2` one of them):
     ///
     /// ```text
     /// cargo test -p roomlerd --lib --features ffmpeg-encoder -- --ignored o18_ \
     ///   --nocapture --test-threads=1 --skip clipboard::
     /// ```
-    #[test]
-    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
-    fn o18_spend_after_a_hold() {
+    fn o18_spend_after_a_hold(row: O18Row) {
         /// What one arm read, frame by frame in the order sent.
         struct Read {
             bytes: Vec<usize>,
@@ -4937,35 +4935,17 @@ mod tests {
                 .finish();
             tracing::subscriber::with_default(subscriber, open)
         }
-        let knob = |k: &str, d: &str| -> String {
-            std::env::var(k)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| d.to_string())
-        };
-        let wxh = |v: &str, what: &str| -> (u32, u32) {
-            v.split_once('x')
-                .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
-                .unwrap_or_else(|| panic!("{what}: WxH, got {v}"))
-        };
-        let names = knob(
-            "O18_NAMES",
-            "h264_nvenc,hevc_nvenc,av1_nvenc,h264_amf,hevc_amf,av1_amf",
-        );
-        let (w, h) = wxh(&knob("O18_DIMS", "640x360"), "O18_DIMS");
-        let fps: u32 = knob("O18_FPS", "30").parse().expect("O18_FPS");
-        let maxrate: usize = knob("O18_TARGET", "3000000").parse().expect("O18_TARGET");
-        let hold_ms: u64 = knob("O18_HOLD_MS", "500").parse().expect("O18_HOLD_MS");
-        let with_444 = knob("O18_444", "1") == "1";
-        let window = knob("O18_WINDOW", "200x120");
+        let O18Row {
+            names,
+            w,
+            h,
+            fps,
+            maxrate,
+            with_444,
+        } = row;
+        let hold_ms: u64 = 500;
         // The noise window, centred and scaled with the frame (200x120 at 640x360).
-        let (ww, wh) = if window == "full" {
-            (w, h)
-        } else {
-            let (a, b) = wxh(&window, "O18_WINDOW");
-            ((w * a / 640).min(w), (h * b / 360).min(h))
-        };
+        let (ww, wh) = ((w * 200 / 640).min(w), (h * 120 / 360).min(h));
         let (x0, y0) = ((w - ww) / 2, (h - wh) / 2);
         let f = fps as usize;
         let (pre, post) = (3 * f, 3 * f);
@@ -5254,6 +5234,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One row of [`o18_spend_after_a_hold`], fixed in the code rather than read
+    /// from the environment, so a run is named by its test.
+    struct O18Row {
+        /// The encoders, comma-separated: NVENC and AMF names only.
+        names: &'static str,
+        w: u32,
+        h: u32,
+        fps: u32,
+        /// The cap, in bits a second.
+        maxrate: usize,
+        /// `hevc_nvenc` in 4:4:4 as well.
+        with_444: bool,
+    }
+
+    /// Every NVENC and AMF encoder the cascades carry.
+    const O18_NAMES: &str = "h264_nvenc,hevc_nvenc,av1_nvenc,h264_amf,hevc_amf,av1_amf";
+
+    /// R1: 640x360 at 30 fps and 3 Mbit/s.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r1_640x360_at_30_fps_and_3_mbit() {
+        o18_spend_after_a_hold(O18Row {
+            names: O18_NAMES,
+            w: 640,
+            h: 360,
+            fps: 30,
+            maxrate: 3_000_000,
+            with_444: true,
+        });
+    }
+
+    /// R2: 1280x720 at 30 fps and 2 Mbit/s.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r2_1280x720_at_30_fps_and_2_mbit() {
+        o18_spend_after_a_hold(O18Row {
+            names: O18_NAMES,
+            w: 1280,
+            h: 720,
+            fps: 30,
+            maxrate: 2_000_000,
+            with_444: true,
+        });
+    }
+
+    /// R3: R2 at 60 fps, HEVC only.
+    #[test]
+    #[ignore = "needs a hardware encoder; a measurement: run by name with --ignored --nocapture"]
+    fn o18_r3_1280x720_at_60_fps_hevc() {
+        o18_spend_after_a_hold(O18Row {
+            names: "hevc_nvenc,hevc_amf",
+            w: 1280,
+            h: 720,
+            fps: 60,
+            maxrate: 2_000_000,
+            with_444: false,
+        });
     }
 }
 
