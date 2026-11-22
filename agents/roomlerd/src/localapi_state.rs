@@ -194,6 +194,11 @@ pub struct DaemonState {
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
     rc_sessions: Option<crate::rc_sessions::RcSessionRegistry>,
+    /// FR-151 — the newest ask for an update this daemon recorded (an
+    /// operator's push, or its person's own ask), which `live_work` answers
+    /// as an age. The process's book ([`crate::updater::ask_book`]), which the
+    /// trigger forwarder writes.
+    asks: Arc<crate::updater::AskBook>,
     /// The netstack ICMP backend for the `ping` verb. `None` on a node not
     /// running the userspace stack (OS-TUN or non-overlay build).
     pinger: Option<Arc<dyn NetstackPinger>>,
@@ -586,6 +591,7 @@ impl DaemonState {
             overlay,
             consent,
             rc_sessions: None,
+            asks: crate::updater::ask_book(),
             pinger,
             tunnel_hub,
             rtt_cache,
@@ -731,6 +737,20 @@ impl DaemonState {
     /// list and a `false` disconnect, which is the honest answer there.
     pub fn with_rc_sessions(mut self, sessions: crate::rc_sessions::RcSessionRegistry) -> Self {
         self.rc_sessions = Some(sessions);
+        self
+    }
+
+    /// FR-151 — a book of asks of the test's own, in place of the process's.
+    #[cfg(test)]
+    pub(crate) fn with_ask_book(mut self, asks: Arc<crate::updater::AskBook>) -> Self {
+        self.asks = asks;
+        self
+    }
+
+    /// FR-151 — as if this daemon ran as root (or not), for a test.
+    #[cfg(test)]
+    pub(crate) fn with_privileged(mut self, privileged: bool) -> Self {
+        self.privileged = privileged;
         self
     }
 
@@ -1076,6 +1096,17 @@ impl LocalApiState for DaemonState {
         // children — vendor driver code — from a control-surface read on any
         // host that has not reached its server yet.
         Some(crate::encode::caps::summarize_cached())
+    }
+
+    fn live_work(&self) -> Option<tunnel_core::localapi::LiveWorkInfo> {
+        // The seam (FR-151 P1, commit 1): nothing live, no ask recorded.
+        let _ = (&self.rc_sessions, &self.asks);
+        Some(tunnel_core::localapi::LiveWorkInfo::default())
+    }
+
+    fn ask_for_update(&self) -> Result<(), String> {
+        // The seam: answered, and nothing recorded.
+        Ok(())
     }
 
     fn peers(&self) -> Vec<PeerInfo> {

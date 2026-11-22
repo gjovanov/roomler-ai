@@ -532,6 +532,9 @@ pub mod busy;
 #[cfg(test)]
 mod config_enum_pins;
 pub mod daemon_error;
+/// FR-151 — the Mac's root update helper waits for live work: the pure
+/// decision its macOS arm (`updater::run_update_helper`) runs.
+pub mod helper_gate;
 
 #[cfg(test)]
 mod tests {

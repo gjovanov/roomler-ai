@@ -288,9 +288,11 @@ fn recent_update_attempt_at(marker_path: &std::path::Path, cooldown: Duration) -
 
 /// The least time between two update-helper runs — launchd's `ThrottleInterval`
 /// (`com.roomler.update.plist`), made explicit for systemd. Locked to the plist
-/// by `update_helper_min_gap_matches_launchd_throttle_interval`.
-#[cfg(target_os = "linux")]
-const UPDATE_HELPER_MIN_GAP: Duration = Duration::from_secs(60);
+/// by `update_helper_min_gap_matches_launchd_throttle_interval`. FR-151: a
+/// Mac's waiting helper spaces the wakes it reads by the same gap
+/// (`helper_gate::next_step`), so a wake costs at most one cycle a minute
+/// whether launchd or the helper itself reads it.
+pub(crate) const UPDATE_HELPER_MIN_GAP: Duration = Duration::from_secs(60);
 
 /// The helper's run-spacing stamp, beside `update-attempt` in the root-owned
 /// log dir. Only root can write it, so no local user can shorten the gap.
@@ -461,7 +463,7 @@ pub struct GithubRelease {
     pub prerelease: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GithubAsset {
     pub name: String,
     pub browser_download_url: String,
@@ -1857,10 +1859,31 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
 /// `Unreachable(...)` (#1755) and verdicts into `Skipped(...)`, so a flaky
 /// link doesn't crash the agent.
 pub async fn check_once() -> CheckOutcome {
+    match probe_once().await {
+        Ok(newer) => download_newer(newer).await,
+        Err(outcome) => outcome,
+    }
+}
+
+/// FR-151 — a newer release with an installer for this platform, found by
+/// [`probe_once`] and not yet downloaded.
+#[derive(Debug, Clone)]
+pub struct NewerRelease {
+    pub current: String,
+    pub latest: String,
+    asset: GithubAsset,
+}
+
+/// FR-151 — [`check_once`]'s first half: the feed, and nothing downloaded.
+/// `Ok` when a newer release has an installer for this platform; otherwise
+/// the outcome `check_once` gives. The Mac's helper reads live work between
+/// the two halves, so a busy Mac with nothing to install never waits, and a
+/// deferred cycle downloads nothing ([`download_asset`] keeps no cache).
+pub async fn probe_once() -> Result<NewerRelease, CheckOutcome> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_latest_release().await {
         Ok(r) => r,
-        Err(e) => return failed("fetch", e),
+        Err(e) => return Err(failed("fetch", e)),
     };
     // Drafts are always skipped; prereleases are tolerated because
     // our 0.x release history marked them all `prerelease: true` and
@@ -1868,31 +1891,53 @@ pub async fn check_once() -> CheckOutcome {
     // /releases/latest endpoint excludes them. pick_latest_release
     // has already filtered by tag prefix.
     if release.draft {
-        return CheckOutcome::Skipped(format!("latest release is draft: {}", release.tag_name));
+        return Err(CheckOutcome::Skipped(format!(
+            "latest release is draft: {}",
+            release.tag_name
+        )));
     }
     let latest_parsed = match parse_version(&release.tag_name) {
         Some(_) => release.tag_name.clone(),
-        None => return CheckOutcome::Skipped(format!("unparseable tag {}", release.tag_name)),
-    };
-    if !is_newer(&latest_parsed, &current) {
-        return CheckOutcome::UpToDate {
-            current,
-            latest: latest_parsed,
-        };
-    }
-    let asset = match pick_asset_for_platform(&release.assets) {
-        Some(a) => a,
         None => {
-            return CheckOutcome::Skipped(format!(
-                "no installer asset for this platform in release {latest_parsed}"
-            ));
+            return Err(CheckOutcome::Skipped(format!(
+                "unparseable tag {}",
+                release.tag_name
+            )));
         }
     };
-    let downloaded = download_asset(asset, &latest_parsed).await;
-    match downloaded {
-        Ok(path) => CheckOutcome::UpdateReady {
+    if !is_newer(&latest_parsed, &current) {
+        return Err(CheckOutcome::UpToDate {
             current,
             latest: latest_parsed,
+        });
+    }
+    let asset = match pick_asset_for_platform(&release.assets) {
+        Some(a) => a.clone(),
+        None => {
+            return Err(CheckOutcome::Skipped(format!(
+                "no installer asset for this platform in release {latest_parsed}"
+            )));
+        }
+    };
+    Ok(NewerRelease {
+        current,
+        latest: latest_parsed,
+        asset,
+    })
+}
+
+/// FR-151 — [`check_once`]'s second half: download and verify the newer
+/// release's installer.
+pub async fn download_newer(newer: NewerRelease) -> CheckOutcome {
+    let NewerRelease {
+        current,
+        latest,
+        asset,
+    } = newer;
+    match download_asset(&asset, &latest).await {
+        Ok(path) => CheckOutcome::UpdateReady {
+            current,
+            latest,
             installer_path: path,
         },
         Err(e) => failed("download", e),
@@ -3134,6 +3179,65 @@ impl UpdateAsk {
     }
 }
 
+/// FR-151 — who asked this daemon for an update, as its [`AskBook`] keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskedBy {
+    /// An operator's push to this daemon's row (`rc:agent.update`), with its
+    /// pin, which a Mac's helper ignores: it installs the latest release.
+    Operator { pin: Option<String> },
+    /// The person this daemon runs as, through "Apply update"
+    /// (`tunnel_core::localapi::Request::AskForUpdate`).
+    Person,
+}
+
+/// FR-151 — one recorded ask: when, on the wall clock, and by whom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedAsk {
+    pub at: std::time::SystemTime,
+    pub by: AskedBy,
+}
+
+/// FR-151 — the newest ask for an update this daemon recorded, which the
+/// LocalAPI's `live_work` answers as an age. The Mac's root update helper
+/// reads it to tell an operator's push, or the person's own ask, from a plain
+/// wake of `com.roomler.update`, whose wake file carries nothing
+/// ([`MACOS_UPDATE_TRIGGER`]). Kept in memory only: a daemon that restarts
+/// has recorded none.
+#[derive(Debug, Default)]
+pub struct AskBook(std::sync::Mutex<Option<RecordedAsk>>);
+
+impl AskBook {
+    /// Record an ask now.
+    pub fn record(&self, by: AskedBy) {
+        self.record_at(by, std::time::SystemTime::now());
+    }
+
+    /// Record an ask made at `at`.
+    pub fn record_at(&self, by: AskedBy, at: std::time::SystemTime) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(RecordedAsk { at, by });
+    }
+
+    /// The newest ask recorded.
+    pub fn newest(&self) -> Option<RecordedAsk> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whole seconds since the newest ask, as of `now`. `None` when none was
+    /// recorded, or when it reads as made after `now` (the clock went back):
+    /// such an ask is never fresh.
+    pub fn age_secs(&self, now: std::time::SystemTime) -> Option<u64> {
+        let newest = self.newest()?;
+        now.duration_since(newest.at).ok().map(|age| age.as_secs())
+    }
+}
+
+/// FR-151 — this process's [`AskBook`], which the trigger forwarder writes
+/// and the LocalAPI reads.
+pub fn ask_book() -> std::sync::Arc<AskBook> {
+    static BOOK: std::sync::OnceLock<std::sync::Arc<AskBook>> = std::sync::OnceLock::new();
+    BOOK.get_or_init(Default::default).clone()
+}
+
 /// Create the update trigger channel and register its sender — for a daemon
 /// whose updater will run. Called once from `run_cmd`; the receiver goes to
 /// [`run_periodic`].
@@ -3957,19 +4061,26 @@ async fn forward_triggers(
 ) {
     forward_triggers_to(
         std::path::Path::new(update_trigger_path()),
+        &ask_book(),
         shutdown,
         trigger_rx,
     )
     .await
 }
 
-/// [`forward_triggers`] against an explicit wake path, so a test can prove a
-/// push writes the wake file and takes no install path at all.
+/// [`forward_triggers`] against an explicit wake path and [`AskBook`], so a
+/// test can prove a push writes the wake file and takes no install path at
+/// all. FR-151: an operator's push is recorded in `book` before the wake
+/// file is written, so the helper it wakes reads the push; the outage
+/// recheck records nothing, and is a plain wake.
 async fn forward_triggers_to(
     wake: &std::path::Path,
+    book: &AskBook,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut trigger_rx: tokio::sync::mpsc::Receiver<UpdateAsk>,
 ) {
+    // The seam (FR-151 P1, commit 1): today's forwarder, which records nothing.
+    let _ = book;
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -4114,9 +4225,15 @@ pub fn auto_update_decision(setting: Option<&str>, marker: Option<&'static str>)
 /// - Linux: the root ladder the in-process updater uses on a system install
 ///   (`apt-get`/`dpkg`, or the tarball's own placement). A per-user daemon runs
 ///   the new binary from its next restart.
+///
+/// FR-151: `stop` resolves on SIGTERM. Only the Mac's gate polls it, while
+/// it reads the halves and while it waits, so the handler is installed then
+/// and not before; Linux never polls it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub async fn run_update_helper() -> anyhow::Result<()> {
+pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> anyhow::Result<()> {
     use anyhow::bail;
+    // The seam (FR-151 P1, commit 1): no gate polls it yet.
+    let _ = stop;
 
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
@@ -5112,7 +5229,9 @@ mod tests {
             // only thing under test here.
             return;
         }
-        let err = run_update_helper().await.expect_err("must refuse non-root");
+        let err = run_update_helper(std::future::pending())
+            .await
+            .expect_err("must refuse non-root");
         assert!(
             err.to_string().contains("must run as root"),
             "unexpected refusal: {err:#}"
@@ -6027,8 +6146,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(4);
         let w = wake.clone();
+        let book = std::sync::Arc::new(AskBook::default());
+        let b = book.clone();
         let task =
-            tokio::spawn(async move { forward_triggers_to(&w, shutdown_rx, trigger_rx).await });
+            tokio::spawn(async move { forward_triggers_to(&w, &b, shutdown_rx, trigger_rx).await });
 
         async fn appears(p: &std::path::Path) -> bool {
             for _ in 0..200 {

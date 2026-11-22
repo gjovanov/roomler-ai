@@ -2036,7 +2036,9 @@ async fn daemon_main() -> Result<()> {
             // runs this for a per-user install.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
-                updater::run_update_helper().await
+                // FR-151 — SIGTERM ends a Mac's waiting helper at once, through
+                // the daemon's one handler, installed only when the gate polls it.
+                updater::run_update_helper(terminate_signal(None, Path::new("/"))).await
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
