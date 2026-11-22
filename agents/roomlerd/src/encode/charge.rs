@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-148 D51 B4f — the time an encode is charged.
 //!
 //! libvpx's one-pass CBR reads its frame rate off the gaps between the pts it

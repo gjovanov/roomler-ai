@@ -2269,7 +2269,7 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
   target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080
   offline. `encode_sync` now stamps a frame whose pts is not after the last
   one with the last pts plus the time since the last encode (`refed_pts`,
-  `agents/roomlerd/src/encode/charge.rs:47`). Offline the keepalive then
+  `agents/roomlerd/src/encode/charge.rs:49`). Offline the keepalive then
   costs what a frame with a pts of its own costs: 1.00× of the target at
   800×600 and 0.99× at 1920×1080, where a capture is coded at q 253 rather
   than borrowing its way to q 221. No pixels are copied. Pinned by
