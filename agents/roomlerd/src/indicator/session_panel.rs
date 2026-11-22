@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::PromptView;
+use super::{NotShown, PromptView};
 
 /// The word a worker says in its caps frame (`delegate::DelegateFrame::WorkerCaps`)
 /// when it hosts the panel for the root daemon. Matched by equality, as
@@ -397,14 +397,21 @@ pub async fn ask(road: &dyn Road, view: &PromptView) -> SessionPanel {
 
 /// Where one question went, for its per-prompt line: `native`, then
 /// `panel=session|root` when a panel shows it, or `session_panel=<…>
-/// why=<…>` when the session panel did not. Every field but `native` is
-/// absent off a one-row Mac's root daemon, so those lines read as before.
+/// why=<…>` when the session panel did not. Off a one-row Mac's root daemon
+/// those two are absent, so its lines read as before. #4164 — and
+/// `panel_busy=true` when no panel showed it because a panel showed another
+/// question, on any daemon: the caller's words then say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompted {
     pub native: bool,
     panel: Option<&'static str>,
     session_panel: Option<&'static str>,
     why: Option<String>,
+    /// #4164 — this daemon's own panel refused it as busy
+    /// ([`super::NotShown::Busy`]), or on a one-row Mac's root daemon the
+    /// session panel did (`busy`), or was not asked because the root
+    /// daemon's own panel showed another (`root_panel_busy`).
+    busy: bool,
 }
 
 impl Prompted {
@@ -415,6 +422,16 @@ impl Prompted {
             panel: None,
             session_panel: None,
             why: None,
+            busy: false,
+        }
+    }
+
+    /// #4164 — this daemon's own panel's answer alone, off a one-row Mac's
+    /// root daemon: [`Self::plain`], and busy when that panel showed another.
+    fn own(answer: Result<(), NotShown>) -> Self {
+        Self {
+            busy: answer == Err(NotShown::Busy),
+            ..Self::plain(answer.is_ok())
         }
     }
 
@@ -438,6 +455,28 @@ impl Prompted {
     pub fn on_the_session_panel(&self) -> bool {
         self.panel == Some("session")
     }
+
+    /// #4164 — the `panel_busy` field: `true` when no panel showed the
+    /// question because a panel showed another, absent otherwise.
+    pub fn panel_busy(&self) -> Option<bool> {
+        self.busy.then_some(true)
+    }
+
+    /// #4164 — why no surface showed the question, when none did: a panel
+    /// busy with another question, over `app`, the cause the app's side
+    /// found (`companion::TrayVerdict::why_not_shown`). A busy panel wins,
+    /// a closed road to the app included: the panel took no question because
+    /// it showed another, so that is what kept this one from the person.
+    pub(crate) fn why_not_shown(
+        &self,
+        app: crate::consent::NoSurface,
+    ) -> crate::consent::NoSurface {
+        if self.busy {
+            crate::consent::NoSurface::PanelBusy
+        } else {
+            app
+        }
+    }
 }
 
 /// The chain for one question: the session panel, then the root daemon's own
@@ -450,19 +489,31 @@ impl Prompted {
 /// another question the session panel is not asked, and while the session
 /// panel shows another the root daemon's own is not tried. Each is then the
 /// road of a question asked while the panel is busy: the app.
+///
+/// #4164 — and a question no panel showed because one showed another is
+/// `busy`, the caller's cause when nothing else shows it: the root daemon's
+/// own panel refusing it as busy (`root_panel`'s [`NotShown::Busy`]), the
+/// session panel's `busy`, and the session panel not asked for the root
+/// daemon's own showing another. A busy panel is one fact for the caller,
+/// whichever panel held it. `not_up`, `no_answer` and every other
+/// `not_asked` keep the app's cause.
 pub async fn chain(
     road: &dyn Road,
     view: &PromptView,
-    root_panel: impl FnOnce() -> bool,
+    root_panel: impl FnOnce() -> Result<(), NotShown>,
 ) -> Prompted {
     if !road.one_row() {
-        return Prompted::plain(root_panel());
+        return Prompted::own(root_panel());
     }
     let asked = if road.root_panel_up() {
         SessionPanel::NotAsked(NotAsked::RootPanelBusy)
     } else {
         ask(road, view).await
     };
+    let mut busy = matches!(
+        asked,
+        SessionPanel::Busy | SessionPanel::NotAsked(NotAsked::RootPanelBusy)
+    );
     let (session_panel, why) = match asked {
         SessionPanel::Shown => {
             return Prompted {
@@ -470,16 +521,23 @@ pub async fn chain(
                 panel: Some("session"),
                 session_panel: None,
                 why: None,
+                busy: false,
             };
         }
         SessionPanel::NotAsked(not) => {
-            if !road.session_panel_up() && root_panel() {
-                return Prompted {
-                    native: true,
-                    panel: Some("root"),
-                    session_panel: None,
-                    why: None,
-                };
+            if !road.session_panel_up() {
+                match root_panel() {
+                    Ok(()) => {
+                        return Prompted {
+                            native: true,
+                            panel: Some("root"),
+                            session_panel: None,
+                            why: None,
+                            busy: false,
+                        };
+                    }
+                    Err(refused) => busy |= refused == NotShown::Busy,
+                }
             }
             ("not_asked", not.why().to_string())
         }
@@ -492,6 +550,7 @@ pub async fn chain(
         panel: None,
         session_panel: Some(session_panel),
         why: Some(why),
+        busy,
     }
 }
 
@@ -866,12 +925,12 @@ mod tests {
     /// FR-149 AC2 — `native` comes only from the worker's `shown`, within
     /// the wait: `busy`, `not_up`, silence, no worker, no word, the switch
     /// off and a person socket not served give no `native` from the session
-    /// panel. The root daemon's own panel is out of the way here (`false`).
+    /// panel. The root daemon's own panel is out of the way here (no panel).
     #[tokio::test]
     async fn native_comes_only_from_the_session_processs_word() {
         let v = view(ID, Duration::from_secs(30));
         let shown = StoodIn::one_row(Asked::Told(PanelState::Shown));
-        let p = chain(&shown, &v, || false).await;
+        let p = chain(&shown, &v, || Err(NotShown::NoPanel)).await;
         assert!(p.native && p.on_the_session_panel(), "{p:?}");
         assert_eq!(shown.asked(), 1);
 
@@ -902,7 +961,7 @@ mod tests {
         unserved.served = None;
         cases.push(("person socket", unserved, "not_asked"));
         for (case, road, said) in &cases {
-            let p = chain(road, &v, || false).await;
+            let p = chain(road, &v, || Err(NotShown::NoPanel)).await;
             assert!(!p.native, "{case}: {p:?}");
             assert_eq!(p.session_panel, Some(*said), "{case}");
             assert!(p.why.is_some(), "{case}: a why");
@@ -922,7 +981,7 @@ mod tests {
         for console in [None, Some(502)] {
             let mut road = StoodIn::one_row(Asked::Told(PanelState::Shown));
             road.console = console;
-            let p = chain(&road, &v, || false).await;
+            let p = chain(&road, &v, || Err(NotShown::NoPanel)).await;
             assert!(!p.native, "{console:?}");
             assert_eq!(
                 (p.session_panel, p.why.as_deref()),
@@ -949,7 +1008,7 @@ mod tests {
             let tried = AtomicBool::new(false);
             let p = chain(&road, &v, || {
                 tried.store(true, Ordering::SeqCst);
-                true
+                Ok(())
             })
             .await;
             assert!(!tried.load(Ordering::SeqCst), "{told:?}: a second panel");
@@ -958,14 +1017,14 @@ mod tests {
         // Not asked: the root daemon's own panel is the second choice (D2).
         let mut road = StoodIn::one_row(Asked::Told(PanelState::Shown));
         road.worker = None;
-        let p = chain(&road, &v, || true).await;
+        let p = chain(&road, &v, || Ok(())).await;
         assert!(p.native && p.panel == Some("root"), "{p:?}");
         // Across questions: the root daemon's own panel shows another, so the
         // session panel is not asked, and the question goes on as one asked
-        // while that panel is busy (its `false`).
+        // while that panel is busy (its busy refusal).
         let mut road = StoodIn::one_row(Asked::Told(PanelState::Shown));
         road.root_up = true;
-        let p = chain(&road, &v, || false).await;
+        let p = chain(&road, &v, || Err(NotShown::Busy)).await;
         assert_eq!(road.asked(), 0, "a second panel asked for");
         assert!(!p.native, "{p:?}");
         assert_eq!(
@@ -983,9 +1042,196 @@ mod tests {
         // Off a one-row Mac's root daemon: its own panel, and no new field.
         let mut road = StoodIn::one_row(Asked::Told(PanelState::Shown));
         road.one_row = false;
-        assert_eq!(chain(&road, &v, || true).await, Prompted::plain(true));
-        assert_eq!(chain(&road, &v, || false).await, Prompted::plain(false));
+        assert_eq!(chain(&road, &v, || Ok(())).await, Prompted::plain(true));
+        assert_eq!(
+            chain(&road, &v, || Err(NotShown::NoPanel)).await,
+            Prompted::plain(false)
+        );
         assert_eq!(road.asked(), 0);
+    }
+
+    /// #4164 — a question no panel showed because a panel showed another is
+    /// busy for its caller, whichever panel held it: the root daemon's own
+    /// panel refusing it as busy (off a one-row Mac, and on one where the
+    /// session panel was not asked), the session panel's `busy` (C8), and the
+    /// session panel not asked because the root daemon's own panel held
+    /// another (`root_panel_busy`, whatever that panel then answers: the hold
+    /// is what kept the session panel from it). Busy wins over either cause
+    /// the app's side finds. Everything else keeps the app's cause: no panel,
+    /// `not_up`, `no_answer`, and `not_asked` with no root panel, or while
+    /// the session panel shows another (the root daemon's own not tried). A
+    /// shown question is never busy. FR-149's routing is unchanged: the same
+    /// `session_panel` field, the root daemon's own panel tried exactly when
+    /// it was before.
+    ///
+    /// Red before #4164: no answer was busy, and the caller read a busy panel
+    /// as no panel at all ("no one at its screen").
+    #[tokio::test]
+    async fn a_panel_showing_another_question_is_busy_for_the_caller() {
+        use crate::consent::NoSurface;
+        let v = view(ID, Duration::from_secs(30));
+        let shown = || Asked::Told(PanelState::Shown);
+        let off = || {
+            let mut road = StoodIn::one_row(shown());
+            road.one_row = false;
+            road
+        };
+        let root_up = || {
+            let mut road = StoodIn::one_row(shown());
+            road.root_up = true;
+            road
+        };
+        let no_worker = || {
+            let mut road = StoodIn::one_row(shown());
+            road.worker = None;
+            road
+        };
+        let mut elsewhere = StoodIn::one_row(shown());
+        elsewhere.console = Some(502);
+        elsewhere.session_up = true;
+        let (busy, free) = (Err(NotShown::Busy), Err(NotShown::NoPanel));
+        // (case, road, the root daemon's own panel's answer, busy for the
+        // caller, `native`, `session_panel`, whether its own panel was tried)
+        type Case = (
+            &'static str,
+            StoodIn,
+            Result<(), NotShown>,
+            bool,
+            bool,
+            Option<&'static str>,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "off one row: its own panel busy",
+                off(),
+                busy,
+                true,
+                false,
+                None,
+                true,
+            ),
+            (
+                "off one row: no panel",
+                off(),
+                free,
+                false,
+                false,
+                None,
+                true,
+            ),
+            ("off one row: shown", off(), Ok(()), false, true, None, true),
+            (
+                "the session panel busy (C8)",
+                StoodIn::one_row(Asked::Told(PanelState::Busy)),
+                free,
+                true,
+                false,
+                Some("busy"),
+                false,
+            ),
+            (
+                "root_panel_busy, its own panel busy",
+                root_up(),
+                busy,
+                true,
+                false,
+                Some("not_asked"),
+                true,
+            ),
+            (
+                "root_panel_busy, its own panel gone",
+                root_up(),
+                free,
+                true,
+                false,
+                Some("not_asked"),
+                true,
+            ),
+            (
+                "not asked (no worker), its own panel busy",
+                no_worker(),
+                busy,
+                true,
+                false,
+                Some("not_asked"),
+                true,
+            ),
+            (
+                "not asked (no worker), no panel",
+                no_worker(),
+                free,
+                false,
+                false,
+                Some("not_asked"),
+                true,
+            ),
+            (
+                "not asked (no worker), its own panel shows it",
+                no_worker(),
+                Ok(()),
+                false,
+                true,
+                None,
+                true,
+            ),
+            (
+                "not asked (not at the console) while the session panel shows another",
+                elsewhere,
+                busy,
+                false,
+                false,
+                Some("not_asked"),
+                false,
+            ),
+            (
+                "not up",
+                StoodIn::one_row(Asked::Told(PanelState::NotUp { why: "x".into() })),
+                busy,
+                false,
+                false,
+                Some("not_up"),
+                false,
+            ),
+            (
+                "no answer",
+                StoodIn::one_row(Asked::NoAnswer),
+                busy,
+                false,
+                false,
+                Some("no_answer"),
+                false,
+            ),
+            (
+                "shown on the session panel",
+                StoodIn::one_row(shown()),
+                busy,
+                false,
+                true,
+                None,
+                false,
+            ),
+        ];
+        for (case, road, own, busy, native, said, tried) in &cases {
+            let was_tried = AtomicBool::new(false);
+            let p = chain(road, &v, || {
+                was_tried.store(true, Ordering::SeqCst);
+                *own
+            })
+            .await;
+            assert_eq!(p.native, *native, "{case}: {p:?}");
+            assert_eq!(p.panel_busy(), busy.then_some(true), "{case}: {p:?}");
+            assert_eq!(p.session_panel, *said, "{case}: FR-149's field");
+            assert_eq!(
+                was_tried.load(Ordering::SeqCst),
+                *tried,
+                "{case}: its own panel tried"
+            );
+            for app in [NoSurface::NothingUp, NoSurface::RoadClosed] {
+                let want = if *busy { NoSurface::PanelBusy } else { app };
+                assert_eq!(p.why_not_shown(app), want, "{case}, over {app:?}");
+            }
+        }
     }
 
     /// The question crosses with its time left in milliseconds, and the

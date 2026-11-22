@@ -4552,6 +4552,165 @@ mod tray_start_tests {
             "{what}: the app showed it, and nobody answered"
         );
     }
+
+    /// #4164 — an exec question that this daemon's consent panel did not take
+    /// because it showed another question, and that nothing else showed,
+    /// ends with words that say so: the device's consent panel was showing
+    /// another question. The question goes up as the WS loop puts it up: the
+    /// daemon's own panel first (`ViewerIndicator::show_prompt`, busy for the
+    /// task, `indicator::own_panel_stand_in`), then the other surfaces
+    /// ([`crate::signaling::exec_surfaces_up`]), and the answer is worded as
+    /// the command's task words it ([`crate::signaling::exec_refusal`]). The
+    /// busy panel wins over every cause the app's side finds: no companion,
+    /// nobody at the screen, no marker to read, and each closed road
+    /// ([`closed_roads`]). The controls: an open road shows the question, and
+    /// its window's end is the person's timeout ([`open_roads`]); no panel
+    /// keeps FR-27's words.
+    ///
+    /// Red before #4164: a busy panel read "no one at its screen and the
+    /// Roomler desktop app is not running", or a closed road's words.
+    #[test]
+    fn an_exec_question_a_busy_panel_did_not_take_says_the_panel_was_busy() {
+        use crate::consent::{Decision, NoSurface};
+        use crate::indicator::NotShown;
+        use crate::indicator::own_panel_stand_in::answering;
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let nobody_there = Host::default();
+        nobody_there.nobody.store(true, SeqCst);
+        let works = Host::default();
+        // No notification: the panel and the companion alone decide.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let words_at_the_windows_end = |stood: StandIn, own: Result<(), NotShown>, marker: bool| {
+            let ind = ind.clone();
+            rt.block_on(asking(
+                stood,
+                answering(own, async move {
+                    let view = exec_view("b4");
+                    let on_screen = ind.show_prompt(view.clone()).await;
+                    assert!(!on_screen.native, "{on_screen:?}");
+                    let shown =
+                        crate::signaling::exec_surfaces_up(marker, &ind, view, on_screen).await;
+                    crate::signaling::exec_refusal(Decision::Timeout, shown)
+                }),
+            ))
+        };
+        let busy = crate::consent::nobody_could_be_asked("execution", NoSurface::PanelBusy);
+        let on = |host: &Host| StandIn::new(host_steps(host));
+        for (stood, marker, what) in [
+            (on(&none), true, "no companion"),
+            (on(&nobody_there), true, "nobody at the screen"),
+            (on(&works), false, "a companion with no marker to read"),
+        ] {
+            let words = words_at_the_windows_end(stood, Err(NotShown::Busy), marker);
+            assert_eq!(words, busy, "{what}, and the panel busy");
+            for guess in ["screen", "app is not running"] {
+                assert!(!words.contains(guess), "{what}: {guess:?} in {words}");
+            }
+        }
+        for (stood, what) in closed_roads(&works) {
+            assert_eq!(
+                words_at_the_windows_end(stood, Err(NotShown::Busy), true),
+                busy,
+                "{what}, and the panel busy: the busy panel wins"
+            );
+        }
+        for (stood, what) in open_roads(&works) {
+            assert_eq!(
+                words_at_the_windows_end(stood, Err(NotShown::Busy), true),
+                "the operator at this device did not approve the command (Timeout)",
+                "{what}, and the panel busy: the app showed it, and nobody answered"
+            );
+        }
+        assert_eq!(
+            words_at_the_windows_end(on(&none), Err(NotShown::NoPanel), true),
+            crate::consent::nobody_could_be_asked("execution", NoSurface::NothingUp),
+            "no panel and no companion: FR-27's words"
+        );
+    }
+
+    /// #4164 — an SSH question reads a busy panel as an exec one does, asked
+    /// as the daemon asks it ([`crate::ssh::ask_here`], through
+    /// [`Companion::System`]) with its own panel busy for the task and no
+    /// notification, for a 1 s window: no companion, and a closed road on one
+    /// row and on two, end with the busy panel's words naming the SSH
+    /// policy. The controls: an open road shows the question, and its
+    /// window's end is the person's timeout; no panel keeps FR-27's words.
+    ///
+    /// Red before #4164: a busy panel read "no one at its screen and the
+    /// Roomler desktop app is not running", or a closed road's words.
+    #[cfg(feature = "ssh-server")]
+    #[test]
+    fn an_ssh_question_a_busy_panel_did_not_take_says_the_panel_was_busy() {
+        use crate::consent::NoSurface;
+        use crate::indicator::NotShown;
+        use crate::indicator::own_panel_stand_in::answering;
+        let rt = runtime();
+        let works = Host::default();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let refusal_at_the_windows_end = |stood: StandIn, own: Result<(), NotShown>| {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let broker = crate::consent::ConsentBroker::new(
+                crate::consent::Mode::AutoGrant,
+                dir.path().join("consent"),
+            )
+            .expect("a broker on its own folder");
+            let ind = crate::indicator::ViewerIndicator::disabled();
+            let id = bson::oid::ObjectId::new().to_hex();
+            rt.block_on(asking(
+                stood,
+                answering(own, async move {
+                    crate::ssh::ask_here(
+                        &broker,
+                        &ind,
+                        Companion::System,
+                        "Alice",
+                        Some("g4164"),
+                        &id,
+                        "open an interactive shell",
+                        Duration::from_secs(1),
+                    )
+                    .await
+                }),
+            ))
+            .expect_err("nobody answered")
+        };
+        let busy = crate::consent::nobody_could_be_asked("SSH", NoSurface::PanelBusy);
+        assert_eq!(
+            refusal_at_the_windows_end(StandIn::new(host_steps(&none)), Err(NotShown::Busy)),
+            busy,
+            "no companion, and the panel busy"
+        );
+        let roads = closed_roads(&works);
+        for row in ["one row", "two rows"] {
+            let (stood, what) = roads
+                .iter()
+                .find(|(_, what)| what.starts_with(row))
+                .cloned()
+                .expect("a closed road on this row");
+            assert_eq!(
+                refusal_at_the_windows_end(stood, Err(NotShown::Busy)),
+                busy,
+                "{what}, and the panel busy: the busy panel wins"
+            );
+        }
+        let (announced, what) = open_roads(&works)
+            .into_iter()
+            .find(|(_, what)| what.starts_with("two rows"))
+            .expect("two rows' open road");
+        assert_eq!(
+            refusal_at_the_windows_end(announced, Err(NotShown::Busy)),
+            "nobody approved this session at the device within 1s",
+            "{what}, and the panel busy: the app showed it, and nobody answered"
+        );
+        assert_eq!(
+            refusal_at_the_windows_end(StandIn::new(host_steps(&none)), Err(NotShown::NoPanel)),
+            crate::consent::nobody_could_be_asked("SSH", NoSurface::NothingUp),
+            "no panel and no companion: FR-27's words"
+        );
+    }
 }
 
 /// Where the Linux companion lives: `/usr/bin` from its .deb, `/usr/local/bin`

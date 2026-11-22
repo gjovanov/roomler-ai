@@ -252,13 +252,13 @@ impl ViewerIndicator {
 
     /// FR-27 — put a consent question on this device's screen, natively.
     ///
-    /// Returns `false` when this build/platform/session has no native surface
-    /// — which is the ordinary answer on a headless host, under a root daemon
+    /// `native` is `false` when this build/platform/session has no native
+    /// surface — the ordinary answer on a headless host, under a root daemon
     /// with no `DISPLAY` (a Wayland desktop's per-user daemon shows the X11
     /// panel through Xwayland, `x11.rs`), and in a build without the per-OS
-    /// feature. The caller then falls back
-    /// to the desktop companion, and only reports `no_prompt_surface` when
-    /// that fails too.
+    /// feature — or when its panel shows another question (#4164, `busy`).
+    /// The caller then falls back to the desktop companion, and only reports
+    /// `no_prompt_surface` when that fails too.
     ///
     /// Answers arrive on the `ConsentSender` given at construction, never by
     /// resolving consent here: the broker stays the single decision point.
@@ -271,7 +271,7 @@ impl ViewerIndicator {
     /// per-prompt line ([`session_panel::Prompted`]).
     pub async fn show_prompt(&self, view: PromptView) -> session_panel::Prompted {
         let own = view.clone();
-        session_panel::chain(&session_panel::TheRoad, &view, || self.inner.prompt(own)).await
+        session_panel::chain(&session_panel::TheRoad, &view, || self.own_panel(own)).await
     }
 
     /// FR-93 P6f — the last on-screen surface: the question as a desktop
@@ -450,6 +450,116 @@ impl ViewerIndicator {
             self.inner.hide(session_id.to_hex());
         }
     }
+
+    /// #4164 — this daemon's own panel's answer for `view`: up, or why not.
+    /// A test stands it in for its own task (`own_panel_stand_in`): no
+    /// lane can hold a platform panel busy where the callers' tests run.
+    fn own_panel(&self, view: PromptView) -> Result<(), NotShown> {
+        #[cfg(test)]
+        if let Some(answer) = own_panel_stand_in::now() {
+            return answer;
+        }
+        self.inner.prompt(view)
+    }
+}
+
+/// #4164 — why this daemon's own consent panel did not take a question. The
+/// caller's words differ: a panel showing another question is on someone's
+/// screen, and no panel here may mean nobody is at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotShown {
+    /// The panel shows another question: at most one on screen.
+    Busy,
+    /// No panel here can show a question now: none in this build, no
+    /// display, a pump that never came up or has ended, or (macOS) a window
+    /// server that does not serve this process now.
+    NoPanel,
+}
+
+/// #4164 — a native panel's one slot: the question it shows, if any. Each
+/// backend's shared state is one, so [`panel_takes`] is one rule for all three.
+#[cfg_attr(
+    not(any(
+        all(target_os = "windows", feature = "viewer-indicator"),
+        all(target_os = "linux", feature = "viewer-indicator-x11"),
+        all(target_os = "macos", feature = "viewer-indicator-macos"),
+    )),
+    allow(dead_code)
+)]
+pub(crate) trait Slot {
+    /// Whether a question is up.
+    fn holds(&self) -> bool;
+    /// Put `view` up: the backend's fields, and its redraw flag where it has one.
+    fn fill(&mut self, view: PromptView);
+}
+
+/// #4164 — how a native panel takes a question, the same on every platform.
+/// No panel first: `reaches`, read with no lock held, since on macOS it
+/// waits for the main thread, whose pump takes the slot's lock. Then busy,
+/// then the slot takes it. A panel that cannot reach the screen is no panel,
+/// whatever its slot holds: a question kept by a panel that is gone is shown
+/// to nobody, and its caller must not read it as a panel someone could see.
+#[cfg_attr(
+    not(any(
+        all(target_os = "windows", feature = "viewer-indicator"),
+        all(target_os = "linux", feature = "viewer-indicator-x11"),
+        all(target_os = "macos", feature = "viewer-indicator-macos"),
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn panel_takes<S: Slot>(
+    reaches: impl FnOnce() -> bool,
+    slot: &std::sync::Mutex<S>,
+    view: PromptView,
+) -> Result<(), NotShown> {
+    if !reaches() {
+        return Err(NotShown::NoPanel);
+    }
+    let mut s = slot.lock().unwrap();
+    // At most one on screen: two overlapping Approve/Deny panels is how
+    // someone approves the wrong thing.
+    if s.holds() {
+        return Err(NotShown::Busy);
+    }
+    s.fill(view);
+    Ok(())
+}
+
+/// #4164 — a test's own panel: what [`ViewerIndicator::show_prompt`] reads as
+/// this daemon's own panel's answer, for the task a test runs it in. Tasks
+/// outside [`answering`](own_panel_stand_in::answering) ask the platform's.
+#[cfg(test)]
+pub(crate) mod own_panel_stand_in {
+    use super::NotShown;
+
+    tokio::task_local! {
+        static ANSWER: Result<(), NotShown>;
+    }
+
+    /// Run `fut` with this daemon's own panel answering `answer` to every
+    /// question it asks.
+    pub(crate) async fn answering<F: std::future::Future>(
+        answer: Result<(), NotShown>,
+        fut: F,
+    ) -> F::Output {
+        ANSWER.scope(answer, fut).await
+    }
+
+    /// The answer stood in for this task, if there is one.
+    pub(super) fn now() -> Option<Result<(), NotShown>> {
+        ANSWER.try_with(|answer| *answer).ok()
+    }
+}
+
+/// #4164 — a slot for a test: the question it holds.
+#[cfg(test)]
+impl Slot for Option<PromptView> {
+    fn holds(&self) -> bool {
+        self.is_some()
+    }
+    fn fill(&mut self, view: PromptView) {
+        *self = Some(view);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,8 +665,8 @@ impl NoPanel {
             "this build has no native consent panel for the current platform"
         ))
     }
-    fn prompt(&self, _view: PromptView) -> bool {
-        false
+    fn prompt(&self, _view: PromptView) -> Result<(), NotShown> {
+        Err(NotShown::NoPanel)
     }
     fn dismiss(&self, _session_hex: &str) {}
 }
@@ -607,10 +717,12 @@ impl Inner {
     fn set_privacy(&self, _session_id: &str, _on: bool, _controller_name: &str) -> bool {
         false
     }
-    /// `false` here is what routes the caller to the companion — never a
-    /// swallowed prompt.
-    fn prompt(&self, view: PromptView) -> bool {
-        self.native.as_ref().is_some_and(|n| n.prompt(view))
+    /// A refusal here is what routes the caller to the companion — never a
+    /// swallowed prompt. No panel on this host is [`NotShown::NoPanel`].
+    fn prompt(&self, view: PromptView) -> Result<(), NotShown> {
+        self.native
+            .as_ref()
+            .map_or(Err(NotShown::NoPanel), |n| n.prompt(view))
     }
     fn dismiss(&self, session_hex: &str) {
         if let Some(n) = self.native.as_ref() {
@@ -777,5 +889,113 @@ mod tests {
         assert!(!listed[0].recording && !listed[0].reconnecting);
         ind.hide_session(a.to_hex());
         assert!(reg.list().is_empty());
+    }
+
+    fn question(id: &str) -> super::PromptView {
+        super::PromptView {
+            session_hex: id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// #4164 — the rule every native panel takes a question by
+    /// ([`super::panel_takes`]): a free panel takes it; a second question
+    /// while one is up is refused as busy, and the first stays; a panel that
+    /// cannot reach the screen is no panel, whatever its slot holds; and the
+    /// screen is read with the slot unlocked.
+    ///
+    /// Red before #4164: a panel had one refusal, `false`, for both.
+    #[test]
+    fn a_panel_refuses_a_second_question_as_busy_and_a_gone_one_as_no_panel() {
+        use super::{NotShown, panel_takes};
+        let slot = std::sync::Mutex::new(None);
+        let reaching = |reaches: bool| {
+            let slot = &slot;
+            move || {
+                assert!(
+                    slot.try_lock().is_ok(),
+                    "the screen read under the slot's lock"
+                );
+                reaches
+            }
+        };
+        assert_eq!(panel_takes(reaching(true), &slot, question("a")), Ok(()));
+        assert_eq!(
+            panel_takes(reaching(true), &slot, question("b")),
+            Err(NotShown::Busy),
+            "a second question while one is up"
+        );
+        let held = |slot: &std::sync::Mutex<Option<super::PromptView>>| {
+            slot.lock().unwrap().as_ref().map(|v| v.session_hex.clone())
+        };
+        assert_eq!(
+            held(&slot).as_deref(),
+            Some("a"),
+            "the first question stays"
+        );
+        assert_eq!(
+            panel_takes(reaching(false), &slot, question("c")),
+            Err(NotShown::NoPanel),
+            "a panel that is gone, holding a question"
+        );
+        let empty = std::sync::Mutex::new(None);
+        assert_eq!(
+            panel_takes(reaching(false), &empty, question("d")),
+            Err(NotShown::NoPanel),
+            "no panel, nothing held"
+        );
+        assert_eq!(held(&empty), None, "no panel takes nothing");
+        *slot.lock().unwrap() = None;
+        assert_eq!(
+            panel_takes(reaching(true), &slot, question("e")),
+            Ok(()),
+            "the panel free again"
+        );
+    }
+
+    /// #4164 — what a caller reads from [`super::ViewerIndicator::show_prompt`]
+    /// off a one-row Mac's root daemon: this daemon's own panel busy with
+    /// another question makes the cause a busy panel, over either cause the
+    /// app's side finds; a handle with no panel keeps the app's cause; one
+    /// whose panel shows it is native. The platform panel is stood in for
+    /// the task ([`super::own_panel_stand_in`]).
+    ///
+    /// Red before #4164: a busy panel read as no panel at all.
+    #[tokio::test]
+    async fn a_busy_own_panel_is_the_callers_cause() {
+        use super::NotShown;
+        use super::own_panel_stand_in::answering;
+        use crate::consent::NoSurface;
+        let ind = super::ViewerIndicator::disabled();
+
+        let p = ind.show_prompt(question("a")).await;
+        assert!(!p.native, "{p:?}");
+        assert_eq!(p.panel_busy(), None, "no panel here: {p:?}");
+        for app in [NoSurface::NothingUp, NoSurface::RoadClosed] {
+            assert_eq!(p.why_not_shown(app), app, "no panel keeps the app's cause");
+        }
+
+        let p = answering(Err(NotShown::Busy), ind.show_prompt(question("b"))).await;
+        assert!(!p.native, "{p:?}");
+        assert_eq!(p.panel_busy(), Some(true), "{p:?}");
+        for app in [NoSurface::NothingUp, NoSurface::RoadClosed] {
+            assert_eq!(
+                p.why_not_shown(app),
+                NoSurface::PanelBusy,
+                "a busy panel over {app:?}"
+            );
+        }
+
+        let p = answering(Err(NotShown::NoPanel), ind.show_prompt(question("c"))).await;
+        assert!(!p.native && p.panel_busy().is_none(), "{p:?}");
+        assert_eq!(p.why_not_shown(NoSurface::NothingUp), NoSurface::NothingUp);
+
+        let p = answering(Ok(()), ind.show_prompt(question("d"))).await;
+        assert!(p.native && p.panel_busy().is_none(), "{p:?}");
     }
 }
