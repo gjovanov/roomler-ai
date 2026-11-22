@@ -3174,7 +3174,7 @@ thread drives the badge, the curtain and the consent panel, on one 120 ms
 as it was up, which a person at the machine reads as "this request does not
 expire". Approve still worked. The timer now runs while a session is up **or** the
 panel is (`pump_timer_wanted`, `agents/roomlerd/src/indicator/win.rs:702`, applied
-at `:1369`), and stops when neither is. The X11 panel needs no such rule, because
+at `:1368`), and stops when neither is. The X11 panel needs no such rule, because
 its loop ticks on its own.
 
 ⚠️ **The X11 panel is drawn at the desktop's scale** (FR-93 P6i). On a scaled
@@ -3186,7 +3186,7 @@ Plasma 6.6). It now reads `Xft.dpi` from the resources the desktop publishes
 for X11 clients and shows the same drawing at `round(dpi / 96)`, between 1 and
 4 (`scale`, `agents/roomlerd/src/indicator/x11.rs:82`). The drawing is painted
 at 1× into a pixmap, scaled up nearest-neighbour, and written in requests the
-server takes (`blit`, `:493`); a click maps back to the 1× layout. Measured:
+server takes (`blit`, `:494`); a click maps back to the 1× layout. Measured:
 KDE at `Xft.dpi` 259 draws at 3× and GNOME at 192 at 2×, the size of the
 companion's own prompt, and **Approve** on the scaled panel granted the
 session. At 1× nothing changes. `ROOMLERD_CONSENT_PANEL_SCALE` overrides the
