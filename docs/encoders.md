@@ -1624,7 +1624,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1929`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
-| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:464`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:461`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
@@ -2180,7 +2180,7 @@ rounds' own spread, keeps the default off every hardware encoder's thread.
 | Desktop, `mf-h264` software, the control | 5.21 · 7.13 → 5.28 · **10.73** | 5.19 · 6.19 → 5.38 · 7.22 |
 
 - **`hevc_qsv`'s p95 rose 9–10 % on the desktop**, in all 12 pairs, against 1–3 % between rounds. That trips the rule, so
-  a hardware encoder's thread keeps its old default (`EncoderOps::HARDWARE`, `encode/thread.rs:103`). `=1` still asks,
+  a hardware encoder's thread keeps its old default (`EncoderOps::HARDWARE`, `encode/thread.rs:116`). `=1` still asks,
   which is how another backend gets its own read.
 - **What that gives up is small.** A frame's work is on the GPU, so the laptop's `h264_qsv`, `hevc_qsv` and `av1_qsv` gain
   5–10 %, about 1 ms, and `vp9_qsv` 2 %. A software encoder doubled on the same host.
@@ -2333,7 +2333,7 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
   target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080
   offline. `encode_sync` now stamps a frame whose pts is not after the last
   one with the last pts plus the time since the last encode (`refed_pts`,
-  `agents/roomlerd/src/encode/charge.rs:49`). Offline the keepalive then
+  `agents/roomlerd/src/encode/charge.rs:52`). Offline the keepalive then
   costs what a frame with a pts of its own costs: 1.00× of the target at
   800×600 and 0.99× at 1920×1080, where a capture is coded at q 253 rather
   than borrowing its way to q 221. No pixels are copied. Pinned by
