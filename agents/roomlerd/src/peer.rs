@@ -19143,4 +19143,91 @@ mod upload_end_tests {
             "still refused as ending once placed: {resumed_after:?}"
         );
     }
+
+    /// Invariant 2 — the channel closes while an upload's end places its file
+    /// (the viewer closed it, and the session goes on): the placement runs
+    /// on, the file lands whole and its staging goes, and its answer is
+    /// dropped. No send is tried on the closed channel.
+    #[tokio::test]
+    async fn an_end_placing_when_its_channel_closes_lands_whole_and_is_not_answered() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let id = id_of("channel-closes");
+        let payload = bytes_of(300 * 1024);
+        let log = Logged::start(tracing::Level::DEBUG);
+        let held = seams::hold_placing(temp.path());
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let put = stash.clone();
+        let pair = Pair::open_with("files", move |device, session_end| {
+            *put.lock().unwrap() = Some(device.clone());
+            attach_files(
+                device,
+                bson::oid::ObjectId::new(),
+                Permissions::default() | Permissions::FILES,
+                FilesChannel::Served,
+                session_end,
+            );
+        })
+        .await;
+        let device = stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the channel's device end");
+        upload(&pair, &id, temp.path(), &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        // The viewer closes the channel; the session goes on. A close from the
+        // far end always reaches the device's end, once its read loop is free.
+        let _ = pair.viewer.close().await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !channel_gone(device.ready_state()) && tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gone = channel_gone(device.ready_state());
+        held.release();
+        let placed = temp.path().join("w42.bin");
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(placed.exists() && staged(temp.path(), &id).is_none())
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let completed = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: complete") && line.contains(&id)
+        })
+        .await;
+        let not_sent = logged_within(&log, Duration::from_secs(5), |line| {
+            line.contains("files: the end's answer is not sent") && line.contains(&id)
+        })
+        .await;
+        pair.close().await;
+        let text = log.text();
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert!(
+            gone,
+            "the device's end did not hear the viewer's close while the end placed its file"
+        );
+        assert!(completed, "the placement did not finish: {text}");
+        assert!(not_sent, "its answer was not dropped: {text}");
+        assert_eq!(
+            std::fs::read(&placed).expect("the file landed"),
+            payload,
+            "the file, whole"
+        );
+        assert!(
+            !temp.path().join(".roomler-partial").exists(),
+            "its staging is left behind"
+        );
+        let registered = crate::files::PARTIAL_REGISTRY
+            .lock()
+            .map(|r| r.contains_key(&id))
+            .unwrap_or(false);
+        assert!(!registered, "its entry is left in the registry");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("files: answer not sent") && line.contains(&id)),
+            "a send was tried on the closed channel: {text}"
+        );
+    }
 }
