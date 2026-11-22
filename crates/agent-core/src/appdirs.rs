@@ -734,14 +734,14 @@ pub fn migration_notes() -> &'static [String] {
 /// Rules, per directory (per-user config/data roots + the Windows
 /// machine-global root, each independent):
 ///   * legacy exists, new doesn't → atomic same-volume `fs::rename`
-///   * both exist (split-brain from the self-heal era) → left in place
-///     (the resolution keeps the tree that holds the config folder, the new
-///     one when both do, and with no config folder the new data folder's;
-///     config cleanup is the `ConfigCleanupStale` verb's job)
+///   * both exist → a data pair merges ([`migrate_children`], #3746); the
+///     config and machine pairs stay (the resolution keeps the tree that
+///     holds the config folder, the new one when both do, and with no config
+///     folder the new data folder's; `ConfigCleanupStale` cleans config up)
 ///   * legacy absent → nothing to do
 ///
-/// Never deletes; a failed rename (locked file, ACL) is noted and the
-/// read-both resolution keeps everything working until the next start.
+/// Never deletes or overwrites; what cannot move (locked file, ACL) is noted,
+/// stays, and moves at a later start. [`DataMerge`]: who runs the merge.
 ///
 /// `companion_running` (the roomler-desktop tray): skip entirely — the tray
 /// may hold open handles inside the tree, and a pre-S1a tray would keep
@@ -753,13 +753,13 @@ pub fn migration_notes() -> &'static [String] {
 /// system names for the account this process runs as. The pairs move by
 /// [`migrate_dirs_within`], which decides for all of them before any pair
 /// moves (none moves through a link below its root), moves the config pair
-/// first and by one rename, and stops at a pair whose move fails: the pairs
-/// before it stay moved, the pairs after it stay in the OLD tree. The
-/// machine pair's root is [`machine_program_data`].
+/// first and by one rename, and leaves the rest in the OLD tree when that
+/// fails. The machine pair's root is [`machine_program_data`].
 pub fn migrate_legacy_trees(
     companion_running: bool,
     installer_step: bool,
     own_profile: Option<&Path>,
+    merge: DataMerge,
 ) {
     let mut notes = Vec::new();
     if companion_running {
@@ -790,7 +790,7 @@ pub fn migrate_legacy_trees(
                 Some(profile) => {
                     // The config pair is first in `pairs`: the order
                     // `migrate_dirs_within` keeps.
-                    notes.extend(migrate_dirs_within(profile, &pairs, rename_on_disk));
+                    notes.extend(migrate_dirs_within(profile, &pairs, merge, rename_on_disk));
                     // Best-effort: drop the now-empty legacy shells (e.g.
                     // Windows `%APPDATA%\roomler\roomler-agent` after its
                     // `config`/`data` children moved out). `remove_dir`
@@ -833,13 +833,13 @@ pub fn migrate_legacy_trees(
         {
             let root = machine_program_data();
             let base = root.join(ORG);
-            let (old, new) = (base.join(OLD_APP), base.join(NEW_APP));
+            let pair = (base.join(OLD_APP), base.join(NEW_APP));
             if installer_step {
-                if old.exists() {
-                    notes.push(in_an_installer_step(&old));
+                if pair.0.exists() {
+                    notes.push(in_an_installer_step(&pair.0));
                 }
             } else {
-                notes.extend(migrate_dirs_within(&root, &[(old, new)], rename_on_disk));
+                notes.extend(migrate_dirs_within(&root, &[pair], merge, rename_on_disk));
             }
         }
     }
@@ -988,20 +988,21 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
 }
 
 /// #3702 — [`migrate_dir`] for the pairs in `root`, with `rename` as the
-/// rename of a pair's folder ([`rename_on_disk`] outside tests). Whether
-/// they move is decided for every pair before any pair moves: none moves
-/// when one lies outside `root` or is reached through a link below it
-/// ([`kept_in_place`]). They then move in the order given, the config pair
-/// first and by one rename, and a pair whose move fails ends the move: the
-/// pairs before it stay moved, the pairs after it stay in the OLD tree.
-/// The segment choice ([`segment_of`]) takes the tree that holds a config
-/// folder. The move makes the NEW config folder only whole, by one rename,
-/// and the NEW local data folder only when the config pair's move did not
-/// fail: the daemon reads the config it had, from the NEW tree or from the
-/// OLD one.
+/// rename of a pair's folder or of an entry a merge moves ([`rename_on_disk`]
+/// outside tests). Whether they move is decided for every pair before any
+/// pair moves: none moves when one lies outside `root` or is reached through
+/// a link below it ([`kept_in_place`]). They then move in the order given,
+/// the config pair first and by one rename; its failure ends the move, and
+/// the pairs after it stay in the OLD tree. A data pair converges on its own
+/// (#3746, [`DataMerge`]). The segment choice ([`segment_of`]) takes the tree
+/// that holds a config folder. The move makes the NEW config folder only
+/// whole, by one rename, and the NEW local data folder only when the config
+/// pair's move did not fail: the daemon reads the config it had, from the NEW
+/// tree or from the OLD one.
 fn migrate_dirs_within(
     root: &Path,
     pairs: &[(PathBuf, PathBuf)],
+    data_merge: DataMerge,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Vec<String> {
     if let Some(note) = kept_in_place(root, pairs) {
@@ -1010,10 +1011,11 @@ fn migrate_dirs_within(
     let mut notes = Vec::new();
     for (at, (old, new)) in pairs.iter().enumerate() {
         // The first pair holds `config.toml`: one rename moves its folder
-        // whole, or the folder stays. The pairs after it may move child by
-        // child.
-        match migrate_dir(old, new, at > 0, &mut rename) {
+        // whole, or the folder stays. A data pair after it merges, and one
+        // that leaves an entry behind holds back no pair after it.
+        match migrate_dir(old, new, (at > 0).then_some(data_merge), &mut rename) {
             Ok(note) => notes.extend(note),
+            Err(note) if at > 0 => notes.push(note),
             Err(note) => {
                 notes.push(note);
                 notes.extend(pairs[at + 1..].iter().filter(|(old, _)| old.exists()).map(
@@ -1032,32 +1034,40 @@ fn migrate_dirs_within(
 }
 
 /// The system's own rename: the one [`migrate_dirs_within`] takes outside
-/// tests.
+/// tests. A real folder renames as the system renames one; anything else (a
+/// file, or a link, which is never followed) only to a free name
+/// ([`rename_no_replace`]), so a merge never takes a name that is taken.
 fn rename_on_disk(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        return std::fs::rename(from, to);
+    }
+    rename_no_replace(from, to)
 }
 
 /// Apply the migration rules to one directory pair, with `rename` as the
 /// rename of its folder: `Ok` with a note for anything noteworthy (moved, or
 /// left beside a NEW folder that is already there), `Ok(None)` for the quiet
 /// no-legacy case, `Err` with a note when the move failed and the legacy
-/// folder is still where it was. A rename the system refuses
-/// (`PermissionDenied`) moves the folder's children one by one when
-/// `per_child` ([`migrate_children`]), and is an `Err` otherwise.
+/// folder is still where it was. A data pair (`merge` is `Some`) merges into
+/// a NEW folder that is there, or when its folder's rename fails, entry by
+/// entry ([`migrate_children`]); the config and machine pairs never do.
 fn migrate_dir(
     old: &Path,
     new: &Path,
-    per_child: bool,
-    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    merge: Option<DataMerge>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Option<String>, String> {
     if !old.exists() {
         return Ok(None);
     }
     if new.exists() {
-        return Ok(Some(format!(
-            "legacy tree left in place (new tree also present): {}",
-            old.display()
-        )));
+        return match merge {
+            Some(merge) => migrate_children(old, new, merge, None, &mut rename).map(Some),
+            None => Ok(Some(format!(
+                "legacy tree left in place (new tree also present): {}",
+                old.display()
+            ))),
+        };
     }
     if let Some(parent) = new.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -1073,20 +1083,20 @@ fn migrate_dir(
             old.display(),
             new.display()
         ))),
-        Err(e) if per_child && e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
-            // denied by an external ROOT-handle (an AV / indexer
-            // directory-watch — no roomler process held anything, ACLs
-            // were Full, and every CHILD renamed fine). Fall back to
-            // moving the children individually; that dodges the
-            // root-handle without needing the watcher gone.
-            migrate_children(old, new, &e).map(Some)
-        }
-        Err(e) => Err(format!(
-            "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
-            old.display(),
-            new.display()
-        )),
+        // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
+        // denied by an external ROOT-handle (an AV / indexer
+        // directory-watch — no roomler process held anything, ACLs
+        // were Full, and every CHILD renamed fine). A data pair merges
+        // its children instead; that dodges the root-handle without
+        // needing the watcher gone, and a held child waits for a later start.
+        Err(e) => match merge {
+            Some(merge) => migrate_children(old, new, merge, Some(&e), &mut rename).map(Some),
+            None => Err(format!(
+                "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
+                old.display(),
+                new.display()
+            )),
+        },
     }
 }
 
@@ -1252,69 +1262,570 @@ pub fn system_config_notes() -> &'static [String] {
         .unwrap_or(&[])
 }
 
-/// Per-child move of a data pair whose folder rename the system refused
-/// (never the first pair, which holds `config.toml`). A failure midway
-/// renames the moved entries back and removes the NEW folder this move
-/// made; either can fail in turn, and the note's `rolled back` says only
-/// whether every rename back succeeded.
-fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> Result<String, String> {
-    let Ok(entries) = std::fs::read_dir(old) else {
+/// #3746 — the merge of a data pair's OLD folder into its NEW folder, entry
+/// by entry ([`merge_folder`]): when the NEW folder is already there (`why`
+/// is `None`, as once that start's `logging::init` made `logs` in it), or
+/// when the folder's own rename failed (`why`). A folder both hold merges
+/// the same way inside it; any other name both hold keeps the copy modified
+/// last, a tie the NEW folder's, and the other copy goes beside it
+/// ([`KEPT_BESIDE`]). Nothing is overwritten or deleted, and an entry gone
+/// meanwhile (another runner moved it) is done. `Ok` once the OLD folder is
+/// gone, `Err` while an entry is left in it for the next start; the note
+/// names what was kept beside and what was left.
+fn migrate_children(
+    old: &Path,
+    new: &Path,
+    merge: DataMerge,
+    why: Option<&std::io::Error>,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<String, String> {
+    let how = match why {
+        None => "the new folder was already there".to_string(),
+        Some(e) => format!("its folder rename failed: {e}"),
+    };
+    if gone(old) {
+        return Ok(format!(
+            "legacy tree {} already moved by another start",
+            old.display()
+        ));
+    }
+    if let Some(because) = merge.left_because() {
         return Err(format!(
-            "migration failed ({} -> {}): {root_err} (and the legacy dir is unreadable)",
-            old.display(),
+            "legacy tree left in place ({how}): {} — {because}",
+            old.display()
+        ));
+    }
+    if !is_real_folder(old) {
+        return Err(format!(
+            "legacy tree left in place: {} is not a folder",
+            old.display()
+        ));
+    }
+    let made_new = match std::fs::create_dir(new) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("migration failed (create {}): {e}", new.display())),
+    };
+    if !is_real_folder(new) {
+        return Err(format!(
+            "legacy tree left in place: {} is not a folder",
             new.display()
         ));
-    };
-    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    // config.toml last: the enrollment must be the final thing to leave
-    // the old tree.
-    children.sort_by_key(|p| p.file_name().is_some_and(|f| f == "config.toml"));
-    let made_new = !new.exists();
-    if let Err(e) = std::fs::create_dir_all(new) {
-        return Err(format!("migration failed (create {}): {e}", new.display()));
     }
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for src in &children {
-        let Some(name) = src.file_name() else {
-            continue;
+    let mut merged = Merged::default();
+    merge_folder(old, new, "", rename, &mut merged);
+    let old_gone = match std::fs::remove_dir(old) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            if merged.left.is_empty() {
+                merged.leave("", &e);
+            }
+            false
+        }
+    };
+    // A NEW folder this merge made goes again while it is empty: the segment
+    // choice keys on a new data folder where neither tree holds a config
+    // folder. `remove_dir` leaves it while anything is in it.
+    if made_new && !old_gone {
+        let _ = std::fs::remove_dir(new);
+    }
+    let note = merged.note(old, new, &how, old_gone);
+    if old_gone { Ok(note) } else { Err(note) }
+}
+
+/// #3746 — whether this process runs the data pairs' merge
+/// ([`migrate_children`]). A process running elevated from a split token
+/// does not: the account's own unelevated daemon runs it at its next start,
+/// so the merge never runs above the integrity level of the folder owner's
+/// own processes. A pair's one folder rename is the same in every process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataMerge {
+    /// The merge runs.
+    Runs,
+    /// Left to the account's own daemon: this process runs elevated from a
+    /// split token.
+    Elevated,
+    /// Left to the account's own daemon: this process could not read its
+    /// own token.
+    TokenUnread,
+}
+
+impl DataMerge {
+    /// From whether this process runs elevated from a split token:
+    /// `Some(true)` it does, `Some(false)` it does not, `None` it could not
+    /// tell.
+    pub fn from_split_elevation(elevated: Option<bool>) -> Self {
+        match elevated {
+            Some(false) => Self::Runs,
+            Some(true) => Self::Elevated,
+            None => Self::TokenUnread,
+        }
+    }
+
+    /// Why the merge is left, for the note; `None` when it runs.
+    fn left_because(self) -> Option<&'static str> {
+        match self {
+            Self::Runs => None,
+            Self::Elevated => Some(
+                "this process runs elevated; the account's own daemon merges it at its next start",
+            ),
+            Self::TokenUnread => Some(
+                "this process could not read its own token; the account's own daemon merges it \
+                 at its next start",
+            ),
+        }
+    }
+}
+
+/// #3746 — the suffix of a copy the merge keeps beside a name both folders
+/// hold: `<name>.older`, then `<name>.older-2`, `<name>.older-3`, … when the
+/// name before it is taken.
+pub const KEPT_BESIDE: &str = ".older";
+
+/// How many names beside one name [`put_beside`] tries.
+const BESIDE_TRIES: u32 = 100;
+
+/// #3746 — whether `name` is a copy the merge kept beside another
+/// (`<name>.older` or `<name>.older-<n>`), which no reader takes for the
+/// file of that name.
+pub fn is_kept_beside(name: &str) -> bool {
+    let Some(at) = name.rfind(KEPT_BESIDE) else {
+        return false;
+    };
+    let rest = &name[at + KEPT_BESIDE.len()..];
+    at > 0
+        && (rest.is_empty()
+            || rest
+                .strip_prefix('-')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// The `n`th name beside `name`: `<name>.older`, `<name>.older-2`, …
+fn beside_name(name: &Path, n: u32) -> PathBuf {
+    let mut at = name.as_os_str().to_os_string();
+    at.push(beside_suffix(n));
+    PathBuf::from(at)
+}
+
+fn beside_suffix(n: u32) -> String {
+    match n {
+        1 => KEPT_BESIDE.to_string(),
+        n => format!("{KEPT_BESIDE}-{n}"),
+    }
+}
+
+/// Nothing is at `path`, read without following a link.
+fn gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A real folder is at `path`, not a link to one.
+fn is_real_folder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// What a merge did, for its note.
+#[derive(Default)]
+struct Merged {
+    moved: usize,
+    /// Each copy kept beside a name, by its path from the pair's folder.
+    beside: Vec<String>,
+    /// Each entry left in the OLD folder, with why.
+    left: Vec<String>,
+}
+
+impl Merged {
+    fn kept_beside(&mut self, rel: &str, n: u32, whose: &str) {
+        let suffix = beside_suffix(n);
+        self.beside
+            .push(format!("{rel}{suffix} (the {whose} folder's copy)"));
+    }
+
+    fn leave(&mut self, rel: &str, e: &std::io::Error) {
+        let rel = if rel.is_empty() {
+            "the folder itself"
+        } else {
+            rel
         };
-        let dst = new.join(name);
-        match std::fs::rename(src, &dst) {
-            Ok(()) => moved.push((src.clone(), dst)),
+        self.left.push(format!("{rel} ({e})"));
+    }
+
+    fn note(&self, old: &Path, new: &Path, how: &str, old_gone: bool) -> String {
+        let mut note = format!(
+            "{} {} -> {} entry by entry ({how}): {} moved",
+            if old_gone {
+                "migrated legacy tree"
+            } else {
+                "legacy tree partly migrated"
+            },
+            old.display(),
+            new.display(),
+            self.moved
+        );
+        if !self.beside.is_empty() {
+            note.push_str("; kept beside: ");
+            note.push_str(&listed(&self.beside));
+        }
+        if !old_gone {
+            note.push_str("; left in the old folder for the next start: ");
+            note.push_str(&listed(&self.left));
+        }
+        note
+    }
+}
+
+/// `items` joined for a note, the first 32 of them.
+fn listed(items: &[String]) -> String {
+    const SHOWN: usize = 32;
+    let mut text = items
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > SHOWN {
+        text.push_str(&format!(" and {} more", items.len() - SHOWN));
+    }
+    text
+}
+
+/// A name's path from the pair's folder, for the note: `rel/name`.
+fn joined(rel: &str, name: &std::ffi::OsStr) -> String {
+    let name = name.to_string_lossy();
+    if rel.is_empty() {
+        name.into_owned()
+    } else {
+        format!("{rel}/{name}")
+    }
+}
+
+/// Every entry of `src_dir`, an OLD folder, into `dst_dir`, the same place
+/// in the NEW folder, by [`merge_entry`]. `rel` is `src_dir`'s path from the
+/// pair's folder. `config.toml` goes last.
+fn merge_folder(
+    src_dir: &Path,
+    dst_dir: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    let entries = match std::fs::read_dir(src_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return merged.leave(rel, &e),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
             Err(e) => {
-                // Roll back so the OLD tree stays complete (best-effort;
-                // a rollback failure is noted and read-both still covers
-                // the pieces that DID move — they're identical content).
-                let mut rolled_back = true;
-                for (orig, dstp) in moved.iter().rev() {
-                    if std::fs::rename(dstp, orig).is_err() {
-                        rolled_back = false;
-                    }
-                }
-                // The NEW folder this move made goes too: the segment choice
-                // keys on a new config folder, and on a new data folder where
-                // neither tree holds a config folder. `remove_dir` leaves it
-                // while anything is in it.
-                if made_new {
-                    let _ = std::fs::remove_dir(new);
-                }
-                return Err(format!(
-                    "per-child migration of {} aborted at {} ({e}); rolled back: {rolled_back} \
-                     (root rename was denied: {root_err})",
-                    old.display(),
-                    src.display()
-                ));
+                merged.leave(rel, &e);
+                break;
             }
         }
     }
-    let _ = std::fs::remove_dir(old);
-    Ok(format!(
-        "migrated legacy tree {} -> {} per-child ({} entries; the root dir itself was \
-         locked by another process: {root_err})",
-        old.display(),
-        new.display(),
-        moved.len()
-    ))
+    // config.toml last: the enrollment must be the final thing to leave
+    // the old tree.
+    names.sort_by(|a, b| (a == "config.toml", a).cmp(&(b == "config.toml", b)));
+    for name in names {
+        let (src, dst) = (src_dir.join(&name), dst_dir.join(&name));
+        merge_entry(&src, &dst, &joined(rel, &name), rename, merged);
+    }
+}
+
+/// One entry of an OLD folder (`src`) to the same place in the NEW folder
+/// (`dst`), each read as it is now and never followed. An entry gone
+/// meanwhile was moved by another runner, and is done. To a free name it
+/// moves by one rename; a real folder whose rename fails merges entry by
+/// entry; a name the NEW folder holds too is settled by [`settle`].
+fn merge_entry(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    if gone(src) {
+        return;
+    }
+    if gone(dst) {
+        let e = match rename(src, dst) {
+            Ok(()) => {
+                merged.moved += 1;
+                return;
+            }
+            Err(e) => e,
+        };
+        if gone(src) {
+            return;
+        }
+        if gone(dst) {
+            if !is_real_folder(src) {
+                return merged.leave(rel, &e);
+            }
+            // A folder whose own rename failed (a handle held on it, or on
+            // something in it): its entries, one by one.
+            match std::fs::create_dir(dst) {
+                Ok(()) => return merge_subfolder(src, dst, rel, rename, merged, true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return merged.leave(rel, &e),
+            }
+        }
+    }
+    settle(src, dst, rel, rename, merged);
+}
+
+/// A folder both folders hold (`made`: one this merge just made in the NEW
+/// folder): its entries merge, and the OLD folder goes once it is empty. A
+/// folder this merge made goes again while the OLD one stays and it is
+/// empty.
+fn merge_subfolder(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+    made: bool,
+) {
+    let noted = merged.left.len();
+    merge_folder(src, dst, rel, rename, merged);
+    match std::fs::remove_dir(src) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            if merged.left.len() == noted {
+                merged.leave(rel, &e);
+            }
+            if made {
+                let _ = std::fs::remove_dir(dst);
+            }
+        }
+    }
+}
+
+/// A name both folders hold. Two real folders merge ([`merge_subfolder`]);
+/// anything else is settled by the rule: the copy modified last keeps the
+/// name, a tie the NEW folder's, and the other copy goes beside it
+/// ([`put_beside`]). Nothing is overwritten or deleted.
+fn settle(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    let old = match std::fs::symlink_metadata(src) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return merged.leave(rel, &e),
+    };
+    let new = match std::fs::symlink_metadata(dst) {
+        Ok(meta) => meta,
+        // The NEW folder's copy went meanwhile: the name is free again.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return take_name(src, dst, rel, rename, merged);
+        }
+        Err(e) => return merged.leave(rel, &e),
+    };
+    if old.is_dir() && new.is_dir() {
+        return merge_subfolder(src, dst, rel, rename, merged, false);
+    }
+    let modified =
+        |meta: &std::fs::Metadata| meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    if modified(&old) <= modified(&new) {
+        // The NEW folder's copy keeps the name; the OLD one goes beside it.
+        match put_beside(src, dst, rename) {
+            Beside::Put(n) => merged.kept_beside(rel, n, "old"),
+            Beside::Gone => {}
+            Beside::Failed(e) => merged.leave(rel, &e),
+        }
+        return;
+    }
+    // The OLD folder's copy is newer: the NEW one goes beside, and the OLD
+    // one takes the name.
+    match put_beside(dst, dst, rename) {
+        Beside::Put(n) => match rename(src, dst) {
+            Ok(()) => {
+                merged.moved += 1;
+                merged.kept_beside(rel, n, "new");
+            }
+            Err(e) => {
+                // The NEW folder's copy goes back under its name while that
+                // is free, and stays beside it otherwise.
+                if rename(&beside_name(dst, n), dst).is_err() {
+                    merged.kept_beside(rel, n, "new");
+                }
+                if !gone(src) {
+                    merged.leave(rel, &e);
+                }
+            }
+        },
+        Beside::Gone => take_name(src, dst, rel, rename, merged),
+        Beside::Failed(e) => merged.leave(rel, &e),
+    }
+}
+
+/// `src` to `dst`, a name that was free when last read: another runner may
+/// take it first, and the next start settles it then.
+fn take_name(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    merged: &mut Merged,
+) {
+    match rename(src, dst) {
+        Ok(()) => merged.moved += 1,
+        Err(e) if !gone(src) => merged.leave(rel, &e),
+        Err(_) => {}
+    }
+}
+
+/// What [`put_beside`] did.
+enum Beside {
+    /// Renamed to the `n`th name beside ([`beside_name`]).
+    Put(u32),
+    /// The entry went meanwhile: another runner moved it.
+    Gone,
+    Failed(std::io::Error),
+}
+
+/// `from` renamed to the first free name beside `name`: `<name>.older`, then
+/// `<name>.older-2`, … A name taken meanwhile is skipped.
+fn put_beside(
+    from: &Path,
+    name: &Path,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Beside {
+    let mut last = None;
+    for n in 1..=BESIDE_TRIES {
+        let at = beside_name(name, n);
+        if !gone(&at) {
+            continue;
+        }
+        match rename(from, &at) {
+            Ok(()) => return Beside::Put(n),
+            Err(_) if gone(from) => return Beside::Gone,
+            Err(e) if !gone(&at) => last = Some(e),
+            Err(e) => return Beside::Failed(e),
+        }
+    }
+    Beside::Failed(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "every name beside it is taken",
+        )
+    }))
+}
+
+/// #3746 — `from` renamed to `to` only while `to` is free: `AlreadyExists`
+/// when anything is there. `from` itself is renamed, never what a link at it
+/// leads to.
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let (from, to) = (wide_path(from)?, wide_path(to)?);
+    // SAFETY: both are NUL-terminated wide strings that outlive the call.
+    // Flags 0: no replace, and no copy to another volume.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `path` as a NUL-terminated wide string; a NUL inside it is refused.
+#[cfg(windows)]
+fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a NUL in the path",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+/// #3746 — as on Windows, by `renameat2` with `RENAME_NOREPLACE`, made as a
+/// raw system call: libc's own wrapper needs glibc 2.28 at load time. A
+/// kernel or filesystem without the flag takes [`link_then_unlink`].
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated strings that outlive the call, and
+    // `renameat2` takes (dirfd, path, dirfd, path, flags).
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD as libc::c_long,
+            from_c.as_ptr(),
+            libc::AT_FDCWD as libc::c_long,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_long,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => link_then_unlink(from, to),
+        _ => Err(e),
+    }
+}
+
+/// #3746 — as on Windows, by `renamex_np` with `RENAME_EXCL`. A filesystem
+/// without the flag takes [`link_then_unlink`].
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated strings that outlive the call.
+    if unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) => link_then_unlink(from, to),
+        _ => Err(e),
+    }
+}
+
+/// #3746 — elsewhere, [`link_then_unlink`].
+#[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    link_then_unlink(from, to)
+}
+
+/// `path` as a C string; a NUL inside it is refused.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the path"))
+}
+
+/// A rename that never takes a taken name, where the system has none: a
+/// second link to `from` at `to` (refused when `to` is taken), then `from`'s
+/// own link removed. When that removal fails, the link at `to` goes again,
+/// and only while it is still `from`'s.
+#[cfg(unix)]
+fn link_then_unlink(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::hard_link(from, to)?;
+    if let Err(e) = std::fs::remove_file(from) {
+        if let (Ok(a), Ok(b)) = (
+            std::fs::symlink_metadata(from),
+            std::fs::symlink_metadata(to),
+        ) && (a.dev(), a.ino()) == (b.dev(), b.ino())
+        {
+            let _ = std::fs::remove_file(to);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1689,6 +2200,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &profile,
             &[(link.join(OLD_APP), link.join(NEW_APP))],
+            DataMerge::Runs,
             rename_on_disk,
         );
         assert!(
@@ -1703,6 +2215,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &real,
             &[(real.join(OLD_APP), real.join(NEW_APP))],
+            DataMerge::Runs,
             rename_on_disk,
         );
         assert!(real.join(NEW_APP).is_dir(), "{notes:?}");
@@ -1740,7 +2253,12 @@ mod tests {
         std::fs::write(data_home.join(OLD_APP).join("logs.txt"), "x").unwrap();
         let (config, data) = (pair_in(&config_home), pair_in(&data_home));
 
-        let notes = migrate_dirs_within(&profile, &[config.clone(), data.clone()], rename_on_disk);
+        let notes = migrate_dirs_within(
+            &profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            rename_on_disk,
+        );
 
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
@@ -1758,7 +2276,7 @@ mod tests {
         for (old, _) in &pairs {
             std::fs::create_dir_all(old).unwrap();
         }
-        let notes = migrate_dirs_within(&plain, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(&plain, &pairs, DataMerge::Runs, rename_on_disk);
         assert!(
             pairs.iter().all(|(old, new)| !old.exists() && new.is_dir()),
             "{notes:?}"
@@ -1781,13 +2299,18 @@ mod tests {
         }
         std::fs::write(config.0.join("config.toml"), "x").unwrap();
         let mut tried = Vec::new();
-        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
-            tried.push(from.to_path_buf());
-            if from == config.0 {
-                return Err(std::io::Error::other("another volume"));
-            }
-            std::fs::rename(from, to)
-        });
+        let notes = migrate_dirs_within(
+            profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            |from, to| {
+                tried.push(from.to_path_buf());
+                if from == config.0 {
+                    return Err(std::io::Error::other("another volume"));
+                }
+                std::fs::rename(from, to)
+            },
+        );
         assert_eq!(tried, std::slice::from_ref(&config.0), "{notes:?}");
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
         assert!(config.0.join("config.toml").is_file(), "{notes:?}");
@@ -1818,12 +2341,17 @@ mod tests {
         }
         std::fs::write(config.0.join("config.toml"), "x").unwrap();
 
-        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
-            if from == config.0 {
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            }
-            std::fs::rename(from, to)
-        });
+        let notes = migrate_dirs_within(
+            profile,
+            &[config.clone(), data.clone()],
+            DataMerge::Runs,
+            |from, to| {
+                if from == config.0 {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                std::fs::rename(from, to)
+            },
+        );
 
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
         assert!(tree_present(&config.0, &data.0), "{notes:?}");
@@ -1960,7 +2488,7 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
 
-        let note = migrate_dir(&old, &new, true, rename_on_disk)
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), rename_on_disk)
             .unwrap()
             .expect("a move produces a note");
         assert!(note.starts_with("migrated"), "{note}");
@@ -1984,7 +2512,8 @@ mod tests {
             std::fs::create_dir_all(&old).unwrap();
             std::fs::create_dir_all(&new).unwrap();
             std::fs::write(old.join("stale.txt"), b"old").unwrap();
-            let note = migrate_dir(&old, &new, per_child, rename_on_disk)
+            let merge = per_child.then_some(DataMerge::Runs);
+            let note = migrate_dir(&old, &new, merge, rename_on_disk)
                 .unwrap()
                 .expect("both-present produces a note");
             if per_child {
@@ -2007,8 +2536,9 @@ mod tests {
         std::fs::write(old.join("service-logs").join("a.log"), b"l").unwrap();
 
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap();
-        assert!(note.contains("per-child"), "{note}");
+        let note =
+            migrate_children(&old, &new, DataMerge::Runs, Some(&err), &mut rename_on_disk).unwrap();
+        assert!(note.contains("entry by entry"), "{note}");
         assert!(!old.exists(), "emptied legacy root must be removed");
         assert_eq!(
             std::fs::read_to_string(new.join("config.toml")).unwrap(),
@@ -2030,14 +2560,19 @@ mod tests {
         std::fs::write(old.join("crashes").join("c1.dmp"), b"dump").unwrap();
         std::fs::write(old.join("config.toml"), b"tok").unwrap();
 
-        let note = migrate_dir(&old, &new, true, |from: &Path, to: &Path| {
-            if from == old {
-                // The other runner, first: a `crashes` folder with something in it.
-                std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
-                return Err(std::io::ErrorKind::PermissionDenied.into());
-            }
-            rename_on_disk(from, to)
-        })
+        let note = migrate_dir(
+            &old,
+            &new,
+            Some(DataMerge::Runs),
+            |from: &Path, to: &Path| {
+                if from == old {
+                    // The other runner, first: a `crashes` folder with something in it.
+                    std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                rename_on_disk(from, to)
+            },
+        )
         .unwrap()
         .expect("a merge produces a note");
 
@@ -2076,7 +2611,7 @@ mod tests {
             rename_on_disk(from, to)
         };
 
-        let note = migrate_dir(&old, &new, true, refused).unwrap_err();
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), refused).unwrap_err();
         assert!(note.contains("b.log"), "{note}");
         for name in ["a.log", "config.toml"] {
             assert!(new.join(name).is_file(), "{name}: {note}");
@@ -2084,7 +2619,7 @@ mod tests {
         assert!(old.join("b.log").is_file(), "{note}");
 
         drop(held);
-        let note = migrate_dir(&old, &new, true, rename_on_disk)
+        let note = migrate_dir(&old, &new, Some(DataMerge::Runs), rename_on_disk)
             .unwrap()
             .expect("a merge produces a note");
         assert!(!old.exists(), "{note}");
@@ -2100,7 +2635,7 @@ mod tests {
             migrate_dir(
                 &tmp.path().join("roomler-agent"),
                 &tmp.path().join("roomler"),
-                true,
+                Some(DataMerge::Runs),
                 rename_on_disk
             ),
             Ok(None)
@@ -2402,7 +2937,7 @@ mod tests {
 
         // The first start: the config folder moves, and a handle held on the
         // data folder refuses every rename below it.
-        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
             if from.starts_with(&data_old) {
                 return Err(std::io::Error::other("held"));
             }
@@ -2415,7 +2950,7 @@ mod tests {
         write_aged(&today, "today", std::time::Duration::ZERO);
 
         // A later start, with nothing held.
-        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
 
         assert!(!data_old.exists(), "{notes:?}");
         let mut want = held.to_vec();
@@ -2452,7 +2987,7 @@ mod tests {
         write_aged(&new.join(day_log), "new day", HOUR);
         write_aged(&old.join("logs/update-attempt"), "attempt", DAY);
 
-        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
 
         assert!(!old.exists(), "{notes:?}");
         let want = listing(&[
@@ -2524,7 +3059,7 @@ mod tests {
                     .map(|_| {
                         s.spawn(|| {
                             start.wait();
-                            migrate_dirs_within(profile, &pairs, rename_on_disk)
+                            migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk)
                         })
                     })
                     .collect();
@@ -2532,7 +3067,7 @@ mod tests {
             });
             assert_eq!(contents(), want, "round {round}: {notes:?}");
 
-            let next = migrate_dirs_within(profile, &pairs, rename_on_disk);
+            let next = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
             assert!(!old.exists(), "round {round}: {notes:?} then {next:?}");
             assert_eq!(contents(), want, "round {round}: {notes:?} then {next:?}");
         }
@@ -2551,7 +3086,7 @@ mod tests {
         write_aged(&old.join("host-mute.json"), "ours", DAY);
         write_aged(&old.join("a.log"), "a", DAY);
 
-        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
             if from == old {
                 // The other runner, first: the NEW folder, a file in it.
                 write_aged(&new.join("host-mute.json"), "theirs", HOUR);
@@ -2581,7 +3116,7 @@ mod tests {
         write_aged(&old.join("b.log"), "b", DAY);
         std::fs::create_dir_all(new.join("logs")).unwrap();
 
-        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
             if from == old.join("a.log") {
                 // The other runner, first.
                 std::fs::rename(from, to).unwrap();
@@ -2616,7 +3151,7 @@ mod tests {
         write_aged(&pairs[2].0.join("logs/x.log"), "x", DAY);
         let held = pairs[1].0.join("held.log");
 
-        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, |from, to| {
             if from == pairs[1].0 || from == held {
                 return Err(std::io::Error::other("held"));
             }
@@ -2630,7 +3165,7 @@ mod tests {
         assert!(!pairs[2].0.exists(), "{notes:?}");
         assert!(pairs[2].1.join("logs").join("x.log").is_file(), "{notes:?}");
 
-        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
         assert!(!pairs[1].0.exists(), "{notes:?}");
         assert!(pairs[1].1.join("held.log").is_file(), "{notes:?}");
     }
@@ -2680,7 +3215,7 @@ mod tests {
         folder_link(&old.join("logs"), &elsewhere);
         write_aged(&new.join("logs").join("today.log"), "today", HOUR);
 
-        let notes = migrate_dirs_within(&profile, &pairs, rename_on_disk);
+        let notes = migrate_dirs_within(&profile, &pairs, DataMerge::Runs, rename_on_disk);
 
         assert!(!old.exists(), "{notes:?}");
         let secret = listing(&[("secret.txt", "secret")]);
@@ -2700,6 +3235,93 @@ mod tests {
             found == link_beside || found == link_named,
             "{found:?}: {notes:?}"
         );
+    }
+
+    /// #3746 — a process running elevated from a split token, or one that
+    /// could not read its own token, leaves a data pair's merge to the
+    /// account's own daemon, with a note that says why. A pair it can move
+    /// by one rename still moves, and the account's daemon merges the rest
+    /// at its next start.
+    #[test]
+    fn an_elevated_process_leaves_the_data_merge_to_the_accounts_own_daemon() {
+        for merge in [DataMerge::Elevated, DataMerge::TokenUnread] {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path();
+            let pairs = [
+                pair_in(&profile.join("config")),
+                pair_in(&profile.join("roaming")),
+                pair_in(&profile.join("local")),
+            ];
+            write_aged(&pairs[1].0.join("host-mute.json"), "muted", DAY);
+            write_aged(&pairs[1].1.join("logs/today.log"), "today", HOUR);
+            write_aged(&pairs[2].0.join("logs/x.log"), "x", DAY);
+
+            let notes = migrate_dirs_within(profile, &pairs, merge, rename_on_disk);
+
+            let because = merge.left_because().unwrap();
+            let old = pairs[1].0.display().to_string();
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains(because) && n.contains(&old)),
+                "{merge:?}: {notes:?}"
+            );
+            let muted = listing(&[("host-mute.json", "muted")]);
+            assert_eq!(files_below(&pairs[1].0), muted, "{notes:?}");
+            let today = listing(&[("logs/today.log", "today")]);
+            assert_eq!(files_below(&pairs[1].1), today, "{notes:?}");
+            assert!(!pairs[2].0.exists(), "{notes:?}");
+            assert!(pairs[2].1.join("logs").join("x.log").is_file(), "{notes:?}");
+
+            // The account's own daemon, at its next start.
+            let notes = migrate_dirs_within(profile, &pairs, DataMerge::Runs, rename_on_disk);
+            assert!(!pairs[1].0.exists(), "{notes:?}");
+            let both = listing(&[("host-mute.json", "muted"), ("logs/today.log", "today")]);
+            assert_eq!(files_below(&pairs[1].1), both, "{notes:?}");
+        }
+    }
+
+    /// #3746 — only a process running elevated from a split token, or one
+    /// that could not tell, leaves the merge.
+    #[test]
+    fn the_merge_runs_unless_the_process_runs_elevated_from_a_split_token() {
+        assert_eq!(
+            DataMerge::from_split_elevation(Some(false)),
+            DataMerge::Runs
+        );
+        assert_eq!(
+            DataMerge::from_split_elevation(Some(true)),
+            DataMerge::Elevated
+        );
+        assert_eq!(
+            DataMerge::from_split_elevation(None),
+            DataMerge::TokenUnread
+        );
+        assert_eq!(DataMerge::Runs.left_because(), None);
+    }
+
+    /// #3746 — a copy kept beside a name is known by its suffix alone.
+    #[test]
+    fn a_copy_kept_beside_is_known_by_its_suffix() {
+        for name in [
+            "a.older",
+            "a.older-2",
+            "a.older.older",
+            "roomlerd.log.2026-11-22.older-17",
+        ] {
+            assert!(is_kept_beside(name), "{name}");
+        }
+        for name in [
+            "a.older-",
+            "a.olderx",
+            ".older",
+            "a.older-2x",
+            "a.log",
+            "older",
+            "roomlerd.log.2026-11-22",
+        ] {
+            assert!(!is_kept_beside(name), "{name}");
+        }
     }
 }
 

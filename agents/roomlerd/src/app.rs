@@ -1597,6 +1597,7 @@ async fn daemon_main() -> Result<()> {
         companion_running,
         installer_step,
         own_profile.as_deref(),
+        own_data_merge(),
     );
 
     // Same one-shot, same reason, different axis: a Linux SYSTEM install's
@@ -7549,6 +7550,19 @@ fn peer_presence_status_cmd() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// #3746 — whether this process runs the data folders' merge in the one-time
+/// folder move: a process running elevated from a split token leaves it to
+/// the account's own unelevated daemon, which runs it at its next start, so
+/// the merge never runs above the integrity level of the folder owner's own
+/// processes.
+fn own_data_merge() -> roomlerd::appdirs::DataMerge {
+    #[cfg(target_os = "windows")]
+    let elevated = roomlerd::win_identity::own_token_is_elevated_from_split();
+    #[cfg(not(target_os = "windows"))]
+    let elevated = Some(false);
+    roomlerd::appdirs::DataMerge::from_split_elevation(elevated)
 }
 
 #[cfg(test)]

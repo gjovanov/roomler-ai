@@ -52,12 +52,19 @@ pub const MAX_TAIL_LINES: usize = 5000;
 pub fn current_log_path() -> Result<PathBuf> {
     let dir = crate::logging::log_dir()
         .ok_or_else(|| anyhow!("log dir is unresolvable on this platform"))?;
+    current_log_in(&dir)
+}
+
+/// [`current_log_path`]'s pick in `dir`. #3746 — a copy the one-time folder
+/// move kept beside a day's log (`roomlerd.log.<day>.older`) is never the
+/// current log, although its name sorts after that day's.
+fn current_log_in(dir: &std::path::Path) -> Result<PathBuf> {
     let entries =
-        std::fs::read_dir(&dir).with_context(|| format!("reading log dir {}", dir.display()))?;
+        std::fs::read_dir(dir).with_context(|| format!("reading log dir {}", dir.display()))?;
     let mut best: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("roomlerd.log") {
+        if !name.starts_with("roomlerd.log") || crate::appdirs::is_kept_beside(&name) {
             continue;
         }
         // Prefer the lexicographically-latest filename. tracing's
@@ -509,6 +516,23 @@ mod tests {
     fn one_line_of_100_kib_fits_the_message_limit() {
         let lines = vec!["x".repeat(100 * 1024)];
         assert_every_frame_fits(&reply_envelopes(PATH, lines, false, None));
+    }
+
+    /// #3746 — a copy the one-time folder move kept beside a day's log sorts
+    /// after that day's name, and is never the current log.
+    #[test]
+    fn a_log_kept_beside_another_is_never_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "roomlerd.log.2026-11-21",
+            "roomlerd.log.2026-11-22",
+            "roomlerd.log.2026-11-22.older",
+            "roomlerd.log.2026-11-22.older-2",
+        ] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let current = current_log_in(dir.path()).unwrap();
+        assert_eq!(current, dir.path().join("roomlerd.log.2026-11-22"));
     }
 
     fn assert_every_frame_within_budget(envelopes: &[serde_json::Value]) {
