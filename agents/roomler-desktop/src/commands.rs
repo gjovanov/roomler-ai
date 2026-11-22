@@ -2143,7 +2143,7 @@ pub async fn cmd_open_remote(
 ) -> Result<(), String> {
     let aid = agent_id.trim().to_ascii_lowercase();
     if aid.len() != 24 || !aid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid agent id".to_string());
+        return Err("invalid device id".to_string());
     }
     let url = tokio::task::spawn_blocking(move || {
         let is_scm = probe_service_state().0 == "scmService";

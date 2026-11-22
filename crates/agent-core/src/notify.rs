@@ -295,9 +295,36 @@ pub fn has_attention() -> bool {
     all_attention_paths().iter().any(|p| p.exists())
 }
 
-/// FR-133 — a release tag in a notice, shown as the version it names. RED: as on master.
+/// FR-133 — a release tag in a notice, shown as the version it names.
+///
+/// A tag (`agent-v0.4.232`, `tunnel-v…`, `setup-v…`) is a wire value: the updater,
+/// the proxies and the release lane key on it, so the reasons a notice carries hold
+/// it. A person reads the version, the way the wizard shows it. Only a tag standing
+/// as a word becomes its version: at the start, or after a space, an opening bracket
+/// or a quote. One inside an address (`/tags/agent-v0.4.1`, `?tag=agent-v0.4.1`) or
+/// glued to a word before it keeps its text, because it still has to lead somewhere.
 pub fn versions_not_tags(message: &str) -> String {
-    message.to_string()
+    const TAGS: [&str; 3] = ["agent-v", "tunnel-v", "setup-v"];
+    let mut shown = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(c) = rest.chars().next() {
+        let stands = shown
+            .chars()
+            .next_back()
+            .is_none_or(|p| p.is_whitespace() || "([{'\"`".contains(p));
+        let tag = TAGS.iter().find(|t| {
+            rest.strip_prefix(**t)
+                .is_some_and(|v| v.starts_with(|d: char| d.is_ascii_digit()))
+        });
+        match tag {
+            Some(t) if stands => rest = &rest[t.len()..],
+            _ => {
+                shown.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    shown
 }
 
 // ─── rc.53: LocalSystem-aware sentinel path routing ────────────────

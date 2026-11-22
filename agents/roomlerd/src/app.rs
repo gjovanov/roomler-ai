@@ -2646,7 +2646,7 @@ pub(crate) fn rollback_attention_msg(
     failure_reason: Option<&str>,
 ) -> String {
     let mut msg = format!(
-        "Roomler agent: crash loop detected (auto-rollback failed).\n\n\
+        "roomlerd: crash loop detected (auto-rollback failed).\n\n\
          Version {current} has crashed {crash_count} times within \
          {win_min} min. Last known good version: {target}.\n",
         win_min = config::CRASH_WINDOW_SECS / 60,
@@ -2669,7 +2669,7 @@ pub(crate) fn rollback_attention_msg(
 /// enrollment, and with updates left on the older version took this one back in 25 s.
 pub(crate) fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
     format!(
-        "Roomler agent: crash loop detected.\n\n\
+        "roomlerd: crash loop detected.\n\n\
          Version {current} has crashed {crash_count} times within {win_min} min. \
          Last known good version: {target}.\n\n\
          This device did not roll back: the Windows installer refuses to install an \

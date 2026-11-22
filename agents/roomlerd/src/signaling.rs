@@ -1668,33 +1668,24 @@ fn write_replaced_sentinel(message: &str, displacements: usize) {
 }
 
 /// FR-133 — what this loop's sentinels say, held here so a test reads each one whole.
-pub(crate) const AUTH_NOTICE: &str = "Roomler agent: re-enrollment required.\n\n\
-    The server is rejecting this agent's token. \
-    Either the device was removed or re-enrolled \
-    elsewhere, or its token expired and could not \
-    be renewed. Run:\n\n\
-    \troomlerd re-enroll --token <new-jwt>\n\n\
-    with a fresh enrollment JWT from the admin UI \
-    to restore service.";
+pub(crate) const AUTH_NOTICE: &str = "roomlerd: re-enrollment required.\n\nThe server is rejecting this \
+    device's token. Either the device was removed or re-enrolled elsewhere, or its token expired and \
+    could not be renewed. Run:\n\n\troomlerd re-enroll --token <new-jwt>\n\nwith a fresh enrollment \
+    JWT from the admin UI to restore service.";
 pub(crate) fn goodbye_notice(reason: AgentCloseReason, message: &str, after: &str) -> String {
-    let why = format!("{reason:?}");
+    let why = notify::goodbye_words(reason);
     format!(
-        "Roomler agent: server-side close — {why}.\n\n{message}\n\n\
-         The agent will not reconnect. Re-enrol with a fresh enrollment \
-         JWT from the admin UI:\n\n\
-         \troomlerd re-enroll --token <new-jwt>\n\n\
-         {after}"
+        "roomlerd: server-side close — {why}.\n\n{message}\n\nThe daemon will not reconnect. Re-enrol \
+         with a fresh enrollment JWT from the admin UI:\n\n\troomlerd re-enroll --token <new-jwt>\n\n{after}"
     )
 }
 pub(crate) fn replaced_notice(message: &str, displacements: usize) -> String {
     format!(
-        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
-         This connection has been displaced {displacements} times in the current \
-         window — another process (different physical host with a copy of this \
-         config.toml, or a stale half-open connection through a TLS-inspecting \
-         middlebox) is using the same agent_id. The agent stays up and backs \
-         off; if this persists, stop the duplicate or re-enrol THIS host with \
-         a fresh enrollment JWT to mint a new agent_id."
+        "roomlerd: duplicate-instance duel detected.\n\n{message}\n\nThis connection has been displaced \
+         {displacements} times in the current window — another process (different physical host with a \
+         copy of this config.toml, or a stale half-open connection through a TLS-inspecting middlebox) is \
+         using the same agent_id. The daemon stays up and backs off; if this persists, stop the duplicate \
+         or re-enrol THIS host with a fresh enrollment JWT to mint a new agent_id."
     )
 }
 
