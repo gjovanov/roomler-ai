@@ -414,12 +414,42 @@ pub fn report_previous_dumps(dir: &Path) -> Vec<PathBuf> {
     reported
 }
 
+/// The stack-walk handler's install, behind a seam (#3564): the tests drive it
+/// with a cell of their own and a fake installer, and touch no signal state.
+#[cfg(any(target_os = "linux", test))]
+struct InstallCell {
+    installed: AtomicBool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl InstallCell {
+    const fn new() -> Self {
+        Self {
+            installed: AtomicBool::new(false),
+        }
+    }
+
+    /// Has an install succeeded?
+    fn is_installed(&self) -> bool {
+        self.installed.load(Ordering::Acquire)
+    }
+
+    fn run(&self, install: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        if self.is_installed() {
+            return Ok(());
+        }
+        install()?;
+        self.installed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::DumpOut;
+    use super::{DumpOut, InstallCell};
     use std::fmt::Write as _;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     const MAX_FRAMES: usize = 64;
@@ -445,7 +475,7 @@ mod linux {
         (request << 2) | phase
     }
 
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static INSTALL: InstallCell = InstallCell::new();
     /// The thread asked to walk its stack. 0 = nobody.
     static TARGET: AtomicI32 = AtomicI32::new(0);
     static REQUEST: AtomicU64 = AtomicU64::new(0);
@@ -463,9 +493,10 @@ mod linux {
     }
 
     pub(super) fn install_handler() -> std::io::Result<()> {
-        if INSTALLED.load(Ordering::Acquire) {
-            return Ok(());
-        }
+        INSTALL.run(install_now)
+    }
+
+    fn install_now() -> std::io::Result<()> {
         // SAFETY: zeroed `sigaction`s are valid starting values; the first
         // call only reads the current action.
         unsafe {
@@ -494,8 +525,19 @@ mod linux {
                 return Err(std::io::Error::last_os_error());
             }
         }
-        INSTALLED.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Is the stack signal's action our handler?
+    #[cfg(test)]
+    pub(super) fn our_handler_is_installed() -> bool {
+        // SAFETY: a zeroed `sigaction` is a valid out-parameter; this only
+        // reads the current action.
+        unsafe {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(stack_signal(), std::ptr::null(), &mut now) == 0
+                && now.sa_sigaction == on_stack_signal as *const () as usize
+        }
     }
 
     extern "C" fn on_stack_signal(
@@ -576,7 +618,7 @@ mod linux {
 
     /// Ask thread `tid` to walk its own stack.
     pub(super) fn stack_of(tid: i32) -> Capture {
-        if !INSTALLED.load(Ordering::Acquire) {
+        if !INSTALL.is_installed() {
             return Capture::NotInstalled;
         }
         let _one_at_a_time = CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
@@ -945,6 +987,122 @@ mod tests {
         );
     }
 
+    /// #3564: the install seam, driven with a fake installer. Nothing here
+    /// touches a real signal.
+    mod install_once {
+        use super::super::InstallCell;
+        use std::io::ErrorKind;
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+        use std::time::Duration;
+
+        const DEFAULT: u8 = 0;
+        const OURS: u8 = 1;
+        const FOREIGN: u8 = 2;
+        const FOREIGN_MESSAGE: &str = "signal 39 already has a handler";
+        const CALLERS: usize = 16;
+
+        /// A stand-in for the stack signal's action, and an installer that
+        /// does what the real one does, slowly: read the action, refuse a
+        /// handler that is already there, install ours, then take a while to
+        /// return. That while is the window in which a check-then-act flag is
+        /// still unset after the handler is in.
+        struct FakeSignal {
+            action: AtomicU8,
+            runs: AtomicUsize,
+        }
+
+        impl FakeSignal {
+            fn new(action: u8) -> Self {
+                Self {
+                    action: AtomicU8::new(action),
+                    runs: AtomicUsize::new(0),
+                }
+            }
+
+            fn install(&self) -> std::io::Result<()> {
+                self.runs.fetch_add(1, SeqCst);
+                if self.action.load(SeqCst) != DEFAULT {
+                    return Err(std::io::Error::other(FOREIGN_MESSAGE));
+                }
+                self.action.store(OURS, SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(())
+            }
+        }
+
+        /// `CALLERS` threads, released together, each running the install.
+        fn all_at_once(cell: &InstallCell, fake: &FakeSignal) -> Vec<std::io::Result<()>> {
+            let barrier = std::sync::Barrier::new(CALLERS);
+            std::thread::scope(|s| {
+                let callers: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            cell.run(|| fake.install())
+                        })
+                    })
+                    .collect();
+                callers
+                    .into_iter()
+                    .map(|c| c.join().expect("caller"))
+                    .collect()
+            })
+        }
+
+        #[test]
+        fn sixteen_callers_at_once_install_once_and_all_get_ok() {
+            let cell = InstallCell::new();
+            let fake = FakeSignal::new(DEFAULT);
+            let results = all_at_once(&cell, &fake);
+            let errors: Vec<String> = results
+                .iter()
+                .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+                .collect();
+            let runs = fake.runs.load(SeqCst);
+            assert!(
+                errors.is_empty() && runs == 1,
+                "the installer ran {runs} time(s), and {} of {CALLERS} callers failed: {errors:?}",
+                errors.len()
+            );
+            assert!(cell.is_installed());
+            cell.run(|| fake.install()).expect("a later caller");
+            assert_eq!(
+                fake.runs.load(SeqCst),
+                1,
+                "a later caller gets the stored outcome"
+            );
+        }
+
+        #[test]
+        fn a_foreign_handler_is_reported_to_every_caller_and_looked_at_once() {
+            let cell = InstallCell::new();
+            let fake = FakeSignal::new(FOREIGN);
+            let seen: Vec<(ErrorKind, String)> = all_at_once(&cell, &fake)
+                .into_iter()
+                .map(|r| {
+                    let e = r.expect_err("every caller gets the error");
+                    (e.kind(), e.to_string())
+                })
+                .collect();
+            let want = (ErrorKind::Other, FOREIGN_MESSAGE.to_string());
+            assert!(seen.iter().all(|e| *e == want), "{seen:?}");
+            let later = cell
+                .run(|| fake.install())
+                .expect_err("the first outcome is final");
+            assert_eq!((later.kind(), later.to_string()), want);
+            assert_eq!(fake.runs.load(SeqCst), 1, "the installer ran once");
+            assert!(
+                !cell.is_installed(),
+                "a failed install never lets stack_of signal"
+            );
+            assert_eq!(
+                fake.action.load(SeqCst),
+                FOREIGN,
+                "the foreign handler is left alone"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     mod linux_capture {
         use super::super::linux;
@@ -982,6 +1140,37 @@ mod tests {
             );
             release_tx.send(()).expect("release");
             parked.join().expect("join");
+        }
+
+        /// #3564: callers that race the real install all get `Ok`, and the
+        /// stack signal then runs our handler.
+        #[test]
+        fn callers_racing_the_real_install_all_get_ok() {
+            const CALLERS: usize = 8;
+            let barrier = std::sync::Barrier::new(CALLERS);
+            let errors: Vec<String> = std::thread::scope(|s| {
+                let callers: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            linux::install_handler()
+                        })
+                    })
+                    .collect();
+                callers
+                    .into_iter()
+                    .filter_map(|c| c.join().expect("caller").err().map(|e| e.to_string()))
+                    .collect()
+            });
+            assert!(
+                errors.is_empty(),
+                "{} of {CALLERS} callers failed: {errors:?}",
+                errors.len()
+            );
+            assert!(
+                linux::our_handler_is_installed(),
+                "the stack signal runs on_stack_signal"
+            );
         }
 
         /// A thread that is gone is reported as gone, not as silent.
