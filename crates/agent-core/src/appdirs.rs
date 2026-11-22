@@ -1972,20 +1972,29 @@ mod tests {
         );
     }
 
+    /// #3746 — both folders present: the config pair stays as it is, and a
+    /// data pair merges into the NEW folder. Before #3746 this test pinned
+    /// "left in place" for every pair; it now pins both rules.
     #[test]
-    fn migrate_dir_leaves_split_brain_alone() {
+    fn a_split_brain_config_pair_stays_and_a_data_pair_merges() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("roomler-agent");
-        let new = tmp.path().join("roomler");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        std::fs::write(old.join("stale.txt"), b"old").unwrap();
-
-        let note = migrate_dir(&old, &new, true, rename_on_disk)
-            .unwrap()
-            .expect("both-present produces a note");
-        assert!(note.contains("left in place"), "{note}");
-        assert!(old.join("stale.txt").exists(), "nothing may be deleted");
+        for per_child in [false, true] {
+            let old = tmp.path().join(per_child.to_string()).join(OLD_APP);
+            let new = tmp.path().join(per_child.to_string()).join(NEW_APP);
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::create_dir_all(&new).unwrap();
+            std::fs::write(old.join("stale.txt"), b"old").unwrap();
+            let note = migrate_dir(&old, &new, per_child, rename_on_disk)
+                .unwrap()
+                .expect("both-present produces a note");
+            if per_child {
+                assert!(!old.exists(), "{note}");
+                assert_eq!(std::fs::read(new.join("stale.txt")).unwrap(), b"old");
+            } else {
+                assert!(note.contains("left in place"), "{note}");
+                assert!(old.join("stale.txt").exists(), "nothing may be deleted");
+            }
+        }
     }
 
     #[test]
@@ -2008,35 +2017,44 @@ mod tests {
         assert!(new.join("service-logs").join("a.log").exists());
     }
 
+    /// #3746 — a data folder whose rename is refused while another runner
+    /// fills the NEW folder merges into it entry by entry, with no roll
+    /// back: a folder both hold merges, and what the other runner put there
+    /// stays. Before #3746 this test pinned the per-child move's roll back.
     #[test]
-    fn migrate_children_rolls_back_on_midway_failure() {
+    fn a_refused_data_folder_merges_into_what_another_runner_made() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("roomler-agent");
-        let new = tmp.path().join("roomler");
+        let old = tmp.path().join(OLD_APP);
+        let new = tmp.path().join(NEW_APP);
         std::fs::create_dir_all(old.join("crashes")).unwrap();
+        std::fs::write(old.join("crashes").join("c1.dmp"), b"dump").unwrap();
         std::fs::write(old.join("config.toml"), b"tok").unwrap();
-        // Pre-create a CONFLICTING non-empty destination for `crashes` so
-        // its rename fails mid-way (rename onto a non-empty dir errors).
-        std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
 
-        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap_err();
-        assert!(note.contains("aborted"), "{note}");
-        // config.toml sorted LAST → it never left the old tree before the
-        // failure, and anything that did move was rolled back.
-        assert!(
-            old.join("config.toml").exists(),
-            "the enrollment must still be in the OLD tree: {note}"
-        );
-        assert!(old.join("crashes").exists());
+        let note = migrate_dir(&old, &new, true, |from: &Path, to: &Path| {
+            if from == old {
+                // The other runner, first: a `crashes` folder with something in it.
+                std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            rename_on_disk(from, to)
+        })
+        .unwrap()
+        .expect("a merge produces a note");
+
+        assert!(!old.exists(), "{note}");
+        assert_eq!(std::fs::read(new.join("config.toml")).unwrap(), b"tok");
+        let dump = new.join("crashes").join("c1.dmp");
+        assert_eq!(std::fs::read(dump).unwrap(), b"dump", "{note}");
+        assert!(new.join("crashes").join("blocker").is_dir(), "{note}");
     }
 
-    /// #3702 — a per-child move that stops midway leaves no NEW folder it
-    /// made: the segment choice keys on that folder being there. A file held
-    /// open with no sharing cannot be renamed on Windows.
+    /// #3746 — a file held open with no sharing, which cannot be renamed on
+    /// Windows, stays in the OLD folder while every other entry moves, and
+    /// the next start moves it. Before #3746 this test pinned the per-child
+    /// move's roll back, which left the whole folder in the OLD tree.
     #[cfg(windows)]
     #[test]
-    fn a_per_child_move_that_stops_leaves_no_new_folder() {
+    fn a_held_file_stays_in_the_old_folder_and_moves_at_the_next_start() {
         use std::os::windows::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let old = tmp.path().join(OLD_APP);
@@ -2050,15 +2068,28 @@ mod tests {
             .share_mode(0)
             .open(old.join("b.log"))
             .unwrap();
+        // An indexer's handle on the folder refuses the folder's own rename.
+        let refused = |from: &Path, to: &Path| {
+            if from == old {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            rename_on_disk(from, to)
+        };
 
-        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err).unwrap_err();
+        let note = migrate_dir(&old, &new, true, refused).unwrap_err();
+        assert!(note.contains("b.log"), "{note}");
+        for name in ["a.log", "config.toml"] {
+            assert!(new.join(name).is_file(), "{name}: {note}");
+        }
+        assert!(old.join("b.log").is_file(), "{note}");
+
         drop(held);
-
-        assert!(note.contains("aborted"), "{note}");
-        assert!(!new.exists(), "{note}");
+        let note = migrate_dir(&old, &new, true, rename_on_disk)
+            .unwrap()
+            .expect("a merge produces a note");
+        assert!(!old.exists(), "{note}");
         for name in ["a.log", "b.log", "config.toml"] {
-            assert!(old.join(name).is_file(), "{name}: {note}");
+            assert_eq!(std::fs::read_to_string(new.join(name)).unwrap(), name);
         }
     }
 
@@ -2275,6 +2306,400 @@ mod tests {
             assert!(!entry.name.is_empty());
         }
         assert_eq!(account_entry(4_000_000_123), None);
+    }
+
+    // ── #3746: a data folder's move converges ─────────────────────────────
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86_400);
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+    /// The file at `path` (its folders made), holding `body`, last modified
+    /// at `when`.
+    fn write_at(path: &Path, body: &str, when: std::time::SystemTime) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    /// The file at `path`, holding `body`, last modified `age` ago.
+    fn write_aged(path: &Path, body: &str, age: std::time::Duration) {
+        write_at(path, body, std::time::SystemTime::now() - age);
+    }
+
+    /// Every entry below `dir` that is not a folder, by its path from `dir`
+    /// (parts joined by `/`), with a file's content, or `<link>` for a link,
+    /// which is never followed. In name order.
+    fn files_below(dir: &Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut folders = vec![(dir.to_path_buf(), String::new())];
+        while let Some((at, rel)) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let kind = std::fs::symlink_metadata(entry.path()).unwrap().file_type();
+                if kind.is_symlink() {
+                    found.push((rel, "<link>".to_string()));
+                } else if kind.is_dir() {
+                    folders.push((entry.path(), rel));
+                } else {
+                    found.push((rel, std::fs::read_to_string(entry.path()).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// `(path, content)` pairs, owned and in name order, as [`files_below`]
+    /// lists them.
+    fn listing(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut listed: Vec<(String, String)> = entries
+            .iter()
+            .map(|(rel, body)| (rel.to_string(), body.to_string()))
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    /// The pairs of one profile: its config pair first, then its data pair.
+    fn config_and_data(profile: &Path) -> [(PathBuf, PathBuf); 2] {
+        [
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("data")),
+        ]
+    }
+
+    /// #3746 AC1 — a data folder whose move failed moves at a later start,
+    /// although that start's `logging::init` has made a `logs` folder in the
+    /// NEW data folder meanwhile: no OLD data folder is left, and every file
+    /// it held is in the NEW one.
+    #[test]
+    fn a_data_folder_whose_move_failed_moves_at_a_later_start() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (data_old, data_new) = pairs[1].clone();
+        write_aged(&pairs[0].0.join("config.toml"), "token", DAY);
+        let held = [
+            ("host-mute.json", "muted"),
+            ("privacy-curtains.json", "curtains"),
+            ("keep-busy.json", "busy"),
+            ("logs/update-attempt", "attempt"),
+            ("logs/last-install.json", "install"),
+            ("logs/roomlerd.log.2026-11-01", "an earlier day"),
+        ];
+        for (rel, body) in held {
+            write_aged(&data_old.join(rel), body, DAY);
+        }
+
+        // The first start: the config folder moves, and a handle held on the
+        // data folder refuses every rename below it.
+        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+            if from.starts_with(&data_old) {
+                return Err(std::io::Error::other("held"));
+            }
+            rename_on_disk(from, to)
+        });
+        assert!(pairs[0].1.join("config.toml").is_file(), "{notes:?}");
+        assert!(data_old.join("host-mute.json").is_file(), "{notes:?}");
+        // That start runs on the NEW tree: `logging::init` makes its folder.
+        let today = data_new.join("logs").join("roomlerd.log.2026-11-22");
+        write_aged(&today, "today", std::time::Duration::ZERO);
+
+        // A later start, with nothing held.
+        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+
+        assert!(!data_old.exists(), "{notes:?}");
+        let mut want = held.to_vec();
+        want.push(("logs/roomlerd.log.2026-11-22", "today"));
+        assert_eq!(files_below(&data_new), listing(&want), "{notes:?}");
+    }
+
+    /// #3746 AC2 — a name both folders hold. Folders merge, entry by entry;
+    /// any other entry is kept under the name by the copy modified last (a
+    /// tie by the NEW folder's), and the other copy is kept beside it as
+    /// `<name>.older`, or `.older-2`, … when that is taken. Nothing is
+    /// overwritten or deleted, and the run's note names what it kept beside.
+    #[test]
+    fn a_name_both_folders_hold_is_kept_by_the_copy_modified_last() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        // NEW's copy is the newer one; OLD's goes beside it, past a name
+        // an earlier merge took.
+        write_aged(&old.join("host-mute.json"), "old mute", DAY);
+        write_aged(&new.join("host-mute.json"), "new mute", HOUR);
+        write_aged(&new.join("host-mute.json.older"), "an earlier merge", DAY);
+        // OLD's copy is the newer one: it takes the name.
+        write_aged(&old.join("keep-busy.json"), "old busy", HOUR);
+        write_aged(&new.join("keep-busy.json"), "new busy", DAY);
+        // The same time: the NEW folder's copy keeps the name.
+        let then = std::time::SystemTime::now() - DAY;
+        write_at(&old.join("privacy-curtains.json"), "old curtains", then);
+        write_at(&new.join("privacy-curtains.json"), "new curtains", then);
+        // A folder both hold merges, by the same rule inside it.
+        let day_log = "logs/roomlerd.log.2026-11-01";
+        write_aged(&old.join(day_log), "old day", DAY);
+        write_aged(&new.join(day_log), "new day", HOUR);
+        write_aged(&old.join("logs/update-attempt"), "attempt", DAY);
+
+        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+
+        assert!(!old.exists(), "{notes:?}");
+        let want = listing(&[
+            ("host-mute.json", "new mute"),
+            ("host-mute.json.older", "an earlier merge"),
+            ("host-mute.json.older-2", "old mute"),
+            ("keep-busy.json", "old busy"),
+            ("keep-busy.json.older", "new busy"),
+            ("logs/roomlerd.log.2026-11-01", "new day"),
+            ("logs/roomlerd.log.2026-11-01.older", "old day"),
+            ("logs/update-attempt", "attempt"),
+            ("privacy-curtains.json", "new curtains"),
+            ("privacy-curtains.json.older", "old curtains"),
+        ]);
+        assert_eq!(files_below(&new), want, "{notes:?}");
+        let note = notes.join("\n");
+        for beside in [
+            "host-mute.json.older-2",
+            "keep-busy.json.older",
+            "privacy-curtains.json.older",
+            "roomlerd.log.2026-11-01.older",
+        ] {
+            assert!(note.contains(beside), "{beside}: {note}");
+        }
+    }
+
+    /// #3746 — two processes can run the move at the same moment (a service
+    /// and a process it starts, or the person's daemon and a command typed
+    /// by hand). Each takes an entry the other moved as moved and a folder
+    /// the other made as one to merge into, and no rename takes a name that
+    /// is taken: no file is lost or doubled, and the next start finishes
+    /// whatever either one left.
+    #[test]
+    fn two_runners_at_once_lose_nothing_and_converge() {
+        for round in 0..12 {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path();
+            let pairs = config_and_data(profile);
+            let (old, new) = pairs[1].clone();
+            let mut want = Vec::new();
+            for i in 0..40 {
+                let rel = match i % 4 {
+                    0 => format!("state-{i}.json"),
+                    1 => format!("logs/roomlerd.log.{i}"),
+                    2 => format!("logs/crashes/c{i}.dmp"),
+                    _ => format!("recordings/r{i}.webm"),
+                };
+                write_aged(&old.join(&rel), &format!("old {i}"), DAY);
+                want.push(format!("old {i}"));
+                if i % 5 == 0 {
+                    write_aged(&new.join(&rel), &format!("new {i}"), HOUR);
+                    want.push(format!("new {i}"));
+                }
+            }
+            std::fs::create_dir_all(new.join("logs")).unwrap();
+            want.sort();
+            let contents = || {
+                let mut all: Vec<String> = [&old, &new]
+                    .iter()
+                    .flat_map(|dir| files_below(dir).into_iter().map(|(_, body)| body))
+                    .collect();
+                all.sort();
+                all
+            };
+
+            let start = std::sync::Barrier::new(2);
+            let notes: Vec<Vec<String>> = std::thread::scope(|s| {
+                let runners: Vec<_> = (0..2)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            migrate_dirs_within(profile, &pairs, rename_on_disk)
+                        })
+                    })
+                    .collect();
+                runners.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            assert_eq!(contents(), want, "round {round}: {notes:?}");
+
+            let next = migrate_dirs_within(profile, &pairs, rename_on_disk);
+            assert!(!old.exists(), "round {round}: {notes:?} then {next:?}");
+            assert_eq!(contents(), want, "round {round}: {notes:?} then {next:?}");
+        }
+    }
+
+    /// #3746 — another runner made the NEW data folder, with a file under a
+    /// name the OLD folder holds too, just before this run's rename of the
+    /// folder was refused: no collision, the folders merge by the rule, and
+    /// both copies stay.
+    #[test]
+    fn a_folder_another_runner_just_made_is_merged_into() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("host-mute.json"), "ours", DAY);
+        write_aged(&old.join("a.log"), "a", DAY);
+
+        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+            if from == old {
+                // The other runner, first: the NEW folder, a file in it.
+                write_aged(&new.join("host-mute.json"), "theirs", HOUR);
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(!old.exists(), "{notes:?}");
+        let want = listing(&[
+            ("a.log", "a"),
+            ("host-mute.json", "theirs"),
+            ("host-mute.json.older", "ours"),
+        ]);
+        assert_eq!(files_below(&new), want, "{notes:?}");
+    }
+
+    /// #3746 — an entry another runner moved between this run's look at the
+    /// OLD folder and its rename is moved, not left behind.
+    #[test]
+    fn an_entry_another_runner_moved_is_done() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = config_and_data(profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("a.log"), "a", DAY);
+        write_aged(&old.join("b.log"), "b", DAY);
+        std::fs::create_dir_all(new.join("logs")).unwrap();
+
+        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+            if from == old.join("a.log") {
+                // The other runner, first.
+                std::fs::rename(from, to).unwrap();
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(!old.exists(), "{notes:?}");
+        assert_eq!(
+            files_below(&new),
+            listing(&[("a.log", "a"), ("b.log", "b")]),
+            "{notes:?}"
+        );
+        assert!(!notes.join("\n").contains("a.log"), "{notes:?}");
+    }
+
+    /// #3746 — a data pair that leaves an entry in the OLD folder holds back
+    /// no pair after it: each data pair converges on its own, and the next
+    /// start moves the entry that was left.
+    #[test]
+    fn a_data_pair_that_leaves_an_entry_behind_holds_back_no_pair_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let pairs = [
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("roaming")),
+            pair_in(&profile.join("local")),
+        ];
+        write_aged(&pairs[0].0.join("config.toml"), "token", DAY);
+        write_aged(&pairs[1].0.join("held.log"), "held", DAY);
+        write_aged(&pairs[1].0.join("free.log"), "free", DAY);
+        write_aged(&pairs[2].0.join("logs/x.log"), "x", DAY);
+        let held = pairs[1].0.join("held.log");
+
+        let notes = migrate_dirs_within(profile, &pairs, |from, to| {
+            if from == pairs[1].0 || from == held {
+                return Err(std::io::Error::other("held"));
+            }
+            rename_on_disk(from, to)
+        });
+
+        assert!(pairs[0].1.join("config.toml").is_file(), "{notes:?}");
+        assert!(pairs[1].1.join("free.log").is_file(), "{notes:?}");
+        assert!(held.is_file(), "{notes:?}");
+        assert!(notes.join("\n").contains("held.log"), "{notes:?}");
+        assert!(!pairs[2].0.exists(), "{notes:?}");
+        assert!(pairs[2].1.join("logs").join("x.log").is_file(), "{notes:?}");
+
+        let notes = migrate_dirs_within(profile, &pairs, rename_on_disk);
+        assert!(!pairs[1].0.exists(), "{notes:?}");
+        assert!(pairs[1].1.join("held.log").is_file(), "{notes:?}");
+    }
+
+    /// #3746 — the rename the move makes on disk never takes a name that is
+    /// taken: not a file's, not a folder's that holds something, and not by
+    /// a link. A free name it takes.
+    #[test]
+    fn the_rename_on_disk_never_takes_a_name_that_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = |name: &str| tmp.path().join(name);
+        std::fs::write(at("a"), "a").unwrap();
+        std::fs::write(at("b"), "b").unwrap();
+        let err = rename_on_disk(&at("a"), &at("b")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(at("a")).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(at("b")).unwrap(), "b");
+
+        std::fs::create_dir_all(at("d").join("x")).unwrap();
+        std::fs::create_dir_all(at("e").join("y")).unwrap();
+        assert!(rename_on_disk(&at("d"), &at("e")).is_err());
+        assert!(at("d").join("x").is_dir() && at("e").join("y").is_dir());
+
+        folder_link(&at("l"), &at("d"));
+        assert!(rename_on_disk(&at("l"), &at("b")).is_err());
+        assert_eq!(std::fs::read_to_string(at("b")).unwrap(), "b");
+        assert!(at("d").join("x").is_dir());
+
+        rename_on_disk(&at("a"), &at("c")).unwrap();
+        assert!(!at("a").exists());
+        assert_eq!(std::fs::read_to_string(at("c")).unwrap(), "a");
+    }
+
+    /// #3746 — a link in the OLD data folder (a junction on Windows, a
+    /// symbolic link elsewhere) is settled by the rule as a link and never
+    /// followed: what it leads to stays where it is, and the NEW folder of
+    /// the same name keeps everything it holds.
+    #[test]
+    fn a_link_in_the_old_folder_moves_as_a_link_and_is_never_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        let elsewhere = root.path().join("elsewhere");
+        write_aged(&elsewhere.join("secret.txt"), "secret", DAY);
+        let pairs = config_and_data(&profile);
+        let (old, new) = pairs[1].clone();
+        write_aged(&old.join("other.json"), "other", DAY);
+        folder_link(&old.join("logs"), &elsewhere);
+        write_aged(&new.join("logs").join("today.log"), "today", HOUR);
+
+        let notes = migrate_dirs_within(&profile, &pairs, rename_on_disk);
+
+        assert!(!old.exists(), "{notes:?}");
+        let secret = listing(&[("secret.txt", "secret")]);
+        assert_eq!(files_below(&elsewhere), secret, "{notes:?}");
+        let link_beside = listing(&[
+            ("logs.older", "<link>"),
+            ("logs/today.log", "today"),
+            ("other.json", "other"),
+        ]);
+        let link_named = listing(&[
+            ("logs", "<link>"),
+            ("logs.older/today.log", "today"),
+            ("other.json", "other"),
+        ]);
+        let found = files_below(&new);
+        assert!(
+            found == link_beside || found == link_named,
+            "{found:?}: {notes:?}"
+        );
     }
 }
 
