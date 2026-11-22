@@ -340,4 +340,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(pending.wait(SHORT).await, AckOutcome::Recorded);
     }
+
+    /// #3558 — a device refuses a second copy of a grant it already holds,
+    /// and on the worker's path that refusal comes after the first copy's
+    /// ack, on the same socket. It must land nowhere: the first ack took the
+    /// slot, so the caller keeps the answer the first copy gave. The device
+    /// relies on this to refuse a copy out loud.
+    #[tokio::test]
+    async fn a_refusal_after_a_recorded_ack_lands_nowhere() {
+        let acks = Arc::new(SshGrantAcks::new());
+        let target = ObjectId::new();
+        let pending = acks.expect("g1", target);
+        assert!(acks.deliver("g1", target, None), "the first copy's ack");
+        assert!(
+            !acks.deliver("g1", target, Some(SshGrantRefusal::Invalid)),
+            "the second copy's refusal finds no slot"
+        );
+        assert_eq!(pending.wait(SHORT).await, AckOutcome::Recorded);
+        assert_eq!(acks.pending(), 0);
+    }
 }
