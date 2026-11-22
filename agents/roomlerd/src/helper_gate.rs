@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-151 — the gate of the Mac's root update helper (`com.roomler.update`):
 //! an automatic update waits for live work on a Mac as it does on Windows and
 //! Linux (#3429, [`crate::updater::periodic_gate`]).

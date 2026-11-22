@@ -212,11 +212,11 @@ at `:748` and `:767-774`):
 | `--system` | turned off, if a per-user install left it on | the root daemon installs its own updates |
 
 - **The gate is the binary's own word, not a version.** `roomlerd update-helper --capabilities` prints `wake-file`,
-  `step-aside`, `restart-on-replace` and exits; any user may ask (the words at `updater.rs:4896-4902`). `install.sh` is
+  `step-aside`, `restart-on-replace` and exits; any user may ask (the words at `updater.rs:4897-4903`). `install.sh` is
   served by the server and ships with a promote, while the daemon ships with an agent release, and the two need not
   arrive in order. A word is never renamed or removed: `the_capabilities_are_the_words_install_sh_matches` pins
   the pair.
-- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1519-1529`, `updater.rs:4904-4932`),
+- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1519-1529`, `updater.rs:4905-4933`),
   and only its exact form (`only_the_exact_capabilities_query_is_answered_before_parsing`). It was a clap flag at
   first, a `--capabilities` field on `Command::UpdateHelper`, and CI's Windows recorder lane (FR-85) went red: the
   debug binary died before printing a line, twice on the same commit, while the parent PR passed on the same base.
@@ -244,7 +244,7 @@ at `:748` and `:767-774`):
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
   of failing (`app.rs:6458-6474`). It asks the daemon's own decision, `helper_owns_updates`
-  (`updater.rs:4941-4949`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
+  (`updater.rs:4942-4950`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off
   with the system unit.

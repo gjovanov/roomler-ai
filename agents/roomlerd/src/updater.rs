@@ -3963,7 +3963,7 @@ async fn wait_for_the_helper_with(
                 Err(e) => tracing::warn!(error = %e, "could not write the update-helper wake file"),
             }
         }
-        return forward_triggers_to(wake, shutdown, trigger_rx).await;
+        return forward_triggers_to(wake, &ask_book(), shutdown, trigger_rx).await;
     }
 }
 
@@ -4361,7 +4361,8 @@ pub async fn run_update_helper(stop: impl std::future::Future<Output = ()>) -> a
     {
         // A per-user Linux install's helper only replaces the binary: the
         // daemon restarts onto it when it reads idle (`replaced_binary`).
-        let _ = stop;
+        // It never waits, so it never reads the stop signal either.
+        drop(stop);
         match check_once().await {
             CheckOutcome::UpToDate { current, latest } => {
                 tracing::info!(%current, %latest, "update-helper: up to date");
