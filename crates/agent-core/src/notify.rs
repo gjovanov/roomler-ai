@@ -583,7 +583,7 @@ mod tests {
             "https://example.invalid/releases/tags/agent-v0.4.231",
             "GET /api/agent/release?tag=agent-v0.4.231",
             "agent-vpn is up",
-            "roomler-agent-v0.4.1",
+            "build-agent-v0.4.1",
             "agent-v",
             "an agent-v.x tag",
             "Version 0.4.232 has crashed",
