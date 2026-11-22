@@ -5299,8 +5299,8 @@ page as one `Vec` (`AuditListResponse`, `crates/modules/remote/src/routes.rs:163
 image one unknown kind fails the whole page, FR-137 S-B5's class. The row sets no floor. `RemoteSession` denies no
 unknown field (`crates/remote_control/src/models.rs:6053-6054`), so an older image ignores `attach_seq`, `detached_at`,
 `resume_by`, `stats_at` and `end_source`, and FR-138 added no `EndReason` and no phase. An `end_source` value from a
-later image, such as D5's `redial`, reads as `Unknown` from P1a on (`EndSource`, `:6134`, its `#[serde(other)]` at
-`:6151`).
+later image, such as D5's `redial`, reads as `Unknown` from P1a on (`EndSource`, `:6139`, its `#[serde(other)]` at
+`:6156`).
 
 What a rollback above the floor still costs:
 
