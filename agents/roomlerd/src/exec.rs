@@ -5408,6 +5408,12 @@ mod console_lookup_tests {
         use super::*;
         use crate::exec::unix_priv::account_stand_in as database;
 
+        /// How long a test waits for the lookups it started to begin (#4274):
+        /// far longer than a busy runner takes to schedule a thread. A count
+        /// already there returns at once, so only a lookup that never begins
+        /// waits this out.
+        const BEGINS: Duration = Duration::from_secs(10);
+
         /// The account database: every lookup recorded as it begins, by the
         /// account it is for, and held until the database is let go, as a
         /// stalled SSSD holds `getpwnam_r`. A lookup let go fails, so nothing
@@ -5483,6 +5489,27 @@ mod console_lookup_tests {
                     .iter()
                     .filter(|asked| *asked == account)
                     .count()
+            }
+
+            /// Lookups begun for `account`, once `want` of them have, waited
+            /// for `within` at most. A lookup counts when its own thread runs
+            /// it, and an ask can answer before that thread has run: once its
+            /// wait is out. So a count read straight after the asks can miss
+            /// a lookup they started (#4274). The caller asserts the exact
+            /// count, so one lookup more than `want` still fails.
+            fn began_for_within(&self, account: &str, want: usize, within: Duration) -> usize {
+                let deadline = Instant::now() + within;
+                loop {
+                    let began = self.began_for(account);
+                    if began >= want {
+                        return began;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{began} of {want} lookups for {account:?} began within {within:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
 
@@ -5680,12 +5707,12 @@ mod console_lookup_tests {
                 );
             }
             assert_eq!(
-                stalled.began_for(&person.name),
+                stalled.began_for_within(&person.name, 1, BEGINS),
                 1,
                 "one lookup for the person's account, however many asked"
             );
             assert_eq!(
-                stalled.began_for(another),
+                stalled.began_for_within(another, 1, BEGINS),
                 1,
                 "another account's own lookup"
             );
@@ -6014,18 +6041,18 @@ mod console_lookup_tests {
                     );
                 }
                 assert_eq!(
-                    stalled.began_for(&person.name),
+                    stalled.began_for_within(&person.name, 1, BEGINS),
                     1,
                     "one lookup for the person's account, however many asked"
                 );
                 assert_eq!(
-                    stalled.began_for(another),
+                    stalled.began_for_within(another, 1, BEGINS),
                     1,
                     "another account's own lookup"
                 );
                 #[cfg(feature = "recording")]
                 assert_eq!(
-                    stalled.began_for(&format!("uid {}", person.uid)),
+                    stalled.began_for_within(&format!("uid {}", person.uid), 1, BEGINS),
                     1,
                     "one lookup for the person's uid, however many asked"
                 );

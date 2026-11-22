@@ -7977,6 +7977,32 @@ mod start_within_tests {
     const WAIT: Duration = Duration::from_millis(300);
     /// What a wait may take past itself on a busy runner.
     const SLACK: Duration = Duration::from_secs(2);
+    /// How long the test waits for the start it expects to begin (#4274):
+    /// far longer than a busy runner takes to schedule a thread. A count
+    /// already there returns at once, so only a start that never begins
+    /// waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
+
+    /// The starts `began` counted, once `want` of them have, waited for
+    /// `within` at most. A start counts when the thread its flight runs on
+    /// reaches it, and an ask can answer before that thread has run: once
+    /// its wait is out. So a count read straight after the asks can miss a
+    /// start they began (#4274). The caller asserts the exact count, so one
+    /// start more than `want` still fails.
+    fn began_within(began: &AtomicUsize, want: usize, within: Duration) -> usize {
+        let deadline = Instant::now() + within;
+        loop {
+            let n = began.load(SeqCst);
+            if n >= want {
+                return n;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{n} of {want} starts began within {within:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn a_start_that_hangs_holds_its_session_alone() {
@@ -8037,7 +8063,7 @@ mod start_within_tests {
         let again = start_within(starts, Some(1), WAIT, held(&gate, &began));
         assert!(matches!(again, TrayStart::Failed(_)), "{again:?}");
         assert_eq!(
-            began.load(SeqCst),
+            began_within(&began, 1, BEGINS),
             1,
             "one start for session 1 while it hangs"
         );
