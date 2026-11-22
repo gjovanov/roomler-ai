@@ -2500,12 +2500,14 @@ fn external_password_state(cfg: &crate::config::AgentConfig) -> ExternalPassword
     }
 }
 
-fn is_hex_object_id(s: &str) -> bool {
+/// A 24-hex ObjectId: the only shape a consent question's id takes. FR-149 —
+/// the session panel's ask and the worker's gate check it too.
+pub(crate) fn is_hex_object_id(s: &str) -> bool {
     s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use tunnel_core::localapi::ConnectionType;
@@ -3000,7 +3002,7 @@ mod tests {
     }
 
     /// A question the companion is to show, on `broker`.
-    fn ask_on(
+    pub(crate) fn ask_on(
         broker: &crate::consent::ConsentBroker,
         id: &str,
         window: Duration,
@@ -3025,7 +3027,7 @@ mod tests {
     /// own, as the root daemon's is in root's home and the worker's in the
     /// person's: the root half behind its person socket for `person`, and the
     /// worker, with no enrollment unless `enrolled`, asking that socket.
-    fn one_row_mac(
+    pub(crate) fn one_row_mac(
         dirs: &tempfile::TempDir,
         window: Duration,
         enrolled: bool,
@@ -3099,6 +3101,90 @@ mod tests {
                 "{id}: a decided question is still listed"
             );
         }
+    }
+
+    /// FR-149 AC2 (D3) — a click on the screen worker's panel takes the
+    /// app's road: on a root daemon's question it goes to the root half,
+    /// whose person socket asks the seat again before its broker takes it
+    /// (`consent_decide_view`'s rule); on the worker's own question it stays
+    /// with the worker's broker; and after a question's window it is
+    /// refused. The click goes as the worker's signalling loop sends it: by
+    /// the road `consent_relay::panel_road` chooses (the registered road, or
+    /// the worker's own broker when it asks the question), through
+    /// `panel_answered`.
+    ///
+    /// Review F1 — a click the root half did not take tells the root daemon,
+    /// unasked, that the panel no longer shows the question (`not_up`,
+    /// `CLICK_NOT_TAKEN`); a click that was taken, or that the worker's own
+    /// broker decided, tells it nothing.
+    ///
+    /// Red before FR-149: the panel's click went to the worker's own broker
+    /// alone, which refused the root daemon's question as one it was not
+    /// asking. Red before the review's F1: a refused click told nobody.
+    #[tokio::test]
+    async fn a_session_panel_click_on_the_roots_question_takes_the_apps_road() {
+        use crate::indicator::session_panel::{CLICK_NOT_TAKEN, PanelState};
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let (root_broker, worker_broker, worker) = one_row_mac(&dirs, window, false);
+        async fn decided(
+            asking: impl std::future::Future<Output = crate::consent::Decision>,
+        ) -> crate::consent::Decision {
+            tokio::time::timeout(Duration::from_secs(3), asking)
+                .await
+                .expect("a question ends promptly")
+        }
+        /// A click on the worker's panel, and what the root daemon was told.
+        async fn click(
+            own: &crate::consent::ConsentBroker,
+            id: &str,
+            allow: bool,
+        ) -> (bool, Vec<PanelState>) {
+            let road = crate::consent_relay::panel_road(own, id);
+            let mut said = Vec::new();
+            let taken =
+                crate::consent_relay::panel_answered(own, road.as_deref(), id, allow, |state| {
+                    said.push(state);
+                    true
+                })
+                .await;
+            (taken, said)
+        }
+
+        crate::consent_relay::road_for_tests::with_the_road(worker.clone(), async {
+            // The root daemon's question, shown on the worker's panel.
+            let roots = "414900000000000000000b01";
+            let asking = ask_on(&root_broker, roots, window);
+            let (taken, said) = click(&worker_broker, roots, true).await;
+            assert!(taken, "the click on the root daemon's question was refused");
+            assert_eq!(said, Vec::new(), "a click that was taken");
+            assert_eq!(decided(asking).await, crate::consent::Decision::Granted);
+
+            // The worker's own question stays with the worker's broker.
+            let own = "414900000000000000000b02";
+            let asking = ask_on(&worker_broker, own, window);
+            assert!(crate::consent_relay::panel_road(&worker_broker, own).is_none());
+            let (taken, said) = click(&worker_broker, own, false).await;
+            assert!(taken);
+            assert_eq!(said, Vec::new(), "the worker's own question");
+            assert_eq!(decided(asking).await, crate::consent::Decision::Denied);
+
+            // After the window, a click counts for nothing, and the root
+            // daemon hears that the panel no longer shows the question.
+            let late = "414900000000000000000b03";
+            let asking = ask_on(&root_broker, late, Duration::from_millis(300));
+            assert_eq!(decided(asking).await, crate::consent::Decision::Timeout);
+            let (taken, said) = click(&worker_broker, late, true).await;
+            assert!(!taken, "a click after the window was taken");
+            assert_eq!(
+                said,
+                vec![PanelState::NotUp {
+                    why: CLICK_NOT_TAKEN.into()
+                }],
+                "the root daemon was not told that the panel no longer shows its question"
+            );
+        })
+        .await;
     }
 
     /// #3967 — a question `broker` asks of the companion, of `kind`: the root
