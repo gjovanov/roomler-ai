@@ -144,11 +144,10 @@ pub(crate) fn with_proven<T>(names: &[&str], f: impl FnOnce() -> T) -> T {
 }
 
 /// `Ok` when `name` opens in its GPU form, or the reason it takes CPU frames
-/// (the heartbeat's `input_reason`). Every gate is read here, at the open.
+/// (the heartbeat's `input_reason`). Every gate is read here, at the open: the
+/// switch (unset, the default list: FR-132 P2) first.
 pub(crate) fn plan(name: &str, chroma444: bool) -> std::result::Result<(), &'static str> {
-    if !crate::capture::zero_copy_enabled() {
-        return Err("switch_off");
-    }
+    crate::capture::zero_copy_admits(name)?;
     if !gpu_cell(name, chroma444) {
         return Err("no_gpu_cell");
     }
@@ -406,7 +405,7 @@ mod tests {
     use crate::capture::iosurface_frame::new_bgra;
     use crate::capture::{Damage, Frame, FrameData, PixelFormat};
     use crate::encode::ffmpeg::FfmpegEncoder;
-    use tunnel_core::env::test_env::{Saved, set};
+    use tunnel_core::env::test_env::{Saved, clear, set};
 
     #[link(name = "IOSurface", kind = "framework")]
     unsafe extern "C" {
@@ -485,8 +484,12 @@ mod tests {
             Ok(()) => "gpu",
             Err(reason) => reason,
         };
-        assert_eq!(reason("hevc_videotoolbox", false), "switch_off");
+        // FR-132 P2 — unset, the built-in list (empty) answers first.
+        assert_eq!(reason("hevc_videotoolbox", false), "default_off");
         // SAFETY: serialised by DENY_ENV_LOCK; the guards restore both.
+        unsafe { set("ZERO_COPY", "0") };
+        assert_eq!(reason("hevc_videotoolbox", false), "switch_off");
+        // SAFETY: as above.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(reason("hevc_qsv", false), "no_gpu_cell");
         assert_eq!(reason("av1_videotoolbox", false), "no_gpu_cell");
@@ -498,6 +501,87 @@ mod tests {
             // SAFETY: as above.
             unsafe { set("ZERO_COPY_DENY", "hevc_videotoolbox:gpu") };
             assert_eq!(reason("hevc_videotoolbox", false), "denied");
+        });
+    }
+
+    /// FR-132 P2, AC4's session half on macOS: with the switch unset, a
+    /// listed cell meets every gate after the switch's as it does with the
+    /// switch `on` (the cell, `zero_copy_deny`, the probe's proof), an
+    /// unlisted one reads `default_off`, and `off` refuses a listed cell too.
+    #[test]
+    fn with_a_list_an_unset_switch_opens_a_listed_cell_as_on_does() {
+        let _guard = knobs();
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let reason = |name, chroma444| match plan(name, chroma444) {
+            Ok(()) => "gpu",
+            Err(reason) => reason,
+        };
+        let listed = ["hevc_videotoolbox"];
+        let names = [
+            "hevc_videotoolbox",
+            "h264_videotoolbox",
+            "av1_videotoolbox",
+            "hevc_qsv",
+        ];
+        crate::capture::with_default_cells(&listed, || {
+            for proven in [&[][..], &["hevc_videotoolbox", "h264_videotoolbox"][..]] {
+                with_proven(proven, || {
+                    for deny in [None, Some("hevc_videotoolbox:gpu")] {
+                        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore both.
+                        match deny {
+                            Some(list) => unsafe { set("ZERO_COPY_DENY", list) },
+                            None => unsafe { clear("ZERO_COPY_DENY") },
+                        }
+                        for name in names {
+                            for chroma444 in [false, true] {
+                                let case = format!(
+                                    "{name} chroma444={chroma444} proven={proven:?} deny={deny:?}"
+                                );
+                                // SAFETY: as above.
+                                unsafe { set("ZERO_COPY", "1") };
+                                let on = reason(name, chroma444);
+                                // SAFETY: as above.
+                                unsafe { set("ZERO_COPY", "0") };
+                                assert_eq!(reason(name, chroma444), "switch_off", "off: {case}");
+                                // SAFETY: as above.
+                                unsafe { clear("ZERO_COPY") };
+                                let unset = reason(name, chroma444);
+                                if listed.contains(&name) {
+                                    assert_eq!(unset, on, "unset, listed, as on: {case}");
+                                } else {
+                                    assert_eq!(unset, "default_off", "unset, unlisted: {case}");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // The cells AC4 names, read out once each.
+            // SAFETY: as above.
+            unsafe { clear("ZERO_COPY_DENY") };
+            with_proven(&["hevc_videotoolbox", "h264_videotoolbox"], || {
+                assert_eq!(
+                    reason("hevc_videotoolbox", false),
+                    "gpu",
+                    "listed and proven"
+                );
+                assert_eq!(reason("h264_videotoolbox", false), "default_off");
+                // SAFETY: as above.
+                unsafe { set("ZERO_COPY_DENY", "hevc_videotoolbox:gpu") };
+                assert_eq!(
+                    reason("hevc_videotoolbox", false),
+                    "denied",
+                    "zero_copy_deny wins over the list"
+                );
+            });
+            // SAFETY: as above.
+            unsafe { clear("ZERO_COPY_DENY") };
+            assert_eq!(
+                reason("hevc_videotoolbox", false),
+                "unproven",
+                "the probe's proof binds a listed cell"
+            );
         });
     }
 

@@ -359,7 +359,7 @@ AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
 | `direct_queue_ms` | `ROOMLERD_DIRECT_QUEUE_MS` | 150 | direct send-queue lag bound (0 = off) |
 | `direct_hrd_pct` | `ROOMLERD_DIRECT_HRD_PCT` | 100 | direct HRD/VBV window (AV1 floored 200) |
 | `roomler-rc-input-gap` | — (localStorage) | 8 | pointer min-gap, ms (0–16) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | unset: the built-in default list, empty, so off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps. `on` takes every proven cell; unset only the default list's ([FR-132](fr/FR-132-zero-copy-by-default.md) P2) |
 
 The age pill needs agent ≥ 0.4.9 and a WebCodecs decode path (HEVC-over-DC or
 VP9-4:4:4); it is absent on the classic `<video>` path and on older agents.

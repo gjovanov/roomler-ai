@@ -134,9 +134,11 @@ impl ScrapCapture {
         #[cfg(target_os = "macos")]
         let desired_worker = desired.clone();
         // FR-118 P5 — read once, when the backend opens. On macOS the switch
-        // hands each frame's IOSurface on instead of its bytes; elsewhere this
-        // arm has no GPU form.
-        let zero_copy = cfg!(target_os = "macos") && super::zero_copy_enabled();
+        // hands each frame's IOSurface on instead of its bytes (unset, only with
+        // a proven VideoToolbox cell listed: FR-132 P2); elsewhere this arm has
+        // no GPU form.
+        let zero_copy =
+            cfg!(target_os = "macos") && super::zero_copy_capture(&super::gpu_input_cells());
         if zero_copy {
             tracing::info!(
                 "FR-118: zero-copy ON — each frame's IOSurface goes on, read back only if a consumer asks"

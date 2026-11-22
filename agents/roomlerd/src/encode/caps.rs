@@ -1349,7 +1349,7 @@ mod child {
         // FR-118 P2-3 — the GPU-input forms, in a child of their own: a form
         // that kills its process costs only the GPU forms (the 4:4:4
         // lesson), and the daemon never opens one the probe has not proven.
-        // With the switch off there are no candidates, so no child (AC6).
+        // Off, or unset with no cell listed (FR-132 P2): no candidates, no child (AC6).
         let gpu_names = candidates_gpu(&report.caps, &cells::denied_with(&learned));
         if !gpu_names.is_empty() {
             let child = run(
@@ -1779,11 +1779,12 @@ mod child {
 
     /// FR-118 P2-3 — the encoders whose GPU-input form the third phase should
     /// try: the base matrix's QSV and (P3) NVENC cells the GPU input covers
-    /// (4:2:0), minus the cell denylist and `zero_copy_deny`; none at all with
-    /// the switch off or on a build without GPU frames. A gate the probe
-    /// honours is a gate only if the session honours it too: `gpu_input::plan`
-    /// reads the same two lists at every open. `deny` is this probe's
-    /// ([`cells::denied_with`]).
+    /// (4:2:0) that the switch admits (`capture::zero_copy_admits`: every one
+    /// with it on, none with it off, only the default list's with it unset,
+    /// FR-132 P2), minus the cell denylist and `zero_copy_deny`; none at all on
+    /// a build without GPU frames. A gate the probe honours is a gate only if
+    /// the session honours it too: `gpu_input::plan` reads the same three at
+    /// every open. `deny` is this probe's ([`cells::denied_with`]).
     pub(super) fn candidates_gpu(caps: &AgentCaps, deny: &[String]) -> Vec<String> {
         #[cfg(all(
             target_os = "windows",
@@ -1791,9 +1792,6 @@ mod child {
             any(feature = "mf-encoder", feature = "wgc-capture")
         ))]
         {
-            if !crate::capture::gpu_frame::zero_copy_enabled() {
-                return Vec::new();
-            }
             let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
             let mut names: Vec<String> = Vec::new();
             for cell in caps.typed_cells() {
@@ -1802,6 +1800,7 @@ mod child {
                 }
                 let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
                 if crate::encode::ffmpeg::gpu_input::gpu_cell(&name, false)
+                    && crate::capture::zero_copy_admits(&name).is_ok()
                     && !crate::encode::cells::cell_denied(deny, &name, ChromaFormat::Yuv420)
                     && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
                     && !names.contains(&name)
@@ -1811,17 +1810,14 @@ mod child {
             }
             names
         }
-        // FR-118 P5 — VideoToolbox's 4:2:0 cells, under the same switch and the
-        // same two denylists `vt_input::plan` reads at every open.
+        // FR-118 P5 — VideoToolbox's 4:2:0 cells, under the same switch (and
+        // list) and the same two denylists `vt_input::plan` reads at every open.
         #[cfg(all(
             target_os = "macos",
             feature = "ffmpeg-encoder",
             feature = "scrap-capture"
         ))]
         {
-            if !crate::capture::zero_copy_enabled() {
-                return Vec::new();
-            }
             let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
             let mut names: Vec<String> = Vec::new();
             for cell in caps.typed_cells() {
@@ -1830,6 +1826,7 @@ mod child {
                 }
                 let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
                 if crate::encode::ffmpeg::vt_input::gpu_cell(&name, false)
+                    && crate::capture::zero_copy_admits(&name).is_ok()
                     && !crate::encode::cells::cell_denied(deny, &name, ChromaFormat::Yuv420)
                     && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
                     && !names.contains(&name)
@@ -3793,18 +3790,20 @@ fn install_vp9_qsv_idr(_verdict: Option<(bool, bool)>) {}
 ))]
 fn install_gpu_input(proven: Vec<String>) {
     // FR-118 P3 — the capture side reads the same list to put its device on
-    // those cells' adapter.
-    crate::capture::gpu_frame::install_gpu_input_cells(proven.clone());
+    // those cells' adapter, and (FR-132 P2) to read the default list for them.
+    crate::capture::install_gpu_input_cells(proven.clone());
     crate::encode::ffmpeg::gpu_input::install_proven(proven);
 }
 
-/// FR-118 P5 — VideoToolbox's GPU forms the probe proved.
+/// FR-118 P5 — VideoToolbox's GPU forms the probe proved. FR-132 P2: the
+/// capture reads them too, for the default list.
 #[cfg(all(
     target_os = "macos",
     feature = "ffmpeg-encoder",
     feature = "scrap-capture"
 ))]
 fn install_gpu_input(proven: Vec<String>) {
+    crate::capture::install_gpu_input_cells(proven.clone());
     crate::encode::ffmpeg::vt_input::install_proven(proven);
 }
 
@@ -6369,9 +6368,15 @@ mod tests {
         };
         assert!(
             child::candidates_gpu(&caps, &denied_cells()).is_empty(),
-            "the switch is off"
+            "the switch is unset and the built-in list is empty (FR-132 P2)"
         );
         // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe { set("ZERO_COPY", "0") };
+        assert!(
+            child::candidates_gpu(&caps, &denied_cells()).is_empty(),
+            "off"
+        );
+        // SAFETY: as above.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(
             child::candidates_gpu(&caps, &denied_cells()),
@@ -6397,6 +6402,76 @@ mod tests {
             child::candidates_gpu(&caps, &denied_cells()),
             vec!["hevc_qsv"]
         );
+    }
+
+    /// FR-132 P2, AC4's probe half with cells on the list: with the switch
+    /// unset, the GPU phase tries the listed cells and no other, each still
+    /// behind both denylists; `off` tries none and `on` every one, whatever
+    /// the list says (the session's half is `gpu_input`'s
+    /// `with_a_list_an_unset_switch_opens_a_listed_cell_as_on_does`).
+    #[cfg(all(
+        target_os = "windows",
+        feature = "ffmpeg-encoder",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    #[test]
+    fn unset_the_gpu_phase_tries_the_listed_cells_and_no_other() {
+        use tunnel_core::env::test_env::{Saved, clear, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cells = Saved::cleared("ENCODER_CELLS_DENY");
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let cell = |codec, backend| VideoCell::new(codec, backend, &[ChromaFormat::Yuv420], true);
+        let caps = AgentCaps {
+            video_cells: vec![
+                cell(VideoCodec::Hevc, VideoBackend::Qsv),
+                cell(VideoCodec::Av1, VideoBackend::Qsv),
+                cell(VideoCodec::H264, VideoBackend::Qsv),
+                cell(VideoCodec::Vp9, VideoBackend::Qsv),
+                cell(VideoCodec::Hevc, VideoBackend::Nvenc),
+            ],
+            ..AgentCaps::default()
+        };
+        crate::capture::with_default_cells(&["av1_qsv", "hevc_nvenc", "vp9_qsv"], || {
+            assert_eq!(
+                child::candidates_gpu(&caps, &denied_cells()),
+                vec!["av1_qsv", "hevc_nvenc"],
+                "listed, and a GPU cell (vp9_qsv is neither tried nor a GPU cell)"
+            );
+            // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+            unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu") };
+            assert_eq!(
+                child::candidates_gpu(&caps, &denied_cells()),
+                vec!["hevc_nvenc"],
+                "zero_copy_deny wins over the list"
+            );
+            // SAFETY: as above.
+            unsafe { clear("ZERO_COPY_DENY") };
+            // SAFETY: as above.
+            unsafe { set("ENCODER_CELLS_DENY", "hevc_nvenc:yuv420") };
+            assert_eq!(
+                child::candidates_gpu(&caps, &denied_cells()),
+                vec!["av1_qsv"],
+                "and so does the cell denylist"
+            );
+            // SAFETY: as above.
+            unsafe { clear("ENCODER_CELLS_DENY") };
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY", "0") };
+            assert!(
+                child::candidates_gpu(&caps, &denied_cells()).is_empty(),
+                "off"
+            );
+            // SAFETY: as above.
+            unsafe { set("ZERO_COPY", "1") };
+            assert_eq!(
+                child::candidates_gpu(&caps, &denied_cells()),
+                vec!["hevc_qsv", "av1_qsv", "h264_qsv", "hevc_nvenc"],
+                "on: every proven-able cell, listed or not"
+            );
+        });
     }
 
     /// FR-118 P5, AC6's probe half on macOS — the GPU-input phase tries
@@ -6428,9 +6503,22 @@ mod tests {
         };
         assert!(
             child::candidates_gpu(&caps, &denied_cells()).is_empty(),
-            "the switch is off"
+            "the switch is unset and the built-in list is empty (FR-132 P2)"
         );
+        crate::capture::with_default_cells(&["h264_videotoolbox"], || {
+            assert_eq!(
+                child::candidates_gpu(&caps, &denied_cells()),
+                vec!["h264_videotoolbox"],
+                "unset: the listed cell and no other"
+            );
+        });
         // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe { set("ZERO_COPY", "0") };
+        assert!(
+            child::candidates_gpu(&caps, &denied_cells()).is_empty(),
+            "off"
+        );
+        // SAFETY: as above.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(
             child::candidates_gpu(&caps, &denied_cells()),
@@ -6490,6 +6578,14 @@ mod tests {
         let proven = probe_gpu(&names);
         eprintln!("proven on the NVIDIA device: {proven:?}");
         assert_eq!(proven, names, "both NVENC forms take GPU frames");
+        // FR-132 P2, AC4 on the hardware: with the switch unset, the child
+        // proves a listed form as it does with the switch on, and an unlisted
+        // one opens on CPU frames (`default_off`), so nothing proves it.
+        // SAFETY: as above.
+        unsafe { tunnel_core::env::test_env::clear("ZERO_COPY") };
+        crate::capture::with_default_cells(&["hevc_nvenc"], || {
+            assert_eq!(probe_gpu(&names), vec!["hevc_nvenc".to_string()]);
+        });
     }
 
     /// FR-77 P3c — the merge adds `yuv444` to exactly the named cells, and

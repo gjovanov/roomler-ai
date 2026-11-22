@@ -532,12 +532,13 @@ fn worker_main(
     //    as IDirect3DDevice for the frame pool, (b) CopyResource
     //    from the capture frame to a staging texture for CPU readback.
     //
-    //    FR-118 P3 — with the zero-copy switch on, the device goes on the
+    //    FR-118 P3 — with GPU frames on at this open (the switch on, or unset
+    //    with that adapter's cell listed: FR-132 P2), the device goes on the
     //    GPU-input encoder's adapter, and each frame is copied into a texture
     //    on it and handed on as a GPU frame instead of being read back. A
     //    device that will not open there, or will not take a texture pool,
     //    leaves the backend exactly as it was: the default adapter, CPU frames.
-    let zero_copy = gpu_frame::zero_copy_enabled();
+    let zero_copy = gpu_frame::gpu_frames_at_open();
     let chosen = if zero_copy {
         gpu_frame::capture_adapter()
     } else {
