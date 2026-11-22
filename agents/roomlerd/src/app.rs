@@ -1600,11 +1600,10 @@ async fn daemon_main() -> Result<()> {
         own_data_merge(),
     );
 
-    // Same one-shot, same reason, different axis: a Linux SYSTEM install's
-    // config belongs at `/etc/roomler/config.toml` (what the packaged unit
-    // passes as `--config`), not in root's profile. Before `default_config_path`
-    // or any config read, and before logging::init, so it collects notes the
-    // same way.
+    // Same one-shot, same reason, different axis: a Linux SYSTEM install's config
+    // belongs at `/etc/roomler/config.toml` (what the packaged unit passes as
+    // `--config`), not in root's profile. Before `default_config_path` or any config
+    // read, and before logging::init, so it collects notes the same way.
     #[cfg(target_os = "linux")]
     roomlerd::appdirs::migrate_system_config(own_profile.as_deref());
 

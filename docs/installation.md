@@ -1902,7 +1902,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1441`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:7828`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:7841`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1938,8 +1938,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1956`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7922`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7955`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7935`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7968`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -1953,7 +1953,7 @@ folder they name from the system, never from the environment they were started w
 | The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:230`, `crates/agent-core/src/appdirs.rs:241` |
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1121`, `agents/roomlerd/src/win_service/supervisor.rs:975` |
-| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:1054`, `crates/agent-core/src/appdirs.rs:779` |
+| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:1061`, `crates/agent-core/src/appdirs.rs:779` |
 | The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:308`, `agents/roomlerd/src/install_cleanup.rs:349` |
 | The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:1112`, `agents/roomlerd/src/install_cleanup.rs:1160` |
 | The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the Scheduled Tasks of the account signed in to its session, and no other account's ([#3801](#what-the-per-user-arm-of-the-clean-up-removes-3801)): that account's `Roomler-<SID>`, and `Roomler` or the one under the retired name when their principal is that account, each ended before it is deleted, and then it stops that account's daemon still running ([#3885](#the-accounts-running-daemon-3885)). Then it removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session, or an account it cannot tell, it removes no tree and no task; when the system records no profile for that account, it removes no tree. Its lines say which. | `agents/roomlerd/src/install_cleanup.rs:233`, `agents/roomlerd/src/install_cleanup.rs:446`, `agents/roomlerd/src/service/user_task.rs:399`, `agents/roomlerd/src/install_cleanup.rs:550`, `agents/roomlerd/src/install_cleanup.rs:990`, `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
@@ -1964,41 +1964,77 @@ neither tree holds a config folder do the local data folders decide, the NEW one
 of the four, the NEW tree, as on a fresh install (`segment_of`,
 `crates/agent-core/src/appdirs.rs:60`). A process takes this choice once, at its first folder
 lookup, and uses it for every per-user folder (`use_old_segment`,
-`crates/agent-core/src/appdirs.rs:81`). A path into another account's profile follows that
+`crates/agent-core/src/appdirs.rs:168`). A path into another account's profile follows that
 account's tree by the same rule, through one helper (`segment_in_profile`,
-`crates/agent-core/src/appdirs.rs:609`): the SystemContext worker's keep-busy store in the
+`crates/agent-core/src/appdirs.rs:695`): the SystemContext worker's keep-busy store in the
 signed-in person's local data (`data_local_dir_in_profile`,
-`crates/agent-core/src/appdirs.rs:564`, called from `agents/roomlerd/src/keep_busy/state.rs:215`)
+`crates/agent-core/src/appdirs.rs:650`, called from `agents/roomlerd/src/keep_busy/state.rs:215`)
 and the service host's read of the console user's config (`config_dir_in_profile`,
-`crates/agent-core/src/appdirs.rs:591`, called from
+`crates/agent-core/src/appdirs.rs:677`, called from
 `agents/roomlerd/src/companion/launch_once.rs:463`). On macOS the config and data folders are one
 folder, so the two cannot disagree (`macos_config_dir_in_home`,
-`crates/agent-core/src/appdirs.rs:114`). The machine folder has a rule of its own: the NEW folder
-if it exists, else the OLD one (`machine_global_dir`, `crates/agent-core/src/appdirs.rs:525`).
+`crates/agent-core/src/appdirs.rs:201`). The machine folder has a rule of its own: the NEW folder
+if it exists, else the OLD one (`machine_global_dir`, `crates/agent-core/src/appdirs.rs:611`).
 
 **How the folder move runs.** It runs when `roomlerd` starts, before logging starts and before
 anything asks for one of its folders (`agents/roomlerd/src/app.rs:1596`), and not while the
-desktop companion runs (`crates/agent-core/src/appdirs.rs:679`). The per-user pairs are the
+desktop companion runs (`crates/agent-core/src/appdirs.rs:765`). The per-user pairs are the
 config folder, then the Roaming data, then the Local data (on Linux the config, then the data; on
-macOS one folder); the machine folder is a pair of its own (`crates/agent-core/src/appdirs.rs:688`,
-`crates/agent-core/src/appdirs.rs:759`). Whether the pairs move is decided for all of them before
+macOS one folder); the machine folder is a pair of its own (`crates/agent-core/src/appdirs.rs:771`,
+`crates/agent-core/src/appdirs.rs:836`). Whether the pairs move is decided for all of them before
 any moves: none moves when a folder of a pair with a legacy folder lies outside its root (the
-profile, or the machine's data folder) or is reached through a link below it
-(`crates/agent-core/src/appdirs.rs:823`). They then move in that order (`migrate_dirs_within`,
-`crates/agent-core/src/appdirs.rs:856`):
+profile, or the machine's data folder) or is reached through a link below it (`kept_in_place`,
+`crates/agent-core/src/appdirs.rs:969`). They then move in that order (`migrate_dirs_within`,
+`crates/agent-core/src/appdirs.rs:1002`):
 
-- A pair whose NEW folder is already there is left in place, and the move goes on
-  (`crates/agent-core/src/appdirs.rs:965`).
-- The first pair, which holds `config.toml`, moves by one rename or not at all. When that move
-  fails, there is no NEW config folder, nothing after it moves, the daemon reads its config from
-  the OLD tree, and the next start tries again. The empty `%APPDATA%\roomler\roomler` made for
-  the rename can stay: which tree is used is decided by the config folders, and by the local
-  data folders only where neither tree holds a config folder
-  (`crates/agent-core/src/appdirs.rs:60`).
-- A later pair whose folder rename the system refuses moves child by child (`migrate_children`,
-  `crates/agent-core/src/appdirs.rs:1169`); when that fails, it renames the moved entries back
-  and its note says whether every one went back. A later pair whose move fails stops the move:
-  the pairs before it stay in the NEW tree, the pairs after it in the OLD one.
+- The first pair, which holds `config.toml`, moves by one rename or not at all, and so does the
+  machine folder. One whose NEW folder is already there is left in place, and the move goes on
+  (`crates/agent-core/src/appdirs.rs:1067`). When the config pair's move fails, there is no NEW
+  config folder, nothing after it moves, the daemon reads its config from the OLD tree, and the
+  next start tries again. The empty `%APPDATA%\roomler\roomler` made for the rename can stay:
+  which tree is used is decided by the config folders, and by the local data folders only where
+  neither tree holds a config folder (`crates/agent-core/src/appdirs.rs:60`).
+- A data pair converges (#3746; macOS has none). Its folder moves by one rename when the NEW
+  folder is not there. When the NEW folder is there (an earlier start's logging makes one after
+  a failed move), or the system refuses the rename, the OLD folder is merged into the NEW one
+  entry by entry and removed once it is empty (`migrate_children`,
+  `crates/agent-core/src/appdirs.rs:1275`). A data pair whose merge leaves an entry behind stops
+  nothing: the next pair still moves (`crates/agent-core/src/appdirs.rs:1018`).
+- A name both folders hold is settled by one rule (`settle`,
+  `crates/agent-core/src/appdirs.rs:1611`). A folder both hold is merged by the same rule, entry
+  by entry. Anything else (two files, a link, a file and a folder) keeps the copy modified last
+  under the name, and the other copy beside it as `<name>.older`, or `.older-2`, `.older-3` and
+  on when that name is taken (`put_beside`, `crates/agent-core/src/appdirs.rs:1696`). With equal
+  times, or a time that cannot be read, the NEW folder's copy keeps the name. The newer copy
+  wins because the tree a copy sits in does not say which one is live: a device whose config
+  stayed in the OLD tree writes its state there (#3747). The update marker's age is what it says
+  (`recent_update_attempt_at`, `agents/roomlerd/src/updater.rs:268`), the newest install record
+  is the one its reader takes (`newest_record_path`, `agents/roomlerd/src/post_install.rs:227`),
+  and the host-mute, privacy-curtain and keep-busy files hold the latest state. A move keeps a
+  file's modification time. Of two fragments of one day's log both are kept: a kept-beside log
+  ages out with the logs (`prune_old_logs_at`, `crates/agent-core/src/logging.rs:1083`), and the
+  log fetch never takes one for the current log (`agents/roomlerd/src/logs_fetch.rs:67`,
+  `crates/agent-core/src/appdirs.rs:1392`).
+- Nothing is overwritten or deleted. A file or a link moves only onto a free name
+  (`rename_no_replace`: `crates/agent-core/src/appdirs.rs:1726` on Windows, `:1756` on Linux),
+  a link moves as itself and is never followed, and a folder is removed only when it is empty.
+- The move ends in one of two states: everything in the NEW folder and the OLD folder gone, or an
+  entry the system would not move (on Windows, a file another process holds open without delete
+  sharing) left in the OLD folder, named in the note and moved at the next start. Either way
+  nothing is lost.
+- Two processes of one account can run the move at once (the service host's children on the
+  service account, or two of a person's processes), and the merge stays correct while the other
+  one runs: an entry already gone was moved by the other process, a folder it has just made is
+  merged into, and no rename replaces a file. A process that started on the OLD tree keeps
+  writing there until it restarts, and the next start merges what it wrote.
+- A process that runs elevated from a split token does not run the merge: the account's own
+  daemon, which runs unelevated, merges at its next start, so the merge never runs above the
+  integrity level of the folder owner's own processes. When the token cannot be read, the merge
+  is left too (`DataMerge`, `crates/agent-core/src/appdirs.rs:1343`;
+  `agents/roomlerd/src/app.rs:7559`). A data folder whose NEW folder is not there still moves by
+  one rename.
+- Every run writes a note that names what it moved, what it kept beside, and what it left for
+  the next start (`crates/agent-core/src/appdirs.rs:1456`).
 
 **The rule for a service's `Environment` entry.** A variable that this pin sets, named in a
 service's `Environment` value, is replaced for the service account by the folder the system
