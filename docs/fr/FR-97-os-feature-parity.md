@@ -440,7 +440,7 @@ silence (R1). Clipboard image events sat on every Linux and macOS agent, whose w
 Ctrl+Alt+Del at all.
 
 **The shape (D10).** A word stays a promise. What a host cannot keep, the daemon takes out and explains in a new map,
-`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:546`). The keys are
+`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:577`). The keys are
 matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked by
 `unavailable_wire_shape_is_locked`. The viewer's rule:
 

@@ -94,6 +94,20 @@ describe('MiniConference — the cameras it shows are reported on screen (FR-127
     expect(byKey).toEqual({ c1: false, c2: false })
   })
 
+  it('its remote tiles show pictures only: the call plays their sound (#3563)', async () => {
+    // The call's audio owner plays every remote participant, the ones past
+    // this widget's three included; a tile here that played too would be a
+    // second copy of the same voice.
+    const store = useConferenceStore()
+    for (const k of ['c1', 'c2']) store.remoteStreams.set(k, remote(k))
+    const w = mount(MiniConference, { global: { plugins: [vuetify] } })
+    await flushPromises()
+    const videos = w.findAll('video')
+    expect(videos).toHaveLength(2)
+    for (const v of videos) expect((v.element as HTMLVideoElement).muted).toBe(true)
+    w.unmount()
+  })
+
   it("the store's per-key count tolerates the widget's report overlapping a tile's during the page switch", () => {
     // A tile reports on, the widget reports on (two reporters), the tile
     // unmounts (off): the key stays on screen until the widget goes too.
