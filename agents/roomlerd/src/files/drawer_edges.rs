@@ -202,11 +202,6 @@ pub(crate) mod seams {
     }
 
     impl HeldPlacing {
-        /// How many ends began to wait at it.
-        pub(crate) fn reached(&self) -> usize {
-            self.gate.reached()
-        }
-
         /// Whether an end began to wait at it within `wait`.
         pub(crate) async fn reached_within(&self, wait: std::time::Duration) -> bool {
             self.gate.reached_within(wait).await

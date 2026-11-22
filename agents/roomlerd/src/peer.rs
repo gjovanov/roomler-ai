@@ -19053,7 +19053,7 @@ mod upload_end_tests {
         assert!(not_sent, "its answer was not dropped: {text}");
         assert_eq!(
             up,
-            RTCDataChannelState::Open,
+            webrtc::data_channel::data_channel_state::RTCDataChannelState::Open,
             "the channel went down before the answer could be sent"
         );
         assert!(
