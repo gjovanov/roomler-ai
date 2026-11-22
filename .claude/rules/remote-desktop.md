@@ -136,6 +136,17 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   goes to the app. Never turn that `false` into a deny or an accept, and never
   restart the daemon to bring the panel back: a restart ends every live session on
   the Mac. Drawing from the person's own session is FR-149 (#4054).
+  ⚠️ On a **one-row Mac** the screen worker draws the root daemon's questions on its
+  own panel (FR-149 P1, `indicator::session_panel`). **A session process's word routes
+  a question and never decides one:** its `PanelTold` only marks the question
+  `Native`, and the panel's Approve reaches the root over the app's road, the person
+  socket's gates and the seat asked again (`consent_relay::panel_clicked`). Never add
+  a frame or verb that decides a question from the worker's word, and never make
+  `native` from an attached worker, a word said or a seat read: only a `shown` within
+  `PANEL_WITHIN`. **At most one panel on the screen:** once the session panel was
+  asked, the root daemon's own panel is not tried, and neither panel takes a question
+  while the other shows one. `consent-panel` is matched by equality, as
+  `relay-consent` is.
   ⚠️ The console-session read is a **root process's only** (`reads_console_session`):
   a root daemon's window-server connection belongs to the console session it started
   in. A two-row Mac's per-user half has a GUI session of its own, which a fast user
