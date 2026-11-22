@@ -19065,12 +19065,17 @@ mod upload_end_tests {
     /// While an upload's end places its file, a resume of it on another
     /// channel is refused and a cancel of it there leaves it alone: its
     /// staging is untouched, and the file lands whole.
+    ///
+    /// #4306 — the staging is read where the placement reads it, at its
+    /// seam: a chunk's write lands in the background, and only the
+    /// placement's flush waits for the last one.
     #[tokio::test]
     async fn another_channel_leaves_an_ending_upload_to_its_end() {
         let temp = tempfile::tempdir().expect("a temp dir");
         let dest = temp.path().to_string_lossy().into_owned();
         let id = id_of("elsewhere");
         let payload = bytes_of(600 * 1024);
+        let held = seams::hold_placing(temp.path());
         let here = crate::files::FilesHandler::new();
         let elsewhere = crate::files::FilesHandler::new();
         here.begin(
@@ -19088,9 +19093,13 @@ mod upload_end_tests {
         let ending = here.begin_end(&id).await.expect("its end begun");
         let resumed = elsewhere.resume_incoming(&id, 0).await;
         let cancelled = elsewhere.cancel_incoming(&id).await;
+        let placing = tokio::spawn(ending.place());
+        let reached = held.reached_within(Duration::from_secs(10)).await;
         let still_staged = staged(temp.path(), &id);
-        let placed = ending.place().await;
+        held.release();
+        let placed = placing.await.expect("the placement ran");
         let resumed_after = elsewhere.resume_incoming(&id, 0).await;
+        assert!(reached, "the upload's end never reached its placement");
         let refusal = resumed.expect_err("a resume elsewhere is refused");
         assert_eq!(
             refusal.to_string(),
