@@ -1560,7 +1560,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1929`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
-| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:458`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:464`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
@@ -1738,7 +1738,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10247-10280`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10258-10291`):
 
 | Field | Meaning |
 |---|---|
@@ -1792,7 +1792,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
-| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:356`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:369`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:361`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:374`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 | `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` (`encode/ffmpeg/encoder.rs:3471`) | `cbr` | `qvbr`: an HEVC or H.264 QSV open leaves constant bitrate for QVBR, its target at 0.9 × the cap, and every rebuild follows ([below](#qsv-off-constant-bitrate-fr-148-p2)). `cbr` is today's open, byte for byte | FR-148 P5 deletes the constant-bitrate path, and the switch with it |
@@ -1814,7 +1814,7 @@ constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every fr
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
 measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
-is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9753`), so
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9764`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
@@ -1945,11 +1945,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:876`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:881`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:860`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:865`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it. So on P3's numbers
     the operator kept the tier off on Windows and macOS until a live read
     ([below](#what-the-numbers-recommend)): `ROOMLERD_SW_FPS_60=1` opts in, `=0` gives back 30 everywhere.
@@ -1961,7 +1961,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:845`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:850`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### The clock on macOS and Windows (FR-112 P3)
@@ -2263,13 +2263,13 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
 - **#3472 — a frame fed again carries its own time.** libvpx's one-pass CBR
   reads its frame rate off the gaps between timestamps and grants each encode
   `target ÷ that rate`. The VP9 4:4:4 data-channel pump's idle keepalive
-  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4048`): the same
+  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4050`): the same
   `Arc<Frame>`, so the same `monotonic_us`. That repeated pts added no time
   and still took a grant, so a damage-gated screen spent about twice its
   target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080
   offline. `encode_sync` now stamps a frame whose pts is not after the last
   one with the last pts plus the time since the last encode (`refed_pts`,
-  `agents/roomlerd/src/encode/libvpx.rs:820`). Offline the keepalive then
+  `agents/roomlerd/src/encode/charge.rs:47`). Offline the keepalive then
   costs what a frame with a pts of its own costs: 1.00× of the target at
   800×600 and 0.99× at 1920×1080, where a capture is coded at q 253 rather
   than borrowing its way to q 221. No pixels are copied. Pinned by

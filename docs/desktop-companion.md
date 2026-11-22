@@ -918,7 +918,7 @@ flowchart TD
 #3669 made each step a read takes run as the person. What a read touched outside such a step, or
 with no bound, and what its refusal said, is gathered in `agents/roomlerd/src/files/reads.rs`, with
 its tests in `files::drawer_edges` (`agents/roomlerd/src/files/drawer_edges.rs`) and
-`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:17937`).
+`peer::dir_listing_tests` (`agents/roomlerd/src/peer.rs:17948`).
 
 ```mermaid
 sequenceDiagram
@@ -949,7 +949,7 @@ sequenceDiagram
 ```
 
 - **The read loop never awaits a listing.** The files channel's message handler hands `files:dir`
-  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13382`, from the arm at
+  to a task of its own (`spawn_dir_listing`, `agents/roomlerd/src/peer.rs:13393`, from the arm at
   `:13324`) and goes on reading, so a download's `files:cancel`, the next listing or an upload's
   chunks never wait behind a share: the channel's worst-case hold for a listing is none. It used to
   be awaited inline, and webrtc-rs reads a channel's next message only once the handler of the last
@@ -957,8 +957,8 @@ sequenceDiagram
   each by its `req_id` (`onFilesMessage`, `ui/src/composables/remoteDirListing.ts:215`), so no wire changed. Once the
   channel closes or its session ends, a listing still running drops its answer and sends nothing
   (`FilesHandler::channel_closed`, `agents/roomlerd/src/files/reads.rs:322`, from the channel's
-  `on_close`, `agents/roomlerd/src/peer.rs:13084`; `end_session`). An answer already being sent
-  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13401`, through
+  `on_close`, `agents/roomlerd/src/peer.rs:13095`; `end_session`). An answer already being sent
+  races that end too (`answer_dir_listing`, `agents/roomlerd/src/peer.rs:13412`, through
   `or_stopped`, `:13891`): after a network drop a send can park for good on a channel that still
   reads open (#1730), and the task kept the channel and its handler for as long as the agent ran.
 - **One listing step at a time per channel** (the folder lane, `reads::Lane`). A step on a blocking thread
@@ -988,7 +988,7 @@ sequenceDiagram
   before the send at `:159`), and 5 s after each page of a listing that comes in pages (#4121),
   which leaves 0.5 s for the way there and back, however long the listing waited, when the read
   loop hands it on at once. ⚠️ The read loop still runs an upload's end itself
-  (`agents/roomlerd/src/peer.rs:13220`), and that end moves the file into place with no bound: on
+  (`agents/roomlerd/src/peer.rs:13231`), and that end moves the file into place with no bound: on
   a service install it copies the whole file across to the person's folder
   (`agents/roomlerd/src/files.rs:2943`). A listing asked while a large upload ends reaches its task
   only after the copy, and the viewer may show its own timeout first (#4082). A lookup that runs out
@@ -1395,10 +1395,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12896`), asked as the channel opens (`files_channel_here`, `:12905`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1171`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12907`), asked as the channel opens (`files_channel_here`, `:12916`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1171`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
-| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12931`), `attach_files_declined` (`:12954`), `declined_reply` (`:12985`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
-| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12864`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12942`), `attach_files_declined` (`:12965`), `declined_reply` (`:12996`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12875`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
 | What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4482`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:
@@ -1413,7 +1413,7 @@ What a viewer notices:
   ends "Remote shell works here.", where it said file transfer worked there too.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17116`), on every lane's lib
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17127`), on every lane's lib
 tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up
@@ -2966,7 +2966,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5816`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5827`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1434`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:535`). The mark goes
