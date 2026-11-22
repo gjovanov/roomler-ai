@@ -2242,9 +2242,7 @@ jobs:
       # this lane's elevated token. The other lane that runs
       # `roomler-node-core` is Linux, where these tests do not exist. Also the
       # elevated writers' merge base (`config::tests::machine_merge_base`): a
-      # machine config is folded into only when it is private. #4176 — and a
-      # missing machine config's copy (`config::tests::machine_copy`): read and
-      # restored only when it passes the checks the config would.
+      # machine config is folded into only when it is private (#4176: and its copy).
       # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
       # the whole workflow file fails to load), and no ` #` in a name.
       - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"

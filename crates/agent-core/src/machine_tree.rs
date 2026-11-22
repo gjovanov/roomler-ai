@@ -318,10 +318,11 @@ pub fn the_machines(
 /// write back (the check refuses that one).
 ///
 /// #3666 — an allow-ACE for which `spare` says yes is kept as it is: while the
-/// machine folder holds a config, R keeps a right to replace it that an
-/// account other than an administrator holds, so the check refuses the parent
-/// at this tick and every one after. Cut in the same pass, the check that
-/// follows would pass a sealed folder moved in through that right.
+/// machine folder holds a config (#4176: or the copy of a missing one), R
+/// keeps a right to replace it that an account other than an administrator
+/// holds, so the check refuses the parent at this tick and every one after.
+/// Cut in the same pass, the check that follows would pass a sealed folder
+/// moved in through that right.
 pub fn parent_cut(sd: &Sd, spare: impl Fn(&Ace) -> bool) -> Option<Vec<Ace>> {
     let aces = sd.dacl.as_ref()?;
     let mut cut = false;
@@ -520,9 +521,10 @@ pub struct Repairs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// `%ProgramData%\roomler`: [`parent_cut`], inheritance as it is. #3666 —
-    /// `spare`: the machine folder held a config when R began and no save is
-    /// writing one, so a right to replace the folder that an account other
-    /// than an administrator holds is kept, for the check to refuse.
+    /// `spare`: the machine folder held a config (#4176: or, with no config,
+    /// its copy) when R began and no save is writing one, so a right to
+    /// replace the folder that an account other than an administrator holds
+    /// is kept, for the check to refuse.
     Parent { spare: bool },
     /// The machine folder: Administrators', SYSTEM and Administrators alone,
     /// `(OI)(CI)`, not inheriting.
@@ -614,6 +616,12 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 ///   spares a right to replace the folder that an account other than an
 ///   administrator holds (`Role::Parent`).
 ///
+/// #4176 — with no config, the copy a start would restore it from counts as
+/// the folder's config: the folder is taken only when the copy was the
+/// machine's as found, and while the copy is there the parent's cut spares
+/// that right too, so the copy's check ([`read_machine_copy`]) refuses at this
+/// tick and every one after.
+///
 /// What it leaves, it says once in `left`, and the check refuses.
 #[cfg(windows)]
 pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
@@ -628,13 +636,11 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     };
     // Read before anything changes. Any answer but "not there" counts as a
     // config: a wrong answer may only keep a right the check then refuses.
-    let holds_a_config = !matches!(
-        std::fs::symlink_metadata(tree.config()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-    );
+    let holds_a_config = there(&tree.config());
+    let holds_a_copy = !holds_a_config && there(&tree.prev());
     match win::open(tree.folder(), win::Kind::Dir, false, true) {
         Ok(Some(folder)) => {
-            if writing || holds_the_machines_config(tree, &mut out) {
+            if writing || holds_the_machines_config(tree, holds_a_config, &mut out) {
                 repair_path(&tree.config(), win::Kind::File, Role::Private, &mut out);
                 repair_path_if_closed(&tree.prev(), win::Kind::File, Role::Private, &mut out);
                 match win::open(&tree.keys(), win::Kind::Dir, false, true) {
@@ -665,7 +671,7 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
         Err(why) => out.left.push(why),
     }
     repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
-    let spare = !writing && holds_a_config;
+    let spare = !writing && (holds_a_config || holds_a_copy);
     repair_entry(tree.parent(), &parent, Role::Parent { spare }, &mut out);
     out
 }
@@ -675,15 +681,22 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
 /// does, the folder is a waiting or attended host's, where the person's own
 /// daemon stages files, and R leaves it as `%ProgramData%` hands it down. A
 /// config another account could have put there, or chosen what it holds, does
-/// not make it the machine's: taken, the check would pass it.
+/// not make it the machine's: taken, the check would pass it. #4176 — with no
+/// config (`config` false), the copy a start would restore it from, read the
+/// same way.
 #[cfg(windows)]
-fn holds_the_machines_config(tree: &MachineTree, out: &mut Repairs) -> bool {
-    match as_found(tree) {
+fn holds_the_machines_config(tree: &MachineTree, config: bool, out: &mut Repairs) -> bool {
+    let (file, what) = if config {
+        (tree.config(), "the config it holds")
+    } else {
+        (tree.prev(), "the copy of a missing config it holds")
+    };
+    match found_as_the_machines(tree, &file) {
         Ok(()) => true,
         Err(Refusal::Absent) => false,
         Err(Refusal::NotPrivate(why)) => {
             out.left.push(format!(
-                "{} is left as it is: the config it holds was not the machine's as found ({why})",
+                "{} is left as it is: {what} was not the machine's as found ({why})",
                 tree.folder().display()
             ));
             false
@@ -938,8 +951,9 @@ pub fn seal_new_record(file: &std::fs::File) -> std::io::Result<()> {
 /// other account may change any of them (the parent: may rename or replace
 /// what it holds). The config is opened for reading, as the worker will open
 /// it (#3096). Its `.prev` is checked where it is loaded instead
-/// ([`read_checked`], from `config::load`). `Err` names the entry and the
-/// reason; with no config at all it says so.
+/// ([`read_checked`], from `config::load`), and #4176 — the copy of a config
+/// that is not there as the config itself would be ([`read_machine_copy`]).
+/// `Err` names the entry and the reason; with no config at all it says so.
 #[cfg(windows)]
 pub fn check(tree: &MachineTree) -> Result<(), String> {
     check_chain(tree).map_err(|refusal| match refusal {
@@ -954,7 +968,15 @@ fn check_chain(tree: &MachineTree) -> Result<(), Refusal> {
     // `.prev` is not part of it: it is loaded only to recover a config that
     // does not parse, and checked there (`config::load_prev`). An old copy
     // another account made is replaced by the next save, never a reason the
-    // device stops.
+    // device stops. #4176 — the copy of a config that is not there is read
+    // through this chain's checks instead ([`read_machine_copy`]).
+    check_keys(tree)
+}
+
+/// The keys folder and each key file the daemon loads, as [`check_chain`]
+/// checks them: what a config, or the copy a start restores, runs with.
+#[cfg(windows)]
+fn check_keys(tree: &MachineTree) -> Result<(), Refusal> {
     if let Some(keys) = open_entry(&tree.keys(), win::Kind::Dir, false)? {
         judge(&tree.keys(), &keys, WRITE_LIKE)?;
         for key in key_files(&tree.keys()) {
@@ -1000,29 +1022,108 @@ fn check_config(tree: &MachineTree) -> Result<(), Refusal> {
 /// or one this process may not open or read, is [`Refusal::NotPrivate`].
 #[cfg(windows)]
 pub fn as_found(tree: &MachineTree) -> Result<(), Refusal> {
-    match std::fs::symlink_metadata(tree.config()) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Absent),
-        _ => {}
+    found_as_the_machines(tree, &tree.config())
+}
+
+/// [`as_found`] for `file` in the machine folder: the config, or #4176 — the
+/// copy a start would restore a missing config from.
+#[cfg(windows)]
+fn found_as_the_machines(tree: &MachineTree, file: &Path) -> Result<(), Refusal> {
+    if !there(file) {
+        return Err(Refusal::Absent);
     }
     fn read(path: &Path, kind: win::Kind) -> Result<(Sd, String), Refusal> {
         let Some(entry) = open_entry(path, kind, false)? else {
             return Err(Refusal::Absent);
         };
-        let sd = win::read_sd(&entry.file).map_err(|e| {
-            Refusal::NotPrivate(format!("{}: reading its security: {e}", path.display()))
-        })?;
-        Ok((sd, path.display().to_string()))
+        Ok((security(path, &entry)?, path.display().to_string()))
     }
     let parent = read(tree.parent(), win::Kind::Dir)?;
     let folder = read(tree.folder(), win::Kind::Dir)?;
-    let config = read(&tree.config(), win::Kind::File)?;
+    let file = read(file, win::Kind::File)?;
     the_machines(
         (&parent.0, &parent.1),
         (&folder.0, &folder.1),
-        (&config.0, &config.1),
+        (&file.0, &file.1),
         win::is_administrator,
     )
     .map_err(Refusal::NotPrivate)
+}
+
+/// Is anything at `path`? Any answer but "not there" counts: a wrong answer
+/// may only keep a right the check then refuses, or ask a check that refuses.
+#[cfg(windows)]
+fn there(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// #4176 — the copy (`.prev`) of a machine config that is not there, for a
+/// start to restore the config from, read only when it passes what the
+/// config itself would: the parent, the machine folder and the copy were the
+/// machine's as found ([`the_machines`], #3666), and they and the keys pass
+/// [`check_chain`]'s check (the parent: no account other than SYSTEM or
+/// Administrators may rename or replace what it holds; the folder, the copy,
+/// the keys folder and each key file: no such account may change them). The
+/// copy is opened for reading and its bytes are read through the handle its
+/// owner and DACL were judged on. `Ok(None)`: there is no copy. `Err` names the
+/// entry and the reason.
+///
+/// The service host's rung, the SYSTEM worker's ladder and its start read the
+/// copy through this one function (`config::machine_previous_copy`), and the
+/// restore (`config::load`) runs on these bytes, so the four cannot disagree.
+/// It repairs nothing: the [`repair`] before it takes the machine folder for a
+/// copy only when the copy was the machine's as found, and while a copy is
+/// there it keeps a replace right on the parent for this check to refuse, so
+/// what a repair did never makes a copy pass that did not. The check's switch
+/// does not relax it: no copy of a missing config was ever run without it.
+#[cfg(windows)]
+pub fn read_machine_copy(tree: &MachineTree) -> Result<Option<Vec<u8>>, String> {
+    match machine_copy(tree) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Refusal::Absent) => Ok(None),
+        Err(Refusal::NotPrivate(why)) => Err(why),
+    }
+}
+
+#[cfg(windows)]
+fn machine_copy(tree: &MachineTree) -> Result<Vec<u8>, Refusal> {
+    let copy = tree.prev();
+    // No copy, no question: the common waiting host, asked at every tick.
+    if !there(&copy) {
+        return Err(Refusal::Absent);
+    }
+    let Some(parent) = open_entry(tree.parent(), win::Kind::Dir, false)? else {
+        return Err(Refusal::Absent);
+    };
+    let Some(folder) = open_entry(tree.folder(), win::Kind::Dir, false)? else {
+        return Err(Refusal::Absent);
+    };
+    let Some(file) = open_entry(&copy, win::Kind::File, true)? else {
+        return Err(Refusal::Absent);
+    };
+    let parent_sd = security(tree.parent(), &parent)?;
+    let folder_sd = security(tree.folder(), &folder)?;
+    let file_sd = security(&copy, &file)?;
+    let (parent_name, folder_name, file_name) = (
+        tree.parent().display().to_string(),
+        tree.folder().display().to_string(),
+        copy.display().to_string(),
+    );
+    the_machines(
+        (&parent_sd, &parent_name),
+        (&folder_sd, &folder_name),
+        (&file_sd, &file_name),
+        win::is_administrator,
+    )
+    .map_err(Refusal::NotPrivate)?;
+    verdict(&parent_sd, SWAP, &parent_name).map_err(Refusal::NotPrivate)?;
+    verdict(&folder_sd, WRITE_LIKE, &folder_name).map_err(Refusal::NotPrivate)?;
+    verdict(&file_sd, WRITE_LIKE, &file_name).map_err(Refusal::NotPrivate)?;
+    check_keys(tree)?;
+    win::read_to_end(&file.file, &copy, 1 << 20).map_err(Refusal::NotPrivate)
 }
 
 /// [`win::open`] for the check: read only, and a failure is a refusal.
@@ -1037,10 +1138,16 @@ fn open_entry(
 
 #[cfg(windows)]
 fn judge(path: &Path, entry: &win::Entry, counts: u32) -> Result<(), Refusal> {
-    let sd = win::read_sd(&entry.file).map_err(|e| {
-        Refusal::NotPrivate(format!("{}: reading its security: {e}", path.display()))
-    })?;
+    let sd = security(path, entry)?;
     verdict(&sd, counts, &path.display().to_string()).map_err(Refusal::NotPrivate)
+}
+
+/// The owner and DACL of the entry opened at `path`, read through its handle;
+/// a read that fails is a refusal.
+#[cfg(windows)]
+fn security(path: &Path, entry: &win::Entry) -> Result<Sd, Refusal> {
+    win::read_sd(&entry.file)
+        .map_err(|e| Refusal::NotPrivate(format!("{}: reading its security: {e}", path.display())))
 }
 
 /// R (unless switched off), then B: the question the service host asks at its
@@ -1048,7 +1155,9 @@ fn judge(path: &Path, entry: &win::Entry, counts: u32) -> Result<(), Refusal> {
 /// its start (`roomlerd`'s `win_service::supervisor::rung_opens`, one function
 /// for both). With the check switched off a refusal is logged and the
 /// config's read open decides, as before #3609. A refusal is logged once per
-/// reason, not once per tick.
+/// reason, not once per tick. #4176 — with no config it is `Absent`, and the
+/// rung then asks the copy a start would restore ([`read_machine_copy`]), after
+/// this repair.
 #[cfg(windows)]
 pub fn private_machine_config(tree: &MachineTree, switches: Switches) -> Result<(), Refusal> {
     if switches.repair {

@@ -967,9 +967,11 @@ pub(crate) fn want_system_worker(
 }
 
 /// #3387 — SYSTEM can open, for reading, an enrollment a SystemContext worker
-/// runs: the machine config, or the SYSTEM profile's own. The two rungs the
-/// worker's ladder takes, through the same resolvers, read by the same account
-/// (this host is LocalSystem), so the host and the worker cannot disagree.
+/// runs: the machine config, or the SYSTEM profile's own (#4176: or the copy a
+/// worker's start restores a missing machine config from, [`rung`]). The two
+/// rungs the worker's ladder takes, through the same resolvers, read by the
+/// same account (this host is LocalSystem), so the host and the worker cannot
+/// disagree.
 /// #3702 — the profile rung only for a config in the service account's own
 /// profile as the system names it, the rule the worker's ladder keeps.
 fn sc_config_opens() -> bool {
@@ -996,6 +998,9 @@ pub(crate) fn config_opens_in(
 /// config is taken only through `machine_tree::private_machine_config`: the
 /// chain repaired first, then checked. The SYSTEM profile's own config is a
 /// read open, as before: only SYSTEM and Administrators may write that profile.
+///
+/// #4176 — a machine config that is not there, beside a copy the worker's
+/// start restores ([`restorable_copy`]), makes this rung the machine's too.
 pub(crate) fn rung(
     tree: &roomler_node_core::machine_tree::MachineTree,
     switches: roomler_node_core::machine_tree::Switches,
@@ -1003,11 +1008,36 @@ pub(crate) fn rung(
 ) -> Result<(), roomler_node_core::machine_tree::Refusal> {
     use roomler_node_core::machine_tree::{Refusal, private_machine_config};
     if path == tree.config() {
-        private_machine_config(tree, switches)
+        match private_machine_config(tree, switches) {
+            // `exists`, as the start reads it (`app::config_at_start::of`).
+            Err(Refusal::Absent) if !path.exists() => restorable_copy(tree),
+            other => other,
+        }
     } else if config_opens(std::iter::once(path.to_path_buf())) {
         Ok(())
     } else {
         Err(Refusal::Absent)
+    }
+}
+
+/// #4176 — the machine config under `tree` is not there: does its copy pass
+/// the checks the config itself would, and hold an enrollment? That is when the
+/// SYSTEM worker's start restores it (`app::config_at_start`, which asks the
+/// same function through `config::previous_copy`), so the host starts that
+/// worker for it, and its ladder names the machine config. `Absent` otherwise,
+/// as with no copy: the host keeps waiting, and the copy's reason is logged
+/// once (`config::machine_previous_copy`). Never `NotPrivate`: a copy is not
+/// the config, and a worker that reaches the machine path all the same ends
+/// with `NoConfig` at its start, as one with no copy does.
+fn restorable_copy(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+) -> Result<(), roomler_node_core::machine_tree::Refusal> {
+    use crate::config::PreviousCopy;
+    match crate::config::machine_previous_copy(tree) {
+        PreviousCopy::Enrolled => Ok(()),
+        PreviousCopy::NoEnrollment | PreviousCopy::Missing | PreviousCopy::Broken => {
+            Err(roomler_node_core::machine_tree::Refusal::Absent)
+        }
     }
 }
 

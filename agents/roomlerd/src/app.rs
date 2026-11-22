@@ -1103,8 +1103,8 @@ enum ServiceAction {
 ///    check; the operator named it deliberately).
 /// 2. A SystemContext worker (LocalSystem) runs the machine's own enrollment
 ///    and nothing else (#3387):
-///    - the machine-global `%PROGRAMDATA%` config, when it opens: the
-///      canonical one, readable before anyone signs in;
+///    - the machine-global `%PROGRAMDATA%` config, when it opens, or #4176
+///      when its start restores it from its copy: readable before sign-in;
 ///    - else the SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
 ///      without `--machine-global`), when it lies in the service account's
 ///      own profile as the system names it (`system_profile`,
@@ -1176,9 +1176,9 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         // The service host's own question (`sc_config_opens`), through the
         // same function: a read open for the SYSTEM profile's config (a file
         // in a folder that refuses SYSTEM lists, and does not open), and for
-        // the machine config #3609's repair, then its check. The SYSTEM
-        // worker never runs a machine config that fails it: the last rung
-        // still names the machine path, and `Run` refuses to load it then.
+        // the machine config #3609's repair, then its check (#4176: a missing
+        // one's copy's). The SYSTEM worker never runs a machine config that
+        // fails it: the last rung names the machine path, and `Run` refuses.
         let tree = roomler_node_core::machine_tree::MachineTree::here();
         let switches = roomler_node_core::machine_tree::Switches::from_env();
         let refused = std::cell::RefCell::new(None);

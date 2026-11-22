@@ -3612,7 +3612,7 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // not parse, is "unreadable", as before. Both lines are ERROR: either way
     // the host now runs on an older config.
     let prev = prev_path(path);
-    match load_prev(path, &prev) {
+    match load_copy(path, &prev, &err) {
         Ok(mut cfg) => {
             if not_found(&err) {
                 tracing::error!(
@@ -3805,7 +3805,7 @@ fn machine_merge_base(
     merge_base(
         path,
         || crate::machine_tree::may_fold(tree, switches),
-        load_private_prev,
+        |prev| load_private_prev(prev),
     )
 }
 
@@ -4899,6 +4899,8 @@ fn outgoing_bytes(path: &std::path::Path, machine: bool) -> Result<Option<Vec<u8
 /// check ([`load_private_prev`]). It is not part of the chain the service
 /// checks before it runs the config, so an old copy another account made never
 /// stops a device: the next save replaces it with a new file ([`rotate_prev`]).
+/// #4176 — the copy of a machine config that is not there is read through the
+/// checks the config would pass instead ([`load_copy`]).
 fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
     #[cfg(windows)]
     if machine_tree_of(path).is_some() {
@@ -4912,13 +4914,90 @@ fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
 /// #3609 — a machine-global `.prev`, only while it is a plain file owned by
 /// SYSTEM or Administrators that no other account may change, checked through
 /// its handle (`machine_tree::read_checked`): what [`load`] and an elevated
-/// writer's merge base ([`read_merge_base`]) recover from.
+/// writer's merge base ([`read_merge_base`]) recover from a config that is
+/// there and does not load. #4176 — the bytes parsed are the bytes checked,
+/// read through that handle, never read again by name.
 #[cfg(windows)]
-fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
-    if let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20) {
-        anyhow::bail!("{why}");
+fn load_private_prev(prev: &std::path::Path) -> Result<AgentConfig> {
+    match crate::machine_tree::read_checked(prev, 1 << 20) {
+        Ok(Some(bytes)) => parse_bytes(bytes, prev),
+        Ok(None) => Err(not_there(prev)),
+        Err(why) => anyhow::bail!("{why}"),
     }
-    try_load(prev)
+}
+
+/// #4176 — the copy [`load`] runs on in place of the config at `path`, whose
+/// read failed with `err`. The machine config that is not there is restored
+/// only from a copy that passes the checks the config itself would, and holds
+/// an enrollment ([`load_machine_copy`]); every other config recovers from its
+/// copy as before ([`load_prev`]).
+fn load_copy(path: &std::path::Path, prev: &PathBuf, err: &anyhow::Error) -> Result<AgentConfig> {
+    #[cfg(windows)]
+    if not_found(err)
+        && let Some(tree) = machine_config_tree(path)
+    {
+        return load_machine_copy(&tree);
+    }
+    #[cfg(not(windows))]
+    let _ = err;
+    load_prev(path, prev)
+}
+
+/// #4176 — the machine tree `path` is the config of, when it is the machine
+/// config itself ([`machine_tree_of`] answers for any path in its folder).
+#[cfg(windows)]
+fn machine_config_tree(path: &std::path::Path) -> Option<crate::machine_tree::MachineTree> {
+    machine_tree_of(path).filter(|tree| tree.config() == path)
+}
+
+/// #4176 — what [`load`] restores the machine config that is not there from:
+/// its copy, read through the checks the config would pass
+/// (`machine_tree::read_machine_copy`: the chain as found, and its check) and
+/// parsed from the bytes that were checked, only when it holds an enrollment.
+/// A copy with none holds nothing the machine could run as SYSTEM, so it is
+/// not written into the machine's place, where the service would then run it.
+/// The service host and the SYSTEM worker's ladder and start ask the same
+/// question first ([`machine_previous_copy`]), and restore only an `Enrolled`.
+#[cfg(windows)]
+fn load_machine_copy(tree: &crate::machine_tree::MachineTree) -> Result<AgentConfig> {
+    let cfg = machine_copy_config(tree)?;
+    if !cfg.has_primary_enrollment() {
+        anyhow::bail!(
+            "{} holds no enrollment, so the missing machine config is not restored from it",
+            tree.prev().display()
+        );
+    }
+    Ok(cfg)
+}
+
+/// #4176 — the copy of the machine config under `tree`, read through
+/// `machine_tree::read_machine_copy` and parsed from those bytes. No copy is
+/// an error [`not_found`] answers yes for.
+#[cfg(windows)]
+fn machine_copy_config(tree: &crate::machine_tree::MachineTree) -> Result<AgentConfig> {
+    let copy = tree.prev();
+    match crate::machine_tree::read_machine_copy(tree) {
+        Ok(Some(bytes)) => parse_bytes(bytes, &copy),
+        Ok(None) => Err(not_there(&copy)),
+        Err(why) => anyhow::bail!("{why}"),
+    }
+}
+
+/// A config's bytes, read through a checked handle, parsed by [`try_load`]'s
+/// rules with `path` naming them.
+#[cfg(windows)]
+fn parse_bytes(bytes: Vec<u8>, path: &std::path::Path) -> Result<AgentConfig> {
+    let raw = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("reading config at {}: {e}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// The error a read of `path` that found nothing gives: [`not_found`] answers
+/// yes for it, as for [`try_load`]'s own.
+#[cfg(windows)]
+fn not_there(path: &std::path::Path) -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+        .context(format!("reading config at {}", path.display()))
 }
 
 /// #4157 — what [`load`] restores the copy without: the marks a run leaves on
@@ -4942,19 +5021,72 @@ pub enum PreviousCopy {
     Missing,
     /// It is there, and does not load or may not be read. At the
     /// machine-global location on Windows, also one that fails the machine
-    /// tree's check.
+    /// tree's check: #4176, the checks the config itself would pass
+    /// ([`machine_previous_copy`]).
     Broken,
 }
 
 /// #4157 — what a start whose config at `path` is missing can run on: its last
 /// good copy ([`prev_path`]), read through the same check as [`load`]'s
-/// restore. It reads the copy and writes nothing.
+/// restore. It reads the copy and writes nothing. #4176 — for the machine
+/// config on Windows, [`machine_previous_copy`].
 pub fn previous_copy(path: &std::path::Path) -> PreviousCopy {
-    match load_prev(path, &prev_path(path)) {
+    #[cfg(windows)]
+    if let Some(tree) = machine_config_tree(path) {
+        return machine_previous_copy(&tree);
+    }
+    what_copy(load_prev(path, &prev_path(path)))
+}
+
+fn what_copy(copy: Result<AgentConfig>) -> PreviousCopy {
+    match copy {
         Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
         Ok(_) => PreviousCopy::NoEnrollment,
         Err(e) if not_found(&e) => PreviousCopy::Missing,
         Err(_) => PreviousCopy::Broken,
+    }
+}
+
+/// #4176 — what the machine config under `tree`, which is not there, can be
+/// restored from: its copy, read through the checks the config itself would
+/// pass (`machine_tree::read_machine_copy`). A copy that fails one is
+/// `Broken`, whatever it holds. The one question the service host's rung
+/// (`roomlerd`'s `win_service::supervisor::rung`), the SYSTEM worker's ladder
+/// and its start ([`previous_copy`]) ask, so they cannot disagree; [`load`]
+/// restores only what it calls `Enrolled`. It reads the copy and writes
+/// nothing. Why a copy is not restored is logged once per reason, not once per
+/// tick of a host that waits.
+#[cfg(windows)]
+pub fn machine_previous_copy(tree: &crate::machine_tree::MachineTree) -> PreviousCopy {
+    let copy = machine_copy_config(tree);
+    note_machine_copy(tree, &copy);
+    what_copy(copy)
+}
+
+#[cfg(windows)]
+fn note_machine_copy(tree: &crate::machine_tree::MachineTree, copy: &Result<AgentConfig>) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let why = match copy {
+        Ok(cfg) if cfg.has_primary_enrollment() => None,
+        Ok(_) => Some("it holds no enrollment".to_string()),
+        Err(e) if not_found(e) => None,
+        // A parse error says where it stopped and nothing of the file
+        // ([`parse_failure`]).
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if why != *last {
+        if let Some(why) = &why {
+            tracing::warn!(
+                config = %tree.config().display(),
+                copy = %tree.prev().display(),
+                reason = %why,
+                "config: the machine config is missing, and its copy is not restored: it does not \
+                 pass the checks the config would, or holds no enrollment; the device runs as one \
+                 with no machine enrollment"
+            );
+        }
+        *last = why;
     }
 }
 

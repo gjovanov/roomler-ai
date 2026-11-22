@@ -11,6 +11,11 @@
 //! the person's retired, enrolled config, and it writes its blank file after the
 //! lock, as before. Nor does the enrolled worker FR-43's macOS supervisor starts
 //! ([`may_restore`]): it ends with `NoConfig` as before, and its copy is not read.
+//!
+//! #4176 — a Windows SystemContext worker's machine config is restored only from
+//! a copy that passes the checks the config itself would
+//! (`config::machine_previous_copy`, through [`config::previous_copy`]): the
+//! service host starts that worker for such a copy, through the same function.
 
 use super::config::{self, PreviousCopy};
 use roomlerd::supervision::Supervision;
@@ -363,22 +368,14 @@ mod tests {
     }
 
     /// What the SYSTEM worker's start reads for a missing machine config's
-    /// copy: [`config::previous_copy`] at the machine path.
+    /// copy: [`config::previous_copy`] at the machine path, which is
+    /// `config::machine_previous_copy` there (`roomler-node-core`'s
+    /// `config::tests::machine_copy` holds that on the same trees). Asked
+    /// directly: this test's trees are not the computer's own, which is all
+    /// `previous_copy` reads at the machine path.
     #[cfg(target_os = "windows")]
     fn worker_copy(tree: &roomler_node_core::machine_tree::MachineTree) -> PreviousCopy {
-        // RED STAND-IN: master's read at the machine path (`load_private_prev`):
-        // the copy's own owner and DACL, and nothing else.
-        match roomler_node_core::machine_tree::read_checked(&tree.prev(), 1 << 20) {
-            Ok(None) => PreviousCopy::Missing,
-            Err(_) => PreviousCopy::Broken,
-            Ok(Some(bytes)) => {
-                match config::parse_text(&String::from_utf8_lossy(&bytes), "the copy") {
-                    Ok(cfg) if cfg.has_primary_enrollment() => PreviousCopy::Enrolled,
-                    Ok(_) => PreviousCopy::NoEnrollment,
-                    Err(_) => PreviousCopy::Broken,
-                }
-            }
-        }
+        config::machine_previous_copy(tree)
     }
 
     /// #4176 — the service host (`want_system_worker` over
