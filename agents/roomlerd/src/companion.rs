@@ -2595,6 +2595,11 @@ mod tray_start_tests {
     const RUNS_WITHIN: Duration = Duration::from_secs(10);
     /// How late "on time" may be on a busy runner: #3836's bar.
     const AT_ONCE: Duration = Duration::from_millis(500);
+    /// How long a test waits for the starts it asked for to reach the held
+    /// step (#4138): far longer than a busy runner takes to schedule a
+    /// thread. A count already there returns at once, so only a start that
+    /// never gets there waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     /// What a start answered: the outcome, or why it failed.
     type Answer = std::result::Result<EnsureOutcome, String>;
@@ -2631,6 +2636,27 @@ mod tray_start_tests {
         /// Starts that reached the held step.
         fn began(&self) -> usize {
             self.0.began.load(SeqCst)
+        }
+
+        /// The starts that reached the held step, once `want` of them have,
+        /// waited for `within` at most. A start counts when the thread it
+        /// runs on reaches the step, and an ask can answer before that: once
+        /// its wait is out. So a count read straight after the asks can miss
+        /// a start they began (#4138). The caller asserts the exact count, so
+        /// one start more than `want` still fails.
+        fn began_within(&self, want: usize, within: Duration) -> usize {
+            let deadline = Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{began} of {want} starts reached the held step within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -2838,7 +2864,11 @@ mod tray_start_tests {
                 });
             assert!(started.is_err(), "nothing starts while held: {started:?}");
         }
-        assert_eq!(held.began(), 1, "one start, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one start, however many asked"
+        );
         assert!(ran.argvs().is_empty(), "nothing was started while held");
         held.open();
         let (started, _) =
@@ -9149,6 +9179,27 @@ pub(crate) mod session_walk_stand_in {
         pub(crate) fn began(&self) -> usize {
             self.0.began.load(SeqCst)
         }
+
+        /// The walks that reached logind, once `want` of them have, waited
+        /// for `within` at most. A walk counts when the thread it runs on
+        /// reaches logind, and an ask can answer before that: once its wait
+        /// is out. So a count read straight after the asks can miss a walk
+        /// they began (#4138). The caller asserts the exact count, so one
+        /// walk more than `want` still fails.
+        pub(crate) fn began_within(&self, want: usize, within: std::time::Duration) -> usize {
+            let deadline = std::time::Instant::now() + within;
+            loop {
+                let began = self.began();
+                if began >= want {
+                    return began;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{began} of {want} walks reached logind within {within:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     /// Opens the gate when dropped: a failed assertion leaves nothing held,
@@ -9227,6 +9278,11 @@ mod session_walk_tests {
     const SLACK: Duration = Duration::from_secs(1);
     /// What a walk that answers may take on a busy runner.
     const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How long a test waits for the walks it asked for to reach logind
+    /// (#4138): far longer than a busy runner takes to schedule a thread. A
+    /// count already there returns at once, so only a walk that never gets
+    /// there waits this out.
+    const BEGINS: Duration = Duration::from_secs(10);
 
     type Walked = Result<GraphicalSession, NoGraphicalSession>;
 
@@ -9287,7 +9343,11 @@ mod session_walk_tests {
                 "logind held the walk, and it answered {walked:?}"
             );
         }
-        assert_eq!(held.began(), 1, "one walk, however many asked");
+        assert_eq!(
+            held.began_within(1, BEGINS),
+            1,
+            "one walk, however many asked"
+        );
         held.open();
         let (walked, _) = ask_on_a_thread(&stood, None, false)
             .recv_timeout(RUNS_WITHIN)
