@@ -2282,7 +2282,7 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                      system/com.roomler.daemon` retries it"
                 ));
                 for &index in &done.booted_out {
-                    problems.push(not_bootstrapped(read.people[index].account.uid));
+                    problems.push(not_bootstrapped(host, read.people[index].account.uid));
                 }
                 None
             }
@@ -2437,11 +2437,26 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
 
 /// #4092 — what `--revert` and the undo say of an agent they load only once
 /// the restart has answered, when it did not.
-fn not_bootstrapped(uid: u32) -> String {
-    format!(
-        "gui/{uid}/com.roomler.agent: not bootstrapped, as the daemon did not restart onto the \
-         files put back; launchd loads it at the next login"
-    )
+///
+/// #4287 — the job is read as the line is made. One still loaded (a run that
+/// stopped after the person's Keep and before its bootout) or loaded again (a
+/// login since) does not load at the next login: its agent may run, or may
+/// have exited 0 while the one-row daemon's screen worker held its lock, and
+/// then only `kickstart` starts it.
+fn not_bootstrapped<H: Host>(host: &mut H, uid: u32) -> String {
+    let job = format!("gui/{uid}/com.roomler.agent");
+    if host.agent_loaded(uid) {
+        format!(
+            "{job}: already loaded, and not started here, as the daemon did not restart onto \
+             the files put back; if the agent is not running, `sudo launchctl kickstart {job}` \
+             starts it"
+        )
+    } else {
+        format!(
+            "{job}: not bootstrapped, as the daemon did not restart onto the files put back; \
+             launchd loads it at the next login"
+        )
+    }
 }
 
 /// The Verify step: the restarted daemon has every part of one row within
@@ -3015,7 +3030,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         Ok(status) => status,
         Err(e) => {
             if let Some((uid, _)) = &agent {
-                host.say(&not_bootstrapped(*uid));
+                let line = not_bootstrapped(host, *uid);
+                host.say(&line);
             }
             host.say(&format!(
                 "root's records stay in {RECORDS}: `sudo roomlerd one-row --revert` finishes the \
@@ -6350,7 +6366,12 @@ mod tests {
     /// restarts, their plist back: that it is loaded and how it starts.
     #[tokio::test]
     async fn an_undo_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
-        let cells: [(&str, Option<(&'static str, usize, u32)>, &str); 2] = [
+        type Cell = (
+            &'static str,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+        );
+        let cells: [Cell; 2] = [
             ("not loaded", None, NOT_BOOTSTRAPPED_501),
             (
                 "loaded again by a login as the undo restarts",
