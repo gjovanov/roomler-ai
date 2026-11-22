@@ -1001,7 +1001,7 @@ sequenceDiagram
   request said `paged`, and as one `files:dir-error` naming the folder, its count and the
   listing's size to a viewer that did not, which every viewer shows. The task sends the pages in
   order behind the same end as a whole answer (`send_listing_frames`,
-  `agents/roomlerd/src/peer.rs:13450`, through `or_stopped`), so a channel that closes mid-listing
+  `agents/roomlerd/src/peer.rs:13461`, through `or_stopped`), so a channel that closes mid-listing
   stops them, and the viewer waits 5 s again at each page. A send that fails is a WARN,
   `files: answer not sent`, with its error. A folder over 10 000 entries is listed to that limit
   and says so (`capped`). The answers by viewer and agent, the limit and the budget:
