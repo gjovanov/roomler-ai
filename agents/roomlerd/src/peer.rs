@@ -18392,3 +18392,231 @@ mod dir_listing_tests {
         const { assert!(DIR_PAGE_BUDGET < FILES_FRAME_MAX) };
     }
 }
+
+/// #4082 — an upload's end never holds the files channel's read loop. Its
+/// placement (a rename; a copy across volumes; on a Windows service install, a
+/// copy into the person's folder, as them) ran in that loop, so while a large
+/// file was copied no later message on the channel was read: not a listing,
+/// not a download's cancel. A test holds the placement where that copy runs
+/// ([`crate::files::drawer_edges::seams::hold_placing`]), over the loopback
+/// channel the listing's tests use ([`files_channel_tests::Pair`]).
+#[cfg(test)]
+mod upload_end_tests {
+    use super::files_channel_tests::Pair;
+    use super::files_log_tests::Logged;
+    use super::*;
+    use crate::files::drawer_edges::seams;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+
+    /// How long the viewer waits for a listing's answer, from its send
+    /// (`ui/src/composables/remoteDirListing.ts`).
+    const VIEWER_WAITS: Duration = Duration::from_secs(5);
+
+    /// A listing's own bound, from reaching its task to its answer
+    /// (`files::reads::LISTING_ANSWERED_WITHIN`, #3682).
+    const LISTING_BOUND: Duration = Duration::from_millis(4500);
+
+    async fn served() -> Pair {
+        Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await
+    }
+
+    /// An id of this test's own: an accepted begin registers its partial
+    /// process-wide.
+    fn id_of(tag: &str) -> String {
+        format!("w42-{tag}-{}", std::process::id())
+    }
+
+    /// `n` bytes that differ from one offset to the next.
+    fn bytes_of(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Upload `payload` as `id` into `dest`, as the viewer sends one: its
+    /// begin, its chunks and its end, back to back.
+    async fn upload(pair: &Pair, id: &str, dest: &std::path::Path, payload: &[u8]) {
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "w42.bin", "size": payload.len(), "dest_path": dest}))
+            .await;
+        for chunk in payload.chunks(16 * 1024) {
+            pair.viewer
+                .send(&Bytes::copy_from_slice(chunk))
+                .await
+                .expect("the chunk went out");
+        }
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+    }
+
+    /// The frames the viewer hears within `wait`, up to the first one that
+    /// `matches`: that one, and every frame heard before it.
+    async fn heard_until(
+        pair: &mut Pair,
+        wait: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> (Option<Value>, Vec<Value>) {
+        let until = tokio::time::Instant::now() + wait;
+        let mut before = Vec::new();
+        loop {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let Some(text) = pair.next_within(left).await else {
+                return (None, before);
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if matches(&frame) {
+                return (Some(frame), before);
+            }
+            before.push(frame);
+        }
+    }
+
+    /// Upload `id`'s answer: its `files:complete`, or its `files:error`.
+    fn answers(id: &str) -> impl Fn(&Value) -> bool + '_ {
+        move |f| f["id"] == id && (f["t"] == "files:complete" || f["t"] == "files:error")
+    }
+
+    /// The answer is upload `id`'s `files:complete`, and the file it names
+    /// holds `payload`, whole.
+    fn assert_whole(answer: Option<&Value>, id: &str, payload: &[u8]) {
+        let Some(answer) = answer else {
+            panic!("upload {id} was never answered");
+        };
+        assert_eq!(answer["t"], "files:complete", "{answer}");
+        assert_eq!(answer["bytes"], payload.len(), "{answer}");
+        let placed = std::path::Path::new(answer["path"].as_str().expect("the file's path"));
+        let landed = std::fs::read(placed).expect("the file landed");
+        assert_eq!(landed.len(), payload.len(), "its size: {answer}");
+        assert!(
+            landed == payload,
+            "its bytes differ from those sent: {answer}"
+        );
+    }
+
+    /// Whether a line logged within `wait` `says` it.
+    async fn logged_within(log: &Logged, wait: Duration, says: impl Fn(&str) -> bool) -> bool {
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            if log.text().lines().any(&says) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// AC1 — a listing asked while an upload's end places its file is
+    /// answered within its own bound, while the end still waits; the upload
+    /// then completes, its file whole. Red on master, where the read loop
+    /// read the listing only once the end was done.
+    #[tokio::test]
+    async fn a_listing_asked_during_an_uploads_end_is_answered_within_its_bound() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        let listed = temp.path().join("listed");
+        for folder in [&dest, &listed] {
+            std::fs::create_dir(folder).expect("a folder");
+        }
+        std::fs::write(listed.join("a.txt"), b"a").expect("a file to list");
+        let id = id_of("listing");
+        let payload = bytes_of(300 * 1024);
+        let held = seams::hold_placing(&dest);
+        let mut pair = served().await;
+        upload(&pair, &id, &dest, &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        let asked = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:dir", "req_id": "w42-during", "path": listed}))
+            .await;
+        let (listing, _) =
+            heard_until(&mut pair, VIEWER_WAITS, |f| f["req_id"] == "w42-during").await;
+        let took = asked.elapsed();
+        // The copy is done: the end goes on.
+        held.release();
+        let (answer, _) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        assert!(reached, "the upload's end never reached its placement");
+        let Some(listing) = listing else {
+            panic!(
+                "a listing asked during an upload's end was not answered within the \
+                 viewer's {VIEWER_WAITS:?} (#4082)"
+            );
+        };
+        assert_eq!(listing["t"], "files:dir-list", "{listing}");
+        assert!(
+            took <= LISTING_BOUND,
+            "the listing was answered {took:?} after its ask"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+
+    /// AC1 — a download's `files:cancel` sent while an upload's end places its
+    /// file is acted on at once: the download stops and the cancel is done
+    /// with, while the end still waits. Red on master, where the read loop
+    /// read the cancel only once the end was done, and the download ran on.
+    #[tokio::test]
+    async fn a_downloads_cancel_sent_during_an_uploads_end_is_acted_on_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).expect("a folder");
+        // Still on its way when it is cancelled: 512 MiB, made without
+        // writing them (never written, they read as zeros).
+        let big = temp.path().join("w42-big.bin");
+        std::fs::File::create(&big)
+            .and_then(|file| file.set_len(512 * 1024 * 1024))
+            .expect("a large file to download");
+        let (dl, id) = (id_of("download"), id_of("cancel"));
+        let payload = bytes_of(64 * 1024);
+        let log = Logged::start(tracing::Level::INFO);
+        let held = seams::hold_placing(&dest);
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:get", "id": dl, "path": big}))
+            .await;
+        let (offer, _) = heard_until(&mut pair, Duration::from_secs(10), |f| {
+            f["id"] == dl.as_str()
+        })
+        .await;
+        upload(&pair, &id, &dest, &payload).await;
+        let reached = held.reached_within(Duration::from_secs(10)).await;
+        pair.ask(&json!({"t": "files:cancel", "id": dl})).await;
+        let quoted = format!("{dl:?}");
+        let stopped = logged_within(&log, Duration::from_secs(2), |line| {
+            line.contains("files: download stopped") && line.contains(&quoted)
+        })
+        .await;
+        let done_with = logged_within(&log, Duration::from_secs(2), |line| {
+            line.contains("files: cancel requested")
+                && line.contains(&dl)
+                && line.contains("out_cancelled=true")
+        })
+        .await;
+        // The copy is done: the end goes on.
+        held.release();
+        let (answer, heard) = heard_until(&mut pair, Duration::from_secs(20), answers(&id)).await;
+        pair.close().await;
+        drop(log);
+        assert!(reached, "the upload's end never reached its placement");
+        assert_eq!(
+            offer.as_ref().map(|f| f["t"].clone()),
+            Some(json!("files:offer")),
+            "the download began"
+        );
+        assert!(
+            stopped,
+            "the download did not stop within 2 s of its cancel, sent during an upload's end (#4082)"
+        );
+        assert!(
+            done_with,
+            "the download's cancel was not done with within 2 s, during an upload's end (#4082)"
+        );
+        assert!(
+            !heard
+                .iter()
+                .any(|f| f["t"] == "files:eof" && f["id"] == dl.as_str()),
+            "the cancelled download ran to its end"
+        );
+        assert_whole(answer.as_ref(), &id, &payload);
+    }
+}
