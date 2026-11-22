@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11086`](../agents/roomlerd/src/peer.rs#L11086)).
+control-channel arm sends the answer ([`peer.rs:11058`](../agents/roomlerd/src/peer.rs#L11058)).
 
 ### The answers
 
