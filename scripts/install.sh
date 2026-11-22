@@ -1994,16 +1994,28 @@ uninstall_linux() {
 
 # ── macOS ──
 
+# Whether com.roomler.update is installing now: the process launchd runs for it
+# has an `installer` child. launchctl's whole answer is read before it is
+# matched, as the .pkg postinstall reads it (#3783).
+update_helper_installs() {
+    out="$(as_root launchctl print system/com.roomler.update 2>/dev/null)" || return 1
+    pid="$(printf '%s\n' "$out" | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
+    [ -n "$pid" ] && pgrep -P "$pid" -x installer >/dev/null 2>&1
+}
+
 uninstall_stop_macos() {
     # The update helper first, and never in the middle of an install: booting
     # it out kills its whole process group, `installer` included (the .pkg
-    # postinstall's own warning).
+    # postinstall's own warning). Only a helper running `installer` is waited
+    # for. One without it is checking, downloading, or waiting for live work
+    # to end (FR-151), which can take hours: it is stopped at once, and it
+    # exits on that SIGTERM without installing.
     if as_root launchctl print system/com.roomler.update >/dev/null 2>&1; then
         n=0
-        while as_root launchctl print system/com.roomler.update 2>/dev/null | grep -q 'state = running'; do
+        while update_helper_installs; do
             [ "$n" = 0 ] && say "waiting for com.roomler.update to finish: it is installing an update"
             n=$((n + 1))
-            [ "$n" -ge 300 ] && { warn "com.roomler.update still runs after 300 s; stopping it"; break; }
+            [ "$n" -ge 300 ] && { warn "com.roomler.update still installs after 300 s; stopping it"; break; }
             sleep 1
         done
         say "stopping com.roomler.update"

@@ -34,7 +34,7 @@ use std::path::Path;
 /// |---|---|
 /// | Linux, the system or the user unit | nothing: `RestartPreventExitStatus=7 8` |
 /// | Windows, the `Roomler` service | its supervisor, at most 60 s apart, for good |
-/// | Windows, the per-user task | nothing, until the next sign-in (#3292) |
+/// | Windows, the per-user task | nothing: its launcher leaves on 7 (FR-150 P2), until the next sign-in |
 /// | macOS, the LaunchDaemon or the LaunchAgent | launchd, on any failed exit |
 ///
 /// Before #2293 both said "wait for the supervisor to relaunch", which on
@@ -693,9 +693,9 @@ pub fn stop_system() -> Result<String> {
 //   * `<RestartOnFailure>` — NOT a supervisor, whatever its name says. Measured
 //     on Win11 (#3292): after exit 1 and after `0xC000013A` it restarted nothing
 //     for five minutes, with `Count` 10 and `PT1M` registered and the task reading
-//     `Ready`. So a per-user daemon that exits stays down until the next logon or
-//     `service start` (#3295); nothing here is at parity with systemd's `Restart=`
-//     or macOS's `KeepAlive`. Kept for what it can still do: a start that FAILED.
+//     `Ready`. What starts a crashed daemon again is the launcher the task runs,
+//     since FR-150 P2 (#3295): `roomlerdw.exe`'s loop (`agents/roomlerdw/src/ends.rs`),
+//     as systemd's `Restart=` does. Kept for what it can still do: a start that FAILED.
 //   * `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>` and
 //     `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` — schtasks
 //     defaults to BOTH true, which silently terminates the agent the
