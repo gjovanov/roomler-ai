@@ -2890,6 +2890,9 @@ impl FilesHandler {
         // commit_partial below would error and the caller surfaces
         // it. We could `drop(state.file)` explicitly for clarity:
         drop(state.file);
+        // #4082 — where a test holds the placement, as a long copy holds it.
+        #[cfg(test)]
+        drawer_edges::seams::placing_waits(&state.dest_dir).await;
 
         // M4 fix: re-run unique_path at rename time so an operator
         // who created a colliding file mid-upload doesn't make us
