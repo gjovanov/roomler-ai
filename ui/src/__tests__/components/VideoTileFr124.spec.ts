@@ -8,9 +8,11 @@
 //    turned OFF is not a covered camera: a disabled track, a peer's FR-30
 //    camera-off signal and a shared screen are never judged.
 // 2. A tile the browser refused to start (autoplay policy) used to stay black:
-//    `play().catch(() => {})` swallowed the NotAllowedError. Now the picture
-//    comes back muted at once, the tile offers its sound, and the next gesture
-//    anywhere brings the sound back.
+//    `play().catch(() => {})` swallowed the NotAllowedError. Now a refused
+//    picture says "Tap to play", and the next gesture anywhere starts it.
+//    Since #3563 a tile is always muted (pictures only): the call's audio
+//    owner plays every participant, and its "Tap for sound" covers a refused
+//    sound once for the whole call (CallAudio.spec.ts).
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { defineComponent, h, ref } from 'vue'
 import { mount, flushPromises } from '@vue/test-utils'
@@ -220,40 +222,33 @@ describe('VideoTile — a black picture is named (FR-124)', () => {
   })
 })
 
+describe('VideoTile — a tile shows the picture only; the call plays the sound (#3563)', () => {
+  it("a remote tile's video is muted, even where the browser would let it play with sound", async () => {
+    // The call's audio owner (CallAudio) plays every remote participant, so a
+    // tile that played too would be a second copy of the same voice.
+    playAnswers(() => 'ok')
+    const w = mountTile()
+    await flushPromises()
+    expect((w.find('video').element as HTMLVideoElement).muted).toBe(true)
+    expect(w.find('[data-testid="tap-for-sound"]').exists()).toBe(false)
+    w.unmount()
+  })
+})
+
 describe('VideoTile — a refused start recovers (FR-124)', () => {
-  it('refused with sound: plays muted at once, offers the sound, and the next click anywhere restores it', async () => {
+  it('a browser that refuses sound before a gesture has nothing to refuse here: the muted picture starts', async () => {
     const play = playAnswers((el) => (el.muted ? 'ok' : 'NotAllowedError'))
     const w = mountTile()
     await flushPromises()
 
-    const video = w.find('video').element as HTMLVideoElement
-    expect(video.muted).toBe(true)
-    expect(w.find('[data-testid="tap-for-sound"]').exists()).toBe(true)
+    expect(play).toHaveBeenCalled()
+    expect((w.find('video').element as HTMLVideoElement).muted).toBe(true)
     expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(false)
-
-    // The page has its gesture now: the browser lets it play with sound.
-    play.mockImplementation(() => Promise.resolve())
-    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    await flushPromises()
-
-    expect(video.muted).toBe(false)
     expect(w.find('[data-testid="tap-for-sound"]').exists()).toBe(false)
     w.unmount()
   })
 
-  it("the tile's own button brings the sound back too", async () => {
-    const play = playAnswers((el) => (el.muted ? 'ok' : 'NotAllowedError'))
-    const w = mountTile()
-    await flushPromises()
-    play.mockImplementation(() => Promise.resolve())
-    await w.find('[data-testid="tap-for-sound"]').trigger('click')
-    await flushPromises()
-    expect((w.find('video').element as HTMLVideoElement).muted).toBe(false)
-    expect(w.find('[data-testid="tap-for-sound"]').exists()).toBe(false)
-    w.unmount()
-  })
-
-  it('refused even muted: "Tap to play", and a tap starts it', async () => {
+  it('refused even muted: "Tap to play", and a tap starts it, still muted', async () => {
     const play = playAnswers(() => 'NotAllowedError')
     const w = mountTile()
     await flushPromises()
@@ -264,7 +259,19 @@ describe('VideoTile — a refused start recovers (FR-124)', () => {
     await w.find('[data-testid="tap-to-play"]').trigger('click')
     await flushPromises()
     expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(false)
-    expect((w.find('video').element as HTMLVideoElement).muted).toBe(false)
+    expect((w.find('video').element as HTMLVideoElement).muted).toBe(true)
+    w.unmount()
+  })
+
+  it('refused even muted: the next click anywhere starts it', async () => {
+    const play = playAnswers(() => 'NotAllowedError')
+    const w = mountTile()
+    await flushPromises()
+    expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(true)
+    play.mockImplementation(() => Promise.resolve())
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(false)
     w.unmount()
   })
 
@@ -286,7 +293,7 @@ describe('VideoTile — a refused start recovers (FR-124)', () => {
     playAnswers(() => 'AbortError')
     const w = mountTile()
     await flushPromises()
-    expect((w.find('video').element as HTMLVideoElement).muted).toBe(false)
+    expect((w.find('video').element as HTMLVideoElement).muted).toBe(true)
     expect(w.find('[data-testid="tap-for-sound"]').exists()).toBe(false)
     expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(false)
     expect(warn).not.toHaveBeenCalled()
@@ -304,9 +311,10 @@ describe('VideoTile — a refused start recovers (FR-124)', () => {
   })
 
   it('an unmounted tile stops listening for the gesture', async () => {
-    const play = playAnswers((el) => (el.muted ? 'ok' : 'NotAllowedError'))
+    const play = playAnswers(() => 'NotAllowedError')
     const w = mountTile()
     await flushPromises()
+    expect(w.find('[data-testid="tap-to-play"]').exists()).toBe(true)
     w.unmount()
     const before = play.mock.calls.length
     document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))

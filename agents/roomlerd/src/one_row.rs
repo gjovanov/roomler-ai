@@ -2282,7 +2282,7 @@ async fn undo<H: Host>(host: &mut H, read: &Read, done: &Done) -> Vec<String> {
                      system/com.roomler.daemon` retries it"
                 ));
                 for &index in &done.booted_out {
-                    problems.push(not_bootstrapped(read.people[index].account.uid));
+                    problems.push(not_bootstrapped(host, read.people[index].account.uid));
                 }
                 None
             }
@@ -2437,11 +2437,26 @@ async fn start_agent<H: Host>(host: &mut H, uid: u32, home: &str, wait: bool) ->
 
 /// #4092 — what `--revert` and the undo say of an agent they load only once
 /// the restart has answered, when it did not.
-fn not_bootstrapped(uid: u32) -> String {
-    format!(
-        "gui/{uid}/com.roomler.agent: not bootstrapped, as the daemon did not restart onto the \
-         files put back; launchd loads it at the next login"
-    )
+///
+/// #4287 — the job is read as the line is made. One still loaded (a run that
+/// stopped after the person's Keep and before its bootout) or loaded again (a
+/// login since) does not load at the next login: its agent may run, or may
+/// have exited 0 while the one-row daemon's screen worker held its lock, and
+/// then only `kickstart` starts it.
+fn not_bootstrapped<H: Host>(host: &mut H, uid: u32) -> String {
+    let job = format!("gui/{uid}/com.roomler.agent");
+    if host.agent_loaded(uid) {
+        format!(
+            "{job}: already loaded, and not started here, as the daemon did not restart onto \
+             the files put back; if the agent is not running, `sudo launchctl kickstart {job}` \
+             starts it"
+        )
+    } else {
+        format!(
+            "{job}: not bootstrapped, as the daemon did not restart onto the files put back; \
+             launchd loads it at the next login"
+        )
+    }
 }
 
 /// The Verify step: the restarted daemon has every part of one row within
@@ -3015,7 +3030,8 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
         Ok(status) => status,
         Err(e) => {
             if let Some((uid, _)) = &agent {
-                host.say(&not_bootstrapped(*uid));
+                let line = not_bootstrapped(host, *uid);
+                host.say(&line);
             }
             host.say(&format!(
                 "root's records stay in {RECORDS}: `sudo roomlerd one-row --revert` finishes the \
@@ -6261,6 +6277,131 @@ mod tests {
                 "{cell}: {said}"
             );
             assert!(mac.loaded.contains(&501), "{cell}");
+        }
+    }
+
+    /// #4287 — the two lines `--revert` and the undo say of casey's job when
+    /// the restart onto the files put back does not answer: not loaded, it
+    /// loads at the next login, as before; loaded, it was not started here,
+    /// and `kickstart` starts it if its agent is not running.
+    const NOT_BOOTSTRAPPED_501: &str = "gui/501/com.roomler.agent: not bootstrapped, as the \
+                                        daemon did not restart onto the files put back; launchd \
+                                        loads it at the next login";
+    const LOADED_NOT_STARTED_501: &str = "gui/501/com.roomler.agent: already loaded, and not \
+                                          started here, as the daemon did not restart onto the \
+                                          files put back; if the agent is not running, `sudo \
+                                          launchctl kickstart gui/501/com.roomler.agent` starts it";
+
+    /// #4287 — a `--revert` whose restart does not answer starts no agent, and
+    /// reads casey's job as it says the line. Not loaded (a conversion, then
+    /// the revert): the line as before. Loaded again by a login as the revert
+    /// restarts, after its plan read it not loaded, or still loaded after a
+    /// stop after the Keep: no "next login", but that it is loaded and how it
+    /// starts.
+    #[tokio::test]
+    async fn a_revert_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            bool,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+            &'static str,
+        );
+        let cells: [Cell; 3] = [
+            (
+                "not loaded",
+                false,
+                None,
+                "their LaunchAgent is bootstrapped after the restart",
+                NOT_BOOTSTRAPPED_501,
+            ),
+            (
+                "loaded again by a login as the revert restarts",
+                false,
+                Some(("kickstart", 2, 501)),
+                "their LaunchAgent is bootstrapped after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+            (
+                "still loaded after a stop after the Keep",
+                true,
+                None,
+                "their LaunchAgent, already loaded, is started after the restart",
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, stopped, login, plan, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            if stopped {
+                stopped_after_the_keep(&mut mac).await;
+            } else {
+                convert_now(&mut mac).await.unwrap();
+                mac.calls.clear();
+                mac.said.clear();
+            }
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", revert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("the restart onto the files put back"),
+                "{cell}: {e}"
+            );
+            assert!(
+                calls_of(&mac, &["bootstrap", "agent"]).is_empty(),
+                "{cell}: {:?}",
+                mac.calls
+            );
+            let said = mac.said();
+            assert!(said.contains(plan), "{cell}: {said}");
+            assert!(said.lines().any(|l| l == line), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
+        }
+    }
+
+    /// #4287 — the undo whose restart does not answer starts no agent, and
+    /// reads each job it booted out as it says the line. casey's job not
+    /// loaded: the line as before. Loaded again by a login as the undo
+    /// restarts, their plist back: that it is loaded and how it starts.
+    #[tokio::test]
+    async fn an_undo_whose_restart_does_not_answer_says_whether_the_agent_is_loaded() {
+        type Cell = (
+            &'static str,
+            Option<(&'static str, usize, u32)>,
+            &'static str,
+        );
+        let cells: [Cell; 2] = [
+            ("not loaded", None, NOT_BOOTSTRAPPED_501),
+            (
+                "loaded again by a login as the undo restarts",
+                Some(("kickstart", 2, 501)),
+                LOADED_NOT_STARTED_501,
+            ),
+        ];
+        for (cell, login, line) in cells {
+            let mut mac = Fake::new(one_row_daemon);
+            mac.stuck = true;
+            mac.login_at = login;
+            let e = format!("{:#}", convert_now(&mut mac).await.unwrap_err());
+            assert!(
+                e.contains("2 thing(s) could not be put back"),
+                "{cell}: {e}"
+            );
+            assert_eq!(
+                calls_of(
+                    &mac,
+                    &["bootout", "put-back", "kickstart", "bootstrap", "agent"]
+                ),
+                ["bootout 501", "kickstart", "put-back 501", "kickstart"],
+                "{cell}"
+            );
+            let said = mac.said();
+            let want = format!("could not put back: {line}");
+            assert!(said.lines().any(|l| l == want), "{cell}: {said}");
+            let loaded = line == LOADED_NOT_STARTED_501;
+            assert_eq!(mac.loaded.contains(&501), loaded, "{cell}");
+            assert_eq!(said.contains("next login"), !loaded, "{cell}: {said}");
         }
     }
 

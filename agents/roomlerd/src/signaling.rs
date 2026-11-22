@@ -6094,7 +6094,17 @@ async fn handle_server_msg(
             via_service,
         } => {
             #[cfg(feature = "ssh-server")]
-            if via_service {
+            if via_service && !crate::ssh::first_sight_via_service(&grant_id) {
+                // #3558 — a copy of a grant this worker already handed on, or
+                // refused, answers nothing: a refusal could reach a wait the
+                // first copy's claim left open on another server instance
+                // (`first_sight_via_service`).
+                warn!(
+                    %grant_id, ?caller,
+                    "rc:ssh.grant already handed to the SYSTEM service (or refused); \
+                     this copy is dropped, no ack"
+                );
+            } else if via_service {
                 // FR-105 — a grant for this device's SYSTEM service never
                 // lands in the worker's table, where the worker's own server
                 // would honour it as the signed-in user. The service claims

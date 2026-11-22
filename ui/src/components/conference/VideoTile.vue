@@ -19,14 +19,15 @@
     >
       <!-- Video element — always in DOM and visible so Chrome autoplay works.
            The avatar overlay covers it when there's no video track.
-           FR-124 — `soundBlocked`: the browser refused to start it with sound,
-           so it plays muted until the next gesture. A binding, not just an
-           assignment, so a re-render can't unmute it behind the browser's back. -->
+           #3563 — always muted: a tile shows the picture only. The call's
+           audio owner (CallAudio) plays every remote participant, rendered
+           or not, so a tile that played too would be a second copy of the
+           same voice. -->
       <video
         ref="videoRef"
         autoplay
         playsinline
-        :muted="isLocal || soundBlocked"
+        muted
         class="w-100 h-100"
         :style="{ objectFit: objectFit }"
         :data-stream-key="streamKey"
@@ -65,9 +66,10 @@
         </div>
       </div>
 
-      <!-- FR-124 — the browser refused to start this tile. Its picture plays
-           muted meanwhile; the next gesture anywhere, or this button, brings
-           the sound back. -->
+      <!-- FR-124 — the browser refused to start this tile's picture, even
+           muted (a phone's power saving, a browser set to block all media).
+           The next gesture anywhere, or this button, starts it. The sound is
+           not the tile's: CallAudio's "Tap for sound" covers a refused one. -->
       <v-btn
         v-if="playBlocked"
         class="play-blocked-btn"
@@ -79,18 +81,6 @@
         @click.stop="resumePlayback"
       >
         Tap to play
-      </v-btn>
-      <v-btn
-        v-else-if="soundBlocked"
-        class="sound-blocked-btn"
-        size="x-small"
-        variant="flat"
-        color="rgba(0,0,0,0.7)"
-        prepend-icon="mdi-volume-off"
-        data-testid="tap-for-sound"
-        @click.stop="resumePlayback"
-      >
-        Tap for sound
       </v-btn>
 
       <!-- Pin badge -->
@@ -311,12 +301,12 @@ function cleanupTrackListeners(stream: MediaStream) {
   })
 }
 
-// FR-124 — the browser refused to START this tile (its autoplay policy:
-// audible playback before the page has had a gesture). Muted playback is
-// always allowed, so the picture comes back muted at once and the sound waits
-// for the next gesture. Both refusals used to be swallowed by
-// `.catch(() => {})`, which left the tile black until its stream changed.
-const soundBlocked = ref(false)
+// FR-124 — the browser refused to START this tile. The refusal used to be
+// swallowed by `.catch(() => {})`, which left the tile black until its stream
+// changed. Since #3563 the tile is always muted, and muted playback is allowed
+// almost everywhere, so what is left here is a picture refused even muted:
+// "Tap to play", and the next gesture starts it. A refused SOUND is the call's
+// audio owner's (CallAudio), said once for the whole call.
 const playBlocked = ref(false)
 let gestureArmed = false
 
@@ -336,30 +326,14 @@ async function startPlayback() {
       console.warn('[VideoTile] play() failed:', err)
       return
     }
-    if (!el.muted) {
-      soundBlocked.value = true
-      el.muted = true // now, not at the next render: the retry below needs it
-      try {
-        await el.play()
-        playBlocked.value = false
-      } catch {
-        playBlocked.value = true
-      }
-    } else {
-      playBlocked.value = true
-    }
+    playBlocked.value = true
     armGestureRetry()
   }
 }
 
-/** From inside a gesture: give the tile its sound back and start it. */
+/** From inside a gesture: start the tile's picture. */
 function resumePlayback() {
-  const el = videoRef.value
-  if (!el) return
-  if (soundBlocked.value) {
-    soundBlocked.value = false
-    el.muted = props.isLocal
-  }
+  if (!videoRef.value) return
   void startPlayback()
 }
 
@@ -668,13 +642,6 @@ defineExpose({ videoRef })
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  z-index: 4;
-}
-
-.sound-blocked-btn {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
   z-index: 4;
 }
 </style>
