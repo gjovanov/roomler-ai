@@ -98,8 +98,8 @@ impl PipeState {
 }
 
 /// The age split for one window, as [`super::viewer_rate::split_age`] hands
-/// it out: the sender's share (`None` where the pump keeps no send-wait
-/// figure), the transit share and the browser's share, all ms.
+/// it out: the sender's share (`None` where the pump hands it no send
+/// wait), the transit share and the browser's share, all ms.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitMs {
     pub sender_ms: Option<f64>,

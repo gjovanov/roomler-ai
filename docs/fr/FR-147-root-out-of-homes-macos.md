@@ -299,9 +299,9 @@ verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
   group or others can write, and the package sets 644 (`postinstall:360-361`). It writes the config with its
   recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:4033-4049`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4437-4441`), and no `.prev` repair, which belongs to the person's own agent
-  (`:3611-3643`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1413`). Root never parses the
+  (`crates/agent-core/src/config.rs:4036-4052`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4440-4444`), and no `.prev` repair, which belongs to the person's own agent
+  (`:3614-3646`). A config that does not parse stops Read, as before (`find_people`, `one_row.rs:1413`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
   identity or version, or the deadline: at Read the command stops with nothing changed; during the conversion it is
@@ -322,7 +322,7 @@ and any error runs `undo` (`:2159`), with `Done` (`:1620`) recording what to put
 | K1 | root's kept copy, then `root.json` (root) | a temporary file at most | remove them |
 | K2 | `/etc/roomler/one-row/<uid>/` per person, `record.json` last (root) | the uids before it, and one unfinished folder | remove them |
 | L | bootout by label of each loaded agent (root, `:3589`) | the job may still drain | bootstrap it back (D6) for every uid booted out |
-| L2 | `read` again, for each person L booted out (child, `:1897-1934`, #4097). The agent's graceful stop saves its config (`mark_clean_shutdown`), and in its first five minutes that save moves `last_run_unhealthy`. A save that moved only the agent's own run state (`config::RUN_STATE_KEYS`, `crates/agent-core/src/config.rs:2738`) is kept again in K2's order, `record.json` removed, the config's copy replaced, `record.json` written again last (`rekeep`, `one_row.rs:2100`), and C converts from it. Anything else that moved stops here: "this Mac changed after the plan was said" (`since_read`, `:2032`) | that uid's folder unfinished, or kept again | remove them |
+| L2 | `read` again, for each person L booted out (child, `:1897-1934`, #4097). The agent's graceful stop saves its config (`mark_clean_shutdown`), and in its first five minutes that save moves `last_run_unhealthy`. A save that moved only the agent's own run state (`config::RUN_STATE_KEYS`, `crates/agent-core/src/config.rs:2741`) is kept again in K2's order, `record.json` removed, the config's copy replaced, `record.json` written again last (`rekeep`, `one_row.rs:2100`), and C converts from it. Anything else that moved stops here: "this Mac changed after the plan was said" (`since_read`, `:2032`) | that uid's folder unfinished, or kept again | remove them |
 | W | root's file (root; `config::save` is atomic) | root's file, old or new | root's file back as a copy of its kept copy; if that write fails, no agent starts, and after S nothing else goes back (below) |
 | C | `convert` per person (child), on the bytes root kept last | that person's plist gone or not, the config old or new, each atomically | `put-back` for every person `convert` was started for, answered or not, unless their child refused before any change: exit 2, 3 or 4 (`before_any_change`, `:2138`), whose files stay as they are |
 | S, V | restart, verify (root) | the new files and the restarted daemon | everything above, the bootstraps last: the restart onto it (`:2259-2260`), then, once it has answered, the bootstraps |
@@ -485,7 +485,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `postinstall:287-290`, `:326` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:1196-1203` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
-| `agents/roomlerd/src/files.rs:5279-5289` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
+| `agents/roomlerd/src/files.rs:5367-5377` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
 | `agents/roomlerd/src/recording/folder.rs:160-164` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:250`) | write |
 | `agents/roomler-cli/src/config.rs:83-90` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:83-90`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:198`). Not established: whether that save leaves the person's file owned by root | write |
 
@@ -493,7 +493,7 @@ The source gate (`crates/agent-core/src/folder_gate.rs:291-357`) holds six of th
 macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
 `default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
 caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
-`files.rs:5366-5370` is Linux's `own_home_and_downloads` and `:7560` is a test.
+`files.rs:5454-5458` is Linux's `own_home_and_downloads` and `:7784` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.
@@ -643,7 +643,7 @@ recommends below; D8 stays open, with no recommendation. P1's root side (#4050) 
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3611-3643`) could bring it back: its own issue
+  previous file), and the person's agent's `.prev` repair (`config.rs:3614-3646`) could bring it back: its own issue
   (#4184). The worker root's supervisor starts never restores it at its start (#4157): with `--unenrolled` it writes
   a blank file, and without it (`macos_one_row` turned off by hand, with no `--revert`) it ends with 78 as before.
 - Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for

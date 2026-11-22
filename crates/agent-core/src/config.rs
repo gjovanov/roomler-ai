@@ -1206,11 +1206,11 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
-    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio` or
-    /// `1`. With it on, a remote-desktop session whose mesh link to the
-    /// viewer is not direct ranks its mesh candidates below every relay; `1`
-    /// also marks them ` network-cost 999`. Env `ROOMLERD_RC_CARRIER_RANK`,
-    /// read once per session. Local only. Temporary: FR-148 P5 deletes it.
+    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio`, `1` or `route`.
+    /// On, a remote-desktop session whose mesh link to the viewer is not direct ranks its
+    /// mesh candidates below every relay; `1` also marks them ` network-cost 999`, and
+    /// `route` (D49) is `1`, ranking pairs by their route. Env `ROOMLERD_RC_CARRIER_RANK`, read
+    /// once per session. Local only. Temporary: FR-148 P5 deletes it.
     #[serde(default)]
     pub rc_carrier_rank: Option<String>,
     /// FR-148 P1 — the path model's switch: `off`, `shadow` (unset; the
@@ -1498,9 +1498,12 @@ pub struct AgentConfig {
     /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm's frames go to QSV,
     /// the WGC arm's to NVENC, and on macOS the display stream's IOSurfaces to
     /// VideoToolbox, each without a CPU copy once the capability probe has
-    /// proven that encoder's GPU-input form. Built-in: off. Read when a capture
-    /// or an encoder opens and by the probe, so a change needs a restart. On a
-    /// supervised Mac the root's value binds the GUI worker.
+    /// proven that encoder's GPU-input form. `true` takes it on every proven
+    /// cell, `false` on none; unset (the built-in) only on the cells on the
+    /// agent's built-in default list (FR-132 P2), and that list is empty for
+    /// now, so unset is off. Read when a capture or an encoder
+    /// opens and by the probe, so a change needs a restart. On a supervised Mac
+    /// the root's value binds the GUI worker.
     #[serde(default)]
     pub zero_copy: Option<bool>,
     /// FR-130 — every encoder writes the colour description it converted

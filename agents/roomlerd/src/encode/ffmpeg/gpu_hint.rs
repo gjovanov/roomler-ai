@@ -84,7 +84,8 @@ pub(crate) fn current() -> Option<GpuDevice> {
 
 /// FR-118 §4.6 — the input form an encoder opened in: GPU frames, or CPU
 /// frames and why. The reasons: `switch_off` (`ROOMLERD_ZERO_COPY` is off),
-/// `cpu_frames` (the capture delivered frames in memory), `no_gpu_cell` (this
+/// `default_off` (it is unset and this cell is not on the default list: FR-132
+/// P2), `cpu_frames` (the capture delivered frames in memory), `no_gpu_cell` (this
 /// encoder or chroma takes no GPU frames yet), `denied` (`zero_copy_deny`),
 /// `unproven` (the capability probe's child did not open this form),
 /// `adapter_mismatch` (the capture's adapter has no QSV), `open_failed`. The

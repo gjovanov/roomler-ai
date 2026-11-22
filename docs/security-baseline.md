@@ -768,8 +768,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11451`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10788`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11434`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10771`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -822,13 +822,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:5021`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:5109`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:5334`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:5422`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -839,11 +839,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:5115`). There root still never places into a
+  (`stage_held`, `files.rs:5203`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:5235`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:5323`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and
@@ -1327,9 +1327,9 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2936`). Two tests lock it:
-`secrets_and_identity_are_not_exposed` (`:4790`) and
-`no_external_credential_key_is_editable_through_the_config_surface` (`:5449`).
+(`crates/agent-core/src/config_surface.rs:2903`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:5010`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5757`).
 
 #3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
 daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,

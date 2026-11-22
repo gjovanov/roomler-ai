@@ -206,9 +206,10 @@ pub struct DxgiDirectBackend {
     /// The intermediate native-size RENDER_TARGET texture for the
     /// `vp_input_needs_copy` route (lazy).
     vp_mid_tex: Option<ID3D11Texture2D>,
-    /// FR-118 P2 — `ROOMLERD_ZERO_COPY`, read once when this backend opens:
-    /// a frame is copied into a texture of [`Self::gpu_pool`] and delivered on
-    /// the GPU, and read back only if a consumer asks for its bytes.
+    /// FR-118 P2 — GPU frames, decided once when this backend opens
+    /// (`gpu_frame::gpu_frames_at_open`: the switch, FR-132 P2's list): a frame
+    /// is copied into a texture of [`Self::gpu_pool`] and delivered on the GPU,
+    /// and read back only if a consumer asks for its bytes.
     zero_copy: bool,
     /// FR-118 P2 — the textures GPU frames are copied into, on this backend's
     /// device. Built with the first GPU frame.
@@ -536,7 +537,7 @@ impl DxgiDirectBackend {
                 vp_failed_at: None,
                 vp_input_needs_copy: false,
                 vp_mid_tex: None,
-                zero_copy: gpu_frame::zero_copy_enabled(),
+                zero_copy: gpu_frame::gpu_frames_at_open(),
                 gpu_pool,
                 gpu_failed_at: None,
             })
@@ -789,10 +790,10 @@ impl DxgiDirectBackend {
         Some((tw, th))
     }
 
-    /// FR-118 P2 — with the switch on, copy this frame into a texture of the GPU
+    /// FR-118 P2 — with GPU frames on, copy this frame into a texture of the GPU
     /// pool (through the VideoProcessor when the pump asked for a smaller box)
-    /// and deliver it on the GPU. `None` = this frame takes the CPU path: the
-    /// switch is off, the desktop is FP16 or rotated (the LUT and raw-copy
+    /// and deliver it on the GPU. `None` = this frame takes the CPU path: GPU
+    /// frames were off at the open, the desktop is FP16 or rotated (the LUT and raw-copy
     /// paths), or the GPU path failed and its retry has not come round. Like
     /// every VP failure, nothing here may surface as a [`BackendBail`].
     fn try_gpu_frame(&mut self, src: &ID3D11Texture2D) -> Option<DxgiFrame> {
