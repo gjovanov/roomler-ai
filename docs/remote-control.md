@@ -6261,8 +6261,10 @@ to-activate, so the browser never sees a bait-and-switch.
   listing's answer can come before an earlier one's, which the viewer
   matches by `req_id`. One 3 s bound covers a listing's step, from when it
   takes the channel's lane, and a listing is answered within 4.5 s of
-  reaching its task, inside the viewer's 5 s unless the read loop is
-  still running an upload's end, which it awaits inline (#4082). A
+  reaching its task, inside the viewer's 5 s, during an upload's end
+  too: the read loop hands that end's placement, which can copy a large
+  file for minutes, to a lane of its own, so a listing or a download's
+  `files:cancel` sent behind it is acted on at once (#4082). A
   channel runs one folder listing step at a time, and the Drives view has
   a lane of its own ([desktop-companion.md](desktop-companion.md) §9.3).
   **A listing too large for one message comes in pages** (#4121). A

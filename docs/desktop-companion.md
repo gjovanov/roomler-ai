@@ -863,7 +863,7 @@ flowchart TD
 | Who reads | `FsAs::for_read` (`:480`) and `FsAs::for_write` (`:502`) through `reads::session_or_daemon_within` (`agents/roomlerd/src/files/reads.rs:392`), one rule with `FsAs::now` (`session_or_daemon`, `agents/roomlerd/src/files.rs:541`): `fs_as_for` (`:420`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`). #3682 — an async caller looks the person up on a thread of its own, through one lookup in flight (`PERSON`, `agents/roomlerd/src/files/reads.rs:381`), and waits for it 1.5 s (`PERSON_LOOKUP_WAIT`, `:376`), as a Linux read asks seat0 (§9.4). `WTSQueryUserToken` calls the session manager and the Downloads known folder reads the person's registry, and the async worker the lookup ran on served the whole files channel. No answer in that time is `FsAs::CannotTell`, never the service. `FsAs::now`, asked only on blocking threads (the status refresh, a `ConfigSet`), still asks on its own |
 | A download | `begin_outgoing_as` (`files.rs:3652`), `open_to_send` (`:3770`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
 | A folder | `begin_outgoing_zip_as` (`files.rs:4392`), `walk_and_zip` (`:4474`), `zip_folder_entries` (`:4664`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
-| A listing | `list_dir_as` (`files.rs:4139`), `list_dir_in` (`:4146`), `list_canonical` (`:4171`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of reaching its task (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s unless an upload's end, which the channel's read loop runs inline, delays its start (#4082). #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
+| A listing | `list_dir_as` (`files.rs:4139`), `list_dir_in` (`:4146`), `list_canonical` (`:4171`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of reaching its task (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s, during an upload's end too: the read loop hands that end's placement to a lane of its own (#4082, below). #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
 | The Drives view | `reads::roots` (`agents/roomlerd/src/files/reads.rs:271`), `enumerate_roots` (`agents/roomlerd/src/files.rs:4306`) | #3682 — built inside a step as them, within the listing's bound, on a lane of its own (`Listings::drives`). Windows keeps drive letters per sign-in, so a letter the person mapped lives in their sign-in's device map, not the service's, and the service's own list left it out. `GetLogicalDrives` asks no drive anything, so the step touches no share, and a folder stuck on a share that stopped answering never holds it up |
 
 - **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
@@ -986,12 +986,10 @@ sequenceDiagram
   person lookup (1.5 s at most), its wait for the lane and its step all in. The viewer gives up
   5 s after its send (`listDir`, `ui/src/composables/remoteDirListing.ts:156`, a timer set just
   before the send at `:159`), and 5 s after each page of a listing that comes in pages (#4121),
-  which leaves 0.5 s for the way there and back, however long the listing waited, when the read
-  loop hands it on at once. ⚠️ The read loop still runs an upload's end itself
-  (`agents/roomlerd/src/peer.rs:13231`), and that end moves the file into place with no bound: on
-  a service install it copies the whole file across to the person's folder
-  (`agents/roomlerd/src/files.rs:2943`). A listing asked while a large upload ends reaches its task
-  only after the copy, and the viewer may show its own timeout first (#4082). A lookup that runs out
+  which leaves 0.5 s for the way there and back, however long the listing waited, since the read
+  loop hands it on at once. That holds while an upload ends too: the read loop no longer runs an
+  upload's end itself, whose copy into place has no bound, but hands its placement to the
+  channel's placement lane (#4082, "An upload's end, off the read loop" below). A lookup that runs out
   answers "Could not tell who is signed in to this computer. Try again." (`CANNOT_TELL`,
   `agents/roomlerd/src/files/reads.rs:35`), a read and a received file alike, never the service's own
   identity. A retry asks again, and joins a lookup still running rather than starting another.
@@ -1028,6 +1026,81 @@ sequenceDiagram
 - **Every step still fetches the session's token** and checks its SID, so a folder download of
   10 000 entries takes about 10 000 such fetches. #3682 measures what they cost in the field and
   changes nothing here.
+
+#### An upload's end, off the read loop (#4082)
+
+An upload's end moves its file into place: a rename, a copy across volumes, or, on a
+background-service install, a whole copy from the service's staging into the person's folder, as
+them (`place_across`, `agents/roomlerd/src/files.rs:3146`, #3048). For a large file that takes
+minutes, and it has no bound, because a large file legitimately takes long. The files channel's
+read loop used to await it, and webrtc-rs reads a channel's next message only once the handler of
+the last one returns, so while a large file was copied nothing sent behind its `files:end` was
+read: a listing reached its task only after the copy, and the viewer showed its own 5 s timeout
+first, and a download's `files:cancel` acted only after the copy. The read loop now takes the
+upload out of its slot and hands its placement to the channel's placement lane:
+
+```mermaid
+sequenceDiagram
+    participant V as viewer
+    participant L as files channel's read loop
+    participant P as channel's placement lane
+    participant T as placement task
+    V->>L: files:end {id: a}
+    L->>L: begin_end: a leaves the slot, marked as ending
+    L->>P: a's placement, then reads the next message
+    P->>T: place a: the rename or the copy, as the person on a service install
+    V->>L: files:dir, a download's files:cancel, files:begin {id: b} and its chunks
+    L-->>V: answered or acted on at once, not behind a's copy
+    V->>L: files:end {id: b}
+    L->>P: b's placement waits for a's
+    T-->>P: a placed, whole
+    P-->>V: files:complete {id: a}
+    P->>T: place b
+    T-->>P: b placed, whole
+    P-->>V: files:complete {id: b}
+    Note over P,V: a placement always runs to its end, and its file lands whole.<br/>Once the channel closes or its session ends, its answer is dropped.
+```
+
+| What | Where (`agents/roomlerd/src/`) | Why |
+|---|---|---|
+| The end's first half, on the loop | `FilesHandler::begin_end` (`files.rs:2927`) | quick: under the channel's `incoming` lock it takes the upload out of the slot and marks it as ending (`ENDING`, `files.rs:1539`, read by `upload_ending`, `:1542`) before the lock goes, so whatever is read next finds the slot free and the upload ending. Its refusals keep their words ("no active transfer to end", "files:end id=… but active transfer is …"), and the read loop answers them, as before |
+| The placement | `Ending::place` (`files.rs:2974`) | the end's body from the flush on, unchanged: the short-transfer check, the rename, the copy across volumes or the copy across to the person, then the staging and its registry entry removed. It keeps the upload's busy mark for the updater (`ActiveTransferGuard`) until the file is durable, and its ending mark until it returns, however it ends. It holds neither the handler nor the channel |
+| The lane | `spawn_placement_lane` (`peer.rs:13180`), made by `attach_files_handler` (`:13101`) | one per channel: the placements run one at a time, each in a task of its own, in the order their ends came, so their answers keep that order. It holds the channel only weakly, and its end by the token a listing drops its answer on (`listings_closed`). Its sender lives in the channel's message callback, which `on_session_end` (`:13148`) lets go, and the lane ends once the placements queued by then are done |
+| The answer | `answer_upload_end` (`peer.rs:13207`) | one per upload, `files:complete` or the end's `files:error`, with the fields and the words the read loop sent; logged ("files: complete", "files: end failed") and noted for the session's audit as before. Sent only while the channel lives, the send racing the channel's end (`or_stopped`, `:14090`) |
+| The End arm | `handle_files_control` (`peer.rs:13326`, `:13331`, `:13340`) | the end of an upload refused at its begin is dropped (#3785), and so is a second end of an upload being placed, so it is answered once. Any other end takes `begin_end`, and the loop never waits for its placement |
+
+- **A cancel of the upload being placed does nothing to it** (`cancel_incoming`,
+  `agents/roomlerd/src/files.rs:3276`). The copy is one step that cannot stop, and its staging is
+  what it reads, so the cancel neither stops it nor removes the staging, and the end answers it,
+  once. The channel logs `files: cancel requested` with `ending=true`. So, as when the cancel was
+  read only after the copy, cancelling a row at 100% does not stop its file from landing. A
+  download's cancel in the same message acts at once.
+- **A begin during a placement is taken at once.** Its chunks are written as they come, and its own
+  end waits in the lane for the earlier placement. The viewer sends its next begin as soon as a row
+  settles, which a local cancel of a row at 100% does at once (`cancelUpload`,
+  `ui/src/composables/useRemoteControl.ts:14065`; the queue's next turn, `:13748`), so the viewer
+  reaches this case. A begin into the same folder makes its `<id>` there twice at most: a placement
+  beside it removes the empty `.roomler-partial` folder, and can do so between the begin's make of
+  that folder and its make of the `<id>`. `staging::stage` already did so on Linux, and the other
+  platforms now do it too (`agents/roomlerd/src/files.rs:2748`).
+- **A resume of the upload being placed is refused at once**, on this channel or another, because
+  the mark is process-wide: "files:resume `<id>` but its end is placing the file now"
+  (`resume_upload`, `agents/roomlerd/src/files.rs:3421`). It is refused before anything is looked
+  up, so it never truncates the staging the copy reads. Today's viewer sends none: `files:end` is the
+  last thing its upload sends (`ui/src/composables/useRemoteControl.ts:13376`).
+- **A channel that closes, or a session that ends, during a placement** leaves the placement to run
+  on: its file lands whole, and its staging and registry entry go, as when the read loop ran it.
+  Only its answer is dropped, with one debug line ("files: the end's answer is not sent: its channel
+  closed, or its session ended"), where the read loop used to try that send on the closed channel
+  and warn `files: answer not sent`.
+- **Still on the read loop**: a `files:begin`, which makes the staging (as the person, on a service
+  install), and each chunk's write. A share that stops answering during a write still holds the
+  channel.
+- **No bound on the copy.** A large file legitimately copies for long, so only a bound on progress
+  would be sound, and none is set.
+- The tests are `peer::upload_end_tests` (`agents/roomlerd/src/peer.rs:18523`). A test holds a
+  placement where its copy runs (`files::drawer_edges::seams::hold_placing`), a download before
+  its first chunk (`hold_sending`), and a begin between its two makes (`before_the_id`).
 
 ### 9.4 A Linux system install reads as the person at the screen too (#3688)
 
