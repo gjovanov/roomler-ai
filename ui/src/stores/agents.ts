@@ -190,7 +190,8 @@ export interface AgentCapabilities {
   supports_file_transfer: boolean
   max_simultaneous_sessions: number
   /** File-DC v2 (0.3.0+) per-feature capability list. Recognised
-   *  values: 'upload', 'download', 'download-folder', 'browse'.
+   *  values: 'upload', 'download', 'download-folder', 'resume', 'browse',
+   *  'dir-pages' (#4121: a large listing comes in pages; with 'browse').
    *  Empty / unset on older agents — browsers fall back to
    *  `supports_file_transfer` as the upload-only marker. */
   files?: string[]

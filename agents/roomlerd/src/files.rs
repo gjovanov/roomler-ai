@@ -2057,8 +2057,17 @@ pub(crate) enum FilesIncoming {
     /// entry on a Mac or Linux host led nowhere (#2870). `req_id` echoes
     /// back in the `dir-list` reply so the browser can match concurrent
     /// requests.
+    ///
+    /// #4121 — `paged`: the viewer joins a listing sent in pages. One that
+    /// leaves it out (every viewer before it) gets the listing whole, or a
+    /// `files:dir-error` saying why it is too large for one message.
     #[serde(rename = "files:dir")]
-    Dir { req_id: String, path: String },
+    Dir {
+        req_id: String,
+        path: String,
+        #[serde(default)]
+        paged: bool,
+    },
     /// Browser → Agent: resume an upload that lost its DC mid-flight
     /// (file-DC v3, rc.19). The browser claims `bytesAcked` from the
     /// last `files:progress` envelope; the agent replies with
@@ -2116,12 +2125,26 @@ pub(crate) enum FilesOutgoing<'a> {
     /// Permission-denied per-entry results are dropped from the
     /// list silently — best-effort so a single inaccessible file
     /// doesn't sink the listing.
+    ///
+    /// #4121 — a listing too large for one message goes in pages, each a
+    /// whole `dir-list` of its own: `page` counts from 0 of `pages`, `total`
+    /// is every page's entries together, and the last page says `capped` when
+    /// the folder held more than the listing takes. A listing sent whole
+    /// carries none of them, as before.
     #[serde(rename = "files:dir-list")]
     DirList {
         req_id: &'a str,
         path: &'a str,
         parent: Option<&'a str>,
         entries: &'a [DirEntryView],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pages: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<usize>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        capped: bool,
     },
     /// Agent → Browser: directory listing failed (path doesn't
     /// exist, permission denied, browse disabled by config).
@@ -2138,6 +2161,58 @@ pub(crate) enum FilesOutgoing<'a> {
     /// `files:end` once it has pumped the remaining bytes.
     #[serde(rename = "files:resumed")]
     Resumed { id: &'a str, accepted_offset: u64 },
+}
+
+/// #4121 — one message on the files channel as it goes out: its JSON, and
+/// what a send that fails is logged by. Never its text: a listing names a
+/// person's files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilesFrame {
+    /// The message's `t`.
+    pub(crate) kind: &'static str,
+    /// The `id` or `req_id` its waiter in the viewer settles on.
+    pub(crate) id: String,
+    pub(crate) text: String,
+}
+
+impl FilesOutgoing<'_> {
+    /// This message as the frame that carries it.
+    pub(crate) fn frame(&self) -> serde_json::Result<FilesFrame> {
+        Ok(FilesFrame {
+            kind: self.kind(),
+            id: self.addressed().to_string(),
+            text: serde_json::to_string(self)?,
+        })
+    }
+
+    /// The `t` the message serializes with.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "files:accepted",
+            Self::Progress { .. } => "files:progress",
+            Self::Complete { .. } => "files:complete",
+            Self::Error { .. } => "files:error",
+            Self::Offer { .. } => "files:offer",
+            Self::Eof { .. } => "files:eof",
+            Self::DirList { .. } => "files:dir-list",
+            Self::DirError { .. } => "files:dir-error",
+            Self::Resumed { .. } => "files:resumed",
+        }
+    }
+
+    /// The `id`, or a listing's `req_id`.
+    fn addressed(&self) -> &str {
+        match self {
+            Self::DirList { req_id, .. } | Self::DirError { req_id, .. } => req_id,
+            Self::Accepted { id, .. }
+            | Self::Progress { id, .. }
+            | Self::Complete { id, .. }
+            | Self::Error { id, .. }
+            | Self::Offer { id, .. }
+            | Self::Eof { id, .. }
+            | Self::Resumed { id, .. } => id,
+        }
+    }
 }
 
 /// Listing entry surfaced over `files:dir-list`. Sorted dirs-first
@@ -4042,9 +4117,10 @@ pub const STAGING_SENTINEL: &str = "<staging>";
 /// List a directory. Empty / `~` enumerates the roots (logical drives on
 /// Windows; a single `/` on Unix); [`STAGING_SENTINEL`] resolves to this
 /// host's staging root; anything else is canonicalised and read, `/`
-/// included. Returns at most 10000 entries — a directory with more is a
-/// degenerate case (deeply nested `node_modules` on a dev box) that we'd
-/// rather refuse than stream a 1 MiB JSON listing.
+/// included. Returns at most 10000 entries ([`DIR_ENTRIES_MAX`]): a folder
+/// with more is listed to that limit and says so (`capped`, #4121), and a
+/// listing too large for one message reaches the viewer in pages
+/// ([`dir_pages`]).
 ///
 /// ⚠️ `/` is a DIRECTORY, not a roots request (#2870). Until this change the
 /// roots arm also matched `/`, so on a Unix host the roots view listed one
@@ -4103,11 +4179,12 @@ async fn list_canonical(
         .step(who, &pb.to_string_lossy(), by, move || {
             let canon = reads::resolve(&asked)?;
             let read = folder_listing(&canon, checks)?;
-            let entries = reads::read_entries(&canon, read);
+            let (entries, capped) = reads::read_entries(&canon, read);
             Ok(DirListing {
                 parent: canon.parent().map(|p| p.to_string_lossy().to_string()),
                 path: canon.to_string_lossy().to_string(),
                 entries,
+                capped,
             })
         })
         .await;
@@ -4177,14 +4254,21 @@ async fn list_staging(
     ))
 }
 
-/// The entries of a folder [`list_canonical`] opened: at most 10 000, the
-/// listing ending at its first error. #3688 — a listing through a folder's
+/// The most entries one listing takes ([`collect_dir_entries`]).
+pub(crate) const DIR_ENTRIES_MAX: usize = 10_000;
+
+/// The entries of a folder [`list_canonical`] opened: at most `max`, the
+/// listing ending at its first error, and whether the folder held more
+/// (#4121). #3688 — a listing through a folder's
 /// handle (`/proc/self/fd/N`, [`folder_listing`]) names its entries after that
 /// handle, so read only `file_name()` and `metadata()` here, never `path()`.
-fn collect_dir_entries(read: std::fs::ReadDir) -> Vec<DirEntryView> {
+fn collect_dir_entries(mut read: std::fs::ReadDir, max: usize) -> (Vec<DirEntryView>, bool) {
     let mut entries: Vec<DirEntryView> = Vec::new();
-    for entry in read.take(10_000) {
+    let (mut taken, mut failed) = (0, false);
+    for entry in read.by_ref().take(max) {
+        taken += 1;
         let Ok(entry) = entry else {
+            failed = true;
             break;
         };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -4207,13 +4291,15 @@ fn collect_dir_entries(read: std::fs::ReadDir) -> Vec<DirEntryView> {
             mtime_unix,
         });
     }
+    // The folder held more when one more entry is there to read.
+    let capped = !failed && taken == max && matches!(read.next(), Some(Ok(_)));
     // Sort: dirs first then files; both alphabetical case-insensitive.
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
-    entries
+    (entries, capped)
 }
 
 #[cfg(target_os = "windows")]
@@ -4264,6 +4350,8 @@ pub struct DirListing {
     pub path: String,
     pub parent: Option<String>,
     pub entries: Vec<DirEntryView>,
+    /// The folder held more entries than the listing took (#4121).
+    pub capped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -6991,12 +7079,148 @@ mod tests {
         let m: FilesIncoming =
             serde_json::from_str(r#"{"t":"files:dir","req_id":"r1","path":""}"#).unwrap();
         match m {
-            FilesIncoming::Dir { req_id, path } => {
+            FilesIncoming::Dir { req_id, path, .. } => {
                 assert_eq!(req_id, "r1");
                 assert_eq!(path, "");
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// #4121 — a viewer that joins a listing's pages says so; one that leaves
+    /// `paged` out (every viewer before it) parses as before.
+    #[test]
+    fn parse_files_dir_paged() {
+        for (text, paged) in [
+            (r#"{"t":"files:dir","req_id":"r1","path":"/p"}"#, false),
+            (
+                r#"{"t":"files:dir","req_id":"r1","path":"/p","paged":false}"#,
+                false,
+            ),
+            (
+                r#"{"t":"files:dir","req_id":"r1","path":"/p","paged":true}"#,
+                true,
+            ),
+        ] {
+            let m: FilesIncoming = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                m,
+                FilesIncoming::Dir {
+                    req_id: "r1".into(),
+                    path: "/p".into(),
+                    paged,
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// #4121 — a listing sent whole is today's bytes: none of the page
+    /// fields, and no `capped` while the folder held no more.
+    #[test]
+    fn dir_list_serializes_as_today() {
+        let entries = [
+            DirEntryView {
+                name: "a.txt".into(),
+                is_dir: false,
+                size: Some(5),
+                mtime_unix: Some(1_763_683_200),
+            },
+            DirEntryView {
+                name: "sub".into(),
+                is_dir: true,
+                size: None,
+                mtime_unix: None,
+            },
+        ];
+        let text = serde_json::to_string(&FilesOutgoing::DirList {
+            req_id: "r1",
+            path: "/home/p",
+            parent: Some("/home"),
+            entries: &entries,
+            page: None,
+            pages: None,
+            total: None,
+            capped: false,
+        })
+        .unwrap();
+        assert_eq!(
+            text,
+            r#"{"t":"files:dir-list","req_id":"r1","path":"/home/p","parent":"/home","entries":[{"name":"a.txt","is_dir":false,"size":5,"mtime_unix":1763683200},{"name":"sub","is_dir":true,"size":null,"mtime_unix":null}]}"#
+        );
+    }
+
+    /// #4121 — a frame's kind is the `t` its message serializes with, and its
+    /// id the one its waiter settles on, for every message: a send that fails
+    /// is logged by them.
+    #[test]
+    fn a_frames_kind_is_its_messages_t() {
+        let entries: [DirEntryView; 0] = [];
+        for msg in [
+            FilesOutgoing::Accepted {
+                id: "a",
+                path: "/p",
+            },
+            FilesOutgoing::Progress { id: "a", bytes: 1 },
+            FilesOutgoing::Complete {
+                id: "a",
+                path: "/p",
+                bytes: 1,
+            },
+            FilesOutgoing::Error {
+                id: "a",
+                message: "m",
+            },
+            FilesOutgoing::Offer {
+                id: "a",
+                name: "n",
+                size: None,
+                mime: None,
+            },
+            FilesOutgoing::Eof { id: "a", bytes: 1 },
+            FilesOutgoing::DirList {
+                req_id: "a",
+                path: "/p",
+                parent: None,
+                entries: &entries,
+                page: None,
+                pages: None,
+                total: None,
+                capped: false,
+            },
+            FilesOutgoing::DirError {
+                req_id: "a",
+                message: "m",
+            },
+            FilesOutgoing::Resumed {
+                id: "a",
+                accepted_offset: 0,
+            },
+        ] {
+            let frame = msg.frame().unwrap();
+            let sent: serde_json::Value = serde_json::from_str(&frame.text).unwrap();
+            assert_eq!(sent["t"], frame.kind, "{msg:?}");
+            assert_eq!(frame.id, "a", "{msg:?}");
+        }
+    }
+
+    /// #4121 (D3-A) — a folder holding more entries than a listing takes is
+    /// listed to the limit and says it was cut; one that fits says nothing.
+    #[test]
+    fn a_folder_over_the_cap_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            std::fs::write(temp.path().join(format!("f{i}.txt")), b"").unwrap();
+        }
+        let (entries, capped) = collect_dir_entries(std::fs::read_dir(temp.path()).unwrap(), 5);
+        assert_eq!(entries.len(), 5, "the listing takes its limit");
+        assert!(capped, "a folder of 6 listed to 5 was cut silently (#4121)");
+        let (entries, capped) = collect_dir_entries(std::fs::read_dir(temp.path()).unwrap(), 6);
+        assert_eq!(
+            (entries.len(), capped),
+            (6, false),
+            "a folder of 6 fits a limit of 6"
+        );
     }
 
     // ---- rc.19 file-DC v3 resume wire-format locks ----
@@ -10345,7 +10569,7 @@ CAN_GRAPHICAL=0
 
     /// #3688 — a listing answers inside the viewer's own timer for it: the
     /// drawer gives up on `files:dir` after 5 s (`listDir`,
-    /// `ui/src/composables/useRemoteControl.ts`). The seat0 lookup and the
+    /// `ui/src/composables/remoteDirListing.ts`). The seat0 lookup and the
     /// listing's own timeout run one after the other, so together they stay
     /// inside it; a lookup that took the whole 5 s could never be answered.
     #[cfg(target_os = "linux")]
@@ -13859,3 +14083,6 @@ pub(crate) mod drawer_edges;
 
 /// #3682 — the drawer's reads to their edges: what resolving a path answers.
 mod reads;
+
+/// #4121 — a folder listing's answer, as the frames that carry it.
+pub(crate) mod dir_pages;

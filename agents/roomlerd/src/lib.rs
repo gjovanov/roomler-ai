@@ -527,6 +527,10 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
 /// #3429 — what a restart would cut or wedge, now: the one model the periodic
 /// update check and the replaced-binary restart both read.
 pub mod busy;
+/// FR-148 — each `enum:` config key read by a parser in this crate,
+/// pinned both ways against the values its registry entry declares.
+#[cfg(test)]
+mod config_enum_pins;
 pub mod daemon_error;
 
 #[cfg(test)]

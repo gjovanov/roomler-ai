@@ -209,6 +209,19 @@ pub struct PathRate {
     /// SCTP's fast retransmits and T3-rtx expiries over the budget's
     /// associations together: a count that never runs back.
     pub loss: u64,
+    /// FR-148 D51 — the budget acts on the session's gate: `on`, on a relay
+    /// session. Off, in shadow and on a direct session it is `false`, and
+    /// none of B4's readers reads the fields below.
+    pub acts: bool,
+    /// FR-148 D51 B4b — while it acts: it held a frame outside a still span
+    /// within the last second of its steps
+    /// (`media_inflight::Budget::held_lately`). The link was busy, so the rate
+    /// is the link's.
+    pub held: bool,
+    /// FR-148 D51 B4a-2 — while it acts: its envelope, ms. S and the largest
+    /// frame of the last second at the budget's rate, that term at most
+    /// 100 ms. Age within it is the budget's own queue.
+    pub envelope_ms: u16,
 }
 
 /// FR-148 D48 — the rule that kept a reading out of the shadow model and the
@@ -945,6 +958,37 @@ impl PushedBy {
     }
 }
 
+/// FR-148 D51 B4g — the reading the measured number is (`pipe_measured`,
+/// `RateGovernor::path_view`). The `path model` line says which, because the
+/// basis cannot: under `on` the budget's held rate stands where the goodput
+/// stood, and both read the sender backlogged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasuredBy {
+    /// The blocked-send goodput, where the budget does not act.
+    Goodput,
+    /// The in-flight budget's held rate, where it acts (`on`, a relay
+    /// session).
+    Budget,
+    /// The viewer's held arrival rate, where it is the lower.
+    Arrival,
+}
+
+impl MeasuredBy {
+    /// The word the line writes.
+    pub fn word(self) -> &'static str {
+        match self {
+            MeasuredBy::Goodput => "goodput",
+            MeasuredBy::Budget => "budget",
+            MeasuredBy::Arrival => "arrival",
+        }
+    }
+
+    /// `goodput`, `budget`, `arrival`, or `-` for no reading.
+    pub fn word_of(by: Option<Self>) -> &'static str {
+        by.map_or("-", Self::word)
+    }
+}
+
 /// The reading that set the model's floor.
 #[derive(Debug, Clone, Copy)]
 struct Held {
@@ -1182,6 +1226,8 @@ pub struct PathView {
     pub belief: (Option<PathNumber>, Option<PathNumber>, Option<PathNumber>),
     /// `pipe_measured`: the reading a stall is judged against.
     pub measured: Option<PathNumber>,
+    /// FR-148 D51 B4g — `pipe_measured_by`: which reading `measured` is.
+    pub measured_by: Option<MeasuredBy>,
     /// `prior_bps`: the stand-in.
     pub prior: Option<PathNumber>,
     /// `learned_ceiling_bps`: `0` is the nominal start, assumed.
@@ -1898,6 +1944,7 @@ mod tests {
             bps: Some(bps),
             measured,
             loss,
+            ..PathRate::default()
         }
     }
 
@@ -2339,6 +2386,7 @@ mod tests {
             bps: None,
             measured: true,
             loss: 0,
+            ..PathRate::default()
         };
         for rate in [path(1_000_000, false, 0), path(0, true, 0), none] {
             let mut p = floored(2_000_000, s(0));

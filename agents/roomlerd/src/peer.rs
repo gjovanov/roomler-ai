@@ -4028,6 +4028,8 @@ async fn media_pump_vp9_444_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // FR-148 D51 B4g — the time the capacity gate held frames back since the last encode.
+    let mut gate_clock = crate::encode::charge::GateClock::default();
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -4254,7 +4256,7 @@ async fn media_pump_vp9_444_dc(
     // loop). A SINGLE consumer keeps the 16 KiB chunk order intact (the browser
     // reassembler needs it). Depth is intentionally shallow so we stay
     // low-latency — under sustained congestion the pump sheds load rather than
-    // building a stale backlog.
+    // building a stale backlog. Each frame carries its hand-off instant (FR-148).
     const VP9_SEND_QUEUE_DEPTH: usize = 2; // shallower than FFmpeg's 4 — VP9-444 frames are large; minimise input head-of-line delay
     let send_depth = if constrained_transport {
         VP9_SEND_QUEUE_DEPTH
@@ -4265,7 +4267,7 @@ async fn media_pump_vp9_444_dc(
         // Input rides a SEPARATE DC, so a deeper video queue adds no input lag.
         8
     };
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
+    let (send_tx, mut send_rx) = mpsc::channel::<(std::time::Instant, Bytes)>(send_depth);
     // P8c — the rate governor owns this pump's AIMD (rc.171 — driven off
     // SEND-CHANNEL OCCUPANCY at the capacity gate, the real webrtc-rs
     // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
@@ -4291,6 +4293,7 @@ async fn media_pump_vp9_444_dc(
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         let budget_bytes = delivery.pump_count(); // FR-148 D46
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
@@ -4303,7 +4306,7 @@ async fn media_pump_vp9_444_dc(
             // (`encode::goodput`).
             while let Some(first) = send_rx.recv().await {
                 let mut next = Some(first);
-                while let Some(wire) = next.take() {
+                while let Some((enqueued_at, wire)) = next.take() {
                     let mut unsent = budget_bytes.unsent(wire.len()); // FR-148 D46
                     if let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let total = wire.len();
@@ -4344,6 +4347,7 @@ async fn media_pump_vp9_444_dc(
                                 ser_start.elapsed(),
                                 video_bytes_is_keyframe(&wire),
                             );
+                            send_wait.sent(enqueued_at, std::time::Instant::now()); // FR-148
                         }
                     }
                     next = send_rx.try_recv().ok();
@@ -4504,6 +4508,7 @@ async fn media_pump_vp9_444_dc(
         delivery.gate(&pc, &mut governor, session_id, constrained_transport, false); // FR-148 D46
         if send_tx.capacity() == 0 || pipeline.followers_congested() || delivery.shuts() {
             frames_skipped_backpressure += 1;
+            gate_clock.skipped(std::time::Instant::now()); // FR-148 D51 B4g
             delivery.note_gate(send_tx.capacity() == 0, false); // FR-148 D46
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
             // backpressure signal. Drive the multiplicative decrease HERE,
@@ -4514,7 +4519,7 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(applied) = delivery.on_skip(false, |t| governor.on_backpressure_skip(t))
+            if let Some(applied) = delivery.on_skip(false, |s| governor.on_gate_skip(s))
                 && let Some(enc) = encoder.as_mut()
             {
                 enc.set_bitrate(applied.bps).await;
@@ -4522,6 +4527,7 @@ async fn media_pump_vp9_444_dc(
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
+        gate_clock.passed(std::time::Instant::now()); // FR-148 D51 B4g
         delivery.on_frame(&pc, &mut governor); // FR-148 D46
 
         // FR-112 P2 — cadence pacing, as the FFmpeg pump's (FR-1 P5): when the
@@ -4952,6 +4958,7 @@ async fn media_pump_vp9_444_dc(
         // Bounded sub-second, and NO forced keyframe on resume — a pause
         // loses no frames, so the delta chain survives it intact.
         if governor.draining(std::time::Instant::now()) {
+            gate_clock.paused(); // FR-148: under `on`, the pause is gated
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
@@ -5028,8 +5035,15 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
+        // FR-148 D51 B4g — where the budget acts, libvpx is charged this frame's gap
+        // less the time the gate held frames back, never less than the interval
+        // (`RateGovernor::charge_interval`), on the encode's own message. Else today's pts.
+        let gated = gate_clock.take();
+        let gate = governor
+            .charge_interval(target_fps)
+            .map(|interval| crate::encode::charge::Gate { gated, interval });
         let encode_start = std::time::Instant::now();
-        let packets = match enc.encode(&frame).await {
+        let packets = match enc.encode_charged(&frame, gate).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(%session_id, %e, "VP9-444 encode error — pump exits");
@@ -5241,7 +5255,7 @@ async fn media_pump_vp9_444_dc(
             );
             let wire_len = wire.len() as u64;
             delivery.on_media_write(&pc, session_id, crate::media_delivery::Pump::Vp9444Dc); // FR-148 O10
-            match send_tx.try_send(wire) {
+            match send_tx.try_send((std::time::Instant::now(), wire)) {
                 Ok(()) => {
                     handed_bytes += wire_len;
                     delivery.on_handed(wire_len); // FR-148 D46
@@ -5324,6 +5338,7 @@ async fn media_pump_vp9_444_dc(
             // None = no report this window.
             let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
             let max_qp = (qp_n > 0).then_some(qp_max);
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms(); // FR-148
             info!(
                 %session_id,
                 target_fps,
@@ -5335,6 +5350,7 @@ async fn media_pump_vp9_444_dc(
                 settle_kf_suppressed,
                 avg_scale_ms,
                 avg_encode_ms,
+                send_wait_avg_ms, send_wait_max_ms,
                 paced_fps = ?governor.paced_software_fps(),
                 target_bps = governor.applied_bps(), target_moves = %governor.take_moves(),
                 avg_qp = ?avg_qp,
@@ -5345,7 +5361,7 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
                 // FR-70 M0 — the fused age split by plane (transit is an
-                // upper bound here: this pump keeps no send-wait figure).
+                // upper bound here: this pump hands it no send wait).
                 age_split = ?governor.viewer_age_split(None),
                 // FR-71 T1a — which plane was the limiter last window (the
                 // verdict FR-79's gate reads; `evidence_rejected` below says
@@ -7087,20 +7103,16 @@ async fn media_pump_ffmpeg_dc(
     // against, resolved once like the line above (env/config are process-stable).
     let direct_lag_bound_ms = crate::encode::rate_profile::direct_queue_ms();
     // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
-    // enqueue→wire-complete per frame, accumulated by the send task and
-    // drained by the heartbeat. Sent frames only — a stale-dropped frame
-    // never rode the wire, and its wait would double-count the rebuild
-    // gap the epoch discard exists to erase.
-    let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // enqueue→wire-complete per frame of the frames that reached the wire,
+    // recorded by the send task in the delivery sampler's send wait (FR-148,
+    // `media_inflight::SendWait`, which both pumps keep) and drained by the
+    // heartbeat.
     // FR-71 T1a — per-viewer-window deltas of the sender-side counters, so the
     // governor's shadow classifier sees THIS window's sends, skips and waits
     // rather than the heartbeat's or the session's totals.
     let mut win_sent_last: u64 = 0;
     let mut win_skips_last: u64 = 0;
-    let mut win_sw_sum_last: u64 = 0;
-    let mut win_sw_frames_last: u64 = 0;
-    let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut win_send_wait = crate::media_inflight::SendWaitSince::default();
     // FR-35 P3 — the opener as a burst probe: bytes sent and the longest
     // queue-wait seen while the opening grace is on. Their ratio is the
     // pipe's burst drain rate — the one number that sizes a crisp opener —
@@ -7116,19 +7128,18 @@ async fn media_pump_ffmpeg_dc(
     let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // FR-74 P1b — the enqueue instant (µs since `head_wait_epoch`, +1 so 0
     // means "nothing at the head") of the frame the send task is writing
-    // RIGHT NOW. The completion-based waits above only learn about a frame
+    // RIGHT NOW. The completion-based send waits only learn about a frame
     // once it has left the wire, so on a stalled pipe they read stale-low
     // while the queue grows; this cell lets the gate see the live age of
     // the head frame instead. Cleared by the send task after each write.
     let send_head_enqueued_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let head_wait_epoch = std::time::Instant::now();
     // The gate's own view of the measured send wait: an EMA over the
-    // per-pass average of completed frames' waits (α = 0.3) — separate
-    // "last" cursors from the FR-71 window deltas so the two readers never
-    // race each other for the same counters.
+    // per-pass average of completed frames' waits (α = 0.3) — its own place
+    // in the send wait, apart from the FR-71 window's, so the two readers
+    // never race each other for the same counters.
     let mut direct_wait_ema_ms: f64 = 0.0;
-    let mut gate_sw_sum_last: u64 = 0;
-    let mut gate_sw_frames_last: u64 = 0;
+    let mut gate_send_wait = crate::media_inflight::SendWaitSince::default();
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -7293,9 +7304,7 @@ async fn media_pump_ffmpeg_dc(
         let send_errors = send_errors.clone();
         let inflight_bytes = inflight_bytes.clone();
         let send_epoch = send_epoch.clone();
-        let send_wait_us_sum = send_wait_us_sum.clone();
-        let send_wait_us_max = send_wait_us_max.clone();
-        let send_wait_frames = send_wait_frames.clone();
+        let send_wait = Arc::clone(delivery.send_wait()); // FR-148
         let send_stall_us = send_stall_us.clone();
         let send_head_enqueued_us = send_head_enqueued_us.clone();
         let opener_wait_us_max = opener_wait_us_max.clone();
@@ -7397,11 +7406,8 @@ async fn media_pump_ffmpeg_dc(
                             );
                             // P7 — queue-wait: enqueue→wire-complete. This is
                             // the transport-added latency the viewer feels;
-                            // the heartbeat drains it per window.
-                            let waited_us = enqueued_at.elapsed().as_micros() as u64;
-                            send_wait_us_sum.fetch_add(waited_us, Relaxed);
-                            send_wait_us_max.fetch_max(waited_us, Relaxed);
-                            send_wait_frames.fetch_add(1, Relaxed);
+                            // the pump's send wait keeps it (FR-148).
+                            let waited_us = send_wait.sent(enqueued_at, std::time::Instant::now());
                             send_stall_us.fetch_max(waited_us, Relaxed);
                             // FR-35 P3 — the opening burst as a probe.
                             if in_opener_grace.load(Relaxed) {
@@ -8032,17 +8038,8 @@ async fn media_pump_ffmpeg_dc(
         let (hard_budget, measured_wait_ms) = if constrained {
             (queue_budget, 0.0)
         } else {
-            {
-                let sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-                let frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-                let frames = frames_now.saturating_sub(gate_sw_frames_last);
-                if frames > 0 {
-                    let avg_ms =
-                        sum_now.saturating_sub(gate_sw_sum_last) as f64 / frames as f64 / 1000.0;
-                    direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
-                }
-                gate_sw_sum_last = sum_now;
-                gate_sw_frames_last = frames_now;
+            if let Some(avg_ms) = gate_send_wait.avg_ms(delivery.send_wait()) {
+                direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
             }
             let head = send_head_enqueued_us.load(std::sync::atomic::Ordering::Relaxed);
             let head_wait_ms = if head == 0 {
@@ -8165,10 +8162,10 @@ async fn media_pump_ffmpeg_dc(
             }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
-            // FR-148 D46 B3 — so is the budget's hold in a still span, under `on`.
+            // FR-148 D46 B3, D51 B4a-1 — nor, under `on`, is the budget's own hold.
             let in_grace = constrained && !opener_grace_done;
             grace_bp_skips += u32::from(in_grace);
-            let bp_applied = delivery.on_skip(in_grace, |t| governor.on_backpressure_skip(t));
+            let bp_applied = delivery.on_skip(in_grace, |s| governor.on_gate_skip(s));
             if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
@@ -9259,23 +9256,18 @@ async fn media_pump_ffmpeg_dc(
         // FR-71 T1a — hand the governor this PASS's sender-side facts, every
         // pass, before it folds the viewer's report; it adds the passes up into
         // the window (FR-119 P2b-8), so the plane verdict reads both sides of
-        // the same window. Deltas against the running counters (the heartbeat
-        // swaps some of them, so it reads the totals, not swaps).
+        // the same window. Deltas against the running counters; the send wait's
+        // average from this reader's own place in it (FR-148). A heartbeat takes
+        // the send wait whole under that place, so the pass across one reads a
+        // saturated delta, as it did before; its longest is the heartbeat's so far.
         {
             let sent_now = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
-            let sw_frames = sw_frames_now.saturating_sub(win_sw_frames_last);
-            let sw_avg_ms = (sw_frames > 0).then(|| {
-                sw_sum_now.saturating_sub(win_sw_sum_last) as f64 / sw_frames as f64 / 1000.0
-            });
+            let sw_avg_ms = win_send_wait.avg_ms(delivery.send_wait());
             governor.note_window_sender(crate::encode::governor::WindowSenderStats {
                 inflight_bytes: inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 budget_bytes: queue_budget,
                 gate_skips: frames_skipped_backpressure.saturating_sub(win_skips_last) as u32,
-                send_wait_max_ms: send_wait_us_max.load(std::sync::atomic::Ordering::Relaxed)
-                    as f64
-                    / 1000.0,
+                send_wait_max_ms: delivery.send_wait().max_ms(),
                 send_wait_avg_ms: sw_avg_ms,
                 frames_sent: sent_now.saturating_sub(win_sent_last) as u32,
                 // FR-79 — the gate's first condition: was the agent's own loop
@@ -9294,8 +9286,6 @@ async fn media_pump_ffmpeg_dc(
             win_stalls_last = watch.stalls_total();
             win_sent_last = sent_now;
             win_skips_last = frames_skipped_backpressure;
-            win_sw_sum_last = sw_sum_now;
-            win_sw_frames_last = sw_frames_now;
         }
         let viewer_window = governor.tick_viewer_window(
             std::time::Instant::now(),
@@ -10026,15 +10016,8 @@ async fn media_pump_ffmpeg_dc(
             // for frames that reached the wire. THE drag-latency number the
             // byte gate exists to bound; read avg against max — a fat max
             // with a small avg is one IDR's transit, both fat is a standing
-            // queue.
-            let sw_frames = send_wait_frames.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let send_wait_avg_ms = send_wait_us_sum
-                .swap(0, std::sync::atomic::Ordering::Relaxed)
-                .checked_div(sw_frames)
-                .map(|us| us as f64 / 1000.0)
-                .unwrap_or(0.0);
-            let send_wait_max_ms =
-                send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            // queue. FR-148: the delivery sampler's send wait, taken whole.
+            let (send_wait_avg_ms, send_wait_max_ms) = delivery.send_wait().take().ms();
             // FR-17 - read the LIVE channel, not a cached flag: the
             // handle can be replaced mid-session, and a stale copy
             // would mislabel exactly the window someone is measuring.
@@ -12969,7 +12952,7 @@ pub(crate) fn attach_files_declined(
                 return; // a chunk for a transfer that was never accepted
             }
             if let Some(reply) = declined_reply(&msg.data, why) {
-                let _ = dc.send_text(reply).await;
+                let _ = send_files_frame(&dc, reply).await;
             }
         })
     }));
@@ -12982,7 +12965,7 @@ pub(crate) fn attach_files_declined(
 /// settles on its `req_id`), `files:error` for anything else (a transfer's
 /// waiter settles on its `id`). A frame that does not parse is answered with
 /// no id, as the FILES-denied channel answers it. Pure.
-fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
+fn declined_reply(frame: &[u8], why: &str) -> Option<crate::files::FilesFrame> {
     let parsed = std::str::from_utf8(frame)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
@@ -13000,15 +12983,17 @@ fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         == Some("files:dir");
     let reply = if listing {
-        serde_json::to_string(&crate::files::FilesOutgoing::DirError {
+        crate::files::FilesOutgoing::DirError {
             req_id: &field("req_id"),
             message: why,
-        })
+        }
+        .frame()
     } else {
-        serde_json::to_string(&crate::files::FilesOutgoing::Error {
+        crate::files::FilesOutgoing::Error {
             id: &field("id"),
             message: why,
-        })
+        }
+        .frame()
     };
     reply.ok()
 }
@@ -13306,7 +13291,11 @@ async fn handle_files_control(
                 }
             }
         }
-        crate::files::FilesIncoming::Dir { req_id, path } => {
+        crate::files::FilesIncoming::Dir {
+            req_id,
+            path,
+            paged,
+        } => {
             if !crate::files::is_remote_browse_enabled() {
                 info!(%session_id, ?req_id, path = ?path, "files: dir refused — remote browse disabled");
                 send_files_json(
@@ -13321,7 +13310,7 @@ async fn handle_files_control(
             }
             // #3682 (D1-B) — never awaited here: this loop reads the
             // channel's next message only once this one is handled.
-            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path, paged);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13379,8 +13368,11 @@ fn spawn_dir_listing(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
-    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+    tokio::spawn(answer_dir_listing(
+        dc, handler, session_id, req_id, path, paged,
+    ));
 }
 
 /// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
@@ -13395,6 +13387,7 @@ async fn answer_dir_listing<S: DownloadSink>(
     session_id: bson::oid::ObjectId,
     req_id: String,
     path: String,
+    paged: bool,
 ) {
     let closed = handler.listings_closed();
     let listed = tokio::select! {
@@ -13406,20 +13399,19 @@ async fn answer_dir_listing<S: DownloadSink>(
     }
     match listed {
         Ok(listing) => {
+            let (frames, bytes) =
+                crate::files::dir_pages::answer_measured(&req_id, &listing, paged);
+            let pages = frames.iter().filter(|f| f.kind == "files:dir-list").count();
             info!(
                 %session_id, ?req_id,
                 path = ?listing.path,
                 entries = listing.entries.len(),
+                capped = listing.capped,
+                bytes,
+                pages,
                 "files: dir listed"
             );
-            let parent_owned = listing.parent.clone();
-            let msg = crate::files::FilesOutgoing::DirList {
-                req_id: &req_id,
-                path: &listing.path,
-                parent: parent_owned.as_deref(),
-                entries: &listing.entries,
-            };
-            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+            send_listing_frames(&dc, &closed, frames).await;
         }
         Err(e) => {
             warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
@@ -13429,6 +13421,40 @@ async fn answer_dir_listing<S: DownloadSink>(
                 message: &message,
             };
             let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+        }
+    }
+}
+
+/// #4121 — a listing's frames ([`crate::files::dir_pages`]), in order. Each
+/// waits while the channel's buffer is over the download pumps' high-water
+/// mark (a listing in pages never fills it alone, but it shares the channel
+/// with them), and the frames stop at the channel's end, the session's, or
+/// the first send that fails, which [`send_files_frame`] logs.
+async fn send_listing_frames<S: DownloadSink>(
+    dc: &S,
+    closed: &tokio_util::sync::CancellationToken,
+    frames: Vec<crate::files::FilesFrame>,
+) {
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    for frame in frames {
+        // ⚠️ After a drop the buffer never drains (only a SACK lowers it):
+        // the channel's state ends the wait too.
+        loop {
+            match or_stopped(closed, dc.buffered()).await {
+                Ok(buffered) if buffered > BACKPRESSURE_HIGH => {}
+                Ok(_) => break,
+                Err(_) => return,
+            }
+            if or_stopped(closed, tokio::time::sleep(Duration::from_millis(20)))
+                .await
+                .is_err()
+                || dc.gone()
+            {
+                return;
+            }
+        }
+        if dc.gone() || !matches!(or_stopped(closed, dc.send_frame(frame)).await, Ok(Ok(()))) {
+            return;
         }
     }
 }
@@ -13840,9 +13866,32 @@ async fn handle_files_chunk(
 }
 
 async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutgoing<'_>) {
-    if let Ok(s) = serde_json::to_string(msg) {
-        let _ = dc.send_text(s).await;
+    if let Ok(frame) = msg.frame() {
+        let _ = send_files_frame(dc, frame).await;
     }
+}
+
+/// #4121 — every answer on the files channel goes out here, a listing's
+/// pages among them, and the send's result comes back. A send that fails is
+/// a WARN naming the frame's kind, size, id and the error, never its text:
+/// a listing names a person's files. One line an answer at most: a stop
+/// (`or_stopped`) drops the send rather than failing it, the senders stop at
+/// the channel's end, and no listing frame is over the stack's limit.
+async fn send_files_frame(
+    dc: &RTCDataChannel,
+    frame: crate::files::FilesFrame,
+) -> anyhow::Result<()> {
+    let crate::files::FilesFrame { kind, id, text } = frame;
+    let bytes = text.len();
+    let sent = dc
+        .send_text(text)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
+    if let Err(e) = &sent {
+        warn!(kind, bytes, id = ?id, e = %e, "files: answer not sent");
+    }
+    sent
 }
 
 /// #1730 — what a download pump needs of its data channel: the channel
@@ -13858,6 +13907,12 @@ trait DownloadSink: Send + Sync {
         &self,
         msg: &crate::files::FilesOutgoing<'_>,
     ) -> impl std::future::Future<Output = ()> + Send;
+    /// #4121 — one frame, as serialized, and whether it went: a listing's
+    /// pages stop at the first that did not.
+    fn send_frame(
+        &self,
+        frame: crate::files::FilesFrame,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     /// Closed, or begun to ([`channel_gone`]).
     fn gone(&self) -> bool;
 }
@@ -13874,6 +13929,9 @@ impl DownloadSink for Arc<RTCDataChannel> {
     }
     async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
         send_files_json(self, msg).await
+    }
+    async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+        send_files_frame(self, frame).await
     }
     fn gone(&self) -> bool {
         channel_gone(self.ready_state())
@@ -16440,6 +16498,9 @@ mod download_stop_tests {
             std::future::pending().await
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16459,6 +16520,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16477,6 +16541,9 @@ mod download_stop_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -16631,6 +16698,10 @@ pub(crate) mod folder_download_as_the_person_tests {
         async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
             let json = serde_json::to_string(msg).expect("a message as JSON");
             self.said.lock().unwrap().push(json);
+        }
+        async fn send_frame(&self, frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.said.lock().unwrap().push(frame.text);
+            Ok(())
         }
         fn gone(&self) -> bool {
             false
@@ -16977,6 +17048,9 @@ pub(crate) mod files_log_tests {
             Ok(())
         }
         async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17097,7 +17171,7 @@ mod files_channel_tests {
     /// The declined channel's answer to one control frame, as JSON.
     fn reply_to(frame: &[u8]) -> Value {
         let reply = declined_reply(frame, WHY).expect("a declined frame is answered");
-        serde_json::from_str(&reply).expect("the answer is JSON")
+        serde_json::from_str(&reply.text).expect("the answer is JSON")
     }
 
     /// A listing's answer is the drawer's: `files:dir-error` on its `req_id`.
@@ -17272,6 +17346,14 @@ mod files_channel_tests {
                 }
             }
             got
+        }
+
+        /// #4121 — the next frame the viewer hears within `wait`, as sent.
+        pub(super) async fn next_within(&mut self, wait: Duration) -> Option<String> {
+            tokio::time::timeout(wait, self.heard.recv())
+                .await
+                .ok()
+                .flatten()
         }
 
         /// Anything more the viewer hears within `wait`.
@@ -17838,9 +17920,12 @@ mod wire_text_log_tests {
 mod dir_listing_tests {
     use super::files_channel_tests::Pair;
     use super::*;
+    use crate::files::dir_pages::{DIR_PAGE_BUDGET, FILES_FRAME_MAX};
     use crate::files::drawer_edges::seams;
     use roomler_ai_remote_control::permissions::Permissions;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
     /// Messages of other kinds, sent behind a listing whose folder's entries
     /// do not come, are acted on at once: a cancel naming an id that is not
@@ -17918,6 +18003,10 @@ mod dir_listing_tests {
             self.parked.notify_one();
             std::future::pending().await
         }
+        async fn send_frame(&self, _frame: crate::files::FilesFrame) -> anyhow::Result<()> {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
         fn gone(&self) -> bool {
             false
         }
@@ -17939,6 +18028,7 @@ mod dir_listing_tests {
             bson::oid::ObjectId::new(),
             "parks".to_string(),
             temp.path().to_string_lossy().into_owned(),
+            false,
         ));
         let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
         handler.end_session().await;
@@ -17948,5 +18038,329 @@ mod dir_listing_tests {
             panic!("the listing outlived its session, parked in its answer's send");
         };
         ended.expect("the listing's task");
+    }
+
+    /// The folder `name` in `temp`, of `n` empty files whose names are `len`
+    /// characters long, and those names in the order a listing gives them.
+    fn folder_of(
+        temp: &std::path::Path,
+        name: &str,
+        n: usize,
+        len: usize,
+    ) -> (std::path::PathBuf, Vec<String>) {
+        let at = temp.join(name);
+        std::fs::create_dir(&at).expect("a folder");
+        let names: Vec<String> = (0..n)
+            .map(|i| {
+                let head = format!("{i:05}-");
+                format!("{head}{}", "x".repeat(len.saturating_sub(head.len())))
+            })
+            .collect();
+        for file in &names {
+            std::fs::write(at.join(file), b"").expect("an empty file");
+        }
+        (at, names)
+    }
+
+    fn json_of(text: &str) -> Value {
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    /// The start of a frame, for a message about it.
+    fn head_of(text: &str) -> &str {
+        let end = text
+            .char_indices()
+            .nth(200)
+            .map_or(text.len(), |(at, _)| at);
+        &text[..end]
+    }
+
+    /// A viewer's `files` channel whose device end nothing serves: the test
+    /// sends on that end itself, once it is open.
+    async fn bare_pair() -> (Pair, Arc<RTCDataChannel>) {
+        let stash = Arc::new(std::sync::Mutex::new(None));
+        let put = stash.clone();
+        let pair = Pair::open_with("files", move |device, _| {
+            *put.lock().unwrap() = Some(device);
+        })
+        .await;
+        let device = stash
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the channel's device end");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while device.ready_state() != RTCDataChannelState::Open
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (pair, device)
+    }
+
+    /// #4121 — a folder whose listing is over 64 KiB of JSON (1 500 names of
+    /// 120 characters, about 270 KB) reaches a viewer that joins pages, over
+    /// a real SCTP association: every entry, in order, each frame within the
+    /// budget and within the viewer's wait of the one before.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_reaches_a_paging_viewer() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "big", "path": folder, "paged": true}))
+            .await;
+        let mut heard: Vec<String> = Vec::new();
+        let mut wait = Duration::from_secs(8);
+        while let Some(text) = pair.next_within(wait).await {
+            heard.push(text);
+            let pages = json_of(&heard[0])["pages"].as_u64().unwrap_or(1);
+            if heard.len() as u64 >= pages {
+                break;
+            }
+            wait = Duration::from_secs(5);
+        }
+        pair.close().await;
+        assert!(
+            !heard.is_empty(),
+            "no frame within 8 s: a ~270 KB listing never reached the viewer (#4121)"
+        );
+        let pages: Vec<Value> = heard.iter().map(|text| json_of(text)).collect();
+        for (i, (text, page)) in heard.iter().zip(&pages).enumerate() {
+            assert!(
+                text.len() <= DIR_PAGE_BUDGET,
+                "frame {i} is {} bytes: {}",
+                text.len(),
+                head_of(text)
+            );
+            assert_eq!(page["t"], "files:dir-list", "frame {i}: {}", head_of(text));
+            assert_eq!(page["req_id"], "big", "frame {i}");
+            assert_eq!(page["page"], i, "frame {i}");
+            assert_eq!(page["pages"], heard.len(), "frame {i}");
+            assert_eq!(page["total"], names.len(), "frame {i}");
+        }
+        let joined: Vec<&str> = pages
+            .iter()
+            .filter_map(|page| page["entries"].as_array())
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(joined, names, "the pages joined in order are the folder");
+    }
+
+    /// #4121 (D1-A) — the same folder, asked by a viewer that does not join
+    /// pages (every viewer before it): within that viewer's 5 s wait, one
+    /// `files:dir-error` naming the folder and its count, and nothing after.
+    #[tokio::test]
+    async fn a_listing_over_64_kib_tells_an_old_viewer_why() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, _) = folder_of(temp.path(), "w23-1500", 1_500, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let asked = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:dir", "req_id": "old", "path": folder}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let took = asked.elapsed();
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let Some(first) = first else {
+            panic!("an old viewer heard nothing in 8 s (#4121)");
+        };
+        let refusal = json_of(&first);
+        assert_eq!(refusal["t"], "files:dir-error", "{}", head_of(&first));
+        assert_eq!(refusal["req_id"], "old");
+        assert!(
+            took <= Duration::from_secs(5),
+            "the refusal came {took:?} after the ask"
+        );
+        let message = refusal["message"].as_str().unwrap_or("");
+        for named in ["w23-1500", "1500"] {
+            assert!(message.contains(named), "{named:?} is not in {message:?}");
+        }
+        assert!(
+            more.is_none(),
+            "something followed the refusal: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — a files answer the channel refuses (a frame over the SCTP
+    /// stack's message limit) is a WARN naming its kind, size, id and the
+    /// error, and never its text: a listing names a person's files.
+    #[tokio::test]
+    async fn a_files_answer_that_cannot_be_sent_is_a_warning() {
+        let (pair, device) = bare_pair().await;
+        let entries: Vec<crate::files::DirEntryView> = (0..400)
+            .map(|i| crate::files::DirEntryView {
+                name: format!("w23-private-name-{i:04}-{}", "y".repeat(100)),
+                is_dir: false,
+                size: Some(0),
+                mtime_unix: None,
+            })
+            .collect();
+        let msg = crate::files::FilesOutgoing::DirList {
+            req_id: "g1",
+            path: "/home/person/w23-g1",
+            parent: None,
+            entries: &entries,
+            page: None,
+            pages: None,
+            total: None,
+            capped: false,
+        };
+        let bytes = serde_json::to_string(&msg)
+            .expect("the answer as JSON")
+            .len();
+        let log = files_log_tests::Logged::start(tracing::Level::WARN);
+        send_files_json(&device, &msg).await;
+        let text = log.text();
+        drop(log);
+        pair.close().await;
+        assert!(
+            bytes > 65_536,
+            "the answer is {bytes} bytes, small enough to go"
+        );
+        let warned: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("files: answer not sent"))
+            .collect();
+        assert!(
+            !warned.is_empty(),
+            "the failed send left no WARN (#4121): {text:?}"
+        );
+        assert_eq!(warned.len(), 1, "{text:?}");
+        for part in [
+            "WARN",
+            "files:dir-list",
+            bytes.to_string().as_str(),
+            "\"g1\"",
+            "outbound packet larger than maximum message size",
+        ] {
+            assert!(
+                warned[0].contains(part),
+                "{part:?} is not in {:?}",
+                warned[0]
+            );
+        }
+        assert!(
+            !text.contains("w23-private-name"),
+            "an entry's name was logged: {text:?}"
+        );
+    }
+
+    /// A small folder is answered in one frame with today's keys, to a viewer
+    /// that joins pages and to one that does not.
+    #[tokio::test]
+    async fn a_small_listing_is_one_frame_as_today() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-4", 4, 12);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let mut heard = Vec::new();
+        for (req_id, paged) in [("c1-old", None), ("c1-new", Some(true))] {
+            let mut ask = json!({"t": "files:dir", "req_id": req_id, "path": folder});
+            if let Some(paged) = paged {
+                ask["paged"] = json!(paged);
+            }
+            pair.ask(&ask).await;
+            heard.push((req_id, pair.next_within(Duration::from_secs(8)).await));
+        }
+        let more = pair.next_within(Duration::from_millis(500)).await;
+        pair.close().await;
+        let today: BTreeSet<&str> = ["t", "req_id", "path", "parent", "entries"].into();
+        for (req_id, frame) in &heard {
+            let listing = json_of(frame.as_deref().unwrap_or(""));
+            let keys: BTreeSet<&str> = listing
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(keys, today, "{req_id}: {frame:?}");
+            assert_eq!(listing["req_id"], *req_id);
+            let listed: Vec<&str> = listing["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| entry["name"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(listed, names, "{req_id}");
+        }
+        assert!(more.is_none(), "a third frame: {more:?}");
+    }
+
+    /// A listing over the page budget but under the frame limit (about 320
+    /// names of 120 characters, about 57 KB) goes whole, in one frame, to a
+    /// viewer that joins pages.
+    #[tokio::test]
+    async fn a_listing_under_the_limit_is_one_frame() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let (folder, names) = folder_of(temp.path(), "w23-320", 320, 120);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "c2", "path": folder, "paged": true}))
+            .await;
+        let first = pair.next_within(Duration::from_secs(8)).await;
+        let more = pair.next_within(Duration::from_secs(1)).await;
+        pair.close().await;
+        let first = first.unwrap_or_default();
+        assert!(
+            (DIR_PAGE_BUDGET + 1..=FILES_FRAME_MAX).contains(&first.len()),
+            "the listing is {} bytes; this test needs one between the budget and the limit",
+            first.len()
+        );
+        let listing = json_of(&first);
+        assert_eq!(listing["t"], "files:dir-list", "{}", head_of(&first));
+        assert!(listing.get("pages").is_none(), "{}", head_of(&first));
+        let listed: Vec<&str> = listing["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(listed, names);
+        assert!(
+            more.is_none(),
+            "a second frame: {}",
+            more.as_deref().map(head_of).unwrap_or("")
+        );
+    }
+
+    /// #4121 — what the constants assume of the stack, over a real
+    /// association: a frame of 65 535 bytes arrives whole at a webrtc-rs
+    /// viewer, and one of 65 537 is refused at the send with the error a
+    /// failed answer logs.
+    #[tokio::test]
+    async fn the_stacks_limits_are_what_the_constants_assume() {
+        let (mut pair, device) = bare_pair().await;
+        let fits = device.send_text("x".repeat(FILES_FRAME_MAX)).await;
+        let heard = pair.next_within(Duration::from_secs(8)).await;
+        let over = device.send_text("x".repeat(FILES_FRAME_MAX + 2)).await;
+        pair.close().await;
+        assert!(fits.is_ok(), "65 535 bytes: {fits:?}");
+        assert_eq!(
+            heard.map(|text| text.len()),
+            Some(FILES_FRAME_MAX),
+            "65 535 bytes arrive whole"
+        );
+        let refused = over.expect_err("65 537 bytes are refused at the send");
+        assert!(
+            refused
+                .to_string()
+                .contains("outbound packet larger than maximum message size"),
+            "{refused}"
+        );
+        const { assert!(DIR_PAGE_BUDGET < FILES_FRAME_MAX) };
     }
 }

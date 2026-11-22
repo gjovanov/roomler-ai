@@ -614,7 +614,7 @@ our stdin.
 | the daemon's own package, as root: a system daemon, or FR-96's helper (`linux_install_candidates`, `agents/roomlerd/src/updater.rs:2367-2382`) | `apt-get install -y -o Dpkg::Options::=--force-confold <deb>`, then `dpkg --force-confold --install <deb>` | `/dev/null` (`run_linux_install_candidates`, `:2564`) |
 | the daemon's own package, not root | `pkexec`, then `sudo -n`, in front of the same `apt-get` | `/dev/null` |
 | the companion's package (`install_commands`, `agents/roomlerd/src/companion/package_sync.rs:138`) | `apt-get install -y --no-remove -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold <deb>`, with `INSTALL_ENV` | `/dev/null` (`run_bounded`) |
-| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:570`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
+| the tunnel CLI's `self-update` (`dpkg_install_args`, `agents/roomler-cli/src/update.rs:592`) | `dpkg --force-confold -i <deb>` | the person's terminal; dpkg asks nothing there either |
 | `install.sh`'s `deb_install` (#3926, [installation.md](installation.md)) | `dpkg --force-confold -i`, then `apt-get … -o Dpkg::Options::=--force-confold` | `/dev/null` |
 
 **What a person finds afterwards:** their file as they left it, a deleted one still deleted,

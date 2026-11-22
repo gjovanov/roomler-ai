@@ -27,7 +27,7 @@
 //! device where it cannot.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use windows::Win32::Graphics::Direct3D11::{
@@ -45,18 +45,17 @@ use windows::core::Interface;
 /// in flight; a texture beyond it is released rather than kept.
 const POOL_KEEP: usize = 6;
 
-/// FR-118 P2 — the kill switch, `ROOMLERD_ZERO_COPY` (config `zero_copy`). It
-/// lives in `capture` since P5 gave macOS the same switch.
-pub use super::zero_copy_enabled;
+/// FR-118 P3 — the backends in the order every codec's cascade opens them
+/// (`encode::ffmpeg::encoder`'s `*_ENCODER_NAMES`): each encoder's suffix, and
+/// the PCI vendor of the adapters it takes frames on.
+const BACKEND_ORDER: [(&str, u32); 3] = [("_nvenc", 0x10de), ("_qsv", 0x8086), ("_amf", 0x1002)];
 
-/// FR-118 P3 — the encoders whose GPU-input form the capability probe proved,
-/// as the capture side sees them: the same list `encode::ffmpeg::gpu_input`
-/// gates its opens on, installed by `caps::detect` before any session, and again
-/// only when a later try's answer is adopted with no session live (#3280).
-static GPU_INPUT_CELLS: RwLock<Vec<String>> = RwLock::new(Vec::new());
-
-pub fn install_gpu_input_cells(names: Vec<String>) {
-    *GPU_INPUT_CELLS.write().unwrap_or_else(|e| e.into_inner()) = names;
+/// The first backend in [`BACKEND_ORDER`] that has a cell in `names`.
+fn preferred_backend(names: &[String]) -> Option<(&'static str, u32)> {
+    BACKEND_ORDER
+        .iter()
+        .find(|(suffix, _)| names.iter().any(|n| n.ends_with(suffix)))
+        .copied()
 }
 
 /// FR-118 P3 — the PCI vendor whose adapter a capture device belongs on: the
@@ -72,11 +71,32 @@ pub fn install_gpu_input_cells(names: Vec<String>) {
 /// NVENC lacks a codec that its QSV has opens that codec on QSV, on the other
 /// adapter, and those sessions read `adapter_mismatch` and stay on CPU frames.
 pub fn preferred_vendor(names: &[String]) -> Option<u32> {
-    const ORDER: [(&str, u32); 3] = [("_nvenc", 0x10de), ("_qsv", 0x8086), ("_amf", 0x1002)];
-    ORDER
-        .iter()
-        .find(|(suffix, _)| names.iter().any(|n| n.ends_with(suffix)))
-        .map(|&(_, vendor)| vendor)
+    preferred_backend(names).map(|(_, vendor)| vendor)
+}
+
+/// FR-132 P2 — the cells of [`preferred_vendor`]'s backend in `names`: the
+/// encoders that take frames on the adapter [`capture_adapter`] puts the
+/// capture's device on. With the switch unset a Windows capture delivers GPU
+/// frames when one of them is on the default list ([`gpu_frames_at_open`]).
+/// Any of them, not only the first: the capture opens before the session's
+/// codec is known.
+pub fn preferred_cells(names: &[String]) -> Vec<String> {
+    match preferred_backend(names) {
+        Some((suffix, _)) => names
+            .iter()
+            .filter(|n| n.ends_with(suffix))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// FR-132 P2 — whether a Windows capture opening now delivers GPU frames
+/// (`capture::zero_copy_capture`): `zero_copy` on, or unset with one of the
+/// proven [`preferred_cells`] on the default list. WGC and the SystemContext
+/// DXGI arm both read it, once, when they open.
+pub fn gpu_frames_at_open() -> bool {
+    super::zero_copy_capture(&preferred_cells(&super::gpu_input_cells()))
 }
 
 /// FR-118 P3 — the adapter of [`preferred_vendor`], with its name: the first
@@ -84,7 +104,7 @@ pub fn preferred_vendor(names: &[String]) -> Option<u32> {
 /// probe installed its cells, when no cell is proven, or when no adapter of
 /// that vendor is present.
 pub fn capture_adapter() -> Option<(IDXGIAdapter1, String)> {
-    let vendor = preferred_vendor(&GPU_INPUT_CELLS.read().unwrap_or_else(|e| e.into_inner()))?;
+    let vendor = preferred_vendor(&super::gpu_input_cells())?;
     adapter_of_vendor(vendor)
 }
 
@@ -456,6 +476,48 @@ mod tests {
             preferred_vendor(&names(&["libvpx-vp9-444-sw", "openh264-sw"])),
             None
         );
+    }
+
+    /// FR-132 P2 — the cells whose listing gives a Windows capture GPU frames
+    /// with the switch unset: the proven cells of the backend whose vendor
+    /// `preferred_vendor` picks, the encoders that take frames on the adapter
+    /// `capture_adapter` puts the capture's device on. Any of them, not only
+    /// the first: a capture opens before the session's codec is known, and P3
+    /// may list `av1_qsv` while decision 9 keeps `hevc_qsv` off the list.
+    #[test]
+    fn unset_a_capture_reads_the_list_for_the_preferred_backend_s_cells() {
+        use tunnel_core::env::test_env::Saved;
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(preferred_cells(&names(&[])).is_empty());
+        assert_eq!(
+            preferred_cells(&names(&["hevc_qsv", "av1_qsv", "h264_qsv"])),
+            names(&["hevc_qsv", "av1_qsv", "h264_qsv"])
+        );
+        assert_eq!(
+            preferred_cells(&names(&["hevc_qsv", "hevc_nvenc", "av1_qsv", "h264_nvenc"])),
+            names(&["hevc_nvenc", "h264_nvenc"]),
+            "NVENC's adapter comes first"
+        );
+        assert!(preferred_cells(&names(&["libvpx-vp9-444-sw", "openh264-sw"])).is_empty());
+
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("ZERO_COPY");
+        let reads =
+            |proven: &[&str]| crate::capture::zero_copy_capture(&preferred_cells(&names(proven)));
+        assert!(
+            !reads(&["hevc_qsv", "av1_qsv"]),
+            "the built-in list is empty"
+        );
+        crate::capture::with_default_cells(&["av1_qsv"], || {
+            assert!(reads(&["hevc_qsv", "av1_qsv", "h264_qsv"]));
+            assert!(
+                !reads(&["hevc_qsv", "av1_qsv", "hevc_nvenc"]),
+                "the device goes on NVIDIA's adapter, where av1_qsv takes no frame"
+            );
+            assert!(!reads(&["hevc_qsv", "h264_qsv"]));
+        });
     }
 
     /// WARP: the software rasterizer every Windows has, so the test needs no GPU.

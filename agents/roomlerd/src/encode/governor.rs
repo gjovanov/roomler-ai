@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use super::aimd::{AimdController, Cause, Causes, CeilingSource, Congestion, FloorSource};
 use super::encode_pressure::{DownscaleTier, EncodePressure};
 use super::goodput::{GoodputEstimator, GoodputSink};
-use super::pipe::{Basis, PathNumber, PathView};
+use super::pipe::{Basis, MeasuredBy, PathNumber, PathView};
 use super::viewer_rate::{self, ViewerRateController};
 
 /// A bitrate target the pump must apply to the live encoder
@@ -61,6 +61,18 @@ pub struct AppliedBitrate {
     /// FR-148 P0 — why the target moved since the last one handed out. A held
     /// target (the FFmpeg pump's `deferred_bps`) keeps it until it lands.
     pub why: Why,
+}
+
+/// FR-148 D51 B4a-1 — a skip at the pump's capacity gate, as the delivery
+/// sampler classes it (`DeliverySampler::on_skip`), at the time it is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateSkip {
+    /// A full send channel, a congested follower, or today's byte gate:
+    /// [`RateGovernor::on_backpressure_skip`].
+    Backpressure(Instant),
+    /// The in-flight budget's own hold under `on`, outside a still span:
+    /// [`RateGovernor::on_budget_hold`].
+    BudgetHold(Instant),
 }
 
 /// FR-148 P0 — why the live target moved: the controller's causes since the
@@ -421,6 +433,12 @@ pub struct RateGovernor {
     /// it against `pipe_bps` before anything acts. The one exception is V5b,
     /// which reads a rise of the floor as a veto on a reading ([`Self::refute_readings`]).
     belief: super::pipe::Pipe,
+    /// FR-148 D51 — the in-flight budget's last step as the pump noted it
+    /// ([`Self::note_path_rate`]). Under `on`, on a relay session, it bounds
+    /// the target (B4b), it is the reading (B4b-2), and its envelope bounds
+    /// the age loop and the prior's push-back (B4a-2). Off, in shadow and on a
+    /// direct session it never acts, and nothing here reads it.
+    budget_path: Option<super::pipe::PathRate>,
     /// FR-148 D46 B2 — the last window's [`Take`](super::pair_memory::Take)
     /// when the gate found it valid, `None` when it did not (or before the
     /// first): what a delivery sample's push-back is filed under
@@ -640,6 +658,7 @@ impl RateGovernor {
             window_sender: None,
             evidence: super::evidence::Rejections::default(),
             belief: super::pipe::Pipe::default(),
+            budget_path: None,
             sample_take: None,
             readings_refuted: 0,
             last_reading_bps: None,
@@ -869,7 +888,9 @@ impl RateGovernor {
             Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
             _ => None,
         };
-        match (self.goodput.estimate_bps(now), link) {
+        // FR-148 D51 B4b-2 — under `on`, on a relay session, the budget's held
+        // rate stands where the blocked-send goodput stood.
+        match (self.sent_bps(now), link) {
             (Some(g), Some(rx)) => Some(g.min(rx)),
             (g, rx) => g.or(rx),
         }
@@ -1028,6 +1049,34 @@ impl RateGovernor {
         Some(self.record_applied(moved))
     }
 
+    /// FR-148 D51 B4a-1 — the capacity gate's skip, as the delivery sampler
+    /// classed it ([`GateSkip`]): a full send channel or a congested follower
+    /// is today's [`Self::on_backpressure_skip`]; the in-flight budget's own
+    /// hold under `on` is [`Self::on_budget_hold`], no AIMD event.
+    pub fn on_gate_skip(&mut self, skip: GateSkip) -> Option<AppliedBitrate> {
+        match skip {
+            GateSkip::Backpressure(now) => self.on_backpressure_skip(now),
+            GateSkip::BudgetHold(now) => {
+                self.on_budget_hold(now);
+                None
+            }
+        }
+    }
+
+    /// FR-148 D51 B4a-1 — the in-flight budget held a pass by itself, under
+    /// `on`, outside a still span. The hold keeps its capacity facts: the link
+    /// is full, which ends the opener's ramp (FR-63), and FR-63's shadow hears
+    /// the same budget-gate skip. It is no AIMD event: no full-occupancy sample,
+    /// so neither the ×0.85 nor the settle window that blocks the additive
+    /// increase. The budget owns the queue, and its rate bounds the target
+    /// ([`super::pipe::PathRate`], B4b).
+    pub fn on_budget_hold(&mut self, now: Instant) {
+        self.slow_start_congested = true;
+        if let Some(s) = self.shadow.as_mut() {
+            s.on_budget_skip(now);
+        }
+    }
+
     /// Pre-encode tick, every frame that reaches the encoder: lazily
     /// construct the AIMD at the session's first ceiling, push the
     /// current floor (area-scaled legibility minimum — see
@@ -1150,6 +1199,22 @@ impl RateGovernor {
             lifted_bps,
             ceiling_bps,
             CeilingSource::Arrival,
+        );
+        // FR-148 D51 B4b — under `on`, on a relay session, the budget owns the
+        // queue, and the rate it measured while it held a frame in the last
+        // second outside a still span is the rate the path carries: the target
+        // stays under it (gain 1.0). Off, shadow, a direct session and a budget
+        // that has not held lately leave the chain as it was.
+        let arrived_bps = ceiling_bps;
+        let ceiling_bps = match self.budget_held_bps() {
+            Some(rate) if constrained => ceiling_bps.min(rate),
+            _ => ceiling_bps,
+        };
+        retag(
+            &mut ceiling_src,
+            arrived_bps,
+            ceiling_bps,
+            CeilingSource::Budget,
         );
         // FR-63 — the opener has no evidence yet, so it must not commit to
         // whatever constant the chain above produced. Build the ramp from THIS
@@ -1698,12 +1763,17 @@ impl RateGovernor {
         // age is an absolute measure against a learned floor and does not
         // vanish when growth does.
         let mut age_elevated = false;
+        // FR-148 D51 B4a-2 — under `on`, on a relay session, the age the
+        // budget's own queue adds (its envelope) is the budget's to hold: the
+        // age loop and the prior's push-back below act only past it. 0, as
+        // before, when the budget does not act.
+        let envelope_ms = self.budget_envelope_ms();
         if let Some((avg, min, rtt)) = report {
             // P2 — half the viewer's own measured round trip is the smallest
             // age this path can physically produce; the loop uses it both to
             // reject impossible floor samples and to catch a session that was
             // congested from its first window.
-            let triggered = self.age_loop.observe(avg, min, rtt / 2);
+            let triggered = self.age_loop.observe_within(avg, min, rtt / 2, envelope_ms);
             // FR-71 T1b — the loop still LEARNS on a held window (a stall
             // never lowers a floor that is a minimum), it just does not fire.
             age_over = triggered && constrained && self.age_feedback && (valid || stall_is_ours);
@@ -1717,7 +1787,8 @@ impl RateGovernor {
             // physical minimum so a session with nothing learned yet still
             // has a bound rather than treating every age as elevated.
             let floor = self.age_loop.floor_ms().unwrap_or((rtt / 2).max(1));
-            age_elevated = avg.saturating_sub(floor) >= viewer_rate::AGE_SLACK_MS;
+            age_elevated =
+                avg.saturating_sub(floor) >= viewer_rate::AGE_SLACK_MS.saturating_add(envelope_ms);
         }
         let age_ms = report.map(|(avg, min, _)| (avg, min));
         self.last_viewer_age =
@@ -1893,7 +1964,10 @@ impl RateGovernor {
             // when no reading is left: the stand-in then says "carried at least
             // this", not the number the delivery disproved. Past the band that
             // ends the prior, and the session is the unremembered one.
-            let reading = self.goodput.estimate_bps(now).or(match self.link_rx_bps {
+            // FR-148 D51 B4b-2 — under `on`, on a relay session, the budget's
+            // held rate is the sender's reading (`sent_bps`); B4a-2 — and its
+            // queue, within the envelope, is no age push-back (above).
+            let reading = self.sent_bps(now).or(match self.link_rx_bps {
                 Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
                 _ => None,
             });
@@ -2247,6 +2321,7 @@ impl RateGovernor {
         };
         let prior = self.prior_tagged().map(number);
         let model = self.belief.model();
+        let measured = self.measured_tagged(now, tags.constrained);
         PathView {
             goodput: self.goodput_tagged(now).map(number),
             belief: (
@@ -2254,7 +2329,8 @@ impl RateGovernor {
                 self.belief.floor_number(now),
                 self.belief.capacity_number(now),
             ),
-            measured: self.measured_tagged(now, tags.constrained).map(number),
+            measured: measured.map(|(bps, tag, _)| number((bps, tag))),
+            measured_by: measured.map(|(_, _, by)| by),
             prior,
             learned_ceiling: Some(number((self.learner.learned_bps(), tags.learned.1))),
             slow_link_floor: self
@@ -2311,9 +2387,77 @@ impl RateGovernor {
     /// shadow, beside its stall mark ([`Self::note_path_stall`]): its rate,
     /// whether this association's figures gave it, and SCTP's loss count. The
     /// shadow model's window rules read it at the next window's close
-    /// ([`super::pipe::Pipe::note_path_rate`]). Nothing else moves.
+    /// ([`super::pipe::Pipe::note_path_rate`]). FR-148 D51: kept for B4's
+    /// readers, which read it only while the budget acts
+    /// ([`super::pipe::PathRate::acts`]).
     pub fn note_path_rate(&mut self, rate: super::pipe::PathRate) {
         self.belief.note_path_rate(rate);
+        self.budget_path = Some(rate);
+    }
+
+    /// FR-148 D51 — whether the in-flight budget acts on this session (`on`,
+    /// a relay session), from its last step. Off, shadow and a direct session
+    /// never say so, and nothing below reads the budget then.
+    fn budget_acts(&self) -> bool {
+        self.budget_path.is_some_and(|r| r.acts)
+    }
+
+    /// FR-148 D51 B4b — the rate the acting budget measured, while it held a
+    /// frame in the last second outside a still span: the rate the path
+    /// carries while the sender is backlogged. `None` otherwise.
+    fn budget_held_bps(&self) -> Option<u32> {
+        self.budget_path
+            .filter(|r| r.acts && r.held && r.measured)
+            .and_then(|r| r.bps)
+            .filter(|&bps| bps > 0)
+    }
+
+    /// FR-148 D51 B4a-2 — the acting budget's envelope, in ms: the age its
+    /// own queue may add, S and the window's largest frame at its rate. 0
+    /// when it does not act.
+    fn budget_envelope_ms(&self) -> u16 {
+        self.budget_path
+            .filter(|r| r.acts)
+            .map_or(0, |r| r.envelope_ms)
+    }
+
+    /// FR-148 D51 B4f, B4g — the interval the pump chose for its next encode,
+    /// the least it is charged where it waited at the gate (`encode::charge`):
+    /// while the budget acts, its capture interval at the rate it runs at
+    /// (FR-112's paced rate while in force, else `target_fps`) times the skip
+    /// divisor. `None` while the budget does not act: the pts is today's.
+    #[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+    pub fn charge_interval(&self, target_fps: u32) -> Option<Duration> {
+        if !self.budget_acts() {
+            return None;
+        }
+        let fps = self.paced_software_fps().unwrap_or(target_fps).max(1);
+        let interval = 1_000_000 / u64::from(fps);
+        Some(Duration::from_micros(
+            interval.saturating_mul(u64::from(self.skip_divisor.max(1))),
+        ))
+    }
+
+    /// FR-148 D51 B4b-2 — what the sender measured: the blocked-send goodput,
+    /// or, while the budget acts, the budget's held rate in its place. Under
+    /// `on` the budget keeps sends from blocking, so the goodput reads only
+    /// the opening's burst, and the budget is what reads the path.
+    fn sent_bps(&self, now: Instant) -> Option<u32> {
+        if self.budget_acts() {
+            self.budget_held_bps()
+        } else {
+            self.goodput.estimate_bps(now)
+        }
+    }
+
+    /// [`Self::sent_bps`], tagged: backlogged either way, the goodput's aged
+    /// from the last window it folded, the budget's from its last step.
+    fn sent_tagged(&self, now: Instant) -> Option<(u32, Tag)> {
+        if self.budget_acts() {
+            let bps = self.budget_held_bps()?;
+            return Some((bps, Tag::measured(Basis::Backlogged, now)));
+        }
+        self.goodput_tagged(now)
     }
 
     /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged
@@ -2324,19 +2468,29 @@ impl RateGovernor {
         Some((bps, Tag::measured(Basis::Backlogged, at)))
     }
 
-    /// [`Self::measured_bps`], tagged: the goodput's tag or the held arrival
-    /// rate's, whichever reading it is (the goodput's on a tie).
-    fn measured_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag)> {
+    /// [`Self::measured_bps`], tagged: the sender's tag ([`Self::sent_tagged`])
+    /// or the held arrival rate's, whichever reading it is (the sender's on a
+    /// tie). FR-148 D51 B4g — with its source: the sender's is the goodput's,
+    /// or the budget's held rate while the budget acts, under the same basis.
+    fn measured_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag, MeasuredBy)> {
         if !constrained {
             return None;
         }
         let link = match self.link_rx_bps {
-            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => {
-                Some((rx, Tag::measured(self.path.link_rx, at)))
-            }
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some((
+                rx,
+                Tag::measured(self.path.link_rx, at),
+                MeasuredBy::Arrival,
+            )),
             _ => None,
         };
-        match (self.goodput_tagged(now), link) {
+        let sender = if self.budget_acts() {
+            MeasuredBy::Budget
+        } else {
+            MeasuredBy::Goodput
+        };
+        let sent = self.sent_tagged(now).map(|(bps, tag)| (bps, tag, sender));
+        match (sent, link) {
             (Some(g), Some(l)) => Some(if g.0 <= l.0 { g } else { l }),
             (g, l) => g.or(l),
         }
@@ -2348,6 +2502,7 @@ impl RateGovernor {
             return None;
         }
         self.measured_tagged(now, constrained)
+            .map(|(bps, tag, _)| (bps, tag))
             .or_else(|| self.prior_tagged())
     }
 
@@ -2358,14 +2513,29 @@ impl RateGovernor {
         Some((bps, Tag::assumed(self.path.prior)))
     }
 
-    /// When the reading the prior anchors on at `now` was taken: the goodput's
-    /// last folded window, else the held arrival rate's.
+    /// When the reading the prior anchors on at `now` was taken: the sender's
+    /// ([`Self::sent_tagged`]), else the held arrival rate's.
     fn reading_origin(&self, now: Instant) -> Origin {
-        match (self.goodput_tagged(now), self.link_rx_bps) {
+        match (self.sent_tagged(now), self.link_rx_bps) {
             (Some((_, tag)), _) => tag.origin,
             (None, Some((_, at))) => Origin::At(at),
             (None, None) => Origin::At(now),
         }
+    }
+
+    /// FR-148 D51 — the prior's base and its net steps from it, for the
+    /// `tcp_shape` closed loop's trail: the walk the stand-in alone hides
+    /// while it sits above the band.
+    #[cfg(test)]
+    pub(crate) fn prior_walk(&self) -> (Option<u32>, i32) {
+        (self.prior.base_bps(), self.prior.steps())
+    }
+
+    /// FR-148 D51 B4a-1 — whether a congestion signal for the opener's ramp
+    /// arrived since the last viewer window, for C2.
+    #[cfg(test)]
+    pub(crate) fn slow_start_congested(&self) -> bool {
+        self.slow_start_congested
     }
 }
 
@@ -6238,6 +6408,7 @@ mod tests {
             bps: Some(1_020_000),
             measured: true,
             loss: 0,
+            ..PathRate::default()
         });
         s.t += Duration::from_secs(2);
         s.g.on_sample_push_back(1_000_000, PushedBy::P3, s.t);
@@ -7809,6 +7980,7 @@ mod tests {
             Cause::Ceiling(CeilingSource::Pipe),
             Cause::Ceiling(CeilingSource::Learned),
             Cause::Ceiling(CeilingSource::Arrival),
+            Cause::Ceiling(CeilingSource::Budget),
             Cause::Ceiling(CeilingSource::Opener),
             Cause::Floor(FloorSource::Area),
             Cause::Floor(FloorSource::Relief),
@@ -7827,7 +7999,394 @@ mod tests {
             "open:2,increase(no-window):1,decrease(full):1,decrease(overflow):1,\
              decrease(stall):1,decrease(age):1,decrease(link):1,decrease(transit-stall):1,\
              hard-decrease:1,ceiling(plan):1,ceiling(pipe):1,ceiling(learned):1,\
-             ceiling(arrival):1,ceiling(opener):1,floor(area):1,floor(relief):1,more:2"
+             ceiling(arrival):1,ceiling(budget):1,ceiling(opener):1,floor(area):1,more:3"
         );
+    }
+
+    /// FR-148 D51 — the budget's last step under `on`, on a relay session: its
+    /// measured rate, whether it held lately outside a still span, and its
+    /// envelope.
+    fn acting(bps: u32, held: bool, envelope_ms: u16) -> crate::encode::pipe::PathRate {
+        crate::encode::pipe::PathRate {
+            bps: Some(bps),
+            measured: true,
+            loss: 0,
+            acts: true,
+            held,
+            envelope_ms,
+        }
+    }
+
+    /// FR-148 D51 — one viewer window `dt` after `t`, with the budget's step
+    /// `rate` noted first, a decode report of 30 fps, and a paint age of
+    /// `avg` over a least of `min` on a 60 ms round trip.
+    fn budget_window(
+        g: &mut RateGovernor,
+        t: &mut Instant,
+        rate: crate::encode::pipe::PathRate,
+        (avg, min): (u16, u16),
+    ) -> ViewerWindow {
+        *t += Duration::from_millis(1_100);
+        g.note_path_rate(rate);
+        g.tick_viewer_window(
+            *t,
+            30,
+            || viewer_rate::pack_report(30, false),
+            || viewer_rate::pack_age(avg, min, 60),
+            || 0,
+            true,
+            |o| o,
+            0,
+        )
+        .expect("window due")
+    }
+
+    /// FR-148 D51 B4b (C5) — under the budget the target follows its measured
+    /// rate. (a) The budget measured 1.5 M and held lately, the target is
+    /// 1.0 M: the additive increase climbs (no hold blocks it) and never
+    /// passes 1.5 M. (b) A target of 2.5 M at the same rate is capped at 1.5 M
+    /// at once, by the budget. (c) Steps with no hold lately lift the cap, and
+    /// the increase climbs past it.
+    #[test]
+    fn under_the_budget_the_target_follows_its_measured_rate() {
+        const AREA: u32 = 500_000;
+        let frame = Duration::from_millis(33);
+        let t0 = Instant::now();
+        // (a)
+        let mut g = gov(t0);
+        let opened = g.pre_encode_tick(1_000_000, AREA, true, DEPTH, t0);
+        assert_eq!(opened.map(|a| a.bps), Some(1_000_000));
+        let (mut t, mut top) = (t0, 1_000_000);
+        for _ in 0..40 * 30 {
+            t += frame;
+            g.note_path_rate(acting(1_500_000, true, 200));
+            if let Some(a) = g.pre_encode_tick(3_000_000, AREA, true, DEPTH, t) {
+                top = top.max(a.bps);
+            }
+        }
+        assert!(top > 1_000_000, "(a) the increase climbed: {top}");
+        assert!(top <= 1_500_000, "(a) never past the budget's rate: {top}");
+        assert_eq!(g.applied_bps(), 1_500_000, "(a) it reached it");
+        // (b)
+        let mut g = gov(t0);
+        g.pre_encode_tick(2_500_000, AREA, true, DEPTH, t0);
+        assert_eq!(g.applied_bps(), 2_500_000);
+        g.note_path_rate(acting(1_500_000, true, 200));
+        let capped = g.pre_encode_tick(3_000_000, AREA, true, DEPTH, t0 + frame);
+        assert_eq!(capped.map(|a| a.bps), Some(1_500_000), "(b) capped at once");
+        let why = capped.map(|a| a.why.to_string()).unwrap_or_default();
+        assert!(why.contains("ceiling(budget)"), "(b) by the budget: {why}");
+        // (c)
+        let (mut t, mut top) = (t0 + frame, 0);
+        for _ in 0..20 * 30 {
+            t += frame;
+            g.note_path_rate(acting(1_500_000, false, 200));
+            if let Some(a) = g.pre_encode_tick(3_000_000, AREA, true, DEPTH, t) {
+                top = top.max(a.bps);
+            }
+        }
+        assert!(top > 1_500_000, "(c) the cap lifted: {top}");
+    }
+
+    /// FR-148 D51 B4b-2 (C7) — under the budget its held rate is the live
+    /// reading. The prior stands two steps under an opening reading of 3.5 M.
+    /// A window in which the budget did not hold lately changes neither the
+    /// prior nor `measured_bps`; a window in which it held re-anchors the
+    /// prior on its measured rate, the steps reset, and that rate is
+    /// `measured_bps`.
+    #[test]
+    fn under_the_budget_its_held_rate_is_the_live_reading() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t0);
+        g.prior.on_window(Some(3_500_000), false);
+        for _ in 0..4 {
+            g.prior.on_window(None, true);
+        }
+        assert_eq!(g.prior_walk(), (Some(3_500_000), -2));
+        let mut t = t0;
+        budget_window(&mut g, &mut t, acting(1_400_000, false, 200), (42, 40));
+        assert_eq!(
+            g.prior_walk(),
+            (Some(3_500_000), -2),
+            "no hold: the prior stays"
+        );
+        assert_eq!(g.measured_bps(t, true), None, "no hold: no reading");
+        budget_window(&mut g, &mut t, acting(1_400_000, true, 200), (42, 40));
+        assert_eq!(g.prior_walk(), (Some(1_400_000), 0), "held: re-anchored");
+        assert_eq!(
+            g.measured_bps(t, true),
+            Some(1_400_000),
+            "held: the reading"
+        );
+    }
+
+    /// FR-148 D51 B4a-2 (C8) — the budget's queue does not walk the prior
+    /// down. Under `on`, with an envelope of 200 ms and no hold lately (so no
+    /// reading re-anchors it): six windows 150 ms over a learned floor of
+    /// 40 ms are the budget's own queue, not push-back; two windows 400 ms over
+    /// it are, and step the prior down once.
+    #[test]
+    fn the_budgets_queue_does_not_walk_the_prior_down() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t0);
+        g.prior.on_window(Some(3_500_000), false);
+        let mut t = t0;
+        let rate = acting(1_400_000, false, 200);
+        for age in [(42, 40), (43, 40)].into_iter().chain([(190, 40); 6]) {
+            budget_window(&mut g, &mut t, rate, age);
+        }
+        assert_eq!(g.prior_walk(), (Some(3_500_000), 0), "within the envelope");
+        for _ in 0..2 {
+            budget_window(&mut g, &mut t, rate, (440, 40));
+        }
+        assert_eq!(g.prior_walk(), (Some(3_500_000), -1), "past it");
+    }
+
+    /// FR-148 D51 B4a-2 (C3) — the age loop leaves the budget's queue to the
+    /// budget. Under `on`, with an envelope of 200 ms (S and a 50 ms frame):
+    /// six windows 150 ms over a learned floor of 40 ms fire nothing. No
+    /// window is over, the divisor stays at 1, no move is an age decrease,
+    /// and the prior is not pushed back.
+    #[test]
+    fn the_age_loop_leaves_the_budgets_queue_to_the_budget() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t0);
+        let mut t = t0;
+        let rate = acting(1_400_000, false, 200);
+        for age in [(42, 40), (43, 40)].into_iter().chain([(190, 40); 6]) {
+            let w = budget_window(&mut g, &mut t, rate, age);
+            assert!(!w.age_over && w.skip_divisor == 1, "{age:?}: {w:?}");
+            let moved =
+                g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+            let why = moved.map(|a| a.why.to_string()).unwrap_or_default();
+            assert!(!why.contains("decrease(age)"), "{age:?}: {why}");
+        }
+        assert_eq!(g.viewer_age(), Some((190, 40)));
+        assert_eq!(g.prior_walk().1, 0, "not pushed back");
+    }
+
+    /// FR-148 D51 B4a-2 (C4) — the age loop still catches a lag past the
+    /// envelope: the same session with the age 400 ms over its floor fires on
+    /// the second such window, and the next frame's move is the age's
+    /// decrease. Green before B4 and after: the backstop holds.
+    #[test]
+    fn the_age_loop_still_catches_a_lag_past_the_envelope() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t0);
+        let mut t = t0;
+        let rate = acting(1_400_000, false, 200);
+        for age in [(42, 40), (43, 40), (440, 40)] {
+            let w = budget_window(&mut g, &mut t, rate, age);
+            assert!(!w.age_over, "{age:?}: one window is a lump");
+        }
+        let w = budget_window(&mut g, &mut t, rate, (440, 40));
+        assert!(w.age_over, "the second fires: {w:?}");
+        let moved = g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        let why = moved.map(|a| a.why.to_string()).unwrap_or_default();
+        assert!(why.contains("decrease(age)"), "{why}");
+    }
+
+    /// FR-148 D51 B4f (C9) — while the budget acts, the pump charges an
+    /// encode at most the interval it chose for the frame: its capture
+    /// interval at 30 fps; a divisor of 3 charges three of them; FR-112's
+    /// paced rate (40 fps on a 60 fps target) is the interval while in force.
+    /// A budget that does not act bounds nothing, whatever the divisor.
+    #[test]
+    fn under_on_the_charge_is_the_pumps_interval_times_the_divisor() {
+        let t0 = Instant::now();
+        let mut g = gov(t0);
+        assert_eq!(g.charge_interval(30), None, "no step yet");
+        g.note_path_rate(acting(1_500_000, true, 200));
+        assert_eq!(g.charge_interval(30), Some(Duration::from_micros(33_333)));
+        let w = g
+            .tick_viewer_window(
+                t0 + Duration::from_secs(2),
+                30,
+                || 0,
+                || 0,
+                || 0,
+                false,
+                |_| 3,
+                0,
+            )
+            .expect("window due");
+        assert_eq!(w.skip_divisor, 3);
+        assert_eq!(
+            g.charge_interval(30),
+            Some(Duration::from_micros(3 * 33_333)),
+            "the divisor"
+        );
+        g.note_path_rate(crate::encode::pipe::PathRate {
+            acts: false,
+            ..acting(1_500_000, true, 200)
+        });
+        assert_eq!(g.charge_interval(30), None, "not acting");
+        let mut g = gov(t0);
+        g.note_path_rate(acting(1_500_000, true, 200));
+        assert_eq!(g.pace_software(25.0, 60), Some(40));
+        assert_eq!(
+            g.charge_interval(60),
+            Some(Duration::from_micros(25_000)),
+            "the paced rate"
+        );
+    }
+
+    /// FR-148 D51 — the kill switch. `off` and `shadow` are today's paths byte
+    /// for byte: with the budget not acting, nothing B4 adds is read. Two
+    /// governors through the same 100,000 random events (frames at any send
+    /// depth, gate skips, viewer windows with any age, arrival rate and decode
+    /// backlog, and the budget's steps); one hears each step as a budget that
+    /// does not act, with random B4 fields, the other as before D51. Every
+    /// live output is the same at every event.
+    #[test]
+    fn b4_reads_nothing_while_the_budget_does_not_act() {
+        use crate::encode::pipe::PathRate;
+        let t0 = Instant::now();
+        let mk = || remembered(900_000, GovernorFlags::default(), t0);
+        let (mut a, mut b) = (mk(), mk());
+        let mut state = 0x0b4d_51c0_ffee_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut t, mut sent) = (t0, 0u64);
+        for i in 0..100_000u32 {
+            let r = next();
+            t += Duration::from_millis(1 + r % 40);
+            match (r >> 8) % 8 {
+                0..=3 => {
+                    let cap = ((r >> 16) % (DEPTH as u64 + 1)) as usize;
+                    let floor = crate::encode::MIN_BITRATE_BPS;
+                    let x = a.pre_encode_tick(3_000_000, floor, true, cap, t);
+                    let y = b.pre_encode_tick(3_000_000, floor, true, cap, t);
+                    assert_eq!(x, y, "frame, event {i}");
+                    sent += (r >> 24) % 20_000;
+                }
+                4 => {
+                    let x = a.on_gate_skip(GateSkip::Backpressure(t));
+                    let y = b.on_gate_skip(GateSkip::Backpressure(t));
+                    assert_eq!(x, y, "skip, event {i}");
+                }
+                5 => {
+                    let rate = PathRate {
+                        bps: Some(200_000 + (r >> 16) as u32 % 4_000_000),
+                        measured: r & 1 == 0,
+                        loss: (r >> 40) % 4,
+                        ..PathRate::default()
+                    };
+                    a.note_path_rate(PathRate {
+                        held: r & 2 == 0,
+                        envelope_ms: ((r >> 20) % 400) as u16,
+                        ..rate
+                    });
+                    b.note_path_rate(rate);
+                }
+                _ => {
+                    let avg = 20 + ((r >> 16) % 900) as u16;
+                    let min = 10 + ((r >> 28) % 200) as u16;
+                    let rtt = 20 + ((r >> 36) % 200) as u16;
+                    let link = viewer_rate::pack_link(
+                        100_000 + ((r >> 44) % 3_000_000) as u32,
+                        ((r >> 52) % 400) as i16 - 100,
+                    );
+                    let report = viewer_rate::pack_report(5 + (r % 26) as u32, r & 4 == 0);
+                    let window = |g: &mut RateGovernor| {
+                        g.tick_viewer_window(
+                            t,
+                            30,
+                            || report,
+                            || viewer_rate::pack_age(avg, min.min(avg), rtt),
+                            || link,
+                            true,
+                            |o| o,
+                            sent,
+                        )
+                        .map(|w| format!("{w:?}"))
+                    };
+                    let (x, y) = (window(&mut a), window(&mut b));
+                    assert_eq!(x, y, "window, event {i}");
+                }
+            }
+            assert_eq!(a.applied_bps(), b.applied_bps(), "event {i}");
+            assert_eq!(a.relieved_floor_bps(), b.relieved_floor_bps(), "event {i}");
+            assert_eq!(
+                a.measured_bps(t, true),
+                b.measured_bps(t, true),
+                "event {i}"
+            );
+            assert_eq!(a.prior_walk(), b.prior_walk(), "event {i}");
+            // FR-148 D51 B4f (C9): and the pump charges each encode today's
+            // pts (`encode::charge`), whatever the divisor and the rate.
+            let fps = 15 + (r % 46) as u32;
+            assert_eq!(a.charge_interval(fps), None, "charge, event {i}");
+        }
+    }
+
+    /// FR-148 D51 B4g (C15) — the measured reading names its source. With no
+    /// reading, none. With the budget not acting, the blocked-send goodput.
+    /// Under `on`, the budget acting and holding, its held rate: its basis is
+    /// the goodput's (`backlogged`), so only the source tells them apart. The
+    /// held arrival rate where it is the lower, the budget's again where it
+    /// is not; and none while the budget acts without holding, the goodput
+    /// not read in its place.
+    #[test]
+    fn the_measured_reading_names_its_source() {
+        use crate::encode::pipe::PathRate;
+        let start = Instant::now();
+        let t1 = start + Duration::from_secs(2);
+        let source = |g: &RateGovernor| {
+            let v = g.path_view(t1, None);
+            (v.measured.map(|n| (n.bps, n.word())), v.measured_by)
+        };
+        let mut g = gov(start);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        assert_eq!(source(&g), (None, None), "no reading");
+        // A relayed keyframe blocked: the goodput folds.
+        let mut g = gov(start);
+        g.goodput_sink()
+            .record_frame(625_000, Duration::from_millis(900), true);
+        g.note_window_sender(t2_sender(2));
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        let goodput = g.blocked_send_bps(t1).expect("the goodput folded");
+        g.note_path_rate(PathRate {
+            acts: false,
+            ..acting(1_400_000, true, 200)
+        });
+        let backlogged = |bps: u32| Some((bps, "backlogged"));
+        assert_eq!(
+            source(&g),
+            (backlogged(goodput), Some(MeasuredBy::Goodput)),
+            "the budget does not act"
+        );
+        g.note_path_rate(acting(1_400_000, true, 200));
+        assert_eq!(
+            source(&g),
+            (backlogged(1_400_000), Some(MeasuredBy::Budget)),
+            "the budget acts and held"
+        );
+        g.link_rx_bps = Some((1_000_000, t1));
+        g.path.link_rx = Basis::AppLimited;
+        assert_eq!(
+            source(&g),
+            (Some((1_000_000, "app-limited")), Some(MeasuredBy::Arrival)),
+            "the arrival rate is the lower"
+        );
+        g.link_rx_bps = Some((2_000_000, t1));
+        assert_eq!(
+            source(&g),
+            (backlogged(1_400_000), Some(MeasuredBy::Budget)),
+            "the arrival rate is not"
+        );
+        g.link_rx_bps = None;
+        g.note_path_rate(acting(1_400_000, false, 200));
+        assert_eq!(source(&g), (None, None), "the budget acts, no hold");
     }
 }
