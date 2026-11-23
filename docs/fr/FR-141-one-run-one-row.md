@@ -251,8 +251,8 @@ person's half on it and says why.
     choice, so "two devices" would be true only while the switch is off. A Mac that `sudo roomlerd
     one-row` made one row is also offered `sudo roomlerd one-row --revert`, but only while root's copy from before,
     `/etc/roomler/config.toml.pre-one-row`, is there (`agents/roomlerd/src/one_row.rs:66-84`): only that command
-    writes it, a finished revert removes it (`:3059-3064`), and with no copy the revert says only "nothing to revert"
-    (`:3094-3099`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
+    writes it, a finished revert removes it (`:3102-3107`), and with no copy the revert says only "nothing to revert"
+    (`:3176-3181`). `/etc/roomler` is 0755, so the person's wizard can `stat` it. `roomlerd uninstall --as-service`
     is not named: it keeps the config. The words are `stop_text`'s (`agents/roomler-setup/src/reinstall_guard.rs`).
   - **A wizard started as root asks as well.** Root has no person socket (`crates/localapi/src/lib.rs:5720-5724`), so
     it asks the system socket (`:4834-4838`), the root daemon's own, through the same root-only connect

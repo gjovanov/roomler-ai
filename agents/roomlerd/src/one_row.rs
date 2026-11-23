@@ -22,7 +22,7 @@
 //! | Step | Root | The person's process | If it fails |
 //! |---|---|---|---|
 //! | Read | root, macOS, the root half enrolled and connected, a person at the console; lists `/Users`, `stat`s each entry, reads each owner's account and UUID | `read`, one per uid, in uid order, 30 s each: owners, modes and kinds, the config's and the plist's bytes, any old copy's name | stops; nothing has changed. R1 to R5 refuse here |
-//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | | |
+//! | Plan | retired or moved, for each enrollment; `--dry-run` stops here | | stops; nothing has changed. An ephemeral enrollment refuses here (#4312): a person's, and the root half's where one-row would restart; `--revert` refuses an ephemeral root file before its restart |
 //! | Keep | root's kept copy, `root.json`, then one folder per uid under [`RECORDS`], its `record.json` last | | puts back what it did, and stops |
 //! | LaunchAgent | booted out by label | | the same |
 //! | Read again | where an agent's save as it stopped moved only its own run state, that person's files kept again, `record.json` last ([`since_read`], #4097) | `read` again, for each person whose agent was booted out | the same; anything else that moved stops it here |
@@ -589,22 +589,20 @@ pub fn plan(root: &AgentConfig, people: &[Person]) -> Result<Plan> {
         let mut found = 0;
         if cfg.has_primary_enrollment() {
             found += 1;
-            let fate = match held_by(&root_after, &cfg.server_url, &cfg.tenant_id) {
+            let held = held_by(&root_after, &cfg.server_url, &cfg.tenant_id);
+            // #4312 — an ephemeral row is refused, held or not: the bootout
+            // stops this half, and on that stop an ephemeral row deletes
+            // itself (FR-51). An `[[orgs]]` entry carries no such flag. The
+            // root half's is refused in `migrate`, where a restart follows.
+            if cfg.ephemeral {
+                return Err(ephemeral_person(&person.account.name, cfg, held.is_some()));
+            }
+            let fate = match held {
                 Some(held) => {
                     retirement_notes(&mut notes, &person.account.name, cfg.overlay_enabled, &held);
                     Fate::Retired
                 }
                 None => {
-                    if cfg.ephemeral {
-                        bail!(
-                            "{}'s enrollment ({} tenant {}) is ephemeral, and the root half does \
-                             not hold that org: an ephemeral row lives only with the half that \
-                             enrolled it. Unenroll it first, or enroll the root half there",
-                            person.account.name,
-                            cfg.server_url,
-                            cfg.tenant_id
-                        );
-                    }
                     let label = free_label(&root_after, host_of(&cfg.server_url));
                     if cfg.overlay_enabled {
                         notes.push(format!(
@@ -706,6 +704,45 @@ fn retirement_notes(notes: &mut Vec<String>, user: &str, overlay_on: bool, held:
             held.label, held.label
         ));
     }
+}
+
+/// #4312 — why the way on past an ephemeral row is a new file: an enrollment
+/// folded into a config keeps that config's `ephemeral`
+/// (`enrollment::preserve_operator_config`).
+const OVER_EPHEMERAL: &str = "an enrollment over an ephemeral one stays ephemeral";
+
+/// #4312 — the root half's enrollment is ephemeral. One-row's restart is a
+/// stop, and on it the daemon deletes its own row.
+fn ephemeral_root(root: &AgentConfig) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the root half's enrollment ({}, tenant {}) is ephemeral: one-row restarts the daemon, \
+         and on that stop an ephemeral row deletes itself. Enroll the root half again with a \
+         key that is not ephemeral, into a new {ROOT_CONFIG} ({OVER_EPHEMERAL}), then run this \
+         again. Nothing has changed",
+        root.server_url,
+        root.tenant_id
+    )
+}
+
+/// #4312 — a person's enrollment is ephemeral. `held`: the root half holds
+/// its org once the plan's moves are in, so the plan would retire it; else it
+/// would move it.
+fn ephemeral_person(name: &str, cfg: &AgentConfig, held: bool) -> anyhow::Error {
+    let why = if held {
+        "and the root half holds that org: one-row would retire that row. Its half deletes it \
+         when the bootout stops it, and the server's reaper, where it runs, deletes it while it \
+         sits offline, so `--revert` could not bring it back"
+    } else {
+        "and the root half does not hold that org: an ephemeral row lives only with the half \
+         that enrolled it, so it cannot move to the root half"
+    };
+    anyhow::anyhow!(
+        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Enroll {name}'s half again \
+         with a key that is not ephemeral, into a new config ({OVER_EPHEMERAL}), then run this \
+         again. Nothing has changed",
+        cfg.server_url,
+        cfg.tenant_id
+    )
 }
 
 /// The plan, in the words the command says before it asks.
@@ -1726,6 +1763,12 @@ pub async fn migrate<H: Host>(
     {
         host.say("this Mac is one row already: nothing to do");
         return Ok(());
+    }
+    // #4312 — a Mac with something to do is restarted, by the apply and by
+    // its undo, and on that stop an ephemeral row deletes itself (FR-51). A
+    // Mac with nothing to do is stopped by nothing: it is left alone above.
+    if read.root.ephemeral {
+        return Err(ephemeral_root(&read.root));
     }
     let refused = refusals(host, read, &plan).await;
     if !refused.is_empty() {
@@ -3084,6 +3127,45 @@ pub async fn revert<H: Host>(host: &mut H, r: &Revert) -> Result<()> {
     Ok(())
 }
 
+/// #4312 — `--revert` restarts the daemon onto root's file put back, and on
+/// that stop an ephemeral row deletes itself, so the root half would come
+/// back on a dead token. The file read is the one that restart stops on:
+/// root's kept copy where there is one, since it goes back first, else root's
+/// own file, read as bytes ([`Host::load_root`] may repair a file). One that
+/// is not there or does not parse holds no ephemeral row. `Some`: the line
+/// that refuses.
+fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
+    let (bytes, kept) = match &r.root_kept {
+        Some(kept) => (kept.clone(), true),
+        None => match host.read_root(RootFile::Config)? {
+            Some(bytes) => (bytes, false),
+            None => return Ok(None),
+        },
+    };
+    let Ok(cfg) = crate::config::parse_text(&String::from_utf8_lossy(&bytes), ROOT_CONFIG) else {
+        return Ok(None);
+    };
+    if !cfg.ephemeral {
+        return Ok(None);
+    }
+    let (file, remove) = if kept {
+        (
+            format!("{ROOT_CONFIG}.{KEPT_EXT}, which --revert puts back first,"),
+            format!(", and remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back"),
+        )
+    } else {
+        (ROOT_CONFIG.to_string(), String::new())
+    };
+    Ok(Some(format!(
+        "--revert is refused: the root half's enrollment ({}, tenant {}) in {file} is \
+         ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral \
+         row deletes itself, so the root half would come back on a dead token. Enroll the root \
+         half again with a key that is not ephemeral, into a new {ROOT_CONFIG} \
+         ({OVER_EPHEMERAL}){remove}, then run this again. Nothing has changed",
+        cfg.server_url, cfg.tenant_id
+    )))
+}
+
 /// `--revert` as the command runs it: the plan, said, then `confirm` and the
 /// revert, unless only the plan was asked for.
 pub async fn revert_main<H: Host>(
@@ -3109,6 +3191,9 @@ pub async fn revert_main<H: Host>(
              tries again",
             names.join(", ")
         );
+    }
+    if let Some(line) = ephemeral_revert(host, &r)? {
+        bail!("{line}");
     }
     if dry_run {
         host.say("--dry-run: nothing has changed");
@@ -3950,11 +4035,63 @@ mod tests {
         )];
         let e = plan(&root(), &people).unwrap_err().to_string();
         assert!(e.contains("ephemeral"), "{e}");
-        // One the root holds is retired, ephemeral or not.
+        // #4312 — one the root holds stops it too: retired, its row would go
+        // at the bootout or to the reaper, and `--revert` could not bring it
+        // back.
         let mut held = cfg("t1", "user-1", "token");
         held.ephemeral = true;
         let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(held))];
-        assert_eq!(plan(&root(), &people).unwrap().items[0].fate, Fate::Retired);
+        assert!(plan(&root(), &people).is_err());
+    }
+
+    /// #4312 — a person's ephemeral enrollment in an org the root holds would
+    /// be retired, and its row would go at the bootout, or to the reaper while
+    /// it stays retired, so `--revert` could not bring it back. The line names
+    /// the person and the org, says why, and how to go on.
+    #[test]
+    fn a_held_ephemeral_person_stops_the_plan_for_the_row_it_would_lose() {
+        let mut held = casey();
+        held.ephemeral = true;
+        let people = vec![person("casey", 501, Path::new("/Users/casey"), Some(held))];
+        let e = plan(&root(), &people).unwrap_err().to_string();
+        for want in [
+            "casey's enrollment",
+            SERVER,
+            "tenant t1",
+            "is ephemeral, and the root half holds that org",
+            "`--revert` could not bring it back",
+            "a key that is not ephemeral, into a new config",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+    }
+
+    /// #4312 — the unheld refusal keeps its meaning, and its way on no longer
+    /// sends a person to enroll the root half there, where the held refusal
+    /// would stop them next.
+    #[test]
+    fn an_unheld_ephemeral_person_is_refused_in_words_true_for_it() {
+        let mut theirs = cfg("t2", "user-2", "token");
+        theirs.ephemeral = true;
+        let people = vec![person(
+            "casey",
+            501,
+            Path::new("/Users/casey"),
+            Some(theirs),
+        )];
+        let e = plan(&root(), &people).unwrap_err().to_string();
+        for want in [
+            "casey's enrollment",
+            "tenant t2",
+            "the root half does not hold that org",
+            "lives only with the half that enrolled it",
+            "a key that is not ephemeral, into a new config",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(!e.contains("enroll the root half there"), "{e}");
     }
 
     #[test]
@@ -4902,6 +5039,154 @@ mod tests {
             .unwrap();
         assert_eq!(mac.files(), before);
         assert!(mac.said().contains("one row already"));
+    }
+
+    /// #4312 — an ephemeral root half stops the plan: one-row restarts the
+    /// daemon, and on that stop an ephemeral row deletes itself. Nothing is
+    /// written and launchd is asked nothing.
+    #[tokio::test]
+    async fn an_ephemeral_root_half_stops_the_plan_and_changes_nothing() {
+        let mut mac = Fake::new(one_row_daemon);
+        let mut ephemeral = root();
+        ephemeral.ephemeral = true;
+        mac.root.insert(RootFile::Config, toml_of(&ephemeral));
+        let before = mac.files();
+        let e = convert_now(&mut mac).await.unwrap_err().to_string();
+        for want in [
+            "the root half's enrollment",
+            SERVER,
+            "tenant t1",
+            "is ephemeral",
+            "one-row restarts the daemon, and on that stop an ephemeral row deletes itself",
+            "Enroll the root half again with a key that is not ephemeral, into a new \
+             /etc/roomler/config.toml",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501), "casey's agent is not booted out");
+        // With nobody's enrollment to take, the restart alone is that stop,
+        // and a dry run says so too.
+        let mut mac = Fake::new(one_row_daemon);
+        mac.root.insert(RootFile::Config, toml_of(&ephemeral));
+        let mut read = read_now(&mut mac).await;
+        read.people[0].config = Some(AgentConfig::for_person_with_no_enrollment("Mac").unwrap());
+        let before = mac.files();
+        let e = migrate(&mut mac, &read, true, |_| panic!("nothing to ask"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the root half's enrollment"), "{e}");
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+    }
+
+    /// #4312 — a Mac that is one row already, its root half ephemeral, is left
+    /// alone as before: one-row stops nothing there, so nothing is refused.
+    #[tokio::test]
+    async fn an_ephemeral_mac_that_is_one_row_already_is_left_alone() {
+        let mut mac = Fake::new(one_row_daemon);
+        let mut read = read_now(&mut mac).await;
+        read.root.ephemeral = true;
+        read.root.macos_supervise_gui_worker = true;
+        read.root.macos_one_row = true;
+        read.people[0].config = Some(AgentConfig::for_person_with_no_enrollment("Mac").unwrap());
+        read.people[0].has_plist = false;
+        mac.loaded.clear();
+        let before = mac.files();
+        migrate(&mut mac, &read, false, |_| panic!("nothing to ask"))
+            .await
+            .unwrap();
+        assert_eq!(mac.files(), before);
+        assert!(mac.said().contains("one row already"));
+    }
+
+    /// #4312 — a permanent root, a permanent person and an ephemeral one: the
+    /// plan stops on the ephemeral one before anything is kept, booted out or
+    /// written, for either person.
+    #[tokio::test]
+    async fn a_mixed_mac_stops_on_its_ephemeral_person_and_writes_nothing() {
+        let mut mac = Fake::new(one_row_daemon).with_ana();
+        let mut ana = cfg("t1", "user-9", "ana-token");
+        ana.ephemeral = true;
+        mac.homes.get_mut(&502).unwrap().config = Some((toml_of(&ana), 0o600));
+        mac.loaded.insert(502);
+        let before = mac.files();
+        let e = convert_now(&mut mac).await.unwrap_err().to_string();
+        assert!(
+            e.contains("ana's enrollment") && e.contains("is ephemeral"),
+            "{e}"
+        );
+        assert!(
+            !e.contains("casey"),
+            "the permanent person is no reason: {e}"
+        );
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        assert!(mac.loaded.contains(&501) && mac.loaded.contains(&502));
+    }
+
+    /// #4312 — `--revert` restarts the daemon onto root's file put back, and
+    /// on that stop an ephemeral row deletes itself. So an ephemeral root file
+    /// stops it before anything changes: no file written, no launchctl call.
+    /// The file read is the one the restart stops on: root's kept copy where
+    /// there is one, which goes back first; else root's own file.
+    #[tokio::test]
+    async fn revert_refuses_an_ephemeral_root_half_before_any_change() {
+        let mut ephemeral = root();
+        ephemeral.ephemeral = true;
+        // Converted with root's kept copy, which `--revert` writes back.
+        let mut mac = Fake::new(one_row_daemon);
+        convert_now(&mut mac).await.unwrap();
+        let mut now = mac.root_cfg();
+        now.ephemeral = true;
+        mac.root.insert(RootFile::Config, toml_of(&now));
+        let kept = toml_of(&ephemeral);
+        let mut record: RootRecord =
+            serde_json::from_slice(&mac.root[&RootFile::RootRecord]).unwrap();
+        record.kept_sha256 = sha256_hex(&kept);
+        record.kept_len = kept.len() as u64;
+        mac.root
+            .insert(RootFile::RootRecord, serde_json::to_vec(&record).unwrap());
+        mac.root.insert(RootFile::Kept, kept);
+        mac.calls.clear();
+        let before = mac.files();
+        let e = format!("{:#}", revert_now(&mut mac).await.unwrap_err());
+        for want in [
+            "--revert is refused",
+            "/etc/roomler/config.toml.pre-one-row",
+            SERVER,
+            "tenant t1",
+            "is ephemeral",
+            "an ephemeral row deletes itself",
+            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
+            "remove /etc/roomler/config.toml.pre-one-row",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert_eq!(mac.files(), before);
+        assert!(!mac.wrote(), "{:?}", mac.calls);
+        // Converted by an older release: its revert reads root's own file.
+        let mut old = Fake::new(one_row_daemon);
+        old.root.insert(RootFile::Config, toml_of(&ephemeral));
+        old.converted_by_an_older_release();
+        let before = old.files();
+        let e = format!("{:#}", revert_now(&mut old).await.unwrap_err());
+        for want in [
+            "--revert is refused",
+            "tenant t1",
+            "is ephemeral",
+            "a key that is not ephemeral, into a new /etc/roomler/config.toml",
+            "Nothing has changed",
+        ] {
+            assert!(e.contains(want), "{want:?} in {e}");
+        }
+        assert!(!e.contains(".pre-one-row"), "{e}");
+        assert_eq!(old.files(), before);
+        assert!(!old.wrote(), "{:?}", old.calls);
     }
 
     #[tokio::test]
