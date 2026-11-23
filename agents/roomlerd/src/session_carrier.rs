@@ -315,7 +315,7 @@ pub fn relay_transport_of(
 /// The nominated pair as the carrier line reads it: the pair, what carries
 /// the agent's relay for it, and, under `route` alone, whether the ICE agent
 /// reads it as riding the mesh (`None` under every other value).
-type Nominated = (PairView, RelayTransport, Option<bool>);
+pub(crate) type Nominated = (PairView, RelayTransport, Option<bool>);
 
 /// The selected pair as read once: its two candidates, ports included, what
 /// carries the agent's relay for it, and, under `route` alone, whether the
@@ -391,7 +391,7 @@ async fn nominated(pc: &RTCPeerConnection, wait: Duration) -> Option<Selection> 
 }
 
 /// The nominated pair, polled every 100 ms for up to `wait`.
-async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
+pub(crate) async fn nominated_pair(pc: &RTCPeerConnection, wait: Duration) -> Option<Nominated> {
     nominated(pc, wait).await.map(|s| s.nominated())
 }
 
