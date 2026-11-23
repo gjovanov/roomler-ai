@@ -41,12 +41,19 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   `MANAGE_AGENTS`, the reads too: the list is the org's whole ACL. `GET …/magic-dns`
   stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
   must not: the policy IS the grant, made for people who hold none
-  (security-baseline.md §3). ⚠️ `Json<T>` as an extractor answers a body that does
-  not parse (400/415/422) before the handler runs. A gated write takes
-  `Result<Json<T>, JsonRejection>` instead and reads it straight after the gate
-  (`let Json(body) = body?;`); `ApiError::JsonBody` answers it as the extractor did
-  (#4187). The tunnel-policy and overlay-acl writes do; the route and exit-node
-  approvals and `PUT …/magic-dns` still read their body first (#4218).
+  (security-baseline.md §3).
+- **A gated write decides its gate before it reads its body** (#4187, #4218).
+  `Json<T>` as an extractor answers a body that does not parse (400/413/415/422)
+  before the handler runs: a caller the gate refuses is told about the body instead,
+  and a platform-operator route's 404 stops keeping it unseen. A write gated on a
+  permission bit or the platform allowlist takes `Result<Json<T>, JsonRejection>` and
+  unwraps it straight after the gate (`let Json(body) = body?;`), before it parses any
+  id its gate does not need; `ApiError::JsonBody` answers a caller it lets through as
+  the extractor did. Every gated write of the network module does. The api crate's
+  unit test `gate_before_body` (`crates/api/src/gate_before_body.rs`) fails on a new
+  one that does not; its `DEFERRED` list is #4254's, `BY_DESIGN` holds the checks that
+  need the body, and both only shrink. ⚠️ It cannot see an ownership check or another
+  extractor (`Query<T>`, a typed `Path<T>`, `Form<T>`): those stay the reviewer's.
 - **A member's roles are the org's own, read where a rule is evaluated.** Only the
   ids of a membership row that are `roles` rows of THAT org count: read them through
   `TenantDao::get_member_permissions` (the bits), `member_live_role_ids` (one member)

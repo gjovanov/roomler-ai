@@ -3288,3 +3288,238 @@ mod overlay_acl_decides_the_bit_before_the_body {
         assert_eq!(list["mode"], "off", "{list}");
     }
 }
+
+/// #4218 — the overlay's other gated writes decide their gate before they
+/// read their body, as the ACL's do (`overlay_acl_decides_the_bit_before_the_body`):
+/// a route approval, an exit-node approval and a renumber decide
+/// `MANAGE_AGENTS` (a renumber lets a platform operator through as well), and
+/// the block reclaim, the host reconcile and the orphan sweep are a platform
+/// operator's, answered 404 to anyone else so the route stays unseen. A caller
+/// a gate refuses gets that refusal for a body that does not even parse, the
+/// answer a body the route reads gets; a caller it lets through is still
+/// answered such a body as axum's `Json` extractor answers it.
+mod overlay_writes_decide_the_gate_before_the_body {
+    use super::*;
+    use crate::fixtures::seed::SeededTenant;
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems, holder_problems,
+    };
+    use roomler_ai_mod_network::routes::overlay_block::{
+        OrphanRequest, ReclaimRequest, ReconcileHostsRequest, RenumberRequest,
+    };
+    use roomler_ai_mod_network::routes::overlay_route::{
+        SetApprovedRoutesRequest, SetExitNodeRequest,
+    };
+    use serde_json::json;
+
+    const RECLAIM: &str = "/api/admin/overlay-block/reclaim";
+    const ORPHANS: &str = "/api/admin/overlay-network/orphans";
+
+    /// A server whose per-address rate limit is out of the way, with
+    /// `operator` on the platform-operator allowlist: each test sends more
+    /// requests than the default burst, and a 429 would read as an answer.
+    async fn spawn(operator: Option<ObjectId>) -> TestApp {
+        TestApp::spawn_with_settings(move |s| {
+            s.app.rate_limit_per_sec = 1_000;
+            s.app.rate_limit_burst = 10_000;
+            s.stats.platform_admins = operator.map(|o| o.to_hex());
+        })
+        .await
+    }
+
+    fn tenant(seeded: &SeededTenant, tail: &str) -> String {
+        format!("/api/tenant/{}{tail}", seeded.tenant_id)
+    }
+
+    /// A node id that names nothing, and one that is not an id at all: the
+    /// bit is decided before the id is parsed or looked up, and a holder is
+    /// answered a body that does not parse whatever the id is.
+    fn node_ids() -> [String; 2] {
+        [ObjectId::new().to_hex(), "not-an-id".to_string()]
+    }
+
+    /// The writes `MANAGE_AGENTS` decides.
+    fn bit_writes(seeded: &SeededTenant) -> Vec<GatedWrite> {
+        let mut writes = Vec::new();
+        for node in node_ids() {
+            writes.push(GatedWrite {
+                method: "PUT",
+                path: tenant(seeded, &format!("/overlay-node/{node}/approved-routes")),
+                reads: json!({ "approved_routes": [] }),
+                refused_field: r#"{"approved_routes": 7}"#,
+            });
+            writes.push(GatedWrite {
+                method: "PUT",
+                path: tenant(seeded, &format!("/overlay-node/{node}/exit-node")),
+                reads: json!({ "enabled": false }),
+                refused_field: r#"{"enabled": 7}"#,
+            });
+        }
+        writes.push(GatedWrite {
+            method: "POST",
+            path: tenant(seeded, "/overlay-block/renumber"),
+            reads: json!({}),
+            refused_field: r#"{"dry_run": 7}"#,
+        });
+        writes
+    }
+
+    /// A platform operator's writes, each a dry run unless asked otherwise.
+    fn operator_writes(seeded: &SeededTenant) -> [GatedWrite; 3] {
+        [
+            GatedWrite {
+                method: "POST",
+                path: RECLAIM.to_string(),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+            GatedWrite {
+                method: "POST",
+                path: tenant(seeded, "/overlay-block/reconcile-hosts"),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+            GatedWrite {
+                method: "POST",
+                path: ORPHANS.to_string(),
+                reads: json!({}),
+                refused_field: r#"{"dry_run": 7}"#,
+            },
+        ]
+    }
+
+    /// While these took `Json<T>` as an extractor, axum answered a body that
+    /// does not parse before the handler ran, with a 400, 415 or 422 decided
+    /// by the body alone: a member without the bit, or someone outside the
+    /// org, was told about their body instead of being refused, and on an
+    /// operator's route anyone was.
+    #[tokio::test]
+    async fn the_gate_is_decided_before_a_body_that_does_not_parse() {
+        let app = spawn(None).await;
+        let seeded = app.seed_tenant("ovgate-unparsed").await;
+        let other = app.seed_tenant("ovgate-unparsed-b").await;
+
+        let mut wrong = Vec::new();
+        for write in bit_writes(&seeded) {
+            let member = &seeded.member.access_token;
+            let bit = Gate::Bit("MANAGE_AGENTS");
+            wrong
+                .extend(gate_problems(&app, "a member without the bit", member, bit, &write).await);
+            let outsider = &other.admin.access_token;
+            wrong.extend(
+                gate_problems(
+                    &app,
+                    "another org's owner",
+                    outsider,
+                    Gate::NotAMember,
+                    &write,
+                )
+                .await,
+            );
+        }
+        // Not even the org's owner, who holds every bit of the org, is told
+        // anything on an operator's route.
+        for write in operator_writes(&seeded) {
+            for (who, token) in [
+                ("the org's owner", &seeded.admin.access_token),
+                ("a member", &seeded.member.access_token),
+            ] {
+                wrong.extend(gate_problems(&app, who, token, Gate::Unseen, &write).await);
+            }
+        }
+        assert_no_problems("answered before the gate", &wrong);
+    }
+
+    /// The control: a holder of the bit (the org's owner), and a platform
+    /// operator on the routes that let one through, are answered such a body
+    /// exactly as the extractor answers it, the status and the plain-text
+    /// words, whatever the node id is.
+    #[tokio::test]
+    async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+        let operator = ObjectId::new();
+        let app = spawn(Some(operator)).await;
+        let seeded = app.seed_tenant("ovgate-unparsed-holder").await;
+        let owner = &seeded.admin.access_token;
+        let op = app
+            .state
+            .auth
+            .generate_tokens(operator, "operator@ovgate.test", "ovgate_operator")
+            .unwrap()
+            .access_token;
+        let networks = OverlayNetworkDao::new(&app.db);
+        let before = networks
+            .get_or_create(tid(&seeded.tenant_id))
+            .await
+            .unwrap()
+            .cidr;
+
+        let mut wrong = Vec::new();
+        for node in node_ids() {
+            let routes = tenant(&seeded, &format!("/overlay-node/{node}/approved-routes"));
+            wrong.extend(
+                holder_problems::<SetApprovedRoutesRequest>(
+                    &app,
+                    owner,
+                    "PUT",
+                    &routes,
+                    r#"{"approved_routes": 7}"#,
+                )
+                .await,
+            );
+            let exit = tenant(&seeded, &format!("/overlay-node/{node}/exit-node"));
+            wrong.extend(
+                holder_problems::<SetExitNodeRequest>(
+                    &app,
+                    owner,
+                    "PUT",
+                    &exit,
+                    r#"{"enabled": 7}"#,
+                )
+                .await,
+            );
+        }
+        let renumber = tenant(&seeded, "/overlay-block/renumber");
+        for token in [owner, &op] {
+            wrong.extend(
+                holder_problems::<RenumberRequest>(
+                    &app,
+                    token,
+                    "POST",
+                    &renumber,
+                    r#"{"dry_run": 7}"#,
+                )
+                .await,
+            );
+        }
+        let reconcile = tenant(&seeded, "/overlay-block/reconcile-hosts");
+        wrong.extend(
+            holder_problems::<ReclaimRequest>(&app, &op, "POST", RECLAIM, r#"{"dry_run": 7}"#)
+                .await,
+        );
+        wrong.extend(
+            holder_problems::<ReconcileHostsRequest>(
+                &app,
+                &op,
+                "POST",
+                &reconcile,
+                r#"{"dry_run": 7}"#,
+            )
+            .await,
+        );
+        wrong.extend(
+            holder_problems::<OrphanRequest>(&app, &op, "POST", ORPHANS, r#"{"dry_run": 7}"#).await,
+        );
+        assert_no_problems("a caller the gate lets through", &wrong);
+
+        // Nothing was renumbered: the org's network is where it was.
+        let after = networks
+            .get_or_create(tid(&seeded.tenant_id))
+            .await
+            .unwrap()
+            .cidr;
+        assert_eq!(
+            after, before,
+            "a body that does not parse renumbers nothing"
+        );
+    }
+}
