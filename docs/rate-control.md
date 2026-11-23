@@ -1449,8 +1449,8 @@ of the vendored webrtc-sctp keeps where the events happen:
 
 | Counter | Counted in | Means |
 |---|---|---|
-| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1518`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
-| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:135`, `:530`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
+| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1604`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
+| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:159`, `:583`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
 
 The agent reads both without the association's lock (`Association::delivery_clock`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:638`), through the peer
@@ -1584,7 +1584,7 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 |---|---|
 | the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:631` (`DeliverySampler`), `:742` (`heartbeat`), `:864` (`on_reading_with`), `:934` (`take_line`) |
 | the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:95` (`QUEUED_OVER_MS`), `:117` (`counts`), `:837-846` (`DeliverySampler::observe`, the one take), `:905` (`judge`), `:556` (`Fold::add_queue`) |
-| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:134` (`Gauges`), `:179` (`take`), `:187` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
+| the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:146` (`Gauges`), `:194` (`take`), `:202` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:482` (`RTCSctpTransport::gauges`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:3978` (made), `:5412` (drained, after the heartbeat line) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6562` (made), `:10344` (drained, after the heartbeat line) |
 | the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:93` (`DeliveryClock`), `:101` (`read`) |
@@ -1637,9 +1637,9 @@ the same rate.
 
 SCTP's acknowledgement delay holds that wait. The vendored webrtc-sctp stamps a chunk
 when it leaves SCTP's queue for the wire
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1975`), and the
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2070`), and the
 SACK handler stores the delay of the newest chunk sent once that a SACK acknowledges
-(`:1316-1318`). The carrier's queue is in that delay; SCTP's own queue is not. The
+(`:1397-1399`). The carrier's queue is in that delay; SCTP's own queue is not. The
 association's gauges keep the least of those delays since the last take, beside the
 congestion window, the slow start threshold, the peer's window, the bytes in flight and
 pending, and the counts of fast retransmissions and T3-rtx expiries. The agent reads
@@ -1837,16 +1837,16 @@ association's congestion state as gauges: one relaxed store, add or min each, wh
 association already holds its lock or where the pending queue counts its own bytes. A
 reader takes them without the lock (`Association::gauges`,
 `crates/vendored/webrtc-sctp/src/association/mod.rs:647`; the reading is `Gauges`,
-`crates/vendored/webrtc-sctp/src/association/gauges.rs:134`), and nothing in the
+`crates/vendored/webrtc-sctp/src/association/gauges.rs:146`), and nothing in the
 association reads them back.
 
 | Gauge | Stored | Means |
 |---|---|---|
-| `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:199`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
-| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:353`) when the association is made (`:200`), at the INIT ACK (`:815`), after every SACK (`:1596`) and every send (`:2073`), and at a T3-rtx expiry (`:2469`) | the windows and the bytes in flight |
-| `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:139`, `:532`) | bytes written and not yet sent, over every stream |
-| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:512`, `:2468`) | loss events since the association began; the train counts only those after its first step |
-| `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1318`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
+| `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:209`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
+| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:363`) when the association is made (`:210`), at the INIT ACK (`:829`), after every SACK (`:1691`) and every send (`:2168`), and at a T3-rtx expiry (`:2582`) | the windows and the bytes in flight |
+| `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:163`, `:585`) | bytes written and not yet sent, over every stream |
+| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:522`, `:2581`) | loss events since the association began; the train counts only those after its first step |
+| `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1399`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
 
 **The twin test** shows that a reader changes nothing the association sends.
 `test_gauges_a_reader_changes_nothing_the_association_sends`
@@ -1901,7 +1901,7 @@ flowchart TD
 within the budget (`:368`). SCTP sends the window at once, and the extra message is
 waiting when the first SACK comes, because the vendored SCTP grows its window only
 while bytes wait
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1358`). Every
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1439`). Every
 later step writes enough that bytes keep waiting until the next step: twice the most one
 step saw acknowledged, and a message (`agents/roomlerd/src/media_train.rs:459`). Three
 limits hold it back. Until the first round ends, what is in flight and waiting stays
@@ -1972,7 +1972,7 @@ leave SCTP in different states:
 
 | Path | The agent's end is established by | Its slow start threshold at the first write | So the train climbs by |
 |---|---|---|---|
-| **I** | the peer's INIT ACK, which sets the threshold to the peer's window (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:814`) | the peer's window: 1 MiB by default, 64 KiB in the window cell | slow start: each SACK adds what it acknowledged to the window while bytes wait (`:1359`), so a SACK of two packets releases four |
+| **I** | the peer's INIT ACK, which sets the threshold to the peer's window (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:828`) | the peer's window: 1 MiB by default, 64 KiB in the window cell | slow start: each SACK adds what it acknowledged to the window while bytes wait (`:1440`), so a SACK of two packets releases four |
 | **C** | the peer's COOKIE ECHO (`handle_cookie_echo`, `:896`), which sets neither | 0, the constructor's (`:169`); the peer's window is 0 until the first SACK | congestion avoidance from the first byte: one MTU more a round trip (`:1393`) |
 
 On path C the train comes within 20 % of the link only where congestion avoidance
@@ -2005,7 +2005,7 @@ and only its first call reads anything (`DeliverySampler::on_first_write`,
 `agents/roomlerd/src/media_delivery.rs:994`). It reads the gauges through
 `RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:482`),
 which never waits for the transport's slot, with `GaugeReader::peek`
-(`crates/vendored/webrtc-sctp/src/association/gauges.rs:187`), which resets nothing, so
+(`crates/vendored/webrtc-sctp/src/association/gauges.rs:202`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
 `crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1167`).
 The answer is a pure function of the gauges (`OpenedBy::of`,
@@ -2014,8 +2014,8 @@ The answer is a pure function of the gauges (`OpenedBy::of`,
 | `open_path` | When |
 |---|---|
 | `init_ack` | the slow start threshold is above 0, and no loss came first |
-| `cookie_echo` | the threshold is 0, and no loss came first. An INIT ACK that arrives after the COOKIE ECHO is discarded (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:782`), so it cannot set the threshold later |
-| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1442`, `:2465`) |
+| `cookie_echo` | the threshold is 0, and no loss came first. An INIT ACK that arrives after the COOKIE ECHO is discarded (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:796`), so it cannot set the threshold later |
+| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1528`, `:2578`) |
 | `unread` | no gauges: no association, or the transport's slot was held at that moment |
 
 The threshold tells the paths apart and the peer's window does not, since any SACK sets
@@ -2171,12 +2171,12 @@ and they stand as found.
 be armed only while its `close_tx` is empty (`AckTimer::start`,
 `crates/vendored/webrtc-sctp/src/timer/ack_timer.rs:36`), and only `stop` empties it
 (`:65`). A timer that fires calls `on_ack_timeout`
-(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2380`), which
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2493`), which
 sends the SACK. Upstream it left `close_tx` set, so after one delayed acknowledgement
 timed out, the next lone packet was acknowledged only when another packet arrived and
-the immediate acknowledgement called `stop` (`:2247`), or when the sender's T3-rtx sent
+the immediate acknowledgement called `stop` (`:2344`), or when the sender's T3-rtx sent
 it again. With one message in flight the train stalled. `on_ack_timeout` now calls
-`stop` itself (`:2393`), so every lone packet arms a timer of its own. A receiver still
+`stop` itself (`:2506`), so every lone packet arms a timer of its own. A receiver still
 holds a lone packet's SACK up to 200 ms, so the cap keeps its floor of three messages,
 with which the train never waits for the timer. The fix reaches the agent's own
 receiver, for what a browser sends it, and both ends of a tunnel on `webrtc-dc-v1`. In a
@@ -4228,11 +4228,11 @@ the larger of its own rate and the budget's rate at its close (`Over::rate`;
 `media_delivery::sample_read_of`,
 `agents/roomlerd/src/media_delivery.rs:442`). With a loss in it the
 sample's two-second mean reads SCTP's recovery as well as the path: a T3 cuts the window to
-one packet (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2465-2466`),
-which then regrows in slow start, and a fast retransmit halves it (`:1442-1443`), each lost
+one packet (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2578-2579`),
+which then regrows in slow start, and a fast retransmit halves it (`:1528-1529`), each lost
 chunk crossing the link twice and counted once. The budget's rate is the most of the same
 clock's one-second figures, and the clock counts what a gap block says the peer holds
-(`:1261-1262`), what reached the peer in any order. So the rate reads the second the
+(`:1342-1343`), what reached the peer in any order. So the rate reads the second the
 recovery cost least, and it follows the path down: every second holds once the path carries
 less than the budget lets out. Keeping such samples out never followed a real fall (0 of 6
 on the halving cell), and a discount has nothing to measure it by. A P3 with no loss in it,
