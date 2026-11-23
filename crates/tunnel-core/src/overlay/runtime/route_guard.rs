@@ -59,12 +59,26 @@ pub(super) fn route_guard_cadence(watch_live: bool, env: Option<String>) -> Dura
 /// re-assert must stay INLINE on the select! loop — this wave runs DETACHED,
 /// and a detached task with a stale snapshot could re-install a `/1` that
 /// `teardown_exit_routing` (on that same loop) had just purged, black-holing
-/// the host's whole egress (the self-wedge the P5 design forbids).
+/// the host's whole egress (the self-wedge the P5 design forbids). The
+/// subnet arm cannot carry them in by accident: [`installable_subnets`]
+/// drops every prefix of length 0 or 1, the `/1` halves included.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Defend {
     /// An installed peer's `/32`: evict foreign competitors, then (re-)add
     /// ours at metric 1 via the overlay NIC ([`TunIo::add_peer_route`]).
     AssertPeer(Ipv4Addr),
+    /// #4279 — an installed router peer's approved subnet, as
+    /// [`OverlayRuntime::install_subnets`] routed it and the netmap still
+    /// approves it ([`defended_subnets_of`]): (re-)add our route via the
+    /// overlay NIC if it is missing
+    /// ([`TunIo::defend_subnet_route`]). NO eviction: another interface may
+    /// route the same range legitimately (the host's own LAN, a corp VPN's
+    /// split include), so only our own row is written. Before this arm a
+    /// subnet route that anything deleted stayed missing until the next
+    /// carrier install for that peer ran `install_subnets` again — 35 minutes
+    /// on a Windows host on 2026-11-21, with the router peer reading online
+    /// throughout.
+    AssertSubnet(crate::overlay::router::Cidr),
     /// Our OWN addresses — the self `/32` plus (on Windows) the derived v6
     /// `/128` and the connected ULA `/96`: EVICTION-ONLY
     /// ([`TunIo::defend_self_route`]). Re-adding our own address via the TUN
@@ -83,22 +97,97 @@ pub(super) enum Defend {
     BlockFloor,
 }
 
+/// P5/A1 — the subnets a peer's approval may route through the generic path:
+/// every CIDR except a default route. Approving `0.0.0.0/0` on an exit node
+/// fans it into every peer's netmap `routes`; installed here it would hijack
+/// the whole fleet's egress with zero opt-in, so default routing toward a
+/// CHOSEN exit node is a separate, opt-in path (split-default `/1`s +
+/// carrier-endpoint exemptions) that never flows through this filter.
+/// [`crate::overlay::router::Cidr::is_default_route`] is `prefix <= 1`, so the
+/// split-default `/1` halves an exit peer's crypto-router entry carries while
+/// it holds our egress are dropped too.
+///
+/// ONE rule for both of its users — [`OverlayRuntime::install_subnets`] (what
+/// a peer install writes) and [`defended_routes`] (what every wave
+/// re-asserts) — so the guard can never defend a prefix the installer
+/// refused. Pure.
+pub(super) fn installable_subnets(
+    subnets: &[crate::overlay::router::Cidr],
+) -> Vec<crate::overlay::router::Cidr> {
+    subnets
+        .iter()
+        .copied()
+        .filter(|c| !c.is_default_route())
+        .collect()
+}
+
+/// #4279 — the subnets the guard defends for ONE installed peer: those
+/// [`OverlayRuntime::install_subnets`] routed to it (`installed`, its
+/// crypto-router entry right now) that the netmap STILL approves (`approved`,
+/// the peer's `routes`), through [`installable_subnets`]. Both halves, because
+/// a route approval reaches an installed peer's crypto-router only at its
+/// next carrier install, so the two can disagree for as long as a carrier
+/// lives:
+///
+/// - approved but not yet installed: no crypto-router entry, so an OS route
+///   would pull the range into the TUN and drop it there. Not defended.
+/// - installed but no longer approved: the guard must not keep a revoked
+///   route alive. Not defended; nothing here deletes it either.
+///
+/// Pure.
+pub(super) fn defended_subnets_of(
+    installed: &[crate::overlay::router::Cidr],
+    approved: &[String],
+) -> Vec<crate::overlay::router::Cidr> {
+    let approved: Vec<crate::overlay::router::Cidr> = approved
+        .iter()
+        .filter_map(|r| crate::overlay::router::Cidr::parse(r))
+        .collect();
+    installable_subnets(installed)
+        .into_iter()
+        .filter(|c| approved.contains(c))
+        .collect()
+}
+
 /// Compose the defended set from the live peer table + our own address.
-/// Peers first, self next, the block floor LAST — the peer/self shape the
-/// arms have used since rc.278, locked by
+/// Peers first, then their subnets, self next, the block floor LAST — the
+/// peer/self shape the arms have used since rc.278, locked by
 /// `route_reassert_covers_self_and_peers`. The floor entry is unconditional
 /// here: its per-wave assert-vs-retract decision (the ISP-CGNAT gate) lives
 /// in [`TunIo::defend_block_floor`] so it runs inside the DETACHED wave, not
 /// on the select loop.
+///
+/// #4279 — each installed peer's subnets come from [`defended_subnets_of`]:
+/// `installed_subnets` answers what the crypto-router holds for a public key
+/// (`WgDevice::peer_subnets`, read on the select loop), and `current_peers`
+/// is the netmap the loop holds. Each CIDR is listed once, however many
+/// routers claim it (one OS route serves them all; the crypto-router's
+/// tie-break picks the carrier).
 pub(super) fn defended_routes(
     by_node: &HashMap<ObjectId, Installed>,
+    current_peers: &HashMap<ObjectId, NetmapPeer>,
     self_v4: Ipv4Addr,
+    installed_subnets: impl Fn(&[u8; 32]) -> Vec<crate::overlay::router::Cidr>,
 ) -> Vec<Defend> {
-    by_node
+    let mut set: Vec<Defend> = by_node
         .values()
         .map(|e| Defend::AssertPeer(e.overlay_ip))
-        .chain([Defend::EvictSelf(self_v4), Defend::BlockFloor])
-        .collect()
+        .collect();
+    let mut subnets: Vec<crate::overlay::router::Cidr> = Vec::new();
+    for (id, e) in by_node {
+        let approved = current_peers
+            .get(id)
+            .map(|np| np.routes.as_slice())
+            .unwrap_or_default();
+        for c in defended_subnets_of(&installed_subnets(&e.pubkey), approved) {
+            if !subnets.contains(&c) {
+                subnets.push(c);
+            }
+        }
+    }
+    set.extend(subnets.into_iter().map(Defend::AssertSubnet));
+    set.extend([Defend::EvictSelf(self_v4), Defend::BlockFloor]);
+    set
 }
 
 /// Execute one defense wave — the ONLY consumer of [`defended_routes`].
@@ -124,6 +213,9 @@ pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
         match entry {
             Defend::AssertPeer(ip) => {
                 tun.add_peer_route(ip).await.ok();
+            }
+            Defend::AssertSubnet(cidr) => {
+                tun.defend_subnet_route(&cidr.to_string()).await.ok();
             }
             Defend::EvictSelf(ip) => tun.defend_self_route(ip).await,
             Defend::BlockFloor => tun.defend_block_floor().await,
@@ -529,12 +621,10 @@ impl OverlayRuntime {
         // route — hijacking the whole fleet's egress with zero opt-in. Default
         // routing toward a CHOSEN exit node is a separate, opt-in path
         // (split-default `/1`s + carrier-endpoint exemptions) that never flows
-        // through this generic installer.
-        let filtered: Vec<crate::overlay::router::Cidr> = subnets
-            .iter()
-            .copied()
-            .filter(|c| !c.is_default_route())
-            .collect();
+        // through this generic installer. #4279 — the route guard re-asserts
+        // through the same filter (`installable_subnets`), so it never defends
+        // a prefix this refused.
+        let filtered = installable_subnets(subnets);
         if filtered.len() != subnets.len() {
             warn!(
                 peer = %node_id,

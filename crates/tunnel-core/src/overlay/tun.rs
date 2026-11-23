@@ -104,6 +104,29 @@ pub trait TunIo: Send + Sync {
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
 
+    /// #4279 — the route guard's re-assert of a router peer's subnet route,
+    /// one that [`add_cidr_route`](Self::add_cidr_route) installed: put ours
+    /// back via this device if it is missing, and write nothing if it is
+    /// there. Never evicts: another interface may route the same range on
+    /// purpose (the host's own LAN, a corp VPN's split include).
+    ///
+    /// The default is `add_cidr_route` itself, whose Linux and macOS forms
+    /// already write only a missing route (`ip route replace` is a no-op for
+    /// an identical route, and macOS reads `route -n get` first). Windows
+    /// overrides it with the peer `/32`'s primitive, `winroute::ensure`: the
+    /// same in-place check, plus the #1328 stand-down. A VPN whose route
+    /// monitor keeps deleting a prefix gets it back for 4 waves, then not
+    /// for a backoff of 1 to 15 min, then one probe: reachability through the
+    /// overlay was lost either way, and the fight is what ran the guard at
+    /// ~20 waves/min (#1282). `add_cidr_route` deliberately never stands down,
+    /// because an exit client's `/1`s must not leave a hole that egress
+    /// leaks through; a subnet route has no such duty. A wrapper device must
+    /// forward this, or it falls back to the default and loses the
+    /// stand-down.
+    async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
+        self.add_cidr_route(cidr).await
+    }
+
     /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
     /// four `plen+2` sub-prefixes of the connected overlay block, installed
     /// via this device. A full-tunnel VPN that claims a LONGER prefix than the
@@ -5893,6 +5916,19 @@ mod system {
                 let _ = (cidr, v6);
                 Ok(())
             }
+        }
+
+        /// #4279 — see [`TunIo::defend_subnet_route`]. Windows only: Linux
+        /// and macOS take the trait default, their `add_cidr_route`.
+        /// `ensure` reads and writes exactly the row `add_cidr_route` makes
+        /// (this LUID, on-link, metric 1), so a route that is ours costs one
+        /// in-memory `Get` and no write, and nothing else on the interface
+        /// is touched.
+        #[cfg(target_os = "windows")]
+        async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
+            let (addr, plen) = parse_cidr(cidr)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr"))?;
+            winroute::ensure(self.dev.tun_luid(), addr, plen, 1)
         }
 
         async fn defend_block_floor(&self) {

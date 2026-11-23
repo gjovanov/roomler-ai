@@ -342,6 +342,10 @@ impl TunIo for SplitTun {
         self.inner.del_cidr_route(cidr).await
     }
 
+    async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
+        self.inner.defend_subnet_route(cidr).await
+    }
+
     async fn defend_block_floor(&self) {
         self.inner.defend_block_floor().await
     }
@@ -488,6 +492,11 @@ mod tests {
         ) -> Vec<std::net::IpAddr> {
             pinned.to_vec()
         }
+        /// An answer only this device gives. A shim that kept the trait's
+        /// default would reach `add_cidr_route` instead, which answers `Ok`.
+        async fn defend_subnet_route(&self, cidr: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other(format!("os device defended {cidr}")))
+        }
     }
 
     /// FR-97 P1a — the stale-exemption check reaches the real device. Keeping
@@ -500,6 +509,23 @@ mod tests {
         let split = SplitTun::wrap(mock, SELF_IP, 10, 1280, PORT);
         let pinned = [std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))];
         assert_eq!(split.stale_host_exemptions(&pinned).await, pinned.to_vec());
+    }
+
+    /// #4279 — the route guard's subnet re-assert reaches the real device.
+    /// The trait's default would still write the route, through
+    /// `add_cidr_route`, but on Windows that path never stands down, so a
+    /// shim that dropped the forward would bring back the unbounded fight
+    /// with a VPN that keeps deleting the route, on every host that serves
+    /// SSH.
+    #[tokio::test]
+    async fn the_subnet_reassert_reaches_the_os_device() {
+        let (mock, _seen) = mock_os_tun();
+        let split = SplitTun::wrap(mock, SELF_IP, 10, 1280, PORT);
+        let err = split
+            .defend_subnet_route("10.66.0.0/16")
+            .await
+            .expect_err("the OS device's own answer");
+        assert_eq!(err.to_string(), "os device defended 10.66.0.0/16");
     }
 
     fn mock_os_tun() -> (Arc<MockOsTun>, mpsc::UnboundedReceiver<Vec<u8>>) {
