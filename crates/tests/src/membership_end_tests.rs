@@ -252,3 +252,85 @@ async fn the_operator_step_ends_room_memberships_without_an_org_membership() {
         (json!(0), json!(0))
     );
 }
+
+const PRUNE: &str = "/api/admin/room-members/prune";
+
+/// The operator step's body, field for field
+/// (`chat::membership::PruneRequest`). This crate does not link the chat
+/// module, and what axum's `Json` extractor answers a body depends on the
+/// body type's shape alone.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct PruneRequest {
+    #[serde(default = "yes")]
+    dry_run: bool,
+    limit: Option<u32>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// #4254 — the operator step decides its gate before it reads its body at
+/// all: anyone but a platform operator, an org's owner included, gets the one
+/// 404 for a body that does not even parse, the answer a body the route reads
+/// gets, so the route stays unseen. While it took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone.
+#[tokio::test]
+async fn the_prune_gate_is_decided_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let a = app.seed_tenant("prunerm-unparsed").await;
+    let write = GatedWrite {
+        method: "POST",
+        path: PRUNE.to_string(),
+        reads: json!({}),
+        refused_field: r#"{"dry_run": 7}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token) in [
+        ("an org's owner", &a.admin.access_token),
+        ("a member", &a.member.access_token),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, Gate::Unseen, &write).await);
+    }
+    assert_no_problems("answered before the gate", &wrong);
+}
+
+/// #4254's control. A platform operator is answered a prune body that does
+/// not parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words.
+#[tokio::test]
+async fn an_operator_is_answered_a_prune_body_that_does_not_parse_as_the_json_extractor_answers_it()
+{
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+
+    let operator = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let op = app
+        .state
+        .auth
+        .generate_tokens(
+            operator,
+            "operator@prunerm-unparsed.test",
+            "prunerm_unparsed_operator",
+        )
+        .unwrap()
+        .access_token;
+
+    let wrong =
+        holder_problems::<PruneRequest>(&app, &op, "POST", PRUNE, r#"{"dry_run": 7}"#).await;
+    assert_no_problems("a platform operator", &wrong);
+}
