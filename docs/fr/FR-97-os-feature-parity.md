@@ -653,7 +653,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:2693-2708`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2716-2731`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -1032,7 +1032,7 @@ test of the SIGKILL property itself.
   off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
   carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
   `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
-  retired config keys (`crates/agent-core/src/config.rs:4431`), and the hidden `roomler hive hook`
+  retired config keys (`crates/agent-core/src/config.rs:4462`), and the hidden `roomler hive hook`
   (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
   It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
   that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,

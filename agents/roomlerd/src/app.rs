@@ -1109,14 +1109,14 @@ enum ServiceAction {
 ///      without `--machine-global`), when it lies in the service account's
 ///      own profile as the system names it (`system_profile`,
 ///      `appdirs::system_profile`) and opens;
-///    - else the machine-global path, so `config::load` fails with an honest
-///      "not found" naming where the machine's enrollment belongs.
+///    - else the machine-global path: its start restores a missing config from
+///      a copy that passes (#4176), or `config::load` fails with "not found".
 ///
 ///    The config of the person signed in at the console is never one of them.
 ///    That enrollment runs as that person, on the service host's user-context
 ///    arm, until the machine has its own
 ///    (`win_service::supervisor::want_system_worker`, which reads the same two
-///    rungs).
+///    rungs, then the copy).
 /// 3. Every other process: the platform default (`%APPDATA%` per user).
 fn pick_config_path(
     explicit: Option<PathBuf>,
