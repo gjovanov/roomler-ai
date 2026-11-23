@@ -394,7 +394,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDisplay } from 'vuetify'
 import { VExpansionPanels } from 'vuetify/components'
@@ -657,13 +657,21 @@ const limitsSummary = computed(() => {
   return parts.length ? joinParts(parts) : 'No limits'
 })
 
-onMounted(() => {
-  void agentStore.fetchOrgRcSessionLimits(props.tenantId)
-  void agentStore.fetchOrgExecEnabled(props.tenantId)
-  void agentStore.fetchOrgSshEnabled(props.tenantId)
-  void agentStore.fetchOrgKeepBusyDenied(props.tenantId)
-  void agentStore.fetchOrgRcSessionPolicy(props.tenantId)
-  void agentStore.fetchOrgEphemeralKeysEnabled(props.tenantId)
-  void agentStore.fetchExternalAccess(props.tenantId)
-})
+// #4257 — the settings follow the page's org: a watch that runs at once, not a
+// one-shot mount (a routed section gets only a new prop when the org changes).
+// The store drops another org's values at once and keeps only the latest
+// answer, so a late one for the previous org never lands here.
+watch(
+  () => props.tenantId,
+  (tenantId) => {
+    void agentStore.fetchOrgRcSessionLimits(tenantId)
+    void agentStore.fetchOrgExecEnabled(tenantId)
+    void agentStore.fetchOrgSshEnabled(tenantId)
+    void agentStore.fetchOrgKeepBusyDenied(tenantId)
+    void agentStore.fetchOrgRcSessionPolicy(tenantId)
+    void agentStore.fetchOrgEphemeralKeysEnabled(tenantId)
+    void agentStore.fetchExternalAccess(tenantId)
+  },
+  { immediate: true },
+)
 </script>

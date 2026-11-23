@@ -66,7 +66,9 @@ export const useRoleStore = defineStore('roles', () => {
 
   async function createRole(tenantId: string, payload: Partial<Role>) {
     const role = await api.post<Role>(`/tenant/${tenantId}/role`, payload)
-    roles.value.push(role)
+    // #4257 — a role created for an org the page has left stays out of a
+    // list that now holds another org's roles.
+    if (rolesTenantId.value === null || rolesTenantId.value === tenantId) roles.value.push(role)
     return role
   }
 

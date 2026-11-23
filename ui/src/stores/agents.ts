@@ -48,6 +48,32 @@ async function mayReadDeviceDiagnostics(tenantId: string): Promise<boolean> {
   return canReadDeviceDiagnostics(tenants.myPermissions, tenants.isOwner)
 }
 
+/** #4257 — what one org setting needs to follow the page's org, as `agents`
+ *  does (#4248). It records the org the value describes (`null`: never
+ *  fetched, so a first or test-seeded value is not dropped). A fetch for
+ *  another org drops the value at once, back to unknown, and only the latest
+ *  fetch writes. A save writes its answer only while the value is its org's,
+ *  so a save answered after the page moved on to another org is dropped.
+ *  Made once per store instance, inside the store. */
+function orgSettingTracker(drop: () => void) {
+  let seq = 0
+  let valueTenantId: string | null = null
+  return {
+    /** A fetch for `tenantId` starts; the check it returns holds while that
+     *  fetch is the latest. */
+    begin(tenantId: string): () => boolean {
+      const mine = ++seq
+      if (valueTenantId !== null && valueTenantId !== tenantId) drop()
+      valueTenantId = tenantId
+      return () => mine === seq
+    },
+    /** Whether the value held is `tenantId`'s (or no org's yet). */
+    holds(tenantId: string): boolean {
+      return valueTenantId === null || valueTenantId === tenantId
+    },
+  }
+}
+
 /** FR-82 — a 403 is an answer: "you may not read this", never a failed
  *  session. Read structurally, so it holds for any client error that carries
  *  the status. */
@@ -1380,15 +1406,24 @@ export const useAgentStore = defineStore('agents', () => {
       typeof resp.exec_require_system === 'boolean' ? resp.exec_require_system : null
   }
 
+  const execSettings = orgSettingTracker(() => {
+    orgExecEnabled.value = null
+    orgExecRequireSystem.value = null
+  })
+
   async function fetchOrgExecEnabled(tenantId: string) {
+    const latest = execSettings.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
+      if (!latest()) return
       orgExecEnabled.value = null
       orgExecRequireSystem.value = null
       return
     }
     try {
-      applyOrgExecSettings(await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`))
+      const resp = await api.get<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`)
+      if (latest()) applyOrgExecSettings(resp)
     } catch {
+      if (!latest()) return
       // A 403 here means "not an admin", not "disabled" — leave it unknown
       // rather than claiming the org is off.
       orgExecEnabled.value = null
@@ -1399,26 +1434,24 @@ export const useAgentStore = defineStore('agents', () => {
   /** Flip gate 1. MANAGE_TENANT server-side. Names only the kill-switch: the
    *  server leaves `exec_require_system` as it is when a PUT omits it. */
   async function setOrgExecEnabled(tenantId: string, enabled: boolean) {
-    applyOrgExecSettings(
-      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
-        remote_exec_enabled: enabled,
-      }),
-    )
+    const resp = await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+      remote_exec_enabled: enabled,
+    })
+    if (execSettings.holds(tenantId)) applyOrgExecSettings(resp)
   }
 
   /** FR-94 — flip `exec_require_system`. The PUT must carry the kill-switch
    *  too (the server reads it as required), so this sends the value it holds
-   *  and refuses to guess one it does not. */
+   *  and refuses to guess one it does not, another org's included (#4257). */
   async function setOrgExecRequireSystem(tenantId: string, required: boolean) {
-    if (orgExecEnabled.value === null) {
+    if (orgExecEnabled.value === null || !execSettings.holds(tenantId)) {
       throw new Error('The organization settings are not loaded yet')
     }
-    applyOrgExecSettings(
-      await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
-        remote_exec_enabled: orgExecEnabled.value,
-        exec_require_system: required,
-      }),
-    )
+    const resp = await api.put<OrgExecSettings>(`/tenant/${tenantId}/exec-settings`, {
+      remote_exec_enabled: orgExecEnabled.value,
+      exec_require_system: required,
+    })
+    if (execSettings.holds(tenantId)) applyOrgExecSettings(resp)
   }
 
   /** Replace a device's exec policy (gate 3). MANAGE_AGENTS server-side. */
@@ -1449,18 +1482,21 @@ export const useAgentStore = defineStore('agents', () => {
    *  the org is off would send an admin hunting through device settings. */
   const orgSshEnabled = ref<boolean | null>(null)
 
+  const sshSettings = orgSettingTracker(() => (orgSshEnabled.value = null))
+
   async function fetchOrgSshEnabled(tenantId: string) {
+    const latest = sshSettings.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgSshEnabled.value = null
+      if (latest()) orgSshEnabled.value = null
       return
     }
     try {
       const resp = await api.get<{ remote_ssh_enabled: boolean }>(
         `/tenant/${tenantId}/ssh-settings`,
       )
-      orgSshEnabled.value = resp.remote_ssh_enabled
+      if (latest()) orgSshEnabled.value = resp.remote_ssh_enabled
     } catch {
-      orgSshEnabled.value = null
+      if (latest()) orgSshEnabled.value = null
     }
   }
 
@@ -1470,7 +1506,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/ssh-settings`,
       { remote_ssh_enabled: enabled },
     )
-    orgSshEnabled.value = resp.remote_ssh_enabled
+    if (sshSettings.holds(tenantId)) orgSshEnabled.value = resp.remote_ssh_enabled
   }
 
   // ── FR-92 — keep busy, the org deny ─────────────────────────────
@@ -1502,19 +1538,26 @@ export const useAgentStore = defineStore('agents', () => {
    *  non-owner's card shows "unknown" and sends nothing. (Any member may
    *  read the route since P8 — `fetchKeepBusyDefaultPattern` is the
    *  ungated read a viewer uses.) */
+  const keepBusySettings = orgSettingTracker(() => {
+    orgKeepBusyDenied.value = null
+    orgKeepBusyDefaultPattern.value = null
+  })
+
   async function fetchOrgKeepBusyDenied(tenantId: string) {
+    const latest = keepBusySettings.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgKeepBusyDenied.value = null
+      if (latest()) orgKeepBusyDenied.value = null
       return
     }
     try {
       const resp = await api.get<OrgKeepBusySettingsResponse>(
         `/tenant/${tenantId}/keep-busy-settings`,
       )
+      if (!latest()) return
       orgKeepBusyDenied.value = resp.keep_busy_denied
       orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
     } catch {
-      orgKeepBusyDenied.value = null
+      if (latest()) orgKeepBusyDenied.value = null
     }
   }
 
@@ -1526,6 +1569,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/keep-busy-settings`,
       patch,
     )
+    if (!keepBusySettings.holds(tenantId)) return
     orgKeepBusyDenied.value = resp.keep_busy_denied
     orgKeepBusyDefaultPattern.value = resp.keep_busy_default_pattern ?? null
   }
@@ -1585,17 +1629,19 @@ export const useAgentStore = defineStore('agents', () => {
    *  settings — the "not an admin ≠ a value" rule of the switches above. */
   const orgRcSessionPolicy = ref<RcSessionPolicy | null>(null)
 
+  const rcSessionPolicy = orgSettingTracker(() => (orgRcSessionPolicy.value = null))
+
   async function fetchOrgRcSessionPolicy(tenantId: string) {
+    const latest = rcSessionPolicy.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgRcSessionPolicy.value = null
+      if (latest()) orgRcSessionPolicy.value = null
       return
     }
     try {
-      orgRcSessionPolicy.value = await api.get<RcSessionPolicy>(
-        `/tenant/${tenantId}/rc-session-policy`,
-      )
+      const resp = await api.get<RcSessionPolicy>(`/tenant/${tenantId}/rc-session-policy`)
+      if (latest()) orgRcSessionPolicy.value = resp
     } catch {
-      orgRcSessionPolicy.value = null
+      if (latest()) orgRcSessionPolicy.value = null
     }
   }
 
@@ -1660,10 +1706,8 @@ export const useAgentStore = defineStore('agents', () => {
   /** Set one or more features (MANAGE_TENANT server-side). The route leaves
    *  a feature the body does not name alone, and answers with all three. */
   async function setOrgRcSessionPolicy(tenantId: string, patch: Partial<RcSessionPolicy>) {
-    orgRcSessionPolicy.value = await api.put<RcSessionPolicy>(
-      `/tenant/${tenantId}/rc-session-policy`,
-      patch,
-    )
+    const resp = await api.put<RcSessionPolicy>(`/tenant/${tenantId}/rc-session-policy`, patch)
+    if (rcSessionPolicy.holds(tenantId)) orgRcSessionPolicy.value = resp
   }
 
   // ── FR-52 — cross-org remote access ──────────────────────────────
@@ -1682,12 +1726,20 @@ export const useAgentStore = defineStore('agents', () => {
    *  deliberately omits connect codes. */
   const externalDevices = ref<ExternalDevice[]>([])
 
+  const externalAccess = orgSettingTracker(() => {
+    orgExternalAccessEnabled.value = null
+    externalDevices.value = []
+  })
+
   async function fetchExternalAccess(tenantId: string) {
+    const latest = externalAccess.begin(tenantId)
     try {
       const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
+      if (!latest()) return
       orgExternalAccessEnabled.value = resp.enabled
       externalDevices.value = resp.devices
     } catch {
+      if (!latest()) return
       orgExternalAccessEnabled.value = null
       externalDevices.value = []
     }
@@ -1698,7 +1750,7 @@ export const useAgentStore = defineStore('agents', () => {
     const resp = await api.put<{ enabled: boolean }>(`/tenant/${tenantId}/external-access`, {
       enabled,
     })
-    orgExternalAccessEnabled.value = resp.enabled
+    if (externalAccess.holds(tenantId)) orgExternalAccessEnabled.value = resp.enabled
   }
 
   /** Replace a device's external-access approval (gate 2).
@@ -1755,18 +1807,21 @@ export const useAgentStore = defineStore('agents', () => {
    *  and SSH switches. */
   const orgEphemeralKeysEnabled = ref<boolean | null>(null)
 
+  const ephemeralKeys = orgSettingTracker(() => (orgEphemeralKeysEnabled.value = null))
+
   async function fetchOrgEphemeralKeysEnabled(tenantId: string) {
+    const latest = ephemeralKeys.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgEphemeralKeysEnabled.value = null
+      if (latest()) orgEphemeralKeysEnabled.value = null
       return
     }
     try {
       const resp = await api.get<{ ephemeral_keys_enabled: boolean }>(
         `/tenant/${tenantId}/ephemeral-key-settings`,
       )
-      orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+      if (latest()) orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
     } catch {
-      orgEphemeralKeysEnabled.value = null
+      if (latest()) orgEphemeralKeysEnabled.value = null
     }
   }
 
@@ -1777,7 +1832,7 @@ export const useAgentStore = defineStore('agents', () => {
       `/tenant/${tenantId}/ephemeral-key-settings`,
       { ephemeral_keys_enabled: enabled },
     )
-    orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+    if (ephemeralKeys.holds(tenantId)) orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
   }
 
   // ── FR-101 P4b — the org's session limits ──────────────────────────
@@ -1799,41 +1854,43 @@ export const useAgentStore = defineStore('agents', () => {
     orgRcIdleSecs.value = resp.idle_secs ?? null
   }
 
+  function clearRcSessionLimits() {
+    orgRcMaxSessionSecs.value = undefined
+    orgRcIdleSecs.value = undefined
+  }
+  const rcSessionLimits = orgSettingTracker(clearRcSessionLimits)
+
   async function fetchOrgRcSessionLimits(tenantId: string) {
+    const latest = rcSessionLimits.begin(tenantId)
     if (!(await mayReadOrgSettings(tenantId))) {
-      orgRcMaxSessionSecs.value = undefined
-      orgRcIdleSecs.value = undefined
+      if (latest()) clearRcSessionLimits()
       return
     }
     try {
-      applyRcSessionLimits(
-        await api.get<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`),
-      )
+      const resp = await api.get<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`)
+      if (latest()) applyRcSessionLimits(resp)
     } catch {
-      orgRcMaxSessionSecs.value = undefined
-      orgRcIdleSecs.value = undefined
+      if (latest()) clearRcSessionLimits()
     }
   }
 
   /** Set the maximum length (`null` clears it). MANAGE_TENANT server-side;
    *  applies to sessions that go live after the change. */
   async function setOrgRcMaxSessionSecs(tenantId: string, maxSecs: number | null) {
-    applyRcSessionLimits(
-      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
-        max_secs: maxSecs,
-      }),
-    )
+    const resp = await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+      max_secs: maxSecs,
+    })
+    if (rcSessionLimits.holds(tenantId)) applyRcSessionLimits(resp)
   }
 
   /** P4b-2 — set the idle limit (`null` clears it). The body names only this
    *  limit, so the maximum length is left as it is. Kept by devices that
    *  advertise `idle-timeout`; applies to sessions requested after it. */
   async function setOrgRcIdleSecs(tenantId: string, idleSecs: number | null) {
-    applyRcSessionLimits(
-      await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
-        idle_secs: idleSecs,
-      }),
-    )
+    const resp = await api.put<RcSessionLimitsResp>(`/tenant/${tenantId}/rc-session-limits`, {
+      idle_secs: idleSecs,
+    })
+    if (rcSessionLimits.holds(tenantId)) applyRcSessionLimits(resp)
   }
 
   /** List the org's keys (secrets are never in the list — mint-once only). */
