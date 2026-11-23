@@ -706,19 +706,19 @@ fn retirement_notes(notes: &mut Vec<String>, user: &str, overlay_on: bool, held:
     }
 }
 
-/// #4312 — why the way on past an ephemeral row is a new file: an enrollment
-/// folded into a config keeps that config's `ephemeral`
-/// (`enrollment::preserve_operator_config`).
-const OVER_EPHEMERAL: &str = "an enrollment over an ephemeral one stays ephemeral";
+/// #4312, #4331 — why the way on past an ephemeral row removes it first: the
+/// same file takes the next enrollment's `ephemeral` from the server's answer
+/// (`enrollment::preserve_operator_config`), and a live ephemeral row stays one.
+const OVER_EPHEMERAL: &str = "an ephemeral row never turns permanent";
 
 /// #4312 — the root half's enrollment is ephemeral. One-row's restart is a
 /// stop, and on it the daemon deletes its own row.
 fn ephemeral_root(root: &AgentConfig) -> anyhow::Error {
     anyhow::anyhow!(
         "the root half's enrollment ({}, tenant {}) is ephemeral: one-row restarts the daemon, \
-         and on that stop an ephemeral row deletes itself. Enroll the root half again with a \
-         key that is not ephemeral, into a new {ROOT_CONFIG} ({OVER_EPHEMERAL}), then run this \
-         again. Nothing has changed",
+         and on that stop an ephemeral row deletes itself. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll the root half again with a key that is not ephemeral: \
+         {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
         root.server_url,
         root.tenant_id
     )
@@ -737,9 +737,9 @@ fn ephemeral_person(name: &str, cfg: &AgentConfig, held: bool) -> anyhow::Error 
          that enrolled it, so it cannot move to the root half"
     };
     anyhow::anyhow!(
-        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Enroll {name}'s half again \
-         with a key that is not ephemeral, into a new config ({OVER_EPHEMERAL}), then run this \
-         again. Nothing has changed",
+        "{name}'s enrollment ({}, tenant {}) is ephemeral, {why}. Remove it on the Devices page \
+         ({OVER_EPHEMERAL}) and enroll {name}'s half again with a key that is not ephemeral: \
+         that half's config keeps its settings. Then run this again. Nothing has changed",
         cfg.server_url,
         cfg.tenant_id
     )
@@ -3151,7 +3151,7 @@ fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
     let (file, remove) = if kept {
         (
             format!("{ROOT_CONFIG}.{KEPT_EXT}, which --revert puts back first,"),
-            format!(", and remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back"),
+            format!(", remove {ROOT_CONFIG}.{KEPT_EXT}, whose enrollment cannot come back,"),
         )
     } else {
         (ROOT_CONFIG.to_string(), String::new())
@@ -3159,9 +3159,9 @@ fn ephemeral_revert<H: Host>(host: &H, r: &Revert) -> Result<Option<String>> {
     Ok(Some(format!(
         "--revert is refused: the root half's enrollment ({}, tenant {}) in {file} is \
          ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral \
-         row deletes itself, so the root half would come back on a dead token. Enroll the root \
-         half again with a key that is not ephemeral, into a new {ROOT_CONFIG} \
-         ({OVER_EPHEMERAL}){remove}, then run this again. Nothing has changed",
+         row deletes itself, so the root half would come back on a dead token. Remove it on the \
+         Devices page ({OVER_EPHEMERAL}){remove} and enroll the root half again with a key that is \
+         not ephemeral: {ROOT_CONFIG} keeps its settings. Then run this again. Nothing has changed",
         cfg.server_url, cfg.tenant_id
     )))
 }

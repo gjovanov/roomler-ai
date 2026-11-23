@@ -47,10 +47,10 @@ pub struct AgentConfig {
     /// the daemon de-enrolls itself on SIGTERM/SIGINT so a clean stop removes
     /// the device in seconds instead of on the deadline.
     ///
-    /// Recorded FROM THE SERVER'S ENROLL RESPONSE, never from a local flag
-    /// alone — the credential decides what was minted, and the config must
-    /// not disagree with the row. Absent (every pre-FR-51 config) = a normal
-    /// permanent device, byte-for-byte today's behaviour.
+    /// Recorded FROM THE SERVER'S ENROLL RESPONSE on every enrollment, a fold
+    /// into an existing file too (#4331), never from a local flag or the old
+    /// file: the answer is the row's, and the config must not disagree with it.
+    /// Absent (every pre-FR-51 config) = a permanent device, today's behaviour.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
     /// Encoder preference: `auto` (default), `hardware`, or `software`.

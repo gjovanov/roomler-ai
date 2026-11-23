@@ -254,19 +254,23 @@ Each comes before Keep, so no file is written and launchd is asked nothing, and 
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
 and `--revert`'s after its own plan.
 
-Each line ends with the way on: enroll that half again with a key that is not ephemeral, into a new config. An
-enrollment folded into an existing config keeps that config's `ephemeral` (`preserve_operator_config`,
-`crates/agent-core/src/enrollment.rs:813-825`; `OVER_EPHEMERAL`, `one_row.rs:712`). The line before #4312 also
-offered "unenroll it first" and "enroll the root half there", and neither gets past it now: no command takes an
-enrollment out of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5868-5871`),
-and an org the root half holds is refused too.
+Each line ends with the way on: remove the row on the Devices page, then enroll that half again with a key that is
+not ephemeral. The same file serves. Since #4331 an enrollment that folds into a file keeps the file's settings and
+takes `ephemeral` from the server's answer, which is the row's (`preserve_operator_config`,
+`crates/agent-core/src/enrollment.rs:816-829`; the answer, `crates/modules/fleet/src/agent.rs:462`). The row goes
+first because a live ephemeral row stays ephemeral when a standard token enrolls over it (`OVER_EPHEMERAL`,
+`one_row.rs:712`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
+#4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
+"unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:5868-5871`), and an org
+the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |
 |---|---|
-| The root half | `the root half's enrollment (<server>, tenant <tenant>) is ephemeral: one-row restarts the daemon, and on that stop an ephemeral row deletes itself. Enroll the root half again with a key that is not ephemeral, into a new /etc/roomler/config.toml (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed` |
-| A person, held | ``<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half holds that org: one-row would retire that row. Its half deletes it when the bootout stops it, and the server's reaper, where it runs, deletes it while it sits offline, so `--revert` could not bring it back. Enroll <name>'s half again with a key that is not ephemeral, into a new config (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed`` |
-| A person, not held | `<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half does not hold that org: an ephemeral row lives only with the half that enrolled it, so it cannot move to the root half. Enroll <name>'s half again with a key that is not ephemeral, into a new config (an enrollment over an ephemeral one stays ephemeral), then run this again. Nothing has changed` |
-| `--revert`, root's kept copy | `--revert is refused: the root half's enrollment (<server>, tenant <tenant>) in /etc/roomler/config.toml.pre-one-row, which --revert puts back first, is ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral row deletes itself, so the root half would come back on a dead token. Enroll the root half again with a key that is not ephemeral, into a new /etc/roomler/config.toml (an enrollment over an ephemeral one stays ephemeral), and remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, then run this again. Nothing has changed` |
+| The root half | `the root half's enrollment (<server>, tenant <tenant>) is ephemeral: one-row restarts the daemon, and on that stop an ephemeral row deletes itself. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps its settings. Then run this again. Nothing has changed` |
+| A person, held | ``<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half holds that org: one-row would retire that row. Its half deletes it when the bootout stops it, and the server's reaper, where it runs, deletes it while it sits offline, so `--revert` could not bring it back. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll <name>'s half again with a key that is not ephemeral: that half's config keeps its settings. Then run this again. Nothing has changed`` |
+| A person, not held | `<name>'s enrollment (<server>, tenant <tenant>) is ephemeral, and the root half does not hold that org: an ephemeral row lives only with the half that enrolled it, so it cannot move to the root half. Remove it on the Devices page (an ephemeral row never turns permanent) and enroll <name>'s half again with a key that is not ephemeral: that half's config keeps its settings. Then run this again. Nothing has changed` |
+| `--revert`, root's kept copy | `--revert is refused: the root half's enrollment (<server>, tenant <tenant>) in /etc/roomler/config.toml.pre-one-row, which --revert puts back first, is ephemeral: --revert restarts the daemon onto that file, and on that stop an ephemeral row deletes itself, so the root half would come back on a dead token. Remove it on the Devices page (an ephemeral row never turns permanent), remove /etc/roomler/config.toml.pre-one-row, whose enrollment cannot come back, and enroll the root half again with a key that is not ephemeral: /etc/roomler/config.toml keeps its settings. Then run this again. Nothing has changed` |
 | `--revert`, no kept copy | the same, naming `/etc/roomler/config.toml` and with nothing to remove |
 
 ### Root's records

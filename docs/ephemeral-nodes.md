@@ -247,6 +247,47 @@ flowchart LR
 - Kill switch: `ROOMLERD_SESSION_END=0` makes no window, and a sign-out ends the
   daemon unannounced again. `service stop` needs none: it acts only when asked.
 
+## Enrolling again over an existing config (#4331)
+
+A device's `ephemeral` (`crates/agent-core/src/config.rs:45-55`) is what the
+server answered the enrollment that wrote the file, on every enrollment. One
+that folds into a file already there keeps that file's settings and takes the
+rest from the fresh enrollment: the identity fields, and `ephemeral`
+(`preserve_operator_config`, `crates/agent-core/src/enrollment.rs:816-829`).
+That covers the three folds of `apply_enrollment`: onto a file with no
+enrollment in it (a one-row Mac person's), a `--replace`, and a re-enrollment
+into the same server and org. Before #4331 a fold kept the old file's flag, so
+a device enrolled again with the other kind of key disagreed with its row.
+
+The answer is the row's nature (`EnrollResponse::ephemeral`,
+`crates/modules/fleet/src/agent.rs:308-311`, answered at `:462`), and a row's
+nature is fixed when the row is made:
+
+| The enrollment | The row it gets | The answer, and so the file |
+|---|---|---|
+| An ephemeral key | a new row, always: the key path is create-only, and a known machine id is a 409 | ephemeral |
+| A standard token, and the machine id has no live row | a new device: a new row, or a removed permanent row brought back as one (`revive`). A removed ephemeral row left nothing | permanent |
+| A standard token, and the machine id's row is live | that row, refreshed, with its nature kept (`rehydrate`, `crates/services/src/dao/agent.rs:254-294`) | what that row is |
+
+A re-enrollment keeps the config's machine id
+(`agents/roomlerd/src/app.rs:2914-2921`), so the live row is the one it finds.
+An ephemeral device that enrolls again with a standard token while its row
+lives therefore stays ephemeral. To make it permanent, remove it first (the
+Devices page, or a clean stop, on which it deletes itself), then enroll it
+again with a standard token: the same config keeps its settings, and the new
+row is permanent. Before #4331 the server answered permanent for that
+refreshed ephemeral row, the token's kind rather than the row's.
+
+`--ephemeral` beside an existing config is still refused
+(`agents/roomlerd/src/app.rs:2905-2913`): the flag mints a random machine id,
+and a fold would put it on a real device's row.
+
+A secondary org (`[[orgs]]`) has no `ephemeral` (`OrgEntry`,
+`crates/agent-core/src/config.rs:1970-2028`). An ephemeral key used to add one
+is not known as ephemeral on the device: a stop removes only the primary's row
+(`agents/roomlerd/src/app.rs:5852-5853`), and the secondary's row goes when the
+reaper, where it runs, finds it silent past its TTL.
+
 ## Quota
 
 An ephemeral device consumes a `max_devices` slot **while it exists** — the
@@ -284,7 +325,9 @@ device left").
   changes anything (#4312, [FR-147](fr/FR-147-root-out-of-homes-macos.md)'s
   "Refusals at Plan"): its restart and its bootout are stops, on which the row
   deletes itself, and a row it retires sits offline for the reaper, so
-  `--revert` could bring neither back.
+  `--revert` could bring neither back. The way on is the same file: remove the
+  row, then enroll that half again with a standard token
+  ([above](#enrolling-again-over-an-existing-config-4331)).
 - Every reap logs
   `ephemeral device reaped` with tenant, device, silence and TTL; every
   self-removal logs `ephemeral device unenrolled itself`. The lifecycle also
