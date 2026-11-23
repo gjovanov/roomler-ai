@@ -6,6 +6,7 @@ runs: the navigator, the pane that shrank around it, and hub-guard 0.4.0–0.4.3
 [FR-131](FR-131-hub-coordinator.md), the hub. The engineering reference is
 [`agent-hub.md` §12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
 and §8 for the view.
+[FR-152](FR-152-cold-hub-continues-from-handoff.md) builds on it in turn: hub-guard's sixth part, `cold`, rotates a hub coordinator whose cache went cold ([`agent-hub.md` §12.5](../agent-hub.md#125-the-cold-rotation)).
 
 ## Problem / Goal
 
