@@ -802,7 +802,7 @@ async fn the_exec_policy_and_the_exec_switch_decide_their_bit_before_a_body_that
                 &app,
                 "a member without the bit",
                 &seeded.member.access_token,
-                Gate::Bit(*bit),
+                Gate::Bit(bit),
                 write,
             )
             .await,

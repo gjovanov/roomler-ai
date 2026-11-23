@@ -395,7 +395,7 @@ async fn the_key_writes_decide_their_bit_before_a_body_that_does_not_parse() {
                 &app,
                 "a member without the bit",
                 &t.member.access_token,
-                Gate::Bit(*bit),
+                Gate::Bit(bit),
                 write,
             )
             .await,
