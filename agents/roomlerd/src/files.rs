@@ -9752,7 +9752,34 @@ mod seat_user_tests {
             fn began(&self) -> usize {
                 self.0.began.load(Ordering::SeqCst)
             }
+
+            /// The lookups begun, once `want` of them have, waited for
+            /// `within` at most. A lookup counts when its own thread runs
+            /// it, and an ask can answer before that thread has run: once
+            /// its wait is out. So a count read straight after the asks can
+            /// miss a lookup they started (#4138). The caller asserts the
+            /// exact count, so one lookup more than `want` still fails.
+            fn began_within(&self, want: usize, within: std::time::Duration) -> usize {
+                let deadline = std::time::Instant::now() + within;
+                loop {
+                    let began = self.began();
+                    if began >= want {
+                        return began;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{began} of {want} lookups began within {within:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
+
+        /// How long a test waits for the lookups it started to begin
+        /// (#4138): far longer than a busy runner takes to schedule a
+        /// thread. A count already there returns at once, so only a lookup
+        /// that never begins waits this out.
+        const BEGINS: std::time::Duration = std::time::Duration::from_secs(10);
 
         /// #3796 — releases its [`Held`] lookup when dropped, so a failed
         /// assertion leaves no lookup held.
@@ -9825,7 +9852,7 @@ mod seat_user_tests {
                 assert_eq!(who, FsAs::CannotTell, "at once {n}");
             }
             assert_eq!(
-                held.began(),
+                held.began_within(1, BEGINS),
                 1,
                 "seven asked while the lookup hung: one lookup between them, not a held thread each"
             );
@@ -9941,7 +9968,7 @@ mod seat_user_tests {
             }
             assert_eq!(std::fs::read(&path).unwrap(), saved_before, "nothing saved");
             assert_eq!(
-                held.began(),
+                held.began_within(1, BEGINS),
                 1,
                 "six sets while the lookup hung: one lookup between them, not a held thread each"
             );

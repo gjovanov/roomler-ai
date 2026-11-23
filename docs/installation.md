@@ -2207,7 +2207,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
 what the installed daemon reports. Both lines are information for the person and for the labs that
 read this output. Neither is a verification, and neither changes a command the script runs or its
-exit code (`scripts/install.sh:2113-2192`):
+exit code (`scripts/install.sh:2125-2204`):
 
 ```text
 ==> resolving the latest roomlerd release from https://roomler.ai
@@ -2263,7 +2263,7 @@ flowchart TD
 
 | Rule | Where | Why |
 |---|---|---|
-| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2279` | the shell has read every byte before the first command runs |
+| The whole script, below the header's comments, is one function, `main` | `scripts/install.sh:94` to `:2291` | the shell has read every byte before the first command runs |
 | Its first statement is `exec </dev/null` | `:94` | what it starts reads an end of file in every mode: piped, from a file (where stdin would be the person's keystrokes) and from the wizard |
 | The last line, `main "$@"`, is its only call, and nothing follows it | `:2267` | dash runs bytes that arrive in the same read as the call, and any shell runs them from a file |
 | Its last statement is `exit` | `:2265` | a byte after the last line never runs, whatever path `main` takes |
@@ -2724,7 +2724,7 @@ The stop also says how to go on, in Terminal, naming only what works on that Mac
 | The Mac | The stop offers | Why |
 |---|---|---|
 | any one-row Mac | remove Roomler with `curl -fsSL <the chosen server>/api/setup/install.sh \| sh -s -- --uninstall` ([Uninstall](#uninstall-every-platform)), then start Setup again | the road to a fresh enrollment, for example after the row was deleted (launchd starts the daemon again after its exit 7, so the stop can still show); it names no layout, since what Setup installs then is its own form's choice |
-| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:66-84`, `:3043-3048`); with no copy the revert says only "nothing to revert" (`:3078-3083`), so it is not offered there |
+| a Mac `sudo roomlerd one-row` made one row, while root's copy from before (`/etc/roomler/config.toml.pre-one-row`) is there | also `sudo roomlerd one-row --revert`, which puts back the rows it had, except one deleted since | only that command writes the copy, and a finished revert removes it (`agents/roomlerd/src/one_row.rs:66-84`, `:3059-3064`); with no copy the revert says only "nothing to revert" (`:3094-3099`), so it is not offered there |
 
 A wizard started as root (`sudo` from Terminal, the only root road: it never
 elevates itself on a Mac, and the administrator prompt runs `install.sh`'s
@@ -2909,8 +2909,8 @@ the stricter of the person's and its own.
 Each org's row says what the worker has told the daemon from the connection's first
 message on (#3992). The hello and the heartbeat announce one snapshot: the worker's
 permissions, what it can record, its Remote Apps words and its audio, and the stricter
-`rc_*` floor ([`signaling.rs:7091`](../agents/roomlerd/src/signaling.rs#L7091)), built
-into the caps by one function ([`:7139`](../agents/roomlerd/src/signaling.rs#L7139)).
+`rc_*` floor ([`signaling.rs:7101`](../agents/roomlerd/src/signaling.rs#L7101)), built
+into the caps by one function ([`:7149`](../agents/roomlerd/src/signaling.rs#L7149)).
 So a worker that has spoken before the hello, as it had 0.1 to 0.4 s before it on both
 restarts of the daemon measured in #3992, is on the row at once, rather than the root's
 own `no-gui-session` for the 30 s until the first heartbeat. A word the worker says after
@@ -2951,7 +2951,7 @@ that person's own process: `roomlerd one-row-home <verb>`, the package's binary
 (`/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`), which root starts with the
 person's uid, primary gid and no other group, an empty environment and `/` as its folder,
 one per account in uid order, 30 s each, and which checks its own identity before it
-touches anything (`agents/roomlerd/src/one_row.rs:3357`,
+touches anything (`agents/roomlerd/src/one_row.rs:3373`,
 `agents/roomlerd/src/one_row_home.rs:3-61`). Root keeps its own copies and records in
 its own tree: `/etc/roomler/config.toml.pre-one-row` and `/etc/roomler/one-row/`
 (root:wheel 700, files 600: `root.json` and one folder per uid, its `record.json`
@@ -3214,7 +3214,7 @@ console user are skipped and every root row runs as on any install
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:627-630`, `:635`, `:735-738`, `:756`, `:764`, `:777`, `:656`, `:791` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
-| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3357`, `agents/roomlerd/src/one_row_home.rs:3-61` |
+| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:3373`, `agents/roomlerd/src/one_row_home.rs:3-61` |
 | `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:145` |
 
 - **`sudo roomlerd one-row` writes nothing in a home as root (FR-147).** A home whose
@@ -3292,7 +3292,7 @@ console user are skipped and every root row runs as on any install
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
     (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1284-1326`,
     started by `--revert` where that person's `read` reports them,
-    `agents/roomlerd/src/one_row.rs:2595`), the command stages first and
+    `agents/roomlerd/src/one_row.rs:2610`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
     sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
     '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
@@ -4039,7 +4039,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 ### The order is the design
 
 `scripts/install.sh:1525` (the section) — `uninstall_linux` at `:1969`,
-`uninstall_macos` at `:2021`.
+`uninstall_macos` at `:2046`, `uninstall_stop_macos` at `:2006`.
 
 ```mermaid
 flowchart TD
@@ -4056,9 +4056,9 @@ flowchart TD
 
 | Step | Linux | macOS |
 |---|---|---|
-| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1149`) | `com.roomler.update` once it is no longer `state = running`, every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`:1340`) |
-| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1078`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
-| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`:1248`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
+| 1 · stop | `roomler-update.timer` + `.path`, a `roomler-update.service` run still in `SubState=start` waited out, then `roomlerd.service`, then each account's `roomler.service` on its user bus (`stop_unit`, `:1806`) | `com.roomler.update` at once, or, while the process launchd runs for it has an `installer` child, once that child is gone (300 s at most; FR-151 P2), every account's `gui/<uid>/com.roomler.{desktop,agent}`, then `com.roomler.daemon` (`uninstall_stop_macos`, `:2006`) |
+| 1b · sweep | `roomlerd` and `roomler-desktop` by exact name — `pgrep -x`, or `/proc/*/comm` where procps is absent (`stop_leftovers`, `:1735`) | the same; it also reaches a companion opened from Finder, which runs under LaunchServices, out of any bootout's reach |
+| 2 · programs | `dpkg --purge` of the companion, the daemon, the tunnel CLI and the two names the daemon's `.deb` replaced (dependent first, one call); `rpm -e roomler-desktop`; the tarball payload of `scripts/stage-linux-tarball.sh` and the tunnel CLI's `/usr/local/bin` (`remove_tarball_linux`, `:1905`); every account's `roomler.service` enable links and the companion's own autostart entry (`X-Roomler-Managed`) | the two privacy grants, the two LaunchDaemons, every account's LaunchAgents, `/Library/Roomler`, `/Applications/Roomler.app`, `/usr/local/bin/roomler{,d}`, the `com.roomler.*` package receipts |
 | 3 · config | `/etc/roomler`, `/etc/default/roomlerd`, `roomlerd.service.d/`; for the caller (the account behind `sudo`) and root: `~/.config/roomler`, `~/.local/share/roomler`, `~/.local/state/roomler`, the tunnel CLI's tree, the pre-rename trees | `/etc/roomler`, `/var/log/roomler`, the `/tmp` logs; for the caller, the console user and root: `~/Library/Application Support/live.roomler.roomler`, the tunnel CLI's tree, the pre-rename trees |
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
