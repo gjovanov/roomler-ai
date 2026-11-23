@@ -442,7 +442,7 @@ fn worker_elevation_requested() -> bool {
 /// # Safety
 /// `token` must be a valid, live Win32 token handle with `TOKEN_QUERY`
 /// access (the WTSQueryUserToken result qualifies).
-unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
+pub(crate) unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
     let mut ty: TOKEN_ELEVATION_TYPE = 0;
     let mut ret_len: u32 = 0;
     // SAFETY: `&mut ty` is a valid out-buffer of exactly the declared
