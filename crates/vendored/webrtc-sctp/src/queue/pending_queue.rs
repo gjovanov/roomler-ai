@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
-use portable_atomic::{AtomicBool, AtomicUsize};
+use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use tokio::sync::{Mutex, Semaphore};
 // roomler (#3755): a write that waits for room wakes the write loop first,
 // and a begun message holds the lock while it queues its rest.
@@ -77,6 +77,15 @@ pub(crate) struct PendingQueue {
     // roomler (FR-148 P0): `n_bytes` again, and the gauges the association
     // stores under its lock (`Association::gauges`).
     gauges: Arc<GaugeCounters>,
+    // roomler (FR-148 P4b-1, D55): the next chunk's `pending_order`, taken
+    // under `semaphore_lock` at every push, so the stamps follow the writes
+    // across both queues.
+    next_order: AtomicU64,
+    // roomler (FR-148 P4b-1, D55): set when a stream of the association is
+    // marked deadline-limited, never cleared. Then `peek` serves ordered and
+    // unordered messages in the order they were written, where today it
+    // serves the unordered queue first.
+    arrival_order: AtomicBool,
 }
 
 impl Default for PendingQueue {
@@ -106,7 +115,22 @@ impl PendingQueue {
             unordered_is_selected: Default::default(),
             delivery: Default::default(), // roomler (FR-148)
             gauges: Default::default(),   // roomler (FR-148 P0)
+            // roomler (FR-148 P4b-1)
+            next_order: Default::default(),
+            arrival_order: Default::default(),
         }
+    }
+
+    /// roomler (FR-148 P4b-1, D55): from now on, ordered and unordered
+    /// messages leave in the order they were written. Never undone.
+    pub(crate) fn set_arrival_order(&self) {
+        self.arrival_order.store(true, Ordering::SeqCst);
+    }
+
+    /// roomler (FR-148 P4b-1, D55): stamps a chunk with the order the queue
+    /// took it in. The caller holds `semaphore_lock`.
+    fn stamp(&self, c: &mut ChunkPayloadData) {
+        c.pending_order = self.next_order.fetch_add(1, Ordering::Relaxed);
     }
 
     /// roomler (FR-148): the counters this queue and the SACK handler keep.
@@ -234,7 +258,10 @@ impl PendingQueue {
     /// roomler (#3716): queues `c` only if no writer is parked in flow control
     /// and its permits are free now; otherwise hands it back. For a stream's
     /// reset, which must never wait behind a writer the peer may never ack.
-    pub(crate) fn try_push(&self, c: ChunkPayloadData) -> std::result::Result<(), ChunkPayloadData> {
+    pub(crate) fn try_push(
+        &self,
+        mut c: ChunkPayloadData,
+    ) -> std::result::Result<(), ChunkPayloadData> {
         let Ok(_sem_lock) = self.semaphore_lock.try_lock() else {
             return Err(c);
         };
@@ -243,6 +270,7 @@ impl PendingQueue {
             return Err(c);
         };
         permits.forget();
+        self.stamp(&mut c); // roomler (FR-148 P4b-1)
         if c.unordered {
             self.unordered_queue.write().push_back(c);
         } else {
@@ -255,7 +283,7 @@ impl PendingQueue {
 
     /// Appends a chunk to the back of the pending queue. False when the queue
     /// was closed (#3716) before the chunk got its permits; nothing is queued.
-    pub(crate) async fn push(&self, c: ChunkPayloadData) -> bool {
+    pub(crate) async fn push(&self, mut c: ChunkPayloadData) -> bool {
         let user_data_len = c.user_data.len();
 
         {
@@ -266,6 +294,7 @@ impl PendingQueue {
                 return false;
             };
             permits.forget();
+            self.stamp(&mut c); // roomler (FR-148 P4b-1)
 
             if c.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
@@ -407,8 +436,9 @@ impl PendingQueue {
 
     /// roomler (#3755): queues one chunk. The caller holds `semaphore_lock`
     /// and has accounted for its bytes: permits, or the overdraft.
-    fn push_chunk(&self, chunk: ChunkPayloadData) {
+    fn push_chunk(&self, mut chunk: ChunkPayloadData) {
         let user_data_len = chunk.user_data.len();
+        self.stamp(&mut chunk); // roomler (FR-148 P4b-1)
         if chunk.unordered {
             let mut unordered_queue = self.unordered_queue.write();
             unordered_queue.push_back(chunk);
@@ -421,7 +451,10 @@ impl PendingQueue {
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held
-    fn append_unlimited(&self, chunks: Vec<ChunkPayloadData>, total_user_data_len: usize) {
+    fn append_unlimited(&self, mut chunks: Vec<ChunkPayloadData>, total_user_data_len: usize) {
+        for c in &mut chunks {
+            self.stamp(c); // roomler (FR-148 P4b-1)
+        }
         let chunks_len = chunks.len();
         let unordered = chunks
             .first()
@@ -456,6 +489,26 @@ impl PendingQueue {
                 let ordered_queue = self.ordered_queue.read();
                 return ordered_queue.front().cloned();
             }
+        }
+
+        // roomler (FR-148 P4b-1, D55): at a message boundary, the message
+        // written first, ordered or not. Each queue's front is a message's
+        // first chunk here, and only the write loop pops, so the front this
+        // picks is the one `pop` takes.
+        if self.arrival_order.load(Ordering::SeqCst) {
+            let unordered_first = {
+                let unordered = self.unordered_queue.read().front().map(|c| c.pending_order);
+                let ordered = self.ordered_queue.read().front().map(|c| c.pending_order);
+                match (unordered, ordered) {
+                    (Some(u), Some(o)) => u < o,
+                    (u, _) => u.is_some(),
+                }
+            };
+            return if unordered_first {
+                self.unordered_queue.read().front().cloned()
+            } else {
+                self.ordered_queue.read().front().cloned()
+            };
         }
 
         let c = {

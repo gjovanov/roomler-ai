@@ -64,6 +64,15 @@
 #     on `RTCSctpTransport` needs. Both `select!`s poll the stop first
 #     (`biased;`): a stop already set never starts a handshake, and after a
 #     stop the accept loop takes up no further stream.
+#   - src/sctp_transport/mod.rs (FR-148 P4b-1, D55):
+#     `mark_deadline_stream(stream_id)`, which marks a stream of the
+#     association deadline-limited (`Association::mark_deadline_stream`, a
+#     patch of the vendored webrtc-sctp: the order written across ordered and
+#     unordered messages, and a `maxRetransmits: 0` chunk abandoned when it
+#     is lost instead of at its first send), beside `gauges()` and in its
+#     way: it never waits for the slot, and a held slot, no association or a
+#     stream the association does not have answers `false`. Nothing calls it
+#     yet.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only

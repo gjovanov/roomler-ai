@@ -169,6 +169,21 @@ impl PayloadQueue {
         }
     }
 
+    /// roomler (FR-148 P4b-1, D55): `mark_all_to_retrasmit`, leaving out the
+    /// chunks `keep_out` names. A deadline chunk's message may still have
+    /// fragments to send, and `abandoned()` holds only once all are out.
+    pub(crate) fn mark_all_to_retransmit_except(
+        &mut self,
+        keep_out: impl Fn(&ChunkPayloadData) -> bool,
+    ) {
+        for c in self.chunk_map.values_mut() {
+            if c.acked || c.abandoned() || keep_out(c) {
+                continue;
+            }
+            c.retransmit = true;
+        }
+    }
+
     pub(crate) fn get_num_bytes(&self) -> usize {
         self.n_bytes
     }
