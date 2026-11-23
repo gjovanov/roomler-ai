@@ -298,7 +298,7 @@ async fn checkout_rejects_non_owner() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
-/// #4254, ruling R1: a pin, green before #4254's change and after it. The
+/// #4254: a pin, green before #4254's change and after it. The
 /// billing writes are on the gate guard's by-design list: their gate asks
 /// about the org their body names, and their routes carry no org in their
 /// path. What this pins is the rest of the order: a member of the org
@@ -329,7 +329,7 @@ async fn the_checkout_gate_is_decided_before_a_bad_interval() {
     assert!(problem.is_none(), "{problem:?}");
 }
 
-/// #4254, ruling R1: the same pin for the plan change. A member of the org
+/// #4254: the same pin for the plan change. A member of the org
 /// without MANAGE_TENANT, sending a body that parses and names their own
 /// org, is answered the gate's 403 before a bad `interval` is judged.
 #[tokio::test]
@@ -400,7 +400,7 @@ async fn portal_fails_without_billing_account() {
     assert_eq!(resp.status().as_u16(), 400);
 }
 
-/// #4254, ruling R1: the portal's pin. Its gate asks about the org the body
+/// #4254: the portal's pin. Its gate asks about the org the body
 /// names, and the route carries no org in its path. A member of the org
 /// without MANAGE_TENANT, sending a body that parses and names their own
 /// org, is answered the gate's 403.

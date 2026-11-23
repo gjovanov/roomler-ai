@@ -27,19 +27,19 @@
 //! counts for that handler. So `require_permission`, `require_platform_admin`
 //! and every helper built on them are gates without being named here.
 //!
-//! What it flags today is listed, each entry with its reason, and both lists
-//! may only shrink: an entry the scan no longer flags fails the test until it
-//! is removed.
-//! - [`DEFERRED`]: gated writes outside the network module, fixed by #4254.
-//! - [`BY_DESIGN`]: handlers whose check needs the body, or that read the
-//!   allowlist to shape their answer rather than to refuse.
+//! What it flags today is listed in [`BY_DESIGN`], each entry with its
+//! reason: handlers whose check needs the body, or that read the allowlist to
+//! shape their answer rather than to refuse. The list may only shrink: an
+//! entry the scan no longer flags fails the test until it is removed.
 //!
 //! What it cannot see:
-//! - A check it does not recognise as a gate: an ownership or author check
-//!   (`chat::message::update` is one, #4254), a bit read some other way, a
-//!   gate called as a method, through a closure or a function pointer, inside
-//!   a macro's arguments (`syn` leaves those unparsed), or defined outside the
-//!   scanned crates.
+//! - A check it does not recognise as a gate: an ownership or author check, a
+//!   bit read some other way, a gate called as a method, through a closure or
+//!   a function pointer, inside a macro's arguments (`syn` leaves those
+//!   unparsed), or defined outside the scanned crates. `chat::message::update`
+//!   unwraps its body after its author check since #4254; the scan does not
+//!   see that check, and only its integration test in `room_access_tests.rs`
+//!   shows the order.
 //! - A call it cannot resolve. A call resolves by name: to the function of the
 //!   calling file, else to the one file that defines the name, else to the
 //!   file the path's module segment names (`agent_exec::authorize`). A name
@@ -58,11 +58,6 @@ use std::path::{Path, PathBuf};
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-
-/// #4254 — gated writes outside the network module that still take their body
-/// as `Json<T>`: `(file, function, issue)`. Fix one the #4218 way and remove
-/// its entry; the test fails while a fixed one is still listed.
-const DEFERRED: &[(&str, &str, &str)] = &[];
 
 /// Handlers that read their body before a gate on purpose:
 /// `(file, function, why)`.
@@ -698,16 +693,11 @@ fn every_gated_write_decides_its_gate_before_it_reads_its_body() {
     );
     let found = scan(&files).findings;
 
-    let listed: BTreeSet<(&str, &str)> = DEFERRED
+    let listed: BTreeSet<(&str, &str)> = BY_DESIGN
         .iter()
-        .chain(BY_DESIGN)
         .map(|(file, name, _)| (*file, *name))
         .collect();
-    assert_eq!(
-        listed.len(),
-        DEFERRED.len() + BY_DESIGN.len(),
-        "a handler is listed twice"
-    );
+    assert_eq!(listed.len(), BY_DESIGN.len(), "a handler is listed twice");
     let flagged: BTreeSet<(&str, &str)> = found
         .iter()
         .map(|f| (f.file.as_str(), f.name.as_str()))
@@ -737,8 +727,8 @@ fn every_gated_write_decides_its_gate_before_it_reads_its_body() {
     }
     if !stale.is_empty() {
         problems.push_str(&format!(
-            "listed in DEFERRED or BY_DESIGN, but the scan no longer flags them (fixed, \
-             renamed or gone): remove each entry:\n{}\n",
+            "listed in BY_DESIGN, but the scan no longer flags them (fixed, renamed or \
+             gone): remove each entry:\n{}\n",
             stale.join("\n")
         ));
     }
