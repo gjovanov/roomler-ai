@@ -18,8 +18,8 @@
 //!
 //! 1. a function takes its body as `Json<T>` or `Option<Json<T>>` (both
 //!    extractors answer before the handler runs) and calls a gate, or
-//! 2. a function takes `Result<Json<T>, _>` and uses it in, or before, the
-//!    first statement that calls a gate.
+//! 2. a function takes `Result<Json<T>, _>` or `Result<Option<Json<T>>, _>`
+//!    and uses it in, or before, the first statement that calls a gate.
 //!
 //! A **gate** is a function other than a handler that checks a permission
 //! bit (`permissions::has`) or the platform-operator allowlist
@@ -62,27 +62,7 @@ use syn::visit::Visit;
 /// #4254 — gated writes outside the network module that still take their body
 /// as `Json<T>`: `(file, function, issue)`. Fix one the #4218 way and remove
 /// its entry; the test fails while a fixed one is still listed.
-const DEFERRED: &[(&str, &str, &str)] = &[
-    ("crates/modules/saas/src/newsletter.rs", "create", "#4254"),
-    ("crates/modules/saas/src/newsletter.rs", "send", "#4254"),
-    (
-        "crates/modules/saas/src/newsletter.rs",
-        "test_send",
-        "#4254",
-    ),
-    ("crates/modules/saas/src/newsletter.rs", "update", "#4254"),
-    ("crates/modules/saas/src/stripe.rs", "change_plan", "#4254"),
-    (
-        "crates/modules/saas/src/stripe.rs",
-        "create_checkout",
-        "#4254",
-    ),
-    (
-        "crates/modules/saas/src/stripe.rs",
-        "create_portal",
-        "#4254",
-    ),
-];
+const DEFERRED: &[(&str, &str, &str)] = &[];
 
 /// Handlers that read their body before a gate on purpose:
 /// `(file, function, why)`.
@@ -161,6 +141,24 @@ const BY_DESIGN: &[(&str, &str, &str)] = &[
         "enroll_tunnel_client",
         "the enrollment credential and the machine id are the body: whether a bit is asked \
          depends on the machine it names (`revive_scope`)",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "change_plan",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "create_checkout",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
+    ),
+    (
+        "crates/modules/saas/src/stripe.rs",
+        "create_portal",
+        "its gate asks about the org the body's `tenant_id` names, and the route carries no \
+         org in its path",
     ),
 ];
 
@@ -276,8 +274,9 @@ enum Body {
     /// `Json<T>` or `Option<Json<T>>`: read by the extractor, before the
     /// handler's first line.
     Extracted,
-    /// `Result<Json<T>, _>` bound to this name (`None`: to a pattern the scan
-    /// cannot follow): read where the handler unwraps it.
+    /// `Result<Json<T>, _>` or `Result<Option<Json<T>>, _>` bound to this
+    /// name (`None`: to a pattern the scan cannot follow): read where the
+    /// handler unwraps it.
     Deferred(Option<String>),
 }
 
@@ -304,6 +303,13 @@ fn is_json(ty: &syn::Type) -> bool {
     last_segment(ty).is_some_and(|segment| segment.ident == "Json")
 }
 
+/// `Option<Json<T>>`.
+fn is_optional_json(ty: &syn::Type) -> bool {
+    last_segment(ty).is_some_and(|segment| {
+        segment.ident == "Option" && first_type_argument(segment).is_some_and(is_json)
+    })
+}
+
 fn body(argument: &syn::FnArg) -> Option<Body> {
     let syn::FnArg::Typed(typed) = argument else {
         return None;
@@ -316,7 +322,7 @@ fn body(argument: &syn::FnArg) -> Option<Body> {
     if segment.ident == "Option" && is_json(inner) {
         return Some(Body::Extracted);
     }
-    if segment.ident == "Result" && is_json(inner) {
+    if segment.ident == "Result" && (is_json(inner) || is_optional_json(inner)) {
         let name = match &*typed.pat {
             syn::Pat::Ident(binding) => Some(binding.ident.to_string()),
             _ => None,
