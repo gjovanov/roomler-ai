@@ -7,6 +7,8 @@
 // empty: mounted or opened for org B after org A's page had loaded them, it
 // named, listed or offered org A's rows. A component whose org can change in
 // place (a prop) must follow it, and a late answer for org A must not land.
+// The audit logs, last, are Shape 1 as well: each loaded its log once, on
+// mount.
 //
 // Every store is real and the API answers per org, so what a component shows
 // is what its store holds for the org it was asked for.
@@ -28,6 +30,8 @@ import RoleAssignDialog from '@/components/rooms/RoleAssignDialog.vue'
 import KeepBusyHistorySection from '@/components/admin/KeepBusyHistorySection.vue'
 import ExecAuditSection from '@/components/admin/ExecAuditSection.vue'
 import SshAuditSection from '@/components/admin/SshAuditSection.vue'
+import SshActivitySection from '@/components/admin/SshActivitySection.vue'
+import ExternalAuditSection from '@/components/admin/ExternalAuditSection.vue'
 import ExecPolicyDialog from '@/components/admin/ExecPolicyDialog.vue'
 import SshPolicyDialog from '@/components/admin/SshPolicyDialog.vue'
 import { useRoleStore } from '@/stores/role'
@@ -140,7 +144,7 @@ function answer(path: string): unknown {
             request_id: `${org.tag} request`,
             source: 'cli',
             shell: 'sh',
-            command: 'uptime',
+            command: `${org.tag} uptime`,
             at: '2026-11-01T12:00:00.000Z',
             exit_code: 0,
           },
@@ -155,10 +159,52 @@ function answer(path: string): unknown {
             tenant_id: tenant,
             agent_id: org.agent,
             user_id: org.user,
-            source: 'cli',
+            source: `${org.tag} cli`,
             caller: org.user,
             account_mode: 'daemon',
             at: '2026-11-01T12:00:00.000Z',
+          },
+        ],
+        total: 1,
+      }
+    case 'ssh-activity':
+      return {
+        items: [
+          {
+            id: `${org.tag} activity`,
+            agent_id: org.agent,
+            caller: `ssh:${org.lead}@node:22`,
+            kind: 'exec',
+            detail: `${org.tag} uptime`,
+            allowed: true,
+            at: '2026-11-01T12:00:00.000Z',
+          },
+        ],
+        total: 1,
+      }
+    case 'external-rc-audit':
+      return {
+        items: [
+          {
+            id: `${org.tag} external`,
+            action: 'login',
+            agent_id: org.agent,
+            user_id: org.user,
+            actor: `${org.tag} visitor`,
+            at: '2026-11-01T12:00:00.000Z',
+          },
+        ],
+        total: 1,
+      }
+    case 'external-principals':
+      return {
+        items: [
+          {
+            agent_id: org.agent,
+            user_id: org.user,
+            name: `${org.tag} outsider`,
+            first_session_at: '2026-11-01T12:00:00.000Z',
+            last_session_at: '2026-11-01T12:00:00.000Z',
           },
         ],
         total: 1,
@@ -176,14 +222,17 @@ function answer(path: string): unknown {
 interface Held {
   match: (path: string) => boolean
   taken: boolean
+  /** The server refuses it, with this message, instead of answering. */
+  fail?: string
   release: () => void
 }
 let held: Held[] = []
 
-function hold(match: (path: string) => boolean): Held {
+function hold(match: (path: string) => boolean, fail?: string): Held {
   const h: Held = {
     match,
     taken: false,
+    fail,
     release: () => {
       throw new Error('the held GET was never sent')
     },
@@ -232,6 +281,8 @@ beforeEach(() => {
   pinia = createPinia()
   setActivePinia(pinia)
   vi.clearAllMocks()
+  // A test that holds a PUT gives it an implementation: clearAllMocks keeps it.
+  mockApi.put.mockReset()
   held = []
   unexpected = []
   raised = []
@@ -239,8 +290,8 @@ beforeEach(() => {
     const h = held.find((x) => !x.taken && x.match(path))
     if (!h) return answer(path) as never
     h.taken = true
-    return new Promise((resolve) => {
-      h.release = () => resolve(answer(path) as never)
+    return new Promise((resolve, reject) => {
+      h.release = () => (h.fail ? reject(new Error(h.fail)) : resolve(answer(path) as never))
     })
   })
   // The caller owns both orgs: every org setting is theirs to read.
@@ -522,6 +573,219 @@ describe("The exec and SSH policy dialogs: the org's people (#4257)", () => {
     await settle()
     expect(asked().slice(since)).toContain(`/tenant/${ORG_B}/member`)
     expect(offeredUsers(w)).toEqual([B.user])
+    expectNothingRaised()
+    w.unmount()
+  })
+})
+
+describe('The audit logs: the org changes (#4257)', () => {
+  // Shape 1. Each log is a routed section (`props: true`), so a change of org
+  // in the URL (back and forward, a link) reuses it with a new `tenantId`.
+  // Each loaded once, on mount: it went on listing org A's log under org B,
+  // and an answer for org A that landed late replaced whatever was there.
+  type Org = ReturnType<typeof makeOrg>
+  interface Log {
+    name: string
+    /** The log's GET, after the org. */
+    route: string
+    /** Text only org `o`'s row shows, whichever org's people the store holds. */
+    row: (o: Org) => string
+    /** It names people from the org's members. */
+    people: boolean
+    /** It names devices from the org's devices, which it loads itself. */
+    devices: boolean
+    mountAt: (tenantId: string) => VueWrapper
+  }
+  const at = (tenantId: string) => ({
+    props: { tenantId },
+    global: globalOpts(),
+    attachTo: document.body,
+  })
+  const LOGS: Log[] = [
+    {
+      name: 'ExecAuditSection',
+      route: 'exec-audit',
+      row: (o) => `${o.tag} uptime`,
+      people: true,
+      devices: false,
+      mountAt: (t) => mount(ExecAuditSection, at(t)),
+    },
+    {
+      name: 'SshAuditSection',
+      route: 'ssh-audit',
+      row: (o) => `${o.tag} cli`,
+      people: true,
+      devices: false,
+      mountAt: (t) => mount(SshAuditSection, at(t)),
+    },
+    {
+      name: 'SshActivitySection',
+      route: 'ssh-activity',
+      row: (o) => `${o.tag} uptime`,
+      people: false,
+      devices: false,
+      mountAt: (t) => mount(SshActivitySection, at(t)),
+    },
+    {
+      name: 'ExternalAuditSection',
+      route: 'external-rc-audit',
+      row: (o) => `${o.tag} visitor`,
+      people: false,
+      devices: true,
+      mountAt: (t) => mount(ExternalAuditSection, at(t)),
+    },
+  ]
+  const toOrgB = (w: VueWrapper) =>
+    w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
+
+  for (const log of LOGS) {
+    it(`${log.name} follows its org: asks for org B's log, and lists only org B's rows`, async () => {
+      const w = log.mountAt(ORG_A)
+      await settle()
+      expect(w.text()).toContain(log.row(A))
+
+      const since = asked().length
+      await toOrgB(w)
+      await settle()
+      const after = asked().slice(since)
+      expect(after.filter(getOf(ORG_B, `${log.route}?`))).toHaveLength(1)
+      expect(after.filter((p) => p.includes(ORG_A))).toEqual([])
+      if (log.people) expect(after).toContain(`/tenant/${ORG_B}/member`)
+      if (log.devices) expect(after).toContain(`/tenant/${ORG_B}/agent?per_page=100`)
+      expect(w.text()).toContain(log.row(B))
+      expect(w.text()).not.toContain(log.row(A))
+      if (log.people) expect(w.text()).toContain(B.lead)
+      expectNothingRaised()
+      w.unmount()
+    })
+
+    it(`${log.name} drops org A's log when it answers after the change`, async () => {
+      const late = hold(getOf(ORG_A, `${log.route}?`))
+      const w = log.mountAt(ORG_A)
+      await settle()
+      expect(late.taken).toBe(true)
+
+      await toOrgB(w)
+      await settle()
+      late.release()
+      await settle()
+      expect(w.text()).toContain(log.row(B))
+      expect(w.text()).not.toContain(log.row(A))
+      expectNothingRaised()
+      w.unmount()
+    })
+
+    it(`${log.name} shows no error for org A's refusal that lands after the change`, async () => {
+      const late = hold(getOf(ORG_A, `${log.route}?`), 'org A refused')
+      const w = log.mountAt(ORG_A)
+      await settle()
+      expect(late.taken).toBe(true)
+
+      await toOrgB(w)
+      await settle()
+      late.release()
+      await settle()
+      expect(w.text()).not.toContain('org A refused')
+      expect(w.text()).toContain(log.row(B))
+      expectNothingRaised()
+      w.unmount()
+    })
+
+    it(`${log.name} lists none of org A's rows while org B's are on their way`, async () => {
+      const w = log.mountAt(ORG_A)
+      await settle()
+      expect(w.text()).toContain(log.row(A))
+
+      const next = hold(getOf(ORG_B, `${log.route}?`))
+      await toOrgB(w)
+      await settle()
+      expect(next.taken).toBe(true)
+      expect(w.text()).not.toContain(log.row(A))
+      next.release()
+      await settle()
+      expect(w.text()).toContain(log.row(B))
+      expectNothingRaised()
+      w.unmount()
+    })
+  }
+})
+
+describe("The external audit page's people card: the org changes (#4257)", () => {
+  // ExternalPeopleCard is the top of the external audit page, mounted with the
+  // page's org as a prop. It loaded the org's outsiders once, on mount, so
+  // under org B it went on listing org A's people, each with a Bar button.
+  const people = () =>
+    [...document.querySelectorAll('[data-testid="external-person"]')]
+      .map((r) => r.textContent ?? '')
+      .join('\n')
+  const mountPage = (tenantId: string) =>
+    mount(ExternalAuditSection, {
+      props: { tenantId },
+      global: globalOpts(),
+      attachTo: document.body,
+    })
+  const toOrgB = (w: VueWrapper) =>
+    w.setProps({ tenantId: ORG_B } as unknown as Parameters<typeof w.setProps>[0])
+
+  it("asks for org B's people, and lists only org B's", async () => {
+    const w = mountPage(ORG_A)
+    await settle()
+    expect(people()).toContain('Org A outsider')
+
+    const since = asked().length
+    await toOrgB(w)
+    await settle()
+    const after = asked().slice(since)
+    expect(after.filter(getOf(ORG_B, 'external-principals?'))).toHaveLength(1)
+    expect(after.filter((p) => p.includes(ORG_A))).toEqual([])
+    expect(people()).toContain('Org B outsider')
+    expect(people()).not.toContain('Org A outsider')
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it("drops org A's people when they answer after the change", async () => {
+    const late = hold(getOf(ORG_A, 'external-principals?'))
+    const w = mountPage(ORG_A)
+    await settle()
+    expect(late.taken).toBe(true)
+
+    await toOrgB(w)
+    await settle()
+    late.release()
+    await settle()
+    expect(people()).toContain('Org B outsider')
+    expect(people()).not.toContain('Org A outsider')
+    expectNothingRaised()
+    w.unmount()
+  })
+
+  it('a Bar sent under org A and refused after the change shows nothing under org B', async () => {
+    let refuse: (e: Error) => void = () => {
+      throw new Error('the Bar was never sent')
+    }
+    mockApi.put.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          refuse = reject
+        }),
+    )
+    const w = mountPage(ORG_A)
+    await settle()
+    await w.find('[data-testid="external-bar"]').trigger('click')
+    await settle()
+    expect(mockApi.put).toHaveBeenCalledWith(
+      `/tenant/${ORG_A}/agent/${A.agent}/external-principals/${A.user}`,
+      { revoked: true },
+    )
+
+    await toOrgB(w)
+    await settle()
+    refuse(new Error('org A refused'))
+    await settle()
+    expect(w.text()).not.toContain('org A refused')
+    expect(people()).toContain('Org B outsider')
+    expect(people()).not.toContain('Org A outsider')
     expectNothingRaised()
     w.unmount()
   })
