@@ -823,7 +823,7 @@ client of it would have black-holed.
   known issues); an exit node forwards for any approved client in its tenant.
 - **Approval reaches clients at once; the OFFER needs a re-join.** The approve
   and exit-node toggles re-fan the node to its peers immediately
-  (`crates/modules/network/src/routes/overlay_route.rs:350`, `:423`, through
+  (`crates/modules/network/src/routes/overlay_route.rs:356`, `:433`, through
   `overlay::refan_node`, `crates/modules/network/src/overlay.rs:1579`), so no
   client re-joins. What does is the exit node itself: the server refuses to
   approve `/0` on a node that has not advertised it, so set

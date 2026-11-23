@@ -280,6 +280,82 @@ async fn the_switch_is_off_by_default_and_its_write_is_strict() {
     assert_eq!(got["mode"], "enforce", "{got}");
 }
 
+/// #4218 — the switch's write decides `MANAGE_AGENTS` before it reads its
+/// body at all: a member without the bit gets the one 403 `forbidden` for a
+/// body that does not even parse, the answer a body the route reads gets, and
+/// someone outside the org the one `not_a_member`. While the write took
+/// `Json<T>` as an extractor, axum answered such a body before the handler
+/// ran, with a 400, 415 or 422 decided by the body alone.
+#[tokio::test]
+async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems,
+    };
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr40p2a-unparsed").await;
+    let other = app.seed_tenant("fr40p2a-unparsed-b").await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: format!("/api/tenant/{}/overlay-retired-keys", t.tenant_id),
+        reads: json!({ "mode": "off" }),
+        refused_field: r#"{"mode": 7}"#,
+    };
+
+    let mut wrong = gate_problems(
+        &app,
+        "a member without the bit",
+        &t.member.access_token,
+        Gate::Bit("MANAGE_AGENTS"),
+        &write,
+    )
+    .await;
+    wrong.extend(
+        gate_problems(
+            &app,
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+            &write,
+        )
+        .await,
+    );
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4218's control. A holder of the bit is answered a body that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words, and the switch stays as it was.
+#[tokio::test]
+async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_network::routes::overlay_key::SetRetiredKeyModeBody;
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr40p2a-unparsed-holder").await;
+    let path = format!("/api/tenant/{}/overlay-retired-keys", t.tenant_id);
+
+    let wrong = holder_problems::<SetRetiredKeyModeBody>(
+        &app,
+        &t.admin.access_token,
+        "PUT",
+        &path,
+        r#"{"mode": 7}"#,
+    )
+    .await;
+    assert_no_problems("a holder of the bit", &wrong);
+
+    let got: Value = app
+        .auth_get(&path, &t.admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["mode"], "off", "{got}");
+}
+
 /// The ledger records in every mode, from day one: a join under a new key
 /// retires the old one, once, and `off` still admits a retired key exactly as
 /// before P2 (a rollback join) — retiring the key it leaves behind.

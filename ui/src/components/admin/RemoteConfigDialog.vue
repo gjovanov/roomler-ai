@@ -221,7 +221,7 @@
           list, never turn a new stage on early, so no extra permission bit; it
           applies from the device's next session, with no restart. Turning a new
           stage on early is the device's own setting, and cannot be pushed. A
-          device whose agent predates this key ignores it and reports the push
+          device whose roomlerd predates this key ignores it and reports the push
           applied.
         </div>
         <!-- FR-130 P1b — four states, because a tribool key has three and a
@@ -241,7 +241,7 @@
           Whether the device's encoders tell the decoder the colour (BT.601,
           limited range) they converted with. <strong>Off</strong> is the
           kill switch for a viewer or player that misreads it: the stream goes
-          back to what agents sent before. Cleared = not managed, and the
+          back to what roomlerd sent before. Cleared = not managed, and the
           device keeps its own value, so after an Off choose the default
           before you stop managing it. It grants nothing, so no extra
           permission bit; takes effect at the next daemon restart.
@@ -464,14 +464,14 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
         type: 'info',
         icon: 'mdi-help-circle-outline',
         title: 'This device cannot report back',
-        detail: `Agent ${agent.value?.agent_version ?? '?'} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
+        detail: `roomlerd ${agent.value?.agent_version ?? '?'} understands a pushed configuration but not how to say what it did with it. It may well have applied this — there is no way to tell from here. Update the device to find out.`,
       }
     case 'push_unsupported':
       return {
         type: 'warning',
         icon: 'mdi-update',
         title: 'This device is too old',
-        detail: `Agent ${agent.value?.agent_version ?? '?'} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
+        detail: `roomlerd ${agent.value?.agent_version ?? '?'} predates remote configuration, so nothing is sent to it at all. Update it, or set these keys on the host directly.`,
       }
     default:
       return null
@@ -572,13 +572,13 @@ const colorDescriptionChoice = computed({
   },
 })
 const colorDescriptionOptions = [
-  { title: 'Off: no colour description, as earlier agents sent', value: 'off' },
+  { title: 'Off: no colour description, as earlier roomlerd versions sent', value: 'off' },
   { title: 'On: describe the colour', value: 'on' },
   { title: 'The device’s built-in default (on)', value: 'default' },
 ]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
-  { title: 'The daemon account (root, or on Windows the agent\'s own)', value: 'daemon' },
+  { title: 'The daemon account (root, or on Windows roomlerd\'s own)', value: 'daemon' },
 ]
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)

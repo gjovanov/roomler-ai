@@ -109,8 +109,8 @@ of a grant, never the lookup.
 | add a member with roles, `POST …/member` | `INVITE_MEMBERS` | 404, the same two checks (`TenantDao::add_member`, `tenant.rs:520`) |
 | create an invite, `POST …/invite`, `…/invite/batch` | `INVITE_MEMBERS` | 404, `check_grant_roles` |
 | redeem an invite, `POST /api/invite/{code}/accept` or registering with its code | the invitee | the invite's roles the org still has (`redeemed_role_ids`, `crates/api/src/routes/invite.rs:166`). If none is left, 409 `conflict` and nothing is spent: the inviter sends a new invite. An invite that names no role gives `member` |
-| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:1581`, `crates/modules/fleet/src/agent_exec.rs:996`, `crates/modules/network/src/routes/agent_ssh.rs:1006`) |
-| a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:967`, `:1051`) |
+| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:1581`, `crates/modules/fleet/src/agent_exec.rs:996`, `crates/modules/network/src/routes/agent_ssh.rs:1012`) |
+| a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:972`, `:1056`) |
 | an overlay ACL rule's `RoleId` source, `POST`/`PUT …/overlay-acl` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/overlay_policy.rs:203`, `:262`) |
 
 A role named by a member-row write is an object the request resolves in the org,
@@ -144,19 +144,19 @@ org-relay grants, so a change of who holds which role reaches the nodes when the
 are recompiled. Every write that changes it (assign, unassign, delete, adding a
 member, an invite's redemption, registration with an invite) calls
 `HookRegistry::org_roles_changed` (`crates/core/src/hooks.rs:366`) after its write.
-The network module's hook (`crates/modules/network/src/membership.rs:82`) re-fans the
+The network module's hook (`crates/modules/network/src/membership.rs:85`) re-fans the
 org 750 ms later, and only while the org's overlay ACL is `warn` or `enforce`
 (`refan_for_role_change`, `crates/modules/network/src/routes/overlay_policy.rs:346`):
 under `off` a role shapes nothing. The request never waits for the re-fan.
 
-⚠️ **One re-fan per org at a time** (`RefanQueue`, `membership.rs:130`). A re-fan
+⚠️ **One re-fan per org at a time** (`RefanQueue`, `membership.rs:133`). A re-fan
 reads on the order of N² rows for an org of N nodes, so runs that overlapped for one
 org would multiply on a shared pod. A change that arrives while a re-fan waits out
 the 750 ms joins it. Changes that arrive while one runs only mark one more run owed:
 the run in progress finishes, then exactly one more starts, whatever the number of
 changes. The mark is cleared before a run reads anything, so every change is
 followed by a run that started after it. A worker that
-panics clears its org's mark as it unwinds (`WorkerMark`, `membership.rs:200`), so
+panics clears its org's mark as it unwinds (`WorkerMark`, `membership.rs:203`), so
 the next change starts a new one.
 
 ## 2 · The managed roles

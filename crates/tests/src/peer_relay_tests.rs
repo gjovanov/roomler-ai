@@ -151,6 +151,78 @@ async fn org_mode_defaults_off_and_flipping_it_is_an_owner_decision() {
     assert_eq!(s, 403, "MANAGE_AGENTS alone must not flip the org switch");
 }
 
+/// #4218 — gate 1's write decides `MANAGE_TENANT` before it reads its body
+/// at all: a member without the bit (an org admin, who holds `MANAGE_AGENTS`,
+/// too) gets the one 403 `forbidden` for a body that does not even parse, the
+/// answer a body the route reads gets, and someone outside the org the one
+/// `not_a_member`. While the switch took `Json<T>` as an extractor, axum
+/// answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone.
+#[tokio::test]
+async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+    use crate::tunnel_policy_permission_tests::{
+        Gate, GatedWrite, assert_no_problems, gate_problems, person_with_role,
+    };
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("relaymode-unparsed").await;
+    let other = app.seed_tenant("relaymode-unparsed-b").await;
+    let org_admin = person_with_role(&app, &seeded, "orgadmin", "admin").await;
+    // An enum takes an unknown variant for the 422 kind: a number where an
+    // enum belongs is a syntax error to serde_json (400).
+    let write = GatedWrite {
+        method: "PUT",
+        path: url(&seeded, "/peer-relay"),
+        reads: json!({ "mode": "off" }),
+        refused_field: r#"{"mode": "loud"}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &seeded.member.access_token,
+            Gate::Bit("MANAGE_TENANT"),
+        ),
+        (
+            "an org admin",
+            &org_admin.access_token,
+            Gate::Bit("MANAGE_TENANT"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, gate, &write).await);
+    }
+    assert_no_problems("answered before the bit", &wrong);
+}
+
+/// #4218's control. The owner is answered a body that does not parse exactly
+/// as axum's `Json` extractor answers it, the status and the plain-text
+/// words, and the switch stays off.
+#[tokio::test]
+async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use crate::tunnel_policy_permission_tests::{assert_no_problems, holder_problems};
+    use roomler_ai_mod_network::routes::peer_relay::PeerRelayModeBody;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("relaymode-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let settings = url(&seeded, "/peer-relay");
+
+    let wrong =
+        holder_problems::<PeerRelayModeBody>(&app, owner, "PUT", &settings, r#"{"mode": "loud"}"#)
+            .await;
+    assert_no_problems("a holder of the bit", &wrong);
+
+    let (s, body) = get(&app, &settings, owner).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["mode"], json!("off"), "{body}");
+}
+
 /// Gate 3 and its audit. `DEFAULT_ADMIN` carries `MANAGE_AGENTS` but
 /// deliberately not `EXEC_DEVICE`; approving a relay needs both, clearing one
 /// needs only the first, and EVERY attempt — granted or refused — is a row.

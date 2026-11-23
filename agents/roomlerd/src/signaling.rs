@@ -1349,15 +1349,7 @@ pub async fn run(
                 // sentinel is primary-only; a secondary org's auth death
                 // is surfaced via the LocalAPI `OrgStatus` + logs.
                 if auth_failures == 3 && ctx.is_primary {
-                    let msg = "Roomler agent: re-enrollment required.\n\n\
-                              The server is rejecting this agent's token. \
-                              Either the device was removed or re-enrolled \
-                              elsewhere, or its token expired and could not \
-                              be renewed. Run:\n\n\
-                              \troomlerd re-enroll --token <new-jwt>\n\n\
-                              with a fresh enrollment JWT from the admin UI \
-                              to restore service.";
-                    match notify::raise_attention_with_reason(notify::REASON_AUTH, msg) {
+                    match notify::raise_attention_with_reason(notify::REASON_AUTH, AUTH_NOTICE) {
                         Ok(path) => warn!(
                             path = %path.display(),
                             "wrote needs-attention sentinel"
@@ -1406,13 +1398,7 @@ pub async fn run(
                 // systemd never restarts exit 7.
                 let after =
                     crate::service::Install::detect(remote_cfg.config_path()).after_removal();
-                let body = format!(
-                    "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
-                     The agent will not reconnect. Re-enrol with a fresh enrollment \
-                     JWT from the admin UI:\n\n\
-                     \troomlerd re-enroll --token <new-jwt>\n\n\
-                     {after}"
-                );
+                let body = goodbye_notice(reason, &message, after);
                 match notify::raise_attention_machine_aware_with_reason(
                     notify::REASON_GOODBYE,
                     &body,
@@ -1667,15 +1653,7 @@ pub(crate) fn replaced_backoff_for(displacements: usize) -> Duration {
 /// The ReplacedByNewer operator sentinel — written once per storm (at the
 /// 3rd displacement in the window), whether or not the legacy exit is on.
 fn write_replaced_sentinel(message: &str, displacements: usize) {
-    let body = format!(
-        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
-         This connection has been displaced {displacements} times in the current \
-         window — another process (different physical host with a copy of this \
-         config.toml, or a stale half-open connection through a TLS-inspecting \
-         middlebox) is using the same agent_id. The agent stays up and backs \
-         off; if this persists, stop the duplicate or re-enrol THIS host with \
-         a fresh enrollment JWT to mint a new agent_id."
-    );
+    let body = replaced_notice(message, displacements);
     match notify::raise_attention_machine_aware_with_reason(notify::REASON_DUPLICATE, &body) {
         Ok(path) => warn!(
             path = %path.display(),
@@ -1687,6 +1665,28 @@ fn write_replaced_sentinel(message: &str, displacements: usize) {
             "failed to write needs-attention sentinel for ReplacedByNewer escalation"
         ),
     }
+}
+
+/// FR-133 — what this loop's sentinels say, held here so a test reads each one whole.
+pub(crate) const AUTH_NOTICE: &str = "roomlerd: re-enrollment required.\n\nThe server is rejecting this \
+    device's token. Either the device was removed or re-enrolled elsewhere, or its token expired and \
+    could not be renewed. Run:\n\n\troomlerd re-enroll --token <new-jwt>\n\nwith a fresh enrollment \
+    JWT from the admin UI to restore service.";
+pub(crate) fn goodbye_notice(reason: AgentCloseReason, message: &str, after: &str) -> String {
+    let why = notify::goodbye_words(reason);
+    format!(
+        "roomlerd: server-side close — {why}.\n\n{message}\n\nThe daemon will not reconnect. Re-enrol \
+         with a fresh enrollment JWT from the admin UI:\n\n\troomlerd re-enroll --token <new-jwt>\n\n{after}"
+    )
+}
+pub(crate) fn replaced_notice(message: &str, displacements: usize) -> String {
+    format!(
+        "roomlerd: duplicate-instance duel detected.\n\n{message}\n\nThis connection has been displaced \
+         {displacements} times in the current window — another process (different physical host with a \
+         copy of this config.toml, or a stale half-open connection through a TLS-inspecting middlebox) is \
+         using the same agent_id. The daemon stays up and backs off; if this persists, stop the duplicate \
+         or re-enrol THIS host with a fresh enrollment JWT to mint a new agent_id."
+    )
 }
 
 /// #1750 — a SECONDARY org's loop ended because that org's server refuses this
@@ -7974,13 +7974,14 @@ pub(crate) async fn exec_surfaces_up(
     let have_surface = (companion && marker) || notified;
     info!(
         %request_id, native = false, session_panel = prompted.session_panel(), why = prompted.why(),
-        companion, marker, notified, have_surface,
+        panel_busy = prompted.panel_busy(), companion, marker, notified, have_surface,
         "consent prompt surface (exec)"
     );
     if have_surface {
         Shown::Yes
     } else {
-        Shown::No(tray.why_not_shown(marker))
+        // #4164 — a panel busy with another question wins over the app's cause.
+        Shown::No(prompted.why_not_shown(tray.why_not_shown(marker)))
     }
 }
 
@@ -10342,6 +10343,34 @@ mod exec_answer_tests {
                 "withdrawn ({shown:?})"
             );
         }
+    }
+
+    /// #4164 — a window that ran out while a consent panel busy with another
+    /// question kept the command's question from the person says that the
+    /// device's consent panel was showing another question, naming the
+    /// execution policy. The verdict carries it to the window's end. An
+    /// answer, and a question withdrawn, read as they always did.
+    ///
+    /// Red before #4164: a busy panel read "no one at its screen and the
+    /// Roomler desktop app is not running".
+    #[test]
+    fn a_window_a_busy_panel_kept_from_the_person_says_the_panel_was_busy() {
+        let busy = Shown::No(NoSurface::PanelBusy);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(busy).unwrap();
+        assert_eq!(shown_by_now(rx), busy, "a verdict that came");
+        assert_eq!(
+            exec_refusal(Decision::Timeout, busy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's execution policy to auto"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Denied, busy),
+            "the operator at this device did not approve the command (Denied)"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Cancelled, busy),
+            "the operator at this device did not approve the command (Cancelled)"
+        );
     }
 }
 

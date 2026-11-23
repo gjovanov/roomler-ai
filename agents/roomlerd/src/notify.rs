@@ -13,6 +13,7 @@
 pub use roomler_node_core::notify::*;
 
 use anyhow::{Context, Result};
+use roomler_ai_remote_control::signaling::AgentCloseReason;
 use std::path::PathBuf;
 
 // RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
@@ -104,6 +105,18 @@ pub fn raise_rollback_attention(message: &str, failed_version: &str) -> Result<P
         "raised rollback_failed sentinel"
     );
     Ok(written)
+}
+
+/// FR-133 — why the server closed this connection for good, as a goodbye notice
+/// says it. The reason's own names (`AgentDeleted`) are wire values, not words a
+/// person reads. `AgentDeleted` also stands for a quarantined row
+/// (`auth_agent::refusal_reason`), which an admin can lift, so it says both.
+pub fn goodbye_words(reason: AgentCloseReason) -> &'static str {
+    match reason {
+        AgentCloseReason::AgentDeleted => "the server removed or quarantined this device",
+        AgentCloseReason::PolicyRejected => "the server's policy refuses this device",
+        AgentCloseReason::ReplacedByNewerConnection => "a newer connection replaced this one",
+    }
 }
 
 #[cfg(test)]

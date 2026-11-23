@@ -23,6 +23,16 @@ describe('FR-135 R3 — moveVideoChannelToWorker', () => {
     expect(posts).toEqual([[{ type: 'video-channel', channel }, [channel]]])
   })
 
+  it('moves video-deadline beside it in the same message, both in the transfer list (FR-148 P4b-2)', () => {
+    // Made in the same task, so both can still move; one message, so the
+    // worker's one `video-channel-attached` answers for the pair.
+    const deadline = { label: 'video-deadline', readyState: 'connecting' } as unknown as RTCDataChannel
+    const posts: [unknown, unknown[]][] = []
+    const worker = { postMessage: (m: unknown, t: unknown[]) => void posts.push([m, t]) }
+    expect(moveVideoChannelToWorker(worker, channel, deadline)).toBeNull()
+    expect(posts).toEqual([[{ type: 'video-channel', channel, deadline }, [channel, deadline]]])
+  })
+
   it('leaves the channel on the page, and says why, where the browser cannot transfer one', () => {
     // A browser without transferable channels refuses in postMessage, before
     // anything is detached (HTML's StructuredSerializeWithTransfer).

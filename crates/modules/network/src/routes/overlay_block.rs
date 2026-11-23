@@ -24,7 +24,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
 };
 use bson::{doc, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
@@ -416,15 +416,21 @@ async fn require_block_operator(
 
 /// POST /api/tenant/{tenant_id}/overlay-block/renumber — plan (default) or
 /// perform the tenant's migration onto its own block.
+///
+/// `require_block_operator` is decided before the body is read (#4218): a
+/// caller it refuses gets its answer whatever the body is, and an operator or
+/// a holder is answered a body that does not parse as the `Json` extractor
+/// answered it (`ApiError::JsonBody`).
 pub async fn renumber(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<RenumberRequest>,
+    body: Result<Json<RenumberRequest>, JsonRejection>,
 ) -> Result<Json<RenumberResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     require_block_operator(&state, tid, auth.user_id, "renumber").await?;
+    let Json(body) = body?;
 
     let prefix = body.prefix.unwrap_or(state.settings.overlay.block_prefix);
     if !(OVERLAY_BLOCK_MIN_PREFIX..=OVERLAY_BLOCK_MAX_PREFIX).contains(&prefix) {
@@ -953,14 +959,20 @@ pub struct ReclaimResponse {
 /// Two conditions, both required:
 /// * the block has been quarantined for at least `min_age_days`;
 /// * no live overlay node anywhere holds an address inside it.
+///
+/// The operator check comes before the body is read (#4218), so the route
+/// stays unseen (one 404) to everyone else whatever the body is. An operator
+/// is answered a body that does not parse as the `Json` extractor answered
+/// it (`ApiError::JsonBody`).
 pub async fn reclaim(
     State(state): State<NetworkState>,
     auth: AuthUser,
-    Json(body): Json<ReclaimRequest>,
+    body: Result<Json<ReclaimRequest>, JsonRejection>,
 ) -> Result<Json<ReclaimResponse>, ApiError> {
     if !state.platform_admins.contains(&auth.user_id) {
         return Err(ApiError::NotFound("Not found".to_string()));
     }
+    let Json(body) = body?;
     let min_age_days = body.min_age_days.unwrap_or(DEFAULT_RECLAIM_MIN_AGE_DAYS);
 
     // Every live address in the fleet, once. The registry is global, so the
@@ -1136,15 +1148,22 @@ fn orphaned_ordinals(
 /// ⚠️ Running this twice, a month apart, answers a question nothing else can:
 /// whether the leak is purely historical (pre-2026-07-29 releases) or whether
 /// a live path is still dropping ordinals.
+///
+/// The operator check comes before the body is read (#4218), and the body
+/// before the tenant id, so the route stays unseen (one 404) to everyone else
+/// whatever the body and the id are, and an operator is answered a body that
+/// does not parse as the `Json` extractor answered it (`ApiError::JsonBody`),
+/// whatever the id.
 pub async fn reconcile_hosts(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Json(body): Json<ReconcileHostsRequest>,
+    body: Result<Json<ReconcileHostsRequest>, JsonRejection>,
 ) -> Result<Json<ReconcileHostsResponse>, ApiError> {
     if !state.platform_admins.contains(&auth.user_id) {
         return Err(ApiError::NotFound("Not found".to_string()));
     }
+    let Json(body) = body?;
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("bad tenant id".to_string()))?;
     let network = state.overlay_networks.get_or_create(tid).await?;
@@ -1333,14 +1352,20 @@ pub struct OrphanResponse {
 /// because that path tombstones under a CAS, pools the host ordinal, and fans
 /// `netmap_delta{removes}` to peers. Bypassing it to tidy up would be the same
 /// class of act that created the mess.
+///
+/// The operator check comes before the body is read (#4218), so the route
+/// stays unseen (one 404) to everyone else whatever the body is. An operator
+/// is answered a body that does not parse as the `Json` extractor answered
+/// it (`ApiError::JsonBody`).
 pub async fn orphans(
     State(state): State<NetworkState>,
     auth: AuthUser,
-    Json(body): Json<OrphanRequest>,
+    body: Result<Json<OrphanRequest>, JsonRejection>,
 ) -> Result<Json<OrphanResponse>, ApiError> {
     if !state.platform_admins.contains(&auth.user_id) {
         return Err(ApiError::NotFound("Not found".to_string()));
     }
+    let Json(body) = body?;
 
     let networks = state.overlay_networks.base.find_many(doc! {}, None).await?;
     let scanned = networks.len() as u32;

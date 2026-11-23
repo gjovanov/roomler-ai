@@ -57,11 +57,13 @@
 //! which a fast user switch away and back leaves alive, so the connection
 //! alone decides for it.
 //!
-//! ⚠️ This `false` is not a refusal. It is the answer a panel already showing
-//! another question gives, and it takes the same road: the caller marks the
-//! question for the person's app (`PromptSurface::Companion`) and, on a
-//! one-row Mac, the app gets it over the root daemon's relay (#3864, #3967).
-//! Never turn it into a deny or an accept.
+//! ⚠️ This `false` is not a refusal. It takes the road of a panel already
+//! showing another question: the caller marks the question for the person's
+//! app (`PromptSurface::Companion`) and, on a one-row Mac, the app gets it
+//! over the root daemon's relay (#3864, #3967). Never turn it into a deny or
+//! an accept. #4164 — it is no panel here, though, never a busy one
+//! ([`reaches_the_screen`]): if nothing else shows the question, the caller's
+//! words say the panel was busy only for a panel that showed another.
 //!
 //! The operator's ruling on #4053 keeps it there: after a reboot or a log-out
 //! every question goes to the app until the root daemon's next start, and
@@ -504,6 +506,16 @@ impl MainLoop {
     pub(crate) fn takes_a_question(&self) -> bool {
         self.pumping.load(Ordering::SeqCst)
     }
+}
+
+/// #4164 — whether the macOS panel reaches the screen for a question now:
+/// the main loop takes one ([`MainLoop::takes_a_question`]), and then the
+/// gate lets it through (`shows`, [`PanelGate::verdict`], read only then: its
+/// connection read waits for a main thread that a loop not pumping never
+/// runs). What `mac`'s panel asks first, with its slot unlocked
+/// (`indicator::panel_takes`): `false` is no panel here, never a busy one.
+pub(crate) fn reaches_the_screen(main_loop: &MainLoop, shows: impl FnOnce() -> bool) -> bool {
+    main_loop.takes_a_question() && shows()
 }
 
 #[cfg(test)]
@@ -1048,8 +1060,8 @@ mod tests {
         left.seat_looked(Seat::Person(501));
         left.seat_looked(Seat::Nobody);
         let no_answer = StoodIn::new(Connection::NotKnown, SESSION);
-        // `Inner::prompt`'s own answer for a panel already showing a
-        // question (`mac.rs`): the road every one below must take.
+        // `native` for `Inner::prompt`'s answer to a panel already showing a
+        // question (`mac.rs`, #4164's busy): the road every one below takes.
         let taken = false;
         let cases = [
             (
@@ -1163,5 +1175,96 @@ mod tests {
             .find(|q| q.session_id == session)
             .expect("listed");
         assert_eq!(question.surface, "native");
+    }
+
+    /// #4164 — what the macOS panel's refusal says, read as `mac.rs` reads it
+    /// ([`reaches_the_screen`] through `indicator::panel_takes`, with the
+    /// panel's slot stood in): a second question while one is up is busy,
+    /// and the first stays; no loop pumping, a connection refused at the
+    /// start and one lost later are no panel, whatever the slot holds; and
+    /// the screen is read with the slot unlocked, and not at all while no
+    /// loop pumps.
+    ///
+    /// Red before #4164: every refusal was `false`, and the caller read a
+    /// busy panel as no panel at all ("no one at its screen").
+    #[test]
+    fn the_macos_panel_says_busy_only_for_a_question_it_shows() {
+        use crate::indicator::{NotShown, PromptView, panel_takes};
+        use std::time::{Duration, Instant};
+        let question = |id: &str| PromptView {
+            session_hex: id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        let slot: Mutex<Option<PromptView>> = Mutex::new(None);
+        let take = |main_loop: &MainLoop, gate: &PanelGate, screen: &StoodIn, id: &str| {
+            panel_takes(
+                || {
+                    assert!(
+                        slot.try_lock().is_ok(),
+                        "the screen read under the slot's lock"
+                    );
+                    reaches_the_screen(main_loop, || gate.verdict(screen).shows())
+                },
+                &slot,
+                question(id),
+            )
+        };
+        let held = || slot.lock().unwrap().as_ref().map(|v| v.session_hex.clone());
+
+        let main_loop = MainLoop::new();
+        main_loop.promise();
+        let screen = StoodIn::new(WORKS, SESSION);
+        let gate = PanelGate::new(WORKS, SESSION);
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "a"),
+            Err(NotShown::NoPanel),
+            "no loop pumps yet"
+        );
+        assert_eq!(
+            screen.reads(),
+            0,
+            "the screen read with no loop to answer it"
+        );
+        assert_eq!(held(), None);
+
+        main_loop.pumps();
+        assert_eq!(take(&main_loop, &gate, &screen, "a"), Ok(()));
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "b"),
+            Err(NotShown::Busy),
+            "a second question while one is up"
+        );
+        assert_eq!(held().as_deref(), Some("a"), "the first question stays");
+
+        screen.connection.set(REFUSED);
+        assert_eq!(
+            take(&main_loop, &gate, &screen, "c"),
+            Err(NotShown::NoPanel),
+            "lost at a log-out, holding a question"
+        );
+        let refused = PanelGate::new(REFUSED, SESSION);
+        let works = StoodIn::new(WORKS, SESSION);
+        assert_eq!(
+            take(&main_loop, &refused, &works, "d"),
+            Err(NotShown::NoPanel),
+            "refused at the start, holding a question"
+        );
+        *slot.lock().unwrap() = None;
+        assert_eq!(
+            take(&main_loop, &refused, &works, "e"),
+            Err(NotShown::NoPanel),
+            "refused at the start, nothing held"
+        );
+        assert_eq!(held(), None, "no panel takes nothing");
+        assert_eq!(
+            take(&main_loop, &PanelGate::new(WORKS, SESSION), &works, "f"),
+            Ok(()),
+            "a free panel that reaches the screen"
+        );
     }
 }

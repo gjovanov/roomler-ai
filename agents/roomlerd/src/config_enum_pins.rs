@@ -26,7 +26,7 @@ use crate::config_surface::{self, pin_declared_values};
 use crate::extauth::ExternalConsent;
 use crate::power::PowerPolicy;
 use crate::rc_overlay::RankMode;
-use crate::{media_delivery, media_inflight};
+use crate::{media_deadline, media_delivery, media_inflight};
 
 /// A key's config fallback, as `tunnel_core::env::node_env` hands it to the
 /// parser when no environment variable is set.
@@ -77,6 +77,20 @@ fn inflight_budget_declares_every_mode_the_pump_reads() {
     pin_declared_values(
         "inflight_budget",
         |cfg| media_inflight::mode_of(fallback(cfg, "INFLIGHT_BUDGET").as_deref()),
+        &modes,
+    );
+}
+
+/// `media_deadline::mode`, once per pump, through `VIDEO_DEADLINE`.
+#[test]
+fn video_deadline_declares_every_mode_the_pump_reads() {
+    use media_deadline::Mode;
+    let modes = [Mode::Off, Mode::Shadow, Mode::On].map(|m| match m {
+        Mode::Off | Mode::Shadow | Mode::On => m,
+    });
+    pin_declared_values(
+        "video_deadline",
+        |cfg| media_deadline::mode_of(fallback(cfg, "VIDEO_DEADLINE").as_deref()),
         &modes,
     );
 }
@@ -152,6 +166,7 @@ fn every_enum_key_is_pinned() {
         "rc_carrier_rank",
         "path_model",
         "inflight_budget",
+        "video_deadline",
         "power_policy",
         "external_consent_mode",
         // `encode::ffmpeg::encoder`'s tests, beside `QsvRateMode::parse`.
