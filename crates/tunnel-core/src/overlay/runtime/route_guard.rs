@@ -190,12 +190,44 @@ pub(super) fn defended_routes(
     set
 }
 
+/// #4279 — the subnet arm's default: ON. [`subnet_guard_enabled`] reads it
+/// unless the environment says otherwise, and the switch's cell runs a wave
+/// with it, so a default flipped to off fails that cell.
+pub(super) const SUBNET_GUARD_DEFAULT: bool = true;
+
+/// #4279 — `ROOMLERD_OVERLAY_SUBNET_GUARD=0` stops the route guard from
+/// putting a router peer's subnet routes back ([`Defend::AssertSubnet`]): a
+/// subnet route that goes missing then stays missing until the router peer's
+/// next carrier install, as before #4279. Every other arm is unchanged. For a
+/// host that deletes our route on purpose, such as a Linux host whose own LAN
+/// is the advertised subnet and that wants the LAN's route back. Read on
+/// every wave, from the daemon's environment.
+fn subnet_guard_enabled() -> bool {
+    crate::env::flag("OVERLAY_SUBNET_GUARD", SUBNET_GUARD_DEFAULT)
+}
+
+/// #4279 — the switch's INFO is said once per process, by the first wave that
+/// carries a subnet while the switch is off.
+static SUBNET_GUARD_OFF_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Execute one defense wave — the ONLY consumer of [`defended_routes`].
 /// Runs detached from the select! loop under the caller's owned re-assert
 /// lock (rc.206: a slow Windows route batch must never stack concurrent
 /// delete-then-add on the same prefix, and awaiting it inline would stall
 /// the outbound TUN arm).
 pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
+    run_defense_wave_with(tun, set, subnet_guard_enabled()).await;
+}
+
+/// [`run_defense_wave`] with the subnet switch passed in
+/// ([`subnet_guard_enabled`]), so a cell sets it without touching the process
+/// environment, which the cells share while they run in parallel.
+pub(super) async fn run_defense_wave_with(
+    tun: Arc<dyn TunIo>,
+    set: Vec<Defend>,
+    subnet_guard: bool,
+) {
     // FR-68 — the wave is the unit of work a route war multiplies: every
     // eviction is a FIB change, which feeds our own route-change subscription,
     // which arms the next wave. Waves/min far above the 30 s heartbeat means
@@ -215,7 +247,16 @@ pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
                 tun.add_peer_route(ip).await.ok();
             }
             Defend::AssertSubnet(cidr) => {
-                tun.defend_subnet_route(&cidr.to_string()).await.ok();
+                if subnet_guard {
+                    tun.defend_subnet_route(&cidr.to_string()).await.ok();
+                } else if !SUBNET_GUARD_OFF_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    info!(
+                        %cidr,
+                        "overlay: the route guard leaves subnet routes alone on this host \
+                         (ROOMLERD_OVERLAY_SUBNET_GUARD is off): a router peer's subnet route \
+                         that goes missing stays missing until that peer's next carrier install"
+                    );
+                }
             }
             Defend::EvictSelf(ip) => tun.defend_self_route(ip).await,
             Defend::BlockFloor => tun.defend_block_floor().await,

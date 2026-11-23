@@ -6278,6 +6278,49 @@ mod tests {
         assert_eq!(verified, HashSet::from([router, plain]), "peers only");
     }
 
+    /// #4279 — `ROOMLERD_OVERLAY_SUBNET_GUARD=0`: a wave over a router peer's
+    /// missing subnets writes no subnet route, and every other arm runs as
+    /// before (the peer's `/32`, our own address, the floor, the ownership
+    /// check). With the default the same wave puts both back. The switch is
+    /// passed in, never set in the process environment, which the cells share
+    /// while they run in parallel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_subnet_guard_switch_off_writes_no_subnet_route() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let router = Ipv4Addr::new(100, 64, 0, 2);
+        let two: &[&str] = &["10.1.0.0/16", "192.168.50.0/24"];
+        let (by_node, current_peers) = router_mesh(&[([1; 32], router, two)]);
+        let set = || {
+            defended_routes(
+                &by_node,
+                &current_peers,
+                self_v4,
+                subnets_held(&[([1; 32], two)]),
+            )
+        };
+        assert_eq!(defended_subnets(&set()), two, "both subnets are defended");
+
+        let off = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = off.clone();
+        run_defense_wave_with(t, set(), false).await;
+        assert!(off.subnet_calls().is_empty(), "{:?}", off.subnet_calls());
+        assert_eq!(
+            off.calls(),
+            [
+                ("add", router),
+                ("defend", self_v4),
+                ("floor", Ipv4Addr::UNSPECIFIED),
+                ("verify", router),
+            ],
+            "every other arm as before"
+        );
+
+        let on = RouteRecordingTun::new();
+        let t: Arc<dyn TunIo> = on.clone();
+        run_defense_wave_with(t, set(), SUBNET_GUARD_DEFAULT).await;
+        assert_eq!(on.subnet_calls(), two, "the default puts both back");
+    }
+
     /// The off-loop ALLOCATE queue's test twin (see `test_relay_bq`).
     fn test_alloc_q() -> RelayAllocQueue {
         let (tx, _rx) = mpsc::channel(4);
