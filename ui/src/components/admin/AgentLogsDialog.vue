@@ -8,7 +8,7 @@
         <!-- The span shrinks with an ellipsis (min-width: 0), so the title's own
              buttons stay on screen: a title never wraps, and a long device name
              used to push Close or Refresh past the edge on a phone. -->
-        <span class="text-truncate" style="min-width: 0">Agent logs — {{ agentName }}</span>
+        <span class="text-truncate" style="min-width: 0">Daemon logs — {{ agentName }}</span>
         <v-spacer />
         <v-btn
           icon="mdi-refresh"
@@ -104,7 +104,7 @@
           <v-icon size="48" color="grey-lighten-1" class="mb-2">mdi-text-box-remove-outline</v-icon>
           <p>No logs uploaded yet.</p>
           <p class="text-body-2">
-            The agent uploads logs in batches; if it just started or has been idle,
+            The daemon uploads logs in batches; if it just started or has been idle,
             give it a minute and hit refresh.
           </p>
         </div>

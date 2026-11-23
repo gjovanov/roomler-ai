@@ -1069,7 +1069,7 @@ impl Hub {
             let goodbye = ServerMsg::Goodbye {
                 reason: AgentCloseReason::ReplacedByNewerConnection,
                 message: format!(
-                    "Another agent is connecting with the same agent_id ({agent_id}); \
+                    "Another daemon is connecting with the same agent_id ({agent_id}); \
                      this connection is being closed. Check for a duplicate install \
                      (another physical host with a copy of this config.toml, the tray \
                      companion, etc.) or re-enrol to mint a fresh agent_id."

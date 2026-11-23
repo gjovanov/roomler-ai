@@ -214,7 +214,7 @@ const blockedReason = computed<string | null>(() => {
     return 'This device is offline — commands will fail until it reconnects.'
   }
   if (!(props.agent?.capabilities?.rpc ?? []).includes('exec')) {
-    return `This device runs agent ${props.agent?.agent_version ?? '?'}, which predates remote execution. Update it first.`
+    return `This device runs roomlerd ${props.agent?.agent_version ?? '?'}, which predates remote execution. Update it first.`
   }
   return null
 })

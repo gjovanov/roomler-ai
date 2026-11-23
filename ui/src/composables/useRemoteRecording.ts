@@ -100,7 +100,7 @@ export const RECORD_REASONS: Record<string, string> = {
   // build without audio), named ahead of the owner's gate because no setting
   // fixes it. Also what greys the box out before any start (`audioUnavailable`).
   audio_unsupported:
-    "this device can't record what the computer plays (a Mac can, from agent 0.4.161)",
+    "this device can't record what the computer plays (a Mac can, from roomlerd 0.4.161)",
   busy: 'a recording is already running on this device',
   already_starting: 'a recording is already starting',
   consent_denied: 'the person at the device said no',

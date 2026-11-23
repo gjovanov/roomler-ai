@@ -1551,7 +1551,7 @@ pub async fn ws_upgrade_agent(
                 info!(%agent_id, reason, "refusing WS with rc:goodbye");
                 let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
                     reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
-                    message: "This agent's server-side row was deleted (or quarantined). \
+                    message: "This device's server-side row was deleted (or quarantined). \
                           Re-enrol with a fresh enrollment token from the admin UI to \
                           revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
                         .into(),

@@ -894,7 +894,7 @@ export function awaitingConsentLabel(asks: ConsentAsks | null): string {
     case 'both':
       return "Waiting for someone at that device, or the device's owner, to approve the connection…"
     default:
-      return 'Waiting for the agent to allow the connection…'
+      return 'Waiting for the host to allow the connection…'
   }
 }
 
@@ -1382,7 +1382,7 @@ export function resolutionOverrideHint(vi: RcVideoInfo | null | undefined, w: nu
     case 'refined-cap':
       return `This session is capped at ${box} by the crisp-at-rest refinement bound.`
     default:
-      return `This session is capped at ${box} by the agent (${vi.cap_reason}).`
+      return `This session is capped at ${box} by roomlerd (${vi.cap_reason}).`
   }
 }
 
@@ -1581,7 +1581,7 @@ export interface RcAppsActionReply {
  *  without a reason (every agent before AC10). Exported so the wording is one
  *  string and the arm that uses it can be tested. */
 export const APPS_UNAVAILABLE_NO_REASON =
-  'Remote apps are not available on this host. This agent did not say why (agents ' +
+  'Remote apps are not available on this host. Its roomlerd did not say why (releases ' +
   'older than FR-56 AC10 carry no reason) — run `roomlerd apps-probe` on the host.'
 
 /** What the person at the viewer can do at the host's lock screen, from
@@ -7649,7 +7649,7 @@ export function useRemoteControl(
     return new Promise((resolve, reject) => {
       const ch = channels.control
       if (!ch || ch.readyState !== 'open') {
-        reject(new Error('control DC not open — not connected to agent'))
+        reject(new Error('control DC not open — not connected to roomlerd'))
         return
       }
       // Cancel any prior in-flight request — late reply is dropped.
@@ -7681,7 +7681,7 @@ export function useRemoteControl(
         agentLogsLoading.value = false
         reject(
           new Error(
-            'rc:logs-fetch timed out after 30 s — agent might be on rc.22 or older, or its log read is being held by the AV scanner'
+            'rc:logs-fetch timed out after 30 s — roomlerd might be on rc.22 or older, or its log read is being held by the AV scanner'
           )
         )
       }, 30000)
@@ -7724,7 +7724,7 @@ export function useRemoteControl(
   ): Promise<T> {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') {
-      return Promise.reject(new Error('control DC not open — not connected to agent'))
+      return Promise.reject(new Error('control DC not open — not connected to roomlerd'))
     }
     if (!msg || typeof msg.id !== 'string') {
       return Promise.reject(new Error('malformed apps request'))
@@ -7735,7 +7735,7 @@ export function useRemoteControl(
         if (pendingAppsRequests.delete(id)) {
           onTimeout?.()
           if (appsSupported.value === null) appsSupported.value = false
-          reject(new Error('apps request timed out (10 s) — agent may predate rc:apps.*'))
+          reject(new Error('apps request timed out (10 s) — roomlerd may predate rc:apps.*'))
         }
       }, 10_000)
       pendingAppsRequests.set(id, {
@@ -10635,7 +10635,7 @@ export function useRemoteControl(
           entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
         }
       } else if (msg.t === 'files:error') {
-        const errMsg = String(msg.message ?? 'agent error')
+        const errMsg = String(msg.message ?? 'roomlerd error')
         // rc.19: if a resume handshake is waiting on this id, route
         // the error THERE first. The wrapper falls back to a fresh
         // `files:begin` with a new id (see uploadOneResumable).
@@ -11084,14 +11084,14 @@ export function useRemoteControl(
         const rich = pendingClipboardRichReads.get(reqId)
         if (rich) {
           pendingClipboardRichReads.delete(reqId)
-          rich.reject(new Error(msg.message || 'agent clipboard error'))
+          rich.reject(new Error(msg.message || 'roomlerd clipboard error'))
         }
         const pending = pendingClipboardReads.get(reqId)
         if (!pending) return
         clearTimeout(pending.timer)
         pendingClipboardReads.delete(reqId)
         pendingClipboardReadChunks.delete(reqId)
-        pending.reject(new Error(msg.message || 'agent clipboard error'))
+        pending.reject(new Error(msg.message || 'roomlerd clipboard error'))
       }
     }
 
@@ -13189,7 +13189,7 @@ export function useRemoteControl(
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingClipboardReads.delete(reqId)
-        reject(new Error('agent did not respond to clipboard:read within 5s'))
+        reject(new Error('roomlerd did not respond to clipboard:read within 5s'))
       }, 5000)
       pendingClipboardReads.set(reqId, { resolve, reject, timer })
       try {
@@ -13233,7 +13233,7 @@ export function useRemoteControl(
       // relay can legitimately take a while.
       const timer = setTimeout(() => {
         cleanup()
-        reject(new Error('agent did not respond to clipboard:read within 15s'))
+        reject(new Error('roomlerd did not respond to clipboard:read within 15s'))
       }, 15_000)
       function cleanup() {
         clearTimeout(timer)
@@ -13289,7 +13289,7 @@ export function useRemoteControl(
     const pct = file.size === 0 ? 100 : Math.round((offset / file.size) * 100)
     const err = new Error(
       `files channel closed mid-upload at ${pct}% (${offset}/${file.size} bytes). ` +
-        `Most likely the remote agent restarted (auto-update / crash / network drop).`
+        `Most likely roomlerd on the host restarted (auto-update / crash / network drop).`
     )
     ;(err as Error & { [k: string]: unknown })[CHANNEL_CLOSED_TAG] = true
     return err
