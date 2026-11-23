@@ -67,8 +67,8 @@ holds. That is what makes the whole chain worth having.
 
 ## Which account a session runs as
 
-A session runs as **what was actually asked for, never more**. The device
-decides which accounts are permitted, and an unset value means *authenticate,
+A session runs as **what was actually asked for, never more**. A session the server
+grants runs as the account its policy names, and the device refuses one above its own ceiling. For the device's own break-glass keys, an unset account mode means *authenticate,
 then run nothing* — rather than quietly handing over a root shell.
 
 An unparseable setting is a refusal, not a fallback.
