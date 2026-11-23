@@ -4,9 +4,9 @@
 **Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
-Each anchor is at the commit its sentence was written on, and it is not moved when the code moves: the plan's
-at master `df905bbc1` (2026-11-16), a later sentence's at the merge that wrote it. §2 names the code that
-failed, and this FR's own merges change that code.
+§2 is evidence, read on master's `df905bbc1`, and its anchors stay on that commit when the code moves: §2 names the
+code that failed, and this FR's own merges change that code. Elsewhere an anchor names the code as it is and moves
+with it, unless its own sentence or row pins it to a commit or a date.
 
 ## 1. Goal
 
@@ -24,7 +24,7 @@ It is one program under one issue, by the operator's decision of 2026-11-16 (D1)
 
 ## 2. Evidence
 
-Two laptops on corporate VPNs, viewed from neo16, 2026-11-10 to 2026-11-16. Everything here was read from
+Line anchors in §2 are on master `df905bbc1`, the commit this evidence was read on. Two laptops on corporate VPNs, viewed from neo16, 2026-11-10 to 2026-11-16. Everything here was read from
 production `agent_logs`, read-only: the pump's heartbeats, the rate-memory lines and the ICE lines of the sessions
 the operator reported as sluggish and blurred. Neither relay was the limit: picture age stayed at 55 to 70 ms in
 the bad sessions.
@@ -45,7 +45,7 @@ the bad sessions.
 | What the path has carried | a 10.0 Mbit/s peak this week; 6 to 9 Mbit/s sustained in FR-35's own P0 |
 | How long the operator's sessions lasted | 48 to 144 s |
 
-Line anchors in this section are on `df905bbc1`, the master this evidence was read on. The chain, in the code:
+The chain, in the code:
 
 1. At a session's end the evidence is the learner's stable rate, else `pipe_bps()`
    (`agents/roomlerd/src/peer.rs:9471-9480`).
@@ -96,7 +96,7 @@ rode a reliable SCTP channel, over WireGuard, over the relay's WebSocket, over T
 | Other sessions the same day | opened at 5.49 Mbit/s (22,884 B a frame) and 5.96 Mbit/s (24,838 B a frame) |
 | What the path has carried | peaks of 11.4 to 13.3 Mbit/s |
 
-Line anchors in this section are on `df905bbc1`, the master this evidence was read on. Three facts compose:
+Three facts compose:
 
 1. **On this host a QSV rate change is an encoder rebuild.** FR-62 closed with QSV's in-place path broken and its
    flag off.
