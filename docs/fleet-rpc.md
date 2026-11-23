@@ -104,7 +104,12 @@ Where the desktop app was up and a Mac's road from the question to it was
 closed (#4140), the sentence names that cause instead: "nobody could be asked
 at this device — the question could not reach the Roomler desktop app there
 (…); answer with `roomlerd consent` there, or set this device's execution
-policy to auto". One a surface showed, which nobody answered, ends "the
+policy to auto". Where the device's consent panel was showing another question
+and nothing else showed this one (#4164), it says so, whatever the app's side
+found: "nobody could be asked at this device — its consent panel was showing
+another question, and nothing else there could show this one; answer with
+`roomlerd consent` there, ask again once the panel is free, or set this
+device's execution policy to auto". One a surface showed, which nobody answered, ends "the
 operator at this device did not approve the command (Timeout)", as before. The
 chain and its log line are in [remote-control.md §11.2](remote-control.md#112-consent),
 its "Prompt surfaces" paragraph.

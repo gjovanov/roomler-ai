@@ -2856,14 +2856,14 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    window, no capture exclusion — X has no equivalent), macOS
    (`viewer-indicator-macos`, AppKit). The macOS panel is a question's surface
    only while the window server serves its process (#4053). At each question
-   `prompt` (`agents/roomlerd/src/indicator/mac.rs:248`) asks a gate
-   (`indicator/panel_gate.rs:330`), with no lock held. Three things decide, in
+   `prompt` (`agents/roomlerd/src/indicator/mac.rs:259`) asks a gate
+   (`indicator/panel_gate.rs:332`), with no lock held. Three things decide, in
    this order, and since #4119 the first two make no window:
    - in a root process only, **the seat**: whether it has emptied or changed
      hands since the gate's first look at it (a log-out, a login as someone
      else, a user switch). The person socket's poll of `/dev/console`'s owner
-     tells the gate every 5 s (`person_socket.rs:895`, `indicator/mac.rs:1154`,
-     `indicator/panel_gate.rs:275`). The change is held for the process's
+     tells the gate every 5 s (`person_socket.rs:895`, `indicator/mac.rs:1161`,
+     `indicator/panel_gate.rs:277`). The change is held for the process's
      life and never read at a question, since after the login someone is at
      the seat again. A seat that goes from nobody to a person (a boot, then a
      login) ends nothing, and a look that could not tell changes nothing.
@@ -2875,10 +2875,10 @@ panel connects to its display once, when the daemon starts, and keeps that conne
      neither name at a lock, a display sleep or the screen saver, and one or
      both at a log-out, a login, a fast user switch and the switch back.
    - **the connection**: whether a 1×1 probe window, never shown, gets a
-     window device (`window_number` above 0, `indicator/mac.rs:1173`). The main
+     window device (`window_number` above 0, `indicator/mac.rs:1180`). The main
      thread makes it, and the question waits 500 ms at most. Just before it
      makes the window, the main thread asks the gate again whether the panel
-     has ended (`probe`, `indicator/mac.rs:1141`).
+     has ended (`probe`, `indicator/mac.rs:1148`).
 
    The order is #4119's. The 0.4.228 lab found a third shape: a log-out that
    killed a two-row Mac's root half's window-server port ("received
@@ -2892,7 +2892,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    the names do not post.
 
    Only a root process follows the seat and reads the console session
-   (`reads_console_session`, `indicator/panel_gate.rs:129`): a one-row Mac's
+   (`reads_console_session`, `indicator/panel_gate.rs:131`): a one-row Mac's
    daemon and a two-row Mac's root half. Its window-server connection belongs
    to the console session it started in, so another one since leaves its
    panel reaching nobody. A per-user process, a two-row Mac's per-user half,
@@ -2906,11 +2906,14 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    it starts, and a log-out detaches one that was served, or kills its port.
    Either way, and when a root process's seat or console session has changed,
    the panel answers `false` for the rest of the process's life. A read with
-   no answer in time gives `false` for that question alone. `false` is the
-   answer of a panel already showing another question: the question is
+   no answer in time gives `false` for that question alone. `false` takes the
+   road of a panel already showing another question: the question is
    marked `companion` and goes on down this chain to the person's app, over
    the relay on a one-row Mac and through the announcement on a two-row Mac.
-   It is never a refusal. The panel comes back at the root daemon's next
+   It is never a refusal. Since #4164 the panel says which it was
+   (`NotShown`): this `false` is no panel here, and only a panel showing
+   another question is busy, which a caller reads when nothing else shows the
+   question (item 5, "A busy panel"). The panel comes back at the root daemon's next
    start with someone signed in. Nothing restarts it, and drawing it from the
    person's own session is FR-149 (#4054), below.
 
@@ -2941,9 +2944,9 @@ panel connects to its display once, when the daemon starts, and keeps that conne
 
    **The exit net (#4119).** A root process registers an `atexit` hook when
    the pump starts (`indicator/exit_net.rs:89`, armed at
-   `indicator/mac.rs:662`). The main thread marks itself while it is inside
+   `indicator/mac.rs:669`). The main thread marks itself while it is inside
    one of the panel's AppKit calls: the probe window, the panel's window, and
-   the event fetch and dispatch (`indicator/mac.rs:1174`, `:714`, `:681`). An
+   the event fetch and dispatch (`indicator/mac.rs:1181`, `:721`, `:688`). An
    exit that begins on that thread inside such a call, and that our code did
    not choose, writes one line to stderr and leaves with 32, which launchd
    relaunches (`the_net`, `indicator/exit_net.rs:138`). 32 is the net's own
@@ -2956,7 +2959,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    `roomlerd-main` thread (#3195), a requested restart, an error, the quit
    backstop, the watchdog, and AppKit's exit 0 after the delegate answers a
    log-out's quit with `NSTerminateNow`, which the delegate marks as chosen
-   (`indicator/mac.rs:550`, #3164). The hook cannot see an `_exit`, a signal
+   (`indicator/mac.rs:557`, #3164). The hook cannot see an `_exit`, a signal
    or an exit on another thread. There the seat and the console session,
    read before any window, are what hold.
 
@@ -3031,19 +3034,20 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    | remote control | `no_prompt_surface` | `timeout` |
    | SSH | "nobody could be asked at this device — it has no prompt surface (no one at its screen and the Roomler desktop app is not running); answer with `roomlerd consent` there, start the desktop app, or set this device's SSH policy to auto" | "nobody approved this session at the device within 30s" |
    | SSH, where the app was up and a Mac's road to it was closed (#4140) | "nobody could be asked at this device — the question could not reach the Roomler desktop app there (the app gets this device's questions through a part of Roomler in the person's session, and that part is not running or did not answer); answer with `roomlerd consent` there, or set this device's SSH policy to auto" | as SSH's above |
+   | SSH, where a consent panel was showing another question (#4164), whatever the app's side found | "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's SSH policy to auto" | as SSH's above |
    | exec (`roomler exec`, the device's console) | the same sentence for each cause, naming the device's execution policy | "the operator at this device did not approve the command (Timeout)" |
 
    SSH's and exec's no-surface sentences are one text, which takes the policy's name and the cause
-   (`nobody_could_be_asked`, [`consent.rs:1097`](../agents/roomlerd/src/consent.rs#L1097); the
+   (`nobody_could_be_asked`, [`consent.rs:1105`](../agents/roomlerd/src/consent.rs#L1105); the
    causes, `NoSurface`, [`:1079`](../agents/roomlerd/src/consent.rs#L1079)), and tests pin every
    sentence, SSH's and exec's. An exec command waits on the broker alone: its companion and
    notification go up on a task of their own (`exec_surfaces_up`,
    [`signaling.rs:7961`](../agents/roomlerd/src/signaling.rs#L7961), handed off at
    [`:5976`](../agents/roomlerd/src/signaling.rs#L5976)), and its answer reads what they came to when
    the window ends, never waiting for it (`shown_by_now`,
-   [`:8006`](../agents/roomlerd/src/signaling.rs#L8006), read at
+   [`:8007`](../agents/roomlerd/src/signaling.rs#L8007), read at
    [`:6013`](../agents/roomlerd/src/signaling.rs#L6013); `exec_refusal`,
-   [`:8046`](../agents/roomlerd/src/signaling.rs#L8046)). A verdict not known by then keeps the
+   [`:8047`](../agents/roomlerd/src/signaling.rs#L8047)). A verdict not known by then keeps the
    right-hand words. Until #3982 every unanswered exec question read "did not approve the command
    (Timeout)", whether anything showed it or not.
 
@@ -3062,12 +3066,47 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    and was told to start it (the 0.4.228 release lab). Only `roomlerd consent` worked as written.
    A remote-control question is unchanged: it ends `no_prompt_surface` for either cause.
 
+   **A busy panel (#4164).** A native panel shows one question at a time. Until #4164 a question
+   asked while it showed another got the `false` of a panel that is not there, so a question that
+   nothing else showed read FR-27's guess, "no one at its screen and the Roomler desktop app is not
+   running", while that screen showed the first question. Each panel now says why it did not take a
+   question (`NotShown`, [`indicator/mod.rs:470`](../agents/roomlerd/src/indicator/mod.rs#L470)):
+   `Busy` while it shows another, `NoPanel` where it cannot reach the screen, whatever it holds (no
+   panel in the build, no display, a pump that never came up or has ended, a Mac's gate). One rule
+   takes a question on Windows, X11 and macOS alike (`panel_takes`,
+   [`:510`](../agents/roomlerd/src/indicator/mod.rs#L510)): no panel first, read with no lock held,
+   then busy. On a one-row Mac's root daemon three states are that one fact (`chain`,
+   [`indicator/session_panel.rs:500`](../agents/roomlerd/src/indicator/session_panel.rs#L500)): the
+   root daemon's own panel refusing the question as busy, the session panel's `busy` (FR-149's C8),
+   and the session panel not asked because the root daemon's own panel held another
+   (`not_asked why=root_panel_busy`). Every other `not_up`, `no_answer` or `not_asked` keeps the
+   app's cause, and FR-149's routing is unchanged.
+
+   | The panel's side | The app's side | The caller reads |
+   |---|---|---|
+   | busy | not up, nobody at the screen, or no marker to read | the busy panel's sentence |
+   | busy | up with the marker, and a Mac's road to it closed | the busy panel's sentence: busy wins |
+   | busy | up with the marker, the road open (it shows the question) | the person's timeout, as before |
+   | no panel | any | as before: FR-27's sentence, or the closed road's |
+
+   Busy wins over the app's cause (`Prompted::why_not_shown`,
+   [`:470`](../agents/roomlerd/src/indicator/session_panel.rs#L470), read by exec at
+   [`signaling.rs:7984`](../agents/roomlerd/src/signaling.rs#L7984) and by SSH at
+   [`ssh.rs:2714`](../agents/roomlerd/src/ssh.rs#L2714)): the panel took no question because it
+   showed another, and that is what kept this one from the person. Its sentence
+   (`NoSurface::PanelBusy`, [`consent.rs:1093`](../agents/roomlerd/src/consent.rs#L1093)) says that
+   the device's consent panel was showing another question. It never says that nobody is at the
+   screen or that the app is not running, and it keeps `roomlerd consent` and the policy switch. The
+   cause is read only for a question that stood its window with nothing showing it, and the
+   per-question line says `panel_busy=true`. A remote-control question is unchanged: it ends
+   `no_prompt_surface` for every cause.
+
 **The window runs from the request (#4000).** A remote-control question's window now runs from the
 request, as an exec question's does. Its surfaces go up beside it on a task of their own
 (`rc_consent_task`, [`signaling.rs:7881`](../agents/roomlerd/src/signaling.rs#L7881), spawned at
 [`:4542`](../agents/roomlerd/src/signaling.rs#L4542); `rc_surfaces_verdict`,
 [`:7844`](../agents/roomlerd/src/signaling.rs#L7844)). When the question ends, the task reads what
-they came to without waiting (`rc_shown_by_now`, [`:8018`](../agents/roomlerd/src/signaling.rs#L8018)).
+they came to without waiting (`rc_shown_by_now`, [`:8019`](../agents/roomlerd/src/signaling.rs#L8019)).
 Not known yet counts as shown (`timeout`), as for exec, and one INFO line says the surfaces were
 still going up. Since #4016 only a question that asked a surface logs it: an auto-grant asks none
 (`surfaces_asked`, read at the call, [`:4534`](../agents/roomlerd/src/signaling.rs#L4534)), and its
@@ -3091,19 +3130,19 @@ nobody: every surface counts down to the request plus the window, because the qu
 marker's `expires_at_ms`). An answer given while the surfaces go up now decides at once. A
 notification that comes up after its question ended rewrites no marker
 (`ConsentBroker::write_prompt_while_asking`,
-[`consent.rs:1121`](../agents/roomlerd/src/consent.rs#L1121)). An SSH session's question still waits
+[`consent.rs:1135`](../agents/roomlerd/src/consent.rs#L1135)). An SSH session's question still waits
 for its surfaces before its window starts, so the same hidden seconds exist there. Nothing races
 it: there is no hub timer for SSH, and the Windows worker relay waits the window plus 20 s.
 
 | Test | Shows |
 |---|---|
-| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9085`](../agents/roomlerd/src/signaling.rs#L9085)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
-| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9156`](../agents/roomlerd/src/signaling.rs#L9156)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
-| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9198`](../agents/roomlerd/src/signaling.rs#L9198)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
-| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9246`](../agents/roomlerd/src/signaling.rs#L9246)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
-| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9296`](../agents/roomlerd/src/signaling.rs#L9296)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
-| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9370`](../agents/roomlerd/src/signaling.rs#L9370)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
-| `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1239`](../agents/roomlerd/src/consent.rs#L1239)) | the notification's marker rewrite writes nothing for a question that ended |
+| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:9086`](../agents/roomlerd/src/signaling.rs#L9086)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
+| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:9157`](../agents/roomlerd/src/signaling.rs#L9157)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
+| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:9199`](../agents/roomlerd/src/signaling.rs#L9199)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
+| `an_auto_grant_logs_no_surfaces_going_up_and_is_granted_as_before` ([`:9247`](../agents/roomlerd/src/signaling.rs#L9247)) | #4016: a question that asked no surface logs no "still going up" line, and is granted as before |
+| `only_a_question_decided_while_its_surfaces_go_up_logs_that_they_were` ([`:9297`](../agents/roomlerd/src/signaling.rs#L9297)) | #4016: the line, once, for a question decided while its surfaces go up; none, and the verdict kept, when the verdict came first |
+| `a_question_that_ended_before_its_surfaces_says_so_in_their_line` ([`:9371`](../agents/roomlerd/src/signaling.rs#L9371)) | #4016: a verdict that comes after its question was answered says the question had ended; one that comes while it stands logs the plain line |
+| `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1253`](../agents/roomlerd/src/consent.rs#L1253)) | the notification's marker rewrite writes nothing for a question that ended |
 
 ⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
 removes a notification clicked on its body, and the removal arrives as a
@@ -3134,8 +3173,8 @@ thread drives the badge, the curtain and the consent panel, on one 120 ms
 *before* its session exists. So a lone prompt read "Expires in 4:59" for as long
 as it was up, which a person at the machine reads as "this request does not
 expire". Approve still worked. The timer now runs while a session is up **or** the
-panel is (`pump_timer_wanted`, `agents/roomlerd/src/indicator/win.rs:703`, applied
-at `:1369`), and stops when neither is. The X11 panel needs no such rule, because
+panel is (`pump_timer_wanted`, `agents/roomlerd/src/indicator/win.rs:702`, applied
+at `:1368`), and stops when neither is. The X11 panel needs no such rule, because
 its loop ticks on its own.
 
 ⚠️ **The X11 panel is drawn at the desktop's scale** (FR-93 P6i). On a scaled
@@ -3147,7 +3186,7 @@ Plasma 6.6). It now reads `Xft.dpi` from the resources the desktop publishes
 for X11 clients and shows the same drawing at `round(dpi / 96)`, between 1 and
 4 (`scale`, `agents/roomlerd/src/indicator/x11.rs:82`). The drawing is painted
 at 1× into a pixmap, scaled up nearest-neighbour, and written in requests the
-server takes (`blit`, `:493`); a click maps back to the 1× layout. Measured:
+server takes (`blit`, `:494`); a click maps back to the 1× layout. Measured:
 KDE at `Xft.dpi` 259 draws at 3× and GNOME at 192 at 2×, the size of the
 companion's own prompt, and **Approve** on the scaled panel granted the
 session. At 1× nothing changes. `ROOMLERD_CONSENT_PANEL_SCALE` overrides the
@@ -3991,7 +4030,7 @@ stateDiagram-v2
 | the rebuild | A new decoder, configured as the old one was, and one `request-keyframe` at once. `reset()` is not an option, because the error already closed the codec and `reset()` then throws. The leading-delta gate drops deltas and keeps asking until the key frame lands | `rebuildDecoder`, `ui/src/workers/rc-dc-worker.ts:715` |
 | both failure routes | The decoder's error callback and `decode()` throwing go through one function. Without recovery each still posts its old message | `onDecoderFailure`, `rc-dc-worker.ts:744` |
 | the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` (`hevc` on an HEVC session) | `useRemoteControl.ts:8907` |
-| a chunk gap | The deltas behind a gap reference the frame it lost, so on the default ordered channel the gap also re-arms the gate, on the same decoder. Before R1 they were decoded, painting garbage until the IDR landed, or failing the decoder. ⚠️ Not on the unordered opt-in (`roomler-rc-unordered-video=1`): a lost packet there kills its chunk, which is routine, and at 1 % loss a key frame rarely survives whole, so a gate waiting for one would freeze a picture that today keeps moving. The switch below turns it off too (`gapClosesGate`) | `rc-dc-worker.ts:634` |
+| a chunk gap | The deltas behind a gap reference the frame it lost, so on the default ordered channel the gap also re-arms the gate, on the same decoder. Before R1 they were decoded, painting garbage until the IDR landed, or failing the decoder. ⚠️ Not on `video-deadline`, the unordered channel a framed session opens beside `video-bytes` (FR-148 P4b-2, which retired the per-browser opt-in `roomler-rc-unordered-video`): a lost packet there kills its chunk, which is routine, and at 1 % loss a key frame rarely survives whole, so a gate waiting for one would freeze a picture that today keeps moving. The rule follows the channel each message came from. The switch below turns it off too (`gapClosesGate`) | `rc-dc-worker.ts:643` |
 | the watchdog | Once a data-channel path has decoded a frame, only its frames count as progress: RTP bytes on the silent m-section must not hold off a re-create while the canvas is frozen. Before that frame RTP still counts, because the viewer opens its channel speculatively and an agent that ignores it sends RTP | `mediaAdvanced`, `useRemoteControl.ts:724` |
 
 **The switch.** `localStorage.setItem('roomler-rc-decode-recover', '0')` in a browser, then reconnect, is the
@@ -5301,7 +5340,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2438`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9001`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:9002`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3351`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2513`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
@@ -6396,7 +6435,7 @@ to-activate, so the browser never sees a bait-and-switch.
   everything on the declined (#3757) and FILES-denied channels. Tests:
   `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17655`), over
   a real channel through the production router, and
-  `files::refused_begin_tests` (`files.rs:14053`).
+  `files::refused_begin_tests` (`files.rs:14080`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
   Downloads for a `dest_path` it will not write: a SYSTEM/root writer
   outside the active user's profile (FR-84 D4), a path that is not a
@@ -6640,8 +6679,8 @@ The constraint that shapes it is the thread. Text Input Sources (Carbon's
 HIToolbox) is called on the main thread only; recent macOS asserts it. A daemon
 built with `viewer-indicator-macos` gives its main thread to AppKit for its
 whole life (`main.rs`'s swap, FR-27), so every read and switch is queued for it:
-`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:204`) parks a
-closure that the pump runs on its next pass (`mac.rs:699`), at most 120 ms
+`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:215`) parks a
+closure that the pump runs on its next pass (`mac.rs:706`), at most 120 ms
 later, and sends the answer back.
 
 ```mermaid
@@ -7160,7 +7199,7 @@ otherwise keep (§11.16). The reconnect is the same either way.
 |---|---|---|---|
 | control WS RX deadline (`signaling.rs:2393`) | the keepalive's own due instant, which `tick()` returns (`:2336`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
 | control WS, a failed heartbeat send (`signaling.rs:2720`) or read (`:3418`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:160`, set at `:2337`). Both are read before the send, or on a read error before the closes (`session_ended`, `:122`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:100`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
-| the reconnect after any of them (`signaling.rs:1562`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
+| the reconnect after any of them (`signaling.rs:1548`) | the session's reason, `AgentDidNotRun` (`:84`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:488`) | the keepalive's due instant (`:475`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:679`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3166`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:779`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |

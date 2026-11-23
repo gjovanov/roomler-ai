@@ -668,6 +668,21 @@ impl Association {
         ai.open_stream(stream_identifier, default_payload_type)
     }
 
+    /// roomler (FR-148 P4b-1, D55): marks stream `stream_identifier`
+    /// deadline-limited, for a data channel that is unordered with
+    /// `maxRetransmits: 0` on a carrier that delivers in order. The
+    /// association then serves ordered and unordered messages in the order
+    /// they were written, and abandons such a stream's chunk when a SACK
+    /// reports it missing or T3-rtx expires while it is out, never at its
+    /// first send; it never retransmits one, and a FORWARD TSN covers only
+    /// what is missing. Every stream of another reliability keeps today's
+    /// rules. The mark is never cleared. False when the association has no
+    /// such stream: nothing is marked.
+    pub async fn mark_deadline_stream(&self, stream_identifier: u16) -> bool {
+        let mut ai = self.association_internal.lock().await;
+        ai.mark_deadline_stream(stream_identifier)
+    }
+
     /// accept_stream accepts a stream
     pub async fn accept_stream(&self) -> Option<Arc<Stream>> {
         let mut accept_ch_rx = self.accept_ch_rx.lock().await;

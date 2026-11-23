@@ -107,7 +107,7 @@ Every reason is said in words ([`describePrivacyReason`, `usePrivacyMode.ts:47`]
 ## How the curtain works
 
 One window over the whole virtual desktop, drawn by the overlay that already paints the "being
-viewed" border and badge ([`set_privacy`, `indicator/win.rs:344`](../agents/roomlerd/src/indicator/win.rs#L344)):
+viewed" border and badge ([`set_privacy`, `indicator/win.rs:353`](../agents/roomlerd/src/indicator/win.rs#L353)):
 
 - topmost, click-through and never activated, so the controller's injected clicks reach the
   applications underneath;

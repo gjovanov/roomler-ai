@@ -1555,8 +1555,9 @@ application-limited.
   the queue fills.
 - The acknowledged bytes are the association's: video, and the control, input and file
   channels beside it.
-- On a partially reliable channel the count is close, not exact. The viewer's unordered
-  opt-in opens video with `maxRetransmits: 0`; the vendored SCTP marks each such chunk
+- On a partially reliable channel the count is close, not exact. The viewer's
+  `video-deadline` channel (FR-148 P4b-2) is unordered with `maxRetransmits: 0`. Unless
+  the agent marks it deadline-limited (P4b-1), the vendored SCTP marks each such chunk
   abandoned at its first send and sends a FORWARD TSN after nearly every SACK, over
   everything then in flight. A lost chunk that a later one follows is reported missing
   and left out. A lost chunk that nothing follows before such a FORWARD TSN reaches the
@@ -1597,7 +1598,7 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 | `an_idle_trickle_yields_only_application_limited_samples` | the jupiter chain of 2026-11-02 as a cell: a still screen's keepalives give only application-limited samples, so none of them can stand for the path |
 | `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue, and messages that fit it): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
 | `shaped_link::a_new_association_starts_a_new_sample` | a new clock starts over, and a held slot keeps the clock the sampler has; the new association's gauges come with it, and the session's least starts over |
-| `shaped_link::a_lossy_unordered_channel_counts_what_the_viewer_took` | an unordered `maxRetransmits: 0` channel, as the viewer's opt-in opens it, writing 1,000-byte messages over the 2 Mbit/s link while one full DATA packet in ten is lost: at each sample's end the clock has counted at least nine tenths of what the viewer took and less than that plus two thirds of what was lost. Of about 215,000 bytes lost by the third sample's end, four runs on a Windows box counted 11,000 to 21,000 more than the viewer took, and two on CI's Linux runners, under the whole suite, 75,000 and 70,000. Before the clock left lost chunks out it counted 2,128,000 against 1,920,000 taken, with 216,000 lost |
+| `shaped_link::a_lossy_unordered_channel_counts_what_the_viewer_took` | an unordered `maxRetransmits: 0` channel, the shape of the viewer's `video-deadline` channel, unmarked, writing 1,000-byte messages over the 2 Mbit/s link while one full DATA packet in ten is lost: at each sample's end the clock has counted at least nine tenths of what the viewer took and less than that plus two thirds of what was lost. Of about 215,000 bytes lost by the third sample's end, four runs on a Windows box counted 11,000 to 21,000 more than the viewer took, and two on CI's Linux runners, under the whole suite, 75,000 and 70,000. Before the clock left lost chunks out it counted 2,128,000 against 1,920,000 taken, with 216,000 lost |
 
 The fork's own tests (`src/association/association_internal/association_internal_test.rs`,
 `test_delivery_clock_*`) pin the rule chunk by chunk: a chunk reported missing that a

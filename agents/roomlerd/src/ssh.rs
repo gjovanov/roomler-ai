@@ -2709,12 +2709,14 @@ mod sshd {
             // this read `native` alone, so a question the companion showed
             // and nobody answered was reported as one nobody could be asked.
             have_surface = (companion_up && marker) || notified;
-            why_not = tray.why_not_shown(marker);
+            // #4164 — a panel busy with another question wins over the app's
+            // cause (`session_panel::Prompted::why_not_shown`).
+            why_not = on_screen.why_not_shown(tray.why_not_shown(marker));
         }
         info!(
             ?caller, %sentinel, native, panel = on_screen.panel(),
-            session_panel = on_screen.session_panel(), why = on_screen.why(), notified,
-            have_surface,
+            session_panel = on_screen.session_panel(), why = on_screen.why(),
+            panel_busy = on_screen.panel_busy(), notified, have_surface,
             "consent prompt surface (ssh)"
         );
 

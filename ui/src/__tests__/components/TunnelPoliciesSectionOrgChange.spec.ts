@@ -255,7 +255,7 @@ async function openEditor(row: number) {
 
 /** The editor's pickers of a row by id, by their label (the kind pickers carry
  *  none; the allowlist's are "Match" and "Proto"). */
-const ID_PICKERS = ['User', 'Role', 'Tunnel client', 'Agent']
+const ID_PICKERS = ['User', 'Role', 'Tunnel client', 'Device']
 
 /** What each id picker of the open editor offers: `<label>: <ids>`. The editor
  *  is teleported, so the pickers are read from the component tree, not the
@@ -329,8 +329,8 @@ describe('TunnelPoliciesSection — the org changes while the tab is open (#4248
     await openEditor(0)
     expect(pickerOffers(w)).toEqual(
       [
-        `Agent: ${B.agent}`,
-        `Agent: ${B.agent}`,
+        `Device: ${B.agent}`,
+        `Device: ${B.agent}`,
         `Role: ${B.role}`,
         `Tunnel client: ${B.client}`,
         `User: ${B.user}`,

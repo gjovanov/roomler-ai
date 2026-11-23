@@ -1085,6 +1085,12 @@ pub(crate) enum NoSurface {
     /// Mac's screen worker, or a two-row Mac's per-user half, did not relay
     /// it ([`crate::companion::TrayVerdict::RoadClosed`]).
     RoadClosed,
+    /// #4164 — a consent panel showed another question, so it did not take
+    /// this one, and nothing else showed it: this daemon's own panel, or on a
+    /// one-row Mac's root daemon the session panel
+    /// ([`crate::indicator::session_panel::Prompted::why_not_shown`]). Over
+    /// either cause above: the panel is what kept it from the person.
+    PanelBusy,
 }
 
 /// #3982 — what a caller is told when its question stood its window and no
@@ -1093,7 +1099,9 @@ pub(crate) enum NoSurface {
 /// policy that would skip the question: `SSH`, `execution`. #4140 — `why`
 /// picks the words: nothing up keeps FR-27's, and a closed road says that the
 /// question could not reach the desktop app, never that the app is not
-/// running or that nobody is at the screen.
+/// running or that nobody is at the screen. #4164 — and a busy panel says
+/// that the device's consent panel was showing another question, never
+/// either of FR-27's guesses: someone may well be at that screen.
 pub(crate) fn nobody_could_be_asked(policy: &str, why: NoSurface) -> String {
     match why {
         NoSurface::NothingUp => format!(
@@ -1106,6 +1114,12 @@ pub(crate) fn nobody_could_be_asked(policy: &str, why: NoSurface) -> String {
              desktop app there (the app gets this device's questions through a part of Roomler \
              in the person's session, and that part is not running or did not answer); answer \
              with `roomlerd consent` there, or set this device's {policy} policy to auto"
+        ),
+        NoSurface::PanelBusy => format!(
+            "nobody could be asked at this device — its consent panel was showing another \
+             question, and nothing else there could show this one; answer with `roomlerd \
+             consent` there, ask again once the panel is free, or set this device's {policy} \
+             policy to auto"
         ),
     }
 }
@@ -2759,6 +2773,55 @@ mod no_surface_words_tests {
                 nobody_could_be_asked(policy, NoSurface::NothingUp),
                 "{policy}: one text for both causes"
             );
+        }
+    }
+
+    /// #4164 — a busy panel's sentence, word for word, for SSH and exec. It
+    /// says the device's consent panel was showing another question. It never
+    /// says that nobody is at the screen or that the app is not running (a
+    /// panel showing a question is on someone's screen), nor "start the
+    /// desktop app". Answering with `roomlerd consent` and the policy switch
+    /// stay, and it is neither of the other causes' texts.
+    ///
+    /// Red before #4164: a busy panel read FR-27's "no one at its screen and
+    /// the Roomler desktop app is not running".
+    #[test]
+    fn a_busy_panels_sentence_is_pinned_and_names_neither_guess() {
+        assert_eq!(
+            nobody_could_be_asked("SSH", NoSurface::PanelBusy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's SSH policy to auto"
+        );
+        assert_eq!(
+            nobody_could_be_asked("execution", NoSurface::PanelBusy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's execution policy to auto"
+        );
+        for policy in ["SSH", "execution"] {
+            let words = nobody_could_be_asked(policy, NoSurface::PanelBusy);
+            for guess in ["screen", "app is not running", "start the desktop app"] {
+                assert!(
+                    !words.contains(guess),
+                    "{policy}: a busy panel's words say {guess:?}: {words}"
+                );
+            }
+            assert!(
+                words.contains("its consent panel was showing another question"),
+                "{policy}: {words}"
+            );
+            assert!(
+                words.contains("answer with `roomlerd consent` there"),
+                "{policy}: {words}"
+            );
+            assert!(
+                words.ends_with(&format!("set this device's {policy} policy to auto")),
+                "{policy}: {words}"
+            );
+            for other in [NoSurface::NothingUp, NoSurface::RoadClosed] {
+                assert_ne!(
+                    words,
+                    nobody_could_be_asked(policy, other),
+                    "{policy}: one text with {other:?}"
+                );
+            }
         }
     }
 }

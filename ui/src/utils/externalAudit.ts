@@ -57,7 +57,7 @@ const REFUSED: Record<string, string> = {
   // An admin's change.
   not_device_admin: 'not a device admin',
   cannot_grant_external: 'may not grant this',
-  device_unsupported: 'agent too old',
+  device_unsupported: 'roomlerd too old',
   // A login or a session.
   unavailable: 'refused',
   throttled: 'too many attempts',
