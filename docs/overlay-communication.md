@@ -1138,7 +1138,9 @@ match this node`), and an org-relay grant that needs them is refused.
 * **Route erasure** — the route guard reacts to OS route-change events
   (Windows `NotifyRouteChange2`, Linux `ip monitor route`, macOS
   `route -n monitor`) with an immediate
-  re-assert of the per-peer `/32`s and any exit `/1`s (waves rate-limited to
+  re-assert of the per-peer `/32`s, a router peer's approved subnet routes
+  (put back only when missing: the bullet after the ⚠️ note below) and any
+  exit `/1`s (waves rate-limited to
   ≥3 s apart; an event inside the quiet window pulls the next tick to the
   due boundary, so no erase waits longer than that). The blind tick is a
   30 s belt-and-braces heartbeat while the subscription is live
@@ -1178,6 +1180,82 @@ match this node`), and an org-relay grant that needs them is refused.
 > `pulled=N` inside the arms bracket (`ROUTE_WAVES_PULLED`): the tick waves an
 > event pulled forward. `pulled ≈ tick` is a guard re-arming itself, and
 > `tick − pulled` is the real heartbeat.
+
+* **A router peer's subnet routes are put back, never taken back** (#4279).
+  Until #4279 a wave re-asserted the peers' `/32`s but not the subnet routes
+  `install_subnets` writes for a router peer, so a subnet route that anything
+  deleted stayed missing until that peer's next carrier install. On
+  2026-11-21 every route on a Windows host's overlay adapter was deleted: the
+  peers' `/32`s were back within seconds, a router peer's three subnet routes
+  stayed missing for 35 minutes, and the network behind that router was dark
+  while the router read online. A wave now also restores them:
+  - **What is defended.** Per installed peer, the subnets its crypto-router
+    entry holds (what install routed, `WgDevice::peer_subnets`, read on the
+    select loop at `crates/tunnel-core/src/overlay/runtime.rs:3441` and
+    `crates/tunnel-core/src/overlay/runtime.rs:3641`) that the network map
+    still approves (`defended_subnets_of`,
+    `crates/tunnel-core/src/overlay/runtime/route_guard.rs:138`). An approved
+    subnet that no install has routed yet is not defended: an OS route with
+    no crypto-router entry behind it would pull the range into the TUN and
+    drop it there. A revoked subnet is not defended, and nothing deletes its
+    route either: the next carrier install does, as before.
+  - **Never a default route.** The set goes through install's own P5/A1
+    filter (`installable_subnets`, `route_guard.rs:114`, which install applies
+    at `route_guard.rs:668`), so no prefix of length 0 or 1 enters it. An exit
+    node's `0.0.0.0/0` approval and the `/1` halves an exit client's
+    crypto-router holds stay with the exit path, which re-asserts them inline.
+  - **Once per CIDR**, however many routers claim it (`defended_routes`,
+    `route_guard.rs:166`): one OS route serves them all, and the
+    crypto-router's tie-break picks the carrier. The wave hands each one
+    (`route_guard.rs:249`) to `TunIo::defend_subnet_route`
+    (`crates/tunnel-core/src/overlay/tun.rs:140`), whose default does nothing:
+    the userspace netstack has no OS routes, and `SplitTun` forwards the call
+    to its OS device (`crates/tunnel-core/src/overlay/split_tun.rs:345`).
+  - **It fills a hole and never displaces a route that holds the prefix**, on
+    every OS. Multi-org gives each org its own adapter
+    ([multi-org.md](multi-org.md)), and two orgs may approve the same subnet,
+    because private ranges overlap across tenants. A guard that took the
+    prefix back would flip it with the sibling org's guard on every wave, and
+    each flip is a route change that arms the next wave in both runtimes. So a
+    sibling org's adapter, another product or the host's own LAN keeps a
+    prefix it holds. Install is unchanged: the last carrier install still
+    takes the prefix (Linux `replace`, macOS delete-then-add), and which org's
+    route should win there is an open decision of FR-68's C3
+    ([FR-68](fr/FR-68-stress-cells-multi-org-and-ipam.md)).
+  - **Logs.** A restore is a DEBUG line, `overlay: route guard restored a
+    missing subnet route`: a VPN that deletes the route on every wave would
+    make an INFO a flood. A holder is named once, when it starts, by one INFO,
+    `overlay: another route holds this subnet's prefix …`, whose `holder`
+    field is the interface that holds it, or `unnamed` when the OS did not say
+    (Linux and macOS, `subnet_restored`, `tun.rs:6265`). It is named again
+    only after our route was back in between. On Windows a route that keeps
+    going missing gets #1328's WARN and stand-down instead.
+  - **Kill switch:** `ROOMLERD_OVERLAY_SUBNET_GUARD=0` (default on,
+    `subnet_guard_enabled`, `route_guard.rs:205`, read on every wave). Off, a
+    wave writes no subnet route and every other arm runs as before; a subnet
+    route that goes missing stays missing until its router peer's next carrier
+    install, as before #4279, and the first wave that carries a subnet logs
+    one INFO per process naming the switch. Its use: a host that deletes our
+    route on purpose, such as a Linux host whose own LAN is the advertised
+    subnet and that wants the LAN's route back. Whether our route should be
+    installed over a connected LAN route at all is install's policy, not the
+    guard's.
+
+  How each OS restores one:
+
+  | OS | The guard reads | It writes | A route that already holds the prefix |
+  |---|---|---|---|
+  | Linux | `ip [-6] route show exact <cidr> dev <if>`, our device only (`linux_subnet_show_args`, `tun.rs:626`; `linux_route_shown`, `tun.rs:8091`) | install's argv with `replace` → `add`, only when ours is not listed (`linux_subnet_restore_writes`, `tun.rs:610`) | refuses the `add` with EEXIST (`File exists`), the quiet held answer. A refused netlink write is answered to the writer alone, so no route monitor sees it |
+  | macOS | install's exact `route -n get`, read three ways as #4117 reads the utun's block: ours, another interface's, absent (`utun_block_held`, `tun.rs:1188`) | install's `add` alone, never its `delete`, and only when nothing holds the prefix (`bsd_subnet_restore_writes`, `tun.rs:724`; `bsd_subnet_restore`, `tun.rs:8469`) | is never added over. `route` exits 0 when the kernel refuses a write, and the refused add still reaches every routing-socket listener as `RTM_ADD … errno 17`, which the route monitor counts (`classify_bsd_monitor_line`, below), so an add over a holder would arm the next wave, be refused, and arm the one after |
+  | Windows | `winroute::ensure` on our adapter's LUID: the row install makes, on-link at metric 1 (`SystemTun::defend_subnet_route`, `tun.rs:6627`; `ensure`, `tun.rs:3122`) | that row, only when it is missing | is another interface's row, which Windows keys apart from ours, so nothing touches it |
+
+  Windows restores through `ensure`, not install's `add_cidr_route`, because
+  only `ensure` carries #1328's stand-down: a subnet is a peer-class route, so
+  before a VPN that keeps deleting it the guard stands down as it does for a
+  peer's `/32`, where `add_cidr_route` (deliberately, for the exit `/1`s)
+  never does, and an endless re-add fight is what ran the Windows guard at
+  ~20 waves/min per adapter (#1282). Linux and macOS have no stand-down for a
+  peer's `/32` either, and a subnet behaves as a peer does there.
 
 * **The OS change feed survives its own monitor dying** (#1867). On Linux and
   macOS, netstate's feed is a child process (`ip -o monitor`, `route -n
@@ -1495,7 +1573,8 @@ add would start the next wave every time.
   second org's WARN names it. When the first org's utun closes its route goes
   with it, and the second org's next wave routes the block on its own utun.
 * **A peer's `/32` is unchanged.** A wave still re-asserts the routes the
-  runtime installed (peers' `/32`s, subnet routes, exit `/1`s). It reads the
+  runtime installed (peers' `/32`s, subnet routes, exit `/1`s; a subnet route
+  only when it is missing, §8). It reads the
   block's route as a cover, never as a peer's own, so a peer's `/32` is still
   written and deleted as before.
 * **Kill switch:** `ROOMLERD_OVERLAY_UTUN_BLOCK_ROUTE=0` leaves the utun as the
@@ -1519,6 +1598,7 @@ overlay against a real utun`:
 | `a_withhold_never_deletes_another_products_route_for_the_block` (`tun.rs:9863`) | with the block on `lo0` and an address inside it, the wave withholds and the `lo0` route stays |
 | `no_utun_of_ours_withholds_a_siblings_block` (`tun.rs:9982`) | three utuns of ours, one block nested in another and two sharing one, withhold nothing |
 | `a_wave_that_finds_the_block_route_as_decided_writes_nothing` (`tun.rs:10025`) | three waves write nothing under `route -n monitor`, routed and withheld alike |
+| `a_subnet_route_is_restored_when_missing_and_never_added_over_a_holder` (`tun.rs:11068`) | #4279: a deleted subnet route is back after one restore; while `lo0` holds exactly the prefix, three restores write nothing (no `RTM_ADD` under `route -n monitor`, not even a refused one, with a positive control) and name the holder once; the holder gone, the next restore routes it on the utun |
 
 The parsers, the argv builders, the gate and the decision are pure and tested
 on every platform (`utun_shape_tests`, `tun.rs:971`; `utun_block_gate_tests`,
@@ -1651,6 +1731,7 @@ prefix is still honoured.
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
 | `…_ROUTE_TICK_SECS` | 30 | route-guard heartbeat seconds while the subscription is live (2–300; `2` = pre-demotion cadence). Ignored — always 2 s — without a live subscription |
 | `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
+| `…_SUBNET_GUARD` | **on** (#4279) | the route guard puts a router peer's approved subnet route back when it is missing, and never over a route that holds the prefix (§8); off = a wave writes no subnet route, so one that goes missing stays missing until the router peer's next carrier install, as before #4279, and the first such wave logs one INFO naming the switch. For a host that deletes our route on purpose, such as a Linux host whose own LAN is the advertised subnet. Read on every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 | `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
 | `…_UTUN_BLOCK_ROUTE` | **on** (#4117) | macOS: the utun's first address is its own peer, and the overlay block is routed on the utun while no other interface's address and no default gateway sits inside the block, decided again on every route-guard wave (§8); off = the utun as the `tun` crate made it, as through 0.4.228, and no wave decides anything for the block. Environment only |
