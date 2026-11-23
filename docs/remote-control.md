@@ -7109,6 +7109,18 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
 
+**Machine guard** (`agents/roomlerd/src/machine_guard.rs`, #4280): one
+daemon per machine, whatever config a `run` loads. `run` takes it before
+anything host-global, and a run that finds it held leaves with 8 (0 on
+macOS). Only a privileged daemon (SYSTEM or an elevated administrator on
+Windows, root on Linux and macOS) can hold it; an unprivileged start can
+check for it but never creates it. It is keyed by the overlay
+interface's name and held only while its owner lives, so a holder that
+ends leaves it free. On Windows only SYSTEM and Administrators, at high
+integrity, can take it or change it, and any other signed-in account can
+only read whether it is held. The rule, and how each supervisor reads the
+code: [multi-org.md §2](multi-org.md#the-machines-guard-one-daemon-per-machine-enforced-4280).
+
 **Internal liveness watchdog** (`agents/roomlerd/src/watchdog.
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
@@ -8314,7 +8326,7 @@ flowchart LR
   | The supervisor returned an error | `ServiceSpecific(2)` | restarts it |
   | The supervisor panicked | `ServiceSpecific(3)` | restarts it |
   | No supervisor at all (the worker path or the startup sequence failed) | `ServiceSpecific(4)` | restarts it |
-  | The worker found the single-instance lock held, and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour (#2465, §19.8.9) | `0` | leaves the service stopped |
+  | The worker found the single-instance lock or the machine's guard held (#4280), and the orphan check read every roomlerd process without finding an earlier host's worker: a second installed flavour, or a console `run` that holds the machine (#2465, §19.8.9) | `0` | leaves the service stopped |
   | The same refusal, but some roomlerd process could not be read, so an orphan cannot be ruled out (#2465) | `ServiceSpecific(5)` | restarts it |
 
   ⚠️ A requested stop must stay `0`. With non-crash failure actions on, any other

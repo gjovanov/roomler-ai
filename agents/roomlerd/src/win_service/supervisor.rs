@@ -1674,7 +1674,8 @@ pub fn run(
                                     code,
                                     orphan_check_complete = reap.complete(),
                                     "supervisor: another roomler daemon already holds this \
-                                     config's single-instance lock — this one is redundant. \
+                                     config's single-instance lock or the machine's guard — \
+                                     this one is redundant. \
                                      Stopping instead of respawning. Uninstall the duplicate \
                                      daemon flavour (perMachine service vs perUser task) to clear \
                                      this."

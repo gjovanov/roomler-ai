@@ -124,6 +124,9 @@ pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+/// #4280 — one daemon per machine: the guard `run` takes before anything
+/// host-global, which only a privileged daemon can hold.
+pub mod machine_guard;
 /// #3164 — a Quit AppleEvent restarts the agent; LaunchServices' own launch of
 /// the bundle never becomes a second daemon. Pure halves on every platform.
 pub mod macos_quit;

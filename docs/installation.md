@@ -1419,7 +1419,11 @@ Deleting a task does not end the process it started, so until #3885 the arm left
 daemon running beside the per-Machine service's: two daemons on one machine, on one TUN name and
 GUID, one LocalAPI pipe, and the host-wide exit, DNS and WFP state. The arm now ends each task
 before it deletes it, and then stops what of the account's daemon still runs
-(`clean_up_user_tasks`, `agents/roomlerd/src/install_cleanup.rs:550`):
+(`clean_up_user_tasks`, `agents/roomlerd/src/install_cleanup.rs:550`). The machine's guard
+(#4280) keeps a per-user daemon from STARTING beside a running service: it finds the guard held
+and leaves with 8, which its launcher takes as a deliberate end. One that already runs holds no
+guard, so the arm still stops it
+([multi-org.md §2](multi-org.md#the-machines-guard-one-daemon-per-machine-enforced-4280)):
 
 ```mermaid
 flowchart TD
