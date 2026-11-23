@@ -15,8 +15,9 @@
 //!
 //! | Piece | Rule |
 //! |---|---|
-//! | the pick ([`pick`]) | `video-deadline` when the carrier class is TCP somewhere ([`CarrierClass::is_tcp`]: TURN over TCP or TLS, by the carrier line's `relay_transport`, or a mesh path whose overlay tier is not `Direct`) and the viewer opened one on a framed session; `video-bytes` otherwise, and whenever the class is not known |
-//! | the class ([`Pump::read`]) | read from the selected pair, at the pump's start and at each 5 s transport re-check, never from `detect_constrained_transport`'s 3 s default: with no pair selected it is `unknown`, so the session starts on `video-bytes` and the re-check picks again once a pair is selected |
+//! | the pick ([`pick`]) | `video-deadline` when the carrier is TCP somewhere ([`TcpEnd`]) and the viewer opened one on a framed session; `video-bytes` otherwise, and whenever neither end's carrier is known |
+//! | TCP somewhere ([`TcpEnd::of`]) | the agent's own class is TCP ([`CarrierClass::is_tcp`]: TURN over TCP or TLS, by the carrier line's `relay_transport`, or a mesh path whose overlay tier is not `Direct`), or, on a pair selected off the mesh, the viewer's newest report of its own relay is `tcp` or `tls` (FR-148 P4b-3b, D58: `rc:decodestat`'s `relay`, kept in [`ViewerRelayReport`]). On the mesh the report is ignored: the browser's label for its candidate there is no read of the carrier |
+//! | the class ([`Pump::read`]) | read from the selected pair, at the pump's start and at each 5 s transport re-check, never from `detect_constrained_transport`'s 3 s default: with no pair selected it is `unknown`, so the session starts on `video-bytes` and the re-check picks again once a pair is selected. The viewer's report is read with it |
 //! | the switch | at a key frame, over one `frame_seq` space: a frame dropped for the switch or for D consumes its number too |
 //! | the drain rule | once the pick says switch, nothing more is written on the old channel, and every frame is dropped whole until its buffered amount reads 0 (acknowledged, or abandoned and forwarded); then a key frame is asked through the session's gate ([`KeyframeGate`]), at each frame until an ask passes its 500 ms gap (a switch's own key frame is not recovery, so the key frame rule never spaces it: [`LaneAsk::Switch`]), frames are dropped until one comes, and it goes whole on the new channel. The wait has no time bound: the switch line says how long it held the video |
 //! | the deadline D ([`DEADLINE`]) | under `on`, on `video-deadline` only: a frame older than D at its first write, counted from its hand-off to the send task, is dropped whole, and a key frame is asked through the gate; a frame begun is finished |
@@ -33,14 +34,17 @@
 //! frame's chunked send as the send task's `if let` did (FR-65's `dc_lock`).
 //!
 //! The lines: `video channel: <from> -> <to> (carrier=<class>,
-//! frame_seq=<n>, held_ms=<n>, dropped=<n>)` at each switch (`none` as
-//! `<from>` at a pump's first pick), with `(shadow)` after `channel` for the
-//! switch `on` would make; one line when the carrier wants `video-deadline`
-//! and the session has none open; one when its stream's mark is refused. The
-//! counts go on the `path delivery` line (FR-148 P0) under `shadow` and `on`,
-//! and after them FR-148 P4b-4's: the session's key frame asks over the line
-//! by who asked, the refusals by the 500 ms gap and by the rule, the owed asks
-//! granted, and the rule's gap at the line.
+//! frame_seq=<n>, held_ms=<n>, dropped=<n>, tcp_end=<end>)` at each switch
+//! (`none` as `<from>` at a pump's first pick), with `(shadow)` after
+//! `channel` for the switch `on` would make; one line when the carrier wants
+//! `video-deadline` and the session has none open; one when its stream's mark
+//! is refused; and the class line, with `viewer_relay` and `tcp_end`, when a
+//! read changes the class, the report or the end that holds the TCP leg.
+//! `carrier` is the agent's own class. The counts go on the `path delivery`
+//! line (FR-148 P0) under `shadow` and `on`, and after them FR-148 P4b-4's:
+//! the session's key frame asks over the line by who asked, the refusals by
+//! the 500 ms gap and by the rule, the owed asks granted, and the rule's gap
+//! at the line.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -185,6 +189,143 @@ impl CarrierClass {
     }
 }
 
+/// FR-148 P4b-3b (D58) — what carries the viewer's own relay, as its
+/// `rc:decodestat` reports it in `relay`: the `relayProtocol` of the local
+/// candidate of the pair the browser selected, when that candidate is a relay.
+/// The agent cannot read the far end's leg itself ([`class_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewerRelay {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+impl ViewerRelay {
+    /// `relay` on one `rc:decodestat`, by exact equality with `udp`, `tcp` or
+    /// `tls`. Anything else, a non-string or an absent key included, is no
+    /// report.
+    pub fn of_decodestat(val: &serde_json::Value) -> Option<Self> {
+        match val.get("relay").and_then(serde_json::Value::as_str) {
+            Some("udp") => Some(ViewerRelay::Udp),
+            Some("tcp") => Some(ViewerRelay::Tcp),
+            Some("tls") => Some(ViewerRelay::Tls),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            ViewerRelay::Udp => "udp",
+            ViewerRelay::Tcp => "tcp",
+            ViewerRelay::Tls => "tls",
+        }
+    }
+
+    /// TCP, or TLS over TCP: the viewer's leg to its relay is TCP.
+    pub fn is_tcp(self) -> bool {
+        matches!(self, ViewerRelay::Tcp | ViewerRelay::Tls)
+    }
+
+    /// A report's word in the class line, `none` without one.
+    fn word_of(report: Option<Self>) -> &'static str {
+        report.map_or("none", Self::word)
+    }
+
+    fn code(report: Option<Self>) -> u8 {
+        match report {
+            None => 0,
+            Some(ViewerRelay::Udp) => 1,
+            Some(ViewerRelay::Tcp) => 2,
+            Some(ViewerRelay::Tls) => 3,
+        }
+    }
+
+    fn of_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(ViewerRelay::Udp),
+            2 => Some(ViewerRelay::Tcp),
+            3 => Some(ViewerRelay::Tls),
+            _ => None,
+        }
+    }
+}
+
+/// FR-148 P4b-3b (D58) — the end of the selected pair that holds a TCP leg:
+/// what the pick reads, and the lines' `tcp_end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpEnd {
+    None,
+    Agent,
+    Viewer,
+    Both,
+}
+
+impl TcpEnd {
+    /// The agent's own class, and the viewer's newest report where it counts:
+    /// on a pair selected off the mesh (`off_mesh`). On the mesh the agent's
+    /// own read decides and the report is ignored, because the browser names
+    /// its local candidate there `prflx` (FR-148 §15, M0R).
+    pub fn of(class: CarrierClass, off_mesh: bool, viewer: Option<ViewerRelay>) -> Self {
+        Self::of_legs(
+            class.is_tcp(),
+            off_mesh && viewer.is_some_and(ViewerRelay::is_tcp),
+        )
+    }
+
+    fn of_legs(agent: bool, viewer: bool) -> Self {
+        match (agent, viewer) {
+            (false, false) => TcpEnd::None,
+            (true, false) => TcpEnd::Agent,
+            (false, true) => TcpEnd::Viewer,
+            (true, true) => TcpEnd::Both,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            TcpEnd::None => "none",
+            TcpEnd::Agent => "agent",
+            TcpEnd::Viewer => "viewer",
+            TcpEnd::Both => "both",
+        }
+    }
+
+    /// TCP somewhere on the pair: `video-deadline`'s carriers.
+    pub fn is_tcp(self) -> bool {
+        self != TcpEnd::None
+    }
+}
+
+/// The agent's own class alone, as a viewer that sends no report leaves it:
+/// P4b-3's pick.
+impl From<CarrierClass> for TcpEnd {
+    fn from(class: CarrierClass) -> Self {
+        Self::of_legs(class.is_tcp(), false)
+    }
+}
+
+/// FR-148 P4b-3b — set in a pump's read, beside the agent's own class, when
+/// the viewer's report names a TCP leg that counts ([`TcpEnd::of`]), so the
+/// send task's lane takes both from one load.
+const VIEWER_TCP: u8 = 0x80;
+
+/// A pump's read as its lane takes it: the agent's own class, and the end
+/// that holds the TCP leg.
+fn read_code(class: CarrierClass, end: TcpEnd) -> u8 {
+    match end {
+        TcpEnd::Viewer | TcpEnd::Both => class.code() | VIEWER_TCP,
+        TcpEnd::None | TcpEnd::Agent => class.code(),
+    }
+}
+
+fn read_of(code: u8) -> (CarrierClass, TcpEnd) {
+    let class = CarrierClass::of_code(code & !VIEWER_TCP);
+    (
+        class,
+        TcpEnd::of_legs(class.is_tcp(), code & VIEWER_TCP != 0),
+    )
+}
+
 /// The class of a selected pair: the pair, what carries the agent's own relay
 /// for it (the carrier line's `relay_transport`), whether it rides the mesh,
 /// and what the overlay said about the remote's peer (`None` when nothing
@@ -218,22 +359,25 @@ pub fn class_of(
     }
 }
 
-/// The pick: `video-deadline` on a carrier that is TCP somewhere, when one is
-/// open; `video-bytes` otherwise.
-pub fn pick(class: CarrierClass, deadline_open: bool) -> Channel {
-    if deadline_open && class.is_tcp() {
+/// The pick: `video-deadline` on a carrier that is TCP somewhere, at either
+/// end of the pair (FR-148 P4b-3b), when one is open; `video-bytes`
+/// otherwise. A class alone is the agent's own end, as P4b-3 picked.
+pub fn pick(end: impl Into<TcpEnd>, deadline_open: bool) -> Channel {
+    if deadline_open && end.into().is_tcp() {
         Channel::Deadline
     } else {
         Channel::Bytes
     }
 }
 
-/// The class of the pair selected now: `unknown` while none is.
-async fn class_now(pc: &RTCPeerConnection) -> CarrierClass {
+/// The class of the pair selected now, and whether it is off the mesh (FR-148
+/// P4b-3b: where the viewer's report counts): `unknown` and not, while none
+/// is.
+async fn class_now(pc: &RTCPeerConnection) -> (CarrierClass, bool) {
     let Some((pair, relay, rides)) =
         crate::session_carrier::nominated_pair(pc, Duration::ZERO).await
     else {
-        return CarrierClass::Unknown;
+        return (CarrierClass::Unknown, false);
     };
     // As the carrier line reads it: the ICE agent's read under `route`, the
     // remote's range otherwise.
@@ -243,7 +387,7 @@ async fn class_now(pc: &RTCPeerConnection) -> CarrierClass {
     } else {
         None
     };
-    class_of(&pair, relay, rides, overlay.as_ref())
+    (class_of(&pair, relay, rides, overlay.as_ref()), !rides)
 }
 
 /// rc.130, rc.217 — the least gap between two key frames a session forces on
@@ -607,10 +751,12 @@ impl KeyframeGate {
 }
 
 /// What a session's pumps and its control channel share: the session's
-/// `video-deadline` once the viewer opened one, and its key frame gate.
+/// `video-deadline` once the viewer opened one, its key frame gate, and the
+/// viewer's report of its own relay (FR-148 P4b-3b).
 pub struct Session {
     deadline: tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     gate: Arc<KeyframeGate>,
+    viewer_relay: Arc<ViewerRelayReport>,
 }
 
 static SESSIONS: LazyLock<Mutex<HashMap<ObjectId, Weak<Session>>>> =
@@ -623,6 +769,7 @@ impl Session {
         let session = Arc::new(Self {
             deadline: tokio::sync::Mutex::new(None),
             gate: Arc::new(KeyframeGate::new(keyframe_requested)),
+            viewer_relay: Arc::default(),
         });
         let mut all = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
         all.retain(|_, s| s.strong_count() > 0);
@@ -644,6 +791,51 @@ impl Session {
     /// The session's key frame gate.
     pub fn gate(&self) -> Arc<KeyframeGate> {
         Arc::clone(&self.gate)
+    }
+
+    /// FR-148 P4b-3b — the session's slot for the viewer's report of its own
+    /// relay, which the control channel writes.
+    pub fn viewer_relay(&self) -> Arc<ViewerRelayReport> {
+        Arc::clone(&self.viewer_relay)
+    }
+}
+
+/// FR-148 P4b-3b (D58) — a session's newest report of the viewer's own relay
+/// (`rc:decodestat`'s `relay`), with its arrival time. The control channel
+/// writes it and the pumps read it with the class. Each `rc:decodestat`
+/// overwrites it, so one without the key clears it, and it has no age bound:
+/// it holds until the next `rc:decodestat` replaces it, so a stall that slows
+/// the control channel cannot flip the pick back. It keeps nothing until a
+/// pump under `shadow` or `on` serves the session ([`Pump::start`]), so under
+/// `off` nothing is kept.
+#[derive(Debug, Default)]
+pub struct ViewerRelayReport {
+    kept: AtomicBool,
+    newest: Mutex<Option<(ViewerRelay, Instant)>>,
+}
+
+impl ViewerRelayReport {
+    /// One `rc:decodestat`, as the control channel received it.
+    pub fn note(&self, val: &serde_json::Value) {
+        self.note_at(ViewerRelay::of_decodestat(val), Instant::now());
+    }
+
+    fn note_at(&self, report: Option<ViewerRelay>, at: Instant) {
+        if !self.kept.load(Relaxed) {
+            return;
+        }
+        *self.newest.lock().unwrap_or_else(PoisonError::into_inner) = report.map(|r| (r, at));
+    }
+
+    /// The newest report and when it arrived; `None` when the newest
+    /// `rc:decodestat` carried none, or before one came.
+    pub fn newest(&self) -> Option<(ViewerRelay, Instant)> {
+        *self.newest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// From now on, each `rc:decodestat` is kept.
+    fn keep(&self) {
+        self.kept.store(true, Relaxed);
     }
 }
 
@@ -786,12 +978,14 @@ impl DeadlineLine {
 }
 
 /// A pump's handle: its switch value and counters, the session it serves,
-/// and the carrier class it last read.
+/// and what it last read: the carrier class and the end that holds the TCP
+/// leg (one byte, [`read_code`]), and the viewer's report (FR-148 P4b-3b).
 pub struct Pump {
     session_id: ObjectId,
     counters: Arc<Counters>,
     session: Option<Arc<Session>>,
     class: Arc<AtomicU8>,
+    viewer: AtomicU8,
 }
 
 impl Pump {
@@ -802,37 +996,68 @@ impl Pump {
         pc: &RTCPeerConnection,
         counters: &Arc<Counters>,
     ) -> Self {
-        let session = match counters.mode {
-            Mode::Off => None,
-            Mode::Shadow | Mode::On => Session::of(session_id),
-        };
-        if let Some(s) = &session {
-            counters.follow(s.gate(), crate::session_telemetry::counters(session_id));
-        }
-        let pump = Self {
-            session_id,
-            counters: Arc::clone(counters),
-            session,
-            class: Arc::new(AtomicU8::new(CarrierClass::Unknown.code())),
-        };
+        let pump = Self::new(session_id, counters);
         pump.read(pc).await;
         pump
     }
 
-    /// The selected pair's class, read now; the send task's next frame picks
-    /// by it. At the pump's start and at each transport re-check. Under `off`
-    /// nothing is read.
+    /// The handle before its first read. Under `shadow` and `on` it finds the
+    /// session's, whose key frame gate its counters follow (FR-148 P4b-4) and
+    /// which keeps the viewer's report of its relay from then on (FR-148
+    /// P4b-3b); under `off` it finds none.
+    fn new(session_id: ObjectId, counters: &Arc<Counters>) -> Self {
+        let session = match counters.mode {
+            Mode::Off => None,
+            Mode::Shadow | Mode::On => Session::of(session_id),
+        };
+        if let Some(session) = &session {
+            counters.follow(
+                session.gate(),
+                crate::session_telemetry::counters(session_id),
+            );
+            session.viewer_relay.keep();
+        }
+        Self {
+            session_id,
+            counters: Arc::clone(counters),
+            session,
+            class: Arc::new(AtomicU8::new(CarrierClass::Unknown.code())),
+            viewer: AtomicU8::new(ViewerRelay::code(None)),
+        }
+    }
+
+    /// The selected pair's class, read now, with the viewer's newest report;
+    /// the send task's next frame picks by them. At the pump's start and at
+    /// each transport re-check. Under `off` nothing is read.
     pub async fn read(&self, pc: &RTCPeerConnection) {
         if self.counters.mode == Mode::Off {
             return;
         }
-        let class = class_now(pc).await;
-        let was = CarrierClass::of_code(self.class.swap(class.code(), Relaxed));
-        if was != class {
+        let (class, off_mesh) = class_now(pc).await;
+        self.note(class, off_mesh);
+    }
+
+    /// FR-148 P4b-3b (D58) — one read: the agent's own class, whether the pair
+    /// is selected off the mesh, and the session's newest report, which counts
+    /// only there. The class line names both ends when one of the three it
+    /// carries changed: the class, the report, or the end that holds the TCP
+    /// leg. `from` and `to` stay the agent's own class.
+    fn note(&self, class: CarrierClass, off_mesh: bool) {
+        let report = self
+            .session
+            .as_ref()
+            .and_then(|s| s.viewer_relay.newest())
+            .map(|(report, _)| report);
+        let end = TcpEnd::of(class, off_mesh, report);
+        let (was, was_end) = read_of(self.class.swap(read_code(class, end), Relaxed));
+        let was_report = ViewerRelay::of_code(self.viewer.swap(ViewerRelay::code(report), Relaxed));
+        if (was, was_report, was_end) != (class, report, end) {
             info!(
                 session = %self.session_id,
                 from = was.word(),
                 to = class.word(),
+                viewer_relay = ViewerRelay::word_of(report),
+                tcp_end = end.word(),
                 "video channel: carrier class (FR-148 P4b-3)"
             );
         }
@@ -960,6 +1185,8 @@ struct Switch {
     from: Channel,
     to: Channel,
     class: CarrierClass,
+    /// The end that held the TCP leg when the pick said switch.
+    end: TcpEnd,
     /// When the pick said switch.
     since: Instant,
     /// From then until the old channel read drained.
@@ -1085,8 +1312,10 @@ impl<W: Wire> Lane<W> {
         }
     }
 
-    fn class(&self) -> CarrierClass {
-        CarrierClass::of_code(self.class.load(Relaxed))
+    /// The pump's last read: the agent's own class, and the end that holds
+    /// the TCP leg (FR-148 P4b-3b).
+    fn carrier(&self) -> (CarrierClass, TcpEnd) {
+        read_of(self.class.load(Relaxed))
     }
 
     /// FR-148 P4b-4 — the key frame rule's scope as the lane stands: on
@@ -1116,13 +1345,13 @@ impl<W: Wire> Lane<W> {
         bytes: W::Dc,
         held: W::Held,
     ) -> Option<Routed<W>> {
-        let class = self.class();
+        let (class, end) = self.carrier();
         let deadline = match self.framed {
             true => self.wire.deadline().await,
             false => None,
         };
-        self.say_none_open(class, deadline.is_some());
-        let want = pick(class, deadline.is_some());
+        self.say_none_open(class, end, deadline.is_some());
+        let want = pick(end, deadline.is_some());
         if self.phase == Phase::Steady && self.on != Some(want) {
             // The mark first: refused, nothing switches.
             let marked = match (&deadline, want) {
@@ -1136,13 +1365,14 @@ impl<W: Wire> Lane<W> {
                     let first = if marked { want } else { Channel::Bytes };
                     self.on = Some(first);
                     self.counters.set_channel(first);
-                    self.say_first(first, class);
+                    self.say_first(first, class, end);
                 }
                 Some(from) if marked => {
                     self.phase = Phase::Draining(Switch {
                         from,
                         to: want,
                         class,
+                        end,
                         since: now,
                         drained_ms: 0,
                         dropped: 0,
@@ -1231,13 +1461,14 @@ impl<W: Wire> Lane<W> {
         info!(
             session = %self.session_id,
             drained_ms = s.drained_ms,
-            "video channel: {} -> {} (carrier={}, frame_seq={}, held_ms={}, dropped={})",
+            "video channel: {} -> {} (carrier={}, frame_seq={}, held_ms={}, dropped={}, tcp_end={})",
             s.from.label(),
             to.label(),
             s.class.word(),
             out.frame_seq,
             ms(now.saturating_duration_since(s.since)),
             s.dropped,
+            s.end.word(),
         );
         Some(out)
     }
@@ -1246,21 +1477,22 @@ impl<W: Wire> Lane<W> {
     /// it would be on, the switch it would make at a key frame, the frames D
     /// would drop there.
     async fn shadow(&mut self, keyframe: bool, age: Duration, now: Instant) {
-        let class = self.class();
+        let (class, end) = self.carrier();
         let open = self.framed && self.wire.deadline().await.is_some();
-        self.say_none_open(class, open);
-        let want = pick(class, open);
+        self.say_none_open(class, end, open);
+        let want = pick(end, open);
         match self.on {
             None => {
                 self.on = Some(want);
                 self.counters.set_channel(want);
-                self.say_first(want, class);
+                self.say_first(want, class, end);
             }
             Some(from) if self.phase == Phase::Steady && want != from => {
                 self.phase = Phase::Keying(Switch {
                     from,
                     to: want,
                     class,
+                    end,
                     since: now,
                     drained_ms: 0,
                     dropped: 0,
@@ -1278,12 +1510,13 @@ impl<W: Wire> Lane<W> {
             self.counters.switches.fetch_add(1, Relaxed);
             info!(
                 session = %self.session_id,
-                "video channel (shadow): {} -> {} (carrier={}, frame_seq={}, held_ms={}, dropped=0)",
+                "video channel (shadow): {} -> {} (carrier={}, frame_seq={}, held_ms={}, dropped=0, tcp_end={})",
                 s.from.label(),
                 s.to.label(),
                 s.class.word(),
                 self.frame_seq.wrapping_add(1),
                 ms(now.saturating_duration_since(s.since)),
+                s.end.word(),
             );
         }
         if self.on == Some(Channel::Deadline) && age > DEADLINE {
@@ -1341,21 +1574,22 @@ impl<W: Wire> Lane<W> {
         }
     }
 
-    fn say_first(&self, first: Channel, class: CarrierClass) {
+    fn say_first(&self, first: Channel, class: CarrierClass, end: TcpEnd) {
         info!(
             session = %self.session_id,
-            "video channel{}: none -> {} (carrier={}, frame_seq={}, held_ms=0, dropped=0)",
+            "video channel{}: none -> {} (carrier={}, frame_seq={}, held_ms=0, dropped=0, tcp_end={})",
             self.tag(),
             first.label(),
             class.word(),
             self.frame_seq.wrapping_add(1),
+            end.word(),
         );
     }
 
     /// The carrier wants `video-deadline` and the session has none open (an
     /// older viewer, or an unframed session): one line says so.
-    fn say_none_open(&mut self, class: CarrierClass, open: bool) {
-        if open || !class.is_tcp() || self.said_none_open {
+    fn say_none_open(&mut self, class: CarrierClass, end: TcpEnd, open: bool) {
+        if open || !end.is_tcp() || self.said_none_open {
             return;
         }
         self.said_none_open = true;
@@ -1363,6 +1597,7 @@ impl<W: Wire> Lane<W> {
             session = %self.session_id,
             carrier = class.word(),
             framed = self.framed,
+            tcp_end = end.word(),
             "video channel{}: the carrier is TCP somewhere and no video-deadline is open; video-bytes (FR-148 P4b-3)",
             self.tag(),
         );
@@ -1762,6 +1997,666 @@ mod tests {
         pc.close().await.expect("closed");
     }
 
+    /// FR-148 P4b-3b — a session whose viewer reports its relay, under
+    /// `mode`: its `Session`, registered as `AgentPeer::new` registers it, a
+    /// pump that serves it, and a lane on a scripted wire that picks by the
+    /// pump's reads. Each has a fresh id, since sessions are found by id.
+    fn ends(mode: Mode) -> (Arc<Session>, Pump, Rig) {
+        let id = ObjectId::new();
+        let session = Session::register(id, Arc::new(AtomicBool::new(false)));
+        let rig = Rig::new(mode);
+        let mut pump = Pump::new(id, &rig.counters);
+        pump.class = Arc::clone(&rig.class);
+        (session, pump, rig)
+    }
+
+    /// One `rc:decodestat` as the viewer sends it, with `relay` as given or
+    /// without the key.
+    fn decodestat(relay: Option<serde_json::Value>) -> serde_json::Value {
+        let mut val =
+            serde_json::json!({ "t": "rc:decodestat", "fps": 30, "struggling": false, "de": 1 });
+        if let Some(relay) = relay {
+            val["relay"] = relay;
+        }
+        val
+    }
+
+    /// The viewer reports `relay` (`None`: an `rc:decodestat` without it) and
+    /// the pump then reads the pair: its class, and whether it is off the mesh.
+    fn report_and_read(
+        session: &Session,
+        pump: &Pump,
+        relay: Option<&str>,
+        class: CarrierClass,
+        off_mesh: bool,
+    ) {
+        session
+            .viewer_relay()
+            .note(&decodestat(relay.map(Into::into)));
+        pump.note(class, off_mesh);
+    }
+
+    /// FR-148 P4b-3b cell 3 — `relay` is read by exact equality: `udp`, `tcp`
+    /// and `tls` are kept, and anything else, a non-string or an absent key
+    /// included, is no report. Each `rc:decodestat` overwrites the session's
+    /// report with its arrival time, so one without the key clears it, and so
+    /// does one whose value cannot be read.
+    #[test]
+    fn the_viewer_s_relay_is_read_by_equality_and_the_newest_overwrites() {
+        use ViewerRelay::{Tcp, Tls, Udp};
+        use serde_json::json;
+        for (relay, want) in [
+            (Some(json!("udp")), Some(Udp)),
+            (Some(json!("tcp")), Some(Tcp)),
+            (Some(json!("tls")), Some(Tls)),
+            (Some(json!("TLS")), None),
+            (Some(json!("tcp ")), None),
+            (Some(json!("quic")), None),
+            (Some(json!("")), None),
+            (Some(json!(1)), None),
+            (Some(json!(true)), None),
+            (Some(json!(null)), None),
+            (Some(json!(["tls"])), None),
+            (None, None),
+        ] {
+            let val = decodestat(relay.clone());
+            assert_eq!(ViewerRelay::of_decodestat(&val), want, "{relay:?}");
+        }
+        assert_eq!(
+            ViewerRelay::of_decodestat(&json!({ "t": "rc:decodestat", "relay": { "p": "tls" } })),
+            None
+        );
+
+        let slot = ViewerRelayReport::default();
+        slot.keep();
+        let t0 = Instant::now();
+        slot.note_at(Some(Tls), t0);
+        assert_eq!(slot.newest(), Some((Tls, t0)));
+        let t1 = t0 + Duration::from_secs(3_600);
+        slot.note_at(Some(Tcp), t1);
+        assert_eq!(slot.newest(), Some((Tcp, t1)), "the newest, with its time");
+        slot.note(&decodestat(None));
+        assert_eq!(slot.newest(), None, "an absent key clears it");
+        slot.note(&decodestat(Some(json!("udp"))));
+        assert_eq!(slot.newest().map(|(r, _)| r), Some(Udp));
+        slot.note(&decodestat(Some(json!("TLS"))));
+        assert_eq!(slot.newest(), None, "so does a value it cannot read");
+    }
+
+    /// FR-148 P4b-3b — TCP somewhere, read at both ends (D58): the agent's own
+    /// class is TCP, or the pair is selected off the mesh and the viewer's
+    /// newest report is `tcp` or `tls`. On the mesh, or with no pair selected,
+    /// the report is ignored; with no report the end is the agent's alone, as
+    /// P4b-3 picked. One byte carries a pump's read to its lane.
+    #[test]
+    fn tcp_somewhere_reads_both_ends_off_the_mesh() {
+        use TcpEnd::{Agent, Both, None as Neither, Viewer};
+        use ViewerRelay::{Tcp, Tls, Udp};
+        for (class, off_mesh, report, want) in [
+            (C::Unknown, true, Some(Tls), Viewer),
+            (C::Unknown, true, Some(Tcp), Viewer),
+            (C::Unknown, true, Some(Udp), Neither),
+            (C::Unknown, true, None, Neither),
+            (C::Unknown, false, Some(Tls), Neither),
+            (C::Direct, true, Some(Tls), Viewer),
+            (C::TurnUdp, true, Some(Tls), Viewer),
+            (C::TurnUdp, true, Some(Udp), Neither),
+            (C::TurnTls, true, Some(Tcp), Both),
+            (C::TurnTcp, true, Some(Tls), Both),
+            (C::TurnTcp, true, Some(Udp), Agent),
+            (C::TurnTls, true, None, Agent),
+            (C::MeshDirect, false, Some(Tcp), Neither),
+            (C::MeshDirect, false, Some(Tls), Neither),
+            (C::MeshRelay, false, Some(Udp), Agent),
+            (C::MeshRelay, false, Some(Tls), Agent),
+            (C::MeshRelay, false, None, Agent),
+        ] {
+            let end = TcpEnd::of(class, off_mesh, report);
+            assert_eq!(end, want, "{class:?} off_mesh={off_mesh} {report:?}");
+            let channel = match want {
+                Neither => Channel::Bytes,
+                Agent | Viewer | Both => Channel::Deadline,
+            };
+            assert_eq!(pick(end, true), channel, "{class:?} {report:?}");
+            assert_eq!(pick(end, false), Channel::Bytes, "none open");
+        }
+        for class in C::ALL {
+            assert_eq!(TcpEnd::from(class), TcpEnd::of(class, true, None));
+            for end in [Neither, Agent, Viewer, Both] {
+                let code = read_code(class, end);
+                let want = match end {
+                    Viewer | Both => TcpEnd::of_legs(class.is_tcp(), true),
+                    Neither | Agent => TcpEnd::from(class),
+                };
+                assert_eq!(read_of(code), (class, want), "{class:?} {end:?}");
+            }
+        }
+        assert_eq!(
+            read_of(C::TurnTcp.code()),
+            (C::TurnTcp, Agent),
+            "P4b-3's byte"
+        );
+    }
+
+    /// FR-148 P4b-3b cell 4 — the viewer's relay alone: a pair off the mesh
+    /// whose remote is the viewer's relay reads `unknown` at the agent, whose
+    /// own candidate is none. A viewer that reports `tls` or `tcp` puts the
+    /// session's first frame on `video-deadline`, `tcp_end=viewer`; with
+    /// `udp`, or no report, it goes on `video-bytes`, as P4b-3 sent it.
+    #[test]
+    fn the_viewer_s_tcp_relay_alone_picks_video_deadline() {
+        for (relay, stream, end) in [
+            (Some("tls"), DL, "viewer"),
+            (Some("tcp"), DL, "viewer"),
+            (Some("udp"), BYTES, "none"),
+            (None, BYTES, "none"),
+        ] {
+            let (session, pump, mut rig) = ends(Mode::On);
+            let (wrote, out) = logged(|| {
+                report_and_read(&session, &pump, relay, C::Unknown, true);
+                rig.key()
+            });
+            assert_eq!(wrote, Some((stream, 1)), "{relay:?}");
+            let label = if stream == DL {
+                DEADLINE_LABEL
+            } else {
+                BYTES_LABEL
+            };
+            let first = format!(
+                "video channel: none -> {label} (carrier=unknown, frame_seq=1, held_ms=0, dropped=0, tcp_end={end})"
+            );
+            assert_eq!(out.matches(&first).count(), 1, "{relay:?}: {out}");
+            assert_eq!(rig.delta(), Some((stream, 2)), "{relay:?}");
+        }
+    }
+
+    /// FR-148 P4b-3b cell 5 — both relays: the agent's own leg over UDP
+    /// (`turn_udp`) and the viewer's over TLS picks `video-deadline`,
+    /// `tcp_end=viewer`; the agent's own over TLS and the viewer's over TCP is
+    /// `tcp_end=both`. `carrier` stays the agent's own class.
+    #[test]
+    fn both_relays_pick_by_the_end_that_holds_the_tcp_leg() {
+        for (class, relay, stream, end) in [
+            (C::TurnUdp, Some("tls"), DL, "viewer"),
+            (C::TurnUdp, Some("tcp"), DL, "viewer"),
+            (C::TurnUdp, Some("udp"), BYTES, "none"),
+            (C::TurnUdp, None, BYTES, "none"),
+            (C::TurnTls, Some("tcp"), DL, "both"),
+            (C::TurnTcp, Some("tls"), DL, "both"),
+            (C::TurnTls, Some("udp"), DL, "agent"),
+            (C::TurnTcp, None, DL, "agent"),
+        ] {
+            let (session, pump, mut rig) = ends(Mode::On);
+            let (wrote, out) = logged(|| {
+                report_and_read(&session, &pump, relay, class, true);
+                rig.key()
+            });
+            assert_eq!(wrote, Some((stream, 1)), "{class:?} {relay:?}");
+            let label = if stream == DL {
+                DEADLINE_LABEL
+            } else {
+                BYTES_LABEL
+            };
+            let first = format!(
+                "video channel: none -> {label} (carrier={}, frame_seq=1, held_ms=0, dropped=0, tcp_end={end})",
+                class.word()
+            );
+            assert_eq!(out.matches(&first).count(), 1, "{class:?} {relay:?}: {out}");
+        }
+    }
+
+    /// FR-148 P4b-3b cell 6 — a pair that rides the mesh ignores the report,
+    /// and the agent's own read decides: `mesh_direct` with a report of `tcp`
+    /// or `tls` stays on `video-bytes`, `mesh_relay` takes `video-deadline`
+    /// whatever the report says, and a mesh pair the overlay said nothing
+    /// about (`unknown`) stays on `video-bytes`.
+    #[test]
+    fn on_the_mesh_the_report_is_ignored() {
+        for relay in [None, Some("udp"), Some("tcp"), Some("tls")] {
+            for (class, stream, end) in [
+                (C::MeshDirect, BYTES, "none"),
+                (C::MeshRelay, DL, "agent"),
+                (C::Unknown, BYTES, "none"),
+            ] {
+                let (session, pump, mut rig) = ends(Mode::On);
+                let (wrote, out) = logged(|| {
+                    report_and_read(&session, &pump, relay, class, false);
+                    rig.key()
+                });
+                assert_eq!(wrote, Some((stream, 1)), "{class:?} {relay:?}");
+                let tail = format!("dropped=0, tcp_end={end})");
+                assert_eq!(out.matches(&tail).count(), 1, "{class:?} {relay:?}: {out}");
+            }
+        }
+    }
+
+    /// FR-148 P4b-3b cell 6 — with no pair selected the agent cannot say the
+    /// pair is off the mesh, so a report waits for the re-check that reads
+    /// one: the class is `unknown` and the end `none`, whatever the report.
+    #[tokio::test]
+    async fn with_no_pair_selected_the_report_waits_for_one() {
+        let pc = webrtc::api::APIBuilder::new()
+            .build()
+            .new_peer_connection(Default::default())
+            .await
+            .expect("a peer connection");
+        for mode in [Mode::Shadow, Mode::On] {
+            let id = ObjectId::new();
+            let session = Session::register(id, Arc::new(AtomicBool::new(false)));
+            let counters = Arc::new(Counters::new(mode));
+            let pump = Pump::start(id, &pc, &counters).await;
+            session
+                .viewer_relay()
+                .note(&decodestat(Some(serde_json::json!("tls"))));
+            assert!(session.viewer_relay().newest().is_some(), "{mode:?}: kept");
+            pump.read(&pc).await;
+            let read = read_of(pump.class.load(Relaxed));
+            assert_eq!(read, (C::Unknown, TcpEnd::None), "{mode:?}");
+        }
+        pc.close().await.expect("closed");
+    }
+
+    /// FR-148 P4b-3b cell 7 — a report that changes mid-session moves the
+    /// session as a class change does (P4b-3, D57): nothing more on the old
+    /// channel until it drained, then a key frame asked, the frames before it
+    /// dropped, and the key frame whole on the new channel, over one
+    /// `frame_seq` space. A report that goes from `tls` to absent switches
+    /// back the same way.
+    #[test]
+    fn a_report_that_changes_mid_session_switches_at_a_key_frame() {
+        let (session, pump, mut rig) = ends(Mode::On);
+        pump.note(C::Unknown, true);
+        assert_eq!(rig.key(), Some((BYTES, 1)));
+        for n in 2..=4 {
+            assert_eq!(rig.delta(), Some((BYTES, n)));
+        }
+        rig.fake.st().buffered.insert(BYTES, 9_000);
+        let (wrote, out) = logged(|| {
+            report_and_read(&session, &pump, Some("tls"), C::Unknown, true);
+            // 5, then 6: a key frame while `video-bytes` holds bytes.
+            let mut wrote = vec![rig.delta(), rig.key()];
+            rig.fake.st().buffered.insert(BYTES, 0);
+            // 7: drained, a key frame asked; 8; 9: the key frame.
+            wrote.extend([rig.delta(), rig.delta(), rig.key(), rig.delta()]);
+            wrote
+        });
+        assert_eq!(
+            wrote,
+            [None, None, None, None, Some((DL, 9)), Some((DL, 10))]
+        );
+        assert_eq!(rig.fake.st().asks, 1, "one ask, after the drain");
+        let line = "video channel: video-bytes -> video-deadline \
+                    (carrier=unknown, frame_seq=9, held_ms=40, dropped=4, tcp_end=viewer)";
+        assert_eq!(out.matches(line).count(), 1, "{out}");
+        assert!(out.contains("drained_ms=20"), "{out}");
+
+        rig.fake.st().buffered.insert(DL, 3_000);
+        let (wrote, out) = logged(|| {
+            report_and_read(&session, &pump, None, C::Unknown, true);
+            let mut wrote = vec![rig.key()];
+            rig.fake.st().buffered.insert(DL, 0);
+            wrote.extend([rig.delta(), rig.key(), rig.delta()]);
+            wrote
+        });
+        assert_eq!(wrote, [None, None, Some((BYTES, 13)), Some((BYTES, 14))]);
+        assert_eq!(rig.fake.st().asks, 2);
+        let line = "video channel: video-deadline -> video-bytes \
+                    (carrier=unknown, frame_seq=13, held_ms=20, dropped=2, tcp_end=none)";
+        assert_eq!(out.matches(line).count(), 1, "{out}");
+        assert_eq!(
+            rig.lane.frame_seq, 14,
+            "one number a frame, written or dropped"
+        );
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.switches, line.drained, line.late), (2, 6, 0));
+        assert_eq!(line.channel, Some(Channel::Bytes));
+    }
+
+    /// FR-148 P4b-3b cell 8 — under `off` the pump finds no session, so the
+    /// session keeps nothing, the pump reads nothing and writes no line, and
+    /// every frame goes as P4b-3's `off` sends it. Under `shadow` the shadow
+    /// lane picks with the report as `on` would and its line says so, while
+    /// every write goes as under `off`: no drain, no mark, no ask.
+    #[tokio::test]
+    async fn off_keeps_nothing_and_shadow_shows_the_switch_the_report_causes() {
+        let pc = webrtc::api::APIBuilder::new()
+            .build()
+            .new_peer_connection(Default::default())
+            .await
+            .expect("a peer connection");
+        let (session, pump, mut rig) = ends(Mode::Off);
+        assert!(pump.session.is_none(), "off finds no session");
+        let ((), out) = logged(|| {
+            session
+                .viewer_relay()
+                .note(&decodestat(Some(serde_json::json!("tls"))));
+            futures::executor::block_on(pump.read(&pc));
+        });
+        assert_eq!(session.viewer_relay().newest(), None, "nothing kept");
+        assert_eq!(pump.class.load(Relaxed), C::Unknown.code(), "nothing read");
+        rig.class(C::TurnTcp);
+        let (wrote, more) = logged(|| {
+            (0..40_u64)
+                .map(|i| rig.frame(i % 10 == 0, i * 40))
+                .collect::<Vec<_>>()
+        });
+        let today: Vec<_> = (1..=40).map(|n| Some((BYTES, n))).collect();
+        assert_eq!(wrote, today);
+        assert_eq!(format!("{out}{more}"), "", "no line under off");
+        assert_eq!(rig.counters.take(None), None);
+        pc.close().await.expect("closed");
+
+        let (session, pump, mut rig) = ends(Mode::Shadow);
+        pump.note(C::Unknown, true);
+        assert_eq!(
+            (rig.key(), rig.delta()),
+            (Some((BYTES, 1)), Some((BYTES, 2)))
+        );
+        rig.fake.st().buffered.insert(BYTES, 9_000);
+        let (wrote, out) = logged(|| {
+            report_and_read(&session, &pump, Some("tls"), C::Unknown, true);
+            vec![rig.delta(), rig.key(), rig.delta()]
+        });
+        assert_eq!(
+            wrote,
+            [Some((BYTES, 3)), Some((BYTES, 4)), Some((BYTES, 5))],
+            "off's writes"
+        );
+        assert!(
+            session.viewer_relay().newest().is_some(),
+            "kept under shadow"
+        );
+        let line = "video channel (shadow): video-bytes -> video-deadline \
+                    (carrier=unknown, frame_seq=4, held_ms=10, dropped=0, tcp_end=viewer)";
+        assert_eq!(out.matches(line).count(), 1, "{out}");
+        assert!(rig.fake.st().marks.is_empty(), "no mark");
+        assert_eq!(rig.fake.st().asks, 0, "no ask");
+        let line = rig.counters.take(None).unwrap();
+        assert_eq!((line.switches, line.drained), (1, 0));
+        assert_eq!(line.channel, Some(Channel::Deadline), "on's channel");
+    }
+
+    /// FR-148 P4b-3b cell 9 — the lines. The class line keeps `from` and
+    /// `to`, the agent's own class, and carries `viewer_relay` and `tcp_end`;
+    /// it is written when the class, the report or the end changes, and a
+    /// report repeated unchanged writes nothing. The "no video-deadline is
+    /// open" line carries `tcp_end` as a field.
+    #[test]
+    fn the_lines_name_the_end_that_holds_the_tcp_leg() {
+        let (session, pump, _rig) = ends(Mode::On);
+        let class_line = |from: &str, to: &str, relay: &str, end: &str| {
+            format!(
+                "video channel: carrier class (FR-148 P4b-3) session={} from=\"{from}\" \
+                 to=\"{to}\" viewer_relay=\"{relay}\" tcp_end=\"{end}\"",
+                pump.session_id
+            )
+        };
+        let ((), out) = logged(|| pump.note(C::Unknown, true));
+        assert_eq!(out, "", "nothing changed");
+        for (relay, class, off_mesh, want) in [
+            (
+                Some("tls"),
+                C::Unknown,
+                true,
+                Some(("unknown", "unknown", "tls", "viewer")),
+            ),
+            (Some("tls"), C::Unknown, true, None),
+            (
+                Some("tls"),
+                C::TurnTls,
+                true,
+                Some(("unknown", "turn_tls", "tls", "both")),
+            ),
+            (
+                Some("udp"),
+                C::TurnTls,
+                true,
+                Some(("turn_tls", "turn_tls", "udp", "agent")),
+            ),
+            (Some("udp"), C::TurnTls, true, None),
+            (
+                Some("tls"),
+                C::Unknown,
+                true,
+                Some(("turn_tls", "unknown", "tls", "viewer")),
+            ),
+            // The pair moved onto the mesh, its class still `unknown`.
+            (
+                Some("tls"),
+                C::Unknown,
+                false,
+                Some(("unknown", "unknown", "tls", "none")),
+            ),
+            (
+                None,
+                C::Unknown,
+                false,
+                Some(("unknown", "unknown", "none", "none")),
+            ),
+        ] {
+            let ((), out) = logged(|| {
+                for _ in 0..5 {
+                    report_and_read(&session, &pump, relay, class, off_mesh);
+                }
+            });
+            match want {
+                Some((from, to, relay, end)) => {
+                    let line = class_line(from, to, relay, end);
+                    assert_eq!(out.matches(&line).count(), 1, "{line}\n{out}");
+                    assert_eq!(out.matches("carrier class").count(), 1, "{out}");
+                }
+                None => assert_eq!(out, "", "an unchanged report"),
+            }
+        }
+
+        let (session, pump, mut rig) = ends(Mode::On);
+        rig.fake.st().deadline = None;
+        let (wrote, out) = logged(|| {
+            report_and_read(&session, &pump, Some("tls"), C::Unknown, true);
+            (0..20_u64)
+                .map(|i| rig.frame(i % 10 == 0, 0))
+                .collect::<Vec<_>>()
+        });
+        let today: Vec<_> = (1..=20).map(|n| Some((BYTES, n))).collect();
+        assert_eq!(wrote, today, "none open: video-bytes");
+        let none_open = "video channel: the carrier is TCP somewhere and no video-deadline \
+                         is open; video-bytes (FR-148 P4b-3)";
+        assert_eq!(out.matches(none_open).count(), 1, "{out}");
+        assert!(
+            out.contains("carrier=\"unknown\" framed=true tcp_end=\"viewer\""),
+            "{out}"
+        );
+    }
+
+    /// FR-148 P4b-3b cell 10 — an older viewer, one that never sends `relay`,
+    /// gets P4b-3's picks and lines: over five seeds of random class
+    /// sequences, on and off the mesh, with key frames, ages, buffered
+    /// amounts, a `video-deadline` that comes and goes and the older viewer's
+    /// own `rc:decodestat`s, a lane fed through the report's whole road (the
+    /// session's slot and the pump's reads) writes what a lane fed the class
+    /// alone writes, as P4b-3's pump stored it, frame for frame, and logs the
+    /// same lines. Each `tcp_end` there reads `agent` or `none`, as the class
+    /// is TCP or not, so a line with it cut is P4b-3's; and the class line
+    /// comes exactly when the class changes, with `viewer_relay="none"`.
+    #[test]
+    fn an_older_viewer_gets_p4b_3_s_picks_and_lines() {
+        #[derive(Clone, Copy)]
+        enum Do {
+            Read(CarrierClass, bool),
+            Decodestat(u64),
+            Frame {
+                key: bool,
+                age_ms: u64,
+                bytes: bool,
+                deadline: bool,
+                buffered: (usize, usize),
+            },
+        }
+        fn script(seed: u64) -> Vec<Do> {
+            let mut state = seed;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut deadline = true;
+            (0..2_000)
+                .map(|_| {
+                    let r = next();
+                    match r % 23 {
+                        0 => Do::Read(C::ALL[(r >> 8) as usize % C::ALL.len()], (r >> 16) % 2 == 0),
+                        1 => Do::Decodestat(r >> 8),
+                        _ => {
+                            if (r >> 12) % 150 == 0 {
+                                deadline = !deadline;
+                            }
+                            Do::Frame {
+                                key: (r >> 44) % 25 == 0,
+                                age_ms: (r >> 54) % 700,
+                                bytes: (r >> 20) % 150 != 0,
+                                deadline,
+                                buffered: (
+                                    ((r >> 28) % 3) as usize * 1_000,
+                                    ((r >> 36) % 2) as usize * 500,
+                                ),
+                            }
+                        }
+                    }
+                })
+                .collect()
+        }
+        /// The older viewer's `rc:decodestat`: today's keys, never `relay`.
+        fn older(r: u64) -> serde_json::Value {
+            let mut val = serde_json::json!({ "t": "rc:decodestat", "fps": r % 61, "struggling": r.is_multiple_of(3), "de": 1 });
+            if r.is_multiple_of(2) {
+                val["rx_bps"] = (r % 9_000_000).into();
+                val["queue_ms"] = ((r % 200) as i64 - 100).into();
+            }
+            val
+        }
+        /// One run of the script: what each frame wrote, and the log.
+        fn run(
+            mode: Mode,
+            seed: u64,
+            through_the_report: bool,
+        ) -> (Vec<Option<(u16, u32)>>, String) {
+            let (session, pump, mut rig) = ends(mode);
+            logged(|| {
+                let mut wrote = Vec::new();
+                for step in script(seed) {
+                    match step {
+                        Do::Read(class, off_mesh) if through_the_report => {
+                            pump.note(class, off_mesh)
+                        }
+                        Do::Read(class, _) => rig.class(class),
+                        Do::Decodestat(r) if through_the_report => {
+                            session.viewer_relay().note(&older(r))
+                        }
+                        Do::Decodestat(_) => {}
+                        Do::Frame {
+                            key,
+                            age_ms,
+                            bytes,
+                            deadline,
+                            buffered,
+                        } => {
+                            {
+                                let mut s = rig.fake.st();
+                                s.bytes = bytes.then_some(BYTES);
+                                s.deadline = deadline.then_some(DL);
+                                s.buffered.insert(BYTES, buffered.0);
+                                s.buffered.insert(DL, buffered.1);
+                            }
+                            wrote.push(rig.frame(key, age_ms));
+                        }
+                    }
+                }
+                wrote
+            })
+        }
+        let (mut switches, mut viewer_lines) = (0, 0);
+        for mode in [Mode::On, Mode::Shadow] {
+            for seed in [1_u64, 2, 3, 0x0d58, 0x5eed_f00d] {
+                let (wrote, log) = run(mode, seed, true);
+                let (today, today_log) = run(mode, seed, false);
+                assert_eq!(wrote, today, "{mode:?} seed {seed}: the picks");
+                // Each line from its message on: the fmt layer's timestamp
+                // differs between the two runs.
+                let message = |l: &str| l[l.find("video channel").expect(l)..].to_owned();
+                let (class_lines, lane): (Vec<&str>, Vec<&str>) = log
+                    .lines()
+                    .partition(|l| l.contains("video channel: carrier class"));
+                assert_eq!(
+                    lane.iter().map(|l| message(l)).collect::<Vec<_>>(),
+                    today_log.lines().map(message).collect::<Vec<_>>(),
+                    "{mode:?} seed {seed}: the lines"
+                );
+                for l in &lane {
+                    if let Some((_, rest)) = l.split_once("(carrier=") {
+                        let class = rest.split(',').next().unwrap();
+                        let tcp = C::ALL.iter().find(|c| c.word() == class).unwrap().is_tcp();
+                        let end = if tcp { "agent" } else { "none" };
+                        assert!(l.contains(&format!(", tcp_end={end})")), "{l}");
+                        switches += 1;
+                    } else if l.contains("no video-deadline is open") {
+                        assert!(l.contains("tcp_end=\"agent\""), "{l}");
+                    }
+                }
+                let mut was = C::Unknown;
+                let mut changes = 0;
+                for step in script(seed) {
+                    if let Do::Read(class, _) = step {
+                        changes += usize::from(class != was);
+                        was = class;
+                    }
+                }
+                assert_eq!(class_lines.len(), changes, "{mode:?} seed {seed}");
+                for l in &class_lines {
+                    assert!(l.contains("viewer_relay=\"none\""), "{l}");
+                    let to = l.split("to=\"").nth(1).unwrap().split('"').next().unwrap();
+                    let tcp = C::ALL.iter().find(|c| c.word() == to).unwrap().is_tcp();
+                    let end = if tcp { "agent" } else { "none" };
+                    assert!(l.contains(&format!("tcp_end=\"{end}\"")), "{l}");
+                    viewer_lines += usize::from(l.contains("tcp_end=\"viewer\""));
+                }
+            }
+        }
+        assert!(switches > 0, "the scripts switch");
+        assert_eq!(viewer_lines, 0);
+    }
+
+    /// FR-148 P4b-3b — the control channel hands every `rc:decodestat` to the
+    /// slot its pumps read: the session's, which `AgentPeer::new` registered,
+    /// given to the handler beside the session's gate. The arm notes the
+    /// message after everything it did before, with no way out before it, so
+    /// one without `relay` clears the report.
+    #[test]
+    fn the_control_channel_notes_each_decodestat_in_the_session_s_slot() {
+        let src = peer_rs();
+        let handler = body_of(&src, "fn attach_control_handler(");
+        let params = &handler[..handler.find(") {\n").unwrap()];
+        let gate = params.find("keyframe_gate: Arc<crate::media_deadline::KeyframeGate>,");
+        let slot = params.find("viewer_relay: Arc<crate::media_deadline::ViewerRelayReport>,");
+        assert!(gate.unwrap() < slot.unwrap(), "{params}");
+        let arm = &handler[handler.find("\"rc:decodestat\" => {").unwrap()..];
+        let arm = &arm[..arm.find("\"rc:display-match\" => {").unwrap()];
+        assert_eq!(arm.matches("viewer_relay.note(&val);").count(), 1, "{arm}");
+        let note = arm.find("viewer_relay.note(&val);").unwrap();
+        assert!(arm.find("note_viewer_decodestat(").unwrap() < note, "{arm}");
+        assert!(!arm.contains("return"), "{arm}");
+        for (wiring, n) in [
+            ("let deadline_stash = deadline_for_callback.clone();", 1),
+            (
+                "keyframe_for_dc,\n                            deadline_stash.viewer_relay(),\n",
+                1,
+            ),
+            ("viewer_relay()", 1),
+        ] {
+            assert_eq!(src.matches(wiring).count(), n, "{wiring}");
+        }
+    }
+
     /// FR-148 P4b-3 — the default fired: the session starts on `video-bytes`
     /// with the class unknown, a `video-deadline` open or not, and the pick
     /// runs again once a re-check reads the selected pair: at the next frame
@@ -1826,7 +2721,7 @@ mod tests {
             })
         );
         let line = "video channel: video-bytes -> video-deadline \
-                    (carrier=turn_tcp, frame_seq=11, held_ms=50, dropped=5)";
+                    (carrier=turn_tcp, frame_seq=11, held_ms=50, dropped=5, tcp_end=agent)";
         assert_eq!(out.matches(line).count(), 1, "{out}");
         assert!(out.contains("drained_ms=30"), "{out}");
 
@@ -2663,7 +3558,7 @@ mod tests {
             "granted at t0 + 100 ms: {out}"
         );
         let line = "video channel: video-bytes -> video-deadline \
-                    (carrier=turn_tcp, frame_seq=12, held_ms=10, dropped=1)";
+                    (carrier=turn_tcp, frame_seq=12, held_ms=10, dropped=1, tcp_end=agent)";
         assert_eq!(out.matches(line).count(), 1, "{out}");
         let s = split(id);
         assert_eq!(
