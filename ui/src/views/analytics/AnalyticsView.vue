@@ -53,7 +53,7 @@
                 <v-card-title class="text-subtitle-1">
                   CPU / RAM
                   <span class="text-caption text-medium-emphasis ml-2"
-                    >needs agents with telemetry v2</span
+                    >needs daemons with telemetry v2</span
                   >
                 </v-card-title>
                 <v-card-text>
@@ -63,7 +63,7 @@
                       { key: 'cpu_pct', label: 'CPU %' },
                       { key: 'rss_mb', label: 'RSS MB' },
                     ]"
-                    empty-text="No telemetry yet — agents report cpu/ram after the next agent release"
+                    empty-text="No telemetry yet — devices report cpu/ram after the next roomlerd release"
                   />
                 </v-card-text>
               </v-card>
@@ -80,7 +80,7 @@
                       { key: 'derp', label: 'DERP' },
                     ]"
                     stacked
-                    empty-text="No transport telemetry yet — arrives with agent telemetry v2"
+                    empty-text="No transport telemetry yet — arrives with roomlerd telemetry v2"
                   />
                 </v-card-text>
               </v-card>
@@ -194,7 +194,7 @@
                   <time-series-chart
                     :points="machines?.series ?? []"
                     :series="[{ key: 'peer_rtt_ms', label: 'RTT ms' }]"
-                    empty-text="No latency telemetry yet — arrives with agent telemetry v2"
+                    empty-text="No latency telemetry yet — arrives with roomlerd telemetry v2"
                   />
                 </v-card-text>
               </v-card>
@@ -218,7 +218,7 @@
                     ]"
                     :y-format="fmtBytes"
                     stacked
-                    empty-text="No traffic telemetry yet — arrives with agent telemetry v3"
+                    empty-text="No traffic telemetry yet — arrives with roomlerd telemetry v3"
                   />
                 </v-card-text>
               </v-card>

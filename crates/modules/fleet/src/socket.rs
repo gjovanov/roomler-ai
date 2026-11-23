@@ -1551,7 +1551,7 @@ pub async fn ws_upgrade_agent(
                 info!(%agent_id, reason, "refusing WS with rc:goodbye");
                 let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
                     reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
-                    message: "This agent's server-side row was deleted (or quarantined). \
+                    message: "This device's server-side row was deleted (or quarantined). \
                           Re-enrol with a fresh enrollment token from the admin UI to \
                           revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
                         .into(),
@@ -1771,5 +1771,33 @@ mod tests {
             }
             other => panic!("a FIN with no close frame read {other:?}"),
         }
+    }
+
+    /// FR-133 P2b: a removed device's daemon quotes this goodbye to a person
+    /// (its server-side-close notice), so the text names the device, never an
+    /// "agent". It sits inline in the WS upgrade path, which only a live
+    /// database row reaches, and docs anchor this file's lines, so the test
+    /// reads the literal from the source rather than moving it.
+    #[test]
+    fn device_deleted_goodbye_names_the_device_not_an_agent() {
+        let src = include_str!("socket.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests module")];
+        let goodbye = code
+            .split_once("AgentCloseReason::AgentDeleted,")
+            .expect("the AgentDeleted goodbye")
+            .1;
+        let text = goodbye
+            .split_once("message: \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .expect("its message literal")
+            .0;
+        let says_agent = text
+            .replace("agent_id", "")
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("agent") || w.eq_ignore_ascii_case("agents"));
+        assert!(
+            !says_agent,
+            "a person reads this in the daemon's notice: {text}"
+        );
     }
 }

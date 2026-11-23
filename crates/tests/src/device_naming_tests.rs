@@ -16,7 +16,11 @@ use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
 use serde_json::{Value, json};
 
+use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
+use crate::tunnel_policy_permission_tests::{
+    Gate, GatedWrite, assert_no_problems, call, gate_problems, holder_problems,
+};
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -404,6 +408,141 @@ async fn tunnel_client_update_renames_and_labels() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
+}
+
+// ─── #4218: the tunnel-client update decides its bit before its body ───
+
+/// Enroll a tunnel client in `t` with a token its owner mints; returns the
+/// client's id.
+async fn enroll_tunnel_client(app: &TestApp, t: &SeededTenant, machine_id: &str) -> String {
+    let (s, et) = call(
+        app,
+        "POST",
+        &format!("/api/tenant/{}/tunnel-client/enroll-token", t.tenant_id),
+        &t.admin.access_token,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "the owner mints a tunnel enrollment token: {et}");
+    let enrolled: Value = app
+        .client
+        .post(app.url("/api/tunnel-client/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": machine_id,
+            "machine_name": "Operator Laptop",
+            "os": "linux",
+            "client_version": "0.3.0-test",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    enrolled["tunnel_client_id"]
+        .as_str()
+        .expect("tunnel_client_id")
+        .to_string()
+}
+
+/// The org's tunnel clients, as its owner lists them.
+async fn tunnel_clients(app: &TestApp, t: &SeededTenant) -> Value {
+    let (s, list) = call(
+        app,
+        "GET",
+        &format!("/api/tenant/{}/tunnel-client", t.tenant_id),
+        &t.admin.access_token,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "{list}");
+    list["items"].clone()
+}
+
+/// #4218 — `PUT …/tunnel-client/{id}` decides `MANAGE_AGENTS` before it parses
+/// the client id or reads the body: a member without the bit gets the one 403
+/// `forbidden` for a body that does not parse and for a client id that is not
+/// an id, the answer a body the route reads gets, and someone outside the org
+/// the one `not_a_member`. While the route took `Json<T>` as an extractor,
+/// axum answered such a body before the handler ran, with a 400, 415 or 422
+/// decided by the body alone, and the handler parsed the id (400) before the
+/// bit. Nothing they send is stored.
+#[tokio::test]
+async fn the_tunnel_client_update_decides_the_bit_before_a_body_that_does_not_parse() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname-unparsed").await;
+    let other = app.seed_tenant("devname-unparsed-b").await;
+    let cid = enroll_tunnel_client(&app, &t, "tunnel-mach-devname-unparsed").await;
+    let fresh = ObjectId::new().to_hex();
+    let before = tunnel_clients(&app, &t).await;
+
+    let mut wrong = Vec::new();
+    for client in [cid.as_str(), fresh.as_str(), "not-an-id"] {
+        let write = GatedWrite {
+            method: "PUT",
+            path: format!("/api/tenant/{}/tunnel-client/{client}", t.tenant_id),
+            reads: json!({ "name": "hijack" }),
+            refused_field: r#"{"tags": 7}"#,
+        };
+        for (who, token, gate) in [
+            (
+                "a member without the bit",
+                &t.member.access_token,
+                Gate::Bit("MANAGE_AGENTS"),
+            ),
+            (
+                "another org's owner",
+                &other.admin.access_token,
+                Gate::NotAMember,
+            ),
+        ] {
+            wrong.extend(gate_problems(&app, who, token, gate, &write).await);
+        }
+    }
+    assert_no_problems("answered before the bit", &wrong);
+    assert_eq!(
+        tunnel_clients(&app, &t).await,
+        before,
+        "the org's tunnel clients are as they were"
+    );
+}
+
+/// #4218's control. A holder of `MANAGE_AGENTS` is answered a tunnel-client
+/// update that does not parse exactly as axum's `Json` extractor answers it,
+/// the status and the plain-text words, whatever the client id: reading the
+/// body after the bit changes who is answered first, never what a holder is
+/// told. Nothing such a body names is stored.
+#[tokio::test]
+async fn a_holder_is_answered_a_tunnel_client_update_that_does_not_parse_as_the_json_extractor_answers_it()
+ {
+    use roomler_ai_mod_network::routes::tunnel::UpdateTunnelClientRequest;
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname-unparsed-holder").await;
+    let cid = enroll_tunnel_client(&app, &t, "tunnel-mach-devname-holder").await;
+    let fresh = ObjectId::new().to_hex();
+    let before = tunnel_clients(&app, &t).await;
+
+    let mut wrong = Vec::new();
+    for client in [cid.as_str(), fresh.as_str(), "not-an-id"] {
+        wrong.extend(
+            holder_problems::<UpdateTunnelClientRequest>(
+                &app,
+                &t.admin.access_token,
+                "PUT",
+                &format!("/api/tenant/{}/tunnel-client/{client}", t.tenant_id),
+                r#"{"tags": 7}"#,
+            )
+            .await,
+        );
+    }
+    assert_no_problems("a holder of the bit", &wrong);
+    assert_eq!(
+        tunnel_clients(&app, &t).await,
+        before,
+        "the org's tunnel clients are as they were"
+    );
 }
 
 // ─── FR-2: pin-update downgrade guard (2026-08-27) ─────────────

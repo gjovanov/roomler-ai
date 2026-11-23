@@ -1456,6 +1456,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-148 D46 - the in-flight budget's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg): `off` (empty; the default: nothing is computed and the path delivery line is as before), `shadow` (once a frame the budget is computed from SCTP's acknowledgements, the frames it would have held are counted, and its fields close the path delivery line; it holds nothing) or `on` (on a relayed session the budget acts: a frame it holds is skipped before capture, a hold while the acknowledgements stand still calls no rate decrease, and the relay byte gate and the VP9 4:4:4 watermark hold nothing; a direct session computes it as `shadow` does). Needs `path_model` other than `off`: that line carries its fields. Env: ROOMLERD_INFLIGHT_BUDGET (a set variable wins). This device only: never pushable. Restart required.",
     },
     KeyMeta {
+        key: "video_deadline",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:off|shadow|on",
+        description: "FR-148 P4b-3 - the deadline-limited video channel's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg) whose viewer opened `video-deadline` beside `video-bytes`: `off` (empty; the default: every frame goes on `video-bytes`, as before), `shadow` (the channel is picked per carrier and the frames older than 300 ms there are counted, and lines say what `on` would do; every frame still goes on `video-bytes`) or `on` (on a carrier that is TCP somewhere - TURN over TCP or TLS, or a relayed mesh path - frames go on the unordered `video-deadline`, switching at a key frame once the old channel drained, and a frame older than 300 ms there is dropped whole and a key frame asked). Its counts ride the path delivery line, so they need `path_model` other than `off`; the switch itself does not. Env: ROOMLERD_VIDEO_DEADLINE (a set variable wins). This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "relay_max_kbps",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -2155,6 +2163,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
         "path_model" => cfg.path_model.clone(),
         "inflight_budget" => cfg.inflight_budget.clone(),
+        "video_deadline" => cfg.video_deadline.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2743,6 +2752,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // FR-148 D46 — as `path_model`: each word is stored, so a device set
         // to `off` stays off when the default moves.
         "inflight_budget" => cfg.inflight_budget = parse_declared(key, value, None)?,
+        // FR-148 P4b-3 — as `inflight_budget`.
+        "video_deadline" => cfg.video_deadline = parse_declared(key, value, None)?,
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
@@ -5219,6 +5230,49 @@ mod tests {
         for bad in ["1", "true", "budget", "on1", "shadow,on"] {
             assert!(
                 apply(&mut cfg, "inflight_budget", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P4b-3 — `video_deadline`: `off`, `shadow` and `on` are stored,
+    /// blank clears the key (the default, `off`), and anything else is refused
+    /// rather than read as `off` without a word. It reaches the daemon's env
+    /// fallbacks under the switch's own name. Remote config's managed keys
+    /// have no field for it, so no push can set it.
+    #[test]
+    fn video_deadline_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "video_deadline"), None);
+        apply(&mut cfg, "video_deadline", Some(" Shadow ")).unwrap();
+        assert_eq!(cfg.video_deadline.as_deref(), Some("shadow"));
+        assert_eq!(
+            entry_for(&cfg, "video_deadline").unwrap().value.as_deref(),
+            Some("shadow")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("VIDEO_DEADLINE")
+                .map(String::as_str),
+            Some("shadow")
+        );
+        apply(&mut cfg, "video_deadline", Some("on")).unwrap();
+        assert_eq!(cfg.video_deadline.as_deref(), Some("on"));
+        apply(&mut cfg, "video_deadline", Some("off")).unwrap();
+        assert_eq!(
+            cfg.video_deadline.as_deref(),
+            Some("off"),
+            "kept, not cleared"
+        );
+        apply(&mut cfg, "video_deadline", Some("")).unwrap();
+        assert_eq!(cfg.video_deadline, None, "blank clears to the default");
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg).get("VIDEO_DEADLINE"),
+            None
+        );
+        for bad in ["1", "true", "deadline", "on1", "shadow,on"] {
+            assert!(
+                apply(&mut cfg, "video_deadline", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

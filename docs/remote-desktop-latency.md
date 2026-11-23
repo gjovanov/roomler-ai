@@ -85,7 +85,7 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
    session and the pump awaits the packets (`thread.rs:417` `encode`, called at
-   `peer.rs:9656`). `block_in_place` remains the inline path, `media_thread = false`.
+   `peer.rs:9683`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -107,7 +107,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:2173`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:2185`; consumed at
-`peer.rs:8213`, logged at `:10059`). FR-112 gave a software encoder a pace of its
+`peer.rs:8240`, logged at `:10086`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -127,15 +127,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:7323`
-`INPUT_MOVE_GAP_MS`, `:7323` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:7327`
+`INPUT_MOVE_GAP_MS`, `:7327` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:13047`). The gap is a per-browser knob,
+always queued (`useRemoteControl.ts:13079`). The gap is a per-browser knob,
 0 to 16 ms (`roomler-rc-input-gap`, `:2778` `storedInputGapMs`, from FR-98 C3); the
-same timer drives the relative-pointer path (`:7432`).
+same timer drives the relative-pointer path (`:7436`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -148,12 +148,12 @@ built **without a wire-format change**: the 13-byte video header already carried
 µs timestamp.
 
 - **One process clock.** Both DataChannel pumps stamp the header from a single
-  process-wide epoch (`peer.rs:3626` `agent_epoch_us`). Stamped at framing, so the
+  process-wide epoch (`peer.rs:3653` `agent_epoch_us`). Stamped at framing, so the
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
-  verbatim plus the agent's epoch µs (`peer.rs:3633` `clock_echo_json`, handled at
-  `:11313`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:7244` `CLOCK_RING`, `:7248`
+  verbatim plus the agent's epoch µs (`peer.rs:3660` `clock_echo_json`, handled at
+  `:11335`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  sample of the last 8 (`useRemoteControl.ts:7248` `CLOCK_RING`, `:7252`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
@@ -279,7 +279,7 @@ heartbeats with a `viewer_age_ms`.
 
 So the wire carries the number the person reads. Each window's `age` goes to the
 pill and to `sendDecodeStat` from one worker `stats` message
-(`useRemoteControl.ts:7795`, `:8449`, `RemoteControl.vue:4898`). A once-a-second
+(`useRemoteControl.ts:7799`, `:8453`, `RemoteControl.vue:4898`). A once-a-second
 read can skip a window, which fits the three misses, though this read can't prove it.
 
 That is all this read shows. The session was VP9 software on a loaded host, under
@@ -293,10 +293,10 @@ different times disagree by the wall-clock slew between their starts, so every a
 read off by that much, low on some hosts and high on others: 7 ms after 162 s on one
 host, near 160 ms after an hour (§5, "On one clock"). The fix, #3568, merged the same
 day: the worker now reads the offset through a skew the page measures when it starts
-the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:861`). Production runs the old
+the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:889`). Production runs the old
 arithmetic until a promote. The read above started each session right after loading
 its page, so it stands, and the pill and the wire still take one worker `stats`
-message (`useRemoteControl.ts:7966`, `:8622`, `RemoteControl.vue:4864`). The fleet
+message (`useRemoteControl.ts:7970`, `:8626`, `RemoteControl.vue:4864`). The fleet
 tables above carry the error, and a window whose ages all read negative sent none,
 since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
 is on production and its owed GREEN read is in.

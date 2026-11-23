@@ -231,7 +231,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
    (`SidTypeUser` only), as text through `sid_string` (`agents/roomlerd/src/win_token.rs:122`). The
    domain-qualified name names exactly one account. It needs no privilege beyond the elevated operator's, so it
    works where this arm runs, a command run by hand; the session's token (`WTSQueryUserToken`, then
-   `token_user_sid`, `agents/roomlerd/src/win_identity.rs:334`) would need SYSTEM's.
+   `token_user_sid`, `agents/roomlerd/src/win_identity.rs:358`) would need SYSTEM's.
 2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:251-263`): `ProfileList\<sid>\ProfileImagePath`,
    with only `%SystemRoot%` and `%SystemDrive%` filled in, from the kernel's answers.
 3. No profile recorded: nothing is removed, and the report says why, in words that tell the cases apart: "the
@@ -290,9 +290,9 @@ above).
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
 | the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7490`) reads through the same `HeldPath` (D4) |
-| the machine config's saves (`crates/agent-core/src/config.rs:3931`, `:4673`, `:4859`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
+| the machine config's saves (`crates/agent-core/src/config.rs:3944`, `:4686`, `:4872`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:619-621`, `:859-861`) | `win::open` of the whole path | `HeldPath::walk` |
-| the one-time segment move (`appdirs.rs:673`, `:933`, `:956`, `:1054`, `:1169`) | renames and removes by path | per D7 |
+| the one-time segment move (`appdirs.rs:673`, `:933`, `:956`, `:1061`, `:1179`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
 ### The kill switch
@@ -405,7 +405,7 @@ The docs:
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
 - `docs/security-baseline.md`: a rule beside "A Windows machine config is the machine's only as found"
-  (`docs/security-baseline.md:591`): a privileged process acts on the machine folder only through
+  (`docs/security-baseline.md:642`): a privileged process acts on the machine folder only through
   `machine_tree::HeldPath`, with the walk as a mermaid flow, the two seals and the leaf policy.
 - `.claude/rules/security.md`: the one-line rule for new code.
 - `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and
@@ -466,7 +466,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1371-1385`; the earlier anchor
   files' deletes, `exec_service.rs:1279-1292`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
-- **D7. The one-time segment move** (`appdirs.rs:673`, `:933`, `:956`, `:1054`, `:1169`). Options: onto a rename by
+- **D7. The one-time segment move** (`appdirs.rs:673`, `:933`, `:956`, `:1061`, `:1179`). Options: onto a rename by
   handle in P3; retire it. **Default: read first** how many Windows devices still keep only the older segment;
   retire the move if none does, else P3 moves it onto a rename by handle.
 - **D8. A gate against a new path-based SYSTEM write.** Options: none; a grep test; clippy's

@@ -602,17 +602,19 @@ pub struct UpdateTunnelClientRequest {
 /// tunnel client SERVER-side. This is the only in-place rename there is: a
 /// client-side rename derives a fresh machine_id and enrolls a brand-new row.
 /// Mirrors `remote_control::update_agent` incl. the overlay/MagicDNS
-/// propagation and the additive response envelope. `MANAGE_AGENTS`.
+/// propagation and the additive response envelope. `MANAGE_AGENTS`, decided
+/// before the client id is parsed or the body read (#4218): a caller without
+/// it gets the gate's answer whatever the id and the body are. A holder is
+/// answered a body that does not parse as the `Json` extractor answered it
+/// (`ApiError::JsonBody`), whatever the id.
 pub async fn update_tunnel_client(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, client_id)): Path<(String, String)>,
-    Json(body): Json<UpdateTunnelClientRequest>,
+    body: Result<Json<UpdateTunnelClientRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&client_id)
-        .map_err(|_| ApiError::BadRequest("Invalid client_id".to_string()))?;
 
     require_permission(
         &state,
@@ -622,6 +624,9 @@ pub async fn update_tunnel_client(
         "MANAGE_AGENTS",
     )
     .await?;
+    let Json(body) = body?;
+    let cid = ObjectId::parse_str(&client_id)
+        .map_err(|_| ApiError::BadRequest("Invalid client_id".to_string()))?;
 
     // Tenant-scope the target first, LIVE — a bogus, foreign or REMOVED id
     // 404s (#1829). The setters below are live-scoped on their own too; this

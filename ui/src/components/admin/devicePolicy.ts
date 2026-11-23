@@ -58,7 +58,7 @@ export function idleMinuteItems(current: number | null | undefined): { title: st
 export const IDLE_LIMIT_HINT =
   'End a remote-desktop session to this device after this long with no input and no ' +
   'change on its screen. The shorter of this and the organization’s limit applies, so it ' +
-  'can only tighten the org’s. The device keeps it: an agent that predates it does not. ' +
+  'can only tighten the org’s. The device keeps it: a daemon that predates it does not. ' +
   'Applies to the next session.'
 
 // FR-99 P3b — what this device's sessions ask of it when the last one ends
@@ -75,7 +75,7 @@ export const LOCK_ON_END_HINT =
   '“If locked or idle at the start” locks it again only if it was locked, or nobody was ' +
   'at it, when the session began. The device takes the stricter of this and its owner’s ' +
   'own setting, so this can only tighten it. Honoured by service installs on Windows and ' +
-  'Linux, where a session can unlock the screen again; a per-user install, or an agent that ' +
+  'Linux, where a session can unlock the screen again; a per-user install, or a daemon that ' +
   'predates it, does not take it. Applies to the next session.'
 
 /** #1882 / FR-128 — the three ways a session to this device may use the mesh. */
@@ -91,7 +91,7 @@ export const RC_OVERLAY_HINT =
   'Off (default): remote desktop never rides the WireGuard mesh; it connects ' +
   'over the LAN, a direct path or a TURN relay. Auto: a session takes the mesh ' +
   'only when the browser runs on one of your Roomler devices and that device’s ' +
-  'mesh link to this one is direct; an agent that predates Auto reads it as Off. ' +
+  'mesh link to this one is direct; a daemon that predates Auto reads it as Off. ' +
   'On: it may take the mesh whenever that is the best path, and inherits the ' +
   'mesh’s outages. Applies to the next session.'
 

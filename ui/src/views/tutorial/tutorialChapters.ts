@@ -112,13 +112,13 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
       id: FEATURED_VIDEO_ID,
       poster: videoTourPoster,
       caption:
-        'A 9-minute tour: installing the agent on Windows, macOS and Linux, connecting from a browser tab, and how it compares with TeamViewer and AnyDesk.',
+        'A 9-minute tour: installing roomlerd on Windows, macOS and Linux, connecting from a browser tab, and how it compares with TeamViewer and AnyDesk.',
     },
     hero: heroMesh,
     heroAlt:
       'Machines joined in a direct encrypted mesh with stable private addresses, crossing NATs and firewalls',
     lead:
-      'Three products on **one small daemon**: remote control of your machines, a private network that joins them wherever they are, and rooms for chat, files and calls. You install **one agent per machine** — everything else happens in this browser. Traffic between your machines is **end-to-end encrypted** and goes peer-to-peer whenever a path exists: the server coordinates, it never carries your pixels, keystrokes or files.',
+      'Three products on **one small daemon**: remote control of your machines, a private network that joins them wherever they are, and rooms for chat, files and calls. You install **one daemon per machine** — everything else happens in this browser. Traffic between your machines is **end-to-end encrypted** and goes peer-to-peer whenever a path exists: the server coordinates, it never carries your pixels, keystrokes or files.',
     badges: [
       {
         icon: 'mdi-monitor-eye',
@@ -178,13 +178,13 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
         icon: 'mdi-cellphone-link',
         color: DEEP,
         title: 'One daemon per machine',
-        text: 'The same agent is the remote-desktop target, the network node, the tunnel exit and the SSH server — not four services to install.',
+        text: 'The same daemon is the remote-desktop target, the network node, the tunnel exit and the SSH server — not four services to install.',
       },
     ],
     detail: [
       {
         label: 'Nothing to install to watch',
-        text: 'The viewing side is a plain browser tab. Only the machine you reach runs the agent.',
+        text: 'The viewing side is a plain browser tab. Only the machine you reach runs roomlerd.',
       },
       {
         label: 'Works from anywhere',
@@ -206,7 +206,7 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     heroAlt:
       'A single-use enrollment token turning into a new row in the device list, beside three machines already enrolled',
     lead:
-      'Devices is the **home page of your fleet**. Every enrolled machine shows up with its live status, operating system, overlay address, MagicDNS name and agent version. Two kinds share the grid: **full daemons** (remote desktop + network + tunnels) and **tunnel-only clients**. Enrolling is one command on the target machine — there is no manual key exchange.',
+      'Devices is the **home page of your fleet**. Every enrolled machine shows up with its live status, operating system, overlay address, MagicDNS name and daemon version. Two kinds share the grid: **full daemons** (remote desktop + network + tunnels) and **tunnel-only clients**. Enrolling is one command on the target machine — there is no manual key exchange.',
     badges: [
       {
         icon: 'mdi-rocket-launch-outline',

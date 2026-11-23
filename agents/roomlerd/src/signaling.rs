@@ -7974,13 +7974,14 @@ pub(crate) async fn exec_surfaces_up(
     let have_surface = (companion && marker) || notified;
     info!(
         %request_id, native = false, session_panel = prompted.session_panel(), why = prompted.why(),
-        companion, marker, notified, have_surface,
+        panel_busy = prompted.panel_busy(), companion, marker, notified, have_surface,
         "consent prompt surface (exec)"
     );
     if have_surface {
         Shown::Yes
     } else {
-        Shown::No(tray.why_not_shown(marker))
+        // #4164 — a panel busy with another question wins over the app's cause.
+        Shown::No(prompted.why_not_shown(tray.why_not_shown(marker)))
     }
 }
 
@@ -10342,6 +10343,34 @@ mod exec_answer_tests {
                 "withdrawn ({shown:?})"
             );
         }
+    }
+
+    /// #4164 — a window that ran out while a consent panel busy with another
+    /// question kept the command's question from the person says that the
+    /// device's consent panel was showing another question, naming the
+    /// execution policy. The verdict carries it to the window's end. An
+    /// answer, and a question withdrawn, read as they always did.
+    ///
+    /// Red before #4164: a busy panel read "no one at its screen and the
+    /// Roomler desktop app is not running".
+    #[test]
+    fn a_window_a_busy_panel_kept_from_the_person_says_the_panel_was_busy() {
+        let busy = Shown::No(NoSurface::PanelBusy);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(busy).unwrap();
+        assert_eq!(shown_by_now(rx), busy, "a verdict that came");
+        assert_eq!(
+            exec_refusal(Decision::Timeout, busy),
+            "nobody could be asked at this device — its consent panel was showing another question, and nothing else there could show this one; answer with `roomlerd consent` there, ask again once the panel is free, or set this device's execution policy to auto"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Denied, busy),
+            "the operator at this device did not approve the command (Denied)"
+        );
+        assert_eq!(
+            exec_refusal(Decision::Cancelled, busy),
+            "the operator at this device did not approve the command (Cancelled)"
+        );
     }
 }
 

@@ -155,7 +155,7 @@ const DENY_LABEL: Record<string, string> = {
   caller_not_allowed: 'caller not allowed',
   shell_not_allowed: 'shell not allowed',
   origin_not_allowed: 'origin not allowed',
-  unsupported: 'agent too old',
+  unsupported: 'roomlerd too old',
   offline: 'device offline',
   consent_denied: 'consent denied',
   rate_limited: 'rate limited',

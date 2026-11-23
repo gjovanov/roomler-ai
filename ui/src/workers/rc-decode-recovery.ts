@@ -54,16 +54,17 @@ export interface DecodeRecovery {
    *  (the idempotent visible-canvas re-init) leaves it as it was. Off until the
    *  main thread says otherwise, like the worker's other session flags. */
   setEnabled(on: boolean): void
-  /** The session's video channel is unordered (`roomler-rc-unordered-video=1`).
-   *  Sticky, like the flag above. */
-  setUnorderedChannel(on: boolean): void
-  /** A chunk gap. True: the deltas behind it wait at the gate for a key frame.
-   *  False: they decode with artefacts, as before R1, and the picture moves.
-   *  That is the switch's old path, and the unordered channel's only path: a
-   *  lost packet there kills its chunk, which is routine, and at 1 % loss a key
-   *  frame rarely survives whole (FR-135 §6.8). A gate waiting for one holds the
-   *  picture still until the watchdog re-creates the session. */
-  gapClosesGate(): boolean
+  /** A chunk gap, revealed by a message off an `unordered` channel or not.
+   *  True: the deltas behind it wait at the gate for a key frame. False: they
+   *  decode with artefacts, as before R1, and the picture moves. That is the
+   *  switch's old path, and the unordered channel's only path: a lost packet
+   *  there kills its chunk, which is routine, and at 1 % loss a key frame
+   *  rarely survives whole (FR-135 §6.8). A gate waiting for one holds the
+   *  picture still until the watchdog re-creates the session.
+   *
+   *  FR-148 P4b-2 — the unordered channel is `video-deadline`, and the channel
+   *  is the message's: `video-bytes` is always ordered now. */
+  gapClosesGate(unordered: boolean): boolean
   /** The decoder failed. True: build a new decoder, ask for a key frame, and do
    *  not report the error as fatal. False: report it as before. */
   onFailure(framesDecoded: number, nowMs: number): boolean
@@ -75,7 +76,6 @@ export interface DecodeRecovery {
 
 export function createDecodeRecovery(): DecodeRecovery {
   let enabled = false
-  let unorderedChannel = false
   // Every rebuild still inside the window, oldest first.
   let rebuilds: number[] = []
   let outageSince: number | null = null
@@ -84,11 +84,8 @@ export function createDecodeRecovery(): DecodeRecovery {
     setEnabled(on: boolean): void {
       enabled = on
     },
-    setUnorderedChannel(on: boolean): void {
-      unorderedChannel = on
-    },
-    gapClosesGate(): boolean {
-      return enabled && !unorderedChannel
+    gapClosesGate(unordered: boolean): boolean {
+      return enabled && !unordered
     },
     onFailure(framesDecoded: number, nowMs: number): boolean {
       if (!enabled || framesDecoded === 0) return false

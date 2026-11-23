@@ -260,6 +260,9 @@ pub struct AgentPeer {
     /// the controlling user ([`Self::set_pair_user`]) and its server-reflexive
     /// candidates, as they are trickled. The FFmpeg pump finds it by session.
     pair_facts: Arc<crate::media_pair_memory::PairFacts>,
+    /// FR-148 P4b-3 — the viewer's `video-deadline` and the key frame gate,
+    /// which the pumps find by session while this holds it.
+    _deadline_session: Arc<crate::media_deadline::Session>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -1185,8 +1188,13 @@ impl AgentPeer {
         let encoded_dims_for_dc = encoded_dims.clone();
         // rc.130 — the control DC handler forces an encoder keyframe on the
         // browser's `rc:keyframe` (sent when its decode queue backs up and it
-        // drops deltas to resync). Same atomic the media pumps already poll.
-        let keyframe_for_dc = keyframe_requested.clone();
+        // drops deltas to resync). Same atomic the media pumps already poll,
+        // through the session's gate, which FR-148 P4b-3's send tasks share;
+        // registered before the pump is spawned, which finds it by session.
+        let deadline_session =
+            crate::media_deadline::Session::register(session_id, keyframe_requested.clone());
+        let keyframe_for_dc = deadline_session.gate();
+        let deadline_for_callback = deadline_session.clone();
         let viewer_report_for_dc = viewer_report.clone();
         let priority_for_dc = priority.clone();
         // FR-132 P1 — a decode error the viewer reports sends one
@@ -1225,6 +1233,7 @@ impl AgentPeer {
             let priority_for_dc = priority_for_dc.clone();
             let stats_now_for_dc = stats_now_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
+            let deadline_stash = deadline_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
             let cursor_stash = cursor_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
@@ -1391,6 +1400,23 @@ impl AgentPeer {
                         // (field 2026-08-30, two viewers of CORPLAP-3). Now the
                         // DC is live, re-sync onto a fresh IDR. No-op for a leader.
                         crate::media_share::resync_follower(session_id);
+                        attach_log_only(dc, session_id);
+                    }
+                    // FR-148 P4b-3 (D55) — the deadline-limited video channel,
+                    // opened beside `video-bytes` on a framed session (P4b-2).
+                    // By equality, like every arm here. The send tasks find it
+                    // through `media_deadline` and pick it per carrier class,
+                    // at a key frame. Logged with its negotiated shape, as
+                    // `video-bytes` is, and its stream, which the mark names.
+                    "video-deadline" => {
+                        info!(
+                            session = %session_id,
+                            ordered = dc.ordered(),
+                            max_retransmits = ?dc.max_retransmits(),
+                            stream_id = dc.id(),
+                            "video-deadline DC stashed (FR-148 P4b-3)"
+                        );
+                        deadline_stash.stash(dc.clone()).await;
                         attach_log_only(dc, session_id);
                     }
                     _ => attach_log_only(dc, session_id),
@@ -1699,6 +1725,7 @@ impl AgentPeer {
             record_ctx,
             privacy_ctx,
             pair_facts,
+            _deadline_session: deadline_session,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -4060,6 +4087,7 @@ async fn media_pump_vp9_444_dc(
     // than reading the process-wide env flag. The env flag still wins as an
     // explicit override (see `detect_constrained_transport`).
     let mut constrained_transport = detect_constrained_transport(&pc, session_id).await;
+    let lanes = crate::media_deadline::Pump::start(session_id, &pc, delivery.deadline()).await;
     // FR-74 P3 — the worst quality libvpx may pick on a DIRECT transport
     // (`rc_max_quantizer`; relay keeps the uncapped 63). Resolved once: the
     // env is process-stable. See `Vp9Encoder::set_max_quantizer` for why a
@@ -4286,7 +4314,7 @@ async fn media_pump_vp9_444_dc(
         std::time::Instant::now(),
     );
     {
-        let video_bytes_dc = video_bytes_dc.clone();
+        let mut lane = lanes.lane(&video_bytes_dc, &pc, chunk_framing); // FR-148 P4b-3
         let frames_sent = frames_sent.clone();
         let bytes_written = bytes_written.clone();
         let send_errors = send_errors.clone();
@@ -4298,8 +4326,7 @@ async fn media_pump_vp9_444_dc(
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
             // FR-17 — see the ffmpeg pump: the sequence lives in the send
-            // task because that is what puts messages on the wire.
-            let mut frame_seq: u32 = 0;
+            // task's lane because that is what puts messages on the wire.
             // Measured-rate v2 — time each frame's chunked serialisation;
             // the sink keeps only genuinely blocked sends (≥10 ms of SCTP
             // flow control), so buffer headroom never biases the estimate
@@ -4308,26 +4335,25 @@ async fn media_pump_vp9_444_dc(
                 let mut next = Some(first);
                 while let Some((enqueued_at, wire)) = next.take() {
                     let mut unsent = budget_bytes.unsent(wire.len()); // FR-148 D46
-                    if let Some(dc) = video_bytes_dc.lock().await.clone() {
+                    if let Some(out) = lane.route(&wire, enqueued_at).await {
                         let total = wire.len();
                         let ser_start = std::time::Instant::now();
                         let mut off = 0usize;
                         let mut ok = true;
                         let chunk_count = total.div_ceil(SCTP_CHUNK_SIZE).max(1) as u16;
                         let mut chunk_idx: u16 = 0;
-                        frame_seq = frame_seq.wrapping_add(1);
                         while off < total {
                             let end = (off + SCTP_CHUNK_SIZE).min(total);
                             let res = if chunk_framing {
                                 let framed = chunk_framed(
-                                    frame_seq,
+                                    out.frame_seq,
                                     chunk_idx,
                                     chunk_count,
                                     &wire.slice(off..end),
                                 );
-                                dc.send(&bytes::Bytes::from(framed)).await
+                                out.dc.send(&bytes::Bytes::from(framed)).await
                             } else {
-                                dc.send(&wire.slice(off..end)).await
+                                out.dc.send(&wire.slice(off..end)).await
                             };
                             chunk_idx = chunk_idx.saturating_add(1);
                             if let Err(e) = res {
@@ -4392,6 +4418,7 @@ async fn media_pump_vp9_444_dc(
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
             delivery.on_pair_check(&pc).await; // FR-148 D46
+            lanes.read(&pc).await; // FR-148 P4b-3: the class, under every override
             if !crate::encode::transport_is_constrained() {
                 let relay_now = current_pair_is_relay(&pc, session_id, constrained_transport).await;
                 if let Some(relay) = relay_now
@@ -6630,6 +6657,7 @@ async fn media_pump_ffmpeg_dc(
     // Relay-escape: `mut` — the loop re-checks the selected pair periodically
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
+    let lanes = crate::media_deadline::Pump::start(session_id, &pc, delivery.deadline()).await;
     let mut last_transport_check = std::time::Instant::now();
     // FR-35 P2 / FR-148 P1 — the pair memories (`media_pair_memory`): today's
     // seeds the opening as before, unless the switch is `on` and the path
@@ -7298,7 +7326,7 @@ async fn media_pump_ffmpeg_dc(
     let mut last_swap_at = crate::clock::instant_before(Duration::from_secs(60));
     const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(3);
     {
-        let video_bytes_dc = video_bytes_dc.clone();
+        let mut lane = lanes.lane(&video_bytes_dc, &pc, chunk_framing); // FR-148 P4b-3
         let frames_sent = frames_sent.clone();
         let bytes_written = bytes_written.clone();
         let send_errors = send_errors.clone();
@@ -7317,10 +7345,9 @@ async fn media_pump_ffmpeg_dc(
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
             // FR-17 — monotonic per-frame sequence for the framing prefix.
-            // Lives in the SEND TASK because that is what actually puts
-            // messages on the wire: a counter kept in the pump would drift
-            // from the wire the moment a frame is shed after encoding.
-            let mut frame_seq: u32 = 0;
+            // Lives in the SEND TASK (its lane, one space over both video
+            // channels: FR-148 P4b-3) because that is what puts messages on
+            // the wire: a pump's counter would drift from the wire.
             // Measured-rate v2 — time each frame's chunked serialisation
             // and report it; the sink keeps only genuinely blocked sends
             // (≥10 ms of SCTP flow control), so buffer headroom never
@@ -7339,11 +7366,11 @@ async fn media_pump_ffmpeg_dc(
                     // motion the rebuild obsoleted; drop it so the fresh IDR
                     // behind it ships immediately (still settles the ledger).
                     let stale = epoch < send_epoch.load(Relaxed);
-                    // Fetch the DC fresh each frame — the same handle the pump's
-                    // open-check uses. None means it closed under us (the pump's
-                    // open-guard re-requests a keyframe on its side); the frame
-                    // is dropped but must still leave the in-flight ledger below.
-                    if !stale && let Some(dc) = video_bytes_dc.lock().await.clone() {
+                    // The lane fetches the DC fresh each frame — the handle the
+                    // pump's open-check uses. None means it closed under us (the
+                    // pump's open-guard re-requests a keyframe), or the lane
+                    // dropped it; it must still leave the in-flight ledger below.
+                    if !stale && let Some(out) = lane.route(&wire, enqueued_at).await {
                         let ser_start = std::time::Instant::now();
                         // FR-74 P1b — publish the head frame's enqueue instant
                         // so the pump's gate can age it while it is on the wire.
@@ -7362,7 +7389,6 @@ async fn media_pump_ffmpeg_dc(
                         // satisfy.
                         let chunk_count = total.div_ceil(SCTP_CHUNK_SIZE).max(1) as u16;
                         let mut chunk_idx: u16 = 0;
-                        frame_seq = frame_seq.wrapping_add(1);
                         while off < total {
                             let end = (off + SCTP_CHUNK_SIZE).min(total);
                             // `wire.slice` is zero-copy (shares the Bytes
@@ -7371,14 +7397,14 @@ async fn media_pump_ffmpeg_dc(
                             // when the controller negotiated it.
                             let res = if chunk_framing {
                                 let framed = chunk_framed(
-                                    frame_seq,
+                                    out.frame_seq,
                                     chunk_idx,
                                     chunk_count,
                                     &wire.slice(off..end),
                                 );
-                                dc.send(&bytes::Bytes::from(framed)).await
+                                out.dc.send(&bytes::Bytes::from(framed)).await
                             } else {
-                                dc.send(&wire.slice(off..end)).await
+                                out.dc.send(&wire.slice(off..end)).await
                             };
                             chunk_idx = chunk_idx.saturating_add(1);
                             if let Err(e) = res {
@@ -7726,6 +7752,7 @@ async fn media_pump_ffmpeg_dc(
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
             delivery.on_pair_check(&pc).await; // FR-148 D46
+            lanes.read(&pc).await; // FR-148 P4b-3: the class, under every override
             if !crate::encode::transport_is_constrained() {
                 // FR-65 — a stats read, not a free predicate: it walks the
                 // stats graph under locks the ICE agent and SCTP association
@@ -9827,7 +9854,7 @@ async fn media_pump_ffmpeg_dc(
         // equivalents); we set max_b_frames=0 so this is rare but
         // possible at GOP boundaries.
         // FR-65 — `dc_lock`: the send task holds this mutex for a frame's
-        // whole chunked send (its `if let` scrutinee keeps the guard alive
+        // whole chunked send (its lane's `Routed` keeps the guard alive
         // through the body), so this waits out the previous frame's send.
         let t = watch.start();
         let dc_lock_from = std::time::Instant::now();
@@ -10828,7 +10855,9 @@ fn attach_control_handler(
     session_id: bson::oid::ObjectId,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
-    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    // rc.130 — the session's key frame gate (FR-148 P4b-3: shared with the
+    // send tasks' own asks), over the atomic the media pumps poll.
+    keyframe_gate: Arc<crate::media_deadline::KeyframeGate>,
     // rc.188 — written on every `rc:decodestat` (packed decoded fps + a
     // struggling bit via `viewer_rate::pack_report`); the DC video pumps swap+
     // decode it to drive the viewer-rate fps cap.
@@ -10848,12 +10877,6 @@ fn attach_control_handler(
     // itself, and a session's control channel (with everything its handlers
     // hold) was never freed.
     let dc_for_reply = Arc::downgrade(&dc);
-    // rc.130 — min-gap clamp for browser-requested keyframes (rc:keyframe).
-    // The atomic itself coalesces (the pump forces at most one IDR per encode
-    // regardless of how often it's set) and the browser debounces, but this
-    // bounds a misbehaving/old controller to one forced IDR per gap so a
-    // resync storm can't pile the LARGEST frames onto a congested link.
-    let last_kf_request = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     // rc.191 — display-match cleanup: restore the host's original display
     // mode when the session's control channel closes (normal disconnect,
     // browser tab gone, watchdog pc.close() — all funnel here). The
@@ -10883,10 +10906,9 @@ fn attach_control_handler(
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
-        let keyframe_requested = keyframe_requested.clone();
+        let keyframe_gate = keyframe_gate.clone();
         let viewer_report = viewer_report.clone();
         let priority = priority.clone();
-        let last_kf_request = last_kf_request.clone();
         let dc_for_reply = dc_for_reply.clone();
         let stats_now = stats_now.clone();
         Box::pin(async move {
@@ -11333,21 +11355,13 @@ fn attach_control_handler(
                     // producing IDRs (qsv forced_idr), the old gap allowed up
                     // to 5 big IDRs/s onto a struggling viewer — feeding the
                     // very backlog the resync was meant to clear. 2 IDRs/s is
-                    // plenty for resync and halves the burst load.
-                    const MIN_KF_GAP: Duration = Duration::from_millis(500);
-                    let now = std::time::Instant::now();
-                    let mut guard = last_kf_request.lock().unwrap();
-                    let allow = guard
-                        .map(|t| now.duration_since(t) >= MIN_KF_GAP)
-                        .unwrap_or(true);
-                    // FR-135 R0 (N12) — every ask, and whether the gap dropped
-                    // it: R1's slow recoveries pointed here with no counter.
-                    crate::session_telemetry::counters(session_id).note_keyframe_ask(allow);
-                    if allow {
-                        *guard = Some(now);
-                        drop(guard);
-                        keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                        crate::session_telemetry::counters(session_id).note_keyframe();
+                    // plenty for resync and halves the burst load. The gap is
+                    // the session's gate's (`media_deadline::MIN_KF_GAP`),
+                    // which FR-148 P4b-3's send tasks ask through too.
+                    // FR-135 R0 (N12) — the gate counts every ask, and whether
+                    // the gap dropped it: R1's slow recoveries pointed here
+                    // with no counter.
+                    if keyframe_gate.ask(session_id) {
                         debug!(%session_id, "control: rc:keyframe — forcing IDR (browser decode-backlog resync)");
                     }
                 }

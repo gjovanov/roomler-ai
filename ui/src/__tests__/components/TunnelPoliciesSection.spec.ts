@@ -232,12 +232,12 @@ describe('TunnelPoliciesSection — a policy that names subjects and targets by 
       'User Ops lead',
       'Role Tunnel operators',
       'Client Field laptop',
-      'Agent Lab box',
+      'Device Lab box',
       'User 5f0c9b…',
     ])
-    expect(chips(rows[0]!, 'Targets')).toEqual(['Agent Lab box', 'Agent 4e1d2c…'])
+    expect(chips(rows[0]!, 'Targets')).toEqual(['Device Lab box', 'Device 4e1d2c…'])
     expect(chips(rows[1]!, 'Subjects')).toEqual(['All users'])
-    expect(chips(rows[1]!, 'Targets')).toEqual(['All agents'])
+    expect(chips(rows[1]!, 'Targets')).toEqual(['All devices'])
     expect(document.body.textContent).not.toContain('[object Object]')
     expectNothingRaised()
     w.unmount()
@@ -256,13 +256,13 @@ describe('TunnelPoliciesSection — a policy that names subjects and targets by 
       'Tunnel operators',
       'Tunnel client',
       'Field laptop',
-      'Agent',
+      'Device',
       'Lab box',
       'User',
       '5f0c9b…',
-      'Agent',
+      'Device',
       'Lab box',
-      'Agent',
+      'Device',
       '4e1d2c…',
       'CIDR',
       'TCP',

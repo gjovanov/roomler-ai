@@ -299,7 +299,7 @@ every other device, and a per-device override outlives an agent losing a cell. T
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
 and telling nobody (`agents/roomlerd/src/signaling.rs:3990`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:10382`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:10414`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:446`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -1802,7 +1802,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10230-10263`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10257-10290`):
 
 | Field | Meaning |
 |---|---|
@@ -1811,7 +1811,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:856`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
+| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:859`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
 **The read for any host** — the FR-62 A0 sweep (`app.rs:6630`):
@@ -1878,7 +1878,7 @@ constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every fr
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
 measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
-is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9743`), so
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9770`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
 
 `qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
@@ -1971,7 +1971,7 @@ read on silicon.
 Under `inflight_budget = on` the in-flight budget holds frames on a relayed session
 ([FR-148](fr/FR-148-path-measured-plan-follows.md) D51, B4). Both data-channel pumps run
 that gate before they capture: the FFmpeg pump re-polls it every 2 ms
-(`agents/roomlerd/src/peer.rs:8107-8192`) and captures after it (`:8239`), and its
+(`agents/roomlerd/src/peer.rs:8134-8219`) and captures after it (`:8266`), and its
 encoder stamps each frame with the capture's time (`encoder.rs:96-99`, `:2357-2362`), so
 a hold of H ms reaches the encoder as a pts gap of one interval plus H. libvpx, the
 VP9-444 pump's encoder, grants that gap: after a 500 ms hold its next three seconds
@@ -1985,7 +1985,7 @@ same gap.
 **Every NVENC and AMF encoder holds, to the byte.** `o18_spend_after_a_hold`
 (`encoder.rs:4882-5296`) opens each encoder as a relayed session does (`new_preferred`
 with `constrained`, as `FfmpegDcCodec::open` does at
-`agents/roomlerd/src/peer.rs:5475-5478`; `hevc_nvenc`
+`agents/roomlerd/src/peer.rs:5502-5505`; `hevc_nvenc`
 4:4:4 through `new_hevc_adaptive`) and feeds it two arms, a fresh encoder each: three
 seconds at the frame interval, a 500 ms jump in the pts, three more seconds (`hold`);
 and the same frames with no jump (`interval`). The content is the libvpx cell's, a grey
@@ -2447,7 +2447,7 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
 - **#3472 — a frame fed again carries its own time.** libvpx's one-pass CBR
   reads its frame rate off the gaps between timestamps and grants each encode
   `target ÷ that rate`. The VP9 4:4:4 data-channel pump's idle keepalive
-  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4050`): the same
+  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4077`): the same
   `Arc<Frame>`, so the same `monotonic_us`. That repeated pts added no time
   and still took a grant, so a damage-gated screen spent about twice its
   target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080

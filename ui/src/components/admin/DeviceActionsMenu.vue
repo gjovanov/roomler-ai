@@ -44,7 +44,7 @@
       <v-list-item
         v-if="mayReadDiagnostics"
         prepend-icon="mdi-text-box-search-outline"
-        title="Agent logs"
+        title="Daemon logs"
         @click="emit('action', 'logs')"
       />
       <v-list-item

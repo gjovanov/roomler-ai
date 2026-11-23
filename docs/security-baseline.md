@@ -348,7 +348,7 @@ give.
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:805`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:810`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:157`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
@@ -376,6 +376,8 @@ roles do not.
   still buffers and parses the bytes before the handler runs, as `Bytes` would;
   what waits for the gate is its answer. The overlay ACL's half is pinned in
   `crates/tests/src/overlay_tests.rs` (`overlay_acl_decides_the_bit_before_the_body`).
+  The rest of the network module's gated writes followed in #4218, and a guard now
+  holds the order in every module ([below](#a-gated-write-decides-its-gate-before-it-reads-its-body)).
 - ⚠️ **The forward itself reads no permission bit, and must not.**
   `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
@@ -402,11 +404,12 @@ name upstream, and under an exit node the host's whole DNS goes there
 ([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
 changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
 overlay ACL's mode and the retired-key switch (`set_magic_dns`,
-`crates/modules/network/src/routes/overlay_route.rs:552`):
+`crates/modules/network/src/routes/overlay_route.rs:564`):
 
-- **Decided first**, before the body is normalized, the plan gate or the domain
-  checks run. A member without the bit gets one 403 `forbidden` whatever the body
-  says, never `not_a_member`; someone outside the org still gets `not_a_member`.
+- **Decided first**, before the body is read (#4218), normalized, or the plan gate or
+  the domain checks run. A member without the bit gets one 403 `forbidden` whatever
+  the body says, one that does not parse included, never `not_a_member`; someone
+  outside the org still gets `not_a_member`.
   Switching MagicDNS off, or setting only the upstreams, is a change like any other.
 - **The read stays any member's**, unlike the tunnel ACL's above, and the difference
   is the content: every node of the org receives the domain and the resolvers in its
@@ -418,6 +421,54 @@ overlay ACL's mode and the retired-key switch (`set_magic_dns`,
   read-only rather than showing an error.
 
 `crates/tests/src/magic_dns_permission_tests.rs` pins each point.
+
+### A gated write decides its gate before it reads its body
+
+axum runs a handler's extractors before the handler's first line, and `Json<T>` as an
+extractor answers a body that does not parse there: 400, 413, 415 or 422. A write that
+takes `Json<T>` and decides its gate in its body therefore answers such a body before
+the gate. A caller the gate refuses is told about the body instead of being refused,
+and a platform-operator route, which answers anyone else 404 so that it stays unseen,
+is seen (#4187, #4218).
+
+- **The order.** A write gated on a permission bit or on the platform-operator
+  allowlist takes `Result<Json<T>, JsonRejection>` and unwraps it with
+  `let Json(body) = body?;` straight after its gate, before it parses or looks up any
+  id its gate does not need (a bit's gate asks about one org, so that org's id is
+  parsed first). A caller the gate refuses gets the gate's answer, whatever the body
+  is. A caller it lets through gets what the extractor answered, the status and the
+  plain-text words (`ApiError::JsonBody`, `crates/core/src/error.rs:55`), whatever the
+  id is, as before.
+- **Where it holds.** Every gated write of the network module: the overlay ACL and
+  tunnel-policy writes (#4187), the route and exit-node approvals, `PUT …/magic-dns`,
+  the retired-key switch, the peer-relay mode, a device's SSH policy, the org's SSH
+  settings, a tunnel client's update and the block renumber, and the four
+  platform-operator routes: block reclaim, host reconcile, orphans and the
+  tunnel-client prune (#4218). The fleet module's `rc-resume-scope` and the remote
+  module's `close-dead` read theirs after the platform-operator check too, and answer
+  an operator's malformed body a 400 JSON. #4254 tracks the gated writes of the other
+  modules that still take `Json<T>`.
+- **The guard.** `gate_before_body` (`crates/api/src/gate_before_body.rs`), a unit
+  test of the api crate, reads the server's source: the api crate, `roomler-core` and
+  every module. It fails when a function takes its body as `Json<T>` or
+  `Option<Json<T>>` and calls a gate, or takes the `Result` and uses it before its
+  gate. A gate is a function, other than a handler, that checks a permission bit
+  (`permissions::has`) or the allowlist (`platform_admins.contains`), or that calls a
+  gate, so a new helper built on `require_permission` is one without being named.
+  Its `DEFERRED` list holds #4254's handlers and its `BY_DESIGN` list the checks
+  that need the body, each with why. Both may only shrink: an entry the scan no
+  longer flags fails the test until it is removed.
+- ⚠️ **What it cannot see** is written in its header: an ownership or author check
+  (`chat::message::update`, #4254), a check called as a method or through a macro, a
+  handler a macro writes, and the other extractors that answer before the handler
+  runs (`Query<T>`, a typed `Path<T>`, `Form<T>`, `Multipart`, a `Bytes` or `String`
+  body's 413). Those stay the reviewer's.
+
+The routes are pinned by the integration tests that cover them: each file has a test
+that a caller the gate refuses gets its answer for `{`, a field of the wrong type and
+a body sent as `text/plain` (`does_not_parse` in its name), and a control that a
+caller it lets through gets the extractor's answer
+(`crates/tests/src/tunnel_policy_permission_tests.rs`, `holder_problems`).
 
 ### A 403 is an answer, not an expired credential (FR-82)
 
@@ -756,7 +807,7 @@ check still builds no path from it. The viewer's own ids
 A viewer chooses every string it sends on a session's data channels, the
 channel's own name included, and the daemon's log writes one event a line. So
 on every channel the session's peer routes (`on_data_channel`,
-`agents/roomlerd/src/peer.rs:1216`: input, control, cursor, clipboard, files,
+`agents/roomlerd/src/peer.rs:1224`: input, control, cursor, clipboard, files,
 record, privacy, video-bytes, and a channel of any other name), a string the
 viewer sent, and a reason or an error built from one, is logged with Debug
 escaping (`?`), so a line break or another control character in it stays inside
@@ -768,8 +819,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11434`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10771`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11448`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10798`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -1201,7 +1252,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:5053` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:5212` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
@@ -1327,9 +1378,9 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2903`). Two tests lock it:
-`secrets_and_identity_are_not_exposed` (`:5010`) and
-`no_external_credential_key_is_editable_through_the_config_surface` (`:5757`).
+(`crates/agent-core/src/config_surface.rs:2914`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:5021`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5811`).
 
 #3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
 daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,
