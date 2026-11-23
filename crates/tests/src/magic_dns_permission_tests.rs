@@ -22,7 +22,10 @@ use serde_json::{Value, json};
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
-use crate::tunnel_policy_permission_tests::{assert_refused, call, grant_role, person_with_role};
+use crate::tunnel_policy_permission_tests::{
+    Gate, GatedWrite, assert_no_problems, assert_refused, call, gate_problems, grant_role,
+    holder_problems, person_with_role,
+};
 
 fn magic_dns(seeded: &SeededTenant) -> String {
     format!("/api/tenant/{}/magic-dns", seeded.tenant_id)
@@ -123,6 +126,99 @@ async fn the_bit_is_decided_before_the_body_is_read() {
         assert_eq!(s, 403, "{method}: {answer}");
         assert_eq!(answer["error"], "not_a_member", "{method}: {answer}");
     }
+}
+
+/// #4218 — the bit is decided before the body is read at all, not only
+/// before it is normalized: a member without it (a moderator too) gets the one
+/// 403 `forbidden` for a body that does not even parse, the answer a body the
+/// route reads gets, and someone outside the org the one `not_a_member`.
+/// While `PUT …/magic-dns` took `Json<T>` as an extractor, axum answered such
+/// a body before the handler ran, with a 400, 415 or 422 decided by the body
+/// alone. Nothing they send is stored.
+#[tokio::test]
+async fn the_bit_is_decided_before_a_body_that_does_not_parse() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("mdnsperm-unparsed").await;
+    let other = app.seed_tenant("mdnsperm-unparsed-b").await;
+    let moderator = person_with_role(&app, &seeded, "mod", "moderator").await;
+    let before = owner_sets(
+        &app,
+        &seeded,
+        settings(Some("corp.example"), &["192.0.2.53"]),
+    )
+    .await;
+    let write = GatedWrite {
+        method: "PUT",
+        path: magic_dns(&seeded),
+        reads: settings(None, &[]),
+        refused_field: r#"{"magic_dns_nameservers": 7}"#,
+    };
+
+    let mut wrong = Vec::new();
+    for (who, token, gate) in [
+        (
+            "a member without the bit",
+            &seeded.member.access_token,
+            Gate::Bit("MANAGE_AGENTS"),
+        ),
+        (
+            "a moderator",
+            &moderator.access_token,
+            Gate::Bit("MANAGE_AGENTS"),
+        ),
+        (
+            "another org's owner",
+            &other.admin.access_token,
+            Gate::NotAMember,
+        ),
+    ] {
+        wrong.extend(gate_problems(&app, who, token, gate, &write).await);
+    }
+    assert_no_problems("answered before the bit", &wrong);
+
+    let (s, now) = call(
+        &app,
+        "GET",
+        &magic_dns(&seeded),
+        &seeded.admin.access_token,
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "{now}");
+    assert_eq!(now, before, "the org's MagicDNS is as the owner set it");
+}
+
+/// #4218's control. A holder of the bit is answered a body that does not
+/// parse exactly as axum's `Json` extractor answers it, the status and the
+/// plain-text words: reading the body after the bit changes who is answered
+/// first, never what a holder is told. Nothing such a body names is stored.
+#[tokio::test]
+async fn a_holder_is_answered_a_body_that_does_not_parse_as_the_json_extractor_answers_it() {
+    use roomler_ai_mod_network::routes::overlay_route::SetMagicDnsRequest;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("mdnsperm-unparsed-holder").await;
+    let owner = &seeded.admin.access_token;
+    let before = owner_sets(
+        &app,
+        &seeded,
+        settings(Some("corp.example"), &["192.0.2.53"]),
+    )
+    .await;
+
+    let wrong = holder_problems::<SetMagicDnsRequest>(
+        &app,
+        owner,
+        "PUT",
+        &magic_dns(&seeded),
+        r#"{"magic_dns_nameservers": 7}"#,
+    )
+    .await;
+    assert_no_problems("a holder of the bit", &wrong);
+
+    let (s, now) = call(&app, "GET", &magic_dns(&seeded), owner, None).await;
+    assert_eq!(s, 200, "{now}");
+    assert_eq!(now, before, "the org's MagicDNS is as the owner set it");
 }
 
 /// The people who manage the org's devices change its MagicDNS: a member

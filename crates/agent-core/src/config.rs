@@ -1226,6 +1226,14 @@ pub struct AgentConfig {
     /// `ROOMLERD_INFLIGHT_BUDGET`, read once per session. Local only.
     #[serde(default)]
     pub inflight_budget: Option<String>,
+    /// FR-148 P4b-3 (D55) — the deadline-limited video channel's switch:
+    /// `off` (unset; the default), `shadow` or `on`. `on` sends a framed
+    /// session's video on the viewer's `video-deadline` channel when its
+    /// carrier is TCP somewhere, switching at a key frame, and drops a frame
+    /// older than D there; `shadow` only logs and counts what `on` would do.
+    /// Env `ROOMLERD_VIDEO_DEADLINE`, read once per pump. Local only.
+    #[serde(default)]
+    pub video_deadline: Option<String>,
     /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
     /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
     /// in the config surface.
@@ -3059,6 +3067,7 @@ pub fn test_fixture() -> AgentConfig {
         rc_carrier_rank: None,
         path_model: None,
         inflight_budget: None,
+        video_deadline: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -3502,6 +3511,10 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // FR-148 D46 — the in-flight budget's switch, read once per session.
     if let Some(v) = &cfg.inflight_budget {
         fallbacks.insert("INFLIGHT_BUDGET".to_string(), v.clone());
+    }
+    // FR-148 P4b-3 — the deadline channel's switch, read once per pump.
+    if let Some(v) = &cfg.video_deadline {
+        fallbacks.insert("VIDEO_DEADLINE".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -5265,6 +5278,7 @@ mod tests {
         cfg.rc_carrier_rank = Some("prio".into());
         cfg.path_model = Some("on".into());
         cfg.inflight_budget = Some("shadow".into());
+        cfg.video_deadline = Some("shadow".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -5278,6 +5292,7 @@ mod tests {
         assert_eq!(get("RC_CARRIER_RANK"), Some("prio"));
         assert_eq!(get("PATH_MODEL"), Some("on"));
         assert_eq!(get("INFLIGHT_BUDGET"), Some("shadow"));
+        assert_eq!(get("VIDEO_DEADLINE"), Some("shadow"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

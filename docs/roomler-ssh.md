@@ -756,7 +756,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1105`](../crates/modules/network/src/routes/agent_ssh.rs#L1105)).
+  [`agent_ssh.rs:1115`](../crates/modules/network/src/routes/agent_ssh.rs#L1115)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -1343,7 +1343,7 @@ server's. These bounds hold whatever the device's clock says:
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
 `grant_unconfirmed` and dials anyway (the route takes any OpenSSH public key,
-`agent_ssh.rs:1203`). On a stalled control connection, a grant that lands late
+`agent_ssh.rs:1213`). On a stalled control connection, a grant that lands late
 could then be redeemed up to about 165 s after mint, instead of 60 s. That
 matters only if the caller's authorization was revoked in between, and a
 redeemed session already outlives a revocation for its `session_secs` (12 h at
@@ -1428,7 +1428,7 @@ differently so that it does:
 | Path | A copy is | Why the first copy's answer stands |
 |---|---|---|
 | the worker's own table | refused, `invalid` | One loop records and acknowledges each grant in order (`handle_server_msg`, [`signaling.rs:3326`](../agents/roomlerd/src/signaling.rs#L3326)), and its answers leave on one queue ([`signaling.rs:2760`](../agents/roomlerd/src/signaling.rs#L2760)). The server reads one socket's frames in order ([`socket.rs:560-583`](../crates/modules/fleet/src/socket.rs#L560)), and the first answer removes the caller's wait ([`ssh_grant_acks.rs:108-120`](../crates/modules/network/src/ssh_grant_acks.rs#L108)). The copy's refusal finds no wait, and the server logs `ssh: grant ack with no waiter` at debug ([`agent_socket.rs:141-155`](../crates/modules/network/src/agent_socket.rs#L141)) |
-| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6097-6106`](../agents/roomlerd/src/signaling.rs#L6097)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1253-1280`](../crates/modules/network/src/routes/agent_ssh.rs#L1253)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3557`](../agents/roomlerd/src/ssh.rs#L3557)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
+| the SYSTEM service (FR-105) | dropped by the worker: no second ring and no acknowledgement, only a warning, `rc:ssh.grant already handed to the SYSTEM service (or refused); this copy is dropped, no ack` ([`signaling.rs:6097-6106`](../agents/roomlerd/src/signaling.rs#L6097)) | Here a refusal could undo the first copy. The service's claim is single use ([`ssh_pending.rs:44-68`](../crates/services/src/dao/ssh_pending.rs#L44)), so a copy's ring ends in a 404 ([`agent_ssh.rs:1263-1290`](../crates/modules/network/src/routes/agent_ssh.rs#L1263)), which the worker would answer as a refusal. The first copy's claim can land on a server instance other than the one holding the caller's wait. That wait reads the claim from the shared row every 400 ms, and until then it still takes a worker's refusal ([`ssh_grant_acks.rs:115`](../crates/modules/network/src/ssh_grant_acks.rs#L115)): its refusal arm would deny the caller ([`agent_ssh.rs:545-566`](../crates/modules/network/src/routes/agent_ssh.rs#L545)) while the service holds the grant. So the worker remembers each via-service id at first sight, before any outcome (`first_sight_via_service`, [`ssh.rs:3557`](../agents/roomlerd/src/ssh.rs#L3557)), in a memory of its own with the same horizon and bound, never the table's. A grant the worker refused is as dead as one the service took, and its first refusal already answered |
 
 Left as they are:
 
@@ -2023,7 +2023,7 @@ stay, each for a reason that outlives it:
 
 A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `claim_service_grant` reads no query, so the word is ignored
-(`crates/modules/network/src/routes/agent_ssh.rs:1223`). The verb
+(`crates/modules/network/src/routes/agent_ssh.rs:1233`). The verb
 `ssh-one-command` is reserved with the rest of FR-90's verbs.
 
 `a_ticketed_ssh_request_is_refused_and_audited`

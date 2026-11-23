@@ -106,8 +106,8 @@ longer depends on how the package arrived.
 ### 3.2 The per-user daemon wakes the helper instead of installing (P2a, as built)
 
 `run_periodic` forks once, at the daemon's start (`updater.rs:3323-3384`). macOS takes `forward_triggers` (the
-shared successor of `macos_forward_triggers`, `:3791-3873`) as before. Linux asks a pure
-`decide_update_owner(euid, kill switch, enable link)` (`:3732-3750`):
+shared successor of `macos_forward_triggers`, `:3954-4037`) as before. Linux asks a pure
+`decide_update_owner(euid, kill switch, enable link)` (`:3894-3912`):
 
 | daemon | `ROOMLERD_UPDATE_HELPER` | helper enabled | owner |
 |---|---|---|---|

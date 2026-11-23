@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:4028`, `crates/agent-core/src/config.rs:4553`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:4028`, `crates/agent-core/src/config.rs:4566`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:996`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,8 +576,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3588`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3673`, `:3681`), and the load fails. Each line is worded for what happened to the live file (below) |
-| `config::read_if_present` (`:3697`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3601`) | the config the process **runs on** | promotes `config.toml.prev` if it parses, without the copy's run marks (#4157) — ERROR *"…from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be enrolled (again)"* or *"…the host must be re-enrolled"* (`:3686`, `:3694`), and the load fails. Each line is worded for what happened to the live file (below) |
+| `config::read_if_present` (`:3710`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 A start restores a missing file too (#4157). An enrolled device's start whose `config.toml` is missing but whose `config.toml.prev`
 loads and holds an enrollment takes the single-instance lock, then `load` restores the copy with the *"config missing — RESTORED"*
@@ -620,8 +620,8 @@ host now runs on an older config, and that must never look like a normal boot.
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3626` |
-| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3630` |
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3639` |
+| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3643` |
 
 "Not there" is read off the read's own error (`not_found`, `:3863`), never off an `exists()`
 that could race the read, and a parse error is never read as missing. Before #4058 a live file
@@ -636,8 +636,8 @@ copy could not be used).
 
 | The live file | ERROR line | Where |
 |---|---|---|
-| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3673` |
-| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3666` |
+| **is not there**: the read's own `NotFound` | *"config missing and no usable previous copy — the host must be enrolled (again)"* | `crates/agent-core/src/config.rs:3686` |
+| **is there and does not load**: it may not be read, does not parse, or is all NUL | *"config unreadable and no usable previous copy — the host must be re-enrolled"* | `:3679` |
 
 Before #4102 both took the second line, so a device with no config at all, such as one never
 enrolled where `roomlerd org ls` ran, was told its config was unreadable.
@@ -663,9 +663,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2623`, `:2645`), at the clean-run promotion
-(`record_clean_run_at`, `:2632`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4505`). Each save
+`crates/agent-core/src/config.rs:2631`, `:2653`), at the clean-run promotion
+(`record_clean_run_at`, `:2640`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4518`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -925,7 +925,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4869`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4882`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -3604,7 +3604,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3711`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2708`).
+back to the version that is running (`crates/agent-core/src/config.rs:2716`).
 
 ### No pipe can stall the supervisor (#3080)
 

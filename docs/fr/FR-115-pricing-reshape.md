@@ -682,7 +682,7 @@ allowance, that path is now throttled on DERP (P4a), and the overlay leaves TURN
 - **In practice it changes less than the ladder suggests.** `ExitNodes` is not an established
   limit (`crates/services/src/quota.rs:93`), and every new org's `plan_enforcement` is `warn`.
   So a Free org in `warn` could already make an exit node: the gate in `set_exit_node`
-  (`crates/modules/network/src/routes/overlay_route.rs:394`) let it through and counted a quota
+  (`crates/modules/network/src/routes/overlay_route.rs:404`) let it through and counted a quota
   collision. P4d stops counting that collision, and lets an org in `enforce` do the same. Such
   an org was refused 403 before.
 - **Proof:** `free_gives_devices_and_mesh_and_fences_concurrency` (`tenant.rs`), and

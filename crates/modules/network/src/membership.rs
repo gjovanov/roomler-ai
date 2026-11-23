@@ -33,7 +33,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{State, rejection::JsonRejection},
+};
 use bson::{Bson, Document, doc, oid::ObjectId};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::{ApiError, MembershipLifecycle, extractors::auth::AuthUser};
@@ -423,13 +426,19 @@ pub struct PruneClient {
 /// A pair counts as ended only when nothing of theirs is left live after the
 /// cascade, because this module's hook answers `Ok` when it could not finish.
 ///
+/// The operator check comes before the body is read (#4218), so the route
+/// stays unseen (one 404) to everyone else whatever the body is. An operator
+/// is answered a body that does not parse as the `Json` extractor answered
+/// it (`ApiError::JsonBody`).
+///
 /// [`HookRegistry::org_member_removed`]: roomler_core::HookRegistry::org_member_removed
 pub async fn prune(
     State(state): State<NetworkState>,
     auth: AuthUser,
-    Json(body): Json<PruneRequest>,
+    body: Result<Json<PruneRequest>, JsonRejection>,
 ) -> Result<Json<PruneResponse>, ApiError> {
     roomler_core::guards::require_platform_admin(&state, &auth)?;
+    let Json(body) = body?;
     let limit = body
         .limit
         .unwrap_or(DEFAULT_PRUNE_LIMIT)

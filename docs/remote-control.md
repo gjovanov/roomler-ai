@@ -239,9 +239,9 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
-| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:494` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:535`, `crates/modules/fleet/src/hub.rs:2407` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1873`, `peer.rs:1912`, `peer.rs:1838` |
+| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:497` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:538`, `crates/modules/fleet/src/hub.rs:2407` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1900`, `peer.rs:1939`, `peer.rs:1865` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2206`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -391,7 +391,7 @@ flowchart TD
 
 **The agent keeps checking.** Upstream's controlled agent sends no check after its first selection. A TURN client creates its permission for a peer only when it first sends to it, and the TURN server drops whatever arrives from a peer no permission covers. So a relay the agent gathered after its first selection never validated, and the browser could not move onto it (the vnet cell `without_the_rank_a_turn_pair_after_the_first_selection_never_validates`, `crates/vendored/webrtc-ice/src/agent/agent_carrier_rank_test.rs`). In rank mode the agent keeps checking every pair the follow gate would follow, on every tick of its loop and bounded as any check is (`check_pairs_above_selection`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:249`, called at `:769`). A tick is 200 ms once connected too, and under `route`, while the selection rides the mesh, the bound is a budget of the pair's own ([phase B](#the-move-off-the-mesh-fr-148-p4-step-2-phase-b)). The two use one predicate, `outranks_on_a_real_path` (`:88`): the pair's remote is off the overlay range, and the pair ranks strictly above the selection. The agent therefore never validates a pair the follow gate (`should_follow_renomination`, `:57`) would refuse. Under `route` both read the route rank's predicate instead, with the mesh's own blocks (`AgentInternal::outranks`, `:152`; [below](#the-route-rank-fr-148-p4-step-2)).
 
-**The opening's wait.** A data-channel pump starts from the pair it reads at its opening: its first constrained flag, which it re-reads every 5 s, and its rate memory's key and opening ceiling, which it keeps (`detect_constrained_transport` and `nominated_remote_ip`, `agents/roomlerd/src/peer.rs:2042`, `:2078`). The browser's move off a ranked-last pair comes a moment after its first selection, so a ranked-last pair waits for it, up to 1.5 s a connection (`opening_pair`, `agents/roomlerd/src/carrier_rank.rs:183`). The wait stops as soon as the selection moves, and at once when gathering has ended with no relay off the mesh, since nothing better can then come. The pump's two reads share one deadline (`opening_deadline`, `:167`). A pair that is not ranked last is read at once, so under `0`, and on a direct link, nothing waits. Under `route` nothing waits either: the ICE agent has held already (`opening=route`, [below](#the-route-rank-fr-148-p4-step-2)).
+**The opening's wait.** A data-channel pump starts from the pair it reads at its opening: its first constrained flag, which it re-reads every 5 s, and its rate memory's key and opening ceiling, which it keeps (`detect_constrained_transport` and `nominated_remote_ip`, `agents/roomlerd/src/peer.rs:2069`, `:2105`). The browser's move off a ranked-last pair comes a moment after its first selection, so a ranked-last pair waits for it, up to 1.5 s a connection (`opening_pair`, `agents/roomlerd/src/carrier_rank.rs:183`). The wait stops as soon as the selection moves, and at once when gathering has ended with no relay off the mesh, since nothing better can then come. The pump's two reads share one deadline (`opening_deadline`, `:167`). A pair that is not ranked last is read at once, so under `0`, and on a direct link, nothing waits. Under `route` nothing waits either: the ICE agent has held already (`opening=route`, [below](#the-route-rank-fr-148-p4-step-2)).
 
 **The four lines.** Their fields are pinned by the cells beside them (`rc_overlay::tests`, `carrier_rank::tests`):
 
@@ -556,7 +556,7 @@ INFO session carrier moved session_id=<id> from="derp" to="turn" route=turn rela
 
 A pair the agent reads no route for ends the follow without a line, and under `0`, `prio` and `1` no follow starts.
 
-**The constrained flag follows on its own.** Phase B builds the line only. A data-channel pump reads its constrained flag at its opening (`detect_constrained_transport`, `agents/roomlerd/src/peer.rs:2028`) and again every 5 s (`TRANSPORT_RECHECK_INTERVAL`, `:2093`; `current_pair_is_relay`, `:2154`), by one predicate: a relay at either end that is not the device's own fast TURN, or a remote on the mesh whose overlay carrier is not direct. A change writes `transport path changed mid-session — updating bitrate clamp (relay-escape)` with `was_relay` and `now_relay`. So within 5 s of a move, the flag is what the opening would have read on the new pair:
+**The constrained flag follows on its own.** Phase B builds the line only. A data-channel pump reads its constrained flag at its opening (`detect_constrained_transport`, `agents/roomlerd/src/peer.rs:2055`) and again every 5 s (`TRANSPORT_RECHECK_INTERVAL`, `:2120`; `current_pair_is_relay`, `:2181`), by one predicate: a relay at either end that is not the device's own fast TURN, or a remote on the mesh whose overlay carrier is not direct. A change writes `transport path changed mid-session — updating bitrate clamp (relay-escape)` with `was_relay` and `now_relay`. So within 5 s of a move, the flag is what the opening would have read on the new pair:
 
 | The move | The flag before | After | What changes |
 |---|---|---|---|
@@ -565,7 +565,7 @@ A pair the agent reads no route for ends the follow without a line, and under `0
 | mesh-direct to native | off | off | nothing |
 | TURN to native | on | off | the clamps lift |
 
-The clamps: in the VP9 pump, the bitrate cap (`relay_max_bps`, 3 Mbps, against none), the buffered-amount watermark (256 KiB against `DC_BUFFERED_HIGH_BYTES`) and the worst-quality cap (`peer.rs:4392`); in the FFmpeg pump, everything it reads from the flag each frame (its rate ceiling and pipe estimate, its relay resolution cap, its queue budget and byte gate, its opener grace and IDR thrift) and, once a flip has held for two re-reads, its capture and encoder rebuilt at 30 or 60 fps, at most once a minute, under `rate_profile_rebuild` (`peer.rs:7726`). Its send depth and its rate memory's key stay the opening's. A relayed mesh and the far TURN read alike, so the move phase B exists for, mesh-relayed to TURN, keeps the clamp and changes the carrier under it. The cell `session_carrier::tests::the_constrained_flag_per_move_class` pins the table from the predicate's parts.
+The clamps: in the VP9 pump, the bitrate cap (`relay_max_bps`, 3 Mbps, against none), the buffered-amount watermark (256 KiB against `DC_BUFFERED_HIGH_BYTES`) and the worst-quality cap (`peer.rs:4418`); in the FFmpeg pump, everything it reads from the flag each frame (its rate ceiling and pipe estimate, its relay resolution cap, its queue budget and byte gate, its opener grace and IDR thrift) and, once a flip has held for two re-reads, its capture and encoder rebuilt at 30 or 60 fps, at most once a minute, under `rate_profile_rebuild` (`peer.rs:7752`). Its send depth and its rate memory's key stay the opening's. A relayed mesh and the far TURN read alike, so the move phase B exists for, mesh-relayed to TURN, keeps the clamp and changes the carrier under it. The cell `session_carrier::tests::the_constrained_flag_per_move_class` pins the table from the predicate's parts.
 
 **The cells** (`crates/vendored/webrtc-ice/src/agent/agent_carrier_rank_test.rs`, on a vnet like phase A's; a stand-in for Chrome nominates with checks that carry USE-CANDIDATE):
 
@@ -741,7 +741,7 @@ JSON, not `ClientMsg`/`ServerMsg` variants, so neither touches the server wire
 or the composition baseline.
 
 ⚠️ **A retry sends the notice once.** `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6203`) bounds each attempt with a timeout, and on
+(`agents/roomlerd/src/peer.rs:6230`) bounds each attempt with a timeout, and on
 a congested path the timeout cuts a send that is still waiting for room in
 the SCTP queue. Such a send leaves nothing on the control channel (#3755):
 no stream sequence number spent, nothing half-queued. So the next attempt is
@@ -764,7 +764,7 @@ capture of its own.
 
 | Who | How it is told | Where |
 |---|---|---|
-| the owner's own viewer | `spawn_capture_unavailable_notice`, as before | `agents/roomlerd/src/peer.rs:6786` |
+| the owner's own viewer | `spawn_capture_unavailable_notice`, as before | `agents/roomlerd/src/peer.rs:6814` |
 | the followers already on the pipeline | the owner calls `Pipeline::tell_unavailable`, which also keeps the reason | `agents/roomlerd/src/media_share.rs:665` |
 | a viewer that joins later | `try_join` reads the kept reason under the same lock as the join, so a follower is told once either way | `agents/roomlerd/src/media_share.rs:943` |
 
@@ -775,9 +775,9 @@ it has any control channel.
 ⚠️ The two pumps tell the pipeline at different points, because they register
 it at different points. The FFmpeg pump registers before it opens the capture,
 so a viewer can join during a slow open. It tells the pipeline beside the
-owner's own notice (`agents/roomlerd/src/peer.rs:6789`). The VP9 pump registers
+owner's own notice (`agents/roomlerd/src/peer.rs:6817`). The VP9 pump registers
 after the open, so it tells the pipeline right after the registration
-(`agents/roomlerd/src/peer.rs:4103`). `tell_unavailable` is a method on the
+(`agents/roomlerd/src/peer.rs:4131`). `tell_unavailable` is a method on the
 pipeline, so neither call can move above the registration.
 
 ⚠️ **A wait reaches them the same way** (#3423). A capture that waits on its
@@ -792,7 +792,7 @@ wait differs from a reason twice: it ends, and it has a deadline.
 
 | | a reason (#3260) | a wait (#3423) |
 |---|---|---|
-| the owner tells the pipeline | when its open returns no capture (above) | when `CaptureWait::hold` tells the owner's own viewer, in the owner's loop (`agents/roomlerd/src/peer.rs:6037`), or from the wait hook of an open that runs after the registration (`shared_media_waiting_hook`, `agents/roomlerd/src/peer.rs:6109`) |
+| the owner tells the pipeline | when its open returns no capture (above) | when `CaptureWait::hold` tells the owner's own viewer, in the owner's loop (`agents/roomlerd/src/peer.rs:6064`), or from the wait hook of an open that runs after the registration (`shared_media_waiting_hook`, `agents/roomlerd/src/peer.rs:6136`) |
 | the followers are told by | `Pipeline::tell_unavailable` | `Pipeline::tell_waiting` (`agents/roomlerd/src/media_share.rs:687`), through the same retrying sender as the owner's own notice |
 | it is kept | until the owner's next frame, unless a wait replaces it | until the owner's next frame (`Pipeline::on_frame`, `agents/roomlerd/src/media_share.rs:708`), unless a reason replaces it |
 | a later joiner hears | the reason | the time the wait has left, not the owner's whole wait, and nothing once that has run out (`try_join`, `agents/roomlerd/src/media_share.rs:943`) |
@@ -830,7 +830,7 @@ channel. Only where the device's plan is the virtual desktop
 nobody is told. **The viewer keeps that notice until the person connects
 again, even if frames reach the session later** (a follower promoted, a
 transport flip that reopens its capture): `mediaUnavailable` is cleared only
-by a new connect (`ui/src/composables/useRemoteControl.ts:10059`), never by a
+by a new connect (`ui/src/composables/useRemoteControl.ts:10091`), never by a
 frame, so the overlay (`ui/src/views/remote/RemoteControl.vue:1394`) stays.
 That is the point: such a session has no input of the new desktop until it
 reconnects (§6.1c).
@@ -1121,10 +1121,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:14377`](../agents/roomlerd/src/peer.rs#L14377)) sends it
+The pump ([`peer.rs:14391`](../agents/roomlerd/src/peer.rs#L14391)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5741`](../agents/roomlerd/src/peer.rs#L5741); the viewer parses it
+[`peer.rs:5768`](../agents/roomlerd/src/peer.rs#L5768); the viewer parses it
 at [`useRemoteControl.ts:1750`](../ui/src/composables/useRemoteControl.ts#L1750)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3760`](../ui/src/views/remote/RemoteControl.vue#L3760)).
@@ -1161,7 +1161,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10683`](../agents/roomlerd/src/peer.rs#L10683)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10710`](../agents/roomlerd/src/peer.rs#L10710)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1595`](../ui/src/composables/useRemoteControl.ts#L1595) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:948`](../agents/roomlerd/src/power.rs#L948)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -1767,12 +1767,12 @@ Without them the viewer never offers above 60 and never sends `rc:fps`.
 | Message | Direction | Fields |
 |---|---|---|
 | `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
-| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5579`](../agents/roomlerd/src/peer.rs#L5579)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5606`](../agents/roomlerd/src/peer.rs#L5606)) |
 | `rc:viewer-hz` | viewer → agent, control channel | `hz`, the viewer's screen as its decode worker measured it, 1 to 1000. Stored and logged ([§5.1h](#51h-a-session-says-what-it-got-fr-135-r2)). The grant reads it only under `ROOMLERD_VIEWER_HZ_CAP=1` |
 
 **The grant** ([`frame_rate.rs:320`](../agents/roomlerd/src/encode/frame_rate.rs#L320)).
 It runs in the FFmpeg data-channel pump
-([`peer.rs:8569`](../agents/roomlerd/src/peer.rs#L8569)) whenever the ask, the
+([`peer.rs:8596`](../agents/roomlerd/src/peer.rs#L8596)) whenever the ask, the
 base rate, the transport or the class moves, and once a second for the pipe's
 belief. Each rate is checked in the order a viewer can see and act on
 ([`frame_rate.rs:260`](../agents/roomlerd/src/encode/frame_rate.rs#L260)):
@@ -1790,7 +1790,7 @@ A refused ask **steps down one rate at a time** (P2b-18): the highest offered
 rate below the ask that nothing refuses runs instead, and the viewer is still
 told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
 checks each of those rates against its own deny entry and its own ceiling
-([`peer.rs:8638`](../agents/roomlerd/src/peer.rs#L8638)).
+([`peer.rs:8665`](../agents/roomlerd/src/peer.rs#L8665)).
 
 ```mermaid
 flowchart TD
@@ -1837,7 +1837,7 @@ from the top. A proven rate stays proven.
 every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
 pin, graphics and memory, from the moment the grant wants the rate
 ([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
-[`peer.rs:8676`](../agents/roomlerd/src/peer.rs#L8676)). Under an encoder-only
+[`peer.rs:8703`](../agents/roomlerd/src/peer.rs#L8703)). Under an encoder-only
 load the driver otherwise drops the memory clock, and NVENC's time per frame
 doubles.
 
@@ -2209,7 +2209,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:13079`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:13111`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -2252,9 +2252,9 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:15241`, pure)
-and carried out by `applyKeyRoute` (`:15331`): a key whose target is the soft
-keyboard's textarea (`isSoftKeyboardTarget`, `:15072` — the same
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:15273`, pure)
+and carried out by `applyKeyRoute` (`:15363`): a key whose target is the soft
+keyboard's textarea (`isSoftKeyboardTarget`, `:15104` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
 key over the stage or under keyboard lock, and has one owner — which one
 depends on the key.
@@ -2321,16 +2321,16 @@ composition.
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
 (`RemoteControl.vue:3477`), registered at mount (`:5755`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12825`), registered later by
-`attachInput` (`:13060`). Same node, same phase, so the drawer's runs
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12857`), registered later by
+`attachInput` (`:13092`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:15450`) returns nothing for a paste already consumed,
-and `routeDeferredPaste` (`:15394`) answers `taken` for one the drawer
+(`useRemoteControl.ts:15482`) returns nothing for a paste already consumed,
+and `routeDeferredPaste` (`:15426`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
-upload (`:12837`). Whichever listener runs first owns the paste, so a future
+upload (`:12869`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
@@ -3871,8 +3871,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14632`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14610`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4688`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14641`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14646`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14624`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4688`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14655`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:691`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:351`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:942`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:481`, #2326) |
@@ -3946,10 +3946,10 @@ where the server still holds the session live: on the device-ended path (sent ah
 own `rc:terminate`), not on the controller-ended one, where `ended_at` is already set when the agent
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
-P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:952`)
+P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:955`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2828`), by the
 same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6876`) queues the sample on
-**the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:292`) — the loop's outbound
+**the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:295`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
 session row carries, rather than up the GUI worker's own WS, where `merge_live_stats` would match
@@ -3991,9 +3991,9 @@ sequenceDiagram
 
 | Piece | What it does | Where |
 |---|---|---|
-| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2634`; sent by `reportDecodeError` (`:7856`) from all three worker handlers |
-| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2608`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10796` |
-| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11354`; `viewer_decode_error`, `peer.rs:10771` |
+| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2634`; sent by `reportDecodeError` (`:7860`) from all three worker handlers |
+| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2608`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10823` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11368`; `viewer_decode_error`, `peer.rs:10798` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:407` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:764` |
@@ -4026,10 +4026,10 @@ stateDiagram-v2
 
 | Piece | What it does | Where |
 |---|---|---|
-| the decision | Whether this failure recovers. Before the first frame it does not: the page bans the transport and renegotiates, because the browser's probe was wrong. Past 3 rebuilds in 10 s it does not: a stream this decoder cannot take fails again on every key frame | `createDecodeRecovery`, `ui/src/workers/rc-decode-recovery.ts:76` |
-| the rebuild | A new decoder, configured as the old one was, and one `request-keyframe` at once. `reset()` is not an option, because the error already closed the codec and `reset()` then throws. The leading-delta gate drops deltas and keeps asking until the key frame lands | `rebuildDecoder`, `ui/src/workers/rc-dc-worker.ts:715` |
-| both failure routes | The decoder's error callback and `decode()` throwing go through one function. Without recovery each still posts its old message | `onDecoderFailure`, `rc-dc-worker.ts:744` |
-| the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` (`hevc` on an HEVC session) | `useRemoteControl.ts:8907` |
+| the decision | Whether this failure recovers. Before the first frame it does not: the page bans the transport and renegotiates, because the browser's probe was wrong. Past 3 rebuilds in 10 s it does not: a stream this decoder cannot take fails again on every key frame | `createDecodeRecovery`, `ui/src/workers/rc-decode-recovery.ts:77` |
+| the rebuild | A new decoder, configured as the old one was, and one `request-keyframe` at once. `reset()` is not an option, because the error already closed the codec and `reset()` then throws. The leading-delta gate drops deltas and keeps asking until the key frame lands | `rebuildDecoder`, `ui/src/workers/rc-dc-worker.ts:743` |
+| both failure routes | The decoder's error callback and `decode()` throwing go through one function. Without recovery each still posts its old message | `onDecoderFailure`, `rc-dc-worker.ts:772` |
+| the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` (`hevc` on an HEVC session) | `useRemoteControl.ts:8939` |
 | a chunk gap | The deltas behind a gap reference the frame it lost, so on the default ordered channel the gap also re-arms the gate, on the same decoder. Before R1 they were decoded, painting garbage until the IDR landed, or failing the decoder. ⚠️ Not on `video-deadline`, the unordered channel a framed session opens beside `video-bytes` (FR-148 P4b-2, which retired the per-browser opt-in `roomler-rc-unordered-video`): a lost packet there kills its chunk, which is routine, and at 1 % loss a key frame rarely survives whole, so a gate waiting for one would freeze a picture that today keeps moving. The rule follows the channel each message came from. The switch below turns it off too (`gapClosesGate`) | `rc-dc-worker.ts:643` |
 | the watchdog | Once a data-channel path has decoded a frame, only its frames count as progress: RTP bytes on the silent m-section must not hold off a re-create while the canvas is frozen. Before that frame RTP still counts, because the viewer opens its channel speculatively and an agent that ignores it sends RTP | `mediaAdvanced`, `useRemoteControl.ts:724` |
 
@@ -4063,7 +4063,7 @@ with no grep of `agent_logs`.
 
 | Piece | What it does | Where |
 |---|---|---|
-| the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10118` |
+| the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10145` |
 | a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:195` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:771` |
@@ -4089,7 +4089,7 @@ say which cell it ran and how long it was in motion. Before this, those numbers 
 `agent_logs`, which keeps seven days. So both data-channel pumps keep a **window**
 (`MediaWindow`, `agents/roomlerd/src/media_window.rs:198`), and two things are built from it: new
 heartbeat fields, and a **summary** that rides P1d's reading into `remote_sessions.video`. The
-VP9 pump folds its window at `agents/roomlerd/src/peer.rs:4369`, the FFmpeg one at `:7453`, each
+VP9 pump folds its window at `agents/roomlerd/src/peer.rs:4395`, the FFmpeg one at `:7479`, each
 into the session's tally (`note_media_fold`, `agents/roomlerd/src/session_telemetry.rs:281`).
 
 ```mermaid
@@ -4113,7 +4113,7 @@ counted**, never zero:
 | `first_frame_ms` | from the pump's start to its first frame in the channel's queue: the agent's half of the time to the first frame |
 
 The VP9 pump now sends P1d's reading too (`vp9_libvpx`, CPU, `no_gpu_cell`,
-`agents/roomlerd/src/peer.rs:4366-4377`), so a VP9 session names its cell as an FFmpeg one does.
+`agents/roomlerd/src/peer.rs:4392-4403`), so a VP9 session names its cell as an FFmpeg one does.
 The server checks every count against a bound (30 days, 240 fps, 64 followers, an hour) and drops
 a reading with one out of range whole, as it drops a bad name (`SessionVideo::checked`,
 `crates/remote_control/src/models.rs:6025`). The agent saturates every count at those bounds
@@ -4132,7 +4132,7 @@ before its first tick keeps that early count, because the server has set `ended_
 last sample lands (above). By FR-135 §2.1's numbers those sessions hold about 6 % of the hours.
 
 **The heartbeat fields**, on the FFmpeg data-channel pump's line
-(`agents/roomlerd/src/peer.rs:10313-10326`), appended and never renamed. Each reads `None` with
+(`agents/roomlerd/src/peer.rs:10340-10353`), appended and never renamed. Each reads `None` with
 `stats` on the session's old path. A `_ms` list is twelve log-2 ms buckets,
 `[0,1)` up to `[1024,∞)`. The `_ms` lists, `frames_keepalive`, `keepalive_bytes` and
 `idr_causes` are this window's; `kf_asks` and `kf_asks_gapped` are the session's so far, as the
@@ -4144,7 +4144,7 @@ line's older `frames_encoded` is.
 | `window_ms` | ledger L03 | the window's real length; "≈2s" is only its floor |
 | `cap_to_handoff_ms`, `_p50_ms`, `_p95_ms` | N7 | from when the pump took a real frame to its hand-off to the channel, in the process's one clock. On a push arm (WGC, the portal) it starts when the pump takes the frame, not at capture |
 | `handoff_gap_ms` | N10, the agent's half | the cadence the channel is fed at |
-| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and the session's asks so far with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter |
+| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and the session's asks so far with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter. Under `ROOMLERD_VIDEO_DEADLINE=on` the send tasks' own asks are counted with the viewer's (§11.20) |
 | `idr_causes` | IDR by cause | forces per window: `[asked, shared, lock, backstop, resync, settle]` (`IdrCause`, `media_window.rs:158`). `asked` is the session's key-frame flag, which the viewer, the settle request and the channel-not-open request all set; `shared` is the pipeline's. ⚠️ The causes overlap: one force with both flags set counts `asked` and `shared`, a settle counts `settle` when requested and `asked` when forced, and each pass while the channel is not open forces and counts `asked`. Their sum is not the number of key frames, and `idr_count` minus it means nothing |
 | `dc_lock_ms` | §2.5 | the video channel's mutex wait, which `send_wait` does not contain |
 | `maxrate_bps` | R12's red | the bitrate ceiling the encoder runs now, from the handle's own copy, which a failed `rate_stats` read cannot zero |
@@ -4153,7 +4153,7 @@ The switch is `rc_media_legacy=stats` (§5.1, "The media paths"): with it, the p
 and send no summary, and the heartbeat's new fields all read `None` under their names. The FFmpeg
 reading still carries `chroma`, so a chroma change can still send an immediate sample. The fix that rides with it: a heartbeat
 whose `rate_stats` read failed no longer reaches `rc:media-plan`, where it wrote a false "gpu →
-cpu" step and its way back (`agents/roomlerd/src/peer.rs:10093`).
+cpu" step and its way back (`agents/roomlerd/src/peer.rs:10120`).
 
 #### 11.13.1 The viewer's half (R0c)
 
@@ -4191,10 +4191,10 @@ cumulative for the worker's session.
 | Piece | What it does | Where |
 |---|---|---|
 | the worker's window | hooks at the hops `rc-hop-stats` already timed; no new message and no new cadence | `createViewerMediaRecorder`, `ui/src/workers/rc-media-window.ts:156`; folded at `ui/src/workers/rc-dc-worker.ts:483` |
-| the freeze rule (N11) | a paint gap less the host's longest framing pause between the two frames, over 200 ms; each header is read as it is parsed, before the gate, the backlog shed and the decoder | `createFreezeCounter`, `ui/src/workers/rc-freeze.ts:95`; fed at `ui/src/workers/rc-dc-worker.ts:1004` |
+| the freeze rule (N11) | a paint gap less the host's longest framing pause between the two frames, over 200 ms; each header is read as it is parsed, before the gate, the backlog shed and the decoder | `createFreezeCounter`, `ui/src/workers/rc-freeze.ts:95`; fed at `ui/src/workers/rc-dc-worker.ts:1032` |
 | the wire | drops a key it cannot read and keeps the rest; every key it sent before is unchanged | `decodeStatWireMessage`, `ui/src/composables/useRemoteControl.ts:2566` |
 | the parse | the viewer is the untrusted side: a histogram must be exactly twelve counts that fit a `u32`, and a count must sit inside the row's bounds, so no viewer can make the agent send a reading the server drops whole | `ViewerReport::parse`, `agents/roomlerd/src/media_window.rs:389` |
-| the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10806` |
+| the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10833` |
 | the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:239` |
 | the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:5997` |
 
@@ -4207,7 +4207,7 @@ viewer that does not count and with `stats` old: `viewer_windows` (how many of t
 one-second windows the histograms sum, `Some(0)` when none came since the last line),
 `viewer_dec_ms`, `viewer_paint_ms`, `viewer_fwd_ms`, `viewer_backlog_ms`, `viewer_arr_gap_ms`,
 `viewer_gate_ms`, and the cumulative `viewer_chunk_gaps`, `viewer_freezes`, `viewer_painted` and
-`viewer_decoder_hw` (`agents/roomlerd/src/peer.rs:10331`). The VP9 pump's heartbeat counts packets
+`viewer_decoder_hw` (`agents/roomlerd/src/peer.rs:10358`). The VP9 pump's heartbeat counts packets
 (ledger L02) and carries none of them; its session's reading still gets the two counts.
 
 **The `rc.l4` record (N2)** names what it measured, so it reads without a join: `target_fps`
@@ -4216,7 +4216,7 @@ one-second windows the histograms sum, `Some(0)` when none came since the last l
 `transport`, coarser than the row's carrier), and while a decode worker paints, `render` (`2d`,
 `fsr`, `rcas`) and `decoder_hw`. Each is absent when the page did not know it, and a value that is
 not a short lowercase name or a size is left out (`buildL4Upload`, `ui/src/composables/rcBench.ts:476`;
-`benchJoin`, `useRemoteControl.ts:7548`). The record stays at `v: 1`, because the fields only add.
+`benchJoin`, `useRemoteControl.ts:7552`). The record stays at `v: 1`, because the fields only add.
 Only an FFmpeg data-channel session has a `target_fps` to give. Its plan's `fps.granted` is the
 rate the encoder opened at without `fps-high`, and the grant's answer with it (the
 [table in §5.1h](#51h-a-session-says-what-it-got-fr-135-r2)). A follower of that stream reads it
@@ -4264,11 +4264,11 @@ flowchart LR
 | Piece | What it does | Where |
 |---|---|---|
 | the worker | one wire format and one decoder life: the key-frame gate, the backlog drop, R1's recovery, FR-130's colour space, the bench probe, the render modes, R0c's window and the capture hold. One paint and one 1 s `stats` message, with the keys both workers sent | `ui/src/workers/rc-dc-worker.ts` |
-| the codec | named by the page in `init-canvas` for every session; with none named it is VP9 profile 1, the VP9 worker's old default. HEVC Main is `HEVC_MAIN_CODEC_STRING`, the string the HEVC probe asks about too, so the two cannot drift | `startDcPath`, `ui/src/composables/useRemoteControl.ts:8670`; `:3189`; `DEFAULT_CODEC`, `rc-dc-worker.ts:193` |
-| the crop | `classifyCrop` classifies every codec's frames and the first frame says how, but only HEVC acts on the class: an alignment crop paints and reports the visible picture, and a spurious one is re-wrapped to the coded picture (rc.100, rc.102). Any other codec paints its decoder's visible picture at its natural size, as the VP9 worker did (below) | `classifyCrop`, `rc-dc-worker.ts:1298`, applied at `:800` |
-| the name | `vp9-444` on VP9, AV1 and H.264 sessions, `hevc` on HEVC ones. It is the `path` of `rc:decode-error` and of the bench record, which the agent and the L4 reads keep, so it stays as it was. Only `msg.codec` says which codec ran | `DcPathLabel`, `useRemoteControl.ts:5061` |
-| the ban | a decoder that fails before its first frame bans the transport the path was started for, and its cell, as both workers did | `onDcWorkerMessage`, `useRemoteControl.ts:8795`, `:8885` |
-| a stale message | a message from a worker that is no longer the page's belongs to a stopped path and is dropped, so a stopped path cannot stop a newer one, now that one handle serves every codec | `useRemoteControl.ts:8796` |
+| the codec | named by the page in `init-canvas` for every session; with none named it is VP9 profile 1, the VP9 worker's old default. HEVC Main is `HEVC_MAIN_CODEC_STRING`, the string the HEVC probe asks about too, so the two cannot drift | `startDcPath`, `ui/src/composables/useRemoteControl.ts:8674`; `:3189`; `DEFAULT_CODEC`, `rc-dc-worker.ts:193` |
+| the crop | `classifyCrop` classifies every codec's frames and the first frame says how, but only HEVC acts on the class: an alignment crop paints and reports the visible picture, and a spurious one is re-wrapped to the coded picture (rc.100, rc.102). Any other codec paints its decoder's visible picture at its natural size, as the VP9 worker did (below) | `classifyCrop`, `rc-dc-worker.ts:1326`, applied at `:828` |
+| the name | `vp9-444` on VP9, AV1 and H.264 sessions, `hevc` on HEVC ones. It is the `path` of `rc:decode-error` and of the bench record, which the agent and the L4 reads keep, so it stays as it was. Only `msg.codec` says which codec ran | `DcPathLabel`, `useRemoteControl.ts:5070` |
+| the ban | a decoder that fails before its first frame bans the transport the path was started for, and its cell, as both workers did | `onDcWorkerMessage`, `useRemoteControl.ts:8827`, `:8917` |
+| a stale message | a message from a worker that is no longer the page's belongs to a stopped path and is dropped, so a stopped path cannot stop a newer one, now that one handle serves every codec | `useRemoteControl.ts:8828` |
 | the view | one `<canvas class="remote-video dc-canvas">`, mounted while `dcActive` | `ui/src/views/remote/RemoteControl.vue:1379` |
 | the watchdog | one counter, `dcFrames`, where VP9 and HEVC each had one | `mediaAdvanced`, `useRemoteControl.ts:724` |
 
@@ -4291,7 +4291,7 @@ strings. Four things changed inside the page:
   Under `roomler-rc-per-frame-msg` it also posts `frame-decoded` for a frame that changed size.
 - The backlog-drop line prints the backlog in ms, which is what the rule reads (ledger G05).
 - `dcStats`, the numbers the stats pill and the picture-size fallbacks read, start from zero with each path
-  (`stopDcPath`, `useRemoteControl.ts:8990`). One set serves every codec now, so a path must not show the last
+  (`stopDcPath`, `useRemoteControl.ts:9022`). One set serves every codec now, so a path must not show the last
   path's numbers, of another codec, until its own first `stats`. The two sets before R3 kept a stopped path's
   numbers, each for its own codec.
 
@@ -4319,12 +4319,12 @@ flowchart LR
 | Piece | What it does | Where |
 |---|---|---|
 | the switch | `localStorage.setItem('roomler-rc-dc-worker', '1')` turns it on and `'0'` off, then reconnect. Anything else is the default, read once per connect. The default is **off** until S11 (§ below), and it is one constant | `storedDcWorker`, `ui/src/composables/useRemoteControl.ts:4476`; `DC_WORKER_DEFAULT`, `:4474` |
-| the move | `startDcPath` posts the channel in the transfer list in the task that created it, the only task in which a channel can move: the spec ends its transferability at the end of that task, and at its first `send()`, which the viewer never calls on this channel. A browser that cannot transfer one throws `DataCloneError` from `postMessage` before anything is detached, so the channel is still the page's, whole, and the relay carries it. The console says which arm the session got, and why | `moveVideoChannelToWorker`, `ui/src/workers/rc-video-channel.ts:116`; `useRemoteControl.ts:8740` |
-| the worker's side | sets the channel's binary type, which does not travel with it, and feeds every message to the same `onChunk` the relay's `chunk` message feeds, with no `sentAt` | `attachVideoChannel`, `ui/src/workers/rc-dc-worker.ts:665`; `onChunk`, `:605` |
-| the word back | the page keeps no copy of a channel it moved, so a move `postMessage` took can still fail in the worker. The worker says `video-channel-attached` as it takes the channel, and `message-error` when a message could not be received in its realm. The page waits 2 s from the worker's first answer to `init-canvas` (`decoder-configured` or `decoder-configure-error`), which the worker sends just before it reads the channel, so a slow module load is not inside the wait. No word by then, or a `message-error`, and the page stops the path, relays the channel on every later session of this viewer, and reconnects at once rather than at the watchdog. The flag lives in the composable (`dcWorkerMoveFailed`, `useRemoteControl.ts:6181`), so leaving the remote page and coming back clears it | `createChannelMoveWatch`, `ui/src/workers/rc-video-channel.ts:48`; `DC_WORKER_ATTACH_GRACE_MS`, `useRemoteControl.ts:4491`; `onVideoChannelMoveFailed`, `:9019`, read at connect, `:11733`; the worker, `rc-dc-worker.ts:588`, `:597` |
-| open and close | the worker posts `video-channel-open` and `video-channel-closed`, once each. The page marks `dc_open` and logs `[rc] <path> DC opened` and `DC closed`, as the relay's own handlers do | `onDcWorkerMessage`, `useRemoteControl.ts:8831` |
-| the delivery gap | the 1.5 s network-silence warning (the 2026-07-24 freeze triangulation) moves with the channel. One clock, `createDeliveryGapClock`, runs on whichever side reads the channel, and the page prints the same line | `rc-video-channel.ts:24`; `useRemoteControl.ts:8509`, `:8514` |
-| the page's object | a moved channel leaves a closed husk behind. It stays out of `channels`, so `teardown()` has nothing to close there | `useRemoteControl.ts:8740` |
+| the move | `startDcPath` posts the channel in the transfer list in the task that created it, the only task in which a channel can move: the spec ends its transferability at the end of that task, and at its first `send()`, which the viewer never calls on this channel. A browser that cannot transfer one throws `DataCloneError` from `postMessage` before anything is detached, so the channel is still the page's, whole, and the relay carries it. The console says which arm the session got, and why | `moveVideoChannelToWorker`, `ui/src/workers/rc-video-channel.ts:126`; `useRemoteControl.ts:8757` |
+| the worker's side | sets the channel's binary type, which does not travel with it, and feeds every message to the same `onChunk` the relay's `chunk` message feeds, with no `sentAt` | `attachVideoChannel`, `ui/src/workers/rc-dc-worker.ts:680`, and `readVideoChannel`, `:698`; `onChunk`, `:613` |
+| the word back | the page keeps no copy of a channel it moved, so a move `postMessage` took can still fail in the worker. The worker says `video-channel-attached` as it takes the channel, and `message-error` when a message could not be received in its realm. The page waits 2 s from the worker's first answer to `init-canvas` (`decoder-configured` or `decoder-configure-error`), which the worker sends just before it reads the channel, so a slow module load is not inside the wait. No word by then, or a `message-error`, and the page stops the path, relays the channel on every later session of this viewer, and reconnects at once rather than at the watchdog. The flag lives in the composable (`dcWorkerMoveFailed`, `useRemoteControl.ts:6185`), so leaving the remote page and coming back clears it | `createChannelMoveWatch`, `ui/src/workers/rc-video-channel.ts:54`; `DC_WORKER_ATTACH_GRACE_MS`, `useRemoteControl.ts:4491`; `onVideoChannelMoveFailed`, `:9051`, read at connect, `:11765`; the worker, `rc-dc-worker.ts:589`, `:598` |
+| open and close | the worker posts `video-channel-open` and `video-channel-closed`, once each. The page marks `dc_open` and logs `[rc] <path> DC opened` and `DC closed`, as the relay's own handlers do | `onDcWorkerMessage`, `useRemoteControl.ts:8863` |
+| the delivery gap | the 1.5 s network-silence warning (the 2026-07-24 freeze triangulation) moves with the channel. One clock, `createDeliveryGapClock`, runs on whichever side reads the channel, and the page prints the same line | `rc-video-channel.ts:25`; `useRemoteControl.ts:8513`, `:8518` |
+| the page's object | a moved channel leaves a closed husk behind. It stays out of `channels`, so `teardown()` has nothing to close there | `useRemoteControl.ts:8757` |
 
 **Every edge, on both arms.** The switch changes who reads the channel. Past that, the edges that differ are the
 moved channel's own: a path that stops while its session goes on, and a move the worker does not confirm, or
@@ -4333,7 +4333,7 @@ confirms and then never delivers on. Their rows say how.
 | Edge | Relay | Channel in the worker |
 |---|---|---|
 | the far end closes the channel | the page's `onclose` logs it, and nothing else happens | the worker's `onclose` posts `video-channel-closed`, the page logs it, and nothing else happens |
-| the path stops: a decode error past R1's budget, or a media plan that shows `<video>` | the worker is terminated. The channel stays open, and its messages reach the page and go nowhere, until the session's `pc.close()` | the worker is terminated with the channel in it, and nothing reads the channel. The page does not close it, as it does not close a relayed one (`detachVideoChannel`, `rc-dc-worker.ts:698`), but the browser may: by libwebrtc's source, a channel with no reader is closed once 16 MiB wait for one (`kMaxQueuedReceivedDataBytes`). The agent sends on an open channel only, so from then on its pump drops each frame and asks for a key frame (`agents/roomlerd/src/peer.rs:5196`, `:9855`) until the watchdog re-creates the session. A follower sharing that pipeline (FR-44) freezes with it, since the pump drops the frame before its fan-out (`peer.rs:5250`, `:9898`); on the relay the channel stays open and a follower is not touched. Only a decode error after the first frame waits for the watchdog: one before it reconnects at once, and a media plan that shows `<video>` sends nothing on the channel. Not read in a browser, and the default stays off until it is closed (ledger `r3:VIEW-1`) |
+| the path stops: a decode error past R1's budget, or a media plan that shows `<video>` | the worker is terminated. The channel stays open, and its messages reach the page and go nowhere, until the session's `pc.close()` | the worker is terminated with the channel in it, and nothing reads the channel. The page does not close it, as it does not close a relayed one (`detachVideoChannel`, `rc-dc-worker.ts:724`), but the browser may: by libwebrtc's source, a channel with no reader is closed once 16 MiB wait for one (`kMaxQueuedReceivedDataBytes`). The agent sends on an open channel only, so from then on its pump drops each frame and asks for a key frame (`agents/roomlerd/src/peer.rs:5223`, `:9882`) until the watchdog re-creates the session. A follower sharing that pipeline (FR-44) freezes with it, since the pump drops the frame before its fan-out (`peer.rs:5277`, `:9925`); on the relay the channel stays open and a follower is not touched. Only a decode error after the first frame waits for the watchdog: one before it reconnects at once, and a media plan that shows `<video>` sends nothing on the channel. Not read in a browser, and the default stays off until it is closed (ledger `r3:VIEW-1`) |
 | the worker does not confirm a move | (nothing moved) | the page stops the path, relays every later session of this viewer, and reconnects at once (the word back, above) |
 | the worker confirms a move, and the channel then never opens or delivers | (nothing moved) | `video-channel-attached` ends the page's wait, so only the watchdog notices the black page, and its next session moves the channel again: every session of that viewer stays black, and the relay is never tried. Not seen in Chromium; Firefox's and Safari's transfers are unread. The default stays off until a move that delivers no frame counts as failed (ledger `r3:VIEW-1`) |
 | the session ends, or the page navigates | `teardown()` closes `channels`, then `pc.close()`. A navigation closes the peer and ends the worker | `pc.close()` closes the channel wherever it lives. A navigation does the same |
@@ -4391,8 +4391,8 @@ release, so it stays as it is.
 
 | Piece | Where |
 |---|---|
-| fed at arrival | `rc-dc-worker.ts:1036`, beside N10's `onArrival` |
-| the old reading, fed at paint | `rc-dc-worker.ts:889` (`queueDrift`, `:371`) |
+| fed at arrival | `rc-dc-worker.ts:1064`, beside N10's `onArrival` |
+| the old reading, fed at paint | `rc-dc-worker.ts:917` (`queueDrift`, `:371`) |
 | into the 1 s `stats` message as `queueArrMs` | `rc-dc-worker.ts:472` (`arrivalQueueDrift`, `:376`) |
 | onto `rc:decodestat` | `decodeStatWireMessage`, `useRemoteControl.ts:2564` |
 
@@ -4420,9 +4420,9 @@ minute.
 
 | Reading | The page stamps | The worker stamps | Read through |
 |---|---|---|---|
-| `fwd_ms` (N9, §11.13.1) | each relayed chunk's `sentAt` (`ui/src/composables/useRemoteControl.ts:8762`) | the chunk's arrival (`ui/src/workers/rc-dc-worker.ts:610`) | `fwdHopMs`, `ui/src/workers/rc-clock-cal.ts:151`, then the band below (`fwdSampleMs`, `:174`) |
-| the age and the age at arrival (FR-1 P7, FR-70 M0), which FR-15's loop, the age split and FR-71's verdicts read | the agent's clock against its own, from `rc:clock` (`handleClockEcho`, `useRemoteControl.ts:7266`) | the paint and the arrival (`rc-dc-worker.ts:873`) | `workerAgentOffsetUs`, `rc-clock-cal.ts:184` |
-| L4 (FR-16) | a bench probe's send (`createBenchProber`, `ui/src/composables/rcBench.ts:188`) | the paint that carried it (`rc-dc-worker.ts:862`, `ui/src/workers/rc-webcodecs-worker.ts:199`) | `toPageEpochMs`, `rc-clock-cal.ts:191`: the worker hands its stamp back on the page's clock |
+| `fwd_ms` (N9, §11.13.1) | each relayed chunk's `sentAt` (`ui/src/composables/useRemoteControl.ts:8781`) | the chunk's arrival (`ui/src/workers/rc-dc-worker.ts:618`) | `fwdHopMs`, `ui/src/workers/rc-clock-cal.ts:151`, then the band below (`fwdSampleMs`, `:174`) |
+| the age and the age at arrival (FR-1 P7, FR-70 M0), which FR-15's loop, the age split and FR-71's verdicts read | the agent's clock against its own, from `rc:clock` (`handleClockEcho`, `useRemoteControl.ts:7270`) | the paint and the arrival (`rc-dc-worker.ts:901`) | `workerAgentOffsetUs`, `rc-clock-cal.ts:184` |
+| L4 (FR-16) | a bench probe's send (`createBenchProber`, `ui/src/composables/rcBench.ts:188`) | the paint that carried it (`rc-dc-worker.ts:890`, `ui/src/workers/rc-webcodecs-worker.ts:199`) | `toPageEpochMs`, `rc-clock-cal.ts:191`: the worker hands its stamp back on the page's clock |
 
 Every other reading is one context's own: `queue_ms` and `queue_arr_ms` are differences of intervals on the worker's
 clock and on the agent's, where a constant offset cancels (§11.14.2), and so are the freezes since #3875 (a gap between
@@ -4448,13 +4448,13 @@ sequenceDiagram
 | Piece | What it does | Where |
 |---|---|---|
 | the page's half | pings one round trip at a time, 20 ms apart, ten to a round; keeps every sample, and posts the skew of the lowest RTT once a round has one of 1 ms or less. A ping with no answer in 1 s ends its round. A round with no trusted answer runs again 2 s later, three rounds in all, and then the page gives up. Nothing waits for it | `createClockCalibration`, `ui/src/workers/rc-clock-cal.ts:225`; `calSample` `:120`, `pickCalSample` `:130` |
-| the start | the data-channel worker's as `startDcPath` makes it, the RTP transform's as `installWebCodecsTransform` installs it. The data-channel worker starts before the session request goes out, so its pings normally finish before media flows | `startWorkerClockCal`, `useRemoteControl.ts:7290`, called at `:8787` and `:8422` |
+| the start | the data-channel worker's as `startDcPath` makes it, the RTP transform's as `installWebCodecsTransform` installs it. The data-channel worker starts before the session request goes out, so its pings normally finish before media flows | `startWorkerClockCal`, `useRemoteControl.ts:7294`, called at `:8819` and `:8426` |
 | the answer | the worker's first branch: stamped as the ping arrives, before anything else runs | `rc-dc-worker.ts:525`; `rc-webcodecs-worker.ts:141` |
-| the stamp of the answer | the page hands a pong to the calibration before any other handler. A pong from a worker that is no longer the page's never reaches a newer worker's calibration, and an answer to a ping the page gave up on is dropped by its number | `useRemoteControl.ts:8800`, `:8341` |
-| the skew | one number per worker, `pageSkewMs`, 0 until it arrives. Every reading through 0 is the arithmetic of before, bit for bit | `rc-dc-worker.ts:385`, set at `:565`; `rc-webcodecs-worker.ts:94`, `:150` |
-| the band (#3596) | the data-channel worker's second number, `pageSkewBandMs`: how far below zero a `fwd` reading can fall on a real hop, from the round trip the page posts beside the skew. 0 until the skew arrives with its round trip, and again when the session closes. The RTP transform has no relayed hop, and reads only the skew | `rc-dc-worker.ts:390`, set at `:569`, applied at `:610`, cleared at `:1220`; `calBandMs`, `rc-clock-cal.ts:165`; posted at `:256` |
-| the stop | a path that stops stops its calibration: no more pings, and no verdict | `stopDcPath`, `useRemoteControl.ts:9007`; `stopWebCodecsPath`, `:8489` |
-| the console | one line per worker: `[rc] vp9-444 decode worker clock: 7.25 ms behind the page's (the fastest of 10 round trips, 0.12 ms) - the worker reads the page's timestamps through it (#3566)`, or that it measured nothing, with the fastest round trip it saw. The line is the field read of the skew | `useRemoteControl.ts:7290` |
+| the stamp of the answer | the page hands a pong to the calibration before any other handler. A pong from a worker that is no longer the page's never reaches a newer worker's calibration, and an answer to a ping the page gave up on is dropped by its number | `useRemoteControl.ts:8832`, `:8345` |
+| the skew | one number per worker, `pageSkewMs`, 0 until it arrives. Every reading through 0 is the arithmetic of before, bit for bit | `rc-dc-worker.ts:385`, set at `:564`; `rc-webcodecs-worker.ts:94`, `:150` |
+| the band (#3596) | the data-channel worker's second number, `pageSkewBandMs`: how far below zero a `fwd` reading can fall on a real hop, from the round trip the page posts beside the skew. 0 until the skew arrives with its round trip, and again when the session closes. The RTP transform has no relayed hop, and reads only the skew | `rc-dc-worker.ts:390`, set at `:568`, applied at `:618`, cleared at `:1248`; `calBandMs`, `rc-clock-cal.ts:165`; posted at `:256` |
+| the stop | a path that stops stops its calibration: no more pings, and no verdict | `stopDcPath`, `useRemoteControl.ts:9039`; `stopWebCodecsPath`, `:8493` |
+| the console | one line per worker: `[rc] vp9-444 decode worker clock: 7.25 ms behind the page's (the fastest of 10 round trips, 0.12 ms) - the worker reads the page's timestamps through it (#3566)`, or that it measured nothing, with the fastest round trip it saw. The line is the field read of the skew | `useRemoteControl.ts:7294` |
 
 **The error, and the band (#3596).** A round trip's skew is wrong by at most half its RTT, whichever leg was slow, so
 the kept one is wrong by at most 0.5 ms, and by about 0.1 ms on an idle page. Chrome coarsens `now()` to 100 µs
@@ -4475,7 +4475,7 @@ only to its grain, as it times every hop only to its grain.
 **The switch.** `localStorage.setItem('roomler-rc-clock-cal', '0')`, then reconnect, and the page measures no
 worker's clock: each worker reads the page's timestamps on its own clock, as before #3566, and the console says so
 once per connect. Anything else, no value, or storage that cannot be read leaves it on (`storedClockCal`,
-`rc-clock-cal.ts:59`, read at `useRemoteControl.ts:11739`). It is on by default, because it is a fix, and the switch
+`rc-clock-cal.ts:59`, read at `useRemoteControl.ts:11771`). It is on by default, because it is a fix, and the switch
 is there because FR-15's live law reads the age it corrects. It is ledger row `r0:CLOCK-1`, which retires after a
 week of field reads with it on.
 
@@ -4536,10 +4536,10 @@ sequenceDiagram
 | Rule | Where |
 |---|---|
 | Only `redialing` is taken over: the ladder's timer waiting, the args known, not external. A request or a consent prompt in flight reads `live`, and a live session gets the banner, never a reload in the middle of it | `rcReloadState`, `ui/src/composables/useRemoteControl.ts:444` |
-| The redial is stopped, not failed: no request leaves a page that is unloading. If the page is still there 20 s later, `releaseRedial` re-arms the ladder with its backoff, and the recorded resume is deleted, or an F5 inside the minute would open a second session beside the redial and, on a device that asks, a second prompt | `reloadSurface`, `useRemoteControl.ts:9882`; `startReload`, `ui/src/utils/staleBuildWatch.ts:284` |
+| The redial is stopped, not failed: no request leaves a page that is unloading. If the page is still there 20 s later, `releaseRedial` re-arms the ladder with its backoff, and the recorded resume is deleted, or an F5 inside the minute would open a second session beside the redial and, on a device that asks, a second prompt | `reloadSurface`, `useRemoteControl.ts:9914`; `startReload`, `ui/src/utils/staleBuildWatch.ts:284` |
 | An external session (FR-52) is never taken over: its login opened one session, and another costs the device's password | `rcReloadState`; the banner says Reload ends it |
-| Work only this page holds keeps the redial: a transfer the redial would resume (rc.19), a recording's download | `reloadSurface.state`, `useRemoteControl.ts:9882` |
-| The next load resumes once, for the same signed-in person, through the redial's own ladder: the connect args set, the attempt count at least 1, the phase `reconnecting`, then the attempt. A first connect would start the ladder at 0, where `rc:error` gives up on `agent_offline`: a tab reloaded while its device restarted for an update would stop there. Its record is `after_drop`. A load with no resume recorded never connects by itself | `resumeAfterNewBuild`, `ui/src/views/remote/RemoteControl.vue:5518`; `resumeAfterReload`, `useRemoteControl.ts:9925`; `resumeArgsFor`, `ui/src/utils/staleBuildPolicy.ts:318` |
+| Work only this page holds keeps the redial: a transfer the redial would resume (rc.19), a recording's download | `reloadSurface.state`, `useRemoteControl.ts:9914` |
+| The next load resumes once, for the same signed-in person, through the redial's own ladder: the connect args set, the attempt count at least 1, the phase `reconnecting`, then the attempt. A first connect would start the ladder at 0, where `rc:error` gives up on `agent_offline`: a tab reloaded while its device restarted for an update would stop there. Its record is `after_drop`. A load with no resume recorded never connects by itself | `resumeAfterNewBuild`, `ui/src/views/remote/RemoteControl.vue:5518`; `resumeAfterReload`, `useRemoteControl.ts:9957`; `resumeArgsFor`, `ui/src/utils/staleBuildPolicy.ts:318` |
 | A session that ended within 5 minutes, or whose rating prompt is up, holds the page: its notice and its error are what the person is reading | `RC_ENDED_HOLD_MS`, `useRemoteControl.ts:469` |
 
 The device decides consent for the resumed session the way it would have for the redial, per device and user,
@@ -4633,7 +4633,7 @@ and the worker keeps the peer (§11.16.1).
 | ⚠️ The consent prompt keeps the connection's own sender: `await_prompt_or_socket_end` reads its close to withdraw a prompt (#2416) | `agents/roomlerd/src/signaling.rs:413` |
 | The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10). The end is logged once, before it, as on every road (#4010) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:1794`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7650`; `log_device_end`, `:7600`; `no_video`, `agents/roomlerd/src/session_table.rs:1443` |
 | The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, or with no window open on this connection, the switch on included, the end closes the peer at once and says nothing, as before (P2a-2, C1; P4-0). A session kept under an earlier connection's window is no exception: with no window its claim is refused `agent_disconnect` at the hello, which its viewer redials after anyway. A GUI worker's delegated table always says it, since it holds only what the daemon offered `keepable` under its window | `close_terminated`, `agents/roomlerd/src/session_table.rs:1469`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:5049`; `p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once`, `agents/roomlerd/src/session_table.rs:4673` |
-| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14170` |
+| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622`; `resume`, `:1566`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:14184` |
 | A connection that ends before its server announced a window (the window comes after the hello) closes what it built, as before. What the last connection kept keeps its own deadline, and the next hello claims it (P2a-2, M3) | `end_connection`, `agents/roomlerd/src/session_table.rs:1622` |
 | What the server must hear is never lost to a full queue: an end at the device, a kept session's own end and reports, the answer to a claim the device can no longer honour, a request refused as busy. It waits, in order, for room on this connection's queue, and the loop's table arm sends it the moment there is room; with no connection, the next one's hello is followed by it. Nothing waits on it (P2a-2, L7) | `queue_end`, `agents/roomlerd/src/session_table.rs:1832`; `next_event`, `:1876` |
 | Kept sessions count against `rc_max_sessions`: a request that would put one beside a kept peer past it is refused as busy (`rc:terminate agent_hangup`), and the table never keeps more than the capacity | `full_beside_kept`, `agents/roomlerd/src/session_table.rs:1539` |
@@ -4781,21 +4781,21 @@ sequenceDiagram
 ```
 
 The machine is `createSessionHold` (`ui/src/composables/rcSessionHold.ts:167`), with its clocks, timers and
-socket handed in, so every row below is a unit test. The composable wires it (`ui/src/composables/useRemoteControl.ts:5594`).
+socket handed in, so every row below is a unit test. The composable wires it (`ui/src/composables/useRemoteControl.ts:5598`).
 
 | Event | What the page does | Where |
 |---|---|---|
-| `rc:session.created` carries `resume_secs` | The session may be held, for that many seconds at most, capped at the agent's own 120 s. An external session (FR-52, D3) never is | `holdWindowFor`, `ui/src/composables/rcSessionHold.ts:62`; `useRemoteControl.ts:9192` |
-| This page's socket drops while the session is live, or the session goes live while it is down | The hold starts. Its deadline is the drop plus `resume_secs` plus 5 s, because a dying pod may never send `rc:session.detached` | the status watch, `useRemoteControl.ts:9989`; `:10464` |
-| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later. The page also notes that the server called the session detached, until an `rc:session.resumed` or the hold's next arm or disarm, and the hold's own end leaves the note: until then no automatic redial of the session hangs up first (D5 = A, below) | `useRemoteControl.ts:9492`; `classifyDegraded`, `:981`; `deviceDetached`, `ui/src/composables/rcSessionHold.ts:309` |
+| `rc:session.created` carries `resume_secs` | The session may be held, for that many seconds at most, capped at the agent's own 120 s. An external session (FR-52, D3) never is | `holdWindowFor`, `ui/src/composables/rcSessionHold.ts:62`; `useRemoteControl.ts:9224` |
+| This page's socket drops while the session is live, or the session goes live while it is down | The hold starts. Its deadline is the drop plus `resume_secs` plus 5 s, because a dying pod may never send `rc:session.detached` | the status watch, `useRemoteControl.ts:10021`; `:10496` |
+| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later. The page also notes that the server called the session detached, until an `rc:session.resumed` or the hold's next arm or disarm, and the hold's own end leaves the note: until then no automatic redial of the session hangs up first (D5 = A, below) | `useRemoteControl.ts:9524`; `classifyDegraded`, `:981`; `deviceDetached`, `ui/src/composables/rcSessionHold.ts:309` |
 | The socket is back | `rc:session.rejoin {session_id}` at once, on the socket that just opened | `socketUp`, `ui/src/composables/rcSessionHold.ts:267` |
 | `rc:session.detached` again, the answer to a rejoin | Asks again a second later, until the deadline. Never without an answer, so a server that drops rejoins gets one rejoin a socket | `detached`, `ui/src/composables/rcSessionHold.ts:276` |
-| `rc:session.resumed` | The hold ends `resumed` and the chip clears. No `rc.connect` record, because no attempt starts | `useRemoteControl.ts:9498` |
-| `rc:terminate` | The hold ends `ended` with its reason, and the rest is today's: a retryable reason starts the ladder, a final one closes and says why. An admin's end now has a sentence (§2.5 of the spec) | `useRemoteControl.ts:9509`; `friendlyEndReason`, `:947` |
-| `rc:ended {reason, limit}` on the control channel | Read as an `rc:terminate` for the session: a retryable reason starts the ladder, a final one closes with no ladder and drops the replay arguments, so a reload resumes nothing either. The first of `rc:terminate` and `rc:ended` for a session wins, and the second does nothing. One from a peer the page has since replaced ends nothing | `onDeviceEnded`, `useRemoteControl.ts:5707`; `claimEnd`, `:5692` |
-| An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9599`; `:10443` |
-| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll when its DERP path is not back before ICE gives up on the pair (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759` |
-| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts, with no hangup first for a session the server called detached, as above | `onExpired`, `useRemoteControl.ts:5605` |
+| `rc:session.resumed` | The hold ends `resumed` and the chip clears. No `rc.connect` record, because no attempt starts | `useRemoteControl.ts:9530` |
+| `rc:terminate` | The hold ends `ended` with its reason, and the rest is today's: a retryable reason starts the ladder, a final one closes and says why. An admin's end now has a sentence (§2.5 of the spec) | `useRemoteControl.ts:9541`; `friendlyEndReason`, `:947` |
+| `rc:ended {reason, limit}` on the control channel | Read as an `rc:terminate` for the session: a retryable reason starts the ladder, a final one closes with no ladder and drops the replay arguments, so a reload resumes nothing either. The first of `rc:terminate` and `rc:ended` for a session wins, and the second does nothing. One from a peer the page has since replaced ends nothing | `onDeviceEnded`, `useRemoteControl.ts:5711`; `claimEnd`, `:5696` |
+| An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9631`; `:10475` |
+| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll when its DERP path is not back before ICE gives up on the pair (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9803`; the skipped hangup, `:9791` |
+| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts, with no hangup first for a session the server called detached, as above | `onExpired`, `useRemoteControl.ts:5609` |
 
 ⚠️ **`resume_by` is on the server's clock, never this browser's** (#3511). It is read once, at receipt, against
 this browser's wall clock, and what is left is bounded to `[0, resume_secs]` (`holdRemainingMs`,
@@ -4813,9 +4813,9 @@ the org's slot back before the request's gate (§11.18).
 
 | Rule | Where |
 |---|---|
-| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays, except before a redial of a session the server called detached; a person's Disconnect always sends it | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759`; the request, `:11836`; answered, `:9193`; `disconnect`, `:11937` |
-| A user's own Connect, a hangup, a failure or a final end replaces nothing, so every other request is the one a page before FR-138 sent | `useRemoteControl.ts:10125`, `:9664`, `:11950` |
-| A reload that takes a redial over (§11.15) carries the id to the next load, by shape only, and that load's first request names it. A reload of a live resumable session names that session | `withReloadReplaces`, `useRemoteControl.ts:9873`; `RcResumeArgs.replaces`, `ui/src/utils/staleBuildPolicy.ts:206`; `resumeAfterReload`, `useRemoteControl.ts:9930` |
+| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays, except before a redial of a session the server called detached; a person's Disconnect always sends it | `scheduleReconnect`, `useRemoteControl.ts:9803`; the skipped hangup, `:9791`; the request, `:11868`; answered, `:9225`; `disconnect`, `:11969` |
+| A user's own Connect, a hangup, a failure or a final end replaces nothing, so every other request is the one a page before FR-138 sent | `useRemoteControl.ts:10157`, `:9696`, `:11982` |
+| A reload that takes a redial over (§11.15) carries the id to the next load, by shape only, and that load's first request names it. A reload of a live resumable session names that session | `withReloadReplaces`, `useRemoteControl.ts:9905`; `RcResumeArgs.replaces`, `ui/src/utils/staleBuildPolicy.ts:206`; `resumeAfterReload`, `useRemoteControl.ts:9962` |
 
 **`rc.resume`, a record of its own.** One record per hold, on the road `rc.connect` takes (`POST /api/log/browser`,
 §12.1.5), best effort and capped at 12 a minute (`buildResumeRecordUpload`, `ui/src/composables/rcResumeRecord.ts:104`).
@@ -4833,7 +4833,7 @@ It is AC2's instrument.
 | `hidden`, `agent_id`, `agent_org_id`, `build` | As `rc.connect` carries them |
 
 `gap_ms` is the paint path's to measure, so the page asks it. At the cut it posts `paint-gap-mark` to the
-data-channel worker (`ui/src/workers/rc-dc-worker.ts:573`) or the RTP-transform worker
+data-channel worker (`ui/src/workers/rc-dc-worker.ts:572`) or the RTP-transform worker
 (`ui/src/workers/rc-webcodecs-worker.ts:152`), which answers at once how long ago it painted and, at its next
 painted frame, the gap (`createPaintGapMark`, `ui/src/workers/rc-paint-gap.ts:48`). On the `<video>` path the view's
 frame callback reports each frame (`ui/src/views/remote/RemoteControl.vue:5606`). A worker says nothing unless the
@@ -5361,6 +5361,159 @@ What a rollback above the floor still costs:
 | `6d13320d7` (P1b-2's second part, #3633) | No sweep: a row a detach marked stays live until an image with the sweep runs again, which ends it `agent_disconnect` at its `detached_at`, at any window, 0 included (§11.18) |
 | `14a516541` (D5 = A, #3693) | A redial of a detached session writes `controller_hangup` again, and the device's own end no longer replaces an end inferred as `redial` |
 
+### 11.20 Two video channels, and the agent's pick (FR-148 P4b-3)
+
+Since FR-148 P4b-2 a framed data-channel session has two video channels: `video-bytes`, reliable and
+ordered, and `video-deadline` beside it, unordered with `maxRetransmits: 0`, which the viewer opens in
+the same offer whenever chunk framing is negotiated (`videoDeadlineDcOptions`,
+`ui/src/composables/useRemoteControl.ts:5114`). Both feed the one assembler of the viewer's worker
+(§11.14), keyed by `frame_seq` (`onChunk`, `ui/src/workers/rc-dc-worker.ts:613`). On a leg that is TCP somewhere, TURN over TCP or TLS or a mesh path the overlay
+relays, a lost segment holds every message behind it on the ordered channel until the leg sends it
+again, and that wait has no bound ([the standing queue](rate-control.md#the-standing-queue-what-a-tcp-carrier-holds)).
+On `video-deadline` the vendored SCTP abandons a lost chunk instead (P4b-1), and its frame is gone.
+P4b-3 is the agent's half: which channel a frame goes on, and whether it goes at all. It ships off,
+behind `ROOMLERD_VIDEO_DEADLINE` (below), and all of it lives in one module that builds without media
+features, `agents/roomlerd/src/media_deadline.rs`, which the two send tasks only call.
+
+| Piece | Rule | Where |
+|---|---|---|
+| the arm | `video-deadline` has an arm of its own in the data-channel match, by equality like every arm there (`video-bytes`' is `:1368`). It stashes the channel in the session's `media_deadline::Session`, which `AgentPeer::new` registers (`:1195`) and both pumps find by session, and logs `video-deadline DC stashed (FR-148 P4b-3)` with the channel's `ordered`, `max_retransmits` and `stream_id` | `agents/roomlerd/src/peer.rs:1411`; `Session`, `agents/roomlerd/src/media_deadline.rs:293` |
+| the class | the carrier of the selected pair, one of seven (below) | `class_of`, `media_deadline.rs:187`; `class_now`, `:227` |
+| the pick | `video-deadline` when the class is TCP somewhere (`turn_tcp`, `turn_tls`, `mesh_relay`) and the session has one open; `video-bytes` otherwise, and whenever the class is `unknown` | `pick`, `media_deadline.rs:218`; `CarrierClass::is_tcp`, `:164` |
+| when the class is read | at the pump's start, once `detect_constrained_transport` returned, and again at each 5 s transport re-check (`TRANSPORT_RECHECK_INTERVAL`, `peer.rs:2120`), under every override. Never from `detect_constrained_transport`'s 3 s default: with no pair selected the class is `unknown`, so the session starts on `video-bytes` and the next re-check picks again. A change writes `video channel: carrier class (FR-148 P4b-3)` with `from` and `to` | `Pump::start`, `media_deadline.rs:424`; `Pump::read`, `:446`; the VP9-444 pump, `peer.rs:4090` and `:4421`; the FFmpeg pump, `:6660` and `:7755` |
+| the lane | each send task routes every frame through its lane once, before the frame's first write: the channel and the `frame_seq`, or nothing. The lane holds `video-bytes`' stash through the frame's chunked send, as the send task's `if let` did, so the FFmpeg pump's `dc_lock` (FR-65) still waits out a frame's send | `Lane::route`, `media_deadline.rs:642`; the VP9-444 send task, `peer.rs:4338`; the FFmpeg one, `:7373` |
+
+**The classes.** The pair, what carries the agent's own relay and whether the pair rides the mesh are
+the carrier line's own reads (§11.9): `session_carrier::nominated_pair`
+(`agents/roomlerd/src/session_carrier.rs:394`), `relay_transport_of` (`:297`), and the ICE agent's
+route read where it has one, else a remote in the mesh's ranges (`addr_is_overlay_range`,
+`agents/roomlerd/src/peer.rs:2285`). The overlay's tier for the remote's peer comes from one LocalAPI
+`peers` call within 400 ms (`overlay_path`, `session_carrier.rs:401`), asked only for a pair on the
+mesh.
+
+| Class | The selected pair | Pick |
+|---|---|---|
+| `unknown` | none selected yet; the far end's relay (the agent's own candidate is no relay, so what carries the far leg is not known here); a relay whose gather left no transport stamp; a mesh pair the overlay said nothing about | `video-bytes` |
+| `direct` | host, server-reflexive or peer-reflexive candidates, off the mesh | `video-bytes` |
+| `turn_udp` | the agent's own TURN allocation, over UDP (`relay_transport=udp` on the carrier line) | `video-bytes` |
+| `turn_tcp` | the agent's own TURN allocation, over TCP | `video-deadline` |
+| `turn_tls` | the agent's own TURN allocation, over TLS | `video-deadline` |
+| `mesh_direct` | a pair on the mesh whose overlay tier is `Direct` | `video-bytes` |
+| `mesh_relay` | a pair on the mesh whose overlay tier is anything but `Direct`: `overlay_remote_is_relay_tier`'s rule (`peer.rs:2235`) | `video-deadline` |
+
+**The switch.** A session changes channel only at a key frame, and each send task keeps one
+`frame_seq` space across both channels:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Steady: the first pick, at the first frame, with no wait
+  Steady --> Draining: the pick names the other channel
+  Draining --> Draining: the old channel still holds bytes, the frame is dropped
+  Draining --> Keying: the old channel reads 0, a key frame is asked
+  Keying --> Keying: a delta is dropped
+  Keying --> Steady: a key frame goes whole on the new channel
+```
+
+| Rule | What the lane does |
+|---|---|
+| the drain rule | once the pick says switch, nothing more is written on the old channel. Every frame that arrives, a key frame too, is dropped whole while the old channel's buffered amount is above 0, that is until each of its chunks was acknowledged, or abandoned and forwarded (P4b-1). Then a key frame is asked through the session's gate, asked again at each frame until an ask passes, and the frames before the key frame are dropped. The wait has no time bound: the switch line says how long it held the video |
+| one `frame_seq` space | a frame written, a frame a switch dropped and a frame D dropped each take the next number, so the viewer reads every drop as a gap and the numbers it receives never repeat (`Lane::write`, `media_deadline.rs:667`; `drop_switching`, `:888`; `drop_late`, `:898`) |
+| the first pick | at the pump's first frame: no old channel, so no drain and no wait |
+| a channel that closes | the drain of a closed channel is over at once. A switch whose `video-deadline` closed while it waited ends on `video-bytes` at the key frame, and a session on `video-deadline` whose channel closed is picked back onto `video-bytes` |
+| an unframed session | never leaves `video-bytes`: an unframed stream on an unordered channel cannot be put back together |
+
+**The mark.** Under `on`, before the first write on `video-deadline`, the lane marks its SCTP stream
+deadline-limited (`RTCSctpTransport::mark_deadline_stream`,
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:493`, FR-148 P4b-1): once per stream, when the pick
+says switch, before the drain. A refused mark (no association, its slot held, no such stream) switches
+nothing: the session stays on `video-bytes`, one WARN line says so, and the mark is tried again at the
+next key frame (`Lane::mark`, `media_deadline.rs:862`). `off` and `shadow` never mark.
+
+**D.** Under `on`, on `video-deadline` only, a frame older than 300 ms at its first write, counted
+from its hand-off to the send task, is dropped whole, and a key frame is asked through the session's
+gate ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)).
+
+**The key frame gate is the session's** (`KeyframeGate`, `media_deadline.rs:255`). The viewer's
+`rc:keyframe` used to keep its 500 ms gap in the control channel's handler. The gap moved into the gate
+(`MIN_KF_GAP`, `:244`), which `AgentPeer::new` hands that handler, whose `rc:keyframe` arm asks
+through it (`peer.rs:11364`), as the send tasks do. So at most one forced key frame passes per 500 ms,
+whoever asks. The gate counts every ask in the session's telemetry, the viewer's and the send tasks'
+alike (`kf_asks`, `kf_asks_gapped` and `kf_ask_to_queued_ms`, FR-135 R0's N12, §11.13), so under `on`
+those fields also count the asks of a switch and of D.
+
+**The switch's values.** `ROOMLERD_VIDEO_DEADLINE`, or the local config key `video_deadline`, read once
+per pump ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)):
+
+| Value | What a session does |
+|---|---|
+| `off`: the default, unset, or any other value | today's writes, numbers and holds: every frame on `video-bytes`, no class read, no line, no count |
+| `shadow` | the pick and D run on the channel `on` would be on, and the lines say what `on` would do, with `(shadow)` after `channel`. Every write is `off`'s, byte for byte: no mark, no drop, no ask. Its switch has no drain, since nothing was written on the channel it leaves: it completes at the next key frame, and its line's `dropped` is 0 |
+| `on` | the pick, the switch with its drain, the mark and D act |
+
+**Mixed versions.**
+
+| Peer | What happens |
+|---|---|
+| a viewer older than P4b-2 | it opens no `video-deadline`. The pick finds none, the session stays on `video-bytes`, and where the carrier wanted one a line says so once per send task |
+| a `video-bytes` that arrives unordered | an older viewer's retired opt-in (`roomler-rc-unordered-video`, retired by P4b-2). The agent sends on it as today under every value: it acts only on the channel labelled `video-deadline` |
+| an agent older than P4b-3 | it attaches `video-deadline` log-only (the catch-all arm, `peer.rs:1422`), and the viewer's second channel stays one idle stream |
+
+**The lines,** each with `session`:
+
+| Line | When |
+|---|---|
+| `video-deadline DC stashed (FR-148 P4b-3)`, with `ordered`, `max_retransmits`, `stream_id` | the viewer's `video-deadline` opened |
+| `video channel: carrier class (FR-148 P4b-3)`, with `from`, `to` | the class read at a pump's start or re-check changed (`shadow`, `on`) |
+| `video channel: none -> <channel> (carrier=<class>, frame_seq=<n>, held_ms=0, dropped=0)` | a send task's first pick |
+| `video channel: <from> -> <to> (carrier=<class>, frame_seq=<n>, held_ms=<n>, dropped=<n>)`, with `drained_ms` | a switch completed: `frame_seq` is the key frame's, `held_ms` the time from the pick to it, `dropped` the frames dropped meanwhile, `drained_ms` the time until the old channel read 0 |
+| `video channel (shadow): …` | the same lines under `shadow`, for what `on` would do |
+| `video channel: the carrier is TCP somewhere and no video-deadline is open; video-bytes (FR-148 P4b-3)`, with `carrier`, `framed` | once per send task, when the pick would take `video-deadline` and the session has none |
+| WARN `video channel: video-deadline's stream was not marked; staying on video-bytes, and trying again at the next key frame (FR-148 P4b-3)`, with `stream` | once per send task, at the first refused mark |
+
+A switch, with made-up values:
+
+```text
+video channel: carrier class (FR-148 P4b-3) session=… from="unknown" to="turn_tcp"
+video channel: video-bytes -> video-deadline (carrier=turn_tcp, frame_seq=164, held_ms=212, dropped=7) session=… drained_ms=145
+```
+
+The counts ride the `path delivery` line ([rate-control.md](rate-control.md#the-deadline-channel-fr-148-p4b-3--a-frame-that-cannot-arrive-in-time-is-not-sent)).
+
+**What it leaves.** The rest of each pump is as it was, and some of it reads `video-bytes` alone:
+
+- Both pumps' open-checks read `video-bytes` (`peer.rs:5223`, `:9882`), and the VP9-444 pump's
+  watermark reads its buffered amount (`dc_buffered_high`, `peer.rs:5239`). On `video-deadline` the
+  watermark does not see what that channel holds. What bounds it there is the send channel's depth,
+  fixed at the pump's start by the opening's constrained flag (`peer.rs:4289`, `:7101`), D, and the
+  in-flight budget where it acts (`ROOMLERD_INFLIGHT_BUDGET=on`), whose `out` is the association's.
+  A `video-deadline` that closes is noticed by the lane, at the next frame's pick.
+- A shared pipeline's followers keep their own `frame_seq` and `video-bytes`
+  (`agents/roomlerd/src/media_share.rs:1113`): only the owner's send task has a lane.
+- The RTP pump has no data channel, and no lane.
+
+**The cells** (`agents/roomlerd/src/media_deadline.rs`, natively on Windows):
+
+| Cell | What it shows |
+|---|---|
+| `the_pick_takes_video_deadline_on_a_tcp_carrier_alone` | the pick table, every class with `video-deadline` open and not, and per switch value the channel a session's first key frame goes on |
+| `the_class_is_read_from_the_selected_pair` | the class from a pair: the agent's relay by its transport, a mesh pair by its tier, `unknown` for the far end's relay, a relay with no stamp and a mesh pair the overlay said nothing about, never `direct` by default |
+| `with_no_pair_selected_the_class_is_unknown`, `a_session_with_no_pair_starts_on_video_bytes_and_switches_at_the_re_check` | a real peer connection with no pair reads `unknown`, never the 3 s default; the session starts on `video-bytes` and switches once a re-check reads a TCP carrier |
+| `a_switch_drains_the_old_channel_then_waits_for_a_key_frame` | the drain rule: frames, a key frame too, dropped while the old channel holds bytes, then the ask, the drops until a key frame, the key frame on the new channel, and the line; a refused ask asked again; a channel that never drains holds the video, every frame dropped and counted |
+| `one_frame_seq_space_across_a_switch_and_back` | the numbers written rise without a repeat across a switch and back, and the gaps are the frames dropped, each counted |
+| `d_drops_a_late_frame_whole_on_video_deadline_alone` | D: a frame over 300 ms dropped whole on `video-deadline` with its number consumed, counted and a key frame asked; none on `video-bytes`; `shadow` counts and drops nothing |
+| `the_mark_comes_once_under_on_before_the_first_write_on_video_deadline` | one mark per stream, before the first write there, however often the session switches; a refusal keeps `video-bytes` and is tried again at the next key frame |
+| `shadow_writes_exactly_off_s_bytes` | over five seeds of 3,000 random frames, carrier changes, a `video-deadline` that comes and goes and a `video-bytes` sometimes missing: `shadow`'s and `off`'s messages, framed as the send task frames them, equal today's send task's in channel, bytes and order |
+| `an_older_viewer_gets_today_s_writes_under_on` | no `video-deadline`, or no framing: under `on` on a TCP carrier, today's writes and one line |
+| `the_gate_passes_one_ask_per_gap` | one ask per 500 ms passes and sets the flag the pumps poll; every ask counted |
+| `the_lane_holds_video_bytes_stash_through_the_send` | a real peer connection: the stash stays locked from the frame's routing to its send's end, under every value |
+| `the_video_deadline_channel_has_an_arm_of_its_own`, `both_send_tasks_take_every_frame_s_road_from_their_lane`, `the_control_channel_asks_through_the_session_s_gate` | pins over `peer.rs` as compiled: the arm by equality, between `video-bytes`' and the catch-all; each send task's chunk loop on the lane's channel and number, with no number of its own; the class read at both pumps' start and re-check; the control channel's asks through the session's gate |
+
+`media_delivery::tests::the_video_channel_s_counts_close_the_line` and
+`config_enum_pins::video_deadline_declares_every_mode_the_pump_reads` pin the line and the config key.
+
+**The kill switch** is the value `off`, which is also the default: no class is read, no channel
+marked, and every frame goes on `video-bytes` under the send task's next number, as before.
+
 ## 12. Performance targets & budget
 
 ### 12.0 Input to photon, measured (FR-98)
@@ -5501,7 +5654,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:10146`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:10178`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -5604,7 +5757,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:5440`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:5444`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -5638,7 +5791,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:5738`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:5742`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:9711`) | none |
 
@@ -5830,7 +5983,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1981`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:2008`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:308` joins it), and sessions
@@ -6370,12 +6523,12 @@ to-activate, so the browser never sees a bait-and-switch.
   A folder whose path alone leaves a page no room is refused, named by its
   last part, shortened to fit if need be (`refusal`, `dir_pages.rs:148`).
   The listing's task sends the frames in order (`send_listing_frames`,
-  [`peer.rs:13540`](../agents/roomlerd/src/peer.rs#L13540)), each waiting
+  [`peer.rs:13554`](../agents/roomlerd/src/peer.rs#L13554)), each waiting
   while the channel holds more than the download pumps' 4 MiB high-water
   mark, and stops at the channel's end, the session's, or the first send
   that fails. A send that fails is a WARN, `files: answer not sent`, with
   the frame's kind, size, id and error, never an entry's name
-  (`send_files_frame`, `peer.rs:13993`); `files: dir listed` gains
+  (`send_files_frame`, `peer.rs:14007`); `files: dir listed` gains
   `capped`, `bytes` and `pages`. The viewer
   ([`remoteDirListing.ts`](../ui/src/composables/remoteDirListing.ts),
   moved out of `useRemoteControl.ts` by #4121) asks with `paged: true`,
@@ -6400,16 +6553,16 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:13490`](../ui/src/composables/useRemoteControl.ts#L13490),
-  `createUploadQueue` at `useRemoteControl.ts:15482`). The transfer shows
+  ([`useRemoteControl.ts:13522`](../ui/src/composables/useRemoteControl.ts#L13522),
+  `createUploadQueue` at `useRemoteControl.ts:15514`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:13738`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:13770`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
   **A refused begin is the upload's only answer** (#3785). The viewer sends
   an upload's `files:begin` and goes straight on to its chunks and its
-  `files:end` (`runOnce`, `useRemoteControl.ts:13629-13652`), without
+  `files:end` (`runOnce`, `useRemoteControl.ts:13661-13684`), without
   waiting for `files:accepted`. So a small file is wholly on the wire
   before a refusal comes back: nobody signed in to a Windows service's
   session (#3048), a seat0 lookup out of its time on a Linux system install
@@ -6417,7 +6570,7 @@ to-activate, so the browser never sees a bait-and-switch.
   its reason, and then the chunk and the end with one more `files:error`
   each, "no active transfer" and "no active transfer to end". The viewer
   settles a transfer on its first error and ignores the rest
-  (`useRemoteControl.ts:10652-10653`), so the row kept the right reason, and
+  (`useRemoteControl.ts:10684-10685`), so the row kept the right reason, and
   the extra errors were noise. Each files channel now keeps a record of
   what it refused (`RefusedBegins`, `agents/roomlerd/src/files.rs:2387`).
   The chunks behind a refused begin, up to the next begin or resume, land
@@ -6426,14 +6579,14 @@ to-activate, so the browser never sees a bait-and-switch.
   upload left open before the refused one, which a viewer's Cancel leaves
   open on the device. The end of an upload whose begin the channel refused
   gets no answer either (`refused_at_begin`, `files.rs:3264`, asked in the
-  End arm at `agents/roomlerd/src/peer.rs:13298`). The channel remembers its
+  End arm at `agents/roomlerd/src/peer.rs:13312`). The channel remembers its
   last 64 refused ids, the oldest forgotten first, and only ids that are one
   plain name. A begin with a refused id is a retry and runs as a fresh
   begin, and once accepted its id is off the list. A resume, whatever its
   answer, ends the dropping, and an accepted one takes its id off the list. A
   chunk or an end for an upload never begun is answered as before, and so is
   everything on the declined (#3757) and FILES-denied channels. Tests:
-  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17655`), over
+  `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17669`), over
   a real channel through the production router, and
   `files::refused_begin_tests` (`files.rs:14080`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
@@ -6441,23 +6594,23 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:15627`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:15659`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:15655`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:15687`), not "Uploaded".
   **A success says where, too** (#3048): "Uploaded report.pdf to
   `C:\Users\ana\Downloads`", and "Uploaded 3 files to `\\server\share\…\Downloads`"
-  for several in one folder (`useRemoteControl.ts:15698-15707`). On a
+  for several in one folder (`useRemoteControl.ts:15730-15739`). On a
   machine-wide Windows install that folder is the signed-in person's own
   Downloads, which Folder Redirection may have moved to a share, and the
   viewer is where the controller learns that path. The folder is `path`
   without the uploaded name's tree (`uploadLandingFolder`,
-  `useRemoteControl.ts:15638`), read without a verbatim prefix:
+  `useRemoteControl.ts:15670`), read without a verbatim prefix:
   `\\?\UNC\server\share` reads `\\server\share`. Files that landed in more
   than one folder say "to 2 folders (first: …)".
   **A dropped folder names itself once** (#3725). A drop on the stage and a
   drop on the files drawer both walk the folder with `walkFolderEntry`
-  (`useRemoteControl.ts:14156`), and each entry carries its own path: the
+  (`useRemoteControl.ts:14188`), and each entry carries its own path: the
   folder's name once, then the path below it, so `l2fold/l2-one.bin` and
   `l2fold/sub/l2-two.bin`. Until #3725 the walk added the folder's name a
   second time and every file landed in `<folder>/<folder>/…`, because the
@@ -6466,8 +6619,8 @@ to-activate, so the browser never sees a bait-and-switch.
   skipped. A folder reaches the device only by a drop: the viewer has no
   folder picker, and a paste carries flat files.
   **A Transfers row moves in one place** (#3726). Every change to a row is a
-  move that `moveTransfer` (`useRemoteControl.ts:15558`) applies, through
-  `patchTransfer` (`useRemoteControl.ts:7193`):
+  move that `moveTransfer` (`useRemoteControl.ts:15590`) applies, through
+  `patchTransfer` (`useRemoteControl.ts:7197`):
 
   | Move | Made by | What it does |
   |---|---|---|
@@ -6484,23 +6637,23 @@ to-activate, so the browser never sees a bait-and-switch.
   again, Cancel button and all, 0.4 s after it read Cancelled.
   ⚠️ **One byte count per direction.** An upload's bar is what the device
   has written (`files:progress`, every 256 KiB, the count a resume asks to
-  start from, `useRemoteControl.ts:10666`), never the pump's offset, which
-  runs up to 4 MiB ahead in the channel's buffer (`useRemoteControl.ts:13365`).
+  start from, `useRemoteControl.ts:10698`), never the pump's offset, which
+  runs up to 4 MiB ahead in the channel's buffer (`useRemoteControl.ts:13397`).
   With both writing, the bar read 13 → 1 → 22 → 4 → 25 % in a row's first
   seconds. A download's bar is what the browser received, never the device's
   send count. The one step back is a resume: after the row has read
   Reconnecting, it reads the device's accepted offset
-  (`useRemoteControl.ts:13650`), which is below what it showed when the
+  (`useRemoteControl.ts:13682`), which is below what it showed when the
   device kept less than it had acknowledged.
   A Cancel the person chose says so: the row reads Cancelled, and the
   snackbar "Upload cancelled: big.bin" or "Download cancelled: …"
-  (`isTransferCancelled`, `useRemoteControl.ts:15600`), never "Upload
+  (`isTransferCancelled`, `useRemoteControl.ts:15632`), never "Upload
   failed: cancelled by operator"; a failure keeps its wording. A download's
-  Cancel (`useRemoteControl.ts:14035`) settles its row in the viewer: the
+  Cancel (`useRemoteControl.ts:14067`) settles its row in the viewer: the
   device stops its pump on `files:cancel` and, since #1730, answers nothing,
   so the row used to stay running with its save target open. The viewer now
   aborts the save target and drops the chunks that arrive late. An upload's
-  Cancel (`useRemoteControl.ts:14065`) does not tell the device: the pump
+  Cancel (`useRemoteControl.ts:14097`) does not tell the device: the pump
   stops, and the partial stays in the device's `.roomler-partial` staging
   folder until a start of the agent sweeps partials older than 24 h
   (`sweep_orphans`). Tests: `useRemoteControl.transfers.spec.ts` drives the
@@ -6594,7 +6747,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
   anyone but the floor holder, as keep busy's switch does
   (`agents/roomlerd/src/input/arbiter.rs:994`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
-  the control DC opens (`agents/roomlerd/src/peer.rs:1279`): the emitter
+  the control DC opens (`agents/roomlerd/src/peer.rs:1288`): the emitter
   starts before the channel does, so the snapshot it starts with found no
   channel, and went out again only on the next change.
 
@@ -6603,8 +6756,8 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:158`), so the peer's emitter
-(`agents/roomlerd/src/peer.rs:1572`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:11418`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:1598`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:11432`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
@@ -6850,7 +7003,7 @@ from (`ui/src/workers/rc-decoder-config.ts:38`). The override wins over whatever
 | | |
 |---|---|
 | **Paths** | both decode workers: `rc-dc-worker` (every codec over the data channel; until FR-135 R3 this was `rc-vp9-444-worker` for VP9, AV1 and H.264 and `rc-hevc-worker`, §11.14) and `rc-webcodecs-worker` (the RTP transform; its flag rides the transform's options, because the transform can start before the canvas arrives). The `<video>` element has no such control and decodes true once the agent describes its stream (FR-130 P1) |
-| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11722`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
+| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11754`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
 | **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4433`). The decoders are no longer told, and the console says so at connect |
 | **A browser that refuses it** | keeps its picture (`ui/src/workers/rc-decoder-config.ts:93`). A `configure()` that throws on the colour space goes again without it. A decoder that fails before its first frame with it set is rebuilt once without it, and it waits for a key frame, which it asks the agent for. One console line names the case: `decoder colour space dropped (FR-130 P2)` |
 | **Reading it** | each worker's `decoder configured` line in the console names the colour space `configure()` was told, and its `first frame` line the one the decoder says it produced. With the override, that is `matrix=smpte170m primaries=bt709 transfer=iec61966-2-1 range=limited` |
@@ -7571,7 +7724,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2674`](../crates/agent-core/src/config.rs#L2674))
+([`crates/agent-core/src/config.rs:2682`](../crates/agent-core/src/config.rs#L2682))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
@@ -7627,7 +7780,7 @@ config itself would, and the service starts that worker for such a copy
 restores a config from its last good copy (`config.toml.prev`), the live
 file missing or unreadable, it clears the copy's run marks first:
 `last_run_unhealthy` and `last_run_boot` (`clear_run_marks`,
-[`crates/agent-core/src/config.rs:5145`](../crates/agent-core/src/config.rs#L5145)).
+[`crates/agent-core/src/config.rs:5158`](../crates/agent-core/src/config.rs#L5158)).
 A save kept that copy while its run went on, so its mark says nothing of
 how the run ended. Before #4157 the copy kept the mark, and the start after
 a restore read the run before it as `Crashed` on the same boot, one step

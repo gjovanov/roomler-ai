@@ -4,6 +4,8 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
+#[cfg(test)]
+mod gate_before_body;
 pub mod growth;
 pub mod logging;
 pub mod middleware;
