@@ -167,9 +167,9 @@ exec roomlerd run
   ([`wix-perMachine/main.wxs:698-700`](../agents/roomlerd/wix-perMachine/main.wxs#L698-L700),
   [`win_service/lifecycle.rs:293`](../agents/roomlerd/src/win_service/lifecycle.rs#L293)).
   The worker takes either stop as an OS-initiated stop
-  ([`app.rs:5776-5782`](../agents/roomlerd/src/app.rs#L5776-L5782)), finds no
+  ([`app.rs:5821-5827`](../agents/roomlerd/src/app.rs#L5821-L5827)), finds no
   update in flight, and an ephemeral device deletes its own row
-  ([`app.rs:5849-5853`](../agents/roomlerd/src/app.rs#L5849-L5853)).
+  ([`app.rs:5894-5898`](../agents/roomlerd/src/app.rs#L5894-L5898)).
 - `roomler status` on an ephemeral device says so
   (`ephemeral   yes — removes itself after inactivity, or on clean stop`).
 
@@ -285,7 +285,7 @@ and a fold would put it on a real device's row.
 A secondary org (`[[orgs]]`) has no `ephemeral` (`OrgEntry`,
 `crates/agent-core/src/config.rs:1970-2028`). An ephemeral key used to add one
 is not known as ephemeral on the device: a stop removes only the primary's row
-(`agents/roomlerd/src/app.rs:5852-5853`), and the secondary's row goes when the
+(`agents/roomlerd/src/app.rs:5897-5898`), and the secondary's row goes when the
 reaper, where it runs, finds it silent past its TTL.
 
 ## Quota
