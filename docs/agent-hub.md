@@ -11,7 +11,8 @@ criterion is ticked with its evidence (§11). The operator keeps every decision 
 
 This page is the engineering reference. The decisions and their evidence are in the spec,
 [FR-131](fr/FR-131-hub-coordinator.md) (#3127), and for process hygiene, the host budget, the
-mailbox and the idle handoff (§12) in [FR-136](fr/FR-136-hub-process-hygiene.md) (#3457). The FR
+mailbox and the idle handoff (§12) in [FR-136](fr/FR-136-hub-process-hygiene.md) (#3457), and for
+the cold rotation (§12.5) in [FR-152](fr/FR-152-cold-hub-continues-from-handoff.md) (#4290). The FR
 rules that every FR worker follows are in
 [`fr/README.md`](fr/README.md) and [`.claude/agents/fr-worker.md`](../.claude/agents/fr-worker.md).
 The tooling is **not in this repo**: on 2026-10-30 the operator decided it stays local for now, in
